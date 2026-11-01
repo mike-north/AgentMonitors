@@ -19,7 +19,7 @@ import { Buffer } from 'node:buffer';
 import { monotonicFactory, ulid } from 'ulid';
 
 /**
- * Monotonic ULID factory for `monitor_events` ids (G10 PR-B). Plain `ulid()` is
+ * Monotonic ULID factory for `monitor_events` ids (spec: pipeline/post-processing). Plain `ulid()` is
  * NOT ordered within a single millisecond, but the per-recipient `net` collapse
  * and the claim-time cursor advance both need a deterministic "newest event per
  * object" tiebreak when a tick materializes several events for one object in the
@@ -255,7 +255,7 @@ function monitorStateKey(monitorId: string, workspacePath: string | null) {
 }
 
 /**
- * The per-recipient `net`-collapse grouping key for an event (002 §1.1.7): the
+ * The per-recipient `net`-collapse grouping key for an event (spec: pipeline/post-processing): the
  * `(monitorId, objectKey, workspacePath)` 3-tuple — the SAME key used by
  * {@link RuntimeStore.advanceCursorsForClaimedEvents} and the
  * `session_object_cursor` UNIQUE index (its omission caused the #186
@@ -277,7 +277,7 @@ export function netCollapseGroupKey(event: MonitorEventRecord): string {
 }
 
 /**
- * The read-only decision half of the per-recipient `net` collapse (002 §1.1.7):
+ * The read-only decision half of the per-recipient `net` collapse (spec: pipeline/post-processing):
  * given a recipient's candidate set, decide which events survive as DELIVERED
  * (the newest event of each `net` object group, plus every non-collapsible
  * event) and which older `net` siblings are SUPPRESSED — with NO database
@@ -305,7 +305,7 @@ export function computeNetCollapseView(
   // Order by (createdAt, id): events materialized in the same tick share a
   // createdAt, so the monotonic `id` (see `eventUlid`) breaks the tie in
   // insertion order — the last is the true endpoint ("where things stand now",
-  // 002 §1.1.7).
+  // spec: pipeline/post-processing).
   const ordered = [...candidates].sort((a, b) => {
     const byTime = a.createdAt.getTime() - b.createdAt.getTime();
     return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
@@ -352,7 +352,7 @@ export function computeNetCollapseView(
 
 /**
  * A delivery-query condition that excludes per-recipient projections the
- * Interpret agentic gate suppressed (G14, 002 §1.1.8): the row is retained for
+ * Interpret agentic gate suppressed (spec: pipeline/post-processing): the row is retained for
  * `monitor explain` but is never surfaced to a transport. `deliver`/`failed`
  * (best-effort fallback) and the absent (non-`prose`) case all deliver normally.
  */
@@ -365,7 +365,7 @@ function notInterpretSuppressed() {
 
 /**
  * A delivery-query condition that excludes per-recipient projections the `net`
- * collapse suppressed (G10 PR-B, 002 §1.1.7): an older intermediate of a `net`
+ * collapse suppressed (spec: pipeline/post-processing): an older intermediate of a `net`
  * monitor's catch-up span whose newest sibling was delivered instead. The row is
  * retained for `monitor explain` but is never surfaced to a transport.
  */
@@ -499,13 +499,13 @@ export class RuntimeStore {
       .run();
   }
 
-  // ── Ephemeral monitors (007 §4) ─────────────────────────────────────────────
+  // ── Ephemeral monitors (spec: agent/ephemeral-monitors) ─────────────────────────────────────────────
 
   /**
-   * Persist a new ephemeral (agent-declared, session-scoped) monitor (007 §4).
+   * Persist a new ephemeral (agent-declared, session-scoped) monitor (spec: agent/ephemeral-monitors).
    * `id` is the caller-assigned namespaced runtime identity
-   * `ephemeral:<sessionId>/<ulid>` (007 §4.3). The record is durable so it
-   * survives a daemon restart while the declaring session lives (007 §4.4).
+   * `ephemeral:<sessionId>/<ulid>` (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime"). The record is durable so it
+   * survives a daemon restart while the declaring session lives (spec: agent/ephemeral-monitors).
    */
   insertEphemeralMonitor(input: {
     id: string;
@@ -563,10 +563,10 @@ export class RuntimeStore {
 
   /**
    * The ACTIVE ephemeral monitors evaluated on a tick for `workspacePath`
-   * (007 §4.4). Only monitors whose declaring session is itself still `active`
+   * (spec: agent/ephemeral-monitors). Only monitors whose declaring session is itself still `active`
    * are returned — so a dormant/closed session's ephemeral monitors never fire,
    * even in the window before the reap step flips their status (a structural
-   * guard for "reaped on session end / no resurrection", 007 §4.4). Scoped to the
+   * guard for "reaped on session end / no resurrection", spec: agent/ephemeral-monitors). Scoped to the
    * workspace plus workspace-agnostic (global) records, mirroring
    * {@link sessionsForWorkspace}.
    */
@@ -598,7 +598,7 @@ export class RuntimeStore {
   }
 
   /**
-   * The ACTIVE ephemeral monitors declared by one session (007 §4), for
+   * The ACTIVE ephemeral monitors declared by one session (spec: agent/ephemeral-monitors), for
    * `watch list`. Ordered oldest-first.
    */
   listEphemeralMonitorsForSession(sessionId: string): EphemeralMonitorRecord[] {
@@ -617,9 +617,9 @@ export class RuntimeStore {
   }
 
   /**
-   * Reap ONE ephemeral monitor (007 §4.4): flip `active` → `reaped` and stamp
+   * Reap ONE ephemeral monitor (spec: agent/ephemeral-monitors): flip `active` → `reaped` and stamp
    * `reaped_at`. Idempotent (already-reaped rows are untouched). Retains the row
-   * and its materialized events for post-hoc observability (007 §4.4 default:
+   * and its materialized events for post-hoc observability (spec: agent/ephemeral-monitors default:
    * retain unread until the session's records are reaped) — the row is never
    * deleted, so a restart can never resurrect it.
    */
@@ -638,7 +638,7 @@ export class RuntimeStore {
   }
 
   /**
-   * Reap every ACTIVE ephemeral monitor declared by a session (007 §4.4) — used
+   * Reap every ACTIVE ephemeral monitor declared by a session (spec: agent/ephemeral-monitors) — used
    * when the session ends (explicit close) or goes dormant. Returns the ids
    * reaped.
    */
@@ -661,7 +661,7 @@ export class RuntimeStore {
 
   /**
    * The `active` sessions for `workspacePath` (plus global) that have gone
-   * dormant by inactivity (002 §6.2 / 007 §4.4 per-session dormancy trigger).
+   * dormant by inactivity (spec: delivery/session-projection, agent/ephemeral-monitors per-session dormancy trigger).
    * Used by the runtime to transition them to `dormant` and reap their ephemeral
    * monitors.
    *
@@ -954,8 +954,8 @@ export class RuntimeStore {
 
   /**
    * Materialize ONE shared `monitor_events` row and project it into matching
-   * lead sessions (002 §6), computing a PER-RECIPIENT delta for each (G10,
-   * 002 §1.1.2) — the shared artifact diffed against THAT session's own baseline
+   * lead sessions (spec: delivery/session-projection), computing a PER-RECIPIENT delta for each
+   * (spec: pipeline/post-processing) — the shared artifact diffed against THAT session's own baseline
    * cursor, recorded on `session_event_state.diff_text`.
    *
    * The event, its projections, initial recipient cursors, and supplied snapshot
@@ -964,7 +964,7 @@ export class RuntimeStore {
    * An empty snapshot is present data and is persisted just like nonempty text.
    * The per-recipient diff lives here (not after an Interpret await) so all
    * durable writes complete synchronously BEFORE the critical-path boundary,
-   * preserving the `ingest()` ordering invariant (002 §1.1.8).
+   * preserving the `ingest()` ordering invariant (spec: pipeline/post-processing).
    *
    * @param input - The shared event row. `input.diffText` is the shared
    *   object-level diff (against the latest stored snapshot) used for
@@ -1014,7 +1014,7 @@ export class RuntimeStore {
         const artifact = event.snapshotText;
         const objectKey = event.objectKey;
         const projectedSessionIds: string[] = [];
-        // Reap race (007 §4.4): a tick pre-fetches the active ephemeral monitors, then
+        // Reap race (spec: agent/ephemeral-monitors): a tick pre-fetches the active ephemeral monitors, then
         // `await source.observe()` yields; a concurrent `watch cancel` on another
         // socket can reap THIS monitor while the session stays active (session-close
         // dormancy is caught by the `status === 'active'` session filter below, but a
@@ -1025,16 +1025,16 @@ export class RuntimeStore {
         const ephemeralStillActive =
           options?.restrictToSessionId === undefined ||
           this.findEphemeralMonitorById(event.monitorId)?.status === 'active';
-        // Projection target (002 §6). For a persistent monitor, every matching LEAD
-        // session (workspace match or global). For an EPHEMERAL monitor (007 §4.6),
+        // Projection target (spec: delivery/session-projection). For a persistent monitor, every matching LEAD
+        // session (workspace match or global). For an EPHEMERAL monitor (spec: agent/ephemeral-monitors),
         // projection is restricted to the DECLARING session ONLY — its events must
         // never reach a sibling lead session in the same workspace (the ephemeral
         // isolation invariant). `restrictToSessionId` names that session; it is still
         // filtered to a lead role (the declaring session is a lead by construction,
-        // 007 §4.6), so a stray non-lead binding projects to nobody rather than
+        // spec: agent/ephemeral-monitors), so a stray non-lead binding projects to nobody rather than
         // leaking. The declaring session must also still be `active`: a session reaped
         // mid-tick (its close raced this observation) must not receive a projection
-        // (007 §4.4). The event row itself is still retained for durability.
+        // (spec: agent/ephemeral-monitors). The event row itself is still retained for durability.
         const projectionTargets = ephemeralStillActive
           ? this.sessionsForWorkspace(event.workspacePath).filter(
               (candidate) =>
@@ -1045,7 +1045,7 @@ export class RuntimeStore {
             )
           : [];
         for (const session of projectionTargets) {
-          // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
+          // ── Per-recipient Diff (spec: pipeline/post-processing) ──────────────────────────────
           // Compute this session's delta against ITS OWN baseline cursor, and seed
           // the cursor on first projection. Only meaningful for snapshot-bearing
           // events keyed by an objectKey; snapshot-less events leave diff_text NULL.
@@ -1139,8 +1139,8 @@ export class RuntimeStore {
 
   /**
    * The lead-session ids the most recent {@link insertEvent} projected the event
-   * into (the per-recipient seam, 002 §1.1.2). The runtime reads these to drive
-   * the per-recipient Interpret stage (G14) without re-querying.
+   * into (the per-recipient seam, spec: pipeline/post-processing). The runtime reads these to drive
+   * the per-recipient Interpret stage (spec: pipeline/post-processing) without re-querying.
    */
   private lastProjectedSessionIds: string[] = [];
 
@@ -1150,10 +1150,10 @@ export class RuntimeStore {
   }
 
   /**
-   * Record the per-recipient Interpret verdict (G14, 002 §1.1.8) on the
+   * Record the per-recipient Interpret verdict (spec: pipeline/post-processing) on the
    * `session_event_state` projection. When `decision` is `suppress`, the
    * projection is retained (so the verdict stays explainable via
-   * `monitor explain`, 002 §10.7) but excluded from delivery by
+   * `monitor explain`, spec: daemon/ipc) but excluded from delivery by
    * {@link unreadEventsForSession}/{@link pendingEventsForSession}.
    */
   recordInterpretDecision(
@@ -1184,8 +1184,8 @@ export class RuntimeStore {
   }
 
   /**
-   * Return the per-session interpret verdicts for a set of events (G14,
-   * 002 §1.1.8). Used by the delivery path to prefer the agentic digest over
+   * Return the per-session interpret verdicts for a set of events
+   * (spec: pipeline/post-processing). Used by the delivery path to prefer the agentic digest over
    * the raw `summary`/`body` for `prose` monitors. Only rows that have an
    * `interpret_digest` recorded are included; callers fall back to
    * `event.summary || event.body || event.title` when absent.
@@ -1216,11 +1216,11 @@ export class RuntimeStore {
   }
 
   /**
-   * Return the PER-RECIPIENT delta for a set of events for one session (G10,
-   * 002 §1.1.2): the diff this session computed against its OWN baseline cursor,
+   * Return the PER-RECIPIENT delta for a set of events for one session
+   * (spec: pipeline/post-processing): the diff this session computed against its OWN baseline cursor,
    * recorded on `session_event_state.diff_text`. Only events with a
    * non-NULL per-recipient `diff_text` are included; callers fall back to the
-   * shared `MonitorEventRecord.diffText` for legacy (pre-G10, NULL) rows.
+   * shared `MonitorEventRecord.diffText` for legacy (pre-per-recipient-delta, NULL) rows.
    */
   perRecipientDiffsForSession(
     sessionId: string,
@@ -1253,8 +1253,8 @@ export class RuntimeStore {
    * then groups the results by session id in memory.
    *
    * Use this instead of calling {@link perRecipientDiffsForSession} in a per-
-   * session loop (which would be O(N) queries for N recipients).  (G10, 002
-   * §1.1.2; Copilot review: comment 3.)
+   * session loop (which would be O(N) queries for N recipients).
+   * (spec: pipeline/post-processing; Copilot review: comment 3.)
    *
    * @returns Map from sessionId → diff text for the event.  Sessions with a NULL
    *   or missing row are omitted; callers should fall back to the shared event
@@ -1347,7 +1347,7 @@ export class RuntimeStore {
             ...rowToEvent(row.event),
             // Only the session-scoped path joins session_event_state, so only
             // it can report per-session delivery state (issue #338). `--unread`
-            // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
+            // filters on `acknowledgedAt IS NULL` (spec: delivery/session-projection — "Unread, claimed, and acknowledged are distinct session states"), which INCLUDES
             // claimed-but-unacknowledged events; this field lets a caller tell
             // those apart from a genuinely never-surfaced event.
             deliveryState: deliveryStateForRow(row.state),
@@ -1355,14 +1355,14 @@ export class RuntimeStore {
       : asInternalDb(this.db)
           .select()
           .from(monitorEvents)
-          // Ephemeral-monitor events (007 §4.6 isolation) must NEVER surface on an
+          // Ephemeral-monitor events (spec: agent/ephemeral-monitors isolation) must NEVER surface on an
           // unscoped (session-less) read: their body is the declaring session's
           // private free-text instruction, and this branch bypasses the
           // per-session projection gate that keeps them scoped. A sibling session
           // could otherwise read another session's ephemeral event. They remain
           // fully readable via the declaring session's session-scoped path above
           // (query.sessionId set). Persistent-monitor events are unaffected. The
-          // `ephemeral:` id prefix is reserved (007 §4.3) so a persistent id can
+          // `ephemeral:` id prefix is reserved (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime") so a persistent id can
           // never match this predicate.
           .where(
             and(
@@ -1445,7 +1445,7 @@ export class RuntimeStore {
   }
 
   /**
-   * The per-recipient baseline cursor (G10, 002 §1.1.2) for one
+   * The per-recipient baseline cursor (spec: pipeline/post-processing) for one
    * `(sessionId, monitorId, objectKey, workspacePath)`, or `null` if this
    * recipient has never had this object projected. NULL `workspacePath` (global)
    * is matched with `IS NULL` so a global cursor is read back exactly.
@@ -1483,7 +1483,7 @@ export class RuntimeStore {
   }
 
   /**
-   * SEED a per-recipient cursor (G10, 002 §1.1.2). Insert-only: if a cursor for
+   * SEED a per-recipient cursor (spec: pipeline/post-processing). Insert-only: if a cursor for
    * the key already exists it is left untouched — materialization seeds a cursor
    * only on a recipient's first projection of an object; it never advances an
    * existing one (that is {@link advanceSessionObjectCursor}, called at claim).
@@ -1519,7 +1519,7 @@ export class RuntimeStore {
   }
 
   /**
-   * ADVANCE a per-recipient cursor (G10, 002 §1.1.2) to a freshly-seen artifact
+   * ADVANCE a per-recipient cursor (spec: pipeline/post-processing) to a freshly-seen artifact
    * — the recipient was just shown this state, so its NEXT diff should span FROM
    * here. Called from {@link markClaimed}. Upserts so an advance can also create
    * the cursor if a legacy claim path never seeded one.
@@ -1613,7 +1613,7 @@ export class RuntimeStore {
         : // Unscoped enumeration (no monitorId) must not leak another session's
           // ephemeral-monitor audit rows — the ephemeral id embeds the declaring
           // session and its observation counts would cross session boundaries
-          // (007 §4.6). A monitorId-targeted query (used by `monitor explain` /
+          // (spec: agent/ephemeral-monitors). A monitorId-targeted query (used by `monitor explain` /
           // doctor / reminder diagnosis) is a deliberate lookup and is unaffected.
           notLike(
             observationHistory.monitorId,
@@ -1707,14 +1707,14 @@ export class RuntimeStore {
       ...(state.interpretDigest
         ? { interpretDigest: state.interpretDigest }
         : {}),
-      // Per-recipient `net`-collapse suppression marker (G10 PR-B, 002 §1.1.7):
+      // Per-recipient `net`-collapse suppression marker (spec: pipeline/post-processing):
       // an older intermediate of a `net` catch-up span whose newest sibling was
       // delivered instead. Retained here so the collapse stays explainable via
-      // `monitor explain` (§10.7), but it was never surfaced to a transport.
+      // `monitor explain` (spec: daemon/ipc), but it was never surfaced to a transport.
       ...(state.netSuppressedAt ? { netSuppressed: true } : {}),
-      // Per-recipient delta (G10, 002 §1.1.2): the diff this recipient computed
+      // Per-recipient delta (spec: pipeline/post-processing): the diff this recipient computed
       // against its own cursor. Fall back to the shared event-level diff for
-      // legacy (pre-G10) rows where the per-recipient column is NULL.
+      // legacy (pre-per-recipient-delta) rows where the per-recipient column is NULL.
       ...(() => {
         const diff = state.diffText ?? event.diffText;
         return diff !== null ? { diffText: diff } : {};
@@ -2049,7 +2049,7 @@ export class RuntimeStore {
 
   /**
    * Apply the per-recipient `net` collapse to a recipient's candidate delivery
-   * set at claim time (G10 PR-B, 002 §1.1.7).
+   * set at claim time (spec: pipeline/post-processing).
    *
    * For each event whose persisted `baselineStrategy` is `net`, group the
    * candidates by `(monitorId, objectKey, workspacePath)` — the same 3-tuple
@@ -2093,7 +2093,7 @@ export class RuntimeStore {
 
     // The MUTATION half. For each surviving delivered event whose group ACTUALLY
     // collapsed (>1 net event), recompute its per-recipient diff_text against
-    // THIS recipient's cursor → endpoint artifact (002 §1.1.7), so the delivered
+    // THIS recipient's cursor → endpoint artifact (spec: pipeline/post-processing), so the delivered
     // delta spans the whole catch-up, not just the last step. A single-event
     // group ("missed nothing") is left byte-identical to what materialization
     // recorded — the degenerate case where `net` ≡ `incremental`, so a baseline
@@ -2134,8 +2134,8 @@ export class RuntimeStore {
   }
 
   /**
-   * Record the per-recipient `net`-collapse suppression marker (G10 PR-B,
-   * 002 §1.1.7) on the given projections: claimed-but-suppressed intermediates,
+   * Record the per-recipient `net`-collapse suppression marker
+   * (spec: pipeline/post-processing) on the given projections: claimed-but-suppressed intermediates,
    * retained for `monitor explain` but excluded from delivery.
    */
   private markNetSuppressed(sessionId: string, eventIds: string[]): void {
@@ -2156,7 +2156,7 @@ export class RuntimeStore {
   /**
    * Overwrite the per-recipient delta (`session_event_state.diff_text`) for one
    * projection. Used by the `net` collapse to re-anchor the surviving delta to
-   * the recipient's cursor → endpoint span at claim time (G10 PR-B, 002 §1.1.7).
+   * the recipient's cursor → endpoint span at claim time (spec: pipeline/post-processing).
    */
   private setPerRecipientDiff(
     sessionId: string,
@@ -2195,7 +2195,7 @@ export class RuntimeStore {
       )
       .run();
 
-    // Advance this recipient's per-object baseline cursor (G10, 002 §1.1.2): the
+    // Advance this recipient's per-object baseline cursor (spec: pipeline/post-processing): the
     // cursor means "the last artifact this recipient was actually shown", so a
     // claim moves it to the artifact of the NEWEST claimed event for each object.
     // Only snapshot-bearing events carry an artifact to advance to.
@@ -2206,7 +2206,7 @@ export class RuntimeStore {
    * For a set of just-claimed events, advance the recipient's per-object cursor
    * to the artifact of the NEWEST (latest `createdAt`, then ULID-ordered) claimed
    * event of each `(monitorId, objectKey, workspacePath)`. Events without a
-   * snapshot artifact are skipped (nothing to span from). (G10, 002 §1.1.2.)
+   * snapshot artifact are skipped (nothing to span from). (spec: pipeline/post-processing.)
    */
   private advanceCursorsForClaimedEvents(
     sessionId: string,

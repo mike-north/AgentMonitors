@@ -10,18 +10,18 @@
  * the WRONG change summary — a recipient last seen at `a1` should receive the
  * full `a1→a3` span, but the shared row only carries `a2→a3` (the latest
  * snapshot delta). That is incomplete/incorrect evidence and violates the
- * per-recipient Diff + session-isolation contract (002 §1.1.2). Both the claim
+ * per-recipient Diff + session-isolation contract (spec: pipeline/post-processing). Both the claim
  * path (`claimDelivery`) and the preview path (`previewSettledHighDelivery`) go
  * through the same mapper, so both are covered.
  *
  * Expected diff text is written BY HAND from the `buildTextDiff` format spec
- * (002 §5.2: line-level `- <n>: <before>` / `+ <n>: <after>`), never captured
+ * (spec: runtime/event-materialization: line-level `- <n>: <before>` / `+ <n>: <after>`), never captured
  * from program output. No snapshot/gold-master assertions (repo policy).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.2 (the shared/per-recipient seam)
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (diff format)
- * @see ../../../../docs/specs/006-agent-integration.md §4.2.1 (change summary on the delivery surface)
- * @see ../../../../docs/specs/roadmap.md §G10
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (the shared/per-recipient seam)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
+ * @see ../../../../openspec/specs/delivery/channel-transport/spec.md, ../../../../openspec/specs/delivery/transport-seam/spec.md (change summary on the delivery surface)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -76,7 +76,7 @@ function freshRuntime(): Harness {
 }
 
 /**
- * Force a `session_event_state` row back to the pre-G10 shape (NULL
+ * Force a `session_event_state` row back to the pre-per-recipient-delta shape (NULL
  * per-recipient `diff_text`) to exercise the legacy fallback path. The store
  * only ever WRITES this column at projection time, so a regression test for
  * the legacy migration case must produce the NULL directly — done over a
@@ -209,7 +209,7 @@ describe('per-recipient change summary on the delivery surface (issue #436)', ()
 
   /**
    * Legacy fallback: a row whose per-recipient `diff_text` is genuinely NULL
-   * (pre-G10, forced via {@link nullOutPerRecipientDiff} — the store only ever
+   * (pre-per-recipient-delta, forced via {@link nullOutPerRecipientDiff} — the store only ever
    * WRITES this column at projection time, so no in-band call produces a NULL
    * row today) MUST fall back to the shared `MonitorEventRecord.diffText`, so
    * an existing install keeps surfacing a change summary rather than dropping
@@ -217,7 +217,7 @@ describe('per-recipient change summary on the delivery surface (issue #436)', ()
    *
    * Regression note (issue #442 review): the prior version of this test never
    * actually nulled the row — a single co-registered session's per-recipient
-   * delta happens to equal the shared diff BY COINCIDENCE (pre-G10 parity), so
+   * delta happens to equal the shared diff BY COINCIDENCE (pre-per-recipient-delta parity), so
    * `perRecipientDiffsForSession(...) ?? event.diffText` never executed its
    * fallback branch. Deleting the fallback would have left that version green.
    */
@@ -232,7 +232,7 @@ describe('per-recipient change summary on the delivery surface (issue #436)', ()
     const shared = store.getEventById(e2).diffText;
     expect(shared).toBe('- 1: a1\n+ 1: a2');
 
-    // Force the projected per-recipient row back to the pre-G10 NULL shape.
+    // Force the projected per-recipient row back to the pre-per-recipient-delta NULL shape.
     nullOutPerRecipientDiff(dbPath, onlyId, e2);
 
     // The batch reader MUST omit a NULL per-recipient row entirely (its own

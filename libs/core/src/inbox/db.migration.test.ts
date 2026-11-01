@@ -11,14 +11,14 @@
  *    can hold independent state for the same id. `source_state` is reset (it
  *    cannot be safely attributed to a workspace), but each row's DURABLE
  *    `notify_state` batch (`pendingDebounce`/`pendingRollup` — already-detected
- *    observations the runtime MUST redeliver, 002 §4.4 / issue #109) is salvaged
+ *    observations the runtime MUST redeliver, spec: runtime/notify-dispatch, pipeline/post-processing / issue #109) is salvaged
  *    and re-inserted, attributed to the workspace derived from each observation's
  *    monitor `filePath`. Dropping such a batch would be silent, permanent event
  *    loss (the next tick re-baselines and never re-detects those changes);
  *  - add the nullable `workspace_path` column to `observation_history`.
  *
  * @see ../runtime/store.ts (getMonitorState/setMonitorState keying)
- * @see docs/specs/002-runtime-delivery.md §3 (Persisted Monitor State), §4.4
+ * @see openspec/specs/runtime/monitor-state/spec.md (Persisted Monitor State), spec: runtime/notify-dispatch, pipeline/post-processing
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -253,7 +253,7 @@ describe('monitor_state / observation_history workspace migration (#345 / #307)'
   });
 
   it('preserves a non-empty pendingRollup batch across the migration, attributed to its workspace, with source_state reset', () => {
-    // A legacy row holding an ALREADY-DETECTED rollup batch (002 §4.4 / #109).
+    // A legacy row holding an ALREADY-DETECTED rollup batch (spec: runtime/notify-dispatch, pipeline/post-processing / #109).
     // Dropping it would be silent, permanent event loss: the batch is redelivered
     // on the next window opening, so the migration MUST carry it forward.
     const workspaceRoot = path.join('/', 'projects', 'alpha');

@@ -13,7 +13,7 @@ import {
  * legitimately takes to reach a session — from the monitor's own declared
  * timing, so it never silently under-shoots the way a fixed 40s loop did
  * (issue #399). The interval/settle inputs to that budget come straight from
- * the runtime's canonical `schedulingDefaults` (002 §4.4 / §9.1), so this
+ * the runtime's canonical `schedulingDefaults` (spec: runtime/notify-dispatch, pipeline/post-processing, delivery/lifecycles), so this
  * estimate can never drift from the daemon's real cadences the way a
  * hand-mirrored copy would.
  */
@@ -98,7 +98,7 @@ export function resolveSettleMs(monitor: MonitorDefinition): number {
  * - `high` → `turn-interruptible` (high-urgency events interrupt mid-turn,
  *   after the ~15s claim-settle window).
  * - `normal` / `low` → `post-compact` (the recap re-shows all unread regardless
- *   of urgency; normal/low never interrupt mid-turn — 002 §9, memory: only
+ *   of urgency; normal/low never interrupt mid-turn — spec: delivery/lifecycles, memory: only
  *   `high` notifies mid-session).
  */
 export function deliveryLifecycleForUrgency(

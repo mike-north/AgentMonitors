@@ -42,7 +42,7 @@ export function validateScope(
 
 /**
  * Returns the actionable BP3 error when a `change-detection.collection` block is
- * present without `strategy: json-diff` (003 §12), or `undefined` otherwise.
+ * present without `strategy: json-diff` (spec: sources/contract), or `undefined` otherwise.
  * Mirrors the schema's `if/then` rule with a clearer, author-facing message than
  * cfworker's opaque "Instance does not match json-diff". Source-agnostic (any
  * source exposing `change-detection`), so it lives on the shared validate path.
@@ -129,11 +129,11 @@ export function invalidTimezoneError(
 /**
  * Validate a monitor's `watch` scope (the `watch` block minus `type`) against a
  * source's `scopeSchema`, returning the SAME diagnostics `agentmonitors validate`
- * produces (004 §2.2): the {@link validateScope} schema errors, plus the BP3
+ * produces (spec: monitor/validation): the {@link validateScope} schema errors, plus the BP3
  * {@link changeDetectionCollectionError} friendly wrapper for the keyed-collection
  * case (replacing cfworker's opaque conditional-schema `then` noise). Both the
- * `validate` command and the ephemeral `watch declare` path (007 §4.2) call this,
- * so an invalid scope is rejected identically on either path (005 §14.4).
+ * `validate` command and the ephemeral `watch declare` path (spec: agent/ephemeral-monitors) call this,
+ * so an invalid scope is rejected identically on either path (spec: agent/ephemeral-monitors).
  *
  * @param scope - The monitor's source-specific `scope` object (no `type` key).
  * @param scopeSchema - The source's `scopeSchema` JSON Schema fragment.

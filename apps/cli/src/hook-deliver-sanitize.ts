@@ -7,8 +7,8 @@
  * MUST share one definition of "render untrusted id safely" rather than
  * risk drifting (issue #365).
  *
- * @see ../../../docs/specs/006-agent-integration.md §5.2.1
- * @see ../../../docs/specs/005-cli-reference.md §12.2.1
+ * @see ../../../openspec/specs/cli/session-commands/spec.md, ../../../openspec/specs/delivery/hook-transport/spec.md
+ * @see ../../../openspec/specs/cli/session-commands/spec.md
  */
 
 /**

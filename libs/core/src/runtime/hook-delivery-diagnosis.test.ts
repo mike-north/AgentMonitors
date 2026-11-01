@@ -10,8 +10,8 @@ const SETTLE_MS = 15_000;
 const NOW = new Date('2026-07-14T12:00:00.000Z');
 
 describe('classifyReminderHold', () => {
-  it('reports no hold when every unread normal event is still unclaimed (the reminder would fire, §9.2)', () => {
-    // unread === pending → the §9.2 guard holds → fires → nothing to explain.
+  it('reports no hold when every unread normal event is still unclaimed (the reminder would fire, spec: delivery/lifecycles)', () => {
+    // unread === pending → the spec: delivery/lifecycles guard holds → fires → nothing to explain.
     expect(classifyReminderHold('normal', 2, 2)).toBeNull();
   });
 
@@ -20,7 +20,7 @@ describe('classifyReminderHold', () => {
     expect(classifyReminderHold('low', 0, 0)).toBeNull();
   });
 
-  it('reports `no-new-work` when the only unread normal event is claimed (§9.2)', () => {
+  it('reports `no-new-work` when the only unread normal event is claimed (spec: delivery/lifecycles)', () => {
     const hold = classifyReminderHold('normal', 1, 0);
     expect(hold).toMatchObject({
       urgency: 'normal',
@@ -51,7 +51,7 @@ describe('classifyReminderHold', () => {
     expect(classifyReminderHold('normal', 3, 1, ['a', 'b'])).toBeNull();
   });
 
-  it('diagnoses the low band at turn-idle (§9.3)', () => {
+  it('diagnoses the low band at turn-idle (spec: delivery/lifecycles)', () => {
     const hold = classifyReminderHold('low', 1, 0);
     expect(hold).toMatchObject({
       urgency: 'low',

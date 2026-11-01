@@ -21,7 +21,7 @@ Node.js `>=24`.
 - [agentmonitors.io](https://agentmonitors.io) — getting started, authoring monitors, end-to-end
   delivery
 - [CLI reference](https://agentmonitors.io/docs) /
-  [`docs/specs/005-cli-reference.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/005-cli-reference.md)
+  [`openspec/specs/cli/`](https://github.com/mike-north/AgentMonitors/tree/main/openspec/specs/cli)
 
 ## License
 

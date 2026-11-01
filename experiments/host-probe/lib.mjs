@@ -1,4 +1,4 @@
-// Shared, pure(ish) logic for the generalized host-probe harness (spec 006 §11.6).
+// Shared, pure(ish) logic for the generalized host-probe harness (change: add-multi-host-adapters — "Host adapters ship with conformance evidence").
 //
 // Kept separate from probe.mjs (the CLI entry / process-boundary code) so the
 // parsing/reduction logic is unit-testable without spawning a real hook subprocess
@@ -44,7 +44,7 @@ export function candidateSignalKeys(env) {
 /**
  * Build one JSONL "sighting" record for a `record-hook` invocation.
  *
- * Mirrors the documented hook stdin contract (006 §5.0): `session_id` is the
+ * Mirrors the documented hook stdin contract (spec: delivery/hook-transport): `session_id` is the
  * session-identity signal, `cwd` is the workspace-binding signal, `hook_event_name`
  * is the firing lifecycle-hook name. Records presence/absence honestly — a missing
  * field is a real finding, not an error.
@@ -85,7 +85,7 @@ export function buildHookSighting({
  * Build one JSONL "sighting" record for a `record-mcp` invocation (the richer,
  * additive-transport analogue — a channel/push server, generalizing
  * experiments/channel-probe). Records env + roots/list, the two documented
- * workspace-binding signals for a spawned MCP server (006 §4.4).
+ * workspace-binding signals for a spawned MCP server (spec: delivery/channel-transport).
  */
 export function buildMcpSighting({
   phase,

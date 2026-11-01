@@ -7,7 +7,7 @@
  * delivered additionalContext, the failing stage, and scratch cleanup — the
  * whole point of the command is that the caller does none of the manual recipe.
  *
- * @see docs/specs/005-cli-reference.md §16
+ * @see openspec/specs/cli/verify/spec.md
  */
 import {
   execFileSync,

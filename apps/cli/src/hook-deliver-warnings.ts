@@ -6,7 +6,7 @@
  * is silent unless the operator opts in. This module is different in kind:
  * it formats the lines that `hook deliver` writes to stderr on EVERY
  * invocation that hits the relevant branch, regardless of `--debug`. `hook
- * deliver`'s STDOUT contract stays unconditionally silent-on-idle (006 §5.1)
+ * deliver`'s STDOUT contract stays unconditionally silent-on-idle (spec: delivery/hook-transport)
  * — the Claude Code host never sees stderr — but an operator polling
  * `hook deliver` manually while diagnosing a broken hook wire does.
  *
@@ -20,7 +20,7 @@
  * A payload that IS a real hook call but is merely held by the expected
  * high-urgency claim-settle window (the runtime debounces high-urgency
  * delivery for up to ~15s; empty output during that window is normal and MUST
- * NOT warn — 002 §9.1) stays silent, as does every other quiet-return branch
+ * NOT warn — spec: delivery/lifecycles) stays silent, as does every other quiet-return branch
  * (disabled workspace, unreachable daemon, nothing pending, …), each of which
  * remains diagnosable via `--debug` (`hook-deliver-debug.ts`).
  *
@@ -40,7 +40,7 @@
  *
  * @see ./commands/hook.ts (writes these lines to stderr, unconditionally, on
  *   the relevant branch)
- * @see ../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
+ * @see ../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  */
 
 import { sanitizeUntrustedField } from './hook-deliver-sanitize.js';

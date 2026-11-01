@@ -162,7 +162,7 @@ export function spawnDetachedDaemon(
 
 /**
  * Open the detached daemon's log for appending under Agent Monitors' owner-only
- * runtime-data policy (002 §3.1), NOT the ambient umask.
+ * runtime-data policy (spec: runtime/local-data-permissions), NOT the ambient umask.
  *
  * The log captures the daemon's stdout/stderr — workspace paths, socket paths,
  * and monitor failure messages — so under a common `umask 022` a plain

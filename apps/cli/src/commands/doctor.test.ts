@@ -25,7 +25,7 @@ import { gatherDeliveryDiagnoses } from './doctor.js';
  * unavailable and force `deliverable: false` for a session nobody is asking
  * about anymore.
  *
- * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
+ * @see ../../../../openspec/specs/delivery/transport-health/spec.md (transport health)
  */
 
 vi.mock('../runtime-client.js', async (importOriginal) => {

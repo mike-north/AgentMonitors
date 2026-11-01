@@ -17,8 +17,8 @@
  * to the old direct-claim call site fails HERE regardless of whether
  * `deliverSessionStartRecap` remains reachable from anywhere else.
  *
- * @see docs/specs/005-cli-reference.md §10.4
- * @see docs/specs/006-agent-integration.md §5.6
+ * @see openspec/specs/cli/session-commands/spec.md, openspec/specs/delivery/hook-transport/spec.md
+ * @see openspec/specs/delivery/channel-transport/spec.md, openspec/specs/delivery/hook-transport/spec.md
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
@@ -187,7 +187,7 @@ describe("session start's actual Commander action (issue #442, round-18 review)"
     expect(writeLocalStateMock).toHaveBeenCalled();
   });
 
-  it('a write failure releases the reservation instead of committing, sets exit code 1 (direct-CLI failure contract, 005 §10.4), and leaks no stdout error listener', async () => {
+  it('a write failure releases the reservation instead of committing, sets exit code 1 (direct-CLI failure contract, spec: cli/session-commands, delivery/hook-transport), and leaks no stdout error listener', async () => {
     const event = makeEvent();
     reserveMock.mockResolvedValueOnce({
       reservationId: 'recap-r-2',
@@ -224,7 +224,7 @@ describe("session start's actual Commander action (issue #442, round-18 review)"
     try {
       // `start`'s always-exit-0 HOOK contract (via the plugin wrapper's
       // `|| true`) means the process never actually dies nonzero in that
-      // context — but the direct CLI call itself still fails per 005 §10.4:
+      // context — but the direct CLI call itself still fails per spec: cli/session-commands, delivery/hook-transport:
       // only the plugin wrapper makes hooks best-effort, not `reportError`
       // itself. So the action's own try/catch swallows the write failure
       // (reported via `reportError`) rather than rejecting, but

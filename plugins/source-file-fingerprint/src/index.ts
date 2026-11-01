@@ -185,7 +185,7 @@ async function buildPresentObservation(
  * the monitor's band floor (`band.lo`) — the file still exists, no information
  * is lost.
  *
- * @see docs/specs/003-source-plugins.md §3.4 (salience policy)
+ * @see openspec/specs/sources/file-fingerprint/spec.md — "Salience policy" (salience policy)
  */
 function buildAbsentObservation(
   filePath: string,

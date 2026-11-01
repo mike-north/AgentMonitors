@@ -1,7 +1,7 @@
 /**
  * Regression coverage for `openLogFd`'s fail-closed policy when the final
  * descriptor `fchmod` cannot secure the `--detach` log to owner-only
- * (spec 002 §3.1; round-7 PR #450 review 3611731176).
+ * (spec: runtime/local-data-permissions; round-7 PR #450 review 3611731176).
  *
  * This lives in its own file — deliberately NOT one of the daemon-spawn
  * files that run serially via `vitest.serial.config.ts` (which shares one

@@ -20,7 +20,7 @@ Node.js `>=24`.
 ## Documentation
 
 - [Authoring monitors](https://agentmonitors.io/docs/authoring-monitors)
-- [`docs/specs/003-source-plugins.md`](https://github.com/mike-north/AgentMonitors/blob/main/docs/specs/003-source-plugins.md)
+- [`sources/contract`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/sources/contract/spec.md) and [`sources/incoming-changes`](https://github.com/mike-north/AgentMonitors/blob/main/openspec/specs/sources/incoming-changes/spec.md)
 
 ## License
 

@@ -12,7 +12,7 @@ import {
 } from '../manual-daemon.js';
 
 /**
- * Parse the `--scope` value into a source-specific config object (005 §14.4).
+ * Parse the `--scope` value into a source-specific config object (spec: agent/ephemeral-monitors).
  *
  * Two forms are accepted so a declaration can express every source's scope:
  *  - **JSON** — when the value is a JSON object (starts with `{`), it is parsed

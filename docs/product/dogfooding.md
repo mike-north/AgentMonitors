@@ -95,6 +95,6 @@ pnpm --filter @agentmonitors/cli exec vitest run \
 This monitor uses the current `source:` / `scope:` frontmatter, which is the stable,
 validated shape supported by the runtime today. The AgentMonitors standard describes a
 future intent-first `watch: { type }` authoring syntax (see the Note in issue #40 and
-`docs/specs/001-monitor-definition.md` §target). Once that authoring migration lands,
+[`monitor/definition`](../../openspec/specs/monitor/definition/spec.md)). Once that authoring migration lands,
 this monitor should be updated to the `watch:` shape. Until then, the current frontmatter
 is the correct form to use.

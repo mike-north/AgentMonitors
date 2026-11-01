@@ -14,11 +14,11 @@
  * The clock is frozen (`vi.useFakeTimers`) so `saveSnapshot`'s internal
  * `new Date()` — and the event `created_at` passed here — all land in the same
  * second, reproducing the tie deterministically. Expected diff strings are
- * written BY HAND from the `buildTextDiff` format spec (002 §5.2: line-level
+ * written BY HAND from the `buildTextDiff` format spec (spec: runtime/event-materialization: line-level
  * `- <n>: <before>` / `+ <n>: <after>`), never captured from program output.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (snapshot ordering & diff format)
- * @see ../../../../docs/specs/002-runtime-delivery.md §15 (monitor_snapshots schema)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (snapshot ordering & diff format)
+ * @see ../../../../openspec/specs/persistence/schema/spec.md — "Storage conventions" (monitor_snapshots schema)
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -126,7 +126,7 @@ describe('snapshot tie ordering (issue #293)', () => {
   it('a1->a2->a3 within one second keeps adjacent diffs a1->a2 then a2->a3', () => {
     // Criterion 3 (frozen-clock diff-chain regression). Pre-fix, materializing
     // a3 read an OLDER snapshot as "latest", so the chain diffed a1->a3 instead
-    // of a2->a3. Each expected diff is one changed line 1 (002 §5.2 format).
+    // of a2->a3. Each expected diff is one changed line 1 (spec: runtime/event-materialization format).
     const store = freshStore();
 
     const first = materialize(store, 'a1');

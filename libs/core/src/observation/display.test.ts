@@ -1,12 +1,12 @@
 /**
  * Tests for {@link displayObjectKey} — the bounded rendering of a source
- * `objectKey` into human-facing observation text (003 §2.8, issue #449).
+ * `objectKey` into human-facing observation text (spec: sources/contract, issue #449).
  *
  * Expected values are written from the rule itself ("unchanged at or below the
  * 60-character bound; otherwise a 59-character prefix plus `…`"), not captured
  * from the implementation's output.
  *
- * @see ../../../../docs/specs/003-source-plugins.md §2.8
+ * @see ../../../../openspec/specs/sources/contract/spec.md
  */
 import { describe, expect, it } from 'vitest';
 import { displayObjectKey } from './display.js';

@@ -1,15 +1,15 @@
 /**
- * Ephemeral (agent-declared, session-scoped) monitors — 007 §4.
+ * Ephemeral (agent-declared, session-scoped) monitors — spec: agent/ephemeral-monitors.
  *
  * Covers the acceptance criteria of issue #312: declaration validity + scope
- * parity (§4.2), namespaced/unique/stable identity with impossible persistent
- * collision (§4.3), lifecycle — active-on-declare, reap on session close,
+ * parity (spec: agent/ephemeral-monitors), namespaced/unique/stable identity with impossible persistent
+ * collision (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime"), lifecycle — active-on-declare, reap on session close,
  * `watch cancel` immediate reap, daemon-restart survival while the session lives,
- * no resurrection after session end, per-session dormancy reap (§4.4) — and
- * projection isolation to the declaring session only (§4.6).
+ * no resurrection after session end, per-session dormancy reap (spec: agent/ephemeral-monitors) — and
+ * projection isolation to the declaring session only (spec: agent/ephemeral-monitors).
  *
- * @see docs/specs/007-agent-facing-interaction.md §4
- * @see docs/specs/002-runtime-delivery.md §6.2
+ * @see openspec/specs/agent/ephemeral-monitors/spec.md
+ * @see openspec/specs/delivery/session-projection/spec.md
  */
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -67,7 +67,7 @@ const ephemeralSource: ObservationSource = {
  * A deterministic ephemeral source whose `observe()` runs a caller-supplied
  * side-effect BEFORE returning its observation — used to inject a reap that
  * races an in-flight tick (a `watch cancel` / session close arriving while the
- * daemon is mid-`observe()`, 007 §4.4). `name` lets a test register several.
+ * daemon is mid-`observe()`, spec: agent/ephemeral-monitors). `name` lets a test register several.
  */
 function raceEphemeralSource(
   name: string,
@@ -184,7 +184,7 @@ function openLead(
   );
 }
 
-describe('ephemeral monitors — declaration (007 §4.2)', () => {
+describe('ephemeral monitors — declaration (spec: agent/ephemeral-monitors)', () => {
   it('registers a valid declaration as active, bound to the declaring session', () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-decl-'));
     tempDirs.push(workspace);
@@ -240,7 +240,7 @@ describe('ephemeral monitors — declaration (007 §4.2)', () => {
     expect(runtime.listEphemeralMonitors(session.id)).toHaveLength(0);
   });
 
-  it('rejects an unbindable declaration rather than silently making it global (007 §4.2)', () => {
+  it('rejects an unbindable declaration rather than silently making it global (spec: agent/ephemeral-monitors)', () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-unbind-'));
     tempDirs.push(workspace);
     const { runtime } = makeHarness(':memory:', workspace);
@@ -274,7 +274,7 @@ describe('ephemeral monitors — declaration (007 §4.2)', () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-subagent-'));
     tempDirs.push(workspace);
     const { runtime } = makeHarness(':memory:', workspace);
-    // Projection is lead-only (007 §4.6); a subagent-bound monitor would observe
+    // Projection is lead-only (spec: agent/ephemeral-monitors); a subagent-bound monitor would observe
     // forever but never deliver, so the declaration MUST be rejected up front.
     const subagent = openSubagent(runtime, workspace, 'host-subagent');
     expect(subagent.role).toBe('subagent');
@@ -321,9 +321,9 @@ describe('ephemeral monitors — declaration (007 §4.2)', () => {
     const session = openLead(runtime, workspace, 'host-collection');
 
     // A `change-detection.collection` block without `strategy: json-diff` is the
-    // BP3 (003 §12) case `agentmonitors validate` reports with a friendly wrapper.
+    // BP3 (spec: sources/contract) case `agentmonitors validate` reports with a friendly wrapper.
     // The ephemeral declare path MUST reject it with the IDENTICAL diagnosis — the
-    // shared `validateWatchScope` helper is what makes the 005 §14.4 parity claim
+    // shared `validateWatchScope` helper is what makes the spec: agent/ephemeral-monitors parity claim
     // true (a plain `validateScope` would miss this wrapper).
     const collectionScope = {
       target: 'foo',
@@ -359,7 +359,7 @@ describe('ephemeral monitors — declaration (007 §4.2)', () => {
   });
 });
 
-describe('ephemeral monitors — identity (007 §4.3, criterion 2)', () => {
+describe('ephemeral monitors — identity (spec: agent/ephemeral-monitors — "Namespaced ephemeral identity", "Ephemeral identity is stable for the monitor lifetime", criterion 2)', () => {
   it('assigns a namespaced id that cannot collide with a persistent (directory-derived) id', () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-id-'));
     tempDirs.push(workspace);
@@ -420,7 +420,7 @@ describe('ephemeral monitors — identity (007 §4.3, criterion 2)', () => {
   });
 });
 
-describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
+describe('ephemeral monitors — lifecycle (spec: agent/ephemeral-monitors, criterion 3)', () => {
   it('is active on declaration and materializes an event on the normal tick', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-active-'));
     tempDirs.push(workspace);
@@ -456,7 +456,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     const result = await runtime.tick(monitorsDir, workspace);
     expect(result.emittedEventIds).toHaveLength(0);
     expect(runtime.listEvents({ sessionId: session.id })).toHaveLength(before);
-    // Retained (007 §4.4 default): the record is reaped, not deleted.
+    // Retained (spec: agent/ephemeral-monitors default): the record is reaped, not deleted.
     expect(record.id).toBeDefined();
   });
 
@@ -514,8 +514,8 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
   // naming affordance (it has no frontmatter file), so it must reach the same
   // authored-name signal a persistent monitor's `name:` does — otherwise a named
   // ephemeral watch still headlines with the source's implementation detail,
-  // violating 007 §4.6's "same pipeline semantics".
-  it('titles a named ephemeral watch with its display name, across a daemon restart (002 §5.4, 007 §4.6)', async () => {
+  // violating the agent/ephemeral-monitors spec's "same pipeline semantics".
+  it('titles a named ephemeral watch with its display name, across a daemon restart (spec: runtime/event-materialization, agent/ephemeral-monitors)', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'am-eph-title-'));
     tempDirs.push(root);
     const dbPath = path.join(root, 'agentmon.db');
@@ -555,7 +555,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     ).toEqual(['PR queue']);
   });
 
-  it('falls back to the source title for an UNNAMED ephemeral watch (002 §5.4)', async () => {
+  it('falls back to the source title for an UNNAMED ephemeral watch (spec: runtime/event-materialization)', async () => {
     const root = mkdtempSync(path.join(tmpdir(), 'am-eph-untitled-'));
     tempDirs.push(root);
     const first = makeHarness(':memory:', root);
@@ -575,7 +575,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
 
   // Regression (issue #449 review): a present-but-whitespace-only display name
   // is an ephemeral monitor's ONLY naming affordance, so if it were accepted it
-  // would win 002 §5.4's title precedence and durably headline every delivered
+  // would win the runtime/event-materialization spec's title precedence and durably headline every delivered
   // event with blank text. Reject it at declaration time, matching the
   // whitespace-only rejection `monitorFrontmatterSchema.name` applies to a
   // persistent monitor's frontmatter.
@@ -617,7 +617,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     );
   });
 
-  it('reaps on per-session dormancy by inactivity (002 §6.2 / 007 §4.4)', async () => {
+  it('reaps on per-session dormancy by inactivity (spec: delivery/session-projection, agent/ephemeral-monitors)', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-dormancy-'));
     tempDirs.push(workspace);
     // A tiny dormancy threshold so an inactive session goes dormant quickly.
@@ -665,7 +665,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
   // ── Declaring is activity: dormancy must not reap a session that just declared
   //    a watch (regression for the long-quiet-live-session event-loss bug). ─────
 
-  it('advances the declaring session lastActiveAt — declaring a watch is session activity (007 §4.4)', () => {
+  it('advances the declaring session lastActiveAt — declaring a watch is session activity (spec: agent/ephemeral-monitors)', () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-bump-'));
     tempDirs.push(workspace);
     const { runtime, store, db } = makeHarness(':memory:', workspace);
@@ -687,7 +687,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     expect(after).toBeGreaterThan(before);
   });
 
-  it('does NOT reap a long-quiet live session that declared a watch within the dormancy window; the watch stays armed and fires (007 §4.4)', async () => {
+  it('does NOT reap a long-quiet live session that declared a watch within the dormancy window; the watch stays armed and fires (spec: agent/ephemeral-monitors)', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-declare-wait-'));
     tempDirs.push(workspace);
     // 60s window; the session's prior activity is 90s stale — beyond it.
@@ -719,7 +719,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     expect(result.emittedEventIds).toHaveLength(1);
   });
 
-  it('staleActiveSessions exempts a session with an active ephemeral declared within the window (declaredAt guard, 007 §4.4)', () => {
+  it('staleActiveSessions exempts a session with an active ephemeral declared within the window (declaredAt guard, spec: agent/ephemeral-monitors)', () => {
     const workspace = mkdtempSync(
       path.join(tmpdir(), 'am-eph-declared-guard-'),
     );
@@ -753,7 +753,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     expect(staleAfter.some((s) => s.id === session.id)).toBe(true);
   });
 
-  it('retains already-materialized events + projections after a post-tick reap (007 §4.4 retention)', async () => {
+  it('retains already-materialized events + projections after a post-tick reap (spec: agent/ephemeral-monitors retention)', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-retain-'));
     tempDirs.push(workspace);
     const { runtime, store, monitorsDir } = makeHarness(':memory:', workspace);
@@ -777,7 +777,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     runtime.closeSession(session.id);
     expect(store.findEphemeralMonitorById(record.id)?.status).toBe('reaped');
 
-    // Retained (007 §4.4): the monitor_events row and the session_event_state
+    // Retained (spec: agent/ephemeral-monitors): the monitor_events row and the session_event_state
     // projection both survive the reap — a late delivery is never dropped (PP1).
     expect(store.getEventById(eventId).id).toBe(eventId);
     expect(runtime.listEvents({ sessionId: session.id })).toHaveLength(1);
@@ -793,7 +793,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     const declaring = openLead(runtime, workspace, 'host-race-close');
     // The source closes the declaring session DURING observe() — modelling a
     // `session close` on another socket that arrives after the tick pre-fetched
-    // the active monitor but before the observation is materialized (007 §4.4).
+    // the active monitor but before the observation is materialized (spec: agent/ephemeral-monitors).
     let closed = false;
     registry.register(
       raceEphemeralSource('race-close', () => {
@@ -830,7 +830,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
     const owner = openLead(runtime, workspace, 'host-race-cancel');
     // The source cancels the ephemeral monitor DURING observe() — the session
     // stays active, so ONLY the insert-time monitor-status re-check (not a session
-    // filter) can stop delivery for this reaped watch (007 §4.4). The id is not
+    // filter) can stop delivery for this reaped watch (spec: agent/ephemeral-monitors). The id is not
     // known until after `declare` returns, but the source must be registered
     // before `declare` validates it — a mutable holder bridges the two.
     const raceCtx: { ephemeralId?: string; cancelled: boolean } = {
@@ -861,7 +861,7 @@ describe('ephemeral monitors — lifecycle (007 §4.4, criterion 3)', () => {
   });
 });
 
-describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)', () => {
+describe('ephemeral monitors — projection isolation (spec: agent/ephemeral-monitors, criterion 4)', () => {
   it('projects an ephemeral monitor’s events into the declaring session ONLY', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-iso-'));
     tempDirs.push(workspace);
@@ -889,7 +889,7 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
     ).toHaveLength(0);
   });
 
-  it('never surfaces a session’s ephemeral event on a sibling’s UNSCOPED read (007 §4.6 read isolation)', async () => {
+  it('never surfaces a session’s ephemeral event on a sibling’s UNSCOPED read (spec: agent/ephemeral-monitors read isolation)', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-unscoped-'));
     tempDirs.push(workspace);
     const { runtime, store, monitorsDir } = makeHarness(':memory:', workspace);
@@ -961,7 +961,7 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
     ).toBe(false);
   });
 
-  it('excludes an ephemeral monitor’s observation-history rows from an UNSCOPED history enumeration (007 §4.6)', async () => {
+  it('excludes an ephemeral monitor’s observation-history rows from an UNSCOPED history enumeration (spec: agent/ephemeral-monitors)', async () => {
     const workspace = mkdtempSync(path.join(tmpdir(), 'am-eph-hist-'));
     tempDirs.push(workspace);
     const { runtime, store, monitorsDir } = makeHarness(':memory:', workspace);
@@ -982,7 +982,7 @@ describe('ephemeral monitors — projection isolation (007 §4.6, criterion 4)',
     // target, and the equivalent daemon-IPC `history.list`, which has no session
     // field) MUST NOT surface the ephemeral audit row: the id embeds the
     // declaring session, so its observation counts would cross session
-    // boundaries (007 §4.6 read isolation).
+    // boundaries (spec: agent/ephemeral-monitors read isolation).
     const unscoped = store.listObservationHistory({});
     expect(unscoped.some((row) => row.monitorId.startsWith('ephemeral:'))).toBe(
       false,

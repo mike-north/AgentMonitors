@@ -105,7 +105,7 @@ describe('scanMonitors', () => {
     expect(monitor?.monitor.id).toBe('my-custom-name');
   });
 
-  // Regression for G1 / SP2: two folders with the same basename derive the same
+  // Regression for duplicate monitor ids (SP2; spec: monitor/validation): two folders with the same basename derive the same
   // monitor id, which would alias persisted monitor state. The scan must surface
   // the collision (it does not silently dedupe or drop either monitor).
   it('flags monitors whose folder-derived id collides', async () => {

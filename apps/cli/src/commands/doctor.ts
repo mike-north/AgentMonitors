@@ -358,7 +358,7 @@ function notConfiguredRemediation(transport: TransportName): string {
  *   transport that DID report in during some past session: a heartbeat left
  *   behind by an uncleanly-killed process (SIGKILL, host crash) is stale or
  *   misbound evidence about a session that is no longer open, not a live
- *   failure of anything happening now (005 §15). Gating on `hasLeadSession`
+ *   failure of anything happening now (spec: cli/doctor). Gating on `hasLeadSession`
  *   here, the same way the `!configured` branch already does, is what keeps a
  *   single dead heartbeat from failing every future `doctor` run in this
  *   workspace forever. `readTransportHeartbeats` itself never reaps — GC is a
@@ -399,7 +399,7 @@ function transportChecks(
           : `No ${transport.name} transport has reported in (expected when no agent session is currently open).`,
         // Idle is not the same as "nothing to do" — the reader who hits this
         // first (every fresh setup) still needs a concrete next step, not a
-        // bare status glyph (005 §15).
+        // bare status glyph (spec: cli/doctor).
         remediation: notConfiguredRemediation(transport.name),
       });
       continue;
@@ -549,7 +549,7 @@ function renderText(
 }
 
 /**
- * Stable, documented machine shape (criterion 4; spec 005 §"doctor"). Dates are
+ * Stable, documented machine shape (criterion 4; spec: cli/doctor). Dates are
  * ISO strings or `null`; `ok` is `true` iff no check failed.
  */
 function toJson(
@@ -648,7 +648,7 @@ interface DeliveryDiagnosisResult {
  * reminder lifecycles.
  *
  * Both are queried because the two bands are held at different lifecycles
- * (normal at `turn-interruptible`, low at `turn-idle`, 002 §9.2/§9.3) — asking
+ * (normal at `turn-interruptible`, low at `turn-idle`, spec: delivery/lifecycles) — asking
  * only one would silently miss the other band's suppression, which is the exact
  * class of blind spot this surface exists to close.
  *
@@ -835,7 +835,7 @@ export const doctorCommand = new Command('doctor')
           // A PURE read (issue #425 review): `doctor` never reaps. Reaping
           // here let the diagnostic erase its own evidence — a second run
           // found no record and exited 0 with nothing actually recovered —
-          // and contradicted 005 §15's "diagnoses only, never mutates".
+          // and contradicted the cli/doctor spec's "diagnoses only, never mutates".
           heartbeats: readTransportHeartbeats(),
           diagnoses,
           diagnosisUnavailableSessionIds: unavailableSessionIds,

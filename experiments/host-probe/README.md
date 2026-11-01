@@ -1,8 +1,8 @@
 # Host probe (generalized binding-probe harness)
 
 Generalizes [`experiments/channel-probe`](../channel-probe/README.md) into a reusable, per-host
-diagnostic required by [`docs/specs/006-agent-integration.md`](../../docs/specs/006-agent-integration.md)
-§11.6: before a host's cells in the §11.3 adapter matrix move from _(probe)_ to _current_, a probe run
+diagnostic required by the [`add-multi-host-adapters`](../../openspec/changes/add-multi-host-adapters/proposal.md)
+change ("Host adapters ship with conformance evidence"): before a host's cells in the adapter matrix move from _(probe)_ to _current_, a probe run
 must pin the **session-identity signal**, the **workspace-binding signal**, and **which lifecycle hook
 points fired** — and commit the artifact as evidence.
 
@@ -16,7 +16,7 @@ Run inside a target host session, `probe.mjs` has two "sighting" sources:
 - **`record-hook`** — a lifecycle-hook command (wired into the host's hook config, one entry per
   event you want to observe). Reads the hook's stdin JSON payload and records whatever
   session-identity (`session_id`) and workspace (`cwd`) fields it finds — or their absence.
-- **`record-mcp`** — a spawned stdio MCP server (the "richer, additive transport" analogue, §11.1
+- **`record-mcp`** — a spawned stdio MCP server (the "richer, additive transport" analogue, change: add-multi-host-adapters
   dimension 6). Records its environment (filtered to identity/workspace-shaped keys) and attempts
   `roots/list`.
 
@@ -39,7 +39,7 @@ npx vitest run --config vitest.config.ts
 ```
 
 This covers the harness's own parsing/reduction logic against the documented stdin contract
-(006 §5.0) and MCP env contract (§4.4) with synthetic-but-spec-accurate payloads, plus an
+(spec: delivery/hook-transport) and MCP env contract (spec: delivery/channel-transport) with synthetic-but-spec-accurate payloads, plus an
 integration layer that spawns the real `probe.mjs` binary and pipes real stdin JSON into it — the
 same way a host hook actually invokes a command. It does **not** require a live Claude Code (or
 other host) session; that part is the manual runbook below.
@@ -144,7 +144,7 @@ Claude Code example (`.claude/settings.json` + `.mcp.json` in the throwaway proj
 ```
 
 For a **new** host (Codex, Cursor), swap in that host's own hook-config file format and
-lifecycle-hook names (§11.1 dimension 1) — the `record-hook` command itself is host-agnostic; it
+lifecycle-hook names (change: add-multi-host-adapters dimension 1) — the `record-hook` command itself is host-agnostic; it
 just reads whatever JSON it is given on stdin and records which fields are present. If the host has
 no MCP-server (or MCP-server-equivalent) mechanism, skip `record-mcp` entirely — `summarize` reports
 `richerTransport.attempted: false` honestly rather than guessing.
@@ -176,8 +176,8 @@ so a reader can see the individual sightings the summary was reduced from, not j
 
 ### 4. Commit the artifact as evidence
 
-Commit both files under `experiments/host-probe/results/`. The §11.3 matrix's _(probe)_ cells for
-that host/surface reference these artifacts as the pinning evidence required by §11.6. **Always
+Commit both files under `experiments/host-probe/results/`. The change: add-multi-host-adapters — "Matrix cells are pinned by a per-host probe" matrix's _(probe)_ cells for
+that host/surface reference these artifacts as the pinning evidence required by change: add-multi-host-adapters — "Host adapters ship with conformance evidence". **Always
 record absences honestly** — a signal that was not observed (env var unset, hook never fired,
 `roots/list` unsupported) is real, useful data; do not omit it or infer a value that was not
 actually seen.
@@ -195,7 +195,7 @@ actually seen.
 
 ## Teardown
 
-Throwaway. `experiments/host-probe/` itself is committed (per spec 006 §11.6, this harness and its
+Throwaway. `experiments/host-probe/` itself is committed (per change: add-multi-host-adapters — "Host adapters ship with conformance evidence", this harness and its
 committed artifacts are the required evidence), but any scratch project directories created under
 step 1 above are not — delete them when done.
 
@@ -236,7 +236,8 @@ Success (exit 0) reports `owner-observed`, identity/workspace signals, version, 
 methods. This is a point-in-time claim by the supplied server, **not an ownership lease**, an
 independent authentication of that server, or proof that another client can safely deliver to it.
 `surface` and `deliveryCapability` remain `unverified`; no lifecycle hook was exercised. This
-partial diagnostic does not satisfy all of §11.6 or unblock the #316 adapter on its own.
+partial diagnostic does not satisfy all of change: add-multi-host-adapters —
+"Host adapters ship with conformance evidence" or unblock the #316 adapter on its own.
 
 Output contains the requested thread id and workspace path for local diagnosis. Apply the
 artifact-hygiene substitutions above before committing real output; do not include conversation

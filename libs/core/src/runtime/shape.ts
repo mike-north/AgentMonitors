@@ -1,8 +1,8 @@
 /**
- * The deterministic **Shape** stage (roadmap G15).
+ * The deterministic **Shape** stage (spec: pipeline/post-processing).
  *
  * Shape runs on the **shared** side of the per-recipient seam, **before** Pace
- * and **before** Diff ([002 §1.1.4–§1.1.5](../../../../docs/specs/002-runtime-delivery.md#114-shape-deterministic-derived-facts)).
+ * and **before** Diff ([spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md)).
  * It does two deterministic things:
  *
  * 1. **Derived facts** — compute author-declared relative/aggregate facts as a
@@ -16,15 +16,15 @@
  *    manifests downstream as phantom diffs.
  *
  * The predicate language is **CEL** (a boolean *condition*, not a reshaping
- * expression — jq is reserved for `payload.transform`, §5.2). It is evaluated by
+ * expression — jq is reserved for `payload.transform`, spec: monitor/definition). It is evaluated by
  * `cel-js`, a Chevrotain-based parser/interpreter that does **not** use the
  * `Function` constructor or `eval`, so it is safe under restrictive CSP /
  * Workers-style environments (the same constraint that drove the choice of
  * `@cfworker/json-schema` over `ajv` repo-wide).
  *
- * @see ../../../../docs/specs/001-monitor-definition.md §5.1 (Shape declaration)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.4–§1.1.5
- * @see ../../../../docs/specs/003-source-plugins.md §2.7 (sources surface raw facts)
+ * @see ../../../../openspec/specs/monitor/definition/spec.md (Shape declaration)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
+ * @see ../../../../openspec/specs/sources/contract/spec.md — "Sources surface raw facts, not derived facts" (sources surface raw facts)
  */
 import { evaluate as celEvaluate, parse as celParse } from 'cel-js';
 
@@ -33,7 +33,7 @@ import { evaluate as celEvaluate, parse as celParse } from 'cel-js';
  * `name` is the marker surfaced in the rendered artifact; `when` is a CEL
  * boolean predicate over `(snapshot, now)`.
  *
- * @see ../../../../docs/specs/001-monitor-definition.md §5.1
+ * @see ../../../../openspec/specs/monitor/definition/spec.md
  */
 export interface DerivedFactRule {
   /** The marker name surfaced in the rendered artifact (e.g. `revealed`). */
@@ -66,7 +66,7 @@ function buildContext(snapshot: unknown, now: number): Record<string, unknown> {
       : { value: snapshot };
   // `now` is the only time input and it is injected — never an ambient clock.
   // It overrides any snapshot field literally named `now` so a source cannot
-  // smuggle wall-clock reasoning into the predicate (003 §2.7).
+  // smuggle wall-clock reasoning into the predicate (spec: sources/contract — "Sources surface raw facts, not derived facts").
   base['now'] = now;
   return base;
 }
@@ -85,7 +85,7 @@ function buildContext(snapshot: unknown, now: number): Record<string, unknown> {
  * @param rules - The author-declared `shape.derive` rules, in order.
  * @returns The facts whose predicate held, in authored order.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.4
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 export function computeDerivedFacts(
   snapshot: unknown,
@@ -115,13 +115,13 @@ export function computeDerivedFacts(
  * state MUST render to byte-identical text run-to-run: object keys are emitted
  * in a stable sorted order, facts in authored order, and there is no embedded
  * wall-clock. This artifact — not the raw source — is the Diff stage's input
- * (§1.1.5), so a newly-held fact surfaces as exactly one added line.
+ * (spec: pipeline/post-processing), so a newly-held fact surfaces as exactly one added line.
  *
  * @param snapshot - The shaped snapshot.
  * @param facts - The derived facts that held (authored order).
  * @returns The byte-stable rendered artifact.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.5
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 export function renderArtifact(
   snapshot: unknown,
@@ -188,7 +188,7 @@ function renderScalar(value: unknown): string {
  * message when it does not. Used by `validate` so a malformed `shape.derive`
  * `when` predicate is rejected before runtime.
  *
- * @see ../../../../docs/specs/004-validation-testing.md §2.2
+ * @see ../../../../openspec/specs/monitor/validation/spec.md
  */
 export function validateCelPredicate(expression: string): string | undefined {
   const result = celParse(expression);

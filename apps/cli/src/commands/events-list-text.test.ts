@@ -14,7 +14,7 @@
  * whenever it differs from `title`, regardless of whether it also equals
  * `body`.
  *
- * @see ../../../../docs/specs/005-cli-reference.md
+ * @see ../../../../openspec/specs/cli/session-commands/spec.md
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { MonitorEventRecord } from '@agentmonitors/core';

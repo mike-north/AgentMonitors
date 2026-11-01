@@ -1,7 +1,7 @@
 import type { Observation } from '@agentmonitors/core';
 
 /**
- * Composite observation (003 §2.6).
+ * Composite observation (spec: sources/api-poll, sources/contract).
  *
  * A source MAY assemble **one** `Observation` from **many** underlying calls,
  * reducing N requests into a single stable, deterministic whole-state snapshot
@@ -9,9 +9,9 @@ import type { Observation } from '@agentmonitors/core';
  * call an external API once per entity to reconstruct a whole document issues N
  * calls within a single `observe()` and renders them into one ordered
  * `snapshotText`. The runtime then diffs that one composite snapshot against the
- * consumer's baseline exactly as it would a single-call snapshot (003 §2.5).
+ * consumer's baseline exactly as it would a single-call snapshot (spec: sources/contract).
  *
- * @see docs/specs/003-source-plugins.md §2.6
+ * @see openspec/specs/sources/api-poll/spec.md, openspec/specs/sources/contract/spec.md
  */
 
 /** A single sub-resource that contributes to the composite whole. */
@@ -32,11 +32,11 @@ export interface CompositePart {
  * part. Capping the part count directly bounds three things at once: the
  * number of requests `observeComposite` issues per tick, the size of the
  * rendered composite artifact (bounded below in bytes too, but the part
- * count is what makes that bound tractable to reason about), and — per 003
- * §4.9 — the worst-case tick duration, since with `MAX_COMPOSITE_CONCURRENCY`
+ * count is what makes that bound tractable to reason about), and — per
+ * spec: sources/api-poll — the worst-case tick duration, since with `MAX_COMPOSITE_CONCURRENCY`
  * workers the batch takes at most `ceil(parts / MAX_COMPOSITE_CONCURRENCY) *
  * timeoutMs`. Enforced both here (defense in depth — `tick()` does not call
- * `validateWatchScope()`, per 002 §2.2) and in the JSON Schema (`scopeSchema`
+ * `validateWatchScope()`, per spec: runtime/tick-scheduling) and in the JSON Schema (`scopeSchema`
  * in `index.ts`, `maxItems`), so an authoring-time `agentmonitors validate`
  * catches it before a monitor is ever ticked.
  */
@@ -81,7 +81,7 @@ function countCodePointsUpTo(value: string, limit: number): number {
 export interface CompositeConfig {
   /**
    * Stable identity for the assembled whole. The composite carries **one**
-   * `objectKey` (003 §2.6): the composite *is* the observed object, so there is
+   * `objectKey` (spec: sources/api-poll, sources/contract): the composite *is* the observed object, so there is
    * one key for the whole, not one per underlying call.
    */
   objectKey: string;
@@ -126,7 +126,7 @@ export function parseCompositeConfig(
   // Issue #304 review, third round: bounds request count, rendered-artifact
   // size, and worst-case tick duration (see MAX_COMPOSITE_PARTS doc comment).
   // Defense in depth alongside the `scopeSchema` `maxItems` — `tick()` does
-  // not call `validateWatchScope()` (002 §2.2), so a hand-edited MONITOR.md
+  // not call `validateWatchScope()` (spec: runtime/tick-scheduling), so a hand-edited MONITOR.md
   // that skipped `agentmonitors validate` still must not reach the runtime.
   if (rawParts.length > MAX_COMPOSITE_PARTS) {
     throw new Error(
@@ -194,7 +194,7 @@ export interface FetchedPart {
 
 /**
  * Render the fetched parts into one **stable, deterministic** composite snapshot
- * text (003 §2.6). Determinism rules:
+ * text (spec: sources/api-poll, sources/contract). Determinism rules:
  *
  * - Parts are emitted **sorted by `id`**, so call-completion order (which is
  *   nondeterministic for concurrent fetches) never churns the snapshot.
@@ -202,7 +202,7 @@ export interface FetchedPart {
  *   attributes a change to the specific part that changed.
  *
  * The same underlying state assembled the same way renders identically
- * run-to-run, so the runtime's diff against the consumer baseline (§2.5) is
+ * run-to-run, so the runtime's diff against the consumer baseline (spec: sources/contract) is
  * meaningful rather than churned by ordering or transient fields.
  */
 /**
@@ -252,7 +252,7 @@ export function framedPartByteLength(part: FetchedPart): number {
  * observation). The observation carries **one** `objectKey` (the whole) and a
  * deterministic `snapshotText`; it is a current-state snapshot, never a
  * pre-diffed delta — the runtime computes the diff against the consumer
- * baseline (§2.5).
+ * baseline (spec: sources/contract).
  */
 export function buildCompositeObservation(
   config: CompositeConfig,

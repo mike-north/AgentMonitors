@@ -1,5 +1,5 @@
 /**
- * Tests for the `diffText` renderers (002 §5.2).
+ * Tests for the `diffText` renderers (spec: runtime/event-materialization).
  *
  * `buildTextDiff` is the line-level unified-style renderer used by default.
  * `buildDiff`/`buildJsonDiff` add a **structural** renderer for
@@ -7,8 +7,8 @@
  * snapshots previously degraded `buildTextDiff` into a whole-line
  * remove-all/add-all because the entire array serialized onto one line.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2
- * @see ../../../../docs/specs/003-source-plugins.md §11.3, §4.2 (json-diff strategy)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md
+ * @see ../../../../openspec/specs/sources/command-poll/spec.md, ../../../../openspec/specs/sources/api-poll/spec.md (json-diff strategy)
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -178,7 +178,7 @@ describe('buildJsonDiff — array of objects', () => {
   // REGRESSION (issue #437 follow-up, Copilot review thread 3608676215):
   // identity-based array matching (both diffJsonArrayByKey and
   // diffJsonArrayByDeepEquality) is itself order-insensitive — it matches by
-  // key/content, not position — but json-diff's `hasChanged` (003 §4.2/§11.3)
+  // key/content, not position — but json-diff's `hasChanged` (spec: sources/api-poll, sources/command-poll)
   // is array-ORDER-sensitive (it sorts object keys, never array elements), so
   // a pure reorder WOULD have fired a real observation. Before this fix,
   // buildJsonDiff rendered '' for a pure reorder (no removed/added/changed

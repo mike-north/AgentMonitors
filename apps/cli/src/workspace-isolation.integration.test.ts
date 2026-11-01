@@ -19,7 +19,7 @@
  *
  * @see https://github.com/mike-north/AgentMonitors/issues/345
  * @see https://github.com/mike-north/AgentMonitors/issues/307
- * @see docs/specs/002-runtime-delivery.md §3 (Persisted Monitor State)
+ * @see openspec/specs/runtime/monitor-state/spec.md (Persisted Monitor State)
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -238,7 +238,7 @@ describe('file-fingerprint workspace isolation (issue #345 / #307)', () => {
       (event) => event.objectKey === path.join(project2, 'p2-gamma.ts'),
     );
     // The per-object text lives on `summary`; `title` is the monitor's
-    // authored name since issue #449 (002 §5.4).
+    // authored name since issue #449 (spec: runtime/event-materialization).
     expect(gammaEvent?.summary).toMatch(/created/i);
     for (const event of restartEvents) {
       expect(eventText(event)).not.toContain('p1-');

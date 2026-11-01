@@ -1,6 +1,6 @@
 /**
  * Unit tests for `runChannelDeliveryCycle`'s reserve → push → commit/release
- * branching (006 §4.5.1, issue #300) — in particular the null-commit path.
+ * branching (spec: delivery/channel-transport, issue #300) — in particular the null-commit path.
  *
  * The daemon round-trip (real `hook.reserve`/`hook.commit`/`hook.release` IPC
  * against a live daemon) is covered end to end by the integration suite
@@ -170,14 +170,14 @@ describe('runChannelDeliveryCycle branching (issue #300)', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Bounded reservation (006 §5.5, issue #442): previews the settled-high
+// Bounded reservation (spec: delivery/channel-transport, delivery/hook-transport, issue #442): previews the settled-high
 // delivery, sizes how many WHOLE event blocks fit under the channel's content
 // ceiling via the REAL `packChannelEventsUnderCap`, and passes that count as
 // `reserveDelivery`'s `maxEvents` — so a large coalesced delivery re-delivers
 // its deferred remainder on a LATER poll rather than being reserved/rendered
 // unbounded in one push.
 // ---------------------------------------------------------------------------
-describe('runChannelDeliveryCycle bounded reservation (006 §5.5, issue #442)', () => {
+describe('runChannelDeliveryCycle bounded reservation (spec: delivery/channel-transport, delivery/hook-transport, issue #442)', () => {
   // Each body alone is well under the ceiling, but three together exceed it —
   // forcing `packChannelEventsUnderCap` to defer the third to a later poll.
   const BIG_BODY = 'x'.repeat(Math.floor(MAX_CHANNEL_CONTENT / 2.2));
@@ -656,7 +656,7 @@ describe('reserveSizedChannelDelivery eventless reminder claim (issue #442, roun
 // legitimately contains only the first event and fits, so the earlier
 // mismatch check reports `fits: true` — but the second, now-settled event is
 // left pending with no `CHANNEL_DEFERRED_MARKER` signposting it, contrary to
-// 006 §5.5 ("the render omits any pending event ... signposting that more
+// spec: delivery/channel-transport, delivery/hook-transport ("the render omits any pending event ... signposting that more
 // updates are pending").
 // ---------------------------------------------------------------------------
 describe('reserveSizedChannelDelivery candidate-set growth race (issue #442, round-6 review)', () => {
@@ -810,7 +810,7 @@ describe('reserveSizedChannelDelivery mismatch-release failure propagation (issu
 // ceiling still gets COMMITTED after `push` resolves (the mid-truncation
 // happens inside `push`'s rendering, not before reserve/commit) — committing
 // sets `first_notified_at`, and `pendingEventsForSession()` only returns rows
-// where that column is still NULL (006 §9), so this event can NEVER surface
+// where that column is still NULL (spec: delivery/channel-transport, delivery/transport-seam), so this event can NEVER surface
 // on a later poll. The old `CHANNEL_DEFERRED_MARKER` falsely told the agent
 // "they will surface on a later poll"; the cycle goes idle instead, and the
 // full body is only recoverable via the durable unread copy (claiming ≠

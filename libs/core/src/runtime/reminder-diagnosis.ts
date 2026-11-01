@@ -62,7 +62,7 @@ export interface ReminderSuppressionFinding {
   message: string;
 }
 
-/** The lifecycle each reminder band is delivered at (§9.2/§9.3). */
+/** The lifecycle each reminder band is delivered at (spec: delivery/lifecycles). */
 const REMINDER_LIFECYCLE: Record<ReminderUrgency, DeliveryLifecycle> = {
   normal: 'turn-interruptible',
   low: 'turn-idle',

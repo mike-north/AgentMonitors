@@ -12,7 +12,7 @@
  * pending events). Because `claimDelivery` marks the underlying rows claimed
  * SYNCHRONOUSLY, a substituted, oversized set would pass the count check but
  * still get cut by `renderHookDelivery`'s own repack — and the cut tail of an
- * already-claimed event can never redeliver (006 §5.5's core guarantee).
+ * already-claimed event can never redeliver (spec: delivery/channel-transport, delivery/hook-transport's core guarantee).
  *
  * `reserveSizedHookDelivery` closes this gap by reserving first (leasing, not
  * claiming) and re-validating the fit of the ACTUAL reserved claim via
@@ -20,7 +20,7 @@
  * retrying on a mismatch, mirroring the channel transport's
  * `reserveSizedChannelDelivery` (`channel-delivery-cycle.test.ts`).
  *
- * @see docs/specs/006-agent-integration.md §5.1, §5.5
+ * @see openspec/specs/delivery/hook-transport/spec.md, openspec/specs/delivery/channel-transport/spec.md
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
@@ -308,7 +308,7 @@ describe('reserveSizedHookDelivery substitution race (issue #442)', () => {
  * before `reserve` runs. The reservation legitimately returns only A, which
  * fits under the cap on its own — so the fit check passed and the (stale)
  * `moreDeferred: false` was returned unchanged, silently dropping the marker
- * that would have told the agent B is genuinely pending (§5.5).
+ * that would have told the agent B is genuinely pending (spec: delivery/channel-transport, delivery/hook-transport).
  */
 describe('reserveSizedHookDelivery candidate-set growth race (issue #442, round-9 review)', () => {
   it('sets moreDeferred when a second event settles between the sizing preview and the reservation', async () => {

@@ -1,14 +1,14 @@
 /**
  * Tests for the concrete {@link createClaudeInterpretAdapter} — the host-specific
- * `claude -p` invocation that 002 §1.1.8 / 006 §2.1 require to live behind the
+ * `claude -p` invocation that spec: pipeline/post-processing, delivery/transport-seam require to live behind the
  * adapter boundary, NEVER in the runtime core.
  *
  * A real model is never invoked: the adapter is pointed at a deterministic fake
  * CLI shim (a tiny Node script) so the argv/stdout contract is exercised without
  * any credentials or network egress (C45).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.8
- * @see ../../../../docs/specs/006-agent-integration.md §2.1
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
+ * @see ../../../../openspec/specs/delivery/transport-seam/spec.md — "Interpret invocation lives behind an adapter boundary", "The Interpret adapter is upstream of transports"
  */
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -36,7 +36,7 @@ function writeShim(rootDir: string, body: string): string {
   return shimPath;
 }
 
-describe('createClaudeInterpretAdapter (002 §1.1.8 / 006 §2.1)', () => {
+describe('createClaudeInterpretAdapter (spec: pipeline/post-processing, delivery/transport-seam)', () => {
   it('parses a DELIVER: response into a deliver decision with the digest', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-ai-shim-'));
     tempDirs.push(rootDir);

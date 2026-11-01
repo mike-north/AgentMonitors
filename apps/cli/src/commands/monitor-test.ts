@@ -132,7 +132,7 @@ function printJsonResult(
 }
 
 /**
- * Print non-fatal source warnings (003 §4.2, issue #219) to stderr so a `monitor
+ * Print non-fatal source warnings (spec: sources/api-poll, issue #219) to stderr so a `monitor
  * test` dry-run surfaces likely misconfigurations (e.g. json-diff on an HTML
  * page) without masking them as success. Text output only; JSON callers embed
  * warnings in the payload.
@@ -402,7 +402,7 @@ monitorTestCommand
 
     // Reject an invalid scope (e.g. a non-IANA schedule `timezone`, issue #297)
     // with the SAME actionable diagnosis `validate` and `watch declare` give
-    // (`validateWatchScope` is the shared core helper, 005 §14.4) instead of
+    // (`validateWatchScope` is the shared core helper, spec: agent/ephemeral-monitors) instead of
     // letting a one-shot dry-run silently echo back a bad value or crash deep
     // inside source-specific logic.
     const scopeErrors = validateWatchScope(

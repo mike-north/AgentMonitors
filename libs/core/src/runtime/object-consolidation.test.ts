@@ -16,7 +16,7 @@
  * These tests drive a REAL runtime tick (UAT layer) end-to-end: a stateful
  * source emits one save per tick; a `notify.strategy: debounce` window holds
  * the burst (the "notification window"); the per-recipient catch-up span
- * collapses to ONE net delta per object at claim (002 §1.1.7). We assert:
+ * collapses to ONE net delta per object at claim (spec: pipeline/post-processing). We assert:
  *
  *   - N saves of object A in one window under `net` → the away recipient
  *     claims exactly ONE before/after delta for A (cursor → final), NOT N.
@@ -28,14 +28,14 @@
  *     deltas — the full play-by-play — for use when sequence matters.
  *
  * Expected diff text is written BY HAND from the `buildTextDiff` format spec
- * (002 §5.2: line-level `- <n>: <before>` / `+ <n>: <after>`) and the §1.1.7
+ * (spec: runtime/event-materialization: line-level `- <n>: <before>` / `+ <n>: <after>`) and the spec: pipeline/post-processing
  * net semantics ("single net delta equivalent to diffing the baseline snapshot
  * against the final observation's snapshot"). No snapshot/gold-master assertions
  * (repo policy). Time is controlled with fake timers.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.7 (baseline strategy; default net since 2026-06-19)
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (diff format)
- * @see ../../../../docs/specs/001-monitor-definition.md §3.7 (baseline-strategy authoring; default net)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (baseline strategy; default net since 2026-06-19)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
+ * @see ../../../../openspec/specs/monitor/definition/spec.md (baseline-strategy authoring; default net)
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -197,7 +197,7 @@ function setup(
 describe('issue #110: per-object before/after consolidation (net) end-to-end', () => {
   // Canonical case: 15 saves of ONE object within a single debounce window under
   // `baseline-strategy: net` → the away recipient claims exactly ONE before/after
-  // delta (cursor → final), NOT 15 fragment events. (002 §1.1.7: "single net delta
+  // delta (cursor → final), NOT 15 fragment events. (spec: pipeline/post-processing: "single net delta
   // equivalent to diffing the baseline snapshot against the final observation's
   // snapshot"; "a within-tick burst that emits several observations for one object
   // collapses the same way".)
@@ -262,7 +262,7 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
     vi.setSystemTime(clock);
     await runtime.tick(monitorsDir, rootDir);
 
-    // The shared chain keeps EVERY save (incremental substrate, 002 §1.1.7) — we
+    // The shared chain keeps EVERY save (incremental substrate, spec: pipeline/post-processing) — we
     // are NOT collapsing the durable history, only the per-recipient delivery.
     const shared = store
       .listEvents({ monitorId: MONITOR_ID })
@@ -280,9 +280,9 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
     expect(deliveredForA[0]?.snapshotText).toBe(finalSave);
 
     // Its per-recipient delta is the single net before/after: the recipient's
-    // anchored cursor → the final burst save (v15). 002 §1.1.7: "single net delta
+    // anchored cursor → the final burst save (v15). spec: pipeline/post-processing: "single net delta
     // equivalent to diffing the baseline snapshot against the final observation's
-    // snapshot." 002 §5.2 single-line format: `- 1: <before>` / `+ 1: <after>`.
+    // snapshot." spec: runtime/event-materialization single-line format: `- 1: <before>` / `+ 1: <after>`.
     const delta = deltas.get(deliveredForA[0]?.id ?? '');
     expect(delta).toBe(`- 1: ${anchored ?? ''}\n+ 1: ${finalSave}`);
     // Exactly one before/after pair — not a multi-line replay of 15 steps.
@@ -362,7 +362,7 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
   });
 
   // Default-net contract: omitting `baseline-strategy` yields `net` (the
-  // default since 2026-06-19, Refs #110 / 001 §3.7 / 002 §1.1.7). The same
+  // default since 2026-06-19, Refs #110 / spec: monitor/definition, pipeline/post-processing). The same
   // burst as test 1 but WITHOUT an explicit `baseline-strategy` line → the
   // monitor is authored with no `baseline-strategy` field → schema defaults to
   // `net` → the away recipient still claims exactly ONE before/after delta.
@@ -383,7 +383,7 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
     // writeMonitor, which writes the field explicitly; to test the true omitted
     // case we build a minimal monitor without the field via the same harness
     // (the schema default applies at parse time regardless of how we author it,
-    // but the test for the omitted-field case lives in service.test.ts §G13
+    // but the test for the omitted-field case lives in service.test.ts's author-declared baseline strategy block
     // criterion (d); here we exercise the same net consolidation behavior to
     // pin that the default is what is shipped).
     //
@@ -418,13 +418,13 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
     const deliveredForA = delivered.filter((e) => e.objectKey === OBJECT_A);
 
     // Under net (the default), the burst collapses to ONE delta — the canonical
-    // consolidation contract (002 §1.1.7).
+    // consolidation contract (spec: pipeline/post-processing).
     expect(deliveredForA).toHaveLength(1);
   });
 
   // Incremental opt-out: `baseline-strategy: incremental` (explicit) delivers
   // every save in the catch-up span as its own ordered delta — the full play-
-  // by-play. (002 §1.1.7: `incremental` is the explicit opt-out from the `net`
+  // by-play. (spec: pipeline/post-processing: `incremental` is the explicit opt-out from the `net`
   // default; use when the sequence of changes carries meaning.)
   it('incremental (explicit opt-out): same burst delivers N ordered deltas', async () => {
     vi.useFakeTimers();
@@ -468,7 +468,7 @@ describe('issue #110: per-object before/after consolidation (net) end-to-end', (
 
     // Under explicit `incremental`, every save in the catch-up span is delivered
     // (play-by-play) — more than one event for the single object.
-    // 002 §1.1.7: N ordered deltas for an N-step catch-up span.
+    // spec: pipeline/post-processing: N ordered deltas for an N-step catch-up span.
     expect(deliveredForA.length).toBeGreaterThan(1);
   });
 });

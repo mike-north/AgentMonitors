@@ -1,5 +1,5 @@
 /**
- * Tests for the optional **Interpret** stage (G14): a cheap agentic digest +
+ * Tests for the optional **Interpret** stage (spec: pipeline/post-processing): a cheap agentic digest +
  * significance gate over the per-recipient delta, produced by shelling out to the
  * user's OWN installed AI tool behind a host-agnostic adapter boundary.
  *
@@ -7,18 +7,18 @@
  * {@link InterpretAdapter} — a real model is NEVER invoked in CI. Expected values
  * are written by hand from the spec, not captured from program output.
  *
- * Proof criteria (issue #178; 002 §1.1.8 test implication):
+ * Proof criteria (issue #178; spec: pipeline/post-processing test implication):
  *  (a) a `prose` monitor invokes the adapter; a non-`prose` monitor never does.
  *  (b) a "substantive" delta → a `prose` delivery whose digest is the fake's output.
  *  (c) a "not substantive" delta → NO delivery + a per-recipient suppression
  *      reason retrievable via `monitor explain` (C12).
- *  (d) the fake adapter throws → the recipient still receives the §1.1.5
+ *  (d) the fake adapter throws → the recipient still receives the spec: pipeline/post-processing
  *      `rendered` artifact (best-effort fallback) + the failure is recorded.
  *  (e) the runtime reads no model credential and ships no model — the only AI call
  *      is the adapter shell-out.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.8
- * @see ../../../../docs/specs/006-agent-integration.md §2.1
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
+ * @see ../../../../openspec/specs/delivery/transport-seam/spec.md — "Interpret invocation lives behind an adapter boundary", "The Interpret adapter is upstream of transports"
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -174,7 +174,7 @@ function setup(
   return { runtime, store, monitorsDir, rootDir };
 }
 
-describe('Interpret stage (G14, 002 §1.1.8)', () => {
+describe('Interpret stage (spec: pipeline/post-processing)', () => {
   it('invokes the adapter only after the event, projection, and snapshot commit', async () => {
     let probeError: unknown;
     let observed:
@@ -302,7 +302,7 @@ describe('Interpret stage (G14, 002 §1.1.8)', () => {
     await runtime.tick(monitorsDir, rootDir);
     expect(fake.calls).toHaveLength(2);
     // The delta handed to the tool for the second event is the rendered diff,
-    // not the raw source snapshot (002 §1.1.8: "never the raw source snapshot").
+    // not the raw source snapshot (spec: pipeline/post-processing: "never the raw source snapshot").
     // A unified text diff of v1 → v2 contains the added line.
     const deltaCall = fake.calls[1];
     expect(deltaCall?.delta).toContain('v2');
@@ -536,7 +536,7 @@ describe('Interpret stage (G14, 002 §1.1.8)', () => {
     expect(projection?.interpretDecision).toBe('suppress');
     expect(projection?.interpretReason).toBe(REASON);
 
-    // The reason surfaces on the delivery stage of `monitor explain` (§10.7).
+    // The reason surfaces on the delivery stage of `monitor explain` (spec: daemon/ipc).
     const deliveryStage = report.stages.find((s) => s.id === 'delivery');
     expect(deliveryStage?.reason).toContain('suppressed');
   });
@@ -559,12 +559,12 @@ describe('Interpret stage (G14, 002 §1.1.8)', () => {
     await pause();
     await runtime.tick(monitorsDir, rootDir); // delta → tool throws
 
-    // Best-effort fallback (002 §1.1.8): the underlying delta is NOT dropped —
+    // Best-effort fallback (spec: pipeline/post-processing): the underlying delta is NOT dropped —
     // the recipient still gets the deterministic delivery for the delta event.
     const unread = store.unreadEventsForSession(session.id);
     const deltaEvent = unread.find((event) => event.diffText !== null);
     expect(deltaEvent).toBeDefined();
-    // The delivered artifact carries the §1.1.5 rendered diff text (today's
+    // The delivered artifact carries the spec: pipeline/post-processing rendered diff text (today's
     // deterministic behavior — degraded gracefully, not lost).
     expect(deltaEvent?.diffText).toContain('v2');
 

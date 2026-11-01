@@ -7,7 +7,7 @@ import { getCliVersion } from './cli-version.js';
 import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
 
 /**
- * Durable liveness records for the two delivery transports (006 §3/§4/§5).
+ * Durable liveness records for the two delivery transports (spec: delivery/hook-transport, delivery/channel-transport).
  *
  * A transport that is *up* is not the same as a transport that is *delivering
  * to this workspace*. The two transports fail in opposite ways:
@@ -60,13 +60,13 @@ import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
  * That case is reported as an *absence* with wording that names the
  * possibility — see `transport-health.ts` — never as a false "healthy".)
  *
- * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
+ * @see ../../../openspec/specs/delivery/transport-health/spec.md (transport health)
  */
 
 /** Record schema version — bumped only on an incompatible field change. */
 export const TRANSPORT_HEARTBEAT_SCHEMA_VERSION = 1;
 
-/** The two delivery transports that report liveness (006 §3, §4). */
+/** The two delivery transports that report liveness (spec: delivery/hook-transport, delivery/channel-transport). */
 export type TransportName = 'hook' | 'channel';
 
 /**
@@ -330,7 +330,7 @@ export function writeTransportHeartbeat(
   // meant `doctor` itself deleted the only evidence of the failure it had
   // just reported: `[heartbeat-stale]` on run 1, then a clean "not
   // configured" idle verdict on run 2, purely because the diagnostic had
-  // been invoked once already (005 §15's "diagnoses only, never mutates"
+  // been invoked once already (the cli/doctor spec's "diagnoses only, never mutates"
   // contract). A live process WRITING again is the genuine reconciliation
   // event a lapsed record should wait for; a bystander's read is not. A busy
   // channel poll writes its own record every ~3s regardless of whether
@@ -453,7 +453,7 @@ export interface ReadTransportHeartbeatsResult {
  * **Pure — never mutates, never reaps** (issue #425 review, round 6). This
  * function takes no `now` and has no GC side effect; a stale-past-TTL record
  * is returned exactly as read, every time, until something else reconciles
- * it. That is deliberate: `doctor` is 005 §15's "diagnoses only" surface, and
+ * it. That is deliberate: `doctor` is the cli/doctor spec's "diagnoses only" surface, and
  * reaping on THIS read path previously let one `doctor` invocation destroy
  * the only evidence of the failure it had just reported — the record proving
  * `[heartbeat-stale]` on run 1 was gone by run 2, which then saw no
@@ -521,7 +521,7 @@ export function readTransportHeartbeats(): TransportHeartbeat[] {
  * nothing recovered — found no record at all, took the "no transport has ever
  * reported in" branch, and exited 0. A dead channel server looked fixed purely
  * because someone had looked at it. It also made `doctor` mutate state, which
- * 005 §15 explicitly says it never does.
+ * spec: cli/doctor explicitly says it never does.
  *
  * A stale record is therefore durable: it keeps reporting the failure on every
  * health check until a transport actually WRITES again, which is the real

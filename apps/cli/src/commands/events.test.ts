@@ -15,7 +15,7 @@
  * carries no raw control byte and cannot be silently corrupted by an editor
  * or tool that mangles literal control characters.
  *
- * @see ../../../../docs/specs/005-cli-reference.md
+ * @see ../../../../openspec/specs/cli/session-commands/spec.md
  */
 import { describe, expect, it } from 'vitest';
 import { singleLineSafe } from './events.js';

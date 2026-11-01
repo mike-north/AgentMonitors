@@ -9,7 +9,7 @@
  * try/catch (the hook's always-exit-0 contract) swallowed the error and
  * emitted nothing while the rows were PERMANENTLY excluded from ordinary
  * redelivery (`pendingEventsForSession` never returns an already-claimed
- * row, §5.5). That is an at-most-once loss window.
+ * row, spec: delivery/channel-transport, delivery/hook-transport). That is an at-most-once loss window.
  *
  * The fix (`reserveRenderAndCommitHookDelivery` + `writeAndCommitHookDelivery`,
  * `hook.ts`) renders off the RESERVATION's own claim first and defers commit
@@ -27,7 +27,7 @@
  * (b) a render/write failure BEFORE commit must release the reservation —
  *     nothing durably claimed, rows return to pending.
  *
- * @see docs/specs/006-agent-integration.md §5.2, §5.5
+ * @see openspec/specs/delivery/hook-transport/spec.md, openspec/specs/delivery/channel-transport/spec.md
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';

@@ -1,8 +1,8 @@
 # UAT Recipe: MCP Channel Transport
 
-The MCP **channel** transport ([006 §4](../specs/006-agent-integration.md)) is a Claude Code
+The MCP **channel** transport ([spec: delivery/channel-transport](../../openspec/specs/delivery/channel-transport/spec.md)) is a Claude Code
 research-preview feature and cannot run in CI — there is no way to spawn a real Claude Code host in
-a headless test runner, and channels may be org-disabled entirely (006 §6). It is therefore gated
+a headless test runner, and channels may be org-disabled entirely (spec: delivery/transport-seam). It is therefore gated
 on **manual UAT**: a human (or an agent with a real Claude Code session) runs this recipe and
 records the result below. Run this recipe before treating the channel path as regression-safe, and
 whenever `apps/cli/src/commands/channel.ts`, `apps/cli/src/channel-ack.ts`,
@@ -15,7 +15,7 @@ This complements, but does not replace, the automated coverage that already exis
   real MCP SDK client, proving the push mechanism itself works end to end — but it plays the role
   of the MCP host, not a real Claude Code session, and never exercises the agent actually reading a
   rendered `<channel>` tag or calling `agentmon_ack` as a tool.
-- `experiments/channel-probe` established the session/workspace-binding signals (006 §4.4) a real
+- `experiments/channel-probe` established the session/workspace-binding signals (spec: delivery/channel-transport) a real
   Claude Code host provides to a spawned channel server.
 - `apps/cli/src/commands/channel-hooks-ipc-parity.test.ts` proves (statically) that the channel's
   push/ack code paths call the exact same daemon-IPC client functions the hooks-only path uses.
@@ -42,7 +42,7 @@ socket always behaved exactly as specified (confirmed with an explicit `--socket
 **As of this fix, `channel serve` resolves the same per-workspace socket `session start` binds to**,
 for an **enabled** workspace — ahead of `AGENTMONITORS_SOCKET` too, since `channel serve` is spawned
 automatically (no flags) and must not let a stale env var from a different workspace cross-connect
-it to the wrong daemon (006 §4.1) — so the plugin's real, unmodified `.mcp.json` (no `--socket`
+it to the wrong daemon (spec: delivery/channel-transport) — so the plugin's real, unmodified `.mcp.json` (no `--socket`
 flag) works with zero extra configuration. **Step 3's pre-seed workaround is no longer required** —
 skip it for a clean run with the plugin's default configuration, which is the way to confirm the
 fix; per the recipe's own guidance it remains harmless to keep applied if you already have it
@@ -51,25 +51,25 @@ so it does not exercise the new precedence one way or the other).
 
 ## What this recipe proves
 
-| Recipe step(s)          | Proves                                                                                                                                                                           | Governing spec                                |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------- |
-| 1–6 (setup)             | A monitor fires and materializes a durable event in a real, plugin-installed session                                                                                             | [002 §§1–9](../specs/002-runtime-delivery.md) |
-| 7–9 (channel push)      | The channel server pushes a `<channel source="agentmonitors" ...>` event carrying the field schema in [006 §4.2](../specs/006-agent-integration.md#42-notification-field-schema) | 006 §4.1–§4.2                                 |
-| 10 (dedup)              | The same event is **not** re-delivered via the hook path after the channel already claimed it                                                                                    | 006 §4.5                                      |
-| 11–12 (ack)             | `agentmon_ack` acknowledges the event in-session and `events list` reflects the acknowledged state                                                                               | 006 §4.3                                      |
-| 12a–12c (push failure)  | A transient channel disconnect does **not** consume the delivery: the event stays `unread`/unclaimed and the hook path still surfaces it (reserve → release fallback)            | 006 §4.5.1 (issue #300)                       |
-| 13–16 (blocked channel) | With the MCP server disabled, hook delivery still occurs and the channel's absence is a silent no-op                                                                             | 006 §6 / NP-CH                                |
+| Recipe step(s)          | Proves                                                                                                                                                                                            | Governing spec                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 1–6 (setup)             | A monitor fires and materializes a durable event in a real, plugin-installed session                                                                                                              | [spec: runtime/\*, delivery/session-projection, delivery/lifecycles](../../openspec/specs/)                                |
+| 7–9 (channel push)      | The channel server pushes a `<channel source="agentmonitors" ...>` event carrying the field schema in [spec: delivery/channel-transport](../../openspec/specs/delivery/channel-transport/spec.md) | spec: delivery/channel-transport                                                                                           |
+| 10 (dedup)              | The same event is **not** re-delivered via the hook path after the channel already claimed it                                                                                                     | spec: delivery/channel-transport                                                                                           |
+| 11–12 (ack)             | `agentmon_ack` acknowledges the event in-session and `events list` reflects the acknowledged state                                                                                                | spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session" |
+| 12a–12c (push failure)  | A transient channel disconnect does **not** consume the delivery: the event stays `unread`/unclaimed and the hook path still surfaces it (reserve → release fallback)                             | spec: delivery/channel-transport (issue #300)                                                                              |
+| 13–16 (blocked channel) | With the MCP server disabled, hook delivery still occurs and the channel's absence is a silent no-op                                                                                              | spec: delivery/transport-seam / NP-CH                                                                                      |
 
 ## Prerequisites
 
-1. **Claude Code v2.1.80+.** Channels are research preview and version-gated (006 §6). If the
+1. **Claude Code v2.1.80+.** Channels are research preview and version-gated (spec: delivery/transport-seam). If the
    channel never appears to load (see the failure-mode note in step 5), consult
    <https://code.claude.com/docs/en/channels-reference.md> and
    <https://code.claude.com/docs/en/mcp.md> for your Claude Code version's current channel/MCP
    enablement surface — Claude Code's own settings for this are outside this repo's control and may
    have moved since this recipe was written. On a Team/Enterprise plan, an admin must enable
-   channels and allowlist this server, or you must launch with a development-channels flag (006
-   §6; `experiments/channel-probe/README.md` shows this flag in use for its own throwaway probe
+   channels and allowlist this server, or you must launch with a development-channels flag (
+   spec: delivery/transport-seam; `experiments/channel-probe/README.md` shows this flag in use for its own throwaway probe
    channel).
 2. **The `agentmonitors` CLI installed and on `PATH`.** `npm i -g agentmonitors`, then confirm with
    `agentmonitors --help`.
@@ -104,7 +104,7 @@ echo "hello" > watched.txt
 **2. Author a fast, high-urgency test monitor** (short `interval`/`settle-for` so the recipe
 doesn't take the default ~30s + 15s to detect — see
 [the setup-monitors skill's fast-test guidance](../../agent-plugins/agentmonitors/skills/setup-monitors/SKILL.md#fast-test-setup-shorten-intervals-before-verifying)).
-`urgency: high` is required — only `high` injects a concrete event body mid-session (006 §5.4 /
+`urgency: high` is required — only `high` injects a concrete event body mid-session (spec: delivery/hook-transport /
 [agent-integration.md](../../apps/website/src/pages/docs/agent-integration.md)):
 
 ```bash
@@ -150,7 +150,7 @@ export AGENTMONITORS_SOCKET="$SOCK"
 `session start` reads the `socket:`/`db:` fields straight out of `.claude/agentmonitors.local.md`
 (so its lazily-booted daemon binds to `$SOCK`); `channel serve` reads `AGENTMONITORS_SOCKET` from
 its inherited environment (Claude Code passes its own process environment through to spawned MCP
-servers, on top of the `CLAUDE_PROJECT_DIR`/`CLAUDE_CODE_SESSION_ID` it injects — 006 §4.4), so both
+servers, on top of the `CLAUDE_PROJECT_DIR`/`CLAUDE_CODE_SESSION_ID` it injects — spec: delivery/channel-transport), so both
 now agree on `$SOCK` without editing the plugin's `.mcp.json`. **Launch Claude Code from this same
 shell** (the one that just ran `export`) so the environment variable is inherited.
 
@@ -161,12 +161,12 @@ claude
 ```
 
 This fires the `SessionStart` hook (`agentmonitors session start`), which lazy-boots the daemon at
-`$SOCK` and registers the session (006 §5.6). It also causes Claude Code to spawn the plugin's
+`$SOCK` and registers the session (spec: delivery/channel-transport, delivery/hook-transport). It also causes Claude Code to spawn the plugin's
 `.mcp.json` MCP server (`agentmonitors channel serve`) for this session.
 
 **Expected observation:** no error banner from Claude Code about a failing plugin or hook. Since the
 project has exactly one, already-enabled monitor, there is no "monitoring disabled" advisory
-(§5.6) — a fresh session with nothing yet pending produces no visible `SessionStart` output.
+(spec: delivery/channel-transport, delivery/hook-transport) — a fresh session with nothing yet pending produces no visible `SessionStart` output.
 
 **Failure mode:** if Claude Code reports the plugin failed to load, re-check step 3 (marketplace
 add + install) and that `agentmonitors` is genuinely on `PATH` inside Claude Code's own shell
@@ -212,18 +212,18 @@ few more seconds and re-run — do not re-trigger step 6.
 **8. Wait for the (separate, additional) high-urgency claim-settle window, then observe the
 `<channel>` push in-session.** A settled-event **claim** is gated by its own fixed ~15s window
 measured from the event's `createdAt` (`DEFAULT_HIGH_URGENCY_SETTLE_MS`,
-[006 §9.1](../specs/006-agent-integration.md#91-a-high-urgency-delivery-rendered-as-a-channel-event)
+[spec: delivery/channel-transport](../../openspec/specs/delivery/channel-transport/spec.md), [spec: delivery/transport-seam](../../openspec/specs/delivery/transport-seam/spec.md)
 — "After a 15 s settle window — not instant") — this is **on top of**, not the same as, the
 monitor's own `notify.settle-for` from step 2. Since step 7 already confirmed materialization at
 roughly `trigger + 10s`, allow at least another **15s** (five polls at the channel's default 3s
-cadence, [005 §13](../specs/005-cli-reference.md)) — i.e. **~25–30s total from step 6** — before
+cadence, [spec: cli/session-commands](../../openspec/specs/cli/session-commands/spec.md)) — i.e. **~25–30s total from step 6** — before
 expecting the push. No action is required from you: the channel server pushes automatically. Ask
 Claude to quote the exact `<channel source="agentmonitors" ...>` tag it received (or, if you are
 the agent running this recipe yourself, read it directly out of your own context — this is the
 identical mechanism that delivers this repo's own `agentmonitors` monitors into a live session).
 
-**Expected observation**, matching 006 §4.2/§9.1 exactly for a single settled high-urgency event
-(the sole watched file, so `event_count="1"`; `object_key` is not yet emitted — 006 §4.2
+**Expected observation**, matching spec: delivery/channel-transport, delivery/transport-seam exactly for a single settled high-urgency event
+(the sole watched file, so `event_count="1"`; `object_key` is not yet emitted — spec: delivery/channel-transport
 "Stage-1 coverage" note):
 
 ```text
@@ -254,9 +254,9 @@ agentmonitors events list --session <agentmon-session-id> --unread
 
 **Expected observation:** the same event is still present (`--unread` matches unacknowledged, which
 includes claimed) but now shows `"deliveryState": "claimed"` — the push surfaced it without
-acknowledging it (006 §2, "MUST NOT acknowledge").
+acknowledging it (spec: delivery/transport-seam, "MUST NOT acknowledge").
 
-**10. Verify cross-transport dedup (006 §4.5).** Ask Claude to replay the exact `UserPromptSubmit`
+**10. Verify cross-transport dedup (spec: delivery/channel-transport).** Ask Claude to replay the exact `UserPromptSubmit`
 hook payload Claude Code itself would send, reusing the host session id from step 7:
 
 ```bash
@@ -266,7 +266,7 @@ printf '{"session_id":"<host-session-id>","cwd":"%s","hook_event_name":"UserProm
 
 **Expected observation:** **completely empty stdout.** The event the channel already claimed is
 excluded from a fresh `turn-interruptible` claim (the runtime's `pendingEventsForSession` only
-considers rows with no `first_notified_at` yet — 006 §4.5's "the existing claimed state is the
+considers rows with no `first_notified_at` yet — the delivery/channel-transport spec's "the existing claimed state is the
 dedup boundary"), and with no other unread `normal`/`low` events in this minimal test project there
 is nothing else to report. Any non-empty output here (in particular, the file's title/body
 reappearing) is a dedup regression — capture the full JSON output and `agentmonitors monitor
@@ -301,10 +301,10 @@ agentmonitors events list --session <agentmon-session-id>
 **Failure mode:** if `events list --session ... --unread` still shows the event, capture the exact
 `agentmon_ack` tool-call arguments and result text from step 11 (a stale/incorrect `event_id`, or a
 session-id mismatch causing the daemon's "outbound gate" re-authorization to silently drop the id —
-006 §4.3 — are the two most likely causes) alongside `agentmonitors monitor explain watch-file
+spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session" — are the two most likely causes) alongside `agentmonitors monitor explain watch-file
 --dir .claude/monitors --format text`.
 
-## Part A-2 — transient push failure (reserve → release fallback, 006 §4.5.1, issue #300)
+## Part A-2 — transient push failure (reserve → release fallback, spec: delivery/channel-transport, issue #300)
 
 This part proves the fix for issue #300: the channel reserves a delivery and commits the claim
 **only after** a successful push, so a transient MCP disconnect **releases** the reservation rather
@@ -336,8 +336,8 @@ self-expiry) returned the row to `pending`.
 hook fires (or run `agentmonitors hook deliver` with a real `UserPromptSubmit` stdin payload).
 
 **Expected observation:** the event is surfaced via the hook transport's `additionalContext` — the
-durable delivery survived the failed channel push (006 §6/§6.1). After this hook delivery the event's
-`deliveryState` becomes `claimed` (still `unread` until acknowledged, BP2/§4.3). Re-enable the channel
+durable delivery survived the failed channel push (spec: delivery/transport-seam). After this hook delivery the event's
+`deliveryState` becomes `claimed` (still `unread` until acknowledged, BP2/spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session"). Re-enable the channel
 MCP server before continuing.
 
 **Failure mode:** if step 12b shows the event already `claimed` immediately after the broken push (no
@@ -345,7 +345,7 @@ hook delivery yet), the channel consumed the delivery before surfacing it — ca
 --session ... --format json` and `agentmonitors monitor explain watch-file --dir .claude/monitors
 --format text`, and note the Claude Code version and how the push was broken.
 
-## Part B — blocked channel (hooks-only fallback, 006 §6 / NP-CH)
+## Part B — blocked channel (hooks-only fallback, spec: delivery/transport-seam / NP-CH)
 
 This part proves that disabling the MCP server changes only the delivery **surface**, never the
 delivery **semantics** — hook-state delivery keeps working, and the channel's absence produces no
@@ -376,7 +376,7 @@ appear disabled), with nothing else in the transcript calling attention to it.
 **14. Trigger a second change and let it fully settle.** `hook deliver`'s `UserPromptSubmit` claim
 uses the exact same `turn-interruptible` high-urgency claim path as the channel push (step 8) — the
 monitor's `notify.settle-for` (5s) plus the fixed, additional ~15s claim-settle window
-(006 §9.1), so allow the same ~25–30s total, not just the notify settle:
+(spec: delivery/channel-transport, delivery/transport-seam), so allow the same ~25–30s total, not just the notify settle:
 
 ```bash
 printf '\nsecond change %s\n' "$(date +%s)" >> watched.txt
@@ -393,7 +393,7 @@ printf '{"session_id":"<host-session-id>","cwd":"%s","hook_event_name":"UserProm
 
 **Expected observation:** a non-empty JSON object whose `hookSpecificOutput.additionalContext`
 names `watch-file` and the file change — the identical content shape the channel would have carried,
-just via `additionalContext` instead of a `<channel>` tag (006 §6.1's capability-parity table). If
+just via `additionalContext` instead of a `<channel>` tag (spec: delivery/transport-seam — "MCP is never required", "Channel and hook paths share the same daemon IPC"'s capability-parity table). If
 empty, wait a few more seconds and retry — do not re-trigger step 14.
 
 **16. Confirm no error surfaced anywhere in this whole sequence.** Check Claude Code's own
@@ -417,12 +417,12 @@ When a step doesn't match its expected observation, capture these before filing:
 - **`agentmonitors daemon status --format json`** — confirms whether a daemon is even running and
   at which socket, and how many sessions/events it knows about.
 - **`agentmonitors hook deliver --debug`** (fed the same stdin payload) — writes a step-by-step
-  diagnosis to stderr naming which resolution step held or failed (005 §12.2.1), without touching
+  diagnosis to stderr naming which resolution step held or failed (spec: cli/session-commands), without touching
   stdout.
 - **Daemon log — with a real caveat.** A `session start`-lazy-booted daemon runs fully detached
   with `stdio: 'ignore'` (`apps/cli/src/detached-spawn.ts`) — there is **no daemon log to tail** in
   the normal plugin flow. If you need live daemon stderr (e.g. a `AgentMon runtime tick failed: …`
-  line, [002 §9.2](../specs/002-runtime-delivery.md)), stop the lazy daemon
+  line, [spec: delivery/lifecycles](../../openspec/specs/delivery/lifecycles/spec.md)), stop the lazy daemon
   (`agentmonitors daemon stop`) and restart it by hand in a visible terminal, pointed at the exact
   same persisted socket/db from `.claude/agentmonitors.local.md`:
   ```bash

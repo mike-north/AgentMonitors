@@ -1,15 +1,15 @@
 /**
- * Proof tests for the author-declared payload-form transform (roadmap G15).
+ * Proof tests for the author-declared payload-form transform (spec: pipeline/post-processing).
  *
  * Expected values are written BY HAND from the spec — no snapshot / gold-master
  * assertions (explicit repo policy).
  *
- * The two languages have distinct, non-overlapping roles (002 §1.1.6):
+ * The two languages have distinct, non-overlapping roles (spec: pipeline/post-processing):
  * **`jq` reshapes** (its output is the structured payload) and **`cel` gates**
  * (a boolean: `true` delivers the un-reshaped snapshot, `false` suppresses).
  *
- * @see ../../../../docs/specs/001-monitor-definition.md §5.2 (payload form)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.6
+ * @see ../../../../openspec/specs/monitor/definition/spec.md (payload form)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { describe, expect, it } from 'vitest';
 import {
@@ -27,9 +27,9 @@ const workoutSnapshot = {
   heartRate: 142,
 };
 
-describe('payload transform — structured + jq (002 §1.1.6)', () => {
+describe('payload transform — structured + jq (spec: pipeline/post-processing)', () => {
   it('projects exactly the declared fields (E6)', () => {
-    // 001 §5.2 example: project each set's { weight, reps, rpe } — dropping
+    // spec: monitor/definition example: project each set's { weight, reps, rpe } — dropping
     // `notes`. jq object-construction uses explicit keys.
     const transform: PayloadTransform = {
       language: 'jq',
@@ -54,7 +54,7 @@ describe('payload transform — structured + jq (002 §1.1.6)', () => {
   });
 });
 
-describe('payload transform — structured + cel gate (002 §1.1.6)', () => {
+describe('payload transform — structured + cel gate (spec: pipeline/post-processing)', () => {
   it('a true gate delivers the canonical (un-reshaped) snapshot', () => {
     // `cel` gates: true delivers the canonical shaped snapshot un-reshaped.
     const transform: PayloadTransform = {
@@ -76,7 +76,7 @@ describe('payload transform — structured + cel gate (002 §1.1.6)', () => {
   });
 });
 
-describe('payload transform — validation (001 §5.2 / 004 §2.2)', () => {
+describe('payload transform — validation (spec: monitor/definition, monitor/validation)', () => {
   it('accepts a well-formed jq transform', () => {
     expect(
       validatePayloadTransform({ language: 'jq', expression: '.heartRate' }),

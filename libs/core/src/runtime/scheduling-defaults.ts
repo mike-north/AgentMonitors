@@ -7,7 +7,7 @@
  * that timing — e.g. the CLI `verify` command sizing its end-to-end delivery
  * budget — import these values instead of re-declaring their own copies, so a
  * change to a default propagates everywhere rather than silently drifting from a
- * hand-mirrored constant (002 §4.4 / §9.1).
+ * hand-mirrored constant (spec: runtime/notify-dispatch, pipeline/post-processing, delivery/lifecycles).
  *
  * @public
  */

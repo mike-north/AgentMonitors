@@ -1,6 +1,6 @@
 /**
- * Tests for roadmap G10 PR-B: the `net` baseline collapse and the G14 Interpret
- * stage rewired onto the PER-RECIPIENT seam (002 §1.1.7 / §1.1.8).
+ * Tests for spec: pipeline/post-processing: the `net` baseline collapse and the Interpret
+ * stage rewired onto the PER-RECIPIENT seam (spec: pipeline/post-processing).
  *
  * PR-A moved the Diff right of the Pace→Diff seam (each recipient diffs the
  * shared artifact against its OWN baseline cursor). PR-B completes the rewire:
@@ -17,15 +17,15 @@
  *    divergent baselines invoke the adapter twice; identical baselines once.
  *
  * Expected diff text is written BY HAND from the `buildTextDiff` format spec
- * (002 §5.2: line-level `- <n>: <before>` / `+ <n>: <after>`), never captured
+ * (spec: runtime/event-materialization: line-level `- <n>: <before>` / `+ <n>: <after>`), never captured
  * from program output. No snapshot/gold-master assertions (repo policy). Time is
  * controlled deterministically (monotone synthetic event timestamps, or fake
  * timers for the runtime path).
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.7 (baseline strategy, per-recipient net)
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.8 (Interpret per distinct delta)
- * @see ../../../../docs/specs/002-runtime-delivery.md §5.2 (diff format)
- * @see ../../../../docs/specs/roadmap.md §G10
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (baseline strategy, per-recipient net)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md (Interpret per distinct delta)
+ * @see ../../../../openspec/specs/runtime/event-materialization/spec.md (diff format)
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -162,7 +162,7 @@ function claimNet(
   return delivered;
 }
 
-describe('net per-recipient collapse at claim (G10 PR-B, 002 §1.1.7)', () => {
+describe('net per-recipient collapse at claim (spec: pipeline/post-processing)', () => {
   // Criterion 1: a recipient AWAY across 3 separate-tick edits to one object
   // under `net` claims and receives exactly ONE net delta (cursor → artifact3);
   // the two intermediates are recorded claimed-but-suppressed (explainable, not
@@ -188,7 +188,7 @@ describe('net per-recipient collapse at claim (G10 PR-B, 002 §1.1.7)', () => {
     expect(delivered[0]?.id).toBe(e3);
 
     // Its per-recipient delta spans the recipient's cursor (a0) → endpoint (a3),
-    // a single net delta — NOT a replay of a1/a2. 002 §5.2 line format.
+    // a single net delta — NOT a replay of a1/a2. spec: runtime/event-materialization line format.
     expect(recipientDelta(store, away, e3)).toBe('- 1: a0\n+ 1: a3');
 
     // The TWO intermediates (a1, a2) are recorded claimed-but-suppressed:
@@ -242,7 +242,7 @@ describe('net per-recipient collapse at claim (G10 PR-B, 002 §1.1.7)', () => {
     ).toHaveLength(0);
 
     // Each delta is the incremental step against the recipient's then-current
-    // cursor: a0→a1, a1→a2, a2→a3 (002 §5.2). The cursor only advances at claim,
+    // cursor: a0→a1, a1→a2, a2→a3 (spec: runtime/event-materialization). The cursor only advances at claim,
     // so at projection time every event diffed against the seeded a0 baseline;
     // the FIRST event's delta is a0→a1 and is the one delivered in order.
     expect(recipientDelta(store, away, e1)).toBe('- 1: a0\n+ 1: a1');
@@ -403,7 +403,7 @@ describe('net per-recipient collapse at claim (G10 PR-B, 002 §1.1.7)', () => {
 // global (null-workspace) sessions. The fix adds workspacePath to BOTH the
 // candidate-group key and the newest-per-group key, matching
 // advanceCursorsForClaimedEvents and the session_object_cursor UNIQUE index.
-// 002 §1.1.7: "newest event per object" must use the same object identity as
+// spec: pipeline/post-processing: "newest event per object" must use the same object identity as
 // the per-recipient cursor (workspace-scoped).
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -465,7 +465,7 @@ function openGlobalLead(store: RuntimeStore, hostSessionId: string): string {
   }).id;
 }
 
-describe('regression #186: collapseNetForClaim workspace-isolation (002 §1.1.7)', () => {
+describe('regression #186: collapseNetForClaim workspace-isolation (spec: pipeline/post-processing)', () => {
   // Regression acceptance criterion: a global (null-workspace) lead session
   // receives projections from two distinct workspaces for the same
   // (monitorId, objectKey). Under `net`, BOTH workspaces' newest events must
@@ -572,7 +572,7 @@ describe('regression #186: collapseNetForClaim workspace-isolation (002 §1.1.7)
 });
 
 // ───────────────────────────────────────────────────────────────────────────
-// Criterion 3: G14 Interpret per DISTINCT per-recipient delta (002 §1.1.8).
+// Criterion 3: Interpret per DISTINCT per-recipient delta (spec: pipeline/post-processing).
 // Driven through the real runtime tick so the per-recipient deltas are produced
 // by the genuine projection path (PR-A seam), with a deterministic fake adapter.
 // ───────────────────────────────────────────────────────────────────────────
@@ -664,7 +664,7 @@ function setupProse(fake: InterpretAdapter): {
   return { runtime, store, monitorsDir: writeProseMonitor(rootDir), rootDir };
 }
 
-describe('Interpret per distinct delta on the per-recipient seam (G10 PR-B, 002 §1.1.8)', () => {
+describe('Interpret per distinct delta on the per-recipient seam (spec: pipeline/post-processing)', () => {
   // Criterion 3: two recipients at DIVERGENT baselines → adapter invoked TWICE
   // for the shared event (one call per distinct delta), each verdict recorded on
   // its own session.
@@ -728,7 +728,7 @@ describe('Interpret per distinct delta on the per-recipient seam (G10 PR-B, 002 
         (p) => p.sessionId === b.id && p.eventId === v3Event?.id,
       );
       // Distinct per-recipient deltas → distinct recorded digests (verdict per
-      // session, 002 §1.1.8).
+      // session, spec: pipeline/post-processing).
       expect(projA?.interpretDigest).toBeDefined();
       expect(projB?.interpretDigest).toBeDefined();
       expect(projA?.interpretDigest).not.toBe(projB?.interpretDigest);

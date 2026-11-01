@@ -1,10 +1,10 @@
 /**
  * Unit tests for the verify PASS/FAIL renderers (issue #399). These assert the
- * user-facing report contract (spec 005 §16) without booting a daemon: the
+ * user-facing report contract (spec: cli/verify) without booting a daemon: the
  * daemon-died path in particular is hard to induce deterministically end-to-end,
  * so its distinct reporting (criterion 3) is proven here.
  *
- * @see docs/specs/005-cli-reference.md §16
+ * @see openspec/specs/cli/verify/spec.md
  */
 import { describe, it, expect } from 'vitest';
 import {

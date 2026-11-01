@@ -4,7 +4,7 @@ Tracking: #524. Base: origin/main e1bafcfa. Scope: normal/low notification starv
 claimed but unacknowledged. User authorized closing this gap on 2026-10-30. No merge is permitted
 without independent adversarial review of the final revision.
 
-The old behavior is intentional in 002 §9 and existing tests, so this is a deliberate policy revision,
+The old behavior is intentional in spec: delivery/lifecycles and existing tests, so this is a deliberate policy revision,
 not a claim that #434 was incompletely implemented. #468 claim expiry remains separate.
 
 ## Acceptance

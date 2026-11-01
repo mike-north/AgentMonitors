@@ -59,7 +59,7 @@ describe('monitorFrontmatterSchema', () => {
     });
 
     it('accepts all urgency values', () => {
-      // `low` is first-class (PP5, 001 §3.2) and must be accepted, not just
+      // `low` is first-class (PP5, spec: monitor/definition) and must be accepted, not just
       // `normal`/`high`; this guards against the schema narrowing it away.
       for (const urgency of ['low', 'normal', 'high']) {
         const result = monitorFrontmatterSchema.safeParse({
@@ -72,8 +72,8 @@ describe('monitorFrontmatterSchema', () => {
       }
     });
 
-    // G13 / 001 §3.7 / 002 §1.1.7: the `baseline-strategy` authoring field.
-    describe('baseline-strategy (G13, 001 §3.7)', () => {
+    // spec: pipeline/post-processing, monitor/definition: the `baseline-strategy` authoring field.
+    describe('baseline-strategy (spec: pipeline/post-processing, monitor/definition)', () => {
       it('accepts baseline-strategy: incremental', () => {
         const result = monitorFrontmatterSchema.safeParse({
           ...validMinimal,
@@ -81,7 +81,7 @@ describe('monitorFrontmatterSchema', () => {
         });
         expect(result.success).toBe(true);
         if (result.success) {
-          // 001 §3.7: surfaced under the camelCase `baselineStrategy` key.
+          // spec: monitor/definition: surfaced under the camelCase `baselineStrategy` key.
           expect(result.data.baselineStrategy).toBe('incremental');
         }
       });
@@ -98,7 +98,7 @@ describe('monitorFrontmatterSchema', () => {
       });
 
       it('defaults to net when baseline-strategy is omitted (per-object consolidation, Refs #110)', () => {
-        // 001 §3.7 / 002 §1.1.7 (2026-06-19 decision): omitting the field MUST
+        // spec: monitor/definition, pipeline/post-processing (2026-06-19 decision): omitting the field MUST
         // behave as `net` — one before/after delta per changed object per window.
         const result = monitorFrontmatterSchema.safeParse(validMinimal);
         expect(result.success).toBe(true);
@@ -108,7 +108,7 @@ describe('monitorFrontmatterSchema', () => {
       });
 
       it('rejects an unknown baseline-strategy value', () => {
-        // 001 §3.7: only `incremental` and `net` are valid; anything else is an
+        // spec: monitor/definition: only `incremental` and `net` are valid; anything else is an
         // authoring error caught by `validate`.
         const result = monitorFrontmatterSchema.safeParse({
           ...validMinimal,
@@ -175,7 +175,7 @@ describe('monitorFrontmatterSchema', () => {
     });
 
     // Regression (issue #449 review): `.min(1)` alone passes a whitespace-only
-    // string (length > 0), which would then win the 002 §5.4 title-precedence
+    // string (length > 0), which would then win the spec: runtime/event-materialization title-precedence
     // race over the source title and durably headline every delivered event
     // with blank/whitespace text.
     it('rejects a whitespace-only name', () => {
@@ -201,7 +201,7 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
-    it('defaults a missing urgency to normal (001 §3.2 — urgency is optional)', () => {
+    it('defaults a missing urgency to normal (spec: monitor/definition — urgency is optional)', () => {
       const { urgency: _, ...rest } = validMinimal;
       const result = monitorFrontmatterSchema.safeParse(rest);
       expect(result.success).toBe(true);
@@ -240,7 +240,7 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
-    describe('urgency band (range) — issue #109 / 001 §3.2', () => {
+    describe('urgency band (range) — issue #109 / spec: monitor/definition', () => {
       it('parses a bare scalar as a degenerate band (urgency === urgencyMax)', () => {
         // Backward compat: `urgency: normal` is the band normal..normal.
         const result = monitorFrontmatterSchema.safeParse({
@@ -411,14 +411,14 @@ describe('monitorFrontmatterSchema', () => {
     });
   });
 
-  // Scheduled-rollup Pace mode (G12). Proof criterion (a): `validate` accepts a
+  // Scheduled-rollup Pace mode (spec: runtime/notify-dispatch). Proof criterion (a): `validate` accepts a
   // rollup monitor (with a `window` cron) and rejects `strategy: rollup` missing
   // `window`. `validate` runs the frontmatter through this schema (via
   // parseMonitor), so asserting acceptance/rejection here is the contract test.
   //
-  // @see docs/specs/001-monitor-definition.md §3.6
-  // @see docs/specs/002-runtime-delivery.md §4.4
-  describe('rollup notify (G12, 001 §3.6)', () => {
+  // @see openspec/specs/monitor/definition/spec.md
+  // @see openspec/specs/runtime/notify-dispatch/spec.md, openspec/specs/pipeline/post-processing/spec.md
+  describe('rollup notify (spec: runtime/notify-dispatch, monitor/definition)', () => {
     it('accepts a rollup monitor with a window cron', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
@@ -516,8 +516,8 @@ describe('monitorFrontmatterSchema', () => {
     });
   });
 
-  // ── Shape / payload frontmatter (G15, 001 §5.1–§5.2) ────────────────────
-  describe('shape declaration (001 §5.1)', () => {
+  // ── Shape / payload frontmatter (spec: pipeline/post-processing, monitor/definition) ────────────────────
+  describe('shape declaration (spec: monitor/definition)', () => {
     it('accepts a monitor without shape (backward compatible)', () => {
       const result = monitorFrontmatterSchema.safeParse(validMinimal);
       expect(result.success).toBe(true);
@@ -538,7 +538,7 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(true);
     });
 
-    it('rejects a malformed CEL predicate in shape.derive (004 §2.2)', () => {
+    it('rejects a malformed CEL predicate in shape.derive (spec: monitor/validation)', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
         shape: { derive: [{ name: 'broken', when: 'due <' }] },
@@ -555,7 +555,7 @@ describe('monitorFrontmatterSchema', () => {
     });
   });
 
-  describe('payload form (001 §5.2)', () => {
+  describe('payload form (spec: monitor/definition)', () => {
     it('accepts each of the four payload forms', () => {
       for (const form of ['prose', 'structured', 'artifact', 'rendered']) {
         const result = monitorFrontmatterSchema.safeParse({
@@ -588,7 +588,7 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(true);
     });
 
-    it('rejects a malformed jq transform — fails validate (002 §1.1.6)', () => {
+    it('rejects a malformed jq transform — fails validate (spec: pipeline/post-processing)', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
         payload: {
@@ -610,7 +610,7 @@ describe('monitorFrontmatterSchema', () => {
       expect(result.success).toBe(false);
     });
 
-    it('rejects a transform under a non-structured form (001 §5.2)', () => {
+    it('rejects a transform under a non-structured form (spec: monitor/definition)', () => {
       const result = monitorFrontmatterSchema.safeParse({
         ...validMinimal,
         payload: {

@@ -43,7 +43,7 @@ describe('validateScope', () => {
     ).toEqual([]);
   });
 
-  // The pre-G2 validator only checked field *presence*; these are the cases it
+  // The original presence-only validator (before full JSON Schema validation) only checked field *presence*; these are the cases it
   // silently accepted and full JSON Schema validation must now reject.
   it('rejects a missing required field', () => {
     const errors = validateScope({}, fileFingerprintScope);

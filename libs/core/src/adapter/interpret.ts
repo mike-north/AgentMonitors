@@ -1,14 +1,14 @@
 /**
- * The host-agnostic **Interpret adapter** boundary (G14,
- * [002 §1.1.8](../../../../docs/specs/002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool),
- * [006 §2.1](../../../../docs/specs/006-agent-integration.md#21-the-interpret-adapter-is-upstream-of-transports-not-a-transport)).
+ * The host-agnostic **Interpret adapter** boundary
+ * ([spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md),
+ * [spec: delivery/transport-seam](../../../../openspec/specs/delivery/transport-seam/spec.md)).
  *
  * The optional Interpret stage produces a cheap, natural-language digest of a
  * **per-recipient delta** and, optionally, applies an agentic significance gate
  * (suppress-if-not-substantive). It is the one stage that invokes an AI model.
  *
  * Per the host-agnostic-core invariant (AP3,
- * [002 §11.1](../../../../docs/specs/002-runtime-delivery.md#111-the-agentruntimeadapter-contract)),
+ * [spec: delivery/host-adapters](../../../../openspec/specs/delivery/host-adapters/spec.md)),
  * **which** AI tool to invoke, the command string, and how to pass the delta in /
  * read the digest out are **host-specific** and live behind this adapter — never
  * in the runtime core (`libs/core/src/runtime/`). The runtime core owns _when_
@@ -21,8 +21,8 @@
  * `claude -p …`), so the deployment inherits the user's existing data-governance
  * and egress posture by construction.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §1.1.8
- * @see ../../../../docs/specs/006-agent-integration.md §2.1
+ * @see ../../../../openspec/specs/pipeline/post-processing/spec.md
+ * @see ../../../../openspec/specs/delivery/transport-seam/spec.md — "Interpret invocation lives behind an adapter boundary", "The Interpret adapter is upstream of transports"
  */
 import { execFile } from 'node:child_process';
 
@@ -30,13 +30,13 @@ import { execFile } from 'node:child_process';
  * The input to one Interpret invocation: the per-recipient delta plus the
  * author-declared criteria the model judges the change against. Interpret is a
  * pure function of `(delta, author criteria)` and **MUST NOT** depend on the
- * receiving agent's private runtime context (002 §1.1.8).
+ * receiving agent's private runtime context (spec: pipeline/post-processing).
  */
 export interface InterpretInput {
   /**
    * The per-recipient delta to read — _what is new for this recipient_ (the
    * output of the per-recipient Diff). Never the raw source snapshot, never the
-   * whole shared artifact (002 §1.1.8).
+   * whole shared artifact (spec: pipeline/post-processing).
    */
   readonly delta: string;
   /**
@@ -64,7 +64,7 @@ export type InterpretResult =
       readonly decision: 'suppress';
       /**
        * Why the agentic gate judged the change not substantive (recorded on the
-       * per-recipient surface and surfaced via `monitor explain`, 002 §10.7).
+       * per-recipient surface and surfaced via `monitor explain`, spec: daemon/ipc).
        */
       readonly reason: string;
     };
@@ -79,7 +79,7 @@ export interface InterpretAdapter {
   /**
    * Invoke the user's own AI tool to read the delta and produce a digest +
    * significance verdict. Rejecting (tool missing / errors / times out) is a
-   * best-effort failure the runtime falls back from (002 §1.1.8) — it MUST NOT
+   * best-effort failure the runtime falls back from (spec: pipeline/post-processing) — it MUST NOT
    * drop the underlying delta.
    */
   interpret(input: InterpretInput): Promise<InterpretResult>;
@@ -149,13 +149,13 @@ function parseToolOutput(stdout: string): InterpretResult {
 /**
  * The concrete Interpret adapter that shells out to the user's own `claude -p`
  * CLI (or another AI CLI named by `options.command`). This is the host-specific
- * invocation that 002 §1.1.8 / 006 §2.1 require to live behind the adapter
+ * invocation that spec: pipeline/post-processing, delivery/transport-seam require to live behind the adapter
  * boundary — **never** in the runtime core.
  *
  * Agent Monitors holds no credentials and ships no model: the tool runs as the
  * user, inheriting their data-governance and egress posture. If the tool is not
  * installed it rejects, and the runtime falls back to the deterministic
- * `rendered` artifact (best-effort, 002 §1.1.8).
+ * `rendered` artifact (best-effort, spec: pipeline/post-processing).
  */
 export function createClaudeInterpretAdapter(
   options: ClaudeInterpretAdapterOptions = {},
@@ -176,7 +176,7 @@ export function createClaudeInterpretAdapter(
           (error, stdout) => {
             // `execFile` surfaces an `Error` (or `null`) here — a tool that is
             // missing, errors, or times out rejects, and the runtime falls back
-            // to the deterministic artifact (best-effort, 002 §1.1.8).
+            // to the deterministic artifact (best-effort, spec: pipeline/post-processing).
             if (error) {
               reject(
                 error instanceof Error ? error : new Error('Interpret failed'),

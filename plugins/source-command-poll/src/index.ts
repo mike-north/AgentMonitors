@@ -32,23 +32,23 @@ export type {
 } from '@agentmonitors/core';
 
 /**
- * Change-detection strategies (003 §11.3). `text-diff` is the default; `exit-code`
+ * Change-detection strategies (spec: sources/command-poll). `text-diff` is the default; `exit-code`
  * is first-class in v1.
  */
 type ChangeStrategy = 'text-diff' | 'json-diff' | 'exit-code';
 
-/** Grace period between SIGTERM and SIGKILL on timeout (003 §11.2). */
+/** Grace period between SIGTERM and SIGKILL on timeout (spec: sources/command-poll). */
 const SIGKILL_GRACE_MS = 5_000;
 
-/** Maximum retained stdout, in bytes (003 §11.2). Excess is drained, not kept. */
+/** Maximum retained stdout, in bytes (spec: sources/command-poll). Excess is drained, not kept. */
 const STDOUT_CAP_BYTES = 1024 * 1024;
 
-/** Number of trailing stderr characters retained for failure diagnostics (003 §11.5). */
+/** Number of trailing stderr characters retained for failure diagnostics (spec: sources/command-poll). */
 const STDERR_TAIL_CHARS = 2000;
 
 /**
  * Maximum retained stderr, in bytes — bounded independently of `STDOUT_CAP_BYTES`
- * (003 §11.2, issue #302). Sized generously above `STDERR_TAIL_CHARS` (4 bytes/char
+ * (spec: sources/command-poll, issue #302). Sized generously above `STDERR_TAIL_CHARS` (4 bytes/char
  * worst case for UTF-8) so the final tail slice is never short on multi-byte input,
  * while still being a small, fixed bound regardless of how much stderr the child
  * writes — a pathological volume of stderr can never grow this process's own memory
@@ -68,12 +68,12 @@ interface ScopeConfig {
    * output comparison. Collection-specific ignores remain inside `collection`.
    */
   ignorePaths: string[];
-  /** Keyed-collection config (003 §12), present only under `strategy: json-diff`. */
+  /** Keyed-collection config (spec: sources/contract), present only under `strategy: json-diff`. */
   collection: KeyedCollectionConfig | undefined;
 }
 
 /**
- * Persisted per-monitor state (003 §11.4–§11.5).
+ * Persisted per-monitor state (spec: sources/command-poll).
  *
  * `stdout`/`exitCode` hold the last **successful** result baseline; they are kept
  * untouched across failing ticks so a recovery can diff against the pre-failure
@@ -81,7 +81,7 @@ interface ScopeConfig {
  * on `ok ↔ failing`. `baselined` records whether a successful baseline has ever been
  * established — a failing-first-run state is `baselined: false` (no output to diff),
  * per "a failing first run establishes no baseline". `env` is never stored here
- * (003 §11.1).
+ * (spec: sources/command-poll).
  */
 interface CommandState {
   stdout: string;
@@ -90,7 +90,7 @@ interface CommandState {
   health: 'ok' | 'failing';
   baselined: boolean;
   /**
-   * The keyed-collection snapshot from the previous successful cycle (003 §12),
+   * The keyed-collection snapshot from the previous successful cycle (spec: sources/contract),
    * present only when the monitor uses `change-detection.collection`. Carried
    * forward untouched across failing ticks so a recovery diffs against the
    * pre-failure keyed baseline.
@@ -104,7 +104,7 @@ interface ExecResult {
   truncated: boolean;
 }
 
-/** Outcome of one spawn: either a result (003 §11.2) or an execution failure (003 §11.5). */
+/** Outcome of one spawn: either a result (spec: sources/command-poll) or an execution failure (spec: sources/command-poll). */
 type ExecOutcome =
   | { kind: 'result'; result: ExecResult }
   | { kind: 'failure'; error: string; stderrTail: string };
@@ -117,7 +117,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     !command.every((c): c is string => typeof c === 'string')
   ) {
     // `command` is argv-only by design — the child is spawned with `shell: false`,
-    // so there is no word-splitting/quoting/injection surface (003 §11.1). The most
+    // so there is no word-splitting/quoting/injection surface (spec: sources/command-poll). The most
     // common mistake is writing a shell pipeline as a bare string; point authors at
     // the supported inline form rather than just rejecting it.
     const shellHint =
@@ -144,7 +144,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
     );
   }
 
-  // Keyed-collection mode (003 §12) is only valid under `json-diff`. The generated
+  // Keyed-collection mode (spec: sources/contract) is only valid under `json-diff`. The generated
   // schema rejects `collection` under other strategies at authoring time (BP3); this
   // is the defence-in-depth guard for the observe path.
   const collection = parseKeyedCollectionConfig(config['change-detection']);
@@ -189,7 +189,7 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
  * direct child itself has exited — resolving on `close` alone would hang this call
  * forever in that case. This bound only matters when a descendant lingers; a normal
  * command's streams close within milliseconds of `exit`, so it never adds latency
- * in the common case (003 §11.7, issue #303).
+ * in the common case (spec: sources/command-poll, issue #303).
  */
 const CLOSE_FALLBACK_MS = 2_000;
 
@@ -199,7 +199,7 @@ const CLOSE_FALLBACK_MS = 2_000;
  * On POSIX, `child` was spawned as the leader of its own process group/session
  * (`detached: true`); signaling the *negative* PID targets that whole group, so a
  * command's own background jobs (`sh -c 'sleep 30 & wait'`) die with it instead of
- * surviving as orphans (003 §11.7, issue #303).
+ * surviving as orphans (spec: sources/command-poll, issue #303).
  *
  * Windows has no process-group-signal equivalent, and no reliable graceful signal
  * for a non-console-attached spawned process — `taskkill` without `/F` frequently
@@ -230,12 +230,12 @@ function killProcessTree(
 }
 
 /**
- * Resolve the child process's effective working directory (003 §11.1).
+ * Resolve the child process's effective working directory (spec: sources/command-poll).
  *
  * A **relative** `cwd` is resolved against `workspacePath` — the runtime
  * workspace/config root the daemon threads through {@link ObservationContext}
  * for a project monitor — the same base `file-fingerprint` already resolves a
- * relative `cwd` against (003 §3). An **absolute** `cwd` is honored as-is
+ * relative `cwd` against (spec: sources/file-fingerprint). An **absolute** `cwd` is honored as-is
  * (unchanged from before). When `cwd` is omitted entirely, a project monitor
  * now defaults to `workspacePath` rather than the daemon's own process
  * working directory: a scaffolded `MONITOR.md` that omits `cwd` therefore
@@ -260,8 +260,8 @@ function resolveCwd(
  * Spawn `command` directly (never a shell — `spawn` with `shell: false`), draining
  * stdout and stderr as they stream rather than buffering to completion, enforcing
  * `timeout` with a SIGTERM→SIGKILL escalation targeted at the command's **entire
- * process tree**, not just the direct child (003 §11.2/§11.7, issue #303). A nonzero
- * exit code with output is a **result**, not a failure (003 §11.2/§11.5); spawn
+ * process tree**, not just the direct child (spec: sources/command-poll, issue #303). A nonzero
+ * exit code with output is a **result**, not a failure (spec: sources/command-poll); spawn
  * failure and timeout are failures. Crucially, neither stream exceeding its
  * retention cap ever kills the child (issue #302) — `data` listeners are attached
  * unconditionally, so the pipe keeps draining and the command always runs to its
@@ -282,12 +282,12 @@ async function runCommand(
       args,
       {
         cwd: effectiveCwd,
-        // `env` is merged over the inherited daemon environment (003 §11.1).
+        // `env` is merged over the inherited daemon environment (spec: sources/command-poll).
         env: scope.env ? { ...process.env, ...scope.env } : process.env,
         shell: false,
         // POSIX: leader of its own process group/session, so the timeout escalation
         // can signal the whole tree at once (`killProcessTree` above) instead of only
-        // the direct child (003 §11.7, issue #303). Windows has no equivalent flag;
+        // the direct child (spec: sources/command-poll, issue #303). Windows has no equivalent flag;
         // its tree-kill goes through `taskkill /T` instead, which does not depend on
         // process-group membership.
         detached: !isWindows,
@@ -298,7 +298,7 @@ async function runCommand(
     let settled = false;
     let timedOut = false;
     let truncated = false;
-    // Post-timeout SIGKILL escalation timer (003 §11.2/§11.7, issue #303). Deliberately
+    // Post-timeout SIGKILL escalation timer (spec: sources/command-poll, issue #303). Deliberately
     // NOT cleared by `finish()`/`clearTimers()` below — see the comment there.
     let sigkillTimer: ReturnType<typeof setTimeout> | undefined;
     let closeFallbackTimer: ReturnType<typeof setTimeout> | undefined;
@@ -311,7 +311,7 @@ async function runCommand(
     // `data` events is never corrupted; decoding happens once, on the final tail.
     let stderrRetained = Buffer.alloc(0);
 
-    // Bound stdout capture at the 1 MiB cap (003 §11.2): once the cap is reached,
+    // Bound stdout capture at the 1 MiB cap (spec: sources/command-poll): once the cap is reached,
     // further bytes are discarded but the stream is never paused, so a chatty child
     // is always drained and can never block on a full pipe buffer (issue #302).
     child.stdout.on('data', (chunk: Buffer) => {
@@ -330,7 +330,7 @@ async function runCommand(
       }
     });
 
-    // Captured solely for failure diagnostics (003 §11.5), bounded independently of
+    // Captured solely for failure diagnostics (spec: sources/command-poll), bounded independently of
     // stdout (issue #302): a pathological stderr volume can never grow this
     // process's own memory unbounded, and — like stdout — never pauses the pipe or
     // kills the child. Only the trailing bytes survive; older chunks are dropped
@@ -377,7 +377,7 @@ async function runCommand(
       // has SIGTERM ignored (e.g. inherited via `exec` from a subshell that
       // trapped it) and so survives untouched. Cancelling the pending SIGKILL as
       // soon as the direct child's own `exit` resolved this promise would leave
-      // that descendant orphaned forever (003 §11.7, issue #303). Firing SIGKILL
+      // that descendant orphaned forever (spec: sources/command-poll, issue #303). Firing SIGKILL
       // on an already-empty process group is caught and ignored in
       // `killProcessTree`, so leaving it armed is always safe.
     }
@@ -416,7 +416,7 @@ async function runCommand(
       }
       if (signal !== null) {
         // Terminated by a signal we did not send ourselves (timedOut is false) — no
-        // usable result was produced (003 §11.5).
+        // usable result was produced (spec: sources/command-poll).
         finish({
           kind: 'failure',
           error: `Command terminated by signal ${signal}`,
@@ -450,7 +450,7 @@ async function runCommand(
         // `sleep` under `sh -c 'sleep 30 & wait'`) can hold those pipes open
         // indefinitely even once the whole process group has been signaled; gating
         // resolution on `close` would hang this call forever in that case — the
-        // exact bug this fixes (003 §11.7, issue #303).
+        // exact bug this fixes (spec: sources/command-poll, issue #303).
         resolveFromExit(code, signal);
         return;
       }
@@ -460,7 +460,7 @@ async function runCommand(
       // open) — if `scope.timeoutMs` is short enough to elapse during that wait,
       // it would fire, set `timedOut = true`, and retroactively flip this already-
       // successful exit into a reported timeout once the fallback resolves
-      // (003 §11.2, issue #303). The direct child is confirmed exited here, so the
+      // (spec: sources/command-poll, issue #303). The direct child is confirmed exited here, so the
       // wall-clock timeout has nothing left to bound.
       clearTimeout(wallClockTimer);
       // Give stdio a bounded window to `close` so a fast, well-behaved command's
@@ -480,8 +480,8 @@ async function runCommand(
     });
 
     // Wall-clock timeout: SIGTERM the whole process group, then SIGKILL after a 5s
-    // grace (003 §11.2). Targeting the group — not just the direct child — is what
-    // guarantees no orphaned descendant survives (003 §11.7, issue #303).
+    // grace (spec: sources/command-poll). Targeting the group — not just the direct child — is what
+    // guarantees no orphaned descendant survives (spec: sources/command-poll, issue #303).
     const wallClockTimer = setTimeout(() => {
       timedOut = true;
       killProcessTree(child, 'SIGTERM', isWindows);
@@ -489,7 +489,7 @@ async function runCommand(
       // even if the direct child has already exited and `finish()` has already
       // settled the promise (see the comment in `clearTimers` above) — a
       // descendant that ignores SIGTERM while the direct child dies from it is
-      // otherwise never reaped (003 §11.7, issue #303). Signaling an
+      // otherwise never reaped (spec: sources/command-poll, issue #303). Signaling an
       // already-empty process group throws ESRCH, which `killProcessTree` catches
       // and ignores.
       sigkillTimer = setTimeout(() => {
@@ -583,7 +583,7 @@ function removeJsonPath(value: unknown, path: string): void {
 }
 
 /**
- * Whether the result changed versus the prior baseline under `strategy` (003 §11.3).
+ * Whether the result changed versus the prior baseline under `strategy` (spec: sources/command-poll).
  * `json-diff` falls back to raw text comparison when either side fails to parse,
  * identical to `api-poll`. `stderr` is never compared.
  */
@@ -632,7 +632,7 @@ function isCommandState(value: unknown): value is CommandState {
 }
 
 /**
- * Build the output-changed observation (003 §11.4). `env` is deliberately absent
+ * Build the output-changed observation (spec: sources/command-poll — "command-poll observation identity", "command-poll stateful baseline"). `env` is deliberately absent
  * from every persisted field (payload/snapshot/state).
  */
 function changedObservation(
@@ -708,7 +708,7 @@ const scopeSchema: JsonSchema = {
           type: 'string',
           enum: ['text-diff', 'json-diff', 'exit-code'],
         },
-        // Keyed-collection mode (003 §12). The `collection` block is only valid
+        // Keyed-collection mode (spec: sources/contract). The `collection` block is only valid
         // under `strategy: json-diff`; the `if/then` below enforces that at
         // authoring time (BP3).
         collection: {
@@ -783,7 +783,7 @@ const source: ObservationSource = {
 
     const outcome = await runCommand(scope, effectiveCwd);
 
-    // ---- Execution failure path (003 §11.5) -------------------------------------
+    // ---- Execution failure path (spec: sources/command-poll) -------------------------------------
     if (outcome.kind === 'failure') {
       // Prior state is kept (no re-baseline, no state loss). Emit only on the
       // ok → failing transition edge — including a failing first-ever run, which
@@ -810,12 +810,12 @@ const source: ObservationSource = {
     const hadBaseline = prev?.baselined ?? false;
 
     const observations: Observation[] = [];
-    // A failing → ok edge always emits the recovery health observation (003 §11.5).
+    // A failing → ok edge always emits the recovery health observation (spec: sources/command-poll).
     if (recovered) {
       observations.push(recoveredObservation(scope));
     }
 
-    // ---- Keyed-collection mode (003 §12) ----------------------------------------
+    // ---- Keyed-collection mode (spec: sources/contract) ----------------------------------------
     // Parse stdout as JSON and diff per keyed object. The keyed snapshot lives in the
     // same per-monitor state slot; the baseline rule is unchanged (first successful
     // run records the snapshot, emits nothing). A failing-first-run leaves no keyed
@@ -853,7 +853,7 @@ const source: ObservationSource = {
 
     // The output-changed observation requires a real pre-failure/prior baseline to
     // diff against. The first-ever success — and the first success after a failing
-    // first run — baselines silently (003 §11.4/§11.5).
+    // first run — baselines silently (spec: sources/command-poll).
     if (
       prev !== undefined &&
       hadBaseline &&
@@ -866,7 +866,7 @@ const source: ObservationSource = {
   },
 };
 
-/** Health observation for the `ok → failing` edge (003 §11.5). Never carries `env`. */
+/** Health observation for the `ok → failing` edge (spec: sources/command-poll). Never carries `env`. */
 function failingObservation(
   scope: ScopeConfig,
   outcome: Extract<ExecOutcome, { kind: 'failure' }>,
@@ -885,7 +885,7 @@ function failingObservation(
   };
 }
 
-/** Health observation for the `failing → ok` edge (003 §11.5). */
+/** Health observation for the `failing → ok` edge (spec: sources/command-poll). */
 function recoveredObservation(scope: ScopeConfig): Observation {
   return {
     title: `Command recovered: ${displayObjectKey(scope.objectKey)}`,

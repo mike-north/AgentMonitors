@@ -32,7 +32,7 @@ import {
  * 3. **Reminders suppressed by coalesced-until-ack.** Events materialized on
  *    real transitions (including a CI failure) but every lead session's
  *    normal-urgency reminder was withheld because one earlier unread event was
- *    already claimed (002 §9.2/§9.3).
+ *    already claimed (spec: delivery/lifecycles).
  *
  * The third case is the reason this is a *health* surface and not a *liveness*
  * surface: both transports were up, connected, and correctly configured. A
@@ -50,8 +50,8 @@ import {
  * and host-integration facts, so composing them here keeps core free of
  * process-topology concerns rather than inventing new delivery behavior (AP6).
  *
- * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
- * @see ../../../docs/specs/002-runtime-delivery.md §9 (delivery lifecycles)
+ * @see ../../../openspec/specs/delivery/transport-health/spec.md (transport health)
+ * @see ../../../openspec/specs/delivery/lifecycles/spec.md (delivery lifecycles)
  */
 
 /**

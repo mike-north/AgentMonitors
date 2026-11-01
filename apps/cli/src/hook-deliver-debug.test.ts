@@ -2,7 +2,7 @@
  * Tests for the pure `hook deliver --debug` line-formatters (issue #334).
  *
  * @see ./commands/hook.ts (wires these into --debug's stderr output)
- * @see ../../../docs/specs/006-agent-integration.md §5 (hook-deliver transport)
+ * @see ../../../openspec/specs/delivery/hook-transport/spec.md (hook-deliver transport)
  */
 import { describe, expect, it } from 'vitest';
 import type {
@@ -168,11 +168,11 @@ describe('hook-deliver-debug line formatters', () => {
     expect(msg).toContain('…');
   });
 
-  it('describeNoSessionId names the missing-session_id branch (§5.2 step 2)', () => {
+  it('describeNoSessionId names the missing-session_id branch (spec: delivery/hook-transport step 2)', () => {
     expect(describeNoSessionId()).toContain('no session_id');
   });
 
-  it('describeUnmappedLifecycle names the unmapped hook_event_name branch (§5.4)', () => {
+  it('describeUnmappedLifecycle names the unmapped hook_event_name branch (spec: delivery/hook-transport)', () => {
     const msg = describeUnmappedLifecycle('PreToolUse');
     expect(msg).toContain('PreToolUse');
     expect(msg).toContain('does not map to a delivery lifecycle');
@@ -262,7 +262,7 @@ describe('hook-deliver-debug line formatters', () => {
     expect(floodMsg).toContain('…');
   });
 
-  it('describeWorkspaceDisabled names the "cwd mismatch" / disabled-workspace branch (§5.2 step 4)', () => {
+  it('describeWorkspaceDisabled names the "cwd mismatch" / disabled-workspace branch (spec: delivery/hook-transport step 4)', () => {
     const msg = describeWorkspaceDisabled('/other/ws');
     expect(msg).toContain('/other/ws');
     expect(msg).toContain('is not enabled');

@@ -145,7 +145,7 @@ const hookClaimParamsSchema = z.object({
 const hookPreviewParamsSchema = z.object({
   sessionId: z.string(),
 });
-// Reserve → commit/release: the atomic surfacing protocol (006 §4, issue #300).
+// Reserve → commit/release: the atomic surfacing protocol (spec: delivery/channel-transport, issue #300).
 // `hook.reserve` shares `hook.claim`'s params (it renders the same claim but
 // defers marking it claimed); `hook.commit`/`hook.release` carry the opaque
 // reservation id the reserve returned.
@@ -177,7 +177,7 @@ const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
   workspacePath: z.string().optional(),
 });
-// Ephemeral-monitor declaration (007 §4.2 / 005 §14.4). The scope is a
+// Ephemeral-monitor declaration (spec: agent/ephemeral-monitors). The scope is a
 // source-specific object validated by the runtime against the SAME
 // `validateScope` path as `agentmonitors validate`, so it stays `unknown`-valued
 // here at the IPC boundary — the source schema, not this Zod schema, is the
@@ -487,7 +487,7 @@ export function resolveSocketPath(
   // the new per-uid path. A daemon only ever *binds* the new path — a live
   // legacy daemon makes `daemon run` observe "already running", so no second
   // bind happens — which is why one restart of the legacy daemon completes the
-  // migration (spec 002 §10.3).
+  // migration (spec: daemon/ipc).
   const legacy = path.join(SOCKET_FALLBACK_BASE, `agentmonitors-${hash}.sock`);
   const resolved = legacyDaemonIsLive(legacy) ? legacy : substituted;
 
@@ -888,7 +888,7 @@ function handleRequest(
  * exists with a looser mode. On-disk databases already tighten this directory at
  * `createDb` → `ensurePrivateDir`, but a `:memory:` database has no such call
  * site — so without this, a pre-existing world-readable default socket directory
- * would never be tightened (issue #292 review), a hole in spec 002 §3.1's "each
+ * would never be tightened (issue #292 review), a hole in the runtime/local-data-permissions spec's "each
  * startup re-applies" rule that also underwrites the socket TOCTOU mitigation
  * (the owner-only parent directory is the load-bearing guard). Tightening is
  * best-effort — {@link restrictExistingPathMode} warns and continues if the
@@ -1087,7 +1087,7 @@ export function createDaemonServer({
           // (issue #292 review). Node binds a Unix domain socket synchronously
           // inside `listen()`, so the umask is still restricted when the socket
           // file is created and is restored before the async 'listening'
-          // callback runs. The owner-only parent directory (§3.1) remains the
+          // callback runs. The owner-only parent directory (spec: runtime/local-data-permissions) remains the
           // load-bearing guard; `chmodSync` follows symlinks, so the umask +
           // private directory — not the post-bind chmod — is what actually
           // closes the race.

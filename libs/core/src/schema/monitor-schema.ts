@@ -32,11 +32,11 @@ const throttleNotifySchema = z.object({
 // grammar the `schedule` source accepts for `cron`. We validate only the
 // field count here (cheap, structural); individual field grammar is evaluated
 // at runtime by `cronMatchesDate` (a malformed field simply never matches),
-// matching how the schedule source treats `scope.cron`. See 001 §3.6.
+// matching how the schedule source treats `scope.cron`. See spec: monitor/definition.
 const cronPattern = /^\s*\S+(?:\s+\S+){4}\s*$/;
 
 /**
- * The third Pace mode (G12 / 001 §3.6, 002 §4.4): the runtime accumulates
+ * The third Pace mode (spec: runtime/notify-dispatch, monitor/definition, pipeline/post-processing): the runtime accumulates
  * observations between delivery windows and flushes them as a single composite
  * delivery when the author's `window` cron next fires. `window` is required —
  * a `rollup` strategy without a delivery schedule has no flush trigger, so it
@@ -82,8 +82,8 @@ const notifySchema = z.discriminatedUnion('strategy', [
  *
  * Omitting `baseline-strategy` entirely is equivalent to `net`.
  *
- * @see docs/specs/001-monitor-definition.md §3.7
- * @see docs/specs/002-runtime-delivery.md §1.1.7
+ * @see openspec/specs/monitor/definition/spec.md
+ * @see openspec/specs/pipeline/post-processing/spec.md
  */
 export const baselineStrategyValues = ['incremental', 'net'] as const;
 
@@ -118,7 +118,7 @@ const DEFAULT_URGENCY_BAND = { lo: 'normal', hi: 'normal' } as const;
  * consumer) and `urgencyMax` is the band's high bound (equal to `urgency` for a
  * scalar). Reject an inverted/invalid range (`lo` must be ≤ `hi`).
  *
- * @see docs/specs/001-monitor-definition.md §3.2
+ * @see openspec/specs/monitor/definition/spec.md
  */
 const urgencyBandSchema = z.string().transform((raw, ctx) => {
   const text = raw.trim();
@@ -178,13 +178,13 @@ const watchSchema = z
   .catchall(z.unknown());
 
 /**
- * The deterministic **Shape** declaration ([001 §5.1](../../docs/specs/001-monitor-definition.md#51-shape-declaration-target)).
+ * The deterministic **Shape** declaration ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md)).
  *
  * `derive` is an ordered list of named derived facts; each `when` is a CEL
  * boolean predicate over `(snapshot, now)`. `render` opts into rendering the
- * shaped state to the diffable artifact ([002 §1.1.5](../../docs/specs/002-runtime-delivery.md#115-shape-render-to-a-stable-artifact-then-diff-the-artifact)).
+ * shaped state to the diffable artifact ([spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md)).
  * A malformed CEL predicate is rejected (determinism is a validation obligation,
- * [004 §2.2](../../docs/specs/004-validation-testing.md)).
+ * [spec: monitor/validation](../../../../openspec/specs/monitor/validation/spec.md)).
  */
 const deriveRuleSchema = z.object({
   name: z.string().min(1, 'shape.derive[].name must be non-empty'),
@@ -216,10 +216,10 @@ const transformLanguages = ['jq', 'cel'] as const satisfies readonly [
 
 /**
  * The author-declared payload **form** — one of `prose`, `structured`,
- * `artifact`, `rendered` ([001 §5.2](../../docs/specs/001-monitor-definition.md#52-payload-form-target),
- * [002 §1.1.6](../../docs/specs/002-runtime-delivery.md#116-author-declared-payload-form)).
+ * `artifact`, `rendered` ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md),
+ * [spec: pipeline/post-processing](../../../../openspec/specs/pipeline/post-processing/spec.md)).
  *
- * This is a **stable contract** the follow-on Interpret stage (G14) builds on:
+ * This is a **stable contract** the follow-on Interpret stage (spec: pipeline/post-processing) builds on:
  * the `prose` form is the one form that invokes Interpret; `structured`,
  * `artifact`, and `rendered` are the deterministic-floor forms. Authored as an
  * explicit union (not a derived alias) so the contract is hand-pinned.
@@ -253,7 +253,7 @@ const payloadTransformSchema = z.object({
 });
 
 /**
- * The author-declared **payload form** ([001 §5.2](../../docs/specs/001-monitor-definition.md#52-payload-form-target)).
+ * The author-declared **payload form** ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md)).
  *
  * `form` is one of `prose | structured | artifact | rendered`. A `transform` is
  * valid **only** under `form: structured`; a malformed `jq`/`cel` expression is
@@ -302,7 +302,7 @@ export const monitorFrontmatterSchema = z
     // `normal..normal` (see the transform below). Keeping the simplest monitor to
     // `watch:` + body is the gradual-reveal floor; an author opts into `high`
     // (interrupt) or a `lo..hi` escalation band only when they need it (PP5 — the
-    // default never escalates on its own). 001 §3.2.
+    // default never escalates on its own). spec: monitor/definition.
     urgency: urgencyBandSchema.optional(),
     notify: notifySchema.optional(),
     // Author-declared baseline strategy for the per-recipient Diff stage. The
@@ -310,7 +310,7 @@ export const monitorFrontmatterSchema = z
     // camelCase `baselineStrategy` in the transform below so consumers read a
     // stable, defaulted value. Omitting the field yields `net` (the
     // `.default()`), the standard per-object consolidation behavior (2026-06-19
-    // decision, Refs #110, 001 §3.7 / 002 §1.1.7). An unknown value (anything
+    // decision, Refs #110, spec: monitor/definition, pipeline/post-processing). An unknown value (anything
     // other than `incremental`/`net`) is rejected by the enum.
     'baseline-strategy': baselineStrategySchema,
     tags: z.array(z.string()).optional(),
@@ -320,7 +320,7 @@ export const monitorFrontmatterSchema = z
   .transform(({ urgency, 'baseline-strategy': baselineStrategy, ...rest }) => ({
     ...rest,
     // Surface the defaulted, validated baseline strategy under a camelCase key
-    // (002 §1.1.7). `net` when the author omitted the field (default since
+    // (spec: pipeline/post-processing). `net` when the author omitted the field (default since
     // 2026-06-19, Refs #110).
     baselineStrategy,
     // Flatten the parsed band: `urgency` is the band's low bound — the base /
@@ -328,7 +328,7 @@ export const monitorFrontmatterSchema = z
     // under this key for backward compatibility with every existing consumer) —
     // and `urgencyMax` is the band's high bound (equal to `urgency` for a
     // scalar). Source salience may escalate the effective urgency between these
-    // two, clamping outside the band. See 002 §4.1 / 003 §2.3.
+    // two, clamping outside the band. See spec: runtime/notify-dispatch, sources/contract.
     //
     // An omitted `urgency` defaults to the degenerate band `normal..normal`, so
     // the minimal monitor (`watch:` + body) is valid and delivers at `normal`.
@@ -340,18 +340,18 @@ export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
 export type NotifyConfig = z.infer<typeof notifySchema>;
 
 /**
- * The author-declared per-recipient Diff baseline strategy (001 §3.7,
- * 002 §1.1.7). `incremental` is the default and backward-compatible behavior.
+ * The author-declared per-recipient Diff baseline strategy (spec: monitor/definition,
+ * spec: pipeline/post-processing). `incremental` is the default and backward-compatible behavior.
  */
 export type BaselineStrategy = (typeof baselineStrategyValues)[number];
 
 /**
- * The parsed `shape` frontmatter block ([001 §5.1](../../docs/specs/001-monitor-definition.md#51-shape-declaration-current)).
+ * The parsed `shape` frontmatter block ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md)).
  */
 export type ShapeConfig = z.infer<typeof shapeSchema>;
 
 /**
- * The parsed `payload` frontmatter block ([001 §5.2](../../docs/specs/001-monitor-definition.md#52-payload-form-current)).
+ * The parsed `payload` frontmatter block ([spec: monitor/definition](../../../../openspec/specs/monitor/definition/spec.md)).
  */
 export type PayloadConfig = z.infer<typeof payloadSchema>;
 

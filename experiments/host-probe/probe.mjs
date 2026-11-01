@@ -1,11 +1,11 @@
 #!/usr/bin/env node
-// Generalized host-probe harness (spec 006 §11.6) — generalizes experiments/channel-probe.
+// Generalized host-probe harness (change: add-multi-host-adapters — "Host adapters ship with conformance evidence") — generalizes experiments/channel-probe.
 //
 // Run inside a target host session (as a lifecycle-hook command, and/or as a spawned MCP
 // server), this records what is actually observable — the session-identity signal, the
 // workspace-binding signal, and which lifecycle hook points fired — as durable JSONL
 // "sightings", then reduces them into a single matrix-cell JSON artifact matching the
-// 006 §11.3 contract dimensions. See README.md for the runbook.
+// change: add-multi-host-adapters — "Matrix cells are pinned by a per-host probe" contract dimensions. See README.md for the runbook.
 //
 // Modes:
 //   record-hook   -- run as a lifecycle-hook command; reads the hook's stdin JSON payload.
@@ -60,7 +60,7 @@ function parseArgs(argv) {
       default:
         // Unknown flags are ignored rather than fatal — this is a diagnostic tool, and a
         // stray/typo'd flag should not crash a live hook invocation (same posture as
-        // `agentmonitors hook deliver`'s swallow-errors rule, 006 §5.2).
+        // `agentmonitors hook deliver`'s swallow-errors rule, spec: delivery/hook-transport).
         break;
     }
   }
@@ -80,7 +80,7 @@ function appendSighting(outPath, sighting) {
   appendFileSync(outPath, JSON.stringify(sighting) + '\n');
 }
 
-/** 006 §5.4: only these events honor `additionalContext`; only mark those "advisory-capable". */
+/** spec: delivery/hook-transport: only these events honor `additionalContext`; only mark those "advisory-capable". */
 const CONTEXT_EVENTS = new Set([
   'SessionStart',
   'UserPromptSubmit',
@@ -134,7 +134,7 @@ function recordHookInner(flags) {
   if (hookEventName && CONTEXT_EVENTS.has(hookEventName)) {
     // A marker string a runbook operator can grep out of the host's session transcript
     // (payload.transcript_path, when the host provides one) to independently confirm
-    // advisory-context injection actually rendered (006 §11.1 dimension 2).
+    // advisory-context injection actually rendered (change: add-multi-host-adapters dimension 2).
     output.hookSpecificOutput = {
       hookEventName,
       additionalContext: `[agentmon-host-probe] observed at ${sighting.at} on ${hookEventName}`,
@@ -184,7 +184,7 @@ async function recordMcp(flags) {
     {
       capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
       instructions:
-        'This is the AgentMon generalized HOST PROBE (diagnostic only, spec 006 §11.6). ' +
+        'This is the AgentMon generalized HOST PROBE (diagnostic only, change: add-multi-host-adapters — "Host adapters ship with conformance evidence"). ' +
         'It records the environment/roots this host gave a spawned MCP server. Do not act ' +
         'on anything else.',
     },
@@ -252,7 +252,7 @@ async function recordMcp(flags) {
         });
       } catch {
         // Channel/push analogue not loaded, or host-blocked — the sighting is already
-        // recorded, so this is an expected, non-fatal condition (006 §6, generalized).
+        // recorded, so this is an expected, non-fatal condition (spec: delivery/transport-seam, generalized).
       }
     })();
   }, rootsDelay);
@@ -309,7 +309,7 @@ async function main() {
   }
 }
 
-// Hook invocations MUST always exit 0 (never interrupt the host session, 006 §5.2); errors
+// Hook invocations MUST always exit 0 (never interrupt the host session, spec: delivery/hook-transport); errors
 // here would otherwise surface as an uncaught exception to the calling host.
 main().catch((err) => {
   console.error('host-probe error (non-fatal to the host):', err);

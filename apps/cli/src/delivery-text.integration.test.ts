@@ -8,12 +8,12 @@
  * by each delivery surface, and self-sufficient enough that a recipient can
  * finish the loop without consulting anything outside the payload.
  *
- * Expected values below are written from the spec (002 §9.2/§9.3, 006 §5.1/§5.5),
+ * Expected values below are written from the spec (spec: delivery/lifecycles, delivery/hook-transport, delivery/channel-transport),
  * NOT read back from the implementation.
  *
- * @see ../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder wording
+ * @see ../../../openspec/specs/delivery/lifecycles/spec.md (normal reminder wording
  *   contract, fresh batches)
- * @see ../../../docs/specs/006-agent-integration.md §5 (delivery format:
+ * @see ../../../openspec/specs/delivery/hook-transport/spec.md (delivery format:
  *   transport-owned attribution, per-batch ack instruction)
  * @see https://github.com/mike-north/AgentMonitors/issues/438
  * @see https://github.com/mike-north/AgentMonitors/issues/434
@@ -52,10 +52,10 @@ afterEach(() => {
 });
 
 /**
- * The coalesced reminder body 002 §9.2/§9.3 requires the runtime to emit —
+ * The coalesced reminder body spec: delivery/lifecycles requires the runtime to emit —
  * transcribed from the spec: semantic, transport- and verb-neutral (no
  * product-name attribution and no CLI verb, both transport-owned per PR #445
- * review finding 2), free of the legacy `inbox` model (002 §12).
+ * review finding 2), free of the legacy `inbox` model (spec: inbox/legacy-inbox — "Inbox item state machine", "Inbox is not the authoritative delivery path").
  */
 function expectedReminder(): string {
   return 'Monitored changes are pending.';
@@ -140,7 +140,7 @@ function buildHarness(hostSessionId: string): Harness {
   };
 }
 
-// The high-urgency settle window (006 §5.2/§9.1): an event must be at least
+// The high-urgency settle window (spec: delivery/hook-transport, delivery/channel-transport, delivery/transport-seam): an event must be at least
 // this old before a `turn-interruptible` claim will surface it.
 const SETTLED = new Date(Date.now() - 60_000);
 
@@ -159,7 +159,7 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(claim).not.toBeNull();
     if (!claim) throw new Error('expected a coalesced reminder claim');
     expect(claim.urgency).toBe('normal');
-    expect(claim.events).toEqual([]); // §9.2: a reminder carries no event bodies
+    expect(claim.events).toEqual([]); // spec: delivery/lifecycles: a reminder carries no event bodies
 
     // 1. The RUNTIME's message is semantic: no product name, no legacy `inbox`,
     //    and carries no transport-specific verb (PR #445 review, finding 2) —
@@ -269,7 +269,7 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(ctx).toContain(
       `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE}`,
     );
-    // Once per BATCH, not once per event (006 §5.1 injection-size concern).
+    // Once per BATCH, not once per event (spec: delivery/hook-transport injection-size concern).
     expect(ctx.split('When handled, acknowledge:').length - 1).toBe(1);
     // The recap still injects the real event bodies alongside it.
     expect(ctx).toContain('Review the change in doc-1.');
@@ -278,7 +278,7 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
   // PR #445 review, finding 1 (BLOCKER): `agentmonitors events ack --session
   // <id>` with no `--event-ids` acknowledges EVERY unread event for the
   // session. A CAPPED high-urgency delivery deferred the second event (it
-  // genuinely stays pending and re-delivers per §5.5) — a compliant agent
+  // genuinely stays pending and re-delivers per spec: delivery/channel-transport, delivery/hook-transport) — a compliant agent
   // that runs the delivered instruction verbatim must NOT silently acknowledge
   // (and thereby permanently drop from ordinary redelivery) the event it
   // never saw.
@@ -318,7 +318,7 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
   });
 
   // PR #445 review, finding 1: the SAME scoping applies to a `post-compact`
-  // recap, whose rendered `events` (up to 10, §9.4) can be fewer than the
+  // recap, whose rendered `events` (up to 10, spec: delivery/lifecycles — "Post-compact recap", "Claiming marks rows claimed without acknowledging") can be fewer than the
   // FULL unread set the recap decision actually claims at commit time.
   it('scopes a recap ack instruction to only the rendered events, leaving un-rendered claimed events recoverable', () => {
     const h = buildHarness('claude-445-recap-scope');

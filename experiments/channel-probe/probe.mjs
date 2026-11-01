@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // AgentMon channel probe — a throwaway diagnostic channel MCP server.
 //
-// Purpose: answer the open question in docs/specs/006-agent-integration.md §4.4/§9 —
+// Purpose: answer the open question in openspec/specs/delivery/channel-transport/spec.md, openspec/specs/delivery/transport-seam/spec.md —
 // when Claude Code spawns a stdio channel MCP server, does it set CLAUDE_PROJECT_DIR,
 // what is the server's cwd, and does roots/list work? The answer decides whether the
 // real channel transport can bind to a workspace.
