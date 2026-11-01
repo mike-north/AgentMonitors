@@ -1,4 +1,15 @@
-## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004)
+# Spec Changelog
+
+This file records clarifications, contradiction resolutions, and structural changes to the
+Agent Monitors spec set in `docs/specs/`.
+
+## Usage
+
+- Add entries when ambiguity is resolved or the intended contract changes.
+- Prefer short entries tied to the numbered doc affected.
+- If implementation behavior and desired behavior differ, say so explicitly.
+
+## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004) — Refs #293
 
 The event-order boundary retains raw shared input representation and refreshes explicit
 non-shared delta views from the requested session projection. Optional lifecycle state
@@ -9,7 +20,7 @@ shared history. Supplied text and another recipient's state never become authori
 Tests first reproduced view loss and stale-delta fallback, then verify both raw and
 recipient representations. Immutable event ordering/artifacts remain database-owned.
 
-## 2026-11-01 — Durable equal-time event ordering (002 §1.1.7/§15, 004)
+## 2026-11-01 — Durable equal-time event ordering (002 §1.1.7/§15, 004) — Refs #293
 
 Event queries and claimed cursor advancement retain persisted observation time as their
 primary order and use a private SQLite AUTOINCREMENT sequence for equal-time ties.
@@ -24,7 +35,7 @@ mixed-band candidates, unequal observed times, rollback, migration, maintenance 
 concurrent opens. Snapshot materialization order remains a separate sequence; history
 and source frontiers are unchanged.
 
-## 2026-11-01 — Durable snapshot materialization order across writers (002 §5.2/§15, 004)
+## 2026-11-01 — Durable snapshot materialization order across writers (002 §5.2/§15, 004) — Refs #293
 
 Snapshot predecessor selection now uses a private SQLite AUTOINCREMENT sequence rather
 than wall-clock timestamps and process-local monotonic ULIDs. Equal-clock independent
@@ -37,17 +48,6 @@ historical chronology or regenerate old diffs. Specs document rollback, deletion
 VACUUM/reopen, concurrent migration, and older-reader limitations. Tests use genuine
 independent process factories and verify the adjacent diff predecessor. Event/history
 ordering is outside this snapshot repair.
-
-# Spec Changelog
-
-This file records clarifications, contradiction resolutions, and structural changes to the
-Agent Monitors spec set in `docs/specs/`.
-
-## Usage
-
-- Add entries when ambiguity is resolved or the intended contract changes.
-- Prefer short entries tied to the numbered doc affected.
-- If implementation behavior and desired behavior differ, say so explicitly.
 
 ## 2026-11-01 — Verify uses observation identity boundaries (005 §16) — Refs #532
 
