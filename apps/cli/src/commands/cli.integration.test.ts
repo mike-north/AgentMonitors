@@ -11113,8 +11113,8 @@ describe('hooks-only delivery parity (issue #270)', () => {
       const eventId = unreadEvent.id;
 
       // 3. Delivery claimed via `hook deliver`, fed a real UserPromptSubmit
-      //    stdin payload — the same wire contract Claude Code uses (
-      //    spec: delivery/hook-transport). This is the hooks/CLI equivalent of the channel
+      //    stdin payload — the same wire contract Claude Code uses
+      //    (spec: delivery/hook-transport). This is the hooks/CLI equivalent of the channel
       //    transport's outbound push (channel.ts's poll loop, which also
       //    calls claimDeliveryClient — confirmed statically in
       //    channel-hooks-ipc-parity.test.ts): same daemon IPC call

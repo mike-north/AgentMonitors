@@ -161,8 +161,8 @@ try {
 
   // Both fixtures below declare \`baseline-strategy: incremental\` explicitly:
   // the default, \`net\` (spec: monitor/definition), collapses each object's multiple
-  // observations down to one delivered "newest" event at claim time (
-  // spec: pipeline/post-processing), which would undercount the per-observation event/unread
+  // observations down to one delivered "newest" event at claim time
+  // (spec: pipeline/post-processing), which would undercount the per-observation event/unread
   // assertions below (each of the 2 ticks touches the same object twice).
   // \`incremental\` restores the original play-by-play semantics this smoke
   // test was written against.

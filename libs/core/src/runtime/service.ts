@@ -769,8 +769,8 @@ export class AgentMonitorRuntime {
       ...(input.displayName ? { displayName: input.displayName } : {}),
     });
     // Declaring a watch IS session activity: bump the session's `lastActiveAt`
-    // so a declaration on its own resets the per-session dormancy clock (
-    // spec: delivery/session-projection, agent/ephemeral-monitors). Without this, only `claimDelivery`/recap advance it, so a
+    // so a declaration on its own resets the per-session dormancy clock
+    // (spec: delivery/session-projection, agent/ephemeral-monitors). Without this, only `claimDelivery`/recap advance it, so a
     // session that declares a watch and then blocks on one long tool call (no
     // hooks) would be reaped mid-wait and lose its watches — exactly the case a
     // watch exists for. See also the declaredAt guard in `staleActiveSessions`.

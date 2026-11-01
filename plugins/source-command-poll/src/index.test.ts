@@ -1095,8 +1095,8 @@ describe('source-command-poll', () => {
     });
 
     // Issue #449: a long argv is an identity, not a headline. `objectKey` keeps
-    // the full joined argv, but the human-facing title/summary bound it (
-    // spec: sources/contract) so a jq-heavy poller cannot make its own implementation the alert.
+    // the full joined argv, but the human-facing title/summary bound it
+    // (spec: sources/contract) so a jq-heavy poller cannot make its own implementation the alert.
     it('bounds the argv in title/summary while objectKey and payload keep it whole (issue #449)', async () => {
       // A long trailing argument stands in for the reported jq program: the
       // program ignores it, but it lands in the joined-argv objectKey.

@@ -192,8 +192,8 @@ describe('renderHookDelivery', () => {
   // Issue #441 cross-monitor coalescing (PR #456 review finding 2): a claim
   // with `events` populated must ALSO surface `coalescedReminder` when set —
   // `claimDelivery` claims the coalesced normal rows alongside the surfaced
-  // high events, so omitting this would claim-but-never-render them (
-  // spec: delivery/channel-transport, delivery/hook-transport).
+  // high events, so omitting this would claim-but-never-render them
+  // (spec: delivery/channel-transport, delivery/hook-transport).
   it('appends the coalesced reminder footer, with this transport’s own ack action step, after the packed event block(s)', () => {
     const out = renderHookDelivery(
       makeClaim({

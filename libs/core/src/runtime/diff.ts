@@ -393,8 +393,8 @@ function diffJsonArrayByKey(
     }
   }
 
-  // Same key set, same content per key — but json-diff's `hasChanged` (
-  // spec: sources/api-poll, sources/command-poll) is array-ORDER-sensitive (it sorts object keys, never array
+  // Same key set, same content per key — but json-diff's `hasChanged`
+  // (spec: sources/api-poll, sources/command-poll) is array-ORDER-sensitive (it sorts object keys, never array
   // elements), so a pure reorder is a real detected change. The invariant
   // "change detected ⟺ non-empty diffText" must hold even though identity-key
   // matching is itself order-insensitive, so surface the reorder explicitly

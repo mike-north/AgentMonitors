@@ -198,8 +198,8 @@ export async function commitDeliveryClient(
 }
 
 /**
- * Release a reservation from {@link reserveDeliveryClient} WITHOUT claiming (
- * spec: delivery/channel-transport, issue #300): the push failed/disconnected, so the leased rows return to
+ * Release a reservation from {@link reserveDeliveryClient} WITHOUT claiming
+ * (spec: delivery/channel-transport, issue #300): the push failed/disconnected, so the leased rows return to
  * `pending` for the hook transport (or the next poll) to re-deliver.
  */
 export async function releaseDeliveryClient(

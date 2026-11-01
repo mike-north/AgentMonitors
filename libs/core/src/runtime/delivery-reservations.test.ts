@@ -86,8 +86,8 @@ function makeHarness({
     objectKey: 'ci/default',
     queryScope: { pipeline: 'default' },
     tags: ['ci'],
-    // A high event must be past the 15s settle window to be deliverable (
-    // spec: delivery/lifecycles); a normal event surfaces immediately as a reminder.
+    // A high event must be past the 15s settle window to be deliverable
+    // (spec: delivery/lifecycles); a normal event surfaces immediately as a reminder.
     createdAt: new Date(Date.now() - (urgency === 'high' ? 20_000 : 1_000)),
   });
   return {

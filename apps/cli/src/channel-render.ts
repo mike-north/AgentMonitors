@@ -131,8 +131,8 @@ export const CHANNEL_DEFERRED_MARKER =
  * no `--socket` could silently query the wrong (or a dead) daemon. The path is
  * escaped with {@link escapeShellPath} — NOT `metaValue`/`contentValue`, since
  * both of those strip the very tag-breakout characters a raw path could
- * contain rather than round-tripping them — so it stays both tag-safe (
- * spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") and shell-safe, and reconstructs to the exact original path when the
+ * contain rather than round-tripping them — so it stays both tag-safe
+ * (spec: delivery/channel-transport, delivery/transport-seam — "Channel meta and content are sanitized", "Injecting transports keep identity out of untrusted content") and shell-safe, and reconstructs to the exact original path when the
  * advertised command is run (issue #442, PR #442 round-8 review). Omitted (no
  * `--socket` clause) only when the caller genuinely has no socket to
  * advertise.

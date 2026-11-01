@@ -422,8 +422,8 @@ export async function reserveSizedChannelDelivery(
 }
 
 /**
- * One reserve → push → commit/release delivery cycle for a bound session (
- * spec: delivery/channel-transport, issue #300).
+ * One reserve → push → commit/release delivery cycle for a bound session
+ * (spec: delivery/channel-transport, issue #300).
  *
  * Reserves the pending `turn-interruptible` delivery — which leases the rows so
  * the hook transport will not double-surface them (spec: delivery/channel-transport) — pushes the claim
@@ -460,8 +460,8 @@ export async function runChannelDeliveryCycle(
     await push(reservation.claim, moreDeferred);
   } catch {
     // Push rejected/disconnected: release the reservation so the leased rows
-    // return to pending and re-deliver via the hook path or the next poll (
-    // spec: delivery/channel-transport, issue #300). NEVER commit here — committing an unsurfaced claim is the
+    // return to pending and re-deliver via the hook path or the next poll
+    // (spec: delivery/channel-transport, issue #300). NEVER commit here — committing an unsurfaced claim is the
     // delivery-loss bug this cycle exists to prevent. Release is best-effort: if
     // it also fails (daemon unreachable), the reservation self-expires.
     await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
@@ -502,8 +502,8 @@ export const CHANNEL_SERVER_INSTRUCTIONS =
  * event. Each poll RESERVES the delivery, pushes it, and COMMITS the claim only
  * after the push succeeds — so a rejected or disconnected push never permanently
  * consumes the delivery; the leased rows are released back to the hook transport
- * (spec: delivery/channel-transport, issue #300). Reserving leases the rows, so cross-transport dedup (
- * spec: delivery/channel-transport) still holds during the push. Inbound: expose an `agentmon_ack` tool that
+ * (spec: delivery/channel-transport, issue #300). Reserving leases the rows, so cross-transport dedup
+ * (spec: delivery/channel-transport) still holds during the push. Inbound: expose an `agentmon_ack` tool that
  * routes through `events.ack` so the agent can acknowledge what it has handled
  * (spec: delivery/channel-transport — "Channel acknowledgement tool", "Acknowledgement is re-authorized to the bound session").
  */
