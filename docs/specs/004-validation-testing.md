@@ -237,6 +237,17 @@ that waits for its durable `triggered` history row before returning; verificatio
 Run the daemon suite serially with retries disabled when accepting this boundary repair. This proves
 the deterministic recording-order defect and repair, not that every historical CI failure had that cause.
 
+### 3.5.2 Literal-path verify cleanup and first-attempt acceptance
+
+The literal-glob integration scenario must prove that verify removes the file it created and its
+create/delete events, then materializes the user's later file contents for the existing lead session.
+The same event identity must survive at least two subsequent completed observations. A filename
+substring or a fixed sleep cannot establish those durable-state guarantees on a loaded daemon.
+
+Acceptance for #452 runs the entire verification integration file repeatedly with retries disabled,
+including bounded CPU contention whose workers are reaped afterward. Failed verification assertions
+include the command report; the literal-path assertion also includes retained observation history.
+
 ### 3.6 PR-alerting presets (`init --type pr-review` / `--type my-prs`, issue #444)
 
 All rows below are covered by `apps/cli/src/commands/pr-alerting-presets.test.ts`, which drives the

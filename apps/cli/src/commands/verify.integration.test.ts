@@ -17,6 +17,7 @@ import {
 } from 'node:child_process';
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -29,6 +30,8 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import type { MonitorEventRecord } from '@agentmonitors/core';
+import { listObservationHistoryClient } from '../runtime-client.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 
@@ -114,7 +117,7 @@ describe('agentmonitors verify', () => {
       ['verify', 'docs-watch', '--workspace', ws, '--format', 'json'],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       stages: { name: string; status: string }[];
@@ -154,7 +157,7 @@ describe('agentmonitors verify', () => {
       ['verify', 'debounced', '--workspace', ws, '--format', 'json'],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       failure: { kind: string } | null;
@@ -278,7 +281,7 @@ describe('agentmonitors verify', () => {
       ],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       stages: { name: string; status: string; detail: string }[];
@@ -368,7 +371,7 @@ describe('agentmonitors verify', () => {
       ],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       failure: { kind: string; message: string } | null;
@@ -432,7 +435,7 @@ describe('agentmonitors verify', () => {
       ],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       failure: { kind: string; message: string } | null;
@@ -749,7 +752,10 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         ok: boolean;
         stages: { name: string; status: string }[];
       };
-      expect(verifyReport.ok).toBe(true);
+      expect(
+        verifyReport.ok,
+        `${verifyResult.stdout}\n${verifyResult.stderr}`,
+      ).toBe(true);
       expect(verifyResult.exitCode).toBe(0);
       // The scratch file itself is gone from disk (unchanged cleanup contract).
       expect(scratchFiles(ws)).toHaveLength(0);
@@ -931,7 +937,7 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         additionalContext: string | null;
       };
       expect(report.ok, JSON.stringify({ report, evidence })).toBe(true);
-      expect(result.exitCode).toBe(0);
+      expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
       expect(report.stages.find(({ name }) => name === 'observe')?.status).toBe(
         'pass',
       );
@@ -1060,23 +1066,33 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         ok: boolean;
         stages: { name: string; status: string }[];
       };
-      expect(verifyReport.ok).toBe(true);
+      expect(
+        verifyReport.ok,
+        `${verifyResult.stdout}\n${verifyResult.stderr}\nHistory: ${JSON.stringify(await listObservationHistoryClient({ monitorId: 'file-watch', workspacePath: ws, limit: 10 }, env['AGENTMONITORS_SOCKET']))}`,
+      ).toBe(true);
       expect(verifyResult.exitCode).toBe(0);
-      // verify's own trigger file is gone from disk again (it created + removed it).
-      expect(scratchFiles(ws)).toHaveLength(0);
+      // A literal trigger uses the real watched name, not the scratch prefix.
+      // Both the file and its synthetic create/delete events must be gone before
+      // a later create can serve as evidence of non-suppression.
+      const watched = path.join(ws, 'watched.txt');
+      expect(existsSync(watched)).toBe(false);
+      const afterVerify = runWs(
+        ['events', 'list', '--session', sessionId, '--format', 'json'],
+        ws,
+        env,
+      );
+      expect(afterVerify.exitCode, afterVerify.stderr).toBe(0);
+      expect(JSON.parse(afterVerify.stdout)).toEqual([]);
 
       // ── The finding: a REAL create at the watched path AFTER verify must be
       // delivered and SURVIVE. Pre-fix, a durable tombstone keyed to this real path
       // swept it on the tick it materialized, so it never appeared. Post-fix there
       // is no tombstone at a real path, so it lands and stays.
-      writeFileSync(
-        path.join(ws, 'watched.txt'),
-        'a genuine change\n',
-        'utf-8',
-      );
-      let realDelivered = false;
+      const realContents = 'a genuine change\n';
+      writeFileSync(watched, realContents, 'utf-8');
+      let realEvent: MonitorEventRecord | undefined;
       const realDeadline = Date.now() + 20_000;
-      while (Date.now() < realDeadline && !realDelivered) {
+      while (Date.now() < realDeadline && !realEvent) {
         const unread = runWs(
           [
             'events',
@@ -1090,23 +1106,66 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
           ws,
           env,
         );
-        if (unread.exitCode === 0 && unread.stdout.includes('watched.txt')) {
-          realDelivered = true;
-          break;
-        }
+        expect(unread.exitCode, unread.stderr).toBe(0);
+        const events = JSON.parse(unread.stdout) as MonitorEventRecord[];
+        realEvent = events.find(
+          (event) =>
+            event.monitorId === 'file-watch' &&
+            event.objectKey === watched &&
+            event.snapshotText === realContents,
+        );
+        if (realEvent) break;
         await delay(400);
       }
-      expect(realDelivered).toBe(true);
+      expect(
+        realEvent,
+        'the real file contents must materialize for the lead session',
+      ).toBeDefined();
+      expect(realEvent?.deliveryState).toBe('unread');
 
-      // And it SURVIVES subsequent ticks (a tombstone would have swept it by now).
-      await delay(2_000);
+      // Prove survival across completed observations, not elapsed wall time:
+      // a loaded daemon may not run any ticks during a fixed sleep.
+      const historyQuery = {
+        monitorId: 'file-watch',
+        workspacePath: ws,
+        limit: 10,
+      };
+      const history = await listObservationHistoryClient(
+        historyQuery,
+        env['AGENTMONITORS_SOCKET'],
+      );
+      const frontier = history[0]?.id;
+      expect(frontier).toBeDefined();
+      const survivalDeadline = Date.now() + 20_000;
+      let subsequentObservations = 0;
+      while (Date.now() < survivalDeadline && subsequentObservations < 2) {
+        const rows = await listObservationHistoryClient(
+          historyQuery,
+          env['AGENTMONITORS_SOCKET'],
+        );
+        subsequentObservations = rows.filter(
+          (row) => frontier !== undefined && row.id > frontier,
+        ).length;
+        if (subsequentObservations < 2) await delay(100);
+      }
+      expect(
+        subsequentObservations,
+        'daemon must complete two later observations',
+      ).toBeGreaterThanOrEqual(2);
       const stillThere = runWs(
         ['events', 'list', '--session', sessionId, '--format', 'json'],
         ws,
         env,
       );
       expect(stillThere.exitCode).toBe(0);
-      expect(stillThere.stdout).toContain('watched.txt');
+      const surviving = JSON.parse(stillThere.stdout) as MonitorEventRecord[];
+      expect(
+        surviving.find((event) => event.id === realEvent?.id),
+      ).toMatchObject({
+        objectKey: watched,
+        snapshotText: realContents,
+        deliveryState: 'unread',
+      });
     } finally {
       runWs(['daemon', 'stop'], ws, env);
       if (daemon.exitCode === null) {
