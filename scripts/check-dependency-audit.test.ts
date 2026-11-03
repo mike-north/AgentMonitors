@@ -618,7 +618,7 @@ const PATCHED_MINIMUMS_UNDER_ANCESTOR = [
   // Our own `glob` dependency (libs/core, apps/cli,
   // plugins/source-file-fingerprint) resolves minimatch@10.x, which pulls
   // brace-expansion — GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg,
-  // GHSA-rgw5-rvv9-x895, patched >=5.0.9. Scoped to the `@agentmonitors/core`
+  // GHSA-rgw5-rvv9-x895 and later fixes, enforced floor >=5.0.12. Scoped to the `@agentmonitors/core`
   // ancestor (rather than `glob` or `minimatch`, whose names are also used,
   // at different unrelated majors, by devDependency-only tooling such as
   // fixturify-project and nx) to isolate this exact path.
@@ -660,9 +660,10 @@ describe('resolved dependency versions clear known high-severity advisories on t
 
 // These experiments are independent npm projects. Root workspace overrides
 // cannot protect them; each committed npm lock must select the patched code.
+// Selected packages are checked throughout the lock, including development paths.
 describe('standalone experiment security resolutions', () => {
   for (const experiment of ['channel-probe', 'channel-uat', 'host-probe']) {
-    it(`${experiment} resolves patched production dependencies`, () => {
+    it(`${experiment} resolves patched dependencies throughout its lockfile`, () => {
       const lock = JSON.parse(
         readFileSync(
           new URL(
@@ -672,6 +673,25 @@ describe('standalone experiment security resolutions', () => {
           'utf8',
         ),
       );
+      expect(lock, `${experiment}: expected a parsed npm lockfile`).toBeTypeOf(
+        'object',
+      );
+      expect(
+        lock,
+        `${experiment}: expected npm lockfile packages map`,
+      ).toHaveProperty('packages');
+      expect(
+        lock.packages,
+        `${experiment}: packages must be a record`,
+      ).toBeTypeOf('object');
+      expect(
+        lock.packages,
+        `${experiment}: packages must not be null`,
+      ).not.toBeNull();
+      expect(
+        Array.isArray(lock.packages),
+        `${experiment}: packages must not be an array`,
+      ).toBe(false);
       for (const [pkg, minimum] of [
         ['@modelcontextprotocol/sdk', '1.32.0'],
         ['fast-uri', '3.1.9'],
