@@ -70,7 +70,8 @@ phase() {
 # Runs "$@" with combined stdout+stderr captured to the current phase's log
 # file (never discarded) so a failure in this phase is diagnosable.
 run_logged() {
-  "$@" >"$LOG_DIR/$CURRENT_PHASE.log" 2>&1
+  echo "=== phase: $CURRENT_PHASE ==="
+  "$@" 2>&1 | tee "$LOG_DIR/$CURRENT_PHASE.log"
 }
 
 phase "apt-get-update"
@@ -81,7 +82,7 @@ run_logged apt-get install -y python3 make g++
 mkdir -p /tmp/repo /tmp/agentmon-home /tmp/npm-cache /tmp/node-gyp /tmp/xdg
 cd /workspace
 phase "extract-workspace"
-run_logged bash -c 'tar --exclude=node_modules --exclude=dist -cf - . | (cd /tmp/repo && tar -xf -)'
+run_logged bash -o pipefail -c 'tar --exclude=node_modules --exclude=dist -cf - . | (cd /tmp/repo && tar -xf -)'
 cd /tmp/repo
 
 phase "corepack-prepare"
