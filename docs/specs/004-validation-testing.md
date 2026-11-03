@@ -92,6 +92,8 @@ indirection under a real global install.
 wired into CI per-PR). The MCP/channel transport ([006 §4](./006-agent-integration.md)) has no
 equivalent fresh-environment proof yet — tracked as a follow-up, not this surface's scope.
 
+The packed Windows install check invokes package-manager JavaScript entrypoints through Node without a shell. Its isolated temporary root includes spaces so packing and installation exercise literal path arguments on every platform. Windows CI verifies the native Windows path.
+
 ### 2.8 Suite-discovery integrity (zero-test guard)
 
 A package-level test suite is only useful evidence if it can fail. Every test-bearing package's

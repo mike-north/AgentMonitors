@@ -9,6 +9,10 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-03 — Preserve package-manager arguments in install checks (004 §2.7) — Refs #520
+
+Run package-manager JavaScript entrypoints without a shell and exercise temporary paths containing spaces in the install check.
+
 ## 2026-11-03 — Update milestone references after the roadmap reorganization (008, roadmap) — Refs #539
 
 Point the milestone citations in 008 §9–§10 and the G21 proof at the milestones in
