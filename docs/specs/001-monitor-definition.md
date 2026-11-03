@@ -734,3 +734,9 @@ Once the sigil-based glob scope logic is implemented, `agentmonitors validate` M
 
 See [003 §3.5](./003-source-plugins.md) for the full source-level validation rules and the
 required test matrix.
+
+### Validation library contract
+
+The exported monitor schemas use Zod 4 types. Parsed monitor fields and authored
+validation messages retain their contracts; consumers composing exported schemas
+must use Zod 4-compatible APIs. Library-generated issue details follow Zod 4.

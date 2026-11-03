@@ -128,7 +128,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
 
   if (parts.length !== 2) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message:
         'urgency must be a single level (e.g. "normal") or a range "lo..hi" (e.g. "normal..high")',
     });
@@ -143,7 +143,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
 
   if (!isLevel(loRaw) || !isLevel(hiRaw)) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: `urgency bounds must each be one of ${urgencyLevels
         .map((level) => `"${level}"`)
         .join(', ')}`,
@@ -153,7 +153,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
 
   if (urgencyRank[loRaw] > urgencyRank[hiRaw]) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: `range "${loRaw}..${hiRaw}" is inverted — the low bound must not exceed the high bound`,
     });
     return z.NEVER;
@@ -201,7 +201,7 @@ const shapeSchema = z
       const error = validateCelPredicate(rule.when);
       if (error) {
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: 'custom',
           path: ['derive', index, 'when'],
           message: `malformed CEL predicate: ${error}`,
         });
@@ -268,7 +268,7 @@ const payloadSchema = z
   .superRefine((payload, ctx) => {
     if (payload.transform && payload.form !== 'structured') {
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: 'custom',
         path: ['transform'],
         message:
           'payload.transform is only valid when payload.form is "structured"',
@@ -279,7 +279,7 @@ const payloadSchema = z
       const error = validatePayloadTransform(payload.transform);
       if (error) {
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: 'custom',
           path: ['transform', 'expression'],
           message: `malformed ${payload.transform.language} transform: ${error}`,
         });

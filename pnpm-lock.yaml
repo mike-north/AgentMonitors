@@ -107,7 +107,7 @@ importers:
         version: link:../../plugins/source-schedule
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.2
-        version: 1.32.2(@cfworker/json-schema@4.1.1)(zod@3.25.76)
+        version: 1.32.2(@cfworker/json-schema@4.1.1)(zod@4.6.7)
       '@toon-format/toon':
         specifier: ^2.3.1
         version: 2.3.1
@@ -124,8 +124,8 @@ importers:
         specifier: ^0.2.0
         version: 0.2.0
       zod:
-        specifier: ^3.25.76
-        version: 3.25.76
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@types/node':
         specifier: ^22.15.0
@@ -198,8 +198,8 @@ importers:
         specifier: ^2.3.0
         version: 2.4.0
       zod:
-        specifier: ^3.25.3
-        version: 3.25.76
+        specifier: ^4.6.7
+        version: 4.6.7
     devDependencies:
       '@types/better-sqlite3':
         specifier: ^9.6.0
@@ -3871,10 +3871,6 @@ packages:
     resolution: {integrity: sha512-aUYIEU/UviqPgc8mHR6IW1EGxkAXpeRETYcrzg8cLAvUPZcpAlleSXHV2mY7G12GphSH6Gzv+4MMVSSkbdteHg==}
     engines: {node: '>=8'}
 
-  source-map-js@1.2.1:
-    resolution: {integrity: sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA==}
-    engines: {node: '>=0.10.0'}
-
   source-map-js@1.2.2:
     resolution: {integrity: sha512-KGj/8Y43x35aZVDtt+J4mK1hoLGHULMYfSkODJNQjNDC3oW1PqPoxMwo0pLUsWM/UEGzON/NxeHywEfNXNP3Vw==}
     engines: {node: '>=0.10.0'}
@@ -4349,11 +4345,8 @@ packages:
     peerDependencies:
       zod: ^3.25.28 || ^4
 
-  zod@3.25.76:
-    resolution: {integrity: sha512-gzUt/qt81nXsFGKIFcC3YnfEAx5NkunCfnDlvuBSSFS02bcXu4Lmea0AFIUwbLWxWPx3d9p8S5QoaujKcNQxcQ==}
-
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
+  zod@4.6.7:
+    resolution: {integrity: sha512-g8W2D2kU6a8untc053fX1uVBKzM7yqAxW/3zwk83+6RyF2+SKOuV+c0wBDhUwzV1PaGapmZH+rmcUzPf+3CGwg==}
 
 snapshots:
 
@@ -4365,7 +4358,7 @@ snapshots:
     dependencies:
       jiti: 2.7.0
       yaml: 2.9.0
-      zod: 4.4.3
+      zod: 4.6.7
 
   '@api-extractor-tools/eslint-plugin@0.1.0(eslint@10.0.3(jiti@2.7.0))(typescript@5.9.3)':
     dependencies:
@@ -5087,7 +5080,7 @@ snapshots:
 
   '@microsoft/tsdoc@0.16.0': {}
 
-  '@modelcontextprotocol/sdk@1.32.2(@cfworker/json-schema@4.1.1)(zod@3.25.76)':
+  '@modelcontextprotocol/sdk@1.32.2(@cfworker/json-schema@4.1.1)(zod@4.6.7)':
     dependencies:
       '@hono/node-server': 1.19.14(hono@4.13.16)
       ajv: 8.18.0
@@ -5104,8 +5097,8 @@ snapshots:
       json-schema-typed: 8.0.2
       pkce-challenge: 5.0.1
       raw-body: 3.0.2
-      zod: 3.25.76
-      zod-to-json-schema: 3.25.2(zod@3.25.76)
+      zod: 4.6.7
+      zod-to-json-schema: 3.25.2(zod@4.6.7)
     optionalDependencies:
       '@cfworker/json-schema': 4.1.1
     transitivePeerDependencies:
@@ -7516,7 +7509,7 @@ snapshots:
     dependencies:
       nanoid: 3.3.18
       picocolors: 1.1.1
-      source-map-js: 1.2.1
+      source-map-js: 1.2.2
 
   postcss@8.5.8:
     dependencies:
@@ -7853,8 +7846,6 @@ snapshots:
   sort-keys@4.2.0:
     dependencies:
       is-plain-obj: 2.1.0
-
-  source-map-js@1.2.1: {}
 
   source-map-js@1.2.2: {}
 
@@ -8280,10 +8271,8 @@ snapshots:
 
   yocto-queue@0.1.0: {}
 
-  zod-to-json-schema@3.25.2(zod@3.25.76):
+  zod-to-json-schema@3.25.2(zod@4.6.7):
     dependencies:
-      zod: 3.25.76
+      zod: 4.6.7
 
-  zod@3.25.76: {}
-
-  zod@4.4.3: {}
+  zod@4.6.7: {}

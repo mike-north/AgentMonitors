@@ -541,6 +541,8 @@ describe('versionAtLeast', () => {
 // GitHub advisory. Runs the real `pnpm why --json` against the workspace's
 // actual node_modules/lockfile resolution.
 const PATCHED_MINIMUMS = [
+  // GHSA-mrhx-c7xc-m3w5: direct validation must resolve patched Zod 4.
+  { package: 'zod', minVersion: '4.6.6' },
   // Published dependency floors must cover the advisory fixes even outside
   // this workspace, where pnpm overrides do not accompany our packages.
   // GHSA-p95v-992w-h6c3 (TOON); GHSA-46jr-4wx8-v453 and related SDK advisories.
