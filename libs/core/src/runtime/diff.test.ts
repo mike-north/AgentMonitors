@@ -10,7 +10,7 @@
  * @see ../../../../docs/specs/002-runtime-delivery.md §5.2
  * @see ../../../../docs/specs/003-source-plugins.md §11.3, §4.2 (json-diff strategy)
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildDiff,
   buildJsonDiff,
@@ -435,11 +435,10 @@ describe('buildJsonDiff — untrusted path escaping and bounding (issue #437 rev
 describe('buildJsonDiff — performance (issue #437 review)', () => {
   // REGRESSION: the no-identity array matcher previously did a full
   // JSON.stringify(sortKeysDeep(...)) of both elements PER PROBE (O(N*M)),
-  // making a reversed 5,000-element array take roughly 1.5s of synchronous
-  // daemon-tick time. The counted-multiset rework is O(N+M); this must stay
-  // comfortably under a generous bound even on a slow CI runner.
-  it('diffs a reversed 5,000-element array (no identity key) well under a bounded time', () => {
-    const prev = Array.from({ length: 5000 }, (_, i) => ({
+  // causing quadratic serialization work. Count that work directly so a
+  // busy runner cannot fail the guard merely by delaying execution.
+  it('diffs a reversed array without pairwise serialization work', () => {
+    const prev = Array.from({ length: 200 }, (_, i) => ({
       // Two fields so no single field is a usable identity key, forcing the
       // deep-equality multiset matcher.
       a: i,
@@ -447,15 +446,21 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
     }));
     const curr = [...prev].reverse();
 
-    const start = performance.now();
-    const diff = buildJsonDiff(JSON.stringify(prev), JSON.stringify(curr));
-    const elapsedMs = performance.now() - start;
-
-    expect(diff).toBeDefined();
-    // A pure reorder of every element renders as one `reordered` entry, not
-    // 5,000 remove/add pairs.
-    expect(diff).toContain('reordered');
-    expect(elapsedMs).toBeLessThan(300);
+    const prevText = JSON.stringify(prev);
+    const currText = JSON.stringify(curr);
+    const stringify = vi.spyOn(JSON, 'stringify');
+    try {
+      const diff = buildJsonDiff(prevText, currText);
+      expect(diff).toContain('reordered');
+      // Canonicalizing each input once costs N+M calls; allow twice that
+      // budget for rendering and other linear work. Pairwise probes on this
+      // reversed fixture require N*(N+1) calls and exceed it decisively.
+      expect(stringify.mock.calls.length).toBeLessThanOrEqual(
+        2 * (prev.length + curr.length),
+      );
+    } finally {
+      stringify.mockRestore();
+    }
   });
 
   // REGRESSION: the reversed-unique fixture above only ever produces
@@ -481,8 +486,8 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
   // of an absolute duration. Load noise (a slower/busier runner) scales both
   // measurements together and mostly cancels out of the ratio, whereas a
   // quadratic regression makes 4x the input take ~16x as long regardless of
-  // how fast or slow the runner is — so the ratio bound stays sensitive to
-  // the thing it guards while becoming insensitive to ambient load.
+  // how fast or slow the runner is. Unequal scheduling delays or GC pauses
+  // can still affect the ratio; this is not a deterministic operation count.
   it('diffs a large duplicate-value bucket plus one moved element in time that scales linearly (not quadratically) with bucket size', () => {
     function fixtureTexts(duplicateCount: number): {
       prevText: string;
@@ -526,14 +531,12 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
     const largeElapsedMs = timeDiff(LARGE_COUNT);
     const ratio = largeElapsedMs / smallElapsedMs;
 
-    // Linear (O(N+M)) behavior puts the ratio near 4x (measured locally:
-    // ~4.0-4.5x, including fixed per-call overhead that skews slightly
-    // above 4x at the smaller size). Quadratic (O(M^2)) behavior on a 4x
-    // input puts the ratio near 16x. 8x sits with wide margin above the
-    // linear expectation and wide margin below the quadratic one, so it
-    // stays load-insensitive (both measurements move together under
-    // ambient noise) while still failing hard on a genuine complexity
-    // regression (issues #437, #515).
+    // Linear work gives (a + 4*b*N)/(a + b*N): nonnegative fixed overhead
+    // a pushes the ratio BELOW 4 toward 1. Unequal scheduling or GC costs
+    // can push a measured ratio above 4. The 8x bound leaves headroom for
+    // those effects while staying below the ~16x ratio of quadratic bucket
+    // work at these sizes (issues #437, #515); shared slowdowns cancel only
+    // to the extent that they affect both measurements proportionally.
     expect(ratio).toBeLessThan(8);
   });
 });
