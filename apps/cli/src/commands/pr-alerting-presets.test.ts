@@ -15,8 +15,10 @@
 import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -26,6 +28,7 @@ import path from 'node:path';
 import { parseMonitor } from '@agentmonitors/core';
 import commandPoll from '@agentmonitors/source-command-poll';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { assertPresetOutput } from './fixtures/assert-preset-output.js';
 import { TEMPLATES } from './init.js';
 
 /** Where the scaffolded template's `watch:` block lands after parsing. */
@@ -218,17 +221,52 @@ async function observe(
 ): Promise<ObserveResult> {
   const fixtureFile = path.join(tempDir('fixture'), 'fixture.json');
   writeFileSync(fixtureFile, fixture, 'utf-8');
+  // Preserve subprocess diagnostics outside the source's successful baseline,
+  // which intentionally retains stdout but not successful stderr (003 §11).
+  const diagnostics = tempDir('jq-diagnostics');
+  const stderrFile = path.join(diagnostics, 'stderr');
+  const exitFile = path.join(diagnostics, 'exit');
+  const command = scope.command;
+  if (
+    !Array.isArray(command) ||
+    !command.every((arg) => typeof arg === 'string')
+  ) {
+    throw new Error('Expected preset command argv');
+  }
   const result = await commandPoll.observe(
     {
       ...scope,
-      env: { PATH: pathWith(stubDir), AM444_FIXTURE: fixtureFile },
+      command: [
+        'bash',
+        '-c',
+        '"$@" 2>"$AM475_STDERR"; code=$?; printf "%s" "$code" >"$AM475_EXIT"; exit "$code"',
+        'preset-jq',
+        ...command,
+      ],
+      env: {
+        PATH: pathWith(stubDir),
+        AM444_FIXTURE: fixtureFile,
+        AM475_STDERR: stderrFile,
+        AM475_EXIT: exitFile,
+      },
     },
     {
       now: new Date('2026-01-15T10:00:00.000Z'),
       ...(previousState === undefined ? {} : { previousState }),
     },
   );
-  const state = result.nextState as { stdout?: string } | undefined;
+  const state = result.nextState as
+    | { stdout?: string; truncated?: boolean }
+    | undefined;
+  assertPresetOutput(
+    command,
+    existsSync(exitFile) ? readFileSync(exitFile, 'utf8') : 'unavailable',
+    existsSync(stderrFile)
+      ? readFileSync(stderrFile, 'utf8')
+      : '(not captured)',
+    state?.stdout ?? '',
+    state?.truncated ?? false,
+  );
   return {
     titles: result.observations.map((o) => o.title),
     stdout: state?.stdout ?? '',
@@ -2057,4 +2095,22 @@ describe('preset portability guarantees (issue #444)', () => {
     expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: high$/m);
     expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: high$/m);
   });
+});
+
+/** Exercise the same subprocess boundary used by every real-jq preset case. */
+describe('real-jq helper diagnostics (issue #475)', () => {
+  it.each([
+    ['0', ''],
+    ['7', 'jq: invalid filter'],
+  ])(
+    'reports empty or failed subprocess output before parsing',
+    async (code, stderr) => {
+      const scope = {
+        command: ['bash', '-c', `printf '%s' '${stderr}' >&2; exit ${code}`],
+      };
+      await expect(observe(scope, tempDir('empty-jq'), '[]')).rejects.toThrow(
+        new RegExp(`exit code: ${code}\\nstderr:`),
+      );
+    },
+  );
 });
