@@ -116,6 +116,9 @@ export async function main() {
     npm_config_python: missingPython,
   };
 
+  console.log(
+    `Package-manager entrypoint: ${process.env.npm_execpath ?? '(unavailable)'}`,
+  );
   console.log('Packing every publishable package (pnpm pack)...');
   const tarballs = PACKAGE_DIRS.map((dir) =>
     packPackage(path.join(REPO_ROOT, dir), packDir),

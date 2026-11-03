@@ -37,15 +37,16 @@ function fixture(extension: string): { root: string; entry: string } {
   const entry = path.join(root, `package manager${extension}`);
   writeFileSync(
     entry,
-    `const fs = require('node:fs');
-     fs.writeFileSync(require('node:path').join(process.argv[4], 'fixture.tgz'), 'packed');
-     fs.writeFileSync(require('node:path').join(process.argv[4], 'argv.json'), JSON.stringify(process.argv.slice(2)));`,
+    `import('node:fs').then(fs => {
+     fs.writeFileSync(process.argv[4] + '/fixture.tgz', 'packed');
+     fs.writeFileSync(process.argv[4] + '/argv.json', JSON.stringify(process.argv.slice(2)));
+     });`,
   );
   return { root, entry };
 }
 
 describe('packPackage shell-free invocation (#520)', () => {
-  it.each(['.cjs', '.js'])(
+  it.each(['.cjs', '.js', '.mjs'])(
     'runs the %s entrypoint with literal path arguments',
     (extension) => {
       const { root, entry } = fixture(extension);

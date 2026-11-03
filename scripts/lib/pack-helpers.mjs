@@ -15,8 +15,11 @@ import path from 'node:path';
  * previously a verbatim copy maintained in both files.
  */
 export function packPackage(packageDir, packDestDir) {
+  // pnpm 11 publishes an ESM .mjs launcher; all Node JavaScript module
+  // extensions are valid here. Never execute the surrounding command shim.
   const entry = process.env.npm_execpath;
-  const useEntry = typeof entry === 'string' && /\.(?:cjs|js)$/i.test(entry);
+  const useEntry =
+    typeof entry === 'string' && /\.(?:cjs|mjs|js)$/i.test(entry);
   if (!useEntry && process.platform === 'win32') {
     throw new Error(
       'On Windows, run via pnpm so its JavaScript entrypoint is available.',
