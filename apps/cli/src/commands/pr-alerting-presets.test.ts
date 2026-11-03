@@ -237,7 +237,7 @@ async function observe(
     {
       ...scope,
       command: [
-        'bash',
+        'sh',
         '-c',
         '"$@" 2>"$AM475_STDERR"; code=$?; printf "%s" "$code" >"$AM475_EXIT"; exit "$code"',
         'preset-jq',
@@ -2099,6 +2099,17 @@ describe('preset portability guarantees (issue #444)', () => {
 
 /** Exercise the same subprocess boundary used by every real-jq preset case. */
 describe('real-jq helper diagnostics (issue #475)', () => {
+  it('captures valid output using sh when bash cannot run', async () => {
+    const stub = tempDir('no-bash');
+    // Shadow any installed bash to enforce the helper's POSIX-shell boundary.
+    writeExecutable(path.join(stub, 'bash'), '#!/bin/sh\nexit 99\n');
+    const result = await observe(
+      { command: ['sh', '-c', 'printf "[]"'] },
+      stub,
+      '[]',
+    );
+    expect(result.stdout).toBe('[]');
+  });
   it.each([
     ['0', ''],
     ['7', 'jq: invalid filter'],
@@ -2106,7 +2117,7 @@ describe('real-jq helper diagnostics (issue #475)', () => {
     'reports empty or failed subprocess output before parsing',
     async (code, stderr) => {
       const scope = {
-        command: ['bash', '-c', `printf '%s' '${stderr}' >&2; exit ${code}`],
+        command: ['sh', '-c', `printf '%s' '${stderr}' >&2; exit ${code}`],
       };
       await expect(observe(scope, tempDir('empty-jq'), '[]')).rejects.toThrow(
         new RegExp(`exit code: ${code}\\nstderr:`),
