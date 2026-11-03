@@ -21,8 +21,8 @@
 > [#479](https://github.com/mike-north/AgentMonitors/issues/479),
 > [#480](https://github.com/mike-north/AgentMonitors/issues/480),
 > [#507](https://github.com/mike-north/AgentMonitors/issues/507),
-> [#426](https://github.com/mike-north/AgentMonitors/issues/426), and the milestone-M3
-> durable-state/verification set cited in §9–§10). Rules marked **current**
+> [#426](https://github.com/mike-north/AgentMonitors/issues/426), and the durable-state and
+> verification set cited in §9–§10, tracked in milestones M0, M1 and M3). Rules marked **current**
 > are already enforced and cite their proving tests. When a target rule ships, move it to
 > _current_ with `verified:` references, and add a
 > [spec-changelog.md](./spec-changelog.md) entry
@@ -322,7 +322,7 @@ one. The exact numeric budget per interval is set by #469's design work; the pro
 is normative now so #469's budget lands as a number in an existing assertion, not a new test
 design.
 
-## 9. Durable-State Truthfulness (target — milestone M3)
+## 9. Durable-State Truthfulness (target — milestones M1 and M3)
 
 Process hygiene is one half of "a process you can leave running"; the other half is that the
 daemon never lies about durable state. The mechanisms are owned by
@@ -363,7 +363,7 @@ ingest → materialize → project → deliver and assert on restart that durabl
 complete or truthfully marked failed, never silently partial
 ([002](./002-runtime-delivery.md)'s restart-safety discipline).
 
-## 10. Verification-Gate Trust (target — milestone M3)
+## 10. Verification-Gate Trust (target — milestone M0)
 
 The claims above are only as credible as the gate that verifies them, so the gate itself
 carries commitments (#504's verification-gate expectations):
