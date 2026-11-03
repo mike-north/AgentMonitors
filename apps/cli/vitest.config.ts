@@ -29,6 +29,7 @@ export default defineConfig({
     exclude: [
       ...configDefaults.exclude,
       '**/concurrent-spawn.test.ts',
+      '**/input-limits.integration.test.ts',
       '**/detached-spawn.test.ts',
       '**/daemon-detach.integration.test.ts',
       '**/daemon-crash-recovery.integration.test.ts',

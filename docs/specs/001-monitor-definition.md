@@ -58,6 +58,27 @@ The parser **MUST**:
 
 > Verified: `libs/core/src/parser/parse-monitor.ts` — trimming at line 49 (`parsed.content.trim()`); `filePath` stored at line 51; schema validation via `monitorFrontmatterSchema.safeParse` at line 36.
 
+### Monitor input admission (current)
+
+Before YAML parsing, monitor content (frontmatter and body together) MUST be at
+most **1,048,576 UTF-8 bytes**. File reads are bounded to that limit plus one byte,
+so file growth cannot bypass admission. Before element validation, `tags` MUST
+contain at most **256** entries and `shape.derive` at most **128** rules. These
+collection limits apply to exported schemas as well as the parser; an oversized collection
+produces one issue at its field path without inspecting its elements or compiling
+its predicates. Exact limits are accepted; ordinary field validation still applies.
+
+These budgets allow generous human-authored configuration while bounding validation
+work. Derive rules have a tighter budget because each rule compiles a predicate.
+They do not limit observation payloads or claim safety for arbitrary YAML aliases
+or source-plugin validation. `parseMonitor`/`parseMonitorFile` return `ok: false`,
+`filePath`, a bounded error message, and `code: INPUT_LIMIT_EXCEEDED` for admission
+failures. Other parse errors retain their existing shape.
+
+Verified: `libs/core/src/schema/input-limits.test.ts` and
+`libs/core/src/parser/parse-monitor.ts`. The editor schema advertises the tag cap;
+its existing lack of a complete shape schema is unchanged.
+
 The scanner discovers monitors using two glob passes relative to the supplied base directory:
 
 1. **Folder monitors**: `**/MONITOR.md`, then excluding any match at depth-0 — a folder monitor is

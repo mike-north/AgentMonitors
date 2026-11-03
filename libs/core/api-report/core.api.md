@@ -876,9 +876,9 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         timezone?: string | undefined;
     }>]>>;
     'baseline-strategy': z.ZodDefault<z.ZodEnum<["incremental", "net"]>>;
-    tags: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
+    tags: z.ZodOptional<z.ZodEffects<z.ZodArray<z.ZodString, "many">, string[], unknown>>;
     shape: z.ZodOptional<z.ZodEffects<z.ZodObject<{
-        derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
+        derive: z.ZodOptional<z.ZodEffects<z.ZodArray<z.ZodObject<{
             name: z.ZodString;
             when: z.ZodString;
         }, "strip", z.ZodTypeAny, {
@@ -887,7 +887,10 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }, {
             name: string;
             when: string;
-        }>, "many">>;
+        }>, "many">, {
+            name: string;
+            when: string;
+        }[], unknown>>;
         render: z.ZodOptional<z.ZodLiteral<"rendered">>;
     }, "strip", z.ZodTypeAny, {
         derive?: {
@@ -896,10 +899,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     }, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
+        derive?: unknown;
         render?: "rendered" | undefined;
     }>, {
         derive?: {
@@ -908,10 +908,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     }, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
+        derive?: unknown;
         render?: "rendered" | undefined;
     }>>;
     payload: z.ZodOptional<z.ZodEffects<z.ZodObject<{
@@ -1004,10 +1001,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
     name?: string | undefined;
     urgency?: string | undefined;
     shape?: {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
+        derive?: unknown;
         render?: "rendered" | undefined;
     } | undefined;
     notify?: {
@@ -1022,7 +1016,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         timezone?: string | undefined;
     } | undefined;
     'baseline-strategy'?: "incremental" | "net" | undefined;
-    tags?: string[] | undefined;
+    tags?: unknown;
     payload?: {
         form: "rendered" | "prose" | "structured" | "artifact";
         transform?: {
@@ -1077,10 +1071,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
     name?: string | undefined;
     urgency?: string | undefined;
     shape?: {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
+        derive?: unknown;
         render?: "rendered" | undefined;
     } | undefined;
     notify?: {
@@ -1095,7 +1086,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         timezone?: string | undefined;
     } | undefined;
     'baseline-strategy'?: "incremental" | "net" | undefined;
-    tags?: string[] | undefined;
+    tags?: unknown;
     payload?: {
         form: "rendered" | "prose" | "structured" | "artifact";
         transform?: {
@@ -1269,6 +1260,7 @@ export function parseDuration(duration: string): number;
 
 // @public (undocumented)
 export interface ParseError {
+    code?: 'INPUT_LIMIT_EXCEEDED';
     // (undocumented)
     error: string;
     // (undocumented)
@@ -1677,7 +1669,7 @@ export function shapeObservation(observation: Observation, now: Date, config: Sh
 
 // @public (undocumented)
 export const shapeSchema: z.ZodEffects<z.ZodObject<{
-    derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
+    derive: z.ZodOptional<z.ZodEffects<z.ZodArray<z.ZodObject<{
         name: z.ZodString;
         when: z.ZodString;
     }, "strip", z.ZodTypeAny, {
@@ -1686,7 +1678,10 @@ export const shapeSchema: z.ZodEffects<z.ZodObject<{
     }, {
         name: string;
         when: string;
-    }>, "many">>;
+    }>, "many">, {
+        name: string;
+        when: string;
+    }[], unknown>>;
     render: z.ZodOptional<z.ZodLiteral<"rendered">>;
 }, "strip", z.ZodTypeAny, {
     derive?: {
@@ -1695,10 +1690,7 @@ export const shapeSchema: z.ZodEffects<z.ZodObject<{
     }[] | undefined;
     render?: "rendered" | undefined;
 }, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
+    derive?: unknown;
     render?: "rendered" | undefined;
 }>, {
     derive?: {
@@ -1707,10 +1699,7 @@ export const shapeSchema: z.ZodEffects<z.ZodObject<{
     }[] | undefined;
     render?: "rendered" | undefined;
 }, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
+    derive?: unknown;
     render?: "rendered" | undefined;
 }>;
 
