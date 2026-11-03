@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-03 — Update milestone references after the roadmap reorganization (008, roadmap)
+
+Point the milestone citations in 008 §9–§10 and the G21 proof at the milestones in
+[docs/product/roadmap.md](../product/roadmap.md). Contract text is unchanged; only the planned
+sequencing of these targets moved.
+
 ## 2026-11-01 — Verify uses observation identity boundaries (005 §16) — Refs #532
 
 Replace millisecond-versus-second history timestamp comparison with a pre-trigger recording frontier
