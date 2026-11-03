@@ -118,6 +118,55 @@ automatically) and `scripts/cli-suite-partition.test.ts` (runs the real `vitest 
 against both `apps/cli` configs and asserts the result partitions the package's git-tracked test
 files with no overlap or gaps). Both run under `pnpm test:scripts`, wired into CI per-PR.
 
+### 2.9 Repository pre-push gate
+
+**Current, normative:** after installing the frozen lockfile with Node 24 and the pinned
+pnpm, contributors on macOS/Linux (POSIX shell) MUST use `pnpm verify` for the portable pre-push gate. It runs these
+root commands sequentially, stopping on failure: `build`, `check`, `check:api-report`,
+`test`, `test:serial`, `test:scripts`, `test:standalone-consumer`,
+`test:e2e-fresh-install-hooks`, and `publish:packages:dry-run`.
+
+`verify` names an aggregate spanning build, tool checks, authored tests, and packaging;
+`check:*` remains tool validation and `test:*` remains authored tests. `pnpm test` retains
+its fast package-suite workload and MUST print its omitted suites and point to `pnpm verify`.
+The aggregate preserves CI's test ordering: daemon tests run after the parallel suite,
+with no overlapping packaging builds. The publish dry-run runs locally regardless of
+CI's release-collateral path filter, and the duplicated CI `test:scripts` step runs once.
+The dry-run reads the registry and packs artifacts without publishing; packaging tests
+perform fresh installs and require network access.
+
+Nx still schedules dependency builds and caches eligible package targets, including
+`test:serial`. Use `NX_SKIP_NX_CACHE=true pnpm verify` for fresh execution evidence.
+A green result means these commands succeeded on this host, subject to reported skips;
+it is not proof of another OS, a fresh runner, or suites skipped for missing facilities.
+
+The explicit CI-only responsibilities are:
+
+- Checkout, Node/pnpm provisioning, dependency installation, and GitHub event/path filters.
+  Local installation is a prerequisite; local verification always runs release validation.
+- `windows-install-check`: Windows build and packed CLI native-module installation require
+  Windows. The hosted runner includes build tools, so even CI does not prove toolchain-free
+  installation.
+- `website-link-check`: website build and internal-link validation remain a separate,
+  path-filtered CI gate. Root build/check/format/lint exclusion is unchanged; the existing
+  website unit tests are already included by root `pnpm test`.
+
+Docker smoke is **not** a separate job: `test:serial` discovers it on both hosts, but it
+self-skips without a reachable Docker daemon. Report this as unverified Docker coverage
+when running locally without Docker; CI's Ubuntu runner normally executes it.
+
+**Human decision pending:** whether website validation should join the root gate.
+Recommendation: keep the site build/link checks separate and path-filtered, then add
+executable documentation-example checks before claiming semantic documentation correctness.
+The existing link checker cannot catch a CLI example missing a required argument.
+Website changes need separate build/link and example verification meanwhile.
+
+**Verified in:** `scripts/local-gate.test.ts` reads the real CI workflow and package scripts,
+rejects missing local commands (including the old build/check/test gate), unclassified jobs,
+new executable steps in excluded jobs, skipped or failure-tolerant portable steps, and
+local failure masking or parallel execution. Changes to the command contract or exclusions
+MUST update this guard and the documented coverage together.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.

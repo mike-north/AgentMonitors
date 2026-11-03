@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-03 — Align the local pre-push gate with portable CI validation (004 §2.9) — Refs #458
+
+Define `pnpm verify` as the sequential aggregate of CI's portable checks, including the
+serial daemon suite, standalone consumer, fresh-install hook E2E, and publish dry-run.
+Keep the fast `pnpm test` workload and print its omissions. A guard compares the actual
+workflow and root scripts, requiring explicit decisions for new CI jobs or commands.
+Document setup, platform, Docker availability, and website exceptions; website exclusion
+is unchanged and expanding it remains a human decision.
+
 ## 2026-11-03 — Update milestone references after the roadmap reorganization (008, roadmap) — Refs #539
 
 Point the milestone citations in 008 §9–§10 and the G21 proof at the milestones in

@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "verify": "pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run",
     "build": "NX_TUI=false nx run-many --target=build --exclude=agentmonitors-workspace,@agentmonitors/website",
     "check": "pnpm check:packages && pnpm check:workspace && pnpm check:aipm",
     "check:aipm": "aipm validate",
@@ -22,7 +23,7 @@
     "publish:packages": "node scripts/publish-release-packages.mjs",
     "publish:packages:dry-run": "node scripts/publish-release-packages.mjs --dry-run",
     "release": "pnpm build && pnpm publish:packages",
-    "test": "NX_TUI=false nx run-many --target=test --exclude=agentmonitors-workspace",
+    "test": "echo 'Partial test run: omits test:serial, test:scripts, test:standalone-consumer, test:e2e-fresh-install-hooks and other validation; run pnpm verify for the pre-push gate.' && NX_TUI=false nx run-many --target=test --exclude=agentmonitors-workspace",
     "test:scripts": "vitest run --config scripts/vitest.config.ts",
     "test:serial": "NX_TUI=false nx run @agentmonitors/cli:test:serial",
     "test:standalone-consumer": "node scripts/test-standalone-consumer.mjs",
