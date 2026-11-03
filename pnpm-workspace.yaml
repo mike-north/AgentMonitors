@@ -15,9 +15,9 @@ minimumReleaseAgeExclude:
 overrides:
   # cel-js's Chevrotain 11 parser uses lodash-es; preserve unrelated consumers.
   # GHSA-r5fr-rjxr-66jc.
-  chevrotain@11>lodash-es: ^4.17.24
-  '@chevrotain/cst-dts-gen@11>lodash-es': ^4.17.24
-  '@chevrotain/gast@11>lodash-es': ^4.17.24
+  chevrotain@11>lodash-es: ^4.18.0
+  '@chevrotain/cst-dts-gen@11>lodash-es': ^4.18.0
+  '@chevrotain/gast@11>lodash-es': ^4.18.0
   # MCP's Ajv 8 URI parser: authority injection/host confusion and subsequent
   # normalization fixes (GHSA-qw65-cvwx-89v3, GHSA-58mr-gqgx-xq4g).
   ajv@8>fast-uri: ^3.1.9

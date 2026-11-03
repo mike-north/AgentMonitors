@@ -550,8 +550,8 @@ const PATCHED_MINIMUMS = [
   { package: '@modelcontextprotocol/sdk', minVersion: '1.32.0' },
   // drizzle-orm: GHSA (libs/core) — patched >=0.45.2
   { package: 'drizzle-orm', minVersion: '0.45.2' },
-  // lodash-es via cel-js>chevrotain (libs/core) — GHSA-r5fr-rjxr-66jc, patched >=4.17.24
-  { package: 'lodash-es', minVersion: '4.17.24' },
+  // lodash-es via cel-js>chevrotain (libs/core) — GHSA-r5fr-rjxr-66jc, patched >=4.18.0
+  { package: 'lodash-es', minVersion: '4.18.0' },
   // fast-uri via @modelcontextprotocol/sdk>ajv (apps/cli) — GHSA-v39h-62p7-jpjc,
   // GHSA-w74x-v6f9-j3xg and authority normalization fixes, patched >=3.1.9
   { package: 'fast-uri', minVersion: '3.1.9' },

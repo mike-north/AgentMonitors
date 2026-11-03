@@ -5,9 +5,9 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  chevrotain@11>lodash-es: ^4.17.24
-  '@chevrotain/cst-dts-gen@11>lodash-es': ^4.17.24
-  '@chevrotain/gast@11>lodash-es': ^4.17.24
+  chevrotain@11>lodash-es: ^4.18.0
+  '@chevrotain/cst-dts-gen@11>lodash-es': ^4.18.0
+  '@chevrotain/gast@11>lodash-es': ^4.18.0
   ajv@8>fast-uri: ^3.1.9
   '@modelcontextprotocol/sdk@1>hono': ^4.13.11
   '@hono/node-server@1>hono': ^4.13.11
