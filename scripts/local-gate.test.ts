@@ -75,7 +75,10 @@ function assertLocalGate(
     ['test', 'publish-dry-run', ...Object.keys(ciOnly)].sort(),
   );
   const commands: string[] = [];
-  for (const [id, job] of Object.entries(candidate.jobs)) {
+  // CI job mappings are unordered. Derive the local sequence from the test
+  // job before release validation, while preserving step order within each.
+  for (const id of ['test', 'publish-dry-run', ...Object.keys(ciOnly)]) {
+    const job = candidate.jobs[id];
     // Provisioning actions are prerequisites, not validation. An unfamiliar
     // action may run checks, so it needs the same explicit coverage decision
     // as a new shell step instead of being silently filtered out.
@@ -151,6 +154,15 @@ describe('local verification gate (issue #458)', () => {
 
   it('accepts the complete portable gate', () => {
     assertLocalGate(workflow, completeScripts);
+  });
+
+  it('accepts equivalent workflows regardless of job mapping order', () => {
+    // YAML job order does not schedule CI. In particular, release validation
+    // appearing before the test job must not reorder the local test chain.
+    assertLocalGate(
+      { jobs: Object.fromEntries(Object.entries(workflow.jobs).reverse()) },
+      completeScripts,
+    );
   });
 
   it('rejects the old build/check/test gate', () => {
