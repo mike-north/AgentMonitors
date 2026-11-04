@@ -26,6 +26,7 @@ interface IWorkflow {
     string,
     {
       readonly steps: readonly IStep[];
+      readonly 'runs-on'?: string;
       readonly if?: unknown;
       readonly 'continue-on-error'?: unknown;
     }
@@ -71,6 +72,12 @@ function assertLocalGate(
   candidate: IWorkflow,
   scripts: IPackage['scripts'],
 ): void {
+  // Inherited defaults and environment can change every command's meaning.
+  // Unrecognized workflow fields require a coverage decision, rather than
+  // assuming that identical command text implies identical execution.
+  for (const key of Object.keys(candidate)) {
+    expect(['name', 'on', 'jobs']).toContain(key);
+  }
   expect(Object.keys(candidate.jobs).sort()).toEqual(
     ['test', 'publish-dry-run', ...Object.keys(ciOnly)].sort(),
   );
@@ -79,10 +86,35 @@ function assertLocalGate(
   // job before release validation, while preserving step order within each.
   for (const id of ['test', 'publish-dry-run', ...Object.keys(ciOnly)]) {
     const job = candidate.jobs[id];
+    if (!(id in ciOnly)) {
+      // Portable commands assume the root checkout on CI's Ubuntu host.
+      // Defaults, environment, containers, services, and matrices need an
+      // explicit local equivalent before they can share that assumption.
+      for (const key of Object.keys(job)) {
+        expect([
+          'name',
+          'runs-on',
+          'timeout-minutes',
+          'steps',
+          'needs',
+          'if',
+        ]).toContain(key);
+      }
+      expect(job['runs-on']).toBe('ubuntu-latest');
+    }
     // Provisioning actions are prerequisites, not validation. An unfamiliar
     // action may run checks, so it needs the same explicit coverage decision
     // as a new shell step instead of being silently filtered out.
     for (const step of job.steps) {
+      if (!(id in ciOnly)) {
+        // Validate execution context before filtering setup or deduplicating
+        // commands. Installation and action steps can also affect checks.
+        const allowed =
+          step.uses === undefined ? ['name', 'run'] : ['name', 'uses', 'with'];
+        for (const key of Object.keys(step)) {
+          expect(allowed).toContain(key);
+        }
+      }
       if (step.uses !== undefined) {
         expect(step.uses).toMatch(
           /^(actions\/checkout|pnpm\/action-setup|actions\/setup-node)@[^\s]+$/,
@@ -154,6 +186,44 @@ describe('local verification gate (issue #458)', () => {
 
   it('accepts the complete portable gate', () => {
     assertLocalGate(workflow, completeScripts);
+  });
+
+  it.each([
+    { 'working-directory': 'apps/website' },
+    { shell: 'bash --noprofile --norc {0}' },
+    { env: { NODE_ENV: 'production' } },
+  ])(
+    'rejects a duplicate command in an unfamiliar step context: %j',
+    (context) => {
+      const changed = structuredClone(workflow);
+      changed.jobs.test = {
+        ...changed.jobs.test,
+        steps: [...changed.jobs.test.steps, { run: 'pnpm check', ...context }],
+      };
+      expect(() => assertLocalGate(changed, completeScripts)).toThrow();
+    },
+  );
+
+  it.each([
+    { defaults: { run: { 'working-directory': 'apps/website' } } },
+    { env: { NODE_ENV: 'production' } },
+  ])('rejects unfamiliar inherited workflow contexts: %j', (context) => {
+    expect(() =>
+      assertLocalGate({ ...workflow, ...context }, completeScripts),
+    ).toThrow();
+  });
+
+  it.each([
+    { defaults: { run: { 'working-directory': 'apps/website' } } },
+    { env: { NODE_ENV: 'production' } },
+    { container: 'node:24' },
+    { services: { database: { image: 'postgres' } } },
+    { strategy: { matrix: { mode: ['production'] } } },
+    { 'runs-on': 'windows-latest' },
+  ])('rejects unfamiliar portable job contexts: %j', (context) => {
+    const changed = structuredClone(workflow);
+    changed.jobs.test = { ...changed.jobs.test, ...context };
+    expect(() => assertLocalGate(changed, completeScripts)).toThrow();
   });
 
   it('accepts equivalent workflows regardless of job mapping order', () => {
