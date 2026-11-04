@@ -500,6 +500,38 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
       Array.prototype.shift = originalShift;
     }
   });
+  // Array-method-independent guard: shift, splice, and copying removals all
+  // increase elapsed work quadratically, even if they bypass the slot counter.
+  it('bounds duplicate-bucket growth using fastest samples at each size', () => {
+    function fastest(duplicateCount: number): number {
+      const duplicate = { a: 'same', b: 'same' };
+      const moved = { a: 'unique', b: 'unique' };
+      const duplicates = Array.from(
+        { length: duplicateCount },
+        () => duplicate,
+      );
+      const previous = JSON.stringify([...duplicates, moved]);
+      const current = JSON.stringify([moved, ...duplicates]);
+      let best = Infinity;
+      for (let sample = 0; sample < 3; sample++) {
+        const start = performance.now();
+        // Sample operation: fixture construction is deliberately outside timing.
+        const diff = buildJsonDiff(previous, current);
+        const elapsed = performance.now() - start;
+        expect(diff).toContain('reordered');
+        best = Math.min(best, elapsed);
+      }
+      return best;
+    }
+    // Four times the input implies about 4x linear or 16x quadratic work.
+    // An 8x ceiling separates them with headroom; the fastest of three samples
+    // per size discards an isolated scheduling/GC pause on either side. This
+    // is still timing evidence, not proof against sustained unequal slowdowns.
+    // 25k/100k keeps the correct path modest while exposing bucket-copy costs.
+    const small = fastest(25_000);
+    const large = fastest(100_000);
+    expect(large / small).toBeLessThan(8);
+  });
 });
 
 describe('buildJsonDiff — totality under pathological nesting (issue #437, TOTALITY REGRESSION)', () => {
