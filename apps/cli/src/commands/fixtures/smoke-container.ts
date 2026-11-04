@@ -229,3 +229,14 @@ export function reportContainerFailure(result: ContainerResult): never {
         : `docker smoke container failed (exit code ${String(result.code)}, signal ${String(result.signal)}); see captured output above`,
   );
 }
+
+/** Reject unusable results before the caller checks its success markers. @internal */
+export function assertSmokeContainerSuccess(result: ContainerResult): void {
+  if (
+    result.terminationReason !== undefined ||
+    result.timedOut ||
+    result.code !== 0
+  ) {
+    reportContainerFailure(result);
+  }
+}

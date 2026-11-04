@@ -6,6 +6,7 @@ vi.mock('node:child_process', () => mocks);
 import {
   runSmokeContainer,
   reportContainerFailure,
+  assertSmokeContainerSuccess,
 } from './fixtures/smoke-container.js';
 afterEach(() => {
   vi.useRealTimers();
@@ -67,4 +68,25 @@ it('retains phase diagnostics and reports spawn errors', async () => {
   const result = await pending;
   expect(result.stderr).toContain('phase build-core');
   expect(result.stderr).toContain('spawn denied');
+});
+
+it('rejects output-cap termination even when the client wins the race and exits zero', () => {
+  const error = vi.spyOn(console, 'error').mockImplementation(() => {
+    /* Expected failure diagnostics. */
+  });
+  try {
+    expect(() =>
+      assertSmokeContainerSuccess({
+        code: 0,
+        signal: null,
+        stdout:
+          'CLAUDE_VERSION=ok\nSTATUS_RUNNING=true\nEVENT_COUNT=1\nCLAIM_URGENCY=normal',
+        stderr: '',
+        timedOut: false,
+        terminationReason: 'output-limit',
+      }),
+    ).toThrow(/output.*limit/);
+  } finally {
+    error.mockRestore();
+  }
 });

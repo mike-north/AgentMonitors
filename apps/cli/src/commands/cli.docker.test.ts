@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   runSmokeContainer,
-  reportContainerFailure,
+  assertSmokeContainerSuccess,
 } from './fixtures/smoke-container.js';
 
 function hasDocker(): boolean {
@@ -32,9 +32,7 @@ describe.skipIf(!dockerAvailable)('Docker runtime smoke', () => {
     const script = readFileSync(dockerScriptPath, 'utf-8');
 
     const result = await runSmokeContainer(script);
-    if (result.timedOut || result.code !== 0) {
-      reportContainerFailure(result);
-    }
+    assertSmokeContainerSuccess(result);
 
     expect(result.stdout).toContain('CLAUDE_VERSION=');
     expect(result.stdout).toContain('STATUS_RUNNING=true');
