@@ -31,6 +31,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { MonitorEventRecord } from '@agentmonitors/core';
+import { assertVerifySucceeded } from '../test-support/verify-result.js';
 import { listObservationHistoryClient } from '../runtime-client.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
@@ -1062,28 +1063,12 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         ws,
         env,
       );
-      const commandContext = `${verifyResult.stdout}\n${verifyResult.stderr}`;
-      // A failed command may not emit JSON; preserve its raw output before parsing.
-      expect(verifyResult.exitCode, commandContext).toBe(0);
-      const verifyReport = JSON.parse(verifyResult.stdout) as {
-        ok: boolean;
-        stages: { name: string; status: string }[];
-      };
-      let failureContext = commandContext;
-      if (!verifyReport.ok) {
-        // Diagnostics must neither add IPC to success nor replace the verdict
-        // with a secondary connection error when the daemon is unavailable.
-        try {
-          const history = await listObservationHistoryClient(
-            { monitorId: 'file-watch', workspacePath: ws, limit: 10 },
-            env['AGENTMONITORS_SOCKET'],
-          );
-          failureContext += `\nHistory: ${JSON.stringify(history)}`;
-        } catch (error) {
-          failureContext += `\nHistory unavailable: ${String(error)}`;
-        }
-      }
-      expect(verifyReport.ok, failureContext).toBe(true);
+      await assertVerifySucceeded(verifyResult, () =>
+        listObservationHistoryClient(
+          { monitorId: 'file-watch', workspacePath: ws, limit: 10 },
+          env['AGENTMONITORS_SOCKET'],
+        ),
+      );
       // A literal trigger uses the real watched name, not the scratch prefix.
       // Both the file and its synthetic create/delete events must be gone before
       // a later create can serve as evidence of non-suppression.
