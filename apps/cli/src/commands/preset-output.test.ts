@@ -4,6 +4,7 @@ import { assertPresetOutput } from './fixtures/assert-preset-output.js';
 it.each([
   ['0', '', '', false],
   ['7', 'jq: compile error', '', false],
+  ['7', 'jq: runtime error', '[]', false],
   ['0', '', '[]', true],
 ])(
   'rejects unusable subprocess results with command, exit and stderr',
@@ -15,4 +16,21 @@ it.each([
 );
 it('accepts valid empty JSON arrays', () => {
   expect(() => assertPresetOutput(['jq'], '0', '', '[]', false)).not.toThrow();
+});
+
+it('never discloses raw input through argv or stderr', () => {
+  try {
+    assertPresetOutput(
+      ['jq', 'PRIVATE_INPUT'],
+      '5',
+      'PRIVATE_INPUT'.repeat(10000),
+      '[]',
+      false,
+    );
+    throw new Error('expected failure');
+  } catch (error) {
+    const message = String(error);
+    expect(message).not.toContain('PRIVATE_INPUT');
+    expect(message.length).toBeLessThan(1000);
+  }
 });

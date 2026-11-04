@@ -239,7 +239,17 @@ async function observe(
       command: [
         'sh',
         '-c',
-        '"$@" 2>"$AM475_STDERR"; code=$?; printf "%s" "$code" >"$AM475_EXIT"; exit "$code"',
+        `fifo="$AM475_STDERR.pipe"
+mkfifo "$fifo" || exit 125
+# Drain the stream after retaining a bounded prefix, preserving child exit semantics.
+{ head -c 4096; cat >/dev/null; } <"$fifo" >"$AM475_STDERR" &
+reader=$!
+trap 'kill "$reader" 2>/dev/null || :; rm -f "$fifo"' EXIT
+"$@" 2>"$fifo"
+code=$?
+wait "$reader"
+printf "%s" "$code" >"$AM475_EXIT"
+exit "$code"`,
         'preset-jq',
         ...command,
       ],
@@ -2124,4 +2134,49 @@ describe('real-jq helper diagnostics (issue #475)', () => {
       );
     },
   );
+});
+
+describe('partial nonzero results (003 §11.2)', () => {
+  it('preserves valid nonzero source results but rejects them at the JSON test boundary', async () => {
+    const scope = { command: ['sh', '-c', 'printf "[]"; exit 7'] };
+    const raw = await commandPoll.observe(scope, { now: new Date() });
+    expect(raw.nextState).toMatchObject({
+      stdout: '[]',
+      exitCode: 7,
+      truncated: false,
+      health: 'ok',
+      baselined: true,
+    });
+    await expect(observe(scope, tempDir('partial-jq'), '[]')).rejects.toThrow(
+      /exit code: 7/,
+    );
+  });
+  it('bounds stored stderr and excludes raw input from errors', async () => {
+    const start = createdTempDirs.length;
+    const secret = 'PRIVATE_JQ_INPUT';
+    const scope = {
+      command: [
+        'sh',
+        '-c',
+        `printf '[]'; i=0; while [ "$i" -lt 1000 ]; do printf '${secret}%.200d' 0 >&2; i=$((i+1)); done; exit 5`,
+      ],
+    };
+    let failure = '';
+    try {
+      await observe(scope, tempDir('large-stderr'), '[]');
+    } catch (error) {
+      failure = String(error);
+    }
+    expect(failure).toContain('exit code: 5');
+    expect(failure).not.toContain(secret);
+    expect(failure.length).toBeLessThan(1000);
+    const dirs = createdTempDirs
+      .slice(start)
+      .filter((dir) => existsSync(path.join(dir, 'stderr')));
+    expect(dirs).toHaveLength(1);
+    for (const dir of dirs)
+      expect(readFileSync(path.join(dir, 'stderr')).length).toBeLessThanOrEqual(
+        4096,
+      );
+  });
 });
