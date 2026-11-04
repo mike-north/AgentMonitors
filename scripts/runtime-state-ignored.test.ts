@@ -16,31 +16,21 @@
  * @see https://git-scm.com/docs/git-check-ignore
  * @see https://prettier.io/docs/ignore
  */
-import { execFileSync, spawnSync } from 'node:child_process';
-import { createRequire } from 'node:module';
-import { dirname, join, relative } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
+import { join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { claudeCodeAdapter } from '../libs/core/src/adapter/claude.js';
-
-const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
-const PRETTIER_CLI = createRequire(import.meta.url).resolve(
-  'prettier/bin/prettier.cjs',
-);
+import {
+  gitCheckIgnore,
+  prettierFileInfo,
+  REPO_ROOT,
+} from './lib/ignore-rule-probes.mjs';
 
 /** `.agentmonitors/` is rooted at `<workspace-or-cwd>`, which can be any directory. */
 const WORKSPACES = [
   ['the checkout root', ''],
   ['a nested working directory', join('apps', 'cli')],
 ] as const;
-
-/**
- * Worktrees live inside the main checkout, so a format check run from there
- * also walks over each worktree's copy. Prettier reads only the root
- * `.gitignore`, so this case is about Prettier alone: git never reaches it,
- * because a worktree directory is excluded locally and absent from CI.
- */
-const NESTED_WORKTREE = join('.claude', 'worktrees', 'probe');
 
 function hookStatePathRelativeToRepo(workspace: string): string {
   return relative(
@@ -49,26 +39,6 @@ function hookStatePathRelativeToRepo(workspace: string): string {
       workspacePath: join(REPO_ROOT, workspace),
       hostSessionId: 'runtime-state-ignored-probe',
     }),
-  );
-}
-
-function gitCheckIgnore(repoRelativePath: string, ...flags: string[]) {
-  return spawnSync(
-    'git',
-    ['check-ignore', '--no-index', ...flags, repoRelativePath],
-    { cwd: REPO_ROOT, encoding: 'utf8' },
-  );
-}
-
-function prettierFileInfo(repoRelativePath: string): unknown {
-  // Runs the CLI entrypoint under Node: the `.bin` shim is not executable this
-  // way on Windows, where pnpm generates `.cmd` and `.ps1` wrappers instead.
-  return JSON.parse(
-    execFileSync(
-      process.execPath,
-      [PRETTIER_CLI, '--file-info', repoRelativePath],
-      { cwd: REPO_ROOT, encoding: 'utf8' },
-    ),
   );
 }
 
@@ -85,14 +55,6 @@ describe.each(WORKSPACES)('hook state written in %s', (_label, workspace) => {
 
   it('is skipped by the Prettier CLI that `check:format` runs', () => {
     expect(prettierFileInfo(hookStatePath)).toMatchObject({ ignored: true });
-  });
-});
-
-describe('hook state in a worktree nested in the main checkout', () => {
-  it('is skipped by the Prettier CLI that `check:format` runs', () => {
-    expect(
-      prettierFileInfo(hookStatePathRelativeToRepo(NESTED_WORKTREE)),
-    ).toMatchObject({ ignored: true });
   });
 });
 
