@@ -463,81 +463,42 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
     }
   });
 
-  // REGRESSION: the reversed-unique fixture above only ever produces
-  // multiset buckets of length 1 (every element is distinct), so it cannot
-  // catch a bucket-internal quadratic blowup. Each successful match used to
-  // call `bucket.shift()`, which re-indexes every remaining element in that
-  // bucket — with one large duplicate-value bucket this degenerates to
-  // `O(M^2)` in the bucket size alone, independent of overall array length.
-  // Measured on the pre-fix code: ~3ms at 5k, 28ms at 20k, 162ms at 50k,
-  // 601ms at 100k, 2.3s at 200k duplicate elements — clearly superlinear. A
-  // single distinguishable "moved" element plus a large duplicate bucket
-  // reproduces this without relying on identity-key matching.
-  //
-  // (issue #515) This used to assert a hard `elapsedMs < 1000` wall-clock
-  // bound at a single input size. On a loaded/shared CI runner that bound has
-  // essentially zero headroom — the real (linear) runtime at 200k duplicates
-  // already sits close to 1000ms, so single-digit-percent scheduler noise
-  // alone fails the assertion (observed: 1006.27ms in run 32782066364,
-  // 1022.08ms in run 33277217804, both on unrelated docs-only PRs). The test
-  // exists to catch a COMPLEXITY regression (quadratic bucket handling), not
-  // to enforce a latency SLA, so it now measures the SAME operation at two
-  // input sizes (N and 4N) and asserts the *ratio* of elapsed times instead
-  // of an absolute duration. Load noise (a slower/busier runner) scales both
-  // measurements together and mostly cancels out of the ratio, whereas a
-  // quadratic regression makes 4x the input take ~16x as long regardless of
-  // how fast or slow the runner is. Unequal scheduling delays or GC pauses
-  // can still affect the ratio; this is not a deterministic operation count.
-  it('diffs a large duplicate-value bucket plus one moved element in time that scales linearly (not quadratically) with bucket size', () => {
-    function fixtureTexts(duplicateCount: number): {
-      prevText: string;
-      currText: string;
-    } {
-      const duplicate = { a: 'same', b: 'same' };
-      const moved = { a: 'unique', b: 'unique' };
-
-      const prev = [
-        ...Array.from({ length: duplicateCount }, () => duplicate),
-        moved,
-      ];
-      // `moved` relocates to the front; every duplicate stays a duplicate.
-      const curr = [
-        moved,
-        ...Array.from({ length: duplicateCount }, () => duplicate),
-      ];
-      return {
-        prevText: JSON.stringify(prev),
-        currText: JSON.stringify(curr),
-      };
+  // Unique buckets cannot expose the duplicate-bucket shift regression (#437).
+  // Count slots reindexed by front removal, rather than elapsed time: removing
+  // N duplicates with shift costs N*(N-1)/2 regardless of scheduler pauses.
+  it('consumes duplicate buckets without quadratic reindexing work', () => {
+    const duplicateCount = 200;
+    const duplicate = { a: 'same', b: 'same' };
+    const moved = { a: 'unique', b: 'unique' };
+    const duplicates = Array.from({ length: duplicateCount }, () => duplicate);
+    const prev = JSON.stringify([...duplicates, moved]);
+    const curr = JSON.stringify([moved, ...duplicates]);
+    let reindexedSlots = 0;
+    const originalShift = Array.prototype.shift;
+    // Observe only the fixture's duplicate buckets, leaving unrelated arrays
+    // and all real mutation semantics intact. Restore the global seam on failure.
+    Array.prototype.shift = function (this: unknown[]) {
+      const first = this[0];
+      if (
+        typeof first === 'object' &&
+        first !== null &&
+        'a' in first &&
+        first.a === 'same' &&
+        'b' in first &&
+        first.b === 'same'
+      ) {
+        reindexedSlots += Math.max(0, this.length - 1);
+      }
+      return originalShift.call(this);
+    };
+    try {
+      expect(buildJsonDiff(prev, curr)).toContain('reordered');
+      // Allow linear reindexing work; the old shift implementation performs
+      // 19,900 slot moves here, exceeding this 400-slot budget decisively.
+      expect(reindexedSlots).toBeLessThanOrEqual(2 * duplicateCount);
+    } finally {
+      Array.prototype.shift = originalShift;
     }
-
-    function timeDiff(duplicateCount: number): number {
-      const { prevText, currText } = fixtureTexts(duplicateCount);
-      const start = performance.now();
-      const diff = buildJsonDiff(prevText, currText);
-      const elapsedMs = performance.now() - start;
-      expect(diff).toBeDefined();
-      expect(diff).toContain('reordered');
-      return elapsedMs;
-    }
-
-    // 50k duplicates already takes double-digit milliseconds (measured
-    // locally: ~20-30ms), well above sub-millisecond noise territory, so the
-    // ratio itself doesn't get swamped by timer-resolution jitter.
-    const SMALL_COUNT = 50_000;
-    const LARGE_COUNT = SMALL_COUNT * 4;
-
-    const smallElapsedMs = timeDiff(SMALL_COUNT);
-    const largeElapsedMs = timeDiff(LARGE_COUNT);
-    const ratio = largeElapsedMs / smallElapsedMs;
-
-    // Linear work gives (a + 4*b*N)/(a + b*N): nonnegative fixed overhead
-    // a pushes the ratio BELOW 4 toward 1. Unequal scheduling or GC costs
-    // can push a measured ratio above 4. The 8x bound leaves headroom for
-    // those effects while staying below the ~16x ratio of quadratic bucket
-    // work at these sizes (issues #437, #515); shared slowdowns cancel only
-    // to the extent that they affect both measurements proportionally.
-    expect(ratio).toBeLessThan(8);
   });
 });
 
