@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-03 — Apply bounded reads to production monitor discovery (001) — Refs #546
+
+Route asynchronous scans through the same byte-budget reader as direct file
+parsing. Previously scans allocated and decoded complete files before rejecting
+them. Deterministic admission tests now observe scan read counts, descriptor
+closure, oversized flat/folder diagnostics, exact-boundary acceptance, and valid
+sibling results. Discovery retains asynchronous filesystem I/O.
+
 ## 2026-11-03 — Bound monitor and daemon inputs before validation (001, 002, 005) — Refs #530
 
 Specify monitor byte/tag/derive limits and daemon byte/collection/depth/aggregate

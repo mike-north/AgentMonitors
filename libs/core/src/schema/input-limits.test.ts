@@ -1,11 +1,23 @@
 /** Admission limits protect validation work without changing ordinary monitor data. */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import * as fsPromises from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import { scanMonitors } from '../parser/scan-monitors.js';
 import { parseMonitor, parseMonitorFile } from '../parser/parse-monitor.js';
 import { generateMonitorSchema } from '../observation/schema-generator.js';
 import { monitorFrontmatterSchema } from './monitor-schema.js';
+
+// Observe real filesystem reads without using heap measurements as an oracle.
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readFile: vi.fn(actual.readFile),
+    open: vi.fn(actual.open),
+  };
+});
 
 const monitorPath = '/workspace/bounded/MONITOR.md';
 const header = '---\nwatch:\n  type: file-fingerprint\n---\n';
@@ -88,6 +100,75 @@ describe('monitor input admission (001)', () => {
       ok: false,
       code: 'INPUT_LIMIT_EXCEEDED',
     });
+  });
+
+  it('bounds production scans before decoding oversized flat and folder monitors', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'scan-limits-'));
+    const actual =
+      await vi.importActual<typeof import('node:fs/promises')>(
+        'node:fs/promises',
+      );
+    const readResults: (() => Promise<readonly { bytesRead: number }[]>)[] = [];
+    const closes: (() => number)[] = [];
+    vi.mocked(fsPromises.readFile).mockClear();
+    vi.mocked(fsPromises.open).mockImplementation(async (...args) => {
+      const handle = await actual.open(...args);
+      const reads = vi.spyOn(handle, 'read');
+      const close = vi.spyOn(handle, 'close');
+      readResults.push(async () =>
+        Promise.all(reads.mock.results.map((result) => result.value)),
+      );
+      closes.push(() => close.mock.calls.length);
+      return handle;
+    });
+    try {
+      mkdirSync(path.join(root, 'folder'));
+      const oversized = header + 'x'.repeat(2 * 1048576);
+      writeFileSync(path.join(root, 'flat.md'), oversized);
+      writeFileSync(path.join(root, 'folder', 'MONITOR.md'), oversized);
+      writeFileSync(
+        path.join(root, 'valid.md'),
+        header + 'normal instructions',
+      );
+      writeFileSync(
+        path.join(root, 'boundary.md'),
+        header + 'x'.repeat(1048576 - Buffer.byteLength(header)),
+      );
+      const result = await scanMonitors(root);
+      expect(result.errors).toEqual([
+        expect.objectContaining({
+          filePath: path.join(root, 'flat.md'),
+          code: 'INPUT_LIMIT_EXCEEDED',
+        }),
+        expect.objectContaining({
+          filePath: path.join(root, 'folder', 'MONITOR.md'),
+          code: 'INPUT_LIMIT_EXCEEDED',
+        }),
+      ]);
+      expect(result.monitors.map(({ monitor }) => monitor.id)).toEqual([
+        'boundary',
+        'valid',
+      ]);
+      expect(result.duplicateIds).toEqual([]);
+      expect(fsPromises.readFile).not.toHaveBeenCalled();
+      expect(readResults).toHaveLength(4);
+      const totals = await Promise.all(
+        readResults.map(async (results) =>
+          (await results()).reduce((sum, result) => sum + result.bytesRead, 0),
+        ),
+      );
+      expect(totals.sort((a, b) => a - b)).toEqual([
+        Buffer.byteLength(header + 'normal instructions'),
+        1048576,
+        1048577,
+        1048577,
+      ]);
+      expect(closes.map((count) => count())).toEqual([1, 1, 1, 1]);
+    } finally {
+      vi.mocked(fsPromises.open).mockImplementation(actual.open);
+      vi.restoreAllMocks();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('applies the same byte limit to files on disk', () => {

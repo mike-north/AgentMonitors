@@ -62,7 +62,9 @@ The parser **MUST**:
 
 Before YAML parsing, monitor content (frontmatter and body together) MUST be at
 most **1,048,576 UTF-8 bytes**. File reads are bounded to that limit plus one byte,
-so file growth cannot bypass admission. Before element validation, `tags` MUST
+so file growth cannot bypass admission. Direct `parseMonitorFile` calls and asynchronous
+`scanMonitors` discovery share this read budget; runtime ticks, CLI validation, and
+CLI scans therefore reject oversized files before allocating or decoding their full contents. Before element validation, `tags` MUST
 contain at most **256** entries and `shape.derive` at most **128** rules. These
 collection limits apply to exported schemas as well as the parser; an oversized collection
 produces one issue at its field path without inspecting its elements or compiling

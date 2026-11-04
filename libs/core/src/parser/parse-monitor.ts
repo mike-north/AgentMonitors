@@ -1,10 +1,10 @@
 /** Read and validate bounded monitor definitions while preserving file-local diagnostics. */
-import { closeSync, openSync, readSync } from 'node:fs';
 import path from 'node:path';
 import matter from 'gray-matter';
 import { MAX_MONITOR_BYTES } from '../schema/input-limits.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import type { MonitorDefinition } from '../schema/types.js';
+import { readMonitorFileSync } from './read-monitor-file.js';
 
 export interface ParseResult {
   ok: true;
@@ -91,34 +91,18 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
  */
 export function parseMonitorFile(filePath: string): ParseOutcome {
   try {
-    // Read at most one byte beyond admission, even if the file grows after
-    // opening. A stat-then-read check alone would leave an allocation race.
-    const fd = openSync(filePath, 'r');
-    try {
-      const bytes = Buffer.alloc(MAX_MONITOR_BYTES + 1);
-      let size = 0;
-      while (size < bytes.length) {
-        const count = readSync(fd, bytes, size, bytes.length - size, null);
-        if (count === 0) {
-          break;
-        }
-        size += count;
-      }
-      if (size > MAX_MONITOR_BYTES) {
-        return monitorByteLimitError(filePath);
-      }
-      return parseMonitor(bytes.subarray(0, size).toString('utf8'), filePath);
-    } finally {
-      closeSync(fd);
-    }
+    const content = readMonitorFileSync(filePath);
+    return content === undefined
+      ? monitorByteLimitError(filePath)
+      : parseMonitor(content, filePath);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, filePath, error: `Failed to read file: ${message}` };
   }
 }
 
-/** A single bounded diagnostic replaces potentially unbounded parser output. */
-function monitorByteLimitError(filePath: string): ParseError {
+/** A shared admission diagnostic for direct file parsing and discovery. @internal */
+export function monitorByteLimitError(filePath: string): ParseError {
   return {
     ok: false,
     filePath,
