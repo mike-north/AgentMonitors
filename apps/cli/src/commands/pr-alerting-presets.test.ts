@@ -242,7 +242,7 @@ async function observe(
         `fifo="$AM475_STDERR.pipe"
 mkfifo "$fifo" || exit 125
 # Drain the stream after retaining a bounded prefix, preserving child exit semantics.
-{ head -c 4096; cat >/dev/null; } <"$fifo" >"$AM475_STDERR" &
+{ head -c 4096; head -c 1 >"$AM475_CUT"; cat >/dev/null; } <"$fifo" >"$AM475_STDERR" &
 reader=$!
 trap 'kill "$reader" 2>/dev/null || :; rm -f "$fifo"' EXIT
 "$@" 2>"$fifo"
@@ -258,6 +258,7 @@ exit "$code"`,
         AM444_FIXTURE: fixtureFile,
         AM475_STDERR: stderrFile,
         AM475_EXIT: exitFile,
+        AM475_CUT: path.join(diagnostics, 'cut'),
       },
     },
     {
@@ -276,6 +277,8 @@ exit "$code"`,
       : '(not captured)',
     state?.stdout ?? '',
     state?.truncated ?? false,
+    existsSync(path.join(diagnostics, 'cut')) &&
+      readFileSync(path.join(diagnostics, 'cut')).length > 0,
   );
   return {
     titles: result.observations.map((o) => o.title),
@@ -2151,7 +2154,7 @@ describe('partial nonzero results (003 §11.2)', () => {
       /exit code: 7/,
     );
   });
-  it('bounds stored stderr and excludes raw input from errors', async () => {
+  it('bounds stored stderr and reports the retained prefix with a cutoff marker', async () => {
     const start = createdTempDirs.length;
     const secret = 'PRIVATE_JQ_INPUT';
     const scope = {
@@ -2168,8 +2171,9 @@ describe('partial nonzero results (003 §11.2)', () => {
       failure = String(error);
     }
     expect(failure).toContain('exit code: 5');
-    expect(failure).not.toContain(secret);
-    expect(failure.length).toBeLessThan(1000);
+    expect(failure).toContain(secret);
+    expect(failure).toContain('stderr truncated at 4096 bytes');
+    expect(failure.length).toBeLessThan(5000);
     const dirs = createdTempDirs
       .slice(start)
       .filter((dir) => existsSync(path.join(dir, 'stderr')));
@@ -2179,4 +2183,11 @@ describe('partial nonzero results (003 §11.2)', () => {
         4096,
       );
   });
+});
+
+it('includes real jq compile-error text and command in the diagnostic', async () => {
+  if (!hasJq) return;
+  await expect(
+    observe({ command: ['jq', '-n', 'broken('] }, tempDir('compile-jq'), '[]'),
+  ).rejects.toThrow(/broken.*exit code: 3.*stderr: jq: error/s);
 });

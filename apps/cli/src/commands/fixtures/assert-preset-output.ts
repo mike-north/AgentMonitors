@@ -6,10 +6,14 @@ export function assertPresetOutput(
   stderr: string,
   stdout: string,
   truncated: boolean,
+  stderrTruncated = false,
 ): void {
   if (exitCode !== '0' || !stdout.trim() || truncated) {
+    const bytes = Buffer.from(stderr);
+    const retained = bytes.subarray(0, 4096).toString('utf8');
+    const cutoff = stderrTruncated || bytes.length > 4096;
     throw new Error(
-      `Preset jq command failed: ${JSON.stringify(Array.isArray(command) ? [command[0], '[arguments redacted]'] : '[command redacted]')}\nexit code: ${exitCode || 'unavailable'}\nstderr: ${stderr ? `[content redacted; ${String(Buffer.byteLength(stderr))} captured bytes]` : '(empty)'}\nstdout empty: ${String(!stdout.trim())}; truncated: ${String(truncated)}`,
+      `Preset jq command failed: ${JSON.stringify(command)}\nexit code: ${exitCode || 'unavailable'}\nstderr: ${retained || '(empty)'}${cutoff ? '\n[stderr truncated at 4096 bytes]' : ''}\nstdout empty: ${String(!stdout.trim())}; truncated: ${String(truncated)}`,
     );
   }
 }

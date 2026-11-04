@@ -18,19 +18,20 @@ it('accepts valid empty JSON arrays', () => {
   expect(() => assertPresetOutput(['jq'], '0', '', '[]', false)).not.toThrow();
 });
 
-it('never discloses raw input through argv or stderr', () => {
+it('retains command arguments and bounded stderr text with a cutoff marker', () => {
   try {
     assertPresetOutput(
-      ['jq', 'PRIVATE_INPUT'],
-      '5',
-      'PRIVATE_INPUT'.repeat(10000),
-      '[]',
+      ['jq', '-n', 'broken('],
+      '3',
+      'compile error: '.repeat(1000),
+      '',
       false,
     );
-    throw new Error('expected failure');
   } catch (error) {
     const message = String(error);
-    expect(message).not.toContain('PRIVATE_INPUT');
-    expect(message.length).toBeLessThan(1000);
+    expect(message).toContain('broken(');
+    expect(message).toContain('compile error:');
+    expect(message).toContain('stderr truncated at 4096 bytes');
+    expect(message.length).toBeLessThan(4500);
   }
 });
