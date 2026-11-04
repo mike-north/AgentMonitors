@@ -17,12 +17,16 @@
  * @see https://prettier.io/docs/ignore
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { dirname, join, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { claudeCodeAdapter } from '../libs/core/src/adapter/claude.js';
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const PRETTIER_CLI = createRequire(import.meta.url).resolve(
+  'prettier/bin/prettier.cjs',
+);
 
 /** `.agentmonitors/` is rooted at `<workspace-or-cwd>`, which can be any directory. */
 const WORKSPACES = [
@@ -57,10 +61,12 @@ function gitCheckIgnore(repoRelativePath: string, ...flags: string[]) {
 }
 
 function prettierFileInfo(repoRelativePath: string): unknown {
+  // Runs the CLI entrypoint under Node: the `.bin` shim is not executable this
+  // way on Windows, where pnpm generates `.cmd` and `.ps1` wrappers instead.
   return JSON.parse(
     execFileSync(
-      join(REPO_ROOT, 'node_modules', '.bin', 'prettier'),
-      ['--file-info', repoRelativePath],
+      process.execPath,
+      [PRETTIER_CLI, '--file-info', repoRelativePath],
       { cwd: REPO_ROOT, encoding: 'utf8' },
     ),
   );
