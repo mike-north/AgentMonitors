@@ -19,6 +19,8 @@ it('accepts valid empty JSON arrays', () => {
 });
 
 it('retains command arguments and bounded stderr text with a cutoff marker', () => {
+  // A silent helper return must fail rather than bypass all diagnostic checks.
+  expect.assertions(4);
   try {
     assertPresetOutput(
       ['jq', '-n', 'broken('],
