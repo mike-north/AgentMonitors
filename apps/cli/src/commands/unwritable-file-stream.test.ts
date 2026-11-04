@@ -15,18 +15,20 @@ import fs, { fstatSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { openUnwritableFileStream } from './unwritable-file-stream.test-support.js';
 
-/** Resolves once the stream has both failed the write and emitted its paired 'error' event. */
-function failWrite(stream: NodeJS.WritableStream): Promise<Error[]> {
-  return new Promise((resolve) => {
-    const errors: Error[] = [];
-    stream.once('error', (error) => {
-      errors.push(error);
-      resolve(errors);
-    });
-    stream.write('hello', (error) => {
-      if (error) errors.push(error);
-    });
+/**
+ * Writes to the stream and resolves with what each failure signal reported, once
+ * the write callback has run and the paired 'error' event has fired.
+ */
+async function failWrite(
+  stream: NodeJS.WritableStream,
+): Promise<(Error | null | undefined)[]> {
+  const errorEvent = new Promise<Error>((resolve) => {
+    stream.once('error', resolve);
   });
+  const writeCallback = new Promise<Error | null | undefined>((resolve) => {
+    stream.write('hello', resolve);
+  });
+  return Promise.all([writeCallback, errorEvent]);
 }
 
 describe('openUnwritableFileStream (stale-descriptor double close, issue #548)', () => {
@@ -39,7 +41,7 @@ describe('openUnwritableFileStream (stale-descriptor double close, issue #548)',
     try {
       const errors = await failWrite(stream);
       expect(
-        errors.map((error) => (error as NodeJS.ErrnoException).code),
+        errors.map((error) => (error as NodeJS.ErrnoException | null)?.code),
       ).toEqual(['EBADF', 'EBADF']);
 
       // A number already closed at this point could be handed to the next
