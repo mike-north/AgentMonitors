@@ -435,16 +435,12 @@ for (const boundary of ['before', 'after']) {
 it('active watcher skip cannot strand a drain and blocked yields are backpressured', async () => {
   const f = fixture(policies.rollup);
   await f.accept();
-  f.edit('');
-  f.current.client.exec(
-    "CREATE TRIGGER edit_fault BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(ABORT, 'blocked'); END",
-  );
-  expect((await f.tick()).erroredObservations).toHaveLength(1);
-  const before = f.state();
+  const firstYield = Promise.withResolvers<undefined>();
   let resumed = 0;
   let checkpoint: ((nextState: unknown) => Promise<void>) | undefined;
   f.source.watch = async function* (_config, context) {
     checkpoint = context.checkpoint;
+    await firstYield.promise;
     yield { title: 'watch C' };
     resumed++;
     yield { title: 'watch D' };
@@ -461,6 +457,14 @@ it('active watcher skip cannot strand a drain and blocked yields are backpressur
     f.root,
   );
   try {
+    await vi.waitFor(() => expect(checkpoint).toBeTypeOf('function'));
+    f.edit('');
+    f.current.client.exec(
+      "CREATE TRIGGER edit_fault BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+    );
+    expect((await f.tick()).erroredObservations).toHaveLength(1);
+    const before = f.state();
+    firstYield.resolve(undefined);
     for (let i = 0; i < 30; i++) await Promise.resolve();
     expect(resumed).toBe(0);
     expect(f.state()).toEqual(before);
@@ -482,6 +486,7 @@ it('active watcher skip cannot strand a drain and blocked yields are backpressur
     expect(f.state().sourceState).toEqual({ cursor: 999 });
     expect(f.calls).toBe(1);
   } finally {
+    firstYield.resolve(undefined);
     await handle.stop();
   }
 });

@@ -7,11 +7,7 @@ import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
-import type {
-  Observation,
-  ObservationContext,
-  ObservationSource,
-} from '../observation/types.js';
+import type { Observation, ObservationSource } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
@@ -587,6 +583,7 @@ export class AgentMonitorRuntime {
    * loop still uses membership (`has`) to skip `observe()` for actively-watched
    * monitors.
    */
+  /** Identity belongs to one workspace/monitor, including a blocked startup. */
   private readonly activeWatchers = new Map<string, symbol>();
 
   /**
@@ -2511,33 +2508,11 @@ export class AgentMonitorRuntime {
     );
     this.reapDormantSessions(now, workspacePath, monitorsById);
 
-    // Missing/invalid definitions cannot cancel operational holds. Diagnose only
-    // held ids here; ordinary definition preflight remains a separate concern.
-    const heldIds = new Set(heldMonitorIds(this.store, workspacePath));
-    for (const id of heldIds) {
-      // Ephemeral definitions live in SQLite, not in the scanned directory.
-      // Their independent declaration/reap lifecycle does not imply a file edit.
-      if (monitorsById.has(id) || id.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
-        continue;
-      }
-      const held = this.store.getMonitorState(id, workspacePath).notifyState;
-      const captured = capturedNotifyRoute(
-        held.pendingDebounce?.observations.at(0) ??
-          held.pendingRollup?.observations.at(0),
-      );
-      const parseError = result.errors.find(
-        (error) => error.filePath === captured.filePath,
-      );
-      const message = `Notify edit blocked: ${parseError?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
-      this.setWatchPolicy(id, workspacePath, null);
-      this.reportNotifyEditFailure(
-        id,
-        workspacePath,
-        captured.sourceName ?? 'unknown',
-        message,
-        acc,
-      );
-    }
+    const heldIds = this.reportMissingHeldDefinitions(
+      result,
+      workspacePath,
+      acc,
+    );
 
     // Persistent monitors (directory-authored). An unknown source is a hard tick
     // failure — the author can fix the file.
@@ -2626,6 +2601,46 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /** Diagnose operational holds whose authored definition cannot be admitted. */
+  private reportMissingHeldDefinitions(
+    result: Awaited<ReturnType<typeof scanMonitors>>,
+    workspacePath: string,
+    acc: TickAccumulator,
+  ): Set<string> {
+    const knownIds = new Set(
+      result.monitors.map((parsed) => parsed.monitor.id),
+    );
+    // Missing/invalid definitions cannot cancel operational holds. Diagnose only
+    // held ids here; ordinary definition preflight remains a separate concern.
+    const heldIds = new Set(heldMonitorIds(this.store, workspacePath));
+    for (const id of heldIds) {
+      // Ephemeral definitions live in SQLite, not in the scanned directory.
+      // Their independent declaration/reap lifecycle does not imply a file edit.
+      if (knownIds.has(id) || id.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
+        continue;
+      }
+      const held = this.store.getMonitorState(id, workspacePath).notifyState;
+      const captured = capturedNotifyRoute(
+        held.pendingDebounce?.observations.at(0) ??
+          held.pendingRollup?.observations.at(0),
+      );
+      const parseError = result.errors.find(
+        (error) => error.filePath === captured.filePath,
+      );
+      const message = `Notify edit blocked: ${parseError?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
+      this.setWatchPolicy(id, workspacePath, null);
+      this.reportNotifyEditFailure(
+        id,
+        workspacePath,
+        captured.sourceName ?? 'unknown',
+        message,
+        acc,
+      );
+    }
+
+    return heldIds;
+  }
+
   /**
    * Scanned notify definitions gate watcher acceptance, without restarting or
    * reconfiguring the live source. A null definition means old held work or its
@@ -2648,13 +2663,20 @@ export class AgentMonitorRuntime {
     }
   }
 
-  /** Hold one unaccepted yield/checkpoint without requesting further source input. */
-  private async waitForWatchPolicy(
-    monitor: MonitorDefinition,
+  /**
+   * Wait for explicit durable reconciliation before source creation, checkpoint,
+   * or yield acceptance. Watch setup initializes this gate even without a tick;
+   * an absent gate is an invariant error, not permission or an indefinite wait.
+   */
+  private async waitForWatchDefinition(
+    id: string,
     workspacePath: string,
     signal: AbortSignal,
   ): Promise<MonitorDefinition | undefined> {
-    const key = JSON.stringify([workspacePath, monitor.id]);
+    const key = JSON.stringify([workspacePath, id]);
+    if (!this.watchPolicies.has(key)) {
+      throw new Error('Watcher notify acceptance was not initialized.');
+    }
     while (!signal.aborted && this.watchPolicies.get(key) === null) {
       await new Promise<void>((resolve) => {
         const waiters =
@@ -2675,7 +2697,21 @@ export class AgentMonitorRuntime {
     if (signal.aborted) {
       return undefined;
     }
-    const current = this.watchPolicies.get(key) ?? monitor;
+    return this.watchPolicies.get(key) ?? undefined;
+  }
+
+  /** Apply reconciled pacing to an already established source/handling snapshot. */
+  private async waitForWatchPolicy(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    signal: AbortSignal,
+  ): Promise<MonitorDefinition | undefined> {
+    const current = await this.waitForWatchDefinition(
+      monitor.id,
+      workspacePath,
+      signal,
+    );
+    if (!current) return undefined;
     // Only pacing/urgency follow reconciliation. Execution and handling remain
     // the established source's snapshot until it is explicitly restarted; this
     // boundary does not introduce unrelated live-definition reload behavior.
@@ -2808,25 +2844,21 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Evaluate ONE monitor on a tick — shared by the persistent (directory) and
-   * ephemeral (007 §4) paths so both flow the IDENTICAL scheduling → observe →
-   * notify → materialize logic (AP7). Mutates the passed {@link TickAccumulator}
-   * exactly as the old inlined loop did. `ephemeralSessionId`, when present,
-   * restricts materialized events to that declaring session (007 §4.6 isolation);
-   * it is `undefined` for persistent monitors (project into all lead sessions).
+   * Publish acceptance only after the owned edit transaction succeeds. Startup
+   * and tick use this same boundary; optional Interpret remains after commit.
+   * A failed attempt retains durable work and leaves a cancellable blocked gate.
    */
-  private async evaluateMonitorOnTick(
+  private async prepareNotifyPolicy(
     monitor: MonitorDefinition,
     source: ObservationSource,
-    now: Date,
     workspacePath: string,
     acc: TickAccumulator,
     ephemeralSessionId?: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
+    this.setWatchPolicy(monitor.id, workspacePath, null);
     const sourceName = monitor.frontmatter.watch.type;
 
     try {
-      // Reconciliation precedes both source-due and active-watcher skips.
       const drained = this.reconcileNotifyEdit(
         monitor,
         workspacePath,
@@ -2867,12 +2899,44 @@ export class AgentMonitorRuntime {
         `Notify edit blocked; accepted holds retained: ${error instanceof Error ? error.message : String(error)}`,
         acc,
       );
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Evaluate ONE monitor on a tick — shared by the persistent (directory) and
+   * ephemeral (007 §4) paths so both flow the IDENTICAL scheduling → observe →
+   * notify → materialize logic (AP7). Mutates the passed {@link TickAccumulator}
+   * exactly as the old inlined loop did. `ephemeralSessionId`, when present,
+   * restricts materialized events to that declaring session (007 §4.6 isolation);
+   * it is `undefined` for persistent monitors (project into all lead sessions).
+   */
+  private async evaluateMonitorOnTick(
+    monitor: MonitorDefinition,
+    source: ObservationSource,
+    now: Date,
+    workspacePath: string,
+    acc: TickAccumulator,
+    ephemeralSessionId?: string,
+  ): Promise<void> {
+    const sourceName = monitor.frontmatter.watch.type;
+    if (
+      !(await this.prepareNotifyPolicy(
+        monitor,
+        source,
+        workspacePath,
+        acc,
+        ephemeralSessionId,
+      ))
+    ) {
       return;
     }
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
-    if (this.activeWatchers.has(monitor.id)) return;
+    if (this.activeWatchers.has(JSON.stringify([workspacePath, monitor.id])))
+      return;
 
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
     if (schedule.error) {
@@ -3336,6 +3400,21 @@ export class AgentMonitorRuntime {
     const result = await scanMonitors(monitorsDir);
     this.assertNoDuplicateIds(result, monitorsDir);
 
+    const startup: TickAccumulator = {
+      evaluated: [],
+      emittedEventIds: [],
+      erroredObservations: [],
+      skippedMonitors: [],
+    };
+    const heldIds = this.reportMissingHeldDefinitions(
+      result,
+      workspacePath,
+      startup,
+    );
+    for (const error of startup.erroredObservations) {
+      options.onError?.(error.monitorId, new Error(error.message));
+    }
+
     const controllers = new Map<string, AbortController>();
     const tasks: Promise<void>[] = [];
 
@@ -3344,12 +3423,31 @@ export class AgentMonitorRuntime {
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
+        if (heldIds.has(monitor.id)) {
+          const message = `Notify edit blocked: unknown source "${sourceName}"; accepted holds retained.`;
+          this.setWatchPolicy(monitor.id, workspacePath, null);
+          this.reportNotifyEditFailure(
+            monitor.id,
+            workspacePath,
+            sourceName,
+            message,
+            startup,
+          );
+          options.onError?.(monitor.id, new Error(message));
+          continue;
+        }
         throw new Error(
           `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
       }
       if (!source.watch) continue;
-      if (this.activeWatchers.has(monitor.id)) continue;
+      const errorStart = startup.erroredObservations.length;
+      await this.prepareNotifyPolicy(monitor, source, workspacePath, startup);
+      for (const error of startup.erroredObservations.slice(errorStart)) {
+        options.onError?.(error.monitorId, new Error(error.message));
+      }
+      if (this.activeWatchers.has(JSON.stringify([workspacePath, monitor.id])))
+        continue;
 
       const controller = new AbortController();
       controllers.set(monitor.id, controller);
@@ -3357,13 +3455,14 @@ export class AgentMonitorRuntime {
       // while its own token is still current, and a superseded watcher's
       // straggling checkpoint is rejected on token mismatch (002 §2.4).
       const watcherToken = Symbol(monitor.id);
-      this.activeWatchers.set(monitor.id, watcherToken);
+      this.activeWatchers.set(
+        JSON.stringify([workspacePath, monitor.id]),
+        watcherToken,
+      );
 
-      const watch = source.watch.bind(source);
       tasks.push(
         this.consumeWatch(
           monitor,
-          watch,
           workspacePath,
           controller.signal,
           watcherToken,
@@ -3398,10 +3497,6 @@ export class AgentMonitorRuntime {
    */
   private async consumeWatch(
     monitor: MonitorDefinition,
-    watch: (
-      config: Record<string, unknown>,
-      context: ObservationContext & { signal: AbortSignal },
-    ) => AsyncIterable<Observation>,
     workspacePath: string,
     signal: AbortSignal,
     watcherToken: symbol,
@@ -3439,7 +3534,8 @@ export class AgentMonitorRuntime {
     const checkpoint = (nextState: unknown): Promise<void> => {
       if (
         signal.aborted ||
-        this.activeWatchers.get(monitor.id) !== watcherToken
+        this.activeWatchers.get(JSON.stringify([workspacePath, monitor.id])) !==
+          watcherToken
       ) {
         process.stderr.write(
           `Warning: watch checkpoint for monitor "${monitor.id}" ignored after ` +
@@ -3463,6 +3559,23 @@ export class AgentMonitorRuntime {
       // hit the `finally` below so the active-watcher slot is released instead
       // of leaking forever (the id would otherwise stay pinned, permanently
       // skipped by the tick loop and unreachable by a future `watchMonitors()`).
+      // No source factory or checkpoint exists until durable reconciliation
+      // permits admission. A corrected blocked declaration becomes the initial
+      // execution snapshot; later edits can change only its pacing/urgency.
+      const admitted = await this.waitForWatchDefinition(
+        monitor.id,
+        workspacePath,
+        signal,
+      );
+      if (!admitted) return;
+      monitor = admitted;
+      const source = this.registry.get(monitor.frontmatter.watch.type);
+      if (!source?.watch) {
+        throw new Error(
+          `Monitor "${monitor.id}" has no available watch source after reconciliation.`,
+        );
+      }
+      const watch = source.watch.bind(source);
       const monitorState = this.store.getMonitorState(
         monitor.id,
         workspacePath,
@@ -3531,8 +3644,11 @@ export class AgentMonitorRuntime {
       // that completes normally must not permanently pin the id and starve
       // observe()) and a future watchMonitors() can re-establish it. A watcher
       // already superseded by a newer one leaves that newer entry untouched.
-      if (this.activeWatchers.get(monitor.id) === watcherToken) {
-        this.activeWatchers.delete(monitor.id);
+      if (
+        this.activeWatchers.get(JSON.stringify([workspacePath, monitor.id])) ===
+        watcherToken
+      ) {
+        this.activeWatchers.delete(JSON.stringify([workspacePath, monitor.id]));
       }
       // Flush every still-pending checkpoint/ingest before the watcher task
       // resolves, so `stop()` (which awaits every watcher task) truly waits for
