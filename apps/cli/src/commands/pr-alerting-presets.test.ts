@@ -30,6 +30,7 @@ import { parseMonitor } from '@agentmonitors/core';
 import commandPoll from '@agentmonitors/source-command-poll';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { assertPresetOutput } from './fixtures/assert-preset-output.js';
+import { PRESET_CAPTURE_COMMAND } from './fixtures/preset-capture-command.js';
 import { TEMPLATES } from './init.js';
 
 /** Where the scaffolded template's `watch:` block lands after parsing. */
@@ -237,23 +238,7 @@ async function observe(
   const result = await commandPoll.observe(
     {
       ...scope,
-      command: [
-        'sh',
-        '-c',
-        `fifo="$AM475_STDERR.pipe"
-mkfifo "$fifo" || exit 125
-# Drain to completion while retaining a bounded tail before the parent reads it.
-"$AM475_NODE" "$AM475_READER" "$AM475_STDERR" "$AM475_TOTAL" <"$fifo" &
-reader=$!
-trap 'if [ -n "$reader" ]; then kill "$reader" 2>/dev/null || :; fi; rm -f "$fifo"' EXIT
-"$@" 2>"$fifo"
-code=$?
-if wait "$reader"; then reader=""; else reader=""; exit 125; fi
-printf "%s" "$code" >"$AM475_EXIT"
-exit "$code"`,
-        'preset-jq',
-        ...command,
-      ],
+      command: ['sh', '-c', PRESET_CAPTURE_COMMAND, 'preset-jq', ...command],
       env: {
         PATH: pathWith(stubDir),
         AM444_FIXTURE: fixtureFile,

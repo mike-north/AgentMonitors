@@ -4,6 +4,8 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it } from 'vitest';
+import { probePresetFifo } from './fixtures/probe-preset-fifo.js';
+import { PRESET_CAPTURE_COMMAND } from './fixtures/preset-capture-command.js';
 
 it.each([0, 4096, 4097, 8 * 1024 * 1024])(
   'retains the exact tail and total byte count for %i bytes',
@@ -36,3 +38,16 @@ it.each([0, 4096, 4097, 8 * 1024 * 1024])(
     }
   },
 );
+
+it('finishes the actual FIFO reader after writer EOF while the command stays alive', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'preset-fifo-'));
+  try {
+    const result = await probePresetFifo(dir, PRESET_CAPTURE_COMMAND);
+    expect(result.writtenBytes).toBe(4097);
+    expect(result.totalBytes).toBe(4097);
+    expect(result.tailBytes).toBe(4096);
+    expect(result.completedWhileCommandAlive).toBe(true);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
