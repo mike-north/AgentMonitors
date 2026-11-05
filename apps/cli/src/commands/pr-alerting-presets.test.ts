@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseMonitor } from '@agentmonitors/core';
 import commandPoll from '@agentmonitors/source-command-poll';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { assertPresetOutput } from './fixtures/assert-preset-output.js';
 import { TEMPLATES } from './init.js';
 
@@ -273,23 +273,29 @@ exit "$code"`,
     },
   );
   const state = result.nextState as
-    | { stdout?: string; truncated?: boolean }
+    | { stdout?: string; truncated?: boolean; health?: 'ok' | 'failing' }
     | undefined;
-  // The total file is written only after the bounded tail at normal EOF.
-  // Timeout/signal or missing/inconsistent files cannot establish completion.
-  const outcome = result.observations.some(
-    (o) =>
-      typeof o.payload?.error === 'string' &&
-      o.payload.error.startsWith('Command timed out after '),
-  )
-    ? 'timeout'
-    : result.observations.some(
-          (o) =>
-            typeof o.payload?.error === 'string' &&
-            o.payload.error.startsWith('Command terminated by signal '),
-        )
-      ? 'signal'
-      : 'result';
+  // Current health establishes whether execution produced a result (003 §11.5).
+  // Failure observations are edge-triggered: their absence on repeated failure
+  // cannot imply success. An emitted reason can refine failure diagnostics only.
+  const outcome =
+    state?.health === 'ok'
+      ? 'result'
+      : result.observations.some(
+            (o) =>
+              typeof o.payload?.error === 'string' &&
+              o.payload.error.startsWith('Command timed out after '),
+          )
+        ? 'timeout'
+        : result.observations.some(
+              (o) =>
+                typeof o.payload?.error === 'string' &&
+                o.payload.error.startsWith('Command terminated by signal '),
+            )
+          ? 'signal'
+          : 'source-failure';
+  // EOF files establish capture completion only for a current successful result,
+  // never for failed source execution retaining a previous successful baseline.
   const tail = existsSync(stderrFile)
     ? readFileSync(stderrFile)
     : Buffer.alloc(0);
@@ -2362,3 +2368,163 @@ it.each(['my-prs', 'pr-review'] as const)(
     ).rejects.toThrow(`context: ${preset}; argv withheld`);
   },
 );
+
+/** Produce real failing health while preserving a private prior-success baseline. */
+async function failingPresetBaseline(): Promise<unknown> {
+  const result = await commandPoll.observe(
+    { command: ['sh', '-c', 'kill -TERM $$'] },
+    {
+      now: new Date(),
+      previousState: {
+        stdout: 'PRIVATE_OLD_BASELINE',
+        exitCode: 0,
+        truncated: true,
+        health: 'ok',
+        baselined: true,
+      },
+    },
+  );
+  expect(result.observations).toHaveLength(1);
+  expect(result.nextState).toMatchObject({
+    stdout: 'PRIVATE_OLD_BASELINE',
+    health: 'failing',
+    truncated: true,
+  });
+  return result.nextState;
+}
+
+describe('consecutive source failures with surviving capture (003 §11.5)', () => {
+  it.each(['signal', 'timeout'] as const)(
+    'reports unknown capture for repeated %s without a new health observation',
+    async (mode) => {
+      const previousState = await failingPresetBaseline();
+      const start = createdTempDirs.length;
+      const marker = path.join(tempDir('repeated-write'), 'written.json');
+      const producer = `const fs=require('node:fs'); const bytes=Buffer.alloc(4097,'x'); bytes.write('PRIVATE_CAPTURE_TAIL',4065); process.stderr.write(bytes,()=>fs.writeFileSync(process.argv[1],JSON.stringify({writtenBytes:4097,group:Number(process.argv[2])})));`;
+      const script = `"$1" -e "$2" "$3" "$PPID"
+exec 2>/dev/null
+while [ ! -f "$AM475_TOTAL" ]; do sleep 0.01; done
+printf '[]'
+if [ "$4" = signal ]; then kill -TERM "$PPID"; else sleep 60; fi`;
+      const scope = {
+        command: [
+          'sh',
+          '-c',
+          script,
+          'owned-repeated-fixture',
+          process.execPath,
+          producer,
+          marker,
+          mode,
+        ],
+        timeout: '2s',
+      };
+      const observed = vi.spyOn(commandPoll, 'observe');
+      let failure = '';
+      try {
+        try {
+          await observe(
+            scope,
+            tempDir('repeated-command'),
+            '[]',
+            previousState,
+          );
+        } catch (error) {
+          failure = String(error);
+        }
+        expect(existsSync(marker)).toBe(true);
+        const written = JSON.parse(readFileSync(marker, 'utf8')) as {
+          writtenBytes: number;
+        };
+        expect(written.writtenBytes).toBe(4097);
+        const raw = await observed.mock.results[0]?.value;
+        expect(raw.observations).toEqual([]);
+        expect(raw.nextState).toMatchObject({
+          health: 'failing',
+          stdout: 'PRIVATE_OLD_BASELINE',
+          truncated: true,
+        });
+        const dirs = createdTempDirs
+          .slice(start)
+          .filter((dir) => existsSync(path.join(dir, 'total')));
+        expect(dirs).toHaveLength(1);
+        for (const dir of dirs) {
+          expect(readFileSync(path.join(dir, 'total'), 'utf8')).toBe('4097');
+          expect(statSync(path.join(dir, 'stderr')).size).toBe(4096);
+          expect(readFileSync(path.join(dir, 'stderr'), 'utf8')).toContain(
+            'PRIVATE_CAPTURE_TAIL',
+          );
+        }
+        expect(failure).toContain(
+          'failure category: source failure (specific reason unavailable)',
+        );
+        expect(failure).not.toContain('command timeout');
+        expect(failure).not.toContain('command interrupted by signal');
+        expect(failure).toContain('stderr capture: incomplete');
+        expect(failure).toContain(
+          'stderr empty: unknown; retained bytes: unknown; stderr truncated: unknown',
+        );
+        expect(failure).toContain('stdout empty: unknown; truncated: unknown');
+        expect(failure).not.toContain('PRIVATE');
+        expect(failure).not.toContain(marker);
+        expect(failure.length).toBeLessThan(600);
+      } finally {
+        observed.mockRestore();
+        if (existsSync(marker)) {
+          const owned = JSON.parse(readFileSync(marker, 'utf8')) as {
+            group: number;
+          };
+          killOwnedCaptureGroup(owned.group);
+        }
+      }
+    },
+  );
+
+  it('uses current healthy recovery rather than prior failing health', async () => {
+    const previousState = await failingPresetBaseline();
+    const recovered = await observe(
+      { command: ['sh', '-c', 'printf "[]"'] },
+      tempDir('recovery-command'),
+      '[]',
+      previousState,
+    );
+    expect(recovered.stdout).toBe('[]');
+    expect(recovered.state).toMatchObject({
+      health: 'ok',
+      truncated: false,
+      stdout: '[]',
+    });
+    expect(
+      recovered.titles.some((title) => title.startsWith('Command recovered:')),
+    ).toBe(true);
+  });
+
+  it('keeps recovered nonzero jq results healthy in the source but rejects partial JSON in this helper', async () => {
+    if (!hasJq) return;
+    const previousState = await failingPresetBaseline();
+    const scope = {
+      command: ['jq', '-n', '[], error("PRIVATE_RECOVERY_INPUT")'],
+    };
+    const raw = await commandPoll.observe(scope, {
+      now: new Date(),
+      previousState,
+    });
+    expect(raw.nextState).toMatchObject({
+      health: 'ok',
+      stdout: '[]\n',
+      exitCode: 5,
+      truncated: false,
+    });
+    let failure = '';
+    try {
+      await observe(scope, tempDir('recovery-jq'), '[]', previousState);
+    } catch (error) {
+      failure = String(error);
+    }
+    expect(failure).toContain('exit code: 5');
+    expect(failure).toContain('failure category: jq runtime error');
+    expect(failure).toContain('stderr capture: complete');
+    expect(failure).toContain('stdout empty: false; truncated: false');
+    expect(failure).not.toContain('PRIVATE');
+  });
+});

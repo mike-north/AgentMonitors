@@ -93,3 +93,17 @@ it.each(['timeout', 'signal'] as const)(
     }
   },
 );
+
+it('does not treat surviving capture or a prior numeric status as success when current source health failed', () => {
+  expect(() =>
+    assertPresetOutput(
+      ['PRIVATE_ARGV'],
+      '0',
+      'PRIVATE_TAIL',
+      'PRIVATE_BASELINE',
+      false,
+      false,
+      { outcome: 'source-failure' },
+    ),
+  ).toThrow('failure category: source failure (specific reason unavailable)');
+});
