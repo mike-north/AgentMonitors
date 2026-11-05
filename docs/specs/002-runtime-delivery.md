@@ -635,7 +635,12 @@ provided), with the same joined diagnostic. Watchers already running keep their
 startup config; live watcher reload is outside this contract.
 
 `monitor explain` **MUST** report a definition failure and `doctor` **MUST** report
-an invalid monitor with the same diagnostic as `validate`. `daemon once` text and
+an invalid monitor with the same diagnostic as `validate`. Doctor **MUST NOT**
+schedule a rejected scope: for example, `file-fingerprint` with valid `globs` and
+`interval: bad` returns the authoritative validation error, `due: false`, and no
+`nextDueAt`, while healthy siblings remain in the report. Diagnostic reads **MUST**
+preserve source state, pending notify work, events, and observation history.
+`daemon once` text and
 JSON output and the continuous daemon log **MUST** expose validation skips even
 when no events emit, naming the monitor and diagnostic; waiting for a next-due time
 cannot fix invalid config. Runtime and built-CLI regressions in

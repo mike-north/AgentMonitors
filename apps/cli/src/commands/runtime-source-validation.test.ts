@@ -98,3 +98,97 @@ it('shows validate diagnostics in tick, explain and doctor while preventing comm
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+/** A rejected interval must be diagnosable without entering duration scheduling. */
+it('keeps malformed-duration diagnostics consistent across validate, tick, explain and doctor', () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'am-duration-cli-'));
+  const monitorsDir = path.join(root, 'monitors');
+  for (const id of ['aaa-invalid', 'zzz-healthy']) {
+    const dir = path.join(monitorsDir, id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      path.join(dir, 'MONITOR.md'),
+      `---\nname: ${id}\nwatch:\n  type: file-fingerprint\n  globs: ['watched.txt']\n  interval: ${id === 'aaa-invalid' ? 'bad' : '1s'}\nurgency: normal\n---\nHandle it.\n`,
+    );
+  }
+  writeFileSync(path.join(root, 'watched.txt'), 'baseline');
+  const run = (...args: string[]) =>
+    spawnSync(
+      process.execPath,
+      [path.resolve(__dirname, '../../dist/index.cjs'), ...args],
+      {
+        encoding: 'utf8',
+        cwd: root,
+        timeout: 10000,
+        env: {
+          ...process.env,
+          AGENTMONITORS_DB: path.join(root, 'state.db'),
+          AGENTMONITORS_SOCKET: path.join(root, 'missing.sock'),
+        },
+      },
+    );
+  try {
+    const validation = run('validate', monitorsDir, '--format', 'json');
+    expect(validation.status).toBe(1);
+    const diagnostic: string = JSON.parse(validation.stdout).errors[0].error;
+    expect(diagnostic).toContain('scope/interval');
+    const tick = run(
+      'daemon',
+      'once',
+      monitorsDir,
+      '--workspace',
+      root,
+      '--format',
+      'json',
+    );
+    expect(tick.status).toBe(0);
+    expect(JSON.parse(tick.stdout)).toMatchObject({
+      evaluatedMonitors: ['zzz-healthy'],
+      skippedMonitors: [
+        { monitorId: 'aaa-invalid', validationError: diagnostic },
+      ],
+    });
+    const explain = run(
+      'monitor',
+      'explain',
+      'aaa-invalid',
+      '--dir',
+      monitorsDir,
+      '--workspace',
+      root,
+      '--format',
+      'json',
+    );
+    expect(explain.status).toBe(0);
+    expect(JSON.parse(explain.stdout).stages[0].reason).toBe(
+      `Monitor definition is invalid: ${diagnostic}`,
+    );
+    const doctor = run(
+      'doctor',
+      '--dir',
+      monitorsDir,
+      '--workspace',
+      root,
+      '--format',
+      'json',
+    );
+    const report = JSON.parse(doctor.stdout);
+    expect(report.monitors).toHaveLength(2);
+    expect(
+      report.monitors.find(
+        (monitor: { id: string }) => monitor.id === 'aaa-invalid',
+      ),
+    ).toMatchObject({
+      valid: false,
+      validationError: diagnostic,
+      nextDueAt: null,
+    });
+    expect(
+      report.monitors.find(
+        (monitor: { id: string }) => monitor.id === 'zzz-healthy',
+      ),
+    ).toMatchObject({ valid: true });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

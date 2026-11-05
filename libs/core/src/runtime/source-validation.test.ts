@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import fileFingerprintSource from '../../../../plugins/source-file-fingerprint/src/index.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
@@ -226,6 +227,85 @@ describe('source config execution preflight', () => {
     ).toMatchObject([
       { title: 'aaa-paused', summary: 'Held change', snapshotText: 'captured' },
     ]);
+  });
+
+  it('diagnoses a bundled file source with a malformed interval without scheduling it or mutating held work', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-11-05T12:00:00Z'));
+    const f = fixture();
+    const registry = new SourceRegistry();
+    registry.register(fileFingerprintSource);
+    const store = new RuntimeStore(createDb(path.join(f.root, 'bundled.db')));
+    const runtime = new AgentMonitorRuntime(store, registry);
+    const write = (id: string, interval: string, notify = '') => {
+      const dir = path.join(f.monitorsDir, id);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        `---\nname: ${id}\nwatch:\n  type: file-fingerprint\n  globs: ['${id}.txt']\n  interval: ${interval}\nurgency: normal\n${notify}\n---\nHandle it.\n`,
+      );
+    };
+    const notify = 'notify:\n  strategy: debounce\n  settle-for: 5s';
+    write('aaa-invalid', '1s', notify);
+    write('zzz-healthy', '1s');
+    writeFileSync(path.join(f.root, 'aaa-invalid.txt'), 'baseline');
+    writeFileSync(path.join(f.root, 'zzz-healthy.txt'), 'baseline');
+    await runtime.tick(f.monitorsDir, f.root);
+    vi.advanceTimersByTime(1000);
+    writeFileSync(path.join(f.root, 'aaa-invalid.txt'), 'captured');
+    await runtime.tick(f.monitorsDir, f.root);
+    const retained = store.getMonitorState('aaa-invalid', f.root);
+    expect(retained.sourceState).toMatchObject({
+      fingerprints: expect.any(Object),
+    });
+    expect(retained.notifyState.pendingDebounce?.observations).toHaveLength(1);
+    write('aaa-invalid', 'bad', notify);
+    const diagnostic = validateWatchScope(
+      { globs: ['aaa-invalid.txt'], interval: 'bad' },
+      fileFingerprintSource.scopeSchema,
+    ).join('; ');
+    expect(diagnostic).toContain('scope/interval');
+    const history = runtime.listObservationHistory({ workspacePath: f.root });
+    const events = runtime.listEvents({ workspacePath: f.root });
+    // Diagnostics must remain read-only even when invalid source config would
+    // throw from scheduling, and must still report the healthy sibling.
+    const doctor = await runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+    expect(doctor.invalidCount).toBe(1);
+    expect(
+      doctor.monitors.find((monitor) => monitor.id === 'aaa-invalid'),
+    ).toMatchObject({ valid: false, validationError: diagnostic, due: false });
+    expect(
+      doctor.monitors.find((monitor) => monitor.id === 'aaa-invalid')
+        ?.nextDueAt,
+    ).toBeUndefined();
+    expect(
+      doctor.monitors.find((monitor) => monitor.id === 'zzz-healthy')?.valid,
+    ).toBe(true);
+    const explain = await runtime.explainMonitor({
+      monitorId: 'aaa-invalid',
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+    expect(explain.stages[0]?.reason).toBe(
+      `Monitor definition is invalid: ${diagnostic}`,
+    );
+    expect(store.getMonitorState('aaa-invalid', f.root)).toEqual(retained);
+    expect(runtime.listObservationHistory({ workspacePath: f.root })).toEqual(
+      history,
+    );
+    expect(runtime.listEvents({ workspacePath: f.root })).toEqual(events);
+    vi.advanceTimersByTime(10000);
+    writeFileSync(path.join(f.root, 'zzz-healthy.txt'), 'sibling progresses');
+    const tick = await runtime.tick(f.monitorsDir, f.root);
+    expect(tick.skippedMonitors).toEqual([
+      { monitorId: 'aaa-invalid', validationError: diagnostic },
+    ]);
+    expect(tick.evaluatedMonitors).toEqual(['zzz-healthy']);
+    expect(tick.emittedEventIds).toHaveLength(1);
+    expect(store.getMonitorState('aaa-invalid', f.root)).toEqual(retained);
   });
 
   it('rechecks persisted ephemeral scopes against the currently registered schema before observing', async () => {

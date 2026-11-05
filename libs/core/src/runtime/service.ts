@@ -163,12 +163,13 @@ function watchConfig(watch: Record<string, unknown>): Record<string, unknown> {
  * Describe a monitor's observation cadence in author-facing terms for the doctor
  * rollup (issue #267): the cron expression for `schedule` sources, the authored
  * `watch.interval` for interval sources, or the resolved default poll interval
- * (`nextPollMs`) when none is authored. Intentionally generic wording so it reads
- * correctly for every bundled source.
+ * (`nextPollMs`) when none is authored. Authored cadence remains descriptive
+ * even for invalid config; without safe scheduling or an authored cadence the
+ * descriptor is unknown rather than inventing a default.
  */
 function describeCadence(
   watch: Record<string, unknown>,
-  nextPollMs: number,
+  nextPollMs: number | undefined,
 ): string {
   if (watch['type'] === 'schedule') {
     const cron = watch['cron'];
@@ -176,7 +177,9 @@ function describeCadence(
   }
   const interval = watch['interval'];
   if (typeof interval === 'string') return `every ${interval}`;
-  return `every ${String(Math.round(nextPollMs / 1000))}s`;
+  return nextPollMs === undefined
+    ? 'unknown'
+    : `every ${String(Math.round(nextPollMs / 1000))}s`;
 }
 /**
  * Semantic, transport-neutral body for a coalesced normal/low-urgency reminder
@@ -1625,17 +1628,16 @@ export class AgentMonitorRuntime {
         monitor.id,
         workspacePath,
       );
-      const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
-      // Defensive isolation (issue #297): scheduleForMonitor() never throws — an
-      // invalid IANA timezone surfaces here as `schedule.error` instead. Doctor
-      // is a diagnostic surface (like explain) and must never crash on a single
-      // bad monitor's config; fold the scheduling failure into the same
-      // valid/validationError reporting as a scope error so it's visible in the
-      // rollup rather than silently producing a bogus `due`/`nextDueAt`.
-      const validationErrors =
-        schedule.error && scopeErrors.length === 0
-          ? [schedule.error]
-          : scopeErrors;
+      // A rejected scope is not safe input to scheduling (for example, an
+      // invalid interval would throw from parseDuration). Preserve the shared
+      // validation diagnostic and leave its due time unknown until correction.
+      // Valid scopes retain the existing scheduler and its timezone diagnostic;
+      // unrelated scheduling failures are not swallowed by this boundary.
+      const schedule =
+        scopeErrors.length === 0
+          ? this.scheduleForMonitor(monitor, now, workspacePath)
+          : undefined;
+      const validationErrors = schedule?.error ? [schedule.error] : scopeErrors;
       const valid = validationErrors.length === 0;
       if (!valid) invalidCount += 1;
 
@@ -1657,11 +1659,15 @@ export class AgentMonitorRuntime {
       const neverObserved =
         runtimeState.lastObservationAt === undefined && history.length === 0;
 
-      const nextDueAt = schedule.due
-        ? now
-        : new Date(
-            (lastObservedAt?.getTime() ?? now.getTime()) + schedule.nextPollMs,
-          );
+      const nextDueAt =
+        !valid || schedule === undefined
+          ? undefined
+          : schedule.due
+            ? now
+            : new Date(
+                (lastObservedAt?.getTime() ?? now.getTime()) +
+                  schedule.nextPollMs,
+              );
 
       const events = this.store.listEvents({
         monitorId: monitor.id,
@@ -1701,11 +1707,11 @@ export class AgentMonitorRuntime {
         ...(valid ? {} : { validationError: validationErrors.join('; ') }),
         ...(lastObservedAt ? { lastObservedAt } : {}),
         neverObserved,
-        due: schedule.due,
-        nextDueAt,
+        due: valid && (schedule?.due ?? false),
+        ...(nextDueAt ? { nextDueAt } : {}),
         cadence: describeCadence(
           monitor.frontmatter.watch,
-          schedule.nextPollMs,
+          schedule?.nextPollMs,
         ),
         ...(lastEventAt ? { lastEventAt } : {}),
         delivery,

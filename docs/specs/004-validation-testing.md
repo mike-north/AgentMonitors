@@ -73,7 +73,10 @@ held notify work retained. Cover directory ticks, persisted ephemeral ticks afte
 schema changes, and continuous watcher startup. Invalid config intentionally stops
 observation, including configs that previously ran; daemon text/JSON and continuous
 logging must make that pause visible. The built CLI must also prove the authoring
-and diagnostic surfaces agree. Covered by
+and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
+with valid globs and a malformed interval: doctor must report the validation error
+without scheduling it or inventing a due time, retain healthy sibling results, and
+leave source/notify state, events, and observation history unchanged. Covered by
 `libs/core/src/runtime/source-validation.test.ts` and
 `apps/cli/src/commands/runtime-source-validation.test.ts`.
 
