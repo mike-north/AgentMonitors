@@ -1,7 +1,7 @@
 /**
  * The pre-push gate must cover CI's portable validation commands. Read the
  * actual workflow and package scripts so adding a CI step requires a local
- * counterpart or an explicit, reviewed environment exclusion (004 §2.9).
+ * counterpart or an explicit, reviewed environment exclusion (004 §2.10).
  * These tests deliberately reject unfamiliar shell syntax rather than infer
  * that a command hidden in a conditional or an echo will actually execute.
  */
