@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Source-config execution preflight (002 §2.0/§2.5, 004 §2.2/§2.5) — Refs #554
+
+Apply Mike's 2026-11-05 decision: schema-invalid configs stop observing, including
+existing configs previously allowed to run. Use the accepted `validateWatchScope`
+helper before tick scheduling/notify processing and continuous watcher startup.
+Report skips visibly with the same diagnostics as validate/explain/doctor; retain
+baseline and pending notify state across restart so a corrected config resumes.
+Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
+and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
+
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
 Remove the launcher suite's blanket retry after tracing the failure it masked to a real race: a CLI

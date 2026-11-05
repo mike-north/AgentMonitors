@@ -1,3 +1,8 @@
+/**
+ * Coordinate host-independent observation, notify timing, durable materialization,
+ * and session projection. Source config must pass the authoring contract before
+ * execution; rejected config pauses work without consuming its durable baseline.
+ */
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { ulid } from 'ulid';
@@ -5,7 +10,7 @@ import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
-import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
+import { validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
 import type {
   Observation,
@@ -548,7 +553,7 @@ interface TickAccumulator {
   evaluated: string[];
   emittedEventIds: string[];
   erroredObservations: ErroredObservation[];
-  skippedMonitors: { monitorId: string; nextDueAt: Date }[];
+  skippedMonitors: RuntimeTickResult['skippedMonitors'];
 }
 
 /**
@@ -1080,7 +1085,7 @@ export class AgentMonitorRuntime {
     const sourceName = monitor.frontmatter.watch.type;
     const source = this.registry.get(sourceName);
     const scopeErrors = source
-      ? validateScope(
+      ? validateWatchScope(
           watchConfig(monitor.frontmatter.watch),
           source.scopeSchema,
         )
@@ -1610,7 +1615,7 @@ export class AgentMonitorRuntime {
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       const scopeErrors = source
-        ? validateScope(
+        ? validateWatchScope(
             watchConfig(monitor.frontmatter.watch),
             source.scopeSchema,
           )
@@ -1627,9 +1632,10 @@ export class AgentMonitorRuntime {
       // bad monitor's config; fold the scheduling failure into the same
       // valid/validationError reporting as a scope error so it's visible in the
       // rollup rather than silently producing a bogus `due`/`nextDueAt`.
-      const validationErrors = schedule.error
-        ? [...scopeErrors, schedule.error]
-        : scopeErrors;
+      const validationErrors =
+        schedule.error && scopeErrors.length === 0
+          ? [schedule.error]
+          : scopeErrors;
       const valid = validationErrors.length === 0;
       if (!valid) invalidCount += 1;
 
@@ -2598,6 +2604,21 @@ export class AgentMonitorRuntime {
   ): Promise<void> {
     const sourceName = monitor.frontmatter.watch.type;
 
+    // Validate before scheduling or notify hydration: even an overdue held batch
+    // must remain untouched while author config is invalid. Rechecking here also
+    // protects persisted ephemeral scopes after a source schema upgrade.
+    const errors = validateWatchScope(
+      watchConfig(monitor.frontmatter.watch),
+      source.scopeSchema,
+    );
+    if (errors.length > 0) {
+      acc.skippedMonitors.push({
+        monitorId: monitor.id,
+        validationError: errors.join('; '),
+      });
+      return;
+    }
+
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
     if (this.activeWatchers.has(monitor.id)) return;
@@ -3074,6 +3095,23 @@ export class AgentMonitorRuntime {
         );
       }
       if (!source.watch) continue;
+      // Watch startup is a source execution boundary just like a one-shot tick.
+      // Isolate bad config before reserving a watcher slot or touching its state.
+      const errors = validateWatchScope(
+        watchConfig(monitor.frontmatter.watch),
+        source.scopeSchema,
+      );
+      if (errors.length > 0) {
+        const error = new Error(errors.join('; '));
+        if (options.onError) {
+          options.onError(monitor.id, error);
+        } else {
+          process.stderr.write(
+            `Monitor "${monitor.id}" skipped: ${error.message}\n`,
+          );
+        }
+        continue;
+      }
       if (this.activeWatchers.has(monitor.id)) continue;
 
       const controller = new AbortController();
