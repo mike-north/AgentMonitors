@@ -11,9 +11,7 @@ it.each([
   (code, stderr, stdout, truncated) => {
     expect(() =>
       assertPresetOutput(['jq', '-sc', '.'], code, stderr, stdout, truncated),
-    ).toThrow(
-      /context: preset subprocess; argv withheld\nexit code:.*\nstderr:/,
-    );
+    ).toThrow(/context: jq; argv withheld\nexit code:.*\nfailure category:/);
   },
 );
 it('accepts valid empty JSON arrays', () => {
@@ -34,7 +32,7 @@ it('reports safe context and bounded metadata without forwarding argv or stderr'
     const message = String(error);
     expect(message).not.toContain('PRIVATE_ARGV_PAYLOAD');
     expect(message).not.toContain('PRIVATE_STDERR_PAYLOAD');
-    expect(message).toContain('context: preset subprocess; argv withheld');
+    expect(message).toContain('context: jq; argv withheld');
     expect(message).toContain('exit code: 5');
     expect(message).toContain('stderr empty: false');
     expect(message).toContain('stderr truncated: true');
@@ -62,5 +60,36 @@ it.each([0, 4096, 4097])(
     ).toThrow(
       `stderr empty: ${size === 0}; retained bytes: ${Math.min(size, 4096)}; stderr truncated: ${size > 4096}`,
     );
+  },
+);
+
+it('does not invent empty or cutoff metadata for unavailable capture', () => {
+  expect(() =>
+    assertPresetOutput(['jq'], 'unavailable', '', '', false, 'unknown'),
+  ).toThrow(
+    'stderr empty: unknown; retained bytes: unknown; stderr truncated: unknown',
+  );
+});
+
+it.each(['timeout', 'signal'] as const)(
+  'reports %s without inventing current stdout or stderr metadata',
+  (outcome) => {
+    expect.assertions(3);
+    try {
+      assertPresetOutput(
+        ['PRIVATE_ARGV'],
+        'unavailable',
+        '',
+        '',
+        false,
+        'unknown',
+        { outcome },
+      );
+    } catch (error) {
+      const message = String(error);
+      expect(message).toContain('stderr capture: incomplete');
+      expect(message).toContain('stdout empty: unknown; truncated: unknown');
+      expect(message).not.toContain('PRIVATE_ARGV');
+    }
   },
 );

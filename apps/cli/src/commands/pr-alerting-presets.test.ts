@@ -245,10 +245,10 @@ mkfifo "$fifo" || exit 125
 # Drain to completion while retaining a bounded tail before the parent reads it.
 "$AM475_NODE" "$AM475_READER" "$AM475_STDERR" "$AM475_TOTAL" <"$fifo" &
 reader=$!
-trap 'kill "$reader" 2>/dev/null || :; rm -f "$fifo"' EXIT
+trap 'if [ -n "$reader" ]; then kill "$reader" 2>/dev/null || :; fi; rm -f "$fifo"' EXIT
 "$@" 2>"$fifo"
 code=$?
-wait "$reader" || exit 125
+if wait "$reader"; then reader=""; else reader=""; exit 125; fi
 printf "%s" "$code" >"$AM475_EXIT"
 exit "$code"`,
         'preset-jq',
@@ -275,14 +275,49 @@ exit "$code"`,
   const state = result.nextState as
     | { stdout?: string; truncated?: boolean }
     | undefined;
+  // The total file is written only after the bounded tail at normal EOF.
+  // Timeout/signal or missing/inconsistent files cannot establish completion.
+  const outcome = result.observations.some(
+    (o) =>
+      typeof o.payload?.error === 'string' &&
+      o.payload.error.startsWith('Command timed out after '),
+  )
+    ? 'timeout'
+    : result.observations.some(
+          (o) =>
+            typeof o.payload?.error === 'string' &&
+            o.payload.error.startsWith('Command terminated by signal '),
+        )
+      ? 'signal'
+      : 'result';
+  const tail = existsSync(stderrFile)
+    ? readFileSync(stderrFile)
+    : Buffer.alloc(0);
+  const totalFile = path.join(diagnostics, 'total');
+  const totalText = existsSync(totalFile)
+    ? readFileSync(totalFile, 'utf8')
+    : '';
+  const total = Number(totalText);
+  const complete =
+    outcome === 'result' &&
+    existsSync(stderrFile) &&
+    /^\d+$/.test(totalText) &&
+    Number.isSafeInteger(total) &&
+    total >= 0 &&
+    tail.length === Math.min(total, 4096);
   assertPresetOutput(
     command,
     existsSync(exitFile) ? readFileSync(exitFile, 'utf8') : 'unavailable',
-    existsSync(stderrFile) ? readFileSync(stderrFile) : '',
+    tail,
     state?.stdout ?? '',
     state?.truncated ?? false,
-    existsSync(path.join(diagnostics, 'total')) &&
-      Number(readFileSync(path.join(diagnostics, 'total'), 'utf8')) > 4096,
+    complete ? total > 4096 : 'unknown',
+    {
+      outcome,
+      ...(scope.key === 'my-prs' || scope.key === 'pr-review'
+        ? { preset: scope.key }
+        : {}),
+    },
   );
   return {
     titles: result.observations.map((o) => o.title),
@@ -2137,7 +2172,7 @@ describe('real-jq helper diagnostics (issue #475)', () => {
         command: ['sh', '-c', `printf '%s' '${stderr}' >&2; exit ${code}`],
       };
       await expect(observe(scope, tempDir('empty-jq'), '[]')).rejects.toThrow(
-        new RegExp(`exit code: ${code}\\nstderr:`),
+        new RegExp(`exit code: ${code}\\nfailure category:`),
       );
     },
   );
@@ -2206,7 +2241,9 @@ it('classifies jq compile errors without forwarding the filter or stderr', async
     failure = String(error);
   }
   expect(failure).toContain('exit code: 3');
-  expect(failure).toContain('stderr: jq compile error (check filter syntax)');
+  expect(failure).toContain(
+    'failure category: jq compile error (check filter syntax)',
+  );
   expect(failure).not.toContain('PRIVATE_FILTER');
 });
 
@@ -2233,3 +2270,95 @@ it('rejects real jq partial stdout at the helper while preserving source nonzero
   expect(failure).toContain('stdout empty: false; truncated: false');
   expect(failure).not.toContain('PRIVATE_FILTER_PAYLOAD');
 });
+
+/** Remove only a group recorded by the timeout fixture; source cleanup may win. */
+function killOwnedCaptureGroup(group: number): void {
+  try {
+    process.kill(-group, 'SIGKILL');
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      !('code' in error) ||
+      error.code !== 'ESRCH'
+    )
+      throw error;
+  }
+}
+describe('interrupted capture metadata', () => {
+  it.each([100, 4097])(
+    'does not call %i completed stderr bytes empty after timeout',
+    async (size) => {
+      const dir = tempDir('interrupted-capture');
+      const marker = path.join(dir, 'written.json');
+      const script = `const fs = require('node:fs'); setInterval(() => {}, 1000); process.stdout.write('[]'); process.stderr.write(Buffer.alloc(${size}, 'x'), () => fs.writeFileSync(process.argv[1], JSON.stringify({ pid: process.pid, group: process.ppid })));`;
+      let failure = '';
+      try {
+        try {
+          await observe(
+            {
+              command: [process.execPath, '-e', script, marker],
+              timeout: '2s',
+            },
+            tempDir('timeout-command'),
+            '[]',
+          );
+        } catch (error) {
+          failure = String(error);
+        }
+        expect(existsSync(marker)).toBe(true); // confirms the write completed before interruption
+        expect(failure).toContain('stderr capture: incomplete');
+        expect(failure).toContain(
+          'stderr empty: unknown; retained bytes: unknown; stderr truncated: unknown',
+        );
+        expect(failure).toContain('failure category: command timeout');
+        expect(failure).not.toContain(marker);
+        expect(failure.length).toBeLessThan(600);
+      } finally {
+        if (existsSync(marker)) {
+          const owned = JSON.parse(readFileSync(marker, 'utf8')) as {
+            pid: number;
+            group: number;
+          };
+          // This fixture records only the detached wrapper group which owns it.
+          killOwnedCaptureGroup(owned.group);
+        }
+      }
+    },
+  );
+});
+it('classifies real jq runtime errors by status rather than private syntax-error wording', async () => {
+  if (!hasJq) return;
+  let failure = '';
+  try {
+    await observe(
+      {
+        command: ['jq', '-n', 'error("PRIVATE syntax error DATA\\u001b[31m")'],
+      },
+      tempDir('runtime-jq'),
+      '[]',
+    );
+  } catch (error) {
+    failure = String(error);
+  }
+  expect(failure).toContain('context: jq');
+  expect(failure).toContain('failure category: jq runtime error');
+  expect(failure).not.toContain('jq compile error');
+  expect(failure).not.toContain('PRIVATE');
+  expect(
+    Array.from(failure, (char) => char.charCodeAt(0)).filter(
+      (code) => (code < 32 && code !== 10) || code === 127,
+    ),
+  ).toEqual([]);
+});
+it.each(['my-prs', 'pr-review'] as const)(
+  'identifies the fixed %s preset without copying argv',
+  async (preset) => {
+    await expect(
+      observe(
+        { ...presetScope(preset), command: ['sh', '-c', 'exit 7'] },
+        tempDir('preset-failure'),
+        '[]',
+      ),
+    ).rejects.toThrow(`context: ${preset}; argv withheld`);
+  },
+);
