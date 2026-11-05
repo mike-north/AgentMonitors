@@ -10,7 +10,7 @@ import {
 import os from 'node:os';
 import path from 'node:path';
 
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { packageManagerEntry } from './package-manager-entry.mjs';
 
@@ -61,3 +61,64 @@ it('reports absence rather than selecting another manager or a bare cmd shim', (
   expect(packageManagerEntry('npm')).toBeUndefined();
   expect(packageManagerEntry('pnpm')).toBeUndefined();
 });
+
+/** Discovery must retain every supported Node module extension under other managers. */
+describe.each(['official Windows', 'official POSIX', 'Windows PATH'])(
+  'pnpm discovery under npm (%s)',
+  (layout) => {
+    it.each(['cjs', 'js', 'mjs', undefined])(
+      'selects only the installed pnpm launcher (%s)',
+      (extension) => {
+        const root = realpathSync(
+          mkdtempSync(path.join(os.tmpdir(), 'am pnpm discovery & spaces-')),
+        );
+        roots.push(root);
+        const nodeDir = path.join(root, 'separate node', 'bin');
+        const toolsDir = path.join(root, 'separate tools');
+        mkdirSync(nodeDir, { recursive: true });
+        mkdirSync(toolsDir, { recursive: true });
+        process.execPath = path.join(nodeDir, 'node.exe');
+        Object.defineProperty(process, 'platform', {
+          value: layout === 'official POSIX' ? 'linux' : 'win32',
+        });
+        vi.stubEnv('PATH', toolsDir);
+        const npm = path.join(root, 'npm-cli.js');
+        writeFileSync(npm, 'throw new Error("npm cannot replace pnpm");');
+        vi.stubEnv('npm_execpath', npm);
+        writeFileSync(
+          path.join(toolsDir, 'pnpm.cmd'),
+          '@echo never execute this shim',
+        );
+        const packageDir =
+          layout === 'Windows PATH'
+            ? path.join(toolsDir, 'node_modules/pnpm/bin')
+            : path.join(
+                nodeDir,
+                layout === 'official POSIX'
+                  ? '../lib/node_modules/pnpm/bin'
+                  : 'node_modules/pnpm/bin',
+              );
+        mkdirSync(packageDir, { recursive: true });
+        const entry = extension
+          ? path.join(packageDir, `pnpm.${extension}`)
+          : undefined;
+        if (entry) {
+          writeFileSync(
+            entry,
+            'console.log(JSON.stringify(process.argv.slice(2)));',
+          );
+        }
+        const resolved = packageManagerEntry('pnpm');
+        expect(resolved).toBe(entry);
+        if (!entry) return;
+        if (!resolved)
+          throw new Error('installed pnpm launcher was not resolved');
+        const result = spawnSync(node, [resolved, 'literal & spaces'], {
+          encoding: 'utf8',
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(JSON.parse(result.stdout)).toEqual(['literal & spaces']);
+      },
+    );
+  },
+);

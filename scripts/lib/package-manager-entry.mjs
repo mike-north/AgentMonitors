@@ -23,19 +23,22 @@ function isEntry(candidate, manager) {
  * @internal
  */
 export function packageManagerEntry(manager) {
-  const relative =
-    manager === 'npm' ? 'npm/bin/npm-cli.js' : 'pnpm/bin/pnpm.cjs';
+  // Installed pnpm launchers use the same module extensions as direct invocations.
+  const relatives =
+    manager === 'npm'
+      ? ['npm/bin/npm-cli.js']
+      : ['cjs', 'js', 'mjs'].map((extension) => `pnpm/bin/pnpm.${extension}`);
   const invoked = process.env.npm_execpath;
   if (invoked && isEntry(invoked, manager) && existsSync(invoked))
     return invoked;
   const nodeDir = path.dirname(process.execPath);
-  const candidates = [
+  const candidates = relatives.map((relative) =>
     path.join(
       nodeDir,
       process.platform === 'win32' ? 'node_modules' : '../lib/node_modules',
       relative,
     ),
-  ];
+  );
   // PATH is case-insensitive on Windows, where the environment may spell it Path.
   const pathKey = Object.keys(process.env).find(
     (key) => key.toLowerCase() === 'path',
@@ -51,12 +54,18 @@ export function packageManagerEntry(manager) {
         const target = realpathSync(bin);
         if (isEntry(target, manager)) candidates.push(target);
         candidates.push(
-          path.join(path.dirname(target), 'node_modules', relative),
+          ...relatives.map((relative) =>
+            path.join(path.dirname(target), 'node_modules', relative),
+          ),
         );
       }
     }
-    candidates.push(path.join(dir, 'node_modules', relative));
-    candidates.push(path.join(dir, '../lib/node_modules', relative));
+    candidates.push(
+      ...relatives.map((relative) => path.join(dir, 'node_modules', relative)),
+      ...relatives.map((relative) =>
+        path.join(dir, '../lib/node_modules', relative),
+      ),
+    );
   }
   return candidates.find((candidate) => existsSync(candidate));
 }
