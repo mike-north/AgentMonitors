@@ -1,4 +1,5 @@
 import type { DeliveryEventSummary } from '@agentmonitors/core';
+import { truncateAtCodePointBoundary } from './truncate-at-code-point-boundary.js';
 
 /**
  * Shared per-event block renderer for the two injecting transports — the
@@ -125,12 +126,7 @@ export function truncateWithMarker(
 ): string {
   if (value.length <= cap) return value;
   const budget = Math.max(0, cap - marker.length);
-  let out = '';
-  for (const ch of value) {
-    if (out.length + ch.length > budget) break;
-    out += ch;
-  }
-  return out + marker;
+  return truncateAtCodePointBoundary(value, budget) + marker;
 }
 
 /**
@@ -163,12 +159,7 @@ export function appendMarkerWithinCap(
 ): string {
   const budget = Math.max(0, cap - marker.length);
   if (body.length <= budget) return body + marker;
-  let out = '';
-  for (const ch of body) {
-    if (out.length + ch.length > budget) break;
-    out += ch;
-  }
-  return out + marker;
+  return truncateAtCodePointBoundary(body, budget) + marker;
 }
 
 /**
