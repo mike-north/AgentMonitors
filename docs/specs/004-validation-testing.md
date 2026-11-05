@@ -56,7 +56,33 @@ The schema-generation path proves that the source registry can produce a combine
 
 `monitor test` is a source exerciser, not a proof of long-running runtime correctness. For stateful sources, it proves: the source can establish a baseline; a follow-up observe call can run without losing state inside the command. It does **not** prove that a real change occurred during that command invocation.
 
-**Verified in:** `apps/cli/src/commands/monitor-test.ts` — when the first observe call returns zero observations and `source.stateful` is true, the command calls `createFollowupObservationContext()` (which reuses `previousState` from the baseline result) and runs a second observe call. Both calls happen within the same process. No file-system or external change can realistically occur in the 100 ms `setTimeout` between calls, so "no changes detected" is the expected and documented outcome.
+**Verified in:** `apps/cli/src/commands/monitor-test.ts` — when the first observe call returns zero observations, `source.stateful` is true and `nextState` is non-nullish, the command calls `createFollowupObservationContext()` (which reuses `previousState` from the baseline result) and runs a second observe call. Both calls happen within the same process. No file-system or external change can realistically occur in the 100 ms `setTimeout` between calls, so "no changes detected" is the expected and documented outcome.
+
+A missing/null initial baseline MUST fail before the baseline message or second call, preserving
+`no-files-matched` diagnostic precedence and accepting non-nullish primitive source states.
+Unavailable `incoming-changes` observation MUST fail through the existing error envelope, not
+claim a baseline or configuration success. A failed follow-up also fails the overall dry-run,
+although an already-established first baseline remains a truthful text statement.
+
+Required regression scenarios for Refs #305 / decision #555:
+
+- Real Git non-repo/missing cwd, missing Git, unknown/option-looking/non-commit refs reject with
+  the exact 003 §6.5 diagnostic; child stderr is quiet. Commit and annotated commit-tag controls
+  baseline successfully; absent old SHA rebaselines and failed show omits only the snapshot.
+- Last-good SHA survives an outage and SQLite reopen; recovery emits the exact net change from
+  that SHA. A failing source does not prevent a sibling from observing.
+- Pin the current error-path consequences: due errors retry without advancing the timestamp,
+  and held debounce/rollup work survives reopen without flushing until a successful observe.
+  Do not fold #558/#559 into this repair.
+- Real bundled CLI text/JSON rejects unavailable inputs without writing the DB. History and
+  explain expose the error over a real daemon socket and the offline DB fallback, in all supported
+  formats. Legacy error display strips controls and bounds Unicode text without rewriting audit
+  bytes or leaking another workspace's history.
+
+Verified by `plugins/source-incoming-changes/src/unavailable.test.ts`,
+`libs/core/src/runtime/source-error-state.test.ts`,
+`apps/cli/src/commands/monitor-test.test.ts`, and
+`apps/cli/src/commands/incoming-changes-diagnostics.test.ts`.
 
 ### 2.5 Runtime tests
 
