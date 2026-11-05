@@ -71,3 +71,18 @@ it('rejects exit 1 despite a successful JSON report and retains exact evidence',
   });
   expect(history).toHaveBeenCalledOnce();
 });
+
+// A zero exit cannot authenticate an incomplete report; retain evidence before teardown.
+it('rejects truncated success-looking JSON despite exit zero and retains exact evidence', async () => {
+  const history = vi.fn(async () => [{ id: 'truncated-report' }]);
+  await expect(
+    assertVerifySucceeded(
+      { exitCode: 0, stdout: '{"ok":true,', stderr: 'report interrupted' },
+      history,
+    ),
+  ).rejects.toMatchObject({
+    message:
+      'verify exited 0\n{"ok":true,\nreport interrupted\nHistory: [{"id":"truncated-report"}]',
+  });
+  expect(history).toHaveBeenCalledOnce();
+});
