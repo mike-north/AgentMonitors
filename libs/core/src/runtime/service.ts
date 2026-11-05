@@ -896,12 +896,10 @@ export class AgentMonitorRuntime {
           // it is still authored (issue #418): a long-interval/long-settle monitor
           // needs a window that outlasts its next poll + settle, or the scratch
           // deletion re-materializes AFTER the tombstone has expired and lingers.
-          // Falls back to the existing fixed floor when a definition or valid
-          // source config is unavailable; cleanup precedes tick preflight.
+          // Source preflight is separate: unrelated invalid config must not
+          // shorten safely derivable cadence protection during cleanup.
           ttlMs: this.orphanSuppressionTtlMs(
             monitorsById.get(object.monitorId),
-            now,
-            object.workspacePath,
           ),
           now,
         });
@@ -953,28 +951,38 @@ export class AgentMonitorRuntime {
    * linger for a later session. When the object's monitor is still authored (its
    * definition is in this tick's scan) we derive the max of the floor and
    * (interval + settle + margin) so the window always outlasts one full
-   * observe-and-settle cycle. When the definition/source is unavailable or its
-   * source config is rejected, cadence cannot safely size the lifetime and the
-   * existing floor applies. Reaping precedes observation preflight, so this
-   * lookup must validate independently without consuming source or notify state.
+   * observe-and-settle cycle. Only unavailable or unparseable runtime cadence
+   * uses the floor; unrelated source-schema errors do not erase authored timing
+   * or known defaults. This is a bounded window, not proof that source/held work
+   * has drained after an arbitrary pause. Source preflight still gates execution.
    */
   private orphanSuppressionTtlMs(
     monitor: MonitorDefinition | undefined,
-    now: Date,
-    workspacePath: string | null,
   ): number {
     if (!monitor) return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-    const source = this.registry.get(monitor.frontmatter.watch.type);
-    if (
-      !source ||
-      validateWatchScope(
-        watchConfig(monitor.frontmatter.watch),
-        source.scopeSchema,
-      ).length > 0
-    ) {
-      return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+    const watch = monitor.frontmatter.watch;
+    let nextPollMs: number;
+    if (watch.type === 'schedule') {
+      // Schedule observation cadence is fixed independently of cron validity.
+      nextPollMs = schedulingDefaults.scheduleTickMs;
+    } else if (watch['interval'] === undefined) {
+      nextPollMs =
+        watch.type === 'api-poll'
+          ? DEFAULT_API_POLL_MS
+          : DEFAULT_FILE_FINGERPRINT_POLL_MS;
+    } else {
+      const interval = watch['interval'];
+      if (typeof interval !== 'string') {
+        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+      }
+      // Catch only the pure duration parser. Cleanup must not turn storage or
+      // unrelated scheduler failures into a silently shortened lifetime.
+      try {
+        nextPollMs = parseDuration(interval);
+      } catch {
+        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+      }
     }
-    const { nextPollMs } = this.scheduleForMonitor(monitor, now, workspacePath);
     const notify = monitor.frontmatter.notify;
     // The settle window that can delay the deletion's materialization: a debounce
     // holds the batch for `settle-for`; a throttle can defer up to `suppress-for`.

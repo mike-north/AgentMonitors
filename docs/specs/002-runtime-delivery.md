@@ -628,14 +628,29 @@ an overdue debounce batch untouched; changing it to `value: fixed` allows the ne
 due tick to observe using the retained baseline and flush the captured batch.
 Healthy sibling monitors **MUST** continue progressing.
 
-Dormant verify-session cleanup runs before observation preflight and **MUST** also
-validate source config before using its cadence to size scratch-event suppression.
-Rejected config or an unavailable definition/source uses the existing five-minute
-suppression floor; it must not abort retraction of owned scratch events or prevent
-later config-skip reporting and healthy sibling evaluation. Valid cadence retains
+Dormant verify-session cleanup runs before observation preflight. It **MUST**
+preserve safely derivable runtime cadence when sizing scratch-event suppression,
+independently of unrelated source-schema rejection. Authored parseable intervals
+and known runtime defaults retain
 `max(5 minutes, poll interval + notify settle/suppress window + 1 minute margin)`.
-The fallback does not establish a new lifetime policy or consume source/notify
-state; malformed config is still reported by ordinary tick preflight.
+Only a missing definition or unavailable/unparseable cadence uses the existing
+five-minute floor; duration parsing must not abort cleanup or sibling evaluation.
+For example, invalid globs with a valid `10m` interval and `5s` settle retain
+`665000ms` from reaping, rather than shortening to five minutes. Ordinary source
+preflight still rejects that config before observation, leaving baseline and
+legitimate notify work intact.
+
+**Known current cleanup gap:** a deleted scratch key retained in source state or
+an already-held scratch envelope can materialize after finite suppression expires;
+a held-only create may never have projected an event for the reaper to discover.
+The intended no-later-scratch-event goal remains, but the current finite mechanism
+does not establish it for arbitrary delayed recovery or held-only discovery.
+[Mike's decision in #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+accepts a separate M1 repair, [#562](https://github.com/mike-north/AgentMonitors/issues/562),
+sequenced after #305/#537/#554: durable exact ownership without TTL, explicit
+retirement, and no source-contract change. #557 may proceed after correcting its
+introduced cadence-window regression and documenting this gap; it does not wait
+for #562. No ownership/retention/filtering repair is implemented here.
 
 Continuous `watchMonitors()` startup **MUST** apply the same preflight before
 calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from

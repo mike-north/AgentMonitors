@@ -21,6 +21,9 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import fileSource from '../../../../plugins/source-file-fingerprint/src/index.js';
+import apiSource from '../../../../plugins/source-api-poll/src/index.js';
+import scheduleSource from '../../../../plugins/source-schedule/src/index.js';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
@@ -528,6 +531,81 @@ describe('object-event suppression safety guards (issue #418)', () => {
       }),
     ).toHaveLength(1);
   });
+
+  it.each([
+    { source: fileSource, config: '  globs: 42', settle: '10m', ttl: 690000 },
+    { source: apiSource, config: '  url: 42', settle: '5m', ttl: 660000 },
+    {
+      source: scheduleSource,
+      config: '  cron: 42',
+      settle: '10m',
+      ttl: 720000,
+    },
+    {
+      source: fileSource,
+      config: '  globs: 42\n  interval: bad',
+      settle: '10m',
+      ttl: 300000,
+    },
+  ])(
+    'preserves safely derivable cadence for rejected $source.name config ($ttl ms)',
+    async ({ source, config, settle, ttl }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-05T12:00:00Z'));
+      const { rootDir, monitorsDir } = makeWorkspace();
+      const dir = path.join(monitorsDir, MONITOR_ID);
+      mkdirSync(dir);
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        `---\nwatch:\n  type: ${source.name}\n${config}\nnotify:\n  strategy: debounce\n  settle-for: ${settle}\nurgency: normal\n---\nHandle it.\n`,
+      );
+      const registry = new SourceRegistry();
+      registry.register(source);
+      const store = new RuntimeStore(createDb(':memory:'));
+      const runtime = new AgentMonitorRuntime(
+        store,
+        registry,
+        [claudeCodeAdapter],
+        undefined,
+        { sessionDormancyMs: 60000 },
+      );
+      runtime.openSession(
+        claudeCodeAdapter.createSessionInput({
+          hostSessionId: 'agentmonitors-verify-abcdef012345',
+          workspacePath: rootDir,
+        }),
+      );
+      const scratchKey = path.join(
+        rootDir,
+        'agentmonitors-verify-abcdef012345.md',
+      );
+      store.insertEvent({
+        ...eventBase(rootDir),
+        sourceName: source.name,
+        title: 'Scratch create',
+        summary: 'Scratch create',
+        objectKey: scratchKey,
+        createdAt: new Date(),
+      });
+      const reapAt = new Date('2026-11-05T12:02:00Z');
+      vi.setSystemTime(reapAt);
+      const tick = await runtime.tick(monitorsDir, rootDir);
+      expect(tick.evaluatedMonitors).toEqual([]);
+      expect(tick.skippedMonitors).toHaveLength(1);
+      expect(
+        store.activeObjectSuppressions(
+          rootDir,
+          new Date(reapAt.getTime() + ttl - 1),
+        ),
+      ).toHaveLength(1);
+      expect(
+        store.activeObjectSuppressions(
+          rootDir,
+          new Date(reapAt.getTime() + ttl),
+        ),
+      ).toEqual([]);
+    },
+  );
 
   it('the reap backstop sizes the orphan tombstone from the monitor cadence, so a long-interval monitor outlives the 5-min floor', async () => {
     vi.useFakeTimers();

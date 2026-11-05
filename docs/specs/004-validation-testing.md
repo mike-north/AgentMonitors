@@ -81,8 +81,21 @@ session with a real projected scratch event and an edited invalid interval must
 be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
 retain the source baseline and held legitimate work, report the config skip, and
 progress a healthy sibling. Assert the existing fallback expiry at five minutes
-for invalid/missing cadence, and the unchanged valid interval-plus-settle sizing.
-Covered by
+for unparseable cadence or a missing definition, and preserve derivable timing despite
+unrelated source-schema errors. A real-source/SQLite delayed-repair case must retain
+665000ms for invalid globs + 10m interval + 5s settle, close/reopen the store, repair
+at 12:08 after a 12:02 reap, and exclude scratch from an actual later-session claim
+while delivering legitimate held work and preserving a foreign workspace. This
+bounded regression does not resolve the known current arbitrary-pause/held-only
+ownership gap: retained fingerprints or held deletions may outlive suppression,
+and held-only creates may escape discovery. The no-later-scratch-event goal remains;
+current tests must not be cited as proof of that unconditional guarantee.
+[Decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+assigns the complete delayed-repair/held-only claim acceptance to
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), sequenced after
+#305/#537/#554. This known gap does not block #557 after its window/docs correction.
+Covered by `libs/core/src/runtime/cadence-window.test.ts`,
+`libs/core/src/runtime/object-event-suppressions.test.ts`,
 `libs/core/src/runtime/source-validation.test.ts` and
 `apps/cli/src/commands/runtime-source-validation.test.ts`.
 
@@ -274,6 +287,15 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | A global install of the packed launcher (no workspace `node_modules`) can go from `agentmonitors init` to a delivered signal over the real hook stdin/stdout contract (issue #276) | Covered (`scripts/test-e2e-fresh-install-hooks.mjs`, `pnpm test:e2e-fresh-install-hooks`, CI per-PR) — see [§2.7](#27-fresh-environment-e2e-hooks-path).                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ### 3.5.1 Verify observation boundary
+
+**Current cleanup verification limit:** the observation/claim checks below do not
+prove arbitrary delayed scratch cleanup. Finite tombstones can expire before
+retained baseline/held-envelope recovery, and projected-event discovery misses a
+held-only scratch create. Preserve the intended no-later-scratch-event requirement,
+but track those missing recovery/ownership cases under
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), per
+[decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828),
+until its exact ownership and explicit-retirement repair lands. See 005 §16 step 9.
 
 `apps/cli/src/verify-observe.test.ts` verifies distinct old/new observation identities with actual
 SQLite second-rounded timestamps, command-start versus completion evidence, repeated-row refusal,
