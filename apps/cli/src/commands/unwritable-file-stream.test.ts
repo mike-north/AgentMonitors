@@ -68,8 +68,11 @@ describe('openUnwritableFileStream (stale-descriptor double close, issue #548)',
     }) as typeof fs.close);
 
     const { stream, dispose } = openUnwritableFileStream();
-    await failWrite(stream);
-    await dispose();
+    try {
+      await failWrite(stream);
+    } finally {
+      await dispose();
+    }
 
     expect(closeResults).toEqual([null]);
   });
