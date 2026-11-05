@@ -118,6 +118,31 @@ automatically) and `scripts/cli-suite-partition.test.ts` (runs the real `vitest 
 against both `apps/cli` configs and asserts the result partitions the package's git-tracked test
 files with no overlap or gaps). Both run under `pnpm test:scripts`, wired into CI per-PR.
 
+### 2.9 Test-run build ownership and first-attempt launcher gate
+
+`apps/cli/dist` is a shared input to concurrently running suites: `nx run-many --target=test` runs
+the CLI and launcher suites side by side, and the launcher executes that bundle. Because the CLI
+build removes its output before writing it again, **a test MUST NOT start a package build**. A
+target whose tests execute the CLI bundle declares its build as an Nx dependency, so the bundle is
+complete before any consumer starts and is not rewritten until the next run.
+
+The launcher suite (`apps/agentmonitors`) MUST pass on its first attempt and its config MUST NOT set
+a retry budget. Its assertions MUST distinguish the CLI rejecting a subcommand from the CLI failing
+to load: both exit 1, so an unknown-subcommand assertion requires the CLI's own error message. Each
+subprocess bound MUST stay below the test's timeout, so a slow or hung launcher fails with its
+status, signal and output rather than vitest's bare timeout.
+
+Running a CLI test file directly with vitest bypasses the Nx dependency and executes whatever bundle
+already exists; build first, or use `pnpm nx test @agentmonitors/cli`.
+
+**Verified in:** `scripts/cli-build-ownership.test.ts` (the CLI's `test` and `test:serial` targets
+depend on `build`; no tracked test source starts a build), `scripts/vitest-launcher-retry.test.ts`
+(the launcher config's resolved retry count is zero; run under `pnpm test:scripts`, wired into CI
+per-PR), and `apps/agentmonitors/test/launcher.test.ts` (forced crash and hang cases prove the
+evidence renders and the subprocess bound stays inside the test budget). The evidence that first
+exposed the race is in
+[`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.

@@ -54,6 +54,8 @@ pnpm nx build @agentmonitors/core         # build a single project (and its deps
 ```
 
 The CLI binary is `agentmonitors` (from `@agentmonitors/cli`). Build, then run `node apps/cli/dist/index.cjs <cmd>`.
+CLI tests that spawn the binary use that same bundle: `pnpm nx test @agentmonitors/cli` builds it first, but a direct
+`vitest run` does not, and tests must never rebuild it ([`004`](docs/specs/004-validation-testing.md) §2.9).
 
 ### Important build ordering
 
