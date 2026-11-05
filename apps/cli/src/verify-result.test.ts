@@ -55,3 +55,19 @@ it('rejects a false report even with exit zero and retains history', async () =>
     ),
   ).rejects.toThrow('evidence');
 });
+
+// Spec 005 §16 treats process failure as decisive even if stdout claims success;
+// spec 004 §3.5.2 requires retaining failure evidence before daemon teardown.
+it('rejects exit 1 despite a successful JSON report and retains exact evidence', async () => {
+  const history = vi.fn(async () => [{ id: 'post-report-failure' }]);
+  await expect(
+    assertVerifySucceeded(
+      { exitCode: 1, stdout: '{"ok":true}', stderr: 'failed after report' },
+      history,
+    ),
+  ).rejects.toMatchObject({
+    message:
+      'verify exited 1\n{"ok":true}\nfailed after report\nHistory: [{"id":"post-report-failure"}]',
+  });
+  expect(history).toHaveBeenCalledOnce();
+});
