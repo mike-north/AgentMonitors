@@ -1,6 +1,9 @@
+/** Packing and installed-file lookup shared by isolated consumer checks. */
 import { spawnSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
+
+import { packageManagerEntry } from './package-manager-entry.mjs';
 
 /**
  * Pack one workspace package with `pnpm pack`, resolving the tarball it
@@ -15,11 +18,9 @@ import path from 'node:path';
  * previously a verbatim copy maintained in both files.
  */
 export function packPackage(packageDir, packDestDir) {
-  // pnpm 11 publishes an ESM .mjs launcher; all Node JavaScript module
-  // extensions are valid here. Never execute the surrounding command shim.
-  const entry = process.env.npm_execpath;
-  const useEntry =
-    typeof entry === 'string' && /\.(?:cjs|mjs|js)$/i.test(entry);
+  // Only pnpm rewrites workspace dependencies into consumer-installable versions.
+  const entry = packageManagerEntry('pnpm');
+  const useEntry = entry !== undefined;
   if (!useEntry && process.platform === 'win32') {
     throw new Error(
       'On Windows, run via pnpm so its JavaScript entrypoint is available.',

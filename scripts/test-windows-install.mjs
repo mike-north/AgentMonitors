@@ -40,7 +40,7 @@
  * @see https://github.com/mike-north/AgentMonitors/issues/509
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -48,6 +48,7 @@ import {
   packPackage,
   resolveInstalledPackageFile,
 } from './lib/pack-helpers.mjs';
+import { packageManagerEntry } from './lib/package-manager-entry.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -75,14 +76,12 @@ function run(command, args, options = {}) {
 }
 
 export async function main() {
-  const npmCli = path.join(
-    path.dirname(process.execPath),
-    process.platform === 'win32'
-      ? 'node_modules/npm/bin/npm-cli.js'
-      : '../lib/node_modules/npm/bin/npm-cli.js',
-  );
-  if (!existsSync(npmCli))
-    throw new Error(`npm-cli.js not found in Node installation: ${npmCli}`);
+  const npmCli = packageManagerEntry('npm');
+  if (!npmCli) {
+    throw new Error(
+      'npm-cli.js not found in Node installation or PATH; install npm and expose its package on PATH.',
+    );
+  }
   const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'am windows install-'));
   const packDir = path.join(tmpRoot, 'packed');
   const npmPrefixDir = path.join(tmpRoot, 'npm-global');

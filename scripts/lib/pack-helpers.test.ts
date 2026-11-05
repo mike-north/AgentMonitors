@@ -3,13 +3,24 @@
  * or interpret. Windows must never fall back to executing a command shim.
  */
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { packPackage } from './pack-helpers.mjs';
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, existsSync: vi.fn(actual.existsSync) };
+});
 
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -21,6 +32,7 @@ const roots: string[] = [];
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 afterEach(() => {
   vi.unstubAllEnvs();
+  vi.mocked(existsSync).mockReset();
   vi.mocked(spawnSync).mockReset();
   if (platformDescriptor) {
     Object.defineProperty(process, 'platform', platformDescriptor);
@@ -34,7 +46,7 @@ afterEach(() => {
 function fixture(extension: string): { root: string; entry: string } {
   const root = mkdtempSync(path.join(os.tmpdir(), 'am pack & spaces-'));
   roots.push(root);
-  const entry = path.join(root, `package manager${extension}`);
+  const entry = path.join(root, `pnpm${extension}`);
   writeFileSync(
     entry,
     `import('node:fs').then(fs => {
@@ -63,21 +75,29 @@ describe('packPackage shell-free invocation (#520)', () => {
     },
   );
 
-  it.each([undefined, '/tools/pnpm.cmd'])(
-    'fails clearly on Windows without a JS entrypoint (%s)',
-    (entry) => {
-      const { root } = fixture('.cjs');
-      Object.defineProperty(process, 'platform', { value: 'win32' });
-      vi.stubEnv('npm_execpath', entry);
-      expect(() => packPackage(root, root)).toThrow(/run via pnpm/i);
-      expect(spawnSync).not.toHaveBeenCalled();
-    },
-  );
+  it.each([
+    undefined,
+    '/tools/pnpm.cmd',
+    '/tools/npm-cli.js',
+    '/tools/yarn.js',
+    '/tools/bun.js',
+  ])('fails clearly on Windows without a JS entrypoint (%s)', (entry) => {
+    const { root } = fixture('.cjs');
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    vi.stubEnv('npm_execpath', entry);
+    // Other managers can be installed without becoming valid pnpm launchers.
+    vi.mocked(existsSync).mockImplementation(
+      (candidate) => typeof entry === 'string' && candidate === entry,
+    );
+    expect(() => packPackage(root, root)).toThrow(/run via pnpm/i);
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
 
   it('retains a shell-free pnpm fallback on POSIX', () => {
     const { root } = fixture('.cjs');
     Object.defineProperty(process, 'platform', { value: 'linux' });
     vi.stubEnv('npm_execpath', undefined);
+    vi.mocked(existsSync).mockReturnValue(false);
     vi.mocked(spawnSync).mockImplementationOnce(() => {
       writeFileSync(path.join(root, 'fallback.tgz'), 'packed');
       return {

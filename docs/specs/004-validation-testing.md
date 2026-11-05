@@ -92,7 +92,7 @@ indirection under a real global install.
 wired into CI per-PR). The MCP/channel transport ([006 §4](./006-agent-integration.md)) has no
 equivalent fresh-environment proof yet — tracked as a follow-up, not this surface's scope.
 
-The packed Windows install check invokes package-manager JavaScript entrypoints through Node without a shell. Its isolated temporary root includes spaces so packing and installation exercise literal path arguments on every platform. Windows CI verifies the native Windows path.
+The packed Windows install check invokes package-manager JavaScript entrypoints through Node without a shell. Packing MUST use pnpm, including when the parent script was launched by npm: pnpm owns rewriting `workspace:` dependencies into installable versions. npm installation MUST support JavaScript entrypoints discovered from PATH installations separate from Node as well as the official Node layout. Command shims are never passed to a shell. Its isolated temporary root includes spaces so packing and installation exercise literal path arguments on every platform. `scripts/package-manager-compatibility.test.ts` verifies real workspace packing and a real npm subprocess in a separate installation on POSIX; Windows CI verifies the native Windows path.
 
 ### 2.8 Suite-discovery integrity (zero-test guard)
 

@@ -9,6 +9,10 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Preserve package-manager identity and separate installations (004 §2.7) — Refs #520
+
+Packing resolves pnpm independently of the invoking manager so workspace dependencies remain installable. The install harness discovers npm JavaScript entrypoints from PATH as well as beside Node, preserving shell-free literal arguments across separate installations.
+
 ## 2026-11-03 — Preserve package-manager arguments in install checks (004 §2.7) — Refs #520
 
 Run package-manager JavaScript entrypoints without a shell and exercise temporary paths containing spaces in the install check.
