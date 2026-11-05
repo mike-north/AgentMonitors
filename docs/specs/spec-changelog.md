@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Source validation parity verification (004 §2.2/§2.4/§3.5, 005 §3/§6) — Refs #301
+
+Clarify the existing pre-observation `validateWatchScope` contract for `monitor test` and its
+shared diagnostics with `validate`, retaining each command's text/JSON channels and exit code 1.
+Replace the incomplete verification evidence with a paired-command invalid-scope matrix covering
+enums, unknown properties, types, required fields, nested collections, and composite parts. Live
+HTTP and command/file sentinels prove rejection precedes source effects; valid controls establish
+that both sentinels detect execution. No production behavior changes.
+
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
 Remove the launcher suite's blanket retry after tracing the failure it masked to a real race: a CLI
