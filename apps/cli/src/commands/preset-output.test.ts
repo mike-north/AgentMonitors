@@ -11,29 +11,56 @@ it.each([
   (code, stderr, stdout, truncated) => {
     expect(() =>
       assertPresetOutput(['jq', '-sc', '.'], code, stderr, stdout, truncated),
-    ).toThrow(/jq.*\nexit code:.*\nstderr:/);
+    ).toThrow(
+      /context: preset subprocess; argv withheld\nexit code:.*\nstderr:/,
+    );
   },
 );
 it('accepts valid empty JSON arrays', () => {
   expect(() => assertPresetOutput(['jq'], '0', '', '[]', false)).not.toThrow();
 });
 
-it('retains command arguments and bounded stderr text with a cutoff marker', () => {
-  // A silent helper return must fail rather than bypass all diagnostic checks.
-  expect.assertions(4);
+it('reports safe context and bounded metadata without forwarding argv or stderr', () => {
+  expect.assertions(8);
   try {
     assertPresetOutput(
-      ['jq', '-n', 'broken('],
-      '3',
-      'compile error: '.repeat(1000),
+      ['jq', 'PRIVATE_ARGV_PAYLOAD'],
+      '5',
+      'PRIVATE_STDERR_PAYLOAD'.repeat(1000),
       '',
       false,
     );
   } catch (error) {
     const message = String(error);
-    expect(message).toContain('broken(');
-    expect(message).toContain('compile error:');
-    expect(message).toContain('stderr truncated at 4096 bytes');
-    expect(message.length).toBeLessThan(4500);
+    expect(message).not.toContain('PRIVATE_ARGV_PAYLOAD');
+    expect(message).not.toContain('PRIVATE_STDERR_PAYLOAD');
+    expect(message).toContain('context: preset subprocess; argv withheld');
+    expect(message).toContain('exit code: 5');
+    expect(message).toContain('stderr empty: false');
+    expect(message).toContain('stderr truncated: true');
+    expect(message).toContain('stdout empty: true');
+    expect(message.length).toBeLessThan(600);
   }
 });
+it('distinguishes empty stderr from nonempty withheld stderr', () => {
+  expect(() => assertPresetOutput(['jq'], '7', '', '[]', false)).toThrow(
+    /stderr empty: true; retained bytes: 0; stderr truncated: false/,
+  );
+});
+
+it.each([0, 4096, 4097])(
+  'reports accurate cutoff and empty metadata for %i stderr bytes',
+  (size) => {
+    expect(() =>
+      assertPresetOutput(
+        ['PRIVATE_COMMAND'],
+        '7',
+        Buffer.alloc(size, 'x'),
+        '[]',
+        false,
+      ),
+    ).toThrow(
+      `stderr empty: ${size === 0}; retained bytes: ${Math.min(size, 4096)}; stderr truncated: ${size > 4096}`,
+    );
+  },
+);

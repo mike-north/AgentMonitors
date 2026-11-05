@@ -21,6 +21,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -241,13 +242,13 @@ async function observe(
         '-c',
         `fifo="$AM475_STDERR.pipe"
 mkfifo "$fifo" || exit 125
-# Drain the stream after retaining a bounded prefix, preserving child exit semantics.
-{ head -c 4096; head -c 1 >"$AM475_CUT"; cat >/dev/null; } <"$fifo" >"$AM475_STDERR" &
+# Drain to completion while retaining a bounded tail before the parent reads it.
+"$AM475_NODE" "$AM475_READER" "$AM475_STDERR" "$AM475_TOTAL" <"$fifo" &
 reader=$!
 trap 'kill "$reader" 2>/dev/null || :; rm -f "$fifo"' EXIT
 "$@" 2>"$fifo"
 code=$?
-wait "$reader"
+wait "$reader" || exit 125
 printf "%s" "$code" >"$AM475_EXIT"
 exit "$code"`,
         'preset-jq',
@@ -258,7 +259,12 @@ exit "$code"`,
         AM444_FIXTURE: fixtureFile,
         AM475_STDERR: stderrFile,
         AM475_EXIT: exitFile,
-        AM475_CUT: path.join(diagnostics, 'cut'),
+        AM475_NODE: process.execPath,
+        AM475_READER: path.join(
+          import.meta.dirname,
+          'fixtures/capture-preset-stderr.ts',
+        ),
+        AM475_TOTAL: path.join(diagnostics, 'total'),
       },
     },
     {
@@ -272,13 +278,11 @@ exit "$code"`,
   assertPresetOutput(
     command,
     existsSync(exitFile) ? readFileSync(exitFile, 'utf8') : 'unavailable',
-    existsSync(stderrFile)
-      ? readFileSync(stderrFile, 'utf8')
-      : '(not captured)',
+    existsSync(stderrFile) ? readFileSync(stderrFile) : '',
     state?.stdout ?? '',
     state?.truncated ?? false,
-    existsSync(path.join(diagnostics, 'cut')) &&
-      readFileSync(path.join(diagnostics, 'cut')).length > 0,
+    existsSync(path.join(diagnostics, 'total')) &&
+      Number(readFileSync(path.join(diagnostics, 'total'), 'utf8')) > 4096,
   );
   return {
     titles: result.observations.map((o) => o.title),
@@ -2154,40 +2158,78 @@ describe('partial nonzero results (003 §11.2)', () => {
       /exit code: 7/,
     );
   });
-  it('bounds stored stderr and reports the retained prefix with a cutoff marker', async () => {
+  it('retains only the last 4 KiB of multi-megabyte jq stderr before reading and emits no private input', async () => {
+    if (!hasJq) return;
     const start = createdTempDirs.length;
-    const secret = 'PRIVATE_JQ_INPUT';
-    const scope = {
-      command: [
-        'sh',
-        '-c',
-        `printf '[]'; i=0; while [ "$i" -lt 1000 ]; do printf '${secret}%.200d' 0 >&2; i=$((i+1)); done; exit 5`,
-      ],
-    };
+    const privateInput =
+      'PRIVATE_JQ_INPUT_' + 'x'.repeat(5 * 1024 * 1024) + '_PRIVATE_TAIL';
+    const input = path.join(tempDir('private-jq'), 'input.json');
+    writeFileSync(input, JSON.stringify(privateInput));
+    const scope = { command: ['jq', '-r', 'error(.)', input] };
     let failure = '';
     try {
-      await observe(scope, tempDir('large-stderr'), '[]');
+      await observe(scope, tempDir('error-jq'), '[]');
     } catch (error) {
       failure = String(error);
     }
     expect(failure).toContain('exit code: 5');
-    expect(failure).toContain(secret);
-    expect(failure).toContain('stderr truncated at 4096 bytes');
-    expect(failure.length).toBeLessThan(5000);
+    expect(failure).not.toContain('PRIVATE_JQ_INPUT');
+    expect(failure).not.toContain('PRIVATE_TAIL');
+    expect(failure).not.toContain('error(.)');
+    expect(failure).not.toContain(input);
+    expect(failure).toContain('stderr empty: false');
+    expect(failure).toContain('stderr truncated: true');
+    expect(failure.length).toBeLessThan(600);
     const dirs = createdTempDirs
       .slice(start)
       .filter((dir) => existsSync(path.join(dir, 'stderr')));
     expect(dirs).toHaveLength(1);
-    for (const dir of dirs)
-      expect(readFileSync(path.join(dir, 'stderr')).length).toBeLessThanOrEqual(
-        4096,
-      );
+    for (const dir of dirs) {
+      // stat occurs BEFORE read: the capture itself must be bounded on disk.
+      expect(statSync(path.join(dir, 'stderr')).size).toBeLessThanOrEqual(4096);
+      const tail = readFileSync(path.join(dir, 'stderr'), 'utf8');
+      expect(tail).toContain('PRIVATE_TAIL');
+      expect(tail).not.toContain('PRIVATE_JQ_INPUT');
+    }
   });
 });
-
-it('includes real jq compile-error text and command in the diagnostic', async () => {
+it('classifies jq compile errors without forwarding the filter or stderr', async () => {
   if (!hasJq) return;
-  await expect(
-    observe({ command: ['jq', '-n', 'broken('] }, tempDir('compile-jq'), '[]'),
-  ).rejects.toThrow(/broken.*exit code: 3.*stderr: jq: error/s);
+  let failure = '';
+  try {
+    await observe(
+      { command: ['jq', '-n', 'PRIVATE_FILTER('] },
+      tempDir('compile-jq'),
+      '[]',
+    );
+  } catch (error) {
+    failure = String(error);
+  }
+  expect(failure).toContain('exit code: 3');
+  expect(failure).toContain('stderr: jq compile error (check filter syntax)');
+  expect(failure).not.toContain('PRIVATE_FILTER');
+});
+
+it('rejects real jq partial stdout at the helper while preserving source nonzero semantics', async () => {
+  if (!hasJq) return;
+  const scope = {
+    command: ['jq', '-n', '[], error("PRIVATE_FILTER_PAYLOAD")'],
+  };
+  const result = await commandPoll.observe(scope, { now: new Date() });
+  expect(result.nextState).toMatchObject({
+    stdout: '[]\n',
+    exitCode: 5,
+    truncated: false,
+    health: 'ok',
+    baselined: true,
+  });
+  let failure = '';
+  try {
+    await observe(scope, tempDir('partial-real-jq'), '[]');
+  } catch (error) {
+    failure = String(error);
+  }
+  expect(failure).toContain('exit code: 5');
+  expect(failure).toContain('stdout empty: false; truncated: false');
+  expect(failure).not.toContain('PRIVATE_FILTER_PAYLOAD');
 });
