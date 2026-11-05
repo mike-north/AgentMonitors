@@ -333,8 +333,8 @@ When sources disagree, the spec process MUST NOT silently average them together.
 - `low` urgency is real and MUST be treated as first-class. The schema generator correctly includes it in the `urgency` enum (`schema-generator.ts` line 31). The `monitor-schema.test.ts` "accepts all urgency values" test currently omits `low` from its loop — this is a test gap, not an implementation gap.
 - The runtime/session event pipeline is the primary delivery path.
 - The inbox item lifecycle is separate from the event pipeline, not merely another view of the same data.
-- Duplicate monitor IDs are a correctness hazard even though explicit rejection is not yet implemented at scan or validate time.
-- Source-specific validation is only partially enforced by the current `validate` command: required field presence is checked but full JSON Schema validation (type checking, format constraints, enum values within scope) is not yet enforced. This limitation is intentional current behavior.
+- Duplicate monitor IDs are a correctness hazard: `scanMonitors()` reports collisions, and `validate` rejects duplicate IDs within the scanned tree (§2.2).
+- Source-specific validation is fully enforced by `validate` against each source's `scopeSchema` using draft-07 JSON Schema checks, including types, enums, required fields, and nested items. Both `validate` and `monitor test` use `validateWatchScope` for the same rejection details; `monitor test` rejects invalid scopes before source observation (§2.2/§2.4).
 
 ### 5.2 Evidence priority during this transition
 
