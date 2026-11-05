@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Effective notify edits drain captured holds (002 §4.6, 004 §2.5) — Refs #537
+
+Record decision #556: a changed effective notify policy flushes accepted old work before new
+source observation, even before a debounce deadline or rollup window. Preserve captured semantics;
+unchanged pacing and body-only edits keep normal clocks. The whole edit drain rereads under an
+owned writer transaction and commits materialization with hold removal; failure retains all state
+and backpressures only that monitor. Specify restart, missing-definition diagnostics, independent
+writer exclusion, real SQLite faults and actual bounded-child kill acceptance. Ordinary flush
+recovery remains separate.
+
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
 Remove the launcher suite's blanket retry after tracing the failure it masked to a real race: a CLI

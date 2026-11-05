@@ -65,6 +65,30 @@ Runtime tests are the primary proof surface for: state persistence across runtim
 **Verified in:** `libs/core/src/runtime/service.test.ts` and
 `libs/core/src/runtime/transactional-materialization.test.ts`.
 
+#### Notify-policy-edit durability (002 §4.6)
+
+`runtime/notify-policy-edit.test.ts` MUST prove all six exits from holding strategies, effective
+same-strategy/default changes, unchanged-policy clocks, captured old/new semantics and immutable
+materialized rows. Edits reconcile before source-due/active-watcher skips without new source input.
+Invalid/missing definitions retain holds and report the reason. A blocked watcher retains its yield
+and backpressures further input/checkpoints until reconciliation succeeds.
+
+Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
+including a later batch write and failed diagnostics. Assert full rollback of original state,
+no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart
+recovery. A stale pre-lock read in one independent process must not duplicate or overwrite another
+process's committed drain. Interpret must run after commit against each event's projected recipients.
+
+Kill evidence MUST use bounded owned child processes, actual SIGKILL before and after commit,
+awaited exit and SQLite reopen. Before commit: original holds and no partial events. After commit:
+events and no old holds. Reconciliation after reopen adds exactly the remaining events, with no
+duplicate prefix. Runtime reconstruction alone is not killed-process evidence. Test children may
+load TypeScript source using Node 24 transformation and a narrow local resolver; tests MUST NOT
+start a package build or rely on a previously built dist tree.
+
+This acceptance concerns the effective-edit transaction, not ordinary ingest/flush retry recovery
+or unchanged-policy flushing after source errors. No downstream exactly-once side effects are claimed.
+
 ### 2.6 CLI integration tests
 
 CLI integration tests are the primary proof surface for: command wiring; output shape and argument validation; round-trip behavior through the daemon/runtime interface.

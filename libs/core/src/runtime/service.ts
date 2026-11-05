@@ -35,6 +35,13 @@ import {
   computeNetCollapseView,
   netCollapseGroupKey,
 } from './store.js';
+import { heldMonitorIds, withStoreWriter } from './store-writer.js';
+import {
+  notifyPolicyKey,
+  validateCapturedNotifyEnvelope,
+  capturedNotifyRoute,
+  type PolicyNotifyState,
+} from './notify-policy.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import type {
   AgentSessionRecord,
@@ -2504,6 +2511,34 @@ export class AgentMonitorRuntime {
     );
     this.reapDormantSessions(now, workspacePath, monitorsById);
 
+    // Missing/invalid definitions cannot cancel operational holds. Diagnose only
+    // held ids here; ordinary definition preflight remains a separate concern.
+    const heldIds = new Set(heldMonitorIds(this.store, workspacePath));
+    for (const id of heldIds) {
+      // Ephemeral definitions live in SQLite, not in the scanned directory.
+      // Their independent declaration/reap lifecycle does not imply a file edit.
+      if (monitorsById.has(id) || id.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
+        continue;
+      }
+      const held = this.store.getMonitorState(id, workspacePath).notifyState;
+      const captured = capturedNotifyRoute(
+        held.pendingDebounce?.observations.at(0) ??
+          held.pendingRollup?.observations.at(0),
+      );
+      const parseError = result.errors.find(
+        (error) => error.filePath === captured.filePath,
+      );
+      const message = `Notify edit blocked: ${parseError?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
+      this.setWatchPolicy(id, workspacePath, null);
+      this.reportNotifyEditFailure(
+        id,
+        workspacePath,
+        captured.sourceName ?? 'unknown',
+        message,
+        acc,
+      );
+    }
+
     // Persistent monitors (directory-authored). An unknown source is a hard tick
     // failure — the author can fix the file.
     for (const parsed of result.monitors) {
@@ -2511,6 +2546,17 @@ export class AgentMonitorRuntime {
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
+        if (heldIds.has(monitor.id)) {
+          this.setWatchPolicy(monitor.id, workspacePath, null);
+          this.reportNotifyEditFailure(
+            monitor.id,
+            workspacePath,
+            sourceName,
+            `Notify edit blocked: unknown source "${sourceName}"; accepted holds retained.`,
+            acc,
+          );
+          continue;
+        }
         throw new Error(
           `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
@@ -2581,6 +2627,187 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Scanned notify definitions gate watcher acceptance, without restarting or
+   * reconfiguring the live source. A null definition means old held work or its
+   * definition is blocked; the current yield remains on the consumer's stack.
+   */
+  private readonly watchPolicies = new Map<string, MonitorDefinition | null>();
+  /** Waiting source acceptance/checkpoints wake on reconciliation or teardown. */
+  private readonly watchPolicyWaiters = new Map<string, Set<() => void>>();
+
+  /** Wake backpressured watcher work only when a reconciliation changes its gate. */
+  private setWatchPolicy(
+    id: string,
+    workspacePath: string,
+    definition: MonitorDefinition | null,
+  ): void {
+    const key = JSON.stringify([workspacePath, id]);
+    this.watchPolicies.set(key, definition);
+    for (const wake of this.watchPolicyWaiters.get(key) ?? []) {
+      wake();
+    }
+  }
+
+  /** Hold one unaccepted yield/checkpoint without requesting further source input. */
+  private async waitForWatchPolicy(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    signal: AbortSignal,
+  ): Promise<MonitorDefinition | undefined> {
+    const key = JSON.stringify([workspacePath, monitor.id]);
+    while (!signal.aborted && this.watchPolicies.get(key) === null) {
+      await new Promise<void>((resolve) => {
+        const waiters =
+          this.watchPolicyWaiters.get(key) ?? new Set<() => void>();
+        const wake = () => {
+          signal.removeEventListener('abort', wake);
+          waiters.delete(wake);
+          if (!waiters.size) {
+            this.watchPolicyWaiters.delete(key);
+          }
+          resolve();
+        };
+        waiters.add(wake);
+        this.watchPolicyWaiters.set(key, waiters);
+        signal.addEventListener('abort', wake, { once: true });
+      });
+    }
+    if (signal.aborted) {
+      return undefined;
+    }
+    const current = this.watchPolicies.get(key) ?? monitor;
+    // Only pacing/urgency follow reconciliation. Execution and handling remain
+    // the established source's snapshot until it is explicitly restarted; this
+    // boundary does not introduce unrelated live-definition reload behavior.
+    const frontmatter = {
+      ...monitor.frontmatter,
+      urgency: current.frontmatter.urgency,
+      urgencyMax: current.frontmatter.urgencyMax,
+    };
+    if (current.frontmatter.notify) {
+      frontmatter.notify = current.frontmatter.notify;
+    } else {
+      delete frontmatter.notify;
+    }
+    return { ...monitor, frontmatter };
+  }
+
+  /** Report a blocked edit through existing error contracts without mutating holds. */
+  private reportNotifyEditFailure(
+    id: string,
+    workspacePath: string,
+    sourceName: string,
+    message: string,
+    acc: TickAccumulator,
+  ): void {
+    acc.erroredObservations.push({ monitorId: id, message });
+    try {
+      this.store.recordObservationHistory({
+        monitorId: id,
+        workspacePath,
+        sourceName,
+        result: 'errored',
+        observationData: { error: message },
+      });
+    } catch {
+      /* The retained holds remain authoritative even if diagnostics cannot persist. */
+    }
+  }
+
+  /**
+   * Own the edit's deterministic write unit. Re-read under the writer lock so
+   * another runtime's committed drain cannot be duplicated or overwritten by a
+   * decision made from an earlier read. Event units nest as SQLite savepoints;
+   * every hold and materialization write commits together or all roll back.
+   */
+  private reconcileNotifyEdit(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    source: ObservationSource,
+    restrictToSessionId?: string,
+  ) {
+    return withStoreWriter(this.store, () => {
+      const state = this.store.getMonitorState(monitor.id, workspacePath);
+      const notify: PolicyNotifyState = state.notifyState;
+      const key = notifyPolicyKey(monitor);
+      const held = [
+        ...(notify.pendingDebounce?.observations ?? []),
+        ...(notify.pendingRollup?.observations ?? []),
+      ];
+      // Definition validity is decided against the same current durable holds
+      // as the drain itself, including work committed by another runtime after
+      // this tick scanned the file. This is scoped protection, not general source
+      // preflight for ordinary observation without held work.
+      if (held.length) {
+        const errors = validateWatchScope(
+          watchConfig(monitor.frontmatter.watch),
+          source.scopeSchema,
+        );
+        if (errors.length) {
+          throw new Error(`Invalid monitor definition: ${errors.join('; ')}`);
+        }
+      }
+      for (const envelope of held) {
+        // Persisted envelopes are older-version data. Missing captured semantics
+        // must block recovery, never borrow instructions or urgency from an edit.
+        validateCapturedNotifyEnvelope(envelope, monitor.id);
+      }
+      const changed =
+        held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
+        (notify.policyKey !== undefined && notify.policyKey !== key);
+      if (!changed) return [];
+      const drained = held
+        .map(hydrateStoredObservationEnvelope)
+        .sort((a, b) => a.observedAt.getTime() - b.observedAt.getTime())
+        .map((envelope) => {
+          const materialized = this.materializeObservation({
+            monitor: envelope.monitor,
+            sourceName: envelope.monitor.frontmatter.watch.type,
+            observation: envelope.observation,
+            observedAt: envelope.observedAt,
+            workspacePath,
+            effectiveUrgency: envelope.effectiveUrgency,
+            ...(restrictToSessionId !== undefined
+              ? { restrictToSessionId }
+              : {}),
+          });
+          if (!materialized) {
+            throw new Error('Captured held observation cannot materialize.');
+          }
+          return {
+            ...materialized,
+            monitor: envelope.monitor,
+            sessions: [...this.store.projectedSessionIdsForLastEvent()],
+          };
+        });
+      // Suppression/window guards belong to the retired policy. They cannot
+      // suppress accepted old work or the new policy's first observation.
+      const nextNotify: PolicyNotifyState = { ...notify, policyKey: key };
+      delete nextNotify.pendingDebounce;
+      delete nextNotify.pendingRollup;
+      delete nextNotify.suppressedUntil;
+      delete nextNotify.rollupLastFiredMinute;
+      this.store.setMonitorState(monitor.id, workspacePath, {
+        ...state,
+        notifyState: nextNotify,
+      });
+      if (drained.length)
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result: 'triggered',
+          observationData: {
+            observed: 0,
+            emitted: drained.length,
+            reason: 'notify-policy-edit',
+          },
+        });
+      return drained;
+    });
+  }
+
+  /**
    * Evaluate ONE monitor on a tick — shared by the persistent (directory) and
    * ephemeral (007 §4) paths so both flow the IDENTICAL scheduling → observe →
    * notify → materialize logic (AP7). Mutates the passed {@link TickAccumulator}
@@ -2597,6 +2824,51 @@ export class AgentMonitorRuntime {
     ephemeralSessionId?: string,
   ): Promise<void> {
     const sourceName = monitor.frontmatter.watch.type;
+
+    try {
+      // Reconciliation precedes both source-due and active-watcher skips.
+      const drained = this.reconcileNotifyEdit(
+        monitor,
+        workspacePath,
+        source,
+        ephemeralSessionId,
+      );
+      acc.emittedEventIds.push(...drained.map((item) => item.event.id));
+      this.setWatchPolicy(monitor.id, workspacePath, monitor);
+      for (const item of drained) {
+        if (
+          item.monitor.frontmatter.payload?.form === 'prose' &&
+          this.interpretAdapter
+        ) {
+          try {
+            await this.runInterpret(
+              item.monitor,
+              item.event,
+              item.diffText,
+              item.sessions,
+            );
+          } catch (error) {
+            this.reportNotifyEditFailure(
+              monitor.id,
+              workspacePath,
+              sourceName,
+              `Interpret failed after notify edit committed: ${error instanceof Error ? error.message : String(error)}`,
+              acc,
+            );
+          }
+        }
+      }
+    } catch (error) {
+      this.setWatchPolicy(monitor.id, workspacePath, null);
+      this.reportNotifyEditFailure(
+        monitor.id,
+        workspacePath,
+        sourceName,
+        `Notify edit blocked; accepted holds retained: ${error instanceof Error ? error.message : String(error)}`,
+        acc,
+      );
+      return;
+    }
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
@@ -2875,7 +3147,10 @@ export class AgentMonitorRuntime {
       sourceState: options.nextSourceState
         ? options.nextSourceState.value
         : monitorState.sourceState,
-      notifyState: dispatch.nextState,
+      notifyState: {
+        ...dispatch.nextState,
+        policyKey: notifyPolicyKey(monitor),
+      },
       lastObservationAt: now,
     });
 
@@ -3172,9 +3447,11 @@ export class AgentMonitorRuntime {
         );
         return Promise.resolve();
       }
-      return enqueue(() =>
-        this.writeCheckpoint(monitor.id, workspacePath, nextState),
-      );
+      return enqueue(async () => {
+        if (await this.waitForWatchPolicy(monitor, workspacePath, signal)) {
+          await this.writeCheckpoint(monitor.id, workspacePath, nextState);
+        }
+      });
     };
 
     try {
@@ -3209,11 +3486,17 @@ export class AgentMonitorRuntime {
         // Ingest runs through the same serialization chain as checkpoint so the
         // G14 ordering (002 §2.4) holds against out-of-band checkpoint calls.
         try {
-          await enqueue(() =>
-            this.ingest(monitor, [observation], new Date(), {
+          await enqueue(async () => {
+            const accepted = await this.waitForWatchPolicy(
+              monitor,
               workspacePath,
-            }),
-          );
+              signal,
+            );
+            if (!accepted) return;
+            await this.ingest(accepted, [observation], new Date(), {
+              workspacePath,
+            });
+          });
           this.refreshWorkspaceSessions(workspacePath);
         } catch (ingestError) {
           try {
@@ -3421,12 +3704,9 @@ export class AgentMonitorRuntime {
     // §4.4 step 6). It never uses the debounce/throttle/immediate paths below,
     // so it short-circuits the rest of dispatchNotify.
     //
-    // Clear any stale `pendingDebounce` state first: if the monitor's strategy
-    // was previously `debounce` and was changed to `rollup`, the held batch
-    // must not linger in notifyState indefinitely (it can never be flushed by
-    // the rollup path). Drop it here so the strategy-change is clean.
+    // Effective edits drain captured holds atomically before this dispatcher
+    // runs. Dispatch never owns cancellation of a different strategy's work.
     if (monitor.frontmatter.notify?.strategy === 'rollup') {
-      delete nextState.pendingDebounce;
       return this.dispatchRollup(monitor, observations, observedAt, nextState);
     }
 
@@ -3749,10 +4029,10 @@ export class AgentMonitorRuntime {
     monitor: MonitorDefinition,
     event: { id: string; diffText: string | null; snapshotText: string | null },
     diffText: string | null,
+    sessionIds = this.store.projectedSessionIdsForLastEvent(),
   ): Promise<void> {
     const adapter = this.interpretAdapter;
     if (!adapter) return;
-    const sessionIds = this.store.projectedSessionIdsForLastEvent();
     if (sessionIds.length === 0) return;
 
     // The per-recipient delta (G10, 002 §1.1.2): each recipient is judged on the

@@ -1,0 +1,58 @@
+/**
+ * Internal store connection ownership for synchronous runtime write units. This
+ * keeps transaction capabilities out of the published RuntimeStore surface.
+ */
+import type { Database } from 'better-sqlite3';
+import type { InboxDb } from '../inbox/db.js';
+
+/** Store lifetime owns the binding; transaction support never retains a dead store. */
+const connections = new WeakMap<object, Database>();
+
+/** Bind a store to its existing driver; never open a second descriptor. @internal */
+export function registerStoreWriter(store: object, db: InboxDb): void {
+  // InboxDb erases the Drizzle driver from its public API; this is the same
+  // concrete connection owned by RuntimeStore, not a separately opened handle.
+  connections.set(store, (db as unknown as { $client: Database }).$client);
+}
+
+/** Resolve only a registered store's owned connection. @internal */
+export function storeWriter(store: object): Database {
+  const client = connections.get(store);
+  if (!client) {
+    throw new Error('Runtime store has no registered writer.');
+  }
+  return client;
+}
+
+/**
+ * Own the outer immediate transaction, including reads that decide what to
+ * remove. Nested event units use SQLite savepoints; no async work may escape
+ * this callback before COMMIT. Joining someone else's transaction is refused.
+ * @internal
+ */
+export function withStoreWriter<T>(store: object, action: () => T): T {
+  const client = storeWriter(store);
+  if (client.inTransaction) {
+    throw new Error('Notify edit requires an owned writer transaction.');
+  }
+  return client
+    .transaction(() => {
+      const result = action();
+      if (result && typeof result === 'object' && 'then' in result) {
+        throw new Error('Notify edit writer callback must be synchronous.');
+      }
+      return result;
+    })
+    .immediate();
+}
+
+/** Enumerate only this workspace's persisted holds, including missing definitions. @internal */
+export function heldMonitorIds(store: object, workspacePath: string): string[] {
+  // Row shape is fixed by the selected SQLite columns, rather than user input.
+  const rows = storeWriter(store)
+    .prepare(
+      "SELECT monitor_id FROM monitor_state WHERE workspace_path = ? AND (json_array_length(notify_state, '$.pendingDebounce.observations') > 0 OR json_array_length(notify_state, '$.pendingRollup.observations') > 0)",
+    )
+    .all(workspacePath) as { monitor_id: string }[];
+  return rows.map((row) => row.monitor_id);
+}

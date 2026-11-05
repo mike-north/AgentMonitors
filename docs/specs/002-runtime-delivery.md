@@ -1064,8 +1064,8 @@ three clocks especially visible:
    batch is flushed as a unit. If materialized as individual events, each event carries its own
    effective urgency.
 
-6. **No per-change interrupts.** A monitor with `strategy: rollup` **MUST NOT** deliver anything
-   outside a window opening. Observations accumulate silently between windows. This is the defining
+6. **No per-change interrupts.** Except for the effective-policy-edit boundary in §4.6,
+   a monitor with `strategy: rollup` **MUST NOT** deliver anything outside a window opening. Observations accumulate silently between windows. This is the defining
    property: the author trades per-change interrupts for a predictable delivery schedule.
 
 **Relationship to the Pace stage (§1.1.1).** Rollup is entirely on the **shared** side of the
@@ -1097,6 +1097,76 @@ explicitly names lower token and observation cost as a first-class motivation fo
 signal become a candidate for delivery" (§1.1.1): immediately on change, after the signal settles,
 at most once per window, or on an author-defined schedule. No further Pace modes are anticipated at
 this stage.
+
+### 4.6 Effective notify-policy edits (_current_)
+
+> **Status: current.** Refs #537; decision [#556](https://github.com/mike-north/AgentMonitors/issues/556#issuecomment-6665228377).
+> An author-caused policy edit is a narrow early-flush exception to debounce settling (§4.3)
+> and rollup's window-only rule (§4.4). It does not claim or acknowledge a delivery.
+
+The runtime **MUST** reconcile effective pacing edits before source-due and active-watcher
+skips, without requiring new source input. Each held envelope's captured definition determines
+its original policy. Effective policy includes the strategy, normalized duration, rollup cron
+and timezone (default UTC), granted whole-batch escalation (§4.1), and
+urgency/salience-dependent defaults when notify is omitted.
+Equivalent duration spellings and explicit/default UTC are unchanged policies. A body/title edit
+alone does not change pacing. The effective policy is compared over absent salience and all three
+salience levels, so an urgency band edit only changes pacing when the resolved notify behavior
+changes. A scalar urgency edit with unchanged explicit debounce retains its clock; a band edit
+that changes the grant to flush a held batch early is an effective pacing change.
+
+On a changed policy, the runtime **MUST** flush **all** existing debounce/rollup holds before
+observing new work under the edited policy. This covers debounce → immediate/throttle/rollup,
+rollup → immediate/throttle/debounce, and effective parameter/default changes within a strategy.
+Unchanged effective policy preserves normal clocks. Omitted notify at high urgency still means
+15s debounce (§4.1), not immediate.
+
+The flush uses each envelope's original content, effective urgency, title/source policy, payload,
+observation timestamp and handling/Shape/Interpret definition. Observation body still takes
+precedence over captured monitor instructions. Missing legacy effective urgency is backfilled
+from the captured definition per §3; missing/invalid captured semantics **MUST** block recovery,
+never borrow values from the new definition. Already-materialized rows remain immutable (#451).
+Old holds retain their order; mixed legacy hold arrays use stable observation-time order, with
+array order and then debounce-before-rollup as ties. Retired throttle suppression and rollup
+minute guards **MUST** be cleared when adopting a changed policy; they cannot suppress accepted
+old work or the new policy's first observation. Private persisted policy identity permits guard
+reset across restarts; it is not an authoring field.
+
+**Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
+reread current held state under that writer boundary, and commit the entire old batch's events,
+projections, cursor seeds, snapshots and removal of corresponding holds together. No stale read
+before the writer lock can authorize removal or replay. Event materialization units may nest as
+savepoints; the edit drain must not join an externally owned transaction. This prevents two
+runtimes from duplicating or overwriting one drain. Optional Interpret runs after commit using
+each event's own projected recipients. This does not guarantee exactly-once downstream effects
+(000 NP2).
+
+Any deterministic write failure **MUST** roll back every event and all original held/source/timing
+state. The runtime reports the blocked edit through existing tick errors and best-effort history,
+retains holds even if diagnostic persistence fails, and defers only that monitor's new observation
+and source-baseline advancement. Healthy siblings and other workspace scopes continue. Restart or
+another edit retries from durable captured state. Watcher acceptance/checkpointing is backpressured
+while blocked: the consumer retains its current unaccepted yield and does not request another.
+Reconciliation can resume it without reloading the live source. Its reconciled pacing and
+urgency band govern future yields; its established execution/handling snapshot remains until an
+explicit restart. This rule does not introduce unrelated live-definition reload behavior.
+
+An invalid/unreadable/missing current definition **MUST** retain its operational holds and report
+the blocking reason. Current source-scope validation at this boundary protects existing holds;
+it does not introduce general observe-time preflight for monitors without held work. There is no
+implicit cancellation on removal, rename or invalid metadata. Ordinary ingest/flush retry recovery
+and flushing unchanged policies after source errors are separate contracts, not added by this rule.
+
+**Example.** At 08:00, debounce holds A at normal urgency with instructions X. At 08:00:02 the author
+selects daily rollup and instructions Y. Reconciliation commits A immediately with normal/X and
+its original 08:00 timestamp, before any new source observation. New B uses Y and waits for rollup's
+09:00 window. If A's write fails, A remains held and B is not newly observed until the drain succeeds.
+
+**Verification:** `runtime/notify-policy-edit.test.ts` covers the transition/default/parameter
+matrix, captured fields, unchanged clocks, missing/invalid definitions, SQLite trigger failures
+(including a later batch event and hold removal), sibling/workspace isolation, watcher backpressure,
+post-commit Interpret, actual owned-child SIGKILL before/after commit and independent-process stale
+read reconciliation. Child probes load the same TypeScript source without invoking a package build.
 
 ## 5. Event Materialization
 
