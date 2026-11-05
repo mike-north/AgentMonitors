@@ -5,6 +5,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   runSmokeContainer,
+  SMOKE_TEST_TIMEOUT_MS,
   assertSmokeContainerSuccess,
 } from './fixtures/smoke-container.js';
 
@@ -28,15 +29,19 @@ const dockerScriptPath = path.join(
 );
 
 describe.skipIf(!dockerAvailable)('Docker runtime smoke', () => {
-  it('installs real Claude Code in a clean home directory and exercises AgentMon end-to-end', async () => {
-    const script = readFileSync(dockerScriptPath, 'utf-8');
+  it(
+    'installs real Claude Code in a clean home directory and exercises AgentMon end-to-end',
+    async () => {
+      const script = readFileSync(dockerScriptPath, 'utf-8');
 
-    const result = await runSmokeContainer(script);
-    assertSmokeContainerSuccess(result);
+      const result = await runSmokeContainer(script);
+      assertSmokeContainerSuccess(result);
 
-    expect(result.stdout).toContain('CLAUDE_VERSION=');
-    expect(result.stdout).toContain('STATUS_RUNNING=true');
-    expect(result.stdout).toContain('EVENT_COUNT=1');
-    expect(result.stdout).toContain('CLAIM_URGENCY=normal');
-  }, 300_000);
+      expect(result.stdout).toContain('CLAUDE_VERSION=');
+      expect(result.stdout).toContain('STATUS_RUNNING=true');
+      expect(result.stdout).toContain('EVENT_COUNT=1');
+      expect(result.stdout).toContain('CLAIM_URGENCY=normal');
+    },
+    SMOKE_TEST_TIMEOUT_MS,
+  );
 });

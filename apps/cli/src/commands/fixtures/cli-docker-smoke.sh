@@ -55,13 +55,10 @@ dump_diagnostics() {
 # fall through silently, and the *next* command — `daemon status` — is what
 # actually failed and reported).
 trap 'dump_diagnostics "command failed with exit code $?"' ERR
-# The outer Node test bounds this whole `docker run` with a hard `timeout`
-# (SIGTERM into the container's PID 1, which is this script) — see
-# cli.docker.test.ts. Trapping it means even a genuine hard-timeout kill
-# still gets a best-effort diagnostic dump flushed to the container's stdout
-# before it dies, instead of vanishing along with the container's
-# filesystem.
-trap 'dump_diagnostics "received SIGTERM (likely the outer execFileSync timeout)"; exit 143' TERM
+# Failure diagnostics are streamed during phases. The outer helper may retrieve
+# remaining logs before forced removal; this TERM trap is best effort only,
+# since synchronous child work can delay bash traps and SIGKILL cannot run them.
+trap 'dump_diagnostics "received SIGTERM"; exit 143' TERM
 
 phase() {
   CURRENT_PHASE="$1"
@@ -150,7 +147,7 @@ phase "daemon-readiness-wait"
 # (apps/cli/src/daemon-ipc.ts `waitForDaemonAvailable` callers: 15s for
 # `daemon run --detach`, 15s for `verify --use-workspace-daemon`, 8s for
 # `session start`'s lazy boot) while still leaving margin inside this
-# script's outer `execFileSync` `timeout` (240s, cli.docker.test.ts) — the
+# outer container execution allocation (derived in smoke-container.ts) — the
 # loop returns as soon as the socket appears, so on the (overwhelmingly
 # common) happy path this budget costs nothing; it is only spent when
 # something is already broken, which is exactly when the diagnostics below

@@ -3,13 +3,30 @@ import { execFileSync, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 const repoRoot = path.resolve(import.meta.dirname, '../../../../..');
+/** Caller budget stays fixed; all run/cleanup work must leave time to report. @internal */
+export const SMOKE_TEST_TIMEOUT_MS = 300_000;
+/** Reserved for client-close delivery, formatting/reporting and ordinary scheduling. */
+const REPORTING_RESERVE_MS = 30_000;
+/** Each diagnostic/cleanup client is independently SIGKILL-bounded. */
+const LOG_RETRIEVAL_TIMEOUT_MS = 5_000;
+const REMOVE_TIMEOUT_MS = 10_000;
+/** Late container creation gets all three delayed cleanup attempts. */
+const LATE_REMOVE_ATTEMPTS = 3;
+const LATE_REMOVE_DELAY_MS = 1_500;
 /**
- * How long the container may run before we force-remove it. Comfortably
- * under the test's own 300s budget so a genuine timeout reports as this
- * test failing with a clear message, not as the whole CI job silently
- * running out its 30-minute budget.
+ * Worst logical cleanup: retrieval + initial/close removal + delayed retries.
+ * 5s + 2*10s + 3*(1.5s + 10s) = 59.5s. Deduct this AND a 30s reporting
+ * reserve from the unchanged 300s caller timeout: container execution gets
+ * 210.5s, and failure reporting begins by logical t=270s in the bounded model.
+ * This allocation does not protect against arbitrary CPU starvation, delayed
+ * OS process reaping, or Docker server work continuing beyond client lifetime.
  */
-const CONTAINER_DEADLINE_MS = 240_000;
+const CLEANUP_BUDGET_MS =
+  LOG_RETRIEVAL_TIMEOUT_MS +
+  2 * REMOVE_TIMEOUT_MS +
+  LATE_REMOVE_ATTEMPTS * (LATE_REMOVE_DELAY_MS + REMOVE_TIMEOUT_MS);
+const CONTAINER_DEADLINE_MS =
+  SMOKE_TEST_TIMEOUT_MS - REPORTING_RESERVE_MS - CLEANUP_BUDGET_MS;
 
 /** Cap on captured container output, mirroring the old `maxBuffer`. */
 const MAX_CAPTURED_OUTPUT_BYTES = 20 * 1024 * 1024;
@@ -33,7 +50,7 @@ function forceRemoveContainer(name: string): void {
   try {
     execFileSync('docker', ['rm', '-f', name], {
       stdio: 'ignore',
-      timeout: 10_000,
+      timeout: REMOVE_TIMEOUT_MS,
       killSignal: 'SIGKILL',
     });
   } catch {
@@ -76,14 +93,10 @@ export function runSmokeContainer(script: string): Promise<ContainerResult> {
     let settled = false;
     let capturedBytes = 0;
 
-    // Deadline path (also used for runaway output). `docker rm -f` alone is
-    // NOT sufficient (review round 3): if the deadline fires while the client
-    // is still pulling the image or waiting on the daemon — before the
-    // container exists — removal no-ops with "No such container", the client
-    // stays blocked, and the container can even be created afterwards. So we
-    // also SIGKILL the client itself (guaranteeing `close` fires), and the
-    // close handler retries removal to catch a container that appears after
-    // this first attempt.
+    // Kill the owned client even before container creation, then remove by its
+    // unique name. Closing the client triggers delayed removal attempts for
+    // server-side creation racing the first removal. Retrieval precedes removal
+    // so streamed/retained diagnostics survive a force-killed container.
     const enforceDeadline = (
       reason: 'deadline' | 'output-limit' = 'deadline',
     ): void => {
@@ -103,7 +116,7 @@ export function runSmokeContainer(script: string): Promise<ContainerResult> {
           ],
           {
             encoding: 'utf8',
-            timeout: 5000,
+            timeout: LOG_RETRIEVAL_TIMEOUT_MS,
             killSignal: 'SIGKILL',
             maxBuffer: MAX_CAPTURED_OUTPUT_BYTES,
           },
@@ -167,8 +180,8 @@ export function runSmokeContainer(script: string): Promise<ContainerResult> {
         return;
       }
       void (async (): Promise<void> => {
-        for (let attempt = 0; attempt < 3; attempt++) {
-          await new Promise((r) => setTimeout(r, 1_500));
+        for (let attempt = 0; attempt < LATE_REMOVE_ATTEMPTS; attempt++) {
+          await new Promise((r) => setTimeout(r, LATE_REMOVE_DELAY_MS));
           forceRemoveContainer(name);
         }
         resolve(result);

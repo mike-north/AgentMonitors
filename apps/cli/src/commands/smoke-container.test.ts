@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({ spawn: vi.fn(), execFileSync: vi.fn() }));
 vi.mock('node:child_process', () => mocks);
 import {
   runSmokeContainer,
+  SMOKE_TEST_TIMEOUT_MS,
   reportContainerFailure,
   assertSmokeContainerSuccess,
 } from './fixtures/smoke-container.js';
@@ -90,3 +91,58 @@ it('rejects output-cap termination even when the client wins the race and exits 
     error.mockRestore();
   }
 });
+
+it.each(['deadline', 'output-limit'] as const)(
+  'completes worst-case %s cleanup and actual failure reporting with a 30s reserve',
+  async (reason) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    const child = client();
+    const started = Date.now();
+    expect(SMOKE_TEST_TIMEOUT_MS).toBe(300_000);
+    // Model each synchronous Docker client consuming its entire configured
+    // bound. setSystemTime models blocking work without firing nested timers.
+    mocks.execFileSync.mockImplementation((_command, _args, options) => {
+      vi.setSystemTime(Date.now() + Number(options.timeout));
+      throw new Error('bounded Docker client timeout');
+    });
+    const pending = runSmokeContainer('fixture');
+    child.stderr.emit(
+      'data',
+      Buffer.from('phase build-core: retained diagnostic'),
+    );
+    if (reason === 'output-limit')
+      child.stdout.emit('data', Buffer.alloc(21 * 1024 * 1024));
+    await vi.runAllTimersAsync();
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    const result = await pending;
+    expect(result.terminationReason).toBe(reason);
+    expect(result.timedOut).toBe(reason === 'deadline');
+    const calls = mocks.execFileSync.mock.calls;
+    expect(calls.filter((call) => call[1][0] === 'exec')).toHaveLength(1);
+    // Initial removal, close removal and all three late-creation retries stay.
+    expect(calls.filter((call) => call[1][0] === 'rm')).toHaveLength(5);
+    for (const call of calls)
+      expect(call[2]).toMatchObject({
+        timeout: call[1][0] === 'exec' ? 5000 : 10000,
+        killSignal: 'SIGKILL',
+      });
+    let reportAt = Infinity;
+    const report = vi.spyOn(console, 'error').mockImplementation(() => {
+      reportAt = Date.now();
+    });
+    try {
+      expect(() => assertSmokeContainerSuccess(result)).toThrow(
+        reason === 'deadline' ? /deadline/ : /output limit/,
+      );
+      expect(report).toHaveBeenCalledWith(
+        expect.stringContaining('phase build-core: retained diagnostic'),
+      );
+      expect(reportAt - started).toBeLessThanOrEqual(270_000);
+      expect(reportAt - started).toBe(reason === 'deadline' ? 270_000 : 59_500);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      report.mockRestore();
+    }
+  },
+);
