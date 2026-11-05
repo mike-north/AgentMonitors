@@ -76,7 +76,13 @@ logging must make that pause visible. The built CLI must also prove the authorin
 and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
 with valid globs and a malformed interval: doctor must report the validation error
 without scheduling it or inventing a due time, retain healthy sibling results, and
-leave source/notify state, events, and observation history unchanged. Covered by
+leave source/notify state, events, and observation history unchanged. A stale verify
+session with a real projected scratch event and an edited invalid interval must
+be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
+retain the source baseline and held legitimate work, report the config skip, and
+progress a healthy sibling. Assert the existing fallback expiry at five minutes
+for invalid/missing cadence, and the unchanged valid interval-plus-settle sizing.
+Covered by
 `libs/core/src/runtime/source-validation.test.ts` and
 `apps/cli/src/commands/runtime-source-validation.test.ts`.
 

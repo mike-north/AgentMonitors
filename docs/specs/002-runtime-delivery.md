@@ -628,6 +628,15 @@ an overdue debounce batch untouched; changing it to `value: fixed` allows the ne
 due tick to observe using the retained baseline and flush the captured batch.
 Healthy sibling monitors **MUST** continue progressing.
 
+Dormant verify-session cleanup runs before observation preflight and **MUST** also
+validate source config before using its cadence to size scratch-event suppression.
+Rejected config or an unavailable definition/source uses the existing five-minute
+suppression floor; it must not abort retraction of owned scratch events or prevent
+later config-skip reporting and healthy sibling evaluation. Valid cadence retains
+`max(5 minutes, poll interval + notify settle/suppress window + 1 minute margin)`.
+The fallback does not establish a new lifetime policy or consume source/notify
+state; malformed config is still reported by ordinary tick preflight.
+
 Continuous `watchMonitors()` startup **MUST** apply the same preflight before
 calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from
 the returned handle and reported through `onError` (or stderr when no callback is

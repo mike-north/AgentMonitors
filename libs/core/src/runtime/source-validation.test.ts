@@ -308,6 +308,117 @@ describe('source config execution preflight', () => {
     expect(store.getMonitorState('aaa-invalid', f.root)).toEqual(retained);
   });
 
+  it('reaps stale verify scratch work before reporting an invalid cadence and progressing healthy siblings', async () => {
+    vi.useFakeTimers();
+    const start = new Date('2026-11-05T12:00:00Z');
+    vi.setSystemTime(start);
+    const f = fixture();
+    const registry = new SourceRegistry();
+    registry.register(fileFingerprintSource);
+    const store = new RuntimeStore(createDb(path.join(f.root, 'reaper.db')));
+    const runtime = new AgentMonitorRuntime(
+      store,
+      registry,
+      [claudeCodeAdapter],
+      undefined,
+      { sessionDormancyMs: 60000 },
+    );
+    const write = (interval: string, notify = '') => {
+      const dir = path.join(f.monitorsDir, 'aaa-invalid');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        `---\nname: Invalid cadence\nwatch:\n  type: file-fingerprint\n  globs: ['watched.txt', 'agentmonitors-verify-*.md']\n  interval: ${interval}\nurgency: normal\n${notify}\n---\nHandle it.\n`,
+      );
+    };
+    write('1s');
+    const siblingDir = path.join(f.monitorsDir, 'zzz-healthy');
+    mkdirSync(siblingDir);
+    writeFileSync(
+      path.join(siblingDir, 'MONITOR.md'),
+      `---\nname: Healthy sibling\nwatch:\n  type: file-fingerprint\n  globs: ['sibling.txt']\n  interval: 1s\nurgency: normal\n---\nHandle it.\n`,
+    );
+    const watched = path.join(f.root, 'watched.txt');
+    const sibling = path.join(f.root, 'sibling.txt');
+    const scratchKey = path.join(
+      f.root,
+      'agentmonitors-verify-abcdef012345.md',
+    );
+    writeFileSync(watched, 'baseline');
+    writeFileSync(sibling, 'baseline');
+    const verify = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'agentmonitors-verify-abcdef012345',
+        workspacePath: f.root,
+      }),
+    );
+    await runtime.tick(f.monitorsDir, f.root);
+    vi.advanceTimersByTime(1000);
+    writeFileSync(scratchKey, 'owned synthetic scratch');
+    await runtime.tick(f.monitorsDir, f.root);
+    expect(
+      runtime.listEvents({ sessionId: verify.id, objectKey: scratchKey }),
+    ).toHaveLength(1);
+    // Capture real held work independently of the already-materialized scratch
+    // event, so cleanup must not reset the source baseline or notify batch.
+    const notify = 'notify:\n  strategy: debounce\n  settle-for: 5s';
+    write('1s', notify);
+    vi.advanceTimersByTime(1000);
+    writeFileSync(watched, 'held legitimate change');
+    await runtime.tick(f.monitorsDir, f.root);
+    const retained = store.getMonitorState('aaa-invalid', f.root);
+    expect(retained.notifyState.pendingDebounce?.observations).toHaveLength(1);
+    const history = runtime.listObservationHistory({
+      monitorId: 'aaa-invalid',
+      workspacePath: f.root,
+    });
+    write('bad', notify);
+    rmSync(scratchKey);
+    writeFileSync(sibling, 'healthy progress');
+    const reapAt = new Date(start.getTime() + 120000);
+    vi.setSystemTime(reapAt);
+    const result = await runtime.tick(f.monitorsDir, f.root);
+    expect(store.getSessionById(verify.id).status).toBe('dormant');
+    expect(result.skippedMonitors).toEqual([
+      {
+        monitorId: 'aaa-invalid',
+        validationError: validateWatchScope(
+          {
+            globs: ['watched.txt', 'agentmonitors-verify-*.md'],
+            interval: 'bad',
+          },
+          fileFingerprintSource.scopeSchema,
+        ).join('; '),
+      },
+    ]);
+    expect(result.evaluatedMonitors).toEqual(['zzz-healthy']);
+    expect(result.emittedEventIds).toHaveLength(1);
+    expect(
+      runtime.listEvents({ workspacePath: f.root, objectKey: scratchKey }),
+    ).toEqual([]);
+    // Invalid cadence uses exactly the pre-existing five-minute fallback;
+    // cleanup must neither throw nor infer a new lifetime from rejected config.
+    expect(
+      store.activeObjectSuppressions(
+        f.root,
+        new Date(reapAt.getTime() + 299999),
+      ),
+    ).toMatchObject([{ monitorId: 'aaa-invalid', objectKey: scratchKey }]);
+    expect(
+      store.activeObjectSuppressions(
+        f.root,
+        new Date(reapAt.getTime() + 300000),
+      ),
+    ).toEqual([]);
+    expect(store.getMonitorState('aaa-invalid', f.root)).toEqual(retained);
+    expect(
+      runtime.listObservationHistory({
+        monitorId: 'aaa-invalid',
+        workspacePath: f.root,
+      }),
+    ).toEqual(history);
+  });
+
   it('rechecks persisted ephemeral scopes against the currently registered schema before observing', async () => {
     const f = fixture();
     const { runtime } = f.open();

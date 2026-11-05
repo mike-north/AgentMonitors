@@ -896,7 +896,8 @@ export class AgentMonitorRuntime {
           // it is still authored (issue #418): a long-interval/long-settle monitor
           // needs a window that outlasts its next poll + settle, or the scratch
           // deletion re-materializes AFTER the tombstone has expired and lingers.
-          // Falls back to the fixed floor when the monitor is gone from the scan.
+          // Falls back to the existing fixed floor when a definition or valid
+          // source config is unavailable; cleanup precedes tick preflight.
           ttlMs: this.orphanSuppressionTtlMs(
             monitorsById.get(object.monitorId),
             now,
@@ -952,7 +953,10 @@ export class AgentMonitorRuntime {
    * linger for a later session. When the object's monitor is still authored (its
    * definition is in this tick's scan) we derive the max of the floor and
    * (interval + settle + margin) so the window always outlasts one full
-   * observe-and-settle cycle; when it is gone we fall back to the floor.
+   * observe-and-settle cycle. When the definition/source is unavailable or its
+   * source config is rejected, cadence cannot safely size the lifetime and the
+   * existing floor applies. Reaping precedes observation preflight, so this
+   * lookup must validate independently without consuming source or notify state.
    */
   private orphanSuppressionTtlMs(
     monitor: MonitorDefinition | undefined,
@@ -960,6 +964,16 @@ export class AgentMonitorRuntime {
     workspacePath: string | null,
   ): number {
     if (!monitor) return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+    const source = this.registry.get(monitor.frontmatter.watch.type);
+    if (
+      !source ||
+      validateWatchScope(
+        watchConfig(monitor.frontmatter.watch),
+        source.scopeSchema,
+      ).length > 0
+    ) {
+      return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+    }
     const { nextPollMs } = this.scheduleForMonitor(monitor, now, workspacePath);
     const notify = monitor.frontmatter.notify;
     // The settle window that can delay the deletion's materialization: a debounce
