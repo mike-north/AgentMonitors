@@ -58,6 +58,17 @@ export async function runJqTestChild(args, options) {
   child.on('error', (cause) => {
     error = cause;
   });
+  /**
+   * Cleanup failure is not a termination claim. Release held readers so a
+   * visible error result does not depend on the failed group's pipe closure.
+   * @param {unknown} cause
+   */
+  function failCleanup(cause) {
+    error = cause instanceof Error ? cause : new Error(String(cause));
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  }
+
   // Kill surviving workers on exit, before waiting for pipe closure: workers
   // can inherit those pipes and otherwise keep a timed-out parent unresolved.
   child.on('exit', () => {
@@ -71,25 +82,25 @@ export async function runJqTestChild(args, options) {
     if (child.pid && ownsGroup) {
       try {
         process.kill(-child.pid, 'SIGKILL');
-        cleanup = waitForOwnedGroupTermination(child.pid, deadline).catch(
-          (cause) => {
-            error = cause instanceof Error ? cause : new Error(String(cause));
-          },
-        );
       } catch (cause) {
         if (
           !(cause instanceof Error && 'code' in cause && cause.code === 'ESRCH')
         ) {
-          error = cause instanceof Error ? cause : new Error(String(cause));
-          child.stdout?.destroy();
-          child.stderr?.destroy();
+          failCleanup(cause);
+          return;
         }
       }
+      // Even ESRCH must be accepted within the confirmation deadline.
+      cleanup = waitForOwnedGroupTermination(child.pid, deadline).catch(
+        failCleanup,
+      );
     }
   });
   /** @type {Promise<number | null>} */
   const completion = new Promise((resolve) => child.on('close', resolve));
   const status = await completion;
   await cleanup;
+  if (!error && Date.now() >= deadline)
+    failCleanup(new Error('Owned child confirmation deadline expired'));
   return { status, stdout, stderr, error };
 }

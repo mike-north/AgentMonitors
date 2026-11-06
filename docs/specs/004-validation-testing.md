@@ -178,7 +178,10 @@ The facility driver's owned boundary covers its Node/jq process group, not produ
 observations that deliberately create separate groups. An error-free outermost return
 requires bounded terminal-state confirmation for that known group (including Linux
 zombie/dead states), rather than merely a SIGKILL request. Cleanup time is reserved
-inside the existing total bound; child/parent deadlines are not increased.
+inside the existing total bound; child/parent deadlines are not increased. Late
+terminal evidence cannot turn an expired confirmation into success. If confirmation
+fails, the driver releases inherited readers and returns the error rather than waiting
+for the failed group's pipe closure; reader release is not termination evidence.
 
 The partial-test notice calls out this facility-dependent coverage. A reported skip means that surface remains unverified.
 

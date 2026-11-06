@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-06 — Bound failed confirmation results and reject late evidence (004 §2.10) — Refs #458
+
+An asynchronous confirmation failure releases held driver readers and returns its error
+without waiting for the failed group to close inherited pipes. Confirmation checks its
+absolute budget before and after asynchronous queries, between proc reads, and before
+accepting success. Pending supported queries are aborted best-effort and the verdict is
+raced against the existing deadline; this does not claim synchronous kernel-I/O interruption.
+No normal diagnostic-drain policy, deadline, facility boundary, or production source changed.
+
 ## 2026-11-06 — Bound facility controls to direct jq and confirm owned termination (004 §2.10) — Refs #458
 
 Clarify the accepted script-control boundary: real shipped jq programs execute directly

@@ -8,56 +8,74 @@ import { promisify } from 'node:util';
 import { readdir, readFile } from 'node:fs/promises';
 import { platform } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
+import { setTimeout, clearTimeout } from 'node:timers';
 
 /** @param {unknown} error @param {string} code @returns {boolean} @internal */
 function hasCode(error, code) {
   return error instanceof Error && 'code' in error && error.code === code;
 }
 
-/** @param {number} group @param {number} deadline @returns {Promise<boolean>} */
-async function terminated(group, deadline) {
+/** @param {number} group @returns {Error} */
+function expired(group) {
+  return new Error(`Owned group ${group} not terminated within deadline`);
+}
+
+/** @param {number} group @param {number} deadline @param {AbortSignal} signal */
+function checkBudget(group, deadline, signal) {
+  if (signal.aborted || Date.now() >= deadline) throw expired(group);
+}
+
+/** @param {number} group @param {number} deadline @param {AbortSignal} signal @returns {Promise<boolean>} */
+async function terminated(group, deadline, signal) {
+  checkBudget(group, deadline, signal);
   if (platform() === 'darwin') {
-    // Darwin group-zero probes can return EPERM after orphan cleanup. Query
-    // kernel membership/state instead; use the OS path, never the test PATH.
+    // Use OS membership/state instead of unreliable Darwin group-zero probes.
     const { stdout } = await promisify(execFile)(
       '/bin/ps',
       ['-axo', 'pid=,pgid=,stat='],
       {
         encoding: 'utf8',
-        timeout: Math.max(1, deadline - Date.now()),
+        timeout: deadline - Date.now(),
         killSignal: 'SIGKILL',
+        signal,
       },
     );
-    return stdout
-      .trim()
-      .split('\n')
-      .filter(Boolean)
-      .every((line) => {
-        const fields = line.trim().split(/\s+/);
-        if (fields.length !== 3)
-          throw new Error('Unreadable owned-group process state');
-        return Number(fields[1]) !== group || /^[ZXx]/.test(fields[2]);
-      });
+    checkBudget(group, deadline, signal);
+    for (const line of stdout.trim().split('\n').filter(Boolean)) {
+      checkBudget(group, deadline, signal);
+      const fields = line.trim().split(/\s+/);
+      if (fields.length !== 3)
+        throw new Error('Unreadable owned-group process state');
+      if (Number(fields[1]) === group && !/^[ZXx]/.test(fields[2]))
+        return false;
+    }
+    checkBudget(group, deadline, signal);
+    return true;
   }
   try {
     process.kill(-group, 0);
   } catch (error) {
+    checkBudget(group, deadline, signal);
     if (hasCode(error, 'ESRCH')) return true;
     throw error;
   }
+  checkBudget(group, deadline, signal);
   if (platform() !== 'linux') return false;
-  // Linux can retain dead group members under a non-reaping PID1. Read
-  // kernel group membership and state, never equate kill-zero with running.
   let members = 0;
-  for (const pid of await readdir('/proc')) {
+  const entries = await readdir('/proc');
+  checkBudget(group, deadline, signal);
+  for (const pid of entries) {
+    checkBudget(group, deadline, signal);
     if (!/^\d+$/.test(pid)) continue;
     let stat;
     try {
-      stat = await readFile(`/proc/${pid}/stat`, 'utf8');
+      stat = await readFile(`/proc/${pid}/stat`, { encoding: 'utf8', signal });
     } catch (error) {
+      checkBudget(group, deadline, signal);
       if (hasCode(error, 'ENOENT') || hasCode(error, 'ESRCH')) continue;
       throw error;
     }
+    checkBudget(group, deadline, signal);
     const fields = stat
       .slice(stat.lastIndexOf(')') + 2)
       .trim()
@@ -68,27 +86,60 @@ async function terminated(group, deadline) {
     members++;
     if (!['Z', 'X', 'x'].includes(fields[0])) return false;
   }
+  checkBudget(group, deadline, signal);
   if (members > 0) return true;
   // A disappearing proc entry is not proof that an existing group is dead.
   try {
     process.kill(-group, 0);
-    return false;
   } catch (error) {
+    checkBudget(group, deadline, signal);
     if (hasCode(error, 'ESRCH')) return true;
     throw error;
   }
+  checkBudget(group, deadline, signal);
+  return false;
 }
 
 /**
  * @param {number} group - Group created by this helper's detached direct child.
  * @param {number} deadline - Absolute deadline within the caller's existing bound.
- * @returns {Promise<void>} Resolves only after terminal evidence; errors are never success.
+ * @returns {Promise<void>} Resolves only after timely terminal evidence; errors are never success.
  * @internal
  */
 export async function waitForOwnedGroupTermination(group, deadline) {
-  while (!(await terminated(group, deadline))) {
-    if (Date.now() >= deadline)
-      throw new Error(`Owned group ${group} not terminated within deadline`);
-    await delay(Math.min(10, Math.max(1, deadline - Date.now())));
+  const controller = new globalThis.AbortController();
+  checkBudget(group, deadline, controller.signal);
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(expired(group));
+    }, deadline - Date.now());
+  });
+  // The race bounds the verdict even when an OS query cannot finish promptly.
+  // Abort supported operations, but do not claim arbitrary kernel I/O was
+  // synchronously interrupted. Every continuation checks budget before more work.
+  const query = (async () => {
+    while (true) {
+      checkBudget(group, deadline, controller.signal);
+      const done = await terminated(group, deadline, controller.signal);
+      checkBudget(group, deadline, controller.signal);
+      if (done) return;
+      await delay(Math.min(10, deadline - Date.now()), undefined, {
+        signal: controller.signal,
+      });
+    }
+  })();
+  try {
+    await Promise.race([query, timeout]);
+    checkBudget(group, deadline, controller.signal);
+  } catch (error) {
+    if (controller.signal.aborted || Date.now() >= deadline)
+      throw expired(group);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    controller.abort();
   }
 }
