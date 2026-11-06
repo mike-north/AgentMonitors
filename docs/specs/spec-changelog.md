@@ -29,6 +29,30 @@ and backpressures only that monitor. Specify restart, missing-definition diagnos
 writer exclusion, real SQLite faults and actual bounded-child kill acceptance. Ordinary flush
 recovery remains separate.
 
+## 2026-11-05 — Preserve native Shape input rejection (001 §5.1) — Refs #542
+
+Extend the pre-normalization guard to the verified historical non-mapping family:
+`Date`, `Map`, `Set`, and objects with callable `then` and `catch`. Synchronous
+validation returns failure for native Promises rather than throwing, and async
+validation rejects them without awaiting a resolved mapping. Preserve the existing
+admission of other objects, mapping/default/CEL behavior, public input/output types,
+and preprocessing composition surface; do not impose a plain-object restriction.
+
+## 2026-11-05 — Preserve Shape mapping admission (001 §5.1) — Refs #542
+
+Clarify the current mapping-only contract: YAML timestamps are scalar declarations
+and must be rejected, including the Date values produced by the YAML loader.
+Restore this rejection before Zod 4 object normalization can erase the scalar to
+`{}`. Valid mappings, omission, authored input types, and parsed output types are
+unchanged. The exported Shape validator now uses a preprocessing pipe; its API
+report records that schema-composition surface.
+
+## 2026-11-03 — Migrate exported validation schemas to Zod 4 (001) — Refs #530
+
+Direct core and CLI validation uses patched Zod 4. Exported schema types now follow
+Zod 4; parsed monitor data and authored messages are unchanged. This dependency
+change does not impose input limits or establish safety of SDK v3 compatibility code.
+
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
 Remove the launcher suite's blanket retry after tracing the failure it masked to a real race: a CLI
