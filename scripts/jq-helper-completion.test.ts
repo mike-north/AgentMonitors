@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
-import type { SpawnOptions } from 'node:child_process';
+import type { ChildProcess, SpawnOptions } from 'node:child_process';
 import { expect, it, vi } from 'vitest';
 import { runJqTestChild } from './run-jq-test-child.mjs';
 
@@ -22,7 +22,7 @@ vi.mock('node:child_process', async (importOriginal) => {
     ...actual,
     spawn(command: string, args: readonly string[], options: SpawnOptions) {
       const child = actual.spawn(command, args, options);
-      onSpawn(child.pid);
+      onSpawn(child);
       child.once('close', () => onClose());
       return child;
     },
@@ -88,8 +88,8 @@ it('returns an async confirmation error while a real worker still holds both pip
   const realKill = process.kill.bind(process);
   let group: number | undefined;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
-  onSpawn.mockImplementationOnce((pid: number) => {
-    group = pid;
+  onSpawn.mockImplementationOnce((child: ChildProcess) => {
+    group = child.pid;
   });
   const signal = vi
     .spyOn(process, 'kill')
@@ -104,7 +104,7 @@ it('returns an async confirmation error while a real worker still holds both pip
       new Promise((_resolve, reject) => {
         setTimeout(
           () => reject(new Error('owned confirmation deadline failure')),
-          Math.max(1, deadline - Date.now()),
+          Math.max(1, deadline - Date.now() - 30),
         );
       }),
   );
@@ -146,3 +146,125 @@ it('returns an async confirmation error while a real worker still holds both pip
     rmSync(dir, { recursive: true, force: true });
   }
 }, 5_000);
+
+// Real process boundaries are required: a successful signal request does not
+// imply an exit/close event, and inherited pipes can outlive the direct child.
+it.each(['direct child alive', 'exited child with held pipes'])(
+  'returns a deadline error before fixture cleanup with %s',
+  async (phase) => {
+    wait.mockClear();
+    const realKill = process.kill.bind(process);
+    let child: ChildProcess | undefined;
+    let exited = false;
+    let requests = 0;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    let release!: () => void;
+    const confirmation = new Promise<void>((resolve, reject) => {
+      release =
+        phase === 'direct child alive'
+          ? resolve
+          : () => reject(new Error('late confirmation failure'));
+    });
+    wait.mockImplementation(() => confirmation);
+    onSpawn.mockImplementationOnce((spawned: ChildProcess) => {
+      child = spawned;
+      child.once('exit', () => {
+        exited = true;
+      });
+      if (phase === 'direct child alive') {
+        const kill = child.kill.bind(child);
+        child.kill = (signal) => {
+          // Node's timeout can pass numeric 9. Control only this exact child.
+          if (signal === 'SIGKILL' || signal === 9) {
+            requests++;
+            return true;
+          }
+          return kill(signal);
+        };
+      }
+    });
+    const signal = vi
+      .spyOn(process, 'kill')
+      .mockImplementation((target, kind) => {
+        if (
+          child?.pid !== undefined &&
+          target === -child.pid &&
+          kind === 'SIGKILL'
+        )
+          return true;
+        return realKill(target, kind);
+      });
+    const code =
+      phase === 'direct child alive'
+        ? "console.log('direct stdout');console.error('direct stderr');setInterval(()=>{},1000)"
+        : "require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'}).unref();console.log('direct stdout');console.error('direct stderr')";
+    const start = Date.now();
+    const operation = runJqTestChild(['-e', code], {
+      cwd: process.cwd(),
+      env: process.env,
+      timeout: 400,
+    });
+    try {
+      const result = await Promise.race([
+        operation,
+        new Promise<null>((resolve) => {
+          watchdog = setTimeout(() => resolve(null), 650);
+        }),
+      ]);
+      expect(exited).toBe(phase !== 'direct child alive');
+      if (phase === 'direct child alive') {
+        expect(requests).toBeGreaterThanOrEqual(1);
+        if (child?.pid === undefined)
+          throw new Error('owned child did not spawn');
+        expect(realKill(child.pid, 0)).toBe(true);
+        expect(wait).not.toHaveBeenCalled();
+      }
+      expect(
+        result,
+        'deadline verdict must precede forced fixture cleanup',
+      ).not.toBeNull();
+      if (!result) throw new Error('helper exceeded its total deadline');
+      expect(Date.now() - start).toBeLessThan(600);
+      expect(result.error?.message).toMatch(/deadline/);
+      expect(result.stdout).toContain('direct stdout');
+      expect(result.stderr).toContain('direct stderr');
+      if (phase === 'direct child alive') expect(result.status).toBeNull();
+    } finally {
+      clearTimeout(watchdog);
+      signal.mockRestore();
+      if (child?.pid !== undefined) {
+        try {
+          realKill(-child.pid, 'SIGKILL');
+        } catch (error) {
+          expect(error).toMatchObject({ code: 'ESRCH' });
+        }
+      }
+      release?.();
+      await operation;
+    }
+  },
+  5_000,
+);
+
+it.each([0, 7])(
+  'preserves natural child status %s and diagnostics',
+  async (status) => {
+    wait.mockResolvedValue(undefined);
+    const result = await runJqTestChild(
+      ['-e', `console.log('natural diagnostic');process.exitCode=${status}`],
+      { cwd: process.cwd(), env: process.env, timeout: 1_000 },
+    );
+    expect(result.status).toBe(status);
+    expect(result.error).toBeUndefined();
+    expect(result.stdout).toContain('natural diagnostic');
+  },
+);
+
+it('retains spawn failure without waiting for the deadline', async () => {
+  const result = await runJqTestChild(['-e', ''], {
+    cwd: '/nonexistent/agentmonitors-fixture-directory',
+    env: process.env,
+    timeout: 1_000,
+  });
+  expect(result.error).toMatchObject({ code: 'ENOENT' });
+});

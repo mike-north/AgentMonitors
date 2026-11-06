@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-06 — Cover every facility-child phase with the total deadline (004 §2.10) — Refs #458
+
+The existing total deadline bounds the verdict before direct-child exit as well as
+through pipe closure and group confirmation. A successful timeout SIGKILL request
+without exit cannot leave the helper blocked: expiry returns a visible error,
+releases readers and unreferences the direct-child handle while retaining lifecycle
+error handling. This is not proof of termination or synchronous kernel interruption.
+The cleanup reservation, timeout budgets, owned boundary and production sources are unchanged.
+
 ## 2026-11-06 — Bound failed confirmation results and reject late evidence (004 §2.10) — Refs #458
 
 An asynchronous confirmation failure releases held driver readers and returns its error

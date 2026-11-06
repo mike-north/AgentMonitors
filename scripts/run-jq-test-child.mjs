@@ -7,10 +7,12 @@
  * its synchronous typings omit that option. Async spawn is used here for
  * streaming output and observing exit so surviving workers can be killed
  * before their inherited pipes prevent closure.
- * The total bound includes termination confirmation for the known owned group.
+ * One total deadline covers execution, pipe closure and group confirmation;
+ * expiry returns an error even if a kill request never produces child exit.
  * Facility controls run jq directly, never detached command-poll observations.
  */
 import { spawn } from 'node:child_process';
+import { setTimeout, clearTimeout } from 'node:timers';
 import { waitForOwnedGroupTermination } from './owned-test-group.mjs';
 
 // Private to these test drivers and propagated only to their owned children.
@@ -49,6 +51,8 @@ export async function runJqTestChild(args, options) {
   let stderr = '';
   /** @type {Error | undefined} */
   let error;
+  // Late process events remain handled but cannot change the returned verdict.
+  let finished = false;
   child.stdout?.on('data', (data) => {
     stdout += data.toString();
   });
@@ -56,7 +60,7 @@ export async function runJqTestChild(args, options) {
     stderr += data.toString();
   });
   child.on('error', (cause) => {
-    error = cause;
+    if (!finished) error ??= cause;
   });
   /**
    * Cleanup failure is not a termination claim. Release held readers so a
@@ -64,7 +68,8 @@ export async function runJqTestChild(args, options) {
    * @param {unknown} cause
    */
   function failCleanup(cause) {
-    error = cause instanceof Error ? cause : new Error(String(cause));
+    if (finished) return;
+    error ??= cause instanceof Error ? cause : new Error(String(cause));
     child.stdout?.destroy();
     child.stderr?.destroy();
   }
@@ -72,6 +77,7 @@ export async function runJqTestChild(args, options) {
   // Kill surviving workers on exit, before waiting for pipe closure: workers
   // can inherit those pipes and otherwise keep a timed-out parent unresolved.
   child.on('exit', () => {
+    if (finished) return;
     if (inheritedBoundary) {
       // Descendants may retain these pipes. Release nested readers on direct
       // child exit so the owner can complete and terminate the shared subtree.
@@ -98,9 +104,41 @@ export async function runJqTestChild(args, options) {
   });
   /** @type {Promise<number | null>} */
   const completion = new Promise((resolve) => child.on('close', resolve));
-  const status = await completion;
-  await cleanup;
-  if (!error && Date.now() >= deadline)
-    failCleanup(new Error('Owned child confirmation deadline expired'));
-  return { status, stdout, stderr, error };
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer;
+  /** @type {Promise<number | null>} */
+  const expiry = new Promise((resolve) => {
+    timer = setTimeout(
+      () => {
+        failCleanup(new Error('Owned child confirmation deadline expired'));
+        // Best effort only: successful signal requests are not terminal evidence.
+        // Nested helpers can signal their direct child, never the ancestor group.
+        try {
+          if (ownsGroup && child.pid) process.kill(-child.pid, 'SIGKILL');
+          else child.kill('SIGKILL');
+        } catch (cause) {
+          failCleanup(cause);
+        }
+        // A non-exiting process must not keep the driver's event loop referenced.
+        // Keep error/exit listeners installed for eventual lifecycle events.
+        child.unref();
+        resolve(child.exitCode);
+      },
+      Math.max(0, deadline - Date.now()),
+    );
+  });
+  const confirmed = (async () => {
+    const status = await completion;
+    await cleanup;
+    if (!error && Date.now() >= deadline)
+      failCleanup(new Error('Owned child confirmation deadline expired'));
+    return status;
+  })();
+  try {
+    const status = await Promise.race([confirmed, expiry]);
+    return { status, stdout, stderr, error };
+  } finally {
+    finished = true;
+    clearTimeout(timer);
+  }
 }

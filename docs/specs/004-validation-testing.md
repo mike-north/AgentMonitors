@@ -179,7 +179,11 @@ observations that deliberately create separate groups. An error-free outermost r
 requires bounded terminal-state confirmation for that known group (including Linux
 zombie/dead states), rather than merely a SIGKILL request. Cleanup time is reserved
 inside the existing total bound; child/parent deadlines are not increased. Late
-terminal evidence cannot turn an expired confirmation into success. If confirmation
+terminal evidence cannot turn an expired confirmation into success. The same total
+deadline owns execution, direct-child exit, pipe closure and confirmation: if a timeout
+kill request never produces exit/close, the driver still returns a visible deadline
+error, releases its readers and unreferences the child handle. Signal success and
+handle release do not prove termination. If confirmation
 fails, the driver releases inherited readers and returns the error rather than waiting
 for the failed group's pipe closure; reader release is not termination evidence.
 
