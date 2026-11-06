@@ -518,6 +518,137 @@ describe('monitorFrontmatterSchema', () => {
 
   // ── Shape / payload frontmatter (G15, 001 §5.1–§5.2) ────────────────────
   describe('shape declaration (001 §5.1)', () => {
+    // 001 §5.1 preserves the pre-migration object boundary for direct callers,
+    // including promise-like values that must never be awaited into a Shape.
+    const nativeInputs = [
+      { label: 'Map', create: () => new Map() },
+      { label: 'Set', create: () => new Set() },
+      {
+        label: 'Promise',
+        create: () => Promise.resolve({ render: 'rendered' }),
+      },
+      {
+        label: 'thenable',
+        create: () => ({
+          then() {
+            throw new Error('Shape validation must not invoke then');
+          },
+          catch() {
+            throw new Error('Shape validation must not invoke catch');
+          },
+        }),
+      },
+    ];
+
+    describe.each(nativeInputs)('$label admission', ({ create }) => {
+      it('returns a synchronous validation failure from the exported Shape schema', () => {
+        // Calling directly also proves safeParse returns instead of throwing.
+        const result = shapeSchema.safeParse(create());
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error.issues).toMatchObject([
+            { code: 'invalid_type', expected: 'object', path: [] },
+          ]);
+      });
+
+      it('returns a synchronous validation failure at the frontmatter shape path', () => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          shape: create(),
+        });
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error.issues).toMatchObject([
+            { code: 'invalid_type', expected: 'object', path: ['shape'] },
+          ]);
+      });
+
+      it('rejects async Shape input before promise assimilation', async () => {
+        const result = await shapeSchema.safeParseAsync(create());
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error.issues).toMatchObject([
+            { code: 'invalid_type', expected: 'object', path: [] },
+          ]);
+      });
+
+      it('rejects async frontmatter input before promise assimilation', async () => {
+        const result = await monitorFrontmatterSchema.safeParseAsync({
+          ...validMinimal,
+          shape: create(),
+        });
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error.issues).toMatchObject([
+            { code: 'invalid_type', expected: 'object', path: ['shape'] },
+          ]);
+      });
+    });
+
+    it.each([
+      {
+        label: 'null-prototype mapping',
+        create: () => {
+          const mapping = { render: 'rendered' };
+          Object.setPrototypeOf(mapping, null);
+          return mapping;
+        },
+        expected: { render: 'rendered' },
+      },
+      { label: 'RegExp', create: () => /shape/, expected: {} },
+      { label: 'WeakMap', create: () => new WeakMap(), expected: {} },
+      { label: 'WeakSet', create: () => new WeakSet(), expected: {} },
+      { label: 'Uint8Array', create: () => new Uint8Array([1]), expected: {} },
+      {
+        label: 'then-only object',
+        create: () => ({
+          then() {
+            throw new Error('not a promise-like Shape input');
+          },
+        }),
+        expected: {},
+      },
+      {
+        label: 'catch-only object',
+        create: () => ({
+          catch() {
+            throw new Error('not a promise-like Shape input');
+          },
+        }),
+        expected: {},
+      },
+    ])(
+      'preserves baseline $label object admission',
+      async ({ create, expected }) => {
+        const input = create();
+        expect(shapeSchema.parse(input)).toEqual(expected);
+        expect(await shapeSchema.parseAsync(input)).toEqual(expected);
+        expect(
+          monitorFrontmatterSchema.parse({ ...validMinimal, shape: input })
+            .shape,
+        ).toEqual(expected);
+        expect(
+          (
+            await monitorFrontmatterSchema.parseAsync({
+              ...validMinimal,
+              shape: input,
+            })
+          ).shape,
+        ).toEqual(expected);
+      },
+    );
+
+    it.each([[], null, 'rendered', 1])(
+      'preserves non-object rejection: %j',
+      (shape) => {
+        expect(shapeSchema.safeParse(shape).success).toBe(false);
+        expect(
+          monitorFrontmatterSchema.safeParse({ ...validMinimal, shape })
+            .success,
+        ).toBe(false);
+      },
+    );
+
     // Direct consumers must enforce the same mapping boundary as YAML parsing.
     it('rejects Date scalars through both exported schema surfaces', () => {
       const timestamp = new Date('2026-11-03T00:00:00Z');

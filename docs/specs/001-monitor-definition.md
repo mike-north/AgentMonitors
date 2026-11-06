@@ -352,7 +352,14 @@ Authoring rules:
   `shape: 2026-11-03` are rejected even when the YAML loader represents them as
   `Date` objects; they MUST NOT normalize to an empty declaration. The exported
   `shapeSchema` and `monitorFrontmatterSchema` enforce the same boundary for
-  direct consumers. Parser and schema regression tests cover both paths.
+  direct consumers. Programmatic inputs retain the historical object boundary:
+  `Date`, `Map`, `Set`, and objects with both callable `then` and `catch` are
+  rejected before normalization. Synchronous `safeParse` returns validation
+  failure for native Promises; asynchronous validation MUST NOT await an invalid
+  input into a valid declaration. Other objects retain their previous admission
+  (including null-prototype mappings, `RegExp`, `WeakMap`, `WeakSet`, and typed
+  arrays); this is not a new plain-object restriction. Parser and schema
+  regression tests cover these boundaries and preserve the mapping controls.
 - **`shape.derive`** is an ordered list of named derived facts. Each entry has a `name` (the marker
   surfaced in the rendered artifact) and a deterministic `when` **CEL boolean predicate** evaluated
   over `(snapshot, now)` — the shaped snapshot plus the runtime-injected `now` (never an ambient

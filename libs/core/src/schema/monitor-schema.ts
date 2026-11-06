@@ -215,16 +215,37 @@ const shapeMappingSchema = z
   });
 
 /**
- * A YAML timestamp is a scalar, even though gray-matter loads it as a Date.
- * Reject it before object parsing can strip it to an empty Shape declaration.
- * Other inputs retain the mapping schema's validation and unknown-key policy.
- * Keep the authored input type as well as the parsed output type unchanged.
+ * Classify raw programmatic inputs independently of the authored TypeScript
+ * type: safeParse accepts unknown values, including native non-declarations.
+ * Other object prototypes remain eligible for ordinary mapping validation.
+ */
+function isNonMappingShapeInput(value: unknown): boolean {
+  return (
+    value instanceof Date ||
+    value instanceof Map ||
+    value instanceof Set ||
+    (typeof value === 'object' &&
+      value !== null &&
+      'then' in value &&
+      typeof value.then === 'function' &&
+      'catch' in value &&
+      typeof value.catch === 'function')
+  );
+}
+
+/**
+ * Preserve the historical Shape object boundary before normalization: Date
+ * (including YAML timestamps), Map, Set, and objects with callable then/catch
+ * are not declarations. Reject promise-like inputs before preprocessing can
+ * await them or object parsing can erase them to an empty declaration.
+ * Other objects retain their existing admission and unknown-key policy; this
+ * is not a plain-object restriction. Authored and parsed types stay unchanged.
  *
  * @see docs/specs/001-monitor-definition.md §5.1
  */
 const shapeSchema = z.preprocess(
   (value: z.input<typeof shapeMappingSchema>, ctx) => {
-    if (value instanceof Date) {
+    if (isNonMappingShapeInput(value)) {
       ctx.addIssue({ code: 'invalid_type', expected: 'object', input: value });
       return z.NEVER;
     }
