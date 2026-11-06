@@ -1,25 +1,61 @@
 set -Eeuo pipefail
 
-# ---------------------------------------------------------------------------
-# Diagnosability (issue #509): the container runs `--rm`, so anything not
-# echoed to *this script's own* stdout/stderr before it exits is gone
-# forever — vitest's error handling on the Node side only has whatever
-# `execFileSync` captured. Previously, install/build phases discarded their
-# output (`>/dev/null`) and the daemon's own log only lived at
-# `/tmp/daemon.log` inside the container, so a failure surfaced in CI as
-# nothing more than "Command failed: docker run ..." (occurrences logged on
-# issue #509, e.g. runs 32650950632, 32654062996, 32760354878). Every heavy
-# step below is now named (`phase "..."`) and its output captured to a log
-# file under `$LOG_DIR`; the `dump_diagnostics` trap prints the failing
-# phase's name, that phase's log tail, and the daemon's log tail to stderr
-# before the script exits, so a failure is root-causable from the CI log
-# alone, without re-running.
-# ---------------------------------------------------------------------------
+# Test-only diagnostics survive --rm and failed outer retrieval: phase commands
+# write logs, while a byte-bounded sampler streams recent phase/daemon evidence.
+# Raw install/build volume must never count against the outer 20 MiB budget.
 
 LOG_DIR=/tmp/logs
 mkdir -p "$LOG_DIR"
 CURRENT_PHASE="startup"
 DAEMON_PID=""
+SAMPLER_PID=""
+# Byte bounds also cover giant single-line compiler/npm diagnostics.
+TAIL_BYTES=8192
+DAEMON_LOG=/tmp/daemon.log
+
+# One sampler for the entire script, independent of phase count/output volume.
+# At most 240 one-second samples of two 8 KiB tails (<4 MiB plus labels) fit
+# comfortably within outer capture. Its horizon exceeds the 210.5s execution
+# allocation; final/ERR tails cover commands finishing between samples. Full
+# files remain available for best-effort retrieval until container removal.
+node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const [dir, daemonLog] = process.argv.slice(1);
+// Read bounded trailing bytes without loading a potentially huge phase file.
+function tail(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const size = fs.fstatSync(fd).size;
+    const bytes = Buffer.alloc(Math.min(size, 8192));
+    fs.readSync(fd, bytes, 0, bytes.length, Math.max(0, size - bytes.length));
+    return bytes.toString("utf8");
+  } catch { return "(no captured log)"; }
+  finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+// One shared sample budget keeps capture bounded across all phase transitions.
+let samples = 0;
+const timer = setInterval(() => {
+  let phase;
+  try { phase = fs.readFileSync(path.join(dir, "current-phase"), "utf8"); }
+  catch { return; }
+  process.stdout.write(`=== recent phase: ${phase} ===\n${tail(path.join(dir, phase + ".log"))}\n--- recent daemon log ---\n${tail(daemonLog)}\n`);
+  if (++samples >= 240) clearInterval(timer);
+}, 1000);
+' "$LOG_DIR" "$DAEMON_LOG" &
+SAMPLER_PID=$!
+
+# Reap only owned diagnostics/daemon processes on ordinary exit. SIGKILL of the
+# container cannot run traps, which is why recent evidence is already streamed.
+cleanup() {
+  if [ -n "$DAEMON_PID" ] && [ "$DAEMON_PID" != "$$" ]; then
+    kill "$DAEMON_PID" 2>/dev/null || true
+  fi
+  kill "$SAMPLER_PID" 2>/dev/null || true
+  wait "$SAMPLER_PID" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 dump_diagnostics() {
   local note="$1"
@@ -29,13 +65,13 @@ dump_diagnostics() {
     local phase_log="$LOG_DIR/$CURRENT_PHASE.log"
     if [ -f "$phase_log" ]; then
       echo "--- tail of $phase_log ---"
-      tail -n 200 "$phase_log"
+      tail -c "$TAIL_BYTES" "$phase_log"
     else
       echo "(no captured log for phase \"$CURRENT_PHASE\" at $phase_log)"
     fi
-    if [ -f /tmp/daemon.log ]; then
+    if [ -f "$DAEMON_LOG" ]; then
       echo "--- tail of /tmp/daemon.log ---"
-      tail -n 200 /tmp/daemon.log
+      tail -c "$TAIL_BYTES" "$DAEMON_LOG"
     fi
     if [ -n "$DAEMON_PID" ]; then
       if kill -0 "$DAEMON_PID" 2>/dev/null; then
@@ -62,13 +98,15 @@ trap 'dump_diagnostics "received SIGTERM"; exit 143' TERM
 
 phase() {
   CURRENT_PHASE="$1"
+  printf %s "$CURRENT_PHASE" >"$LOG_DIR/current-phase"
+  echo "=== phase: $CURRENT_PHASE ==="
 }
 
 # Runs "$@" with combined stdout+stderr captured to the current phase's log
 # file (never discarded) so a failure in this phase is diagnosable.
 run_logged() {
-  echo "=== phase: $CURRENT_PHASE ==="
-  "$@" 2>&1 | tee "$LOG_DIR/$CURRENT_PHASE.log"
+  "$@" >"$LOG_DIR/$CURRENT_PHASE.log" 2>&1
+  tail -c "$TAIL_BYTES" "$LOG_DIR/$CURRENT_PHASE.log"
 }
 
 phase "apt-get-update"
@@ -133,9 +171,8 @@ export AGENTMONITORS_DB=/tmp/agentmon.db
 export AGENTMONITORS_SOCKET=/tmp/agentmon.sock
 
 phase "daemon-start"
-node apps/cli/dist/index.cjs daemon run /tmp/workspace/.claude/monitors --workspace /tmp/workspace --poll-ms 200 >/tmp/daemon.log 2>&1 &
+node apps/cli/dist/index.cjs daemon run /tmp/workspace/.claude/monitors --workspace /tmp/workspace --poll-ms 200 >"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
-trap 'kill "$DAEMON_PID" >/dev/null 2>&1 || true' EXIT
 
 phase "daemon-readiness-wait"
 # The previous fixed 10s budget (100 * 0.1s) lost this race under CI load

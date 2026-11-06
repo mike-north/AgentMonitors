@@ -112,7 +112,7 @@ export function runSmokeContainer(script: string): Promise<ContainerResult> {
             name,
             'bash',
             '-c',
-            'tail -n 200 /tmp/logs/*.log /tmp/daemon.log 2>/dev/null',
+            'for log in /tmp/logs/*.log /tmp/daemon.log; do echo "--- $log ---"; tail -c 8192 "$log" 2>/dev/null; done',
           ],
           {
             encoding: 'utf8',

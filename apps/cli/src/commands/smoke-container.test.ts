@@ -109,7 +109,9 @@ it.each(['deadline', 'output-limit'] as const)(
     const pending = runSmokeContainer('fixture');
     child.stderr.emit(
       'data',
-      Buffer.from('phase build-core: retained diagnostic'),
+      Buffer.from(
+        'phase build-core: retained diagnostic\ndaemon: recent crash evidence',
+      ),
     );
     if (reason === 'output-limit')
       child.stdout.emit('data', Buffer.alloc(21 * 1024 * 1024));
@@ -137,6 +139,9 @@ it.each(['deadline', 'output-limit'] as const)(
       );
       expect(report).toHaveBeenCalledWith(
         expect.stringContaining('phase build-core: retained diagnostic'),
+      );
+      expect(report).toHaveBeenCalledWith(
+        expect.stringContaining('daemon: recent crash evidence'),
       );
       expect(reportAt - started).toBeLessThanOrEqual(270_000);
       expect(reportAt - started).toBe(reason === 'deadline' ? 270_000 : 59_500);

@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Bounded Docker phase diagnostics (004 §2.10) — Refs #509
+
+Separate valid install/build output volume from the outer smoke helper's runaway-output bound.
+Replace full phase streaming with capped periodic byte tails and final tails, preserving recent
+phase/daemon evidence when retrieval fails and force removal destroys files. Add successful 21 MiB,
+ordinary failure and active-termination regressions; retain the existing timeout/cleanup allocation
+and zero-exit overflow guard. This test-fixture contract does not establish repeated-CI reliability.
+
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
 Remove the launcher suite's blanket retry after tracing the failure it masked to a real race: a CLI
