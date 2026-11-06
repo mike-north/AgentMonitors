@@ -180,6 +180,10 @@ The script facility control executes the actual jq programs extracted from the s
 preset templates directly against authored raw-GitHub fixtures. It does not start
 command-poll observations or prove source/preset integration; those unchanged integration
 cases remain in the normal CLI package suite run by `pnpm test` and `pnpm verify`.
+Each negative command-deadline phase selects one actual command invocation; both
+positive canonical reductions still execute. Startup and teardown remain inside the
+unchanged hard driver watchdog, and the owned negative command must be terminal
+before fixture force-cleanup.
 The facility driver's owned boundary covers its Node/jq process group, not production
 observations that deliberately create separate groups. An error-free outermost return
 requires bounded terminal-state confirmation for that known group (including Linux

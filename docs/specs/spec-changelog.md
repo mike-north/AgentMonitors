@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-06 — Isolate the negative filter deadline phase (004 §2.10) — Refs #458
+
+The negative filter driver selects exactly one actual canonical PR-review invocation,
+rather than spending both canonical filters' separate 1,000ms budgets inside one
+4-second driver watchdog. Both positive canonical controls still execute. The fixture
+asserts one owned negative command and terminal state before force-cleanup, and reports
+child output, phase timestamps and elapsed time on failure. No helper/runtime deadline,
+watchdog, retry, positive control or production source changed.
+
 ## 2026-11-06 — Avoid payload writes for no-input jq probes (004 §2.10) — Refs #458
 
 A no-input version probe closes unused stdin without writing an empty payload that
