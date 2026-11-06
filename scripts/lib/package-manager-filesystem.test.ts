@@ -131,12 +131,18 @@ describe.skipIf(process.platform === 'win32').each(['npm', 'pnpm'])(
         const expected = path.join(root, 'physical/bin/node_modules', relative);
         launcher(expected, 'physical');
         launcher(path.join(root, 'bin/node_modules', relative), 'decoy');
-        // Native executables isolate OS PATH lookup from Node's script-argv normalization.
-        symlinkSync(
-          '/usr/bin/printf',
+        // Non-JS shell executables preserve native PATH traversal without the
+        // argv[0] alias restrictions of host multicall utilities such as uutils.
+        writeFileSync(
           path.join(root, 'physical/bin', manager),
+          '#!/bin/sh\nprintf "$@"\n',
+          { mode: 0o755 },
         );
-        symlinkSync('/usr/bin/false', path.join(root, 'bin', manager));
+        writeFileSync(
+          path.join(root, 'bin', manager),
+          '#!/bin/sh\nprintf "%s" "lexical-decoy" >&2\nexit 23\n',
+          { mode: 0o755 },
+        );
         const searchPath =
           selection === 'relative traversal'
             ? 'link/../bin'
@@ -151,6 +157,14 @@ describe.skipIf(process.platform === 'win32').each(['npm', 'pnpm'])(
         );
         expect(native.status, native.stderr).toBe(0);
         expect(native.stdout).toBe('physical-command:literal & spaces');
+        const decoy = spawnSync(
+          path.join(root, 'bin', manager),
+          ['physical-command:%s', 'literal & spaces'],
+          { cwd: root, env, encoding: 'utf8' },
+        );
+        expect(decoy.status, decoy.stderr).toBe(23);
+        expect(decoy.stdout).toBe('');
+        expect(decoy.stderr).toBe('lexical-decoy');
         const result = selectedExecution(root, manager, env);
         expect(result.status, result.stderr).toBe(0);
         expect(JSON.parse(result.stdout)).toEqual({

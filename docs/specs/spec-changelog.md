@@ -9,6 +9,10 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Make physical PATH controls portable across POSIX utilities (004 §2.7) — Refs #520
+
+Physical PATH controls now use owned non-JS shell executables and an explicit failing lexical decoy, preserving native lookup and literal argv assertions without depending on renamed host printf/false utilities.
+
 ## 2026-11-05 — Validate the manager of every physical candidate (004 §2.7) — Refs #520
 
 Official and adjacent installation candidates now apply the same requested-manager predicate as invoking entries and direct PATH targets after physical canonicalization. A symlink to another manager is skipped so a later valid installation can be selected.
