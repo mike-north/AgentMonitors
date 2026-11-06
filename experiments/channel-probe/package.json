@@ -8,6 +8,6 @@
     "start": "node probe.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0"
+    "@modelcontextprotocol/sdk": "^1.32.2"
   }
 }
