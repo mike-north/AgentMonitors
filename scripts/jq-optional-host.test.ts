@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { expect, it } from 'vitest';
+import { ownedWorkerTerminated } from './owned-worker-terminated.mjs';
 import { runJqTestChild } from './run-jq-test-child.mjs';
 
 const root = resolve(import.meta.dirname, '..');
@@ -69,16 +70,7 @@ it('bounds an owned child and cleans up workers that inherit its pipes', async (
   expect(result.status).toBeNull();
   expect(result.stdout.trim()).toMatch(/^\d+$/);
   const workerPid = Number(result.stdout.trim());
-  await expect
-    .poll(() => {
-      try {
-        process.kill(workerPid, 0);
-        return false;
-      } catch (error) {
-        return (
-          error instanceof Error && 'code' in error && error.code === 'ESRCH'
-        );
-      }
-    })
-    .toBe(true);
+  // A killed worker may remain an unreaped Linux zombie under PID 1.
+  // Require termination, not reaping by a process outside this fixture.
+  await expect.poll(() => ownedWorkerTerminated(workerPid)).toBe(true);
 }, 10_000);
