@@ -1,5 +1,8 @@
 /**
- * Run an owned Vitest child with a deadline and cleanup of its worker group.
+ * Run a Vitest child inside an outermost owner's process-group boundary.
+ * Nested helpers inherit that boundary so killing a timeout owner cannot leave
+ * its separately detached descendants alive. Only the outermost owner signals
+ * the group; a nested helper must never signal its own ancestor's group.
  * Node 24 also supports spawnSync with detached private groups at runtime;
  * its synchronous typings omit that option. Async spawn is used here for
  * streaming output and observing exit so surviving workers can be killed
@@ -8,17 +11,29 @@
  */
 import { spawn } from 'node:child_process';
 
+// Private to these test drivers and propagated only to their owned children.
+// The marker grants no independent cleanup ownership to a nested helper.
+const OWNER_BOUNDARY = 'AGENTMONITORS_JQ_TEST_OWNER_BOUNDARY';
+
 /**
  * @param {readonly string[]} args - Node arguments selecting only the intended child suite.
  * @param {{cwd: string, env: NodeJS.ProcessEnv, timeout: number}} options - Isolated host context and child bound.
- * @returns {Promise<{status: number | null, stdout: string, stderr: string, error: Error | undefined}>} Captured evidence, after child/workers have exited.
+ * @returns {Promise<{status: number | null, stdout: string, stderr: string, error: Error | undefined}>} Captured child evidence; outermost completion also establishes subtree cleanup.
  * @internal
  */
 export async function runJqTestChild(args, options) {
+  // Ownership belongs to this helper process, even if the caller supplies a
+  // minimal environment for its next child. Child env cannot revoke the owner.
+  const inheritedBoundary = process.env[OWNER_BOUNDARY] === '1';
+  const ownsGroup = process.platform !== 'win32' && !inheritedBoundary;
   const child = spawn(process.execPath, args, {
     ...options,
+    env: {
+      ...options.env,
+      ...(process.platform !== 'win32' ? { [OWNER_BOUNDARY]: '1' } : {}),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
-    detached: process.platform !== 'win32',
+    detached: ownsGroup,
     killSignal: 'SIGKILL',
   });
   let stdout = '';
@@ -37,7 +52,14 @@ export async function runJqTestChild(args, options) {
   // Kill surviving workers on exit, before waiting for pipe closure: workers
   // can inherit those pipes and otherwise keep a timed-out parent unresolved.
   child.on('exit', () => {
-    if (child.pid && process.platform !== 'win32') {
+    if (inheritedBoundary) {
+      // Descendants may retain these pipes. Release nested readers on direct
+      // child exit so the owner can complete and terminate the shared subtree.
+      // Remaining descendant output is not evidence from this direct child.
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    }
+    if (child.pid && ownsGroup) {
       try {
         process.kill(-child.pid, 'SIGKILL');
       } catch (cause) {
