@@ -34,6 +34,7 @@ import {
 import { heldMonitorIds, withStoreWriter } from './store-writer.js';
 import {
   notifyPolicyKey,
+  storedNotifyPolicyMatches,
   validateCapturedNotifyEnvelope,
   capturedNotifyRoute,
   type PolicyNotifyState,
@@ -2700,6 +2701,29 @@ export class AgentMonitorRuntime {
     return this.watchPolicies.get(key) ?? undefined;
   }
 
+  /**
+   * Admit a watcher operation against the current gate in the same synchronous
+   * turn as its durable work. A definition returned through an await is only a
+   * wake-up hint: reconciliation can close or replace the gate before resumption.
+   * Blocked work sleeps on gate changes/abort, retaining its FIFO chain position.
+   */
+  private async acceptWatchWork<T>(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    signal: AbortSignal,
+    work: (accepted: MonitorDefinition) => T,
+  ): Promise<T | undefined> {
+    const key = JSON.stringify([workspacePath, monitor.id]);
+    for (;;) {
+      await this.waitForWatchPolicy(monitor, workspacePath, signal);
+      const current = this.watchPolicies.get(key);
+      if (signal.aborted) return undefined;
+      if (!current) continue;
+      // No await separates this read from work's synchronous mutation phase.
+      return work(this.applyWatchPolicy(monitor, current));
+    }
+  }
+
   /** Apply reconciled pacing to an already established source/handling snapshot. */
   private async waitForWatchPolicy(
     monitor: MonitorDefinition,
@@ -2711,7 +2735,14 @@ export class AgentMonitorRuntime {
       workspacePath,
       signal,
     );
-    if (!current) return undefined;
+    return current ? this.applyWatchPolicy(monitor, current) : undefined;
+  }
+
+  /** Live pacing changes cannot reload the established execution/handling snapshot. */
+  private applyWatchPolicy(
+    monitor: MonitorDefinition,
+    current: MonitorDefinition,
+  ): MonitorDefinition {
     // Only pacing/urgency follow reconciliation. Execution and handling remain
     // the established source's snapshot until it is explicitly restarted; this
     // boundary does not introduce unrelated live-definition reload behavior.
@@ -2790,7 +2821,8 @@ export class AgentMonitorRuntime {
       }
       const changed =
         held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
-        (notify.policyKey !== undefined && notify.policyKey !== key);
+        (notify.policyKey !== undefined &&
+          !storedNotifyPolicyMatches(notify.policyKey, key));
       if (!changed) return [];
       const drained = held
         .map(hydrateStoredObservationEnvelope)
@@ -3186,7 +3218,7 @@ export class AgentMonitorRuntime {
     // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
     // and are never counted as emitted in the audit history row.  Running it
-    // inside processObservation (after dispatch) was incorrect: the history row
+    // inside event materialization (after dispatch) was incorrect: the history row
     // would say `triggered` even though no event was ever materialized.
     const passedObservations = observations.filter((obs) => {
       const shaped = shapeObservation(obs, now, {
@@ -3320,9 +3352,20 @@ export class AgentMonitorRuntime {
     // `net` recipient (the same-tick span `collapseToNetSpan` used to fold,
     // semantics preserved on the per-recipient side).
     const emittedEventIds: string[] = [];
+    const interpretations: {
+      monitor: MonitorDefinition;
+      event: MonitorEventRecord;
+      diffText: string | null;
+      sessions: string[];
+    }[] = [];
+    // The watcher gate protects this entire synchronous acceptance phase. Do not
+    // yield between dispatch's state write and the span's deterministic writes:
+    // an edit must not drain a suffix while an earlier admission is suspended.
+    // Per-event failure isolation stays ordinary ingestion's existing contract;
+    // only effective-edit drains own an all-or-nothing batch transaction.
     for (const envelope of emitted) {
       try {
-        const event = await this.processObservation({
+        const materialized = this.materializeObservation({
           monitor: envelope.monitor,
           sourceName: envelope.monitor.frontmatter.watch.type,
           observation: envelope.observation,
@@ -3333,7 +3376,14 @@ export class AgentMonitorRuntime {
             ? { restrictToSessionId: options.ephemeralSessionId }
             : {}),
         });
-        if (event) emittedEventIds.push(event.id);
+        if (materialized) {
+          emittedEventIds.push(materialized.event.id);
+          interpretations.push({
+            ...materialized,
+            monitor: envelope.monitor,
+            sessions: [...this.store.projectedSessionIdsForLastEvent()],
+          });
+        }
       } catch (materializeError) {
         try {
           this.store.recordObservationHistory({
@@ -3350,6 +3400,37 @@ export class AgentMonitorRuntime {
           });
         } catch {
           // best-effort audit — ignore write failures
+        }
+      }
+    }
+    // Every event/projection/snapshot is committed before optional async work.
+    // Capture recipients per event rather than reading another event's last set.
+    for (const item of interpretations) {
+      if (
+        item.monitor.frontmatter.payload?.form !== 'prose' ||
+        !this.interpretAdapter
+      )
+        continue;
+      try {
+        await this.runInterpret(
+          item.monitor,
+          item.event,
+          item.diffText,
+          item.sessions,
+        );
+      } catch (error) {
+        try {
+          this.store.recordObservationHistory({
+            monitorId: monitor.id,
+            workspacePath: options.workspacePath,
+            sourceName: monitor.frontmatter.watch.type,
+            result: 'errored',
+            observationData: {
+              error: error instanceof Error ? error.message : String(error),
+            },
+          });
+        } catch {
+          // A diagnostic failure cannot undo already committed accepted work.
         }
       }
     }
@@ -3442,7 +3523,13 @@ export class AgentMonitorRuntime {
       }
       if (!source.watch) continue;
       const errorStart = startup.erroredObservations.length;
+      const emittedStart = startup.emittedEventIds.length;
       await this.prepareNotifyPolicy(monitor, source, workspacePath, startup);
+      // Startup may never receive a yield or tick. Publish committed projections
+      // to the workspace's hook files even for an idle or completed source.
+      if (startup.emittedEventIds.length > emittedStart) {
+        this.refreshWorkspaceSessions(workspacePath);
+      }
       for (const error of startup.erroredObservations.slice(errorStart)) {
         options.onError?.(error.monitorId, new Error(error.message));
       }
@@ -3544,9 +3631,9 @@ export class AgentMonitorRuntime {
         return Promise.resolve();
       }
       return enqueue(async () => {
-        if (await this.waitForWatchPolicy(monitor, workspacePath, signal)) {
-          await this.writeCheckpoint(monitor.id, workspacePath, nextState);
-        }
+        await this.acceptWatchWork(monitor, workspacePath, signal, () =>
+          this.writeCheckpoint(monitor.id, workspacePath, nextState),
+        );
       });
     };
 
@@ -3600,15 +3687,15 @@ export class AgentMonitorRuntime {
         // G14 ordering (002 §2.4) holds against out-of-band checkpoint calls.
         try {
           await enqueue(async () => {
-            const accepted = await this.waitForWatchPolicy(
+            await this.acceptWatchWork(
               monitor,
               workspacePath,
               signal,
+              (accepted) =>
+                this.ingest(accepted, [observation], new Date(), {
+                  workspacePath,
+                }),
             );
-            if (!accepted) return;
-            await this.ingest(accepted, [observation], new Date(), {
-              workspacePath,
-            });
           });
           this.refreshWorkspaceSessions(workspacePath);
         } catch (ingestError) {
@@ -4007,23 +4094,6 @@ export class AgentMonitorRuntime {
       delete nextState.pendingRollup;
     }
     return { emitted: [], nextState };
-  }
-
-  private async processObservation(input: ProcessObservationInput) {
-    const materialized = this.materializeObservation(input);
-    if (!materialized) return null;
-
-    const { event, diffText } = materialized;
-    // Interpret runs only after the deterministic event, every recipient
-    // projection/cursor seed, and the snapshot have committed atomically.
-    if (
-      input.monitor.frontmatter.payload?.form === 'prose' &&
-      this.interpretAdapter
-    ) {
-      await this.runInterpret(input.monitor, event, diffText);
-    }
-
-    return event;
   }
 
   /** Commit the deterministic materialization boundary before optional Interpret. */

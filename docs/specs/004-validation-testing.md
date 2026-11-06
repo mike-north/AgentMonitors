@@ -72,6 +72,15 @@ same-strategy/default changes, unchanged-policy clocks, captured old/new semanti
 materialized rows. Edits reconcile before source-due/active-watcher skips without new source input.
 Invalid/missing definitions retain holds and report the reason. A blocked watcher retains its yield
 and backpressures further input/checkpoints until reconciliation succeeds.
+`runtime/notify-boundaries.test.ts` MUST exercise actual watcher-chain microtask interleavings:
+queue checkpoint/yield while admission is open, then fail the real SQLite edit drain before the
+mutation. Original holds and cursor remain unchanged, without an event prefix; recovery drains
+captured old work before the retained operation, while cancellation writes nothing. Cover a newer
+successful policy without reloading handling, and prove an accepted span's deterministic writes
+complete before Interpret can close its gate. Immediate/throttle escalation grants participate in
+policy identity; equivalent policies and prior private-key encodings retain unchanged clocks. Restart/startup drains with idle or completed
+sources MUST update actual lead hook files without tick/new observations, preserving workspace and
+session isolation and publishing no unread state before transaction commit.
 
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,

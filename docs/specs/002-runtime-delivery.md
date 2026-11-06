@@ -1113,7 +1113,8 @@ Equivalent duration spellings and explicit/default UTC are unchanged policies. A
 alone does not change pacing. The effective policy is compared over absent salience and all three
 salience levels, so an urgency band edit only changes pacing when the resolved notify behavior
 changes. A scalar urgency edit with unchanged explicit debounce retains its clock; a band edit
-that changes the grant to flush a held batch early is an effective pacing change.
+that changes the grant to flush a held batch early is an effective pacing change. This includes
+observations resolving to immediate or throttle: escalation is tested before either branch.
 
 On a changed policy, the runtime **MUST** flush **all** existing debounce/rollup holds before
 observing new work under the edited policy. This covers debounce → immediate/throttle/rollup,
@@ -1130,7 +1131,9 @@ Old holds retain their order; mixed legacy hold arrays use stable observation-ti
 array order and then debounce-before-rollup as ties. Retired throttle suppression and rollup
 minute guards **MUST** be cleared when adopting a changed policy; they cannot suppress accepted
 old work or the new policy's first observation. Private persisted policy identity permits guard
-reset across restarts; it is not an authoring field.
+reset across restarts; it is not an authoring field. Changes to that private encoding alone must
+not flush unchanged captured work or reset its clocks; complete captured definitions still detect
+real effective edits when older metadata omitted an escalation bit.
 
 **Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
 reread current held state under that writer boundary, and commit the entire old batch's events,
@@ -1147,9 +1150,16 @@ retains holds even if diagnostic persistence fails, and defers only that monitor
 and source-baseline advancement. Healthy siblings and other workspace scopes continue. Restart or
 another edit retries from durable captured state. Watcher acceptance/checkpointing is backpressured
 while blocked: the consumer retains its current unaccepted yield and does not request another.
+Admission **MUST** re-read the current gate in the same synchronous turn as the durable mutation;
+a definition captured before an `await` cannot authorize a later write. A queued checkpoint/yield
+whose gate closes before its mutation waits for recovery or cancellation. The admitted span's
+deterministic writes finish before optional async Interpret can interleave another edit. This does
+not add ordinary ingest/flush batch rollback or retry guarantees.
 Reconciliation can resume it without reloading the live source. Its reconciled pacing and
 urgency band govern future yields; its established execution/handling snapshot remains until an
-explicit restart. This rule does not introduce unrelated live-definition reload behavior.
+explicit restart. Successful startup drains **MUST** refresh the affected workspace's session
+hook state after commit, even if the source never yields and no tick follows; failed transactions
+must not publish an unread prefix. This rule does not introduce unrelated live-definition reload behavior.
 
 An invalid/unreadable/missing current definition **MUST** retain its operational holds and report
 the blocking reason. Current source-scope validation at this boundary protects existing holds;
@@ -1162,7 +1172,9 @@ selects daily rollup and instructions Y. Reconciliation commits A immediately wi
 its original 08:00 timestamp, before any new source observation. New B uses Y and waits for rollup's
 09:00 window. If A's write fails, A remains held and B is not newly observed until the drain succeeds.
 
-**Verification:** `runtime/notify-policy-edit.test.ts` covers the transition/default/parameter
+**Verification:** `runtime/notify-boundaries.test.ts` covers immediate/throttle escalation identity,
+real watcher checkpoint/yield microtask races, synchronous acceptance before Interpret, and actual
+hook-file refresh after idle/completed startup drains. `runtime/notify-policy-edit.test.ts` covers the transition/default/parameter
 matrix, captured fields, unchanged clocks, missing/invalid definitions, SQLite trigger failures
 (including a later batch event and hold removal), sibling/workspace isolation, watcher backpressure,
 post-commit Interpret, actual owned-child SIGKILL before/after commit and independent-process stale

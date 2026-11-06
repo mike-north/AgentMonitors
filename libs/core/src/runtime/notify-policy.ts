@@ -39,7 +39,8 @@ export function notifyPolicyKey(monitor: {
         monitor.frontmatter.notify,
       );
       if (!policy) {
-        return ['immediate'];
+        // The dispatcher grants escalation before its immediate/throttle branches too.
+        return ['immediate', Math.max(lo, Math.min(hi, rank)) > lo];
       }
       switch (policy.strategy) {
         case 'debounce':
@@ -51,7 +52,11 @@ export function notifyPolicyKey(monitor: {
             Math.max(lo, Math.min(hi, rank)) > lo,
           ];
         case 'throttle':
-          return ['throttle', parseDuration(policy['suppress-for'])];
+          return [
+            'throttle',
+            parseDuration(policy['suppress-for']),
+            Math.max(lo, Math.min(hi, rank)) > lo,
+          ];
         case 'rollup':
           return [
             'rollup',
@@ -61,6 +66,52 @@ export function notifyPolicyKey(monitor: {
       }
     }),
   );
+}
+
+/** Private key entries carry only deterministic pacing primitives. */
+const policyKeyEntriesSchema = z.array(
+  z.array(z.union([z.string(), z.number(), z.boolean()])),
+);
+
+/**
+ * Preserve clocks when reading the older private encoding, which omitted the
+ * immediate/throttle escalation bit. Captured held definitions are compared
+ * independently with complete keys, so compatibility cannot hide a real edit's
+ * effect on accepted work. With no debounce hold, this grant has no batch to
+ * flush and must not reset an otherwise unchanged suppression clock.
+ * @internal
+ */
+export function storedNotifyPolicyMatches(
+  stored: string,
+  current: string,
+): boolean {
+  if (stored === current) return true;
+  try {
+    const previous = policyKeyEntriesSchema.parse(JSON.parse(stored));
+    const next = policyKeyEntriesSchema.parse(JSON.parse(current));
+    return (
+      previous.length === next.length &&
+      previous.every((entry, index) => {
+        const candidate = next[index];
+        if (!candidate) return false;
+        const legacyLength =
+          entry[0] === 'immediate'
+            ? 1
+            : entry[0] === 'throttle'
+              ? 2
+              : undefined;
+        // Ignore only a bit absent from the older representation, never an
+        // explicitly recorded grant or a change to another pacing parameter.
+        const comparable =
+          legacyLength !== undefined && entry.length === legacyLength
+            ? candidate.slice(0, legacyLength)
+            : candidate;
+        return JSON.stringify(entry) === JSON.stringify(comparable);
+      })
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Only the persisted semantics needed for a truthful edit drain are required. */
