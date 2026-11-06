@@ -1161,6 +1161,28 @@ explicit restart. Successful startup drains **MUST** refresh the affected worksp
 hook state after commit, even if the source never yields and no tick follows; failed transactions
 must not publish an unread prefix. This rule does not introduce unrelated live-definition reload behavior.
 
+Polling shares this boundary: concurrent rescans may reconcile a monitor while its `observe()` is
+in flight. The runtime **MUST** recheck current admission before the returned result's deterministic
+writes, applying current pacing with the established execution/handling snapshot. Only one source
+observation may be in flight or awaiting admission per monitor/workspace. If reconciliation is
+blocked, retain that returned result locally and finish the tick with an explainable error, so the
+daemon can run a later recovery scan. A successful rescan drains the old captured holds and admits
+the retained result before another observation or watcher factory can overtake its source baseline.
+This local retention is not a durable recovery queue: before admission, the persisted source cursor
+remains unchanged, so restart reobserves from that cursor under the existing source contract.
+
+Watcher factory creation **MUST** reread the gate and cancellation in its synchronous creation
+turn. Its full initial definition is the latest admitted definition at actual creation; subsequent
+pacing changes preserve that established execution/handling snapshot. Outstanding polls precede
+factory creation, including a startup overlapping polling without a failed edit.
+
+Cached notify definitions **MUST** belong only to live watcher/poll admissions or locally retained
+results. Poll completion and watcher teardown release their ownership; cancellation/session close/
+dormancy also retire unadmitted ephemeral results. Reaping cannot resurrect their timing/baselines
+or keep private instruction snapshots as historical cache entries. Cleanup of this process-local
+metadata does not delete durable holds, event history or diagnostics. Missing/invalid definitions
+with operational work retain that work until valid reconciliation or its existing lifetime rules.
+
 An invalid/unreadable/missing current definition **MUST** retain its operational holds and report
 the blocking reason. Current source-scope validation at this boundary protects existing holds;
 it does not introduce general observe-time preflight for monitors without held work. There is no

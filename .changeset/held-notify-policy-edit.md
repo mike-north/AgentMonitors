@@ -11,3 +11,8 @@ that monitor's new observation until reconciliation succeeds.
 Escalation grants participate in effective policy edits even for immediate/throttle observations.
 Queued watcher checkpoints and yields recheck admission at their durable writes; failed drains
 keep them backpressured. Startup drains refresh session hook state even when the source stays idle.
+
+Concurrent polling rechecks admission after observation and retains blocked results locally so a
+later tick can recover without advancing the old cursor. Watcher creation uses the latest admitted
+initial definition, and policy snapshots retire with their live admission instead of accumulating
+retired monitor instructions.

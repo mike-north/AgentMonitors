@@ -7,7 +7,11 @@ import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
-import type { Observation, ObservationSource } from '../observation/types.js';
+import type {
+  Observation,
+  ObservationSource,
+  ObservationResult,
+} from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type { AgentRuntimeAdapter } from '../adapter/types.js';
@@ -555,6 +559,16 @@ interface TickAccumulator {
   skippedMonitors: { monitorId: string; nextDueAt: Date }[];
 }
 
+/** One live poll's captured execution, returned-but-unadmitted work, and declaration lifetime. */
+interface PollAdmission {
+  readonly monitor: MonitorDefinition;
+  readonly now: Date;
+  readonly workspacePath: string;
+  readonly ephemeralSessionId?: string;
+  result?: ObservationResult;
+  retired?: boolean;
+}
+
 /**
  * The pure decision a delivery makes (issue #300): the rendered {@link
  * DeliveryClaim} plus the candidate rows a commit must mark claimed. Produced by
@@ -649,6 +663,7 @@ export class AgentMonitorRuntime {
   }
 
   closeSession(sessionId: string): AgentSessionRecord {
+    const ephemerals = this.store.listEphemeralMonitorsForSession(sessionId);
     const session = this.store.closeSession(sessionId);
     // Reap the session's ephemeral monitors (007 §4.4): a session that ends or
     // goes dormant MUST release its session-scoped watches immediately — they
@@ -657,6 +672,7 @@ export class AgentMonitorRuntime {
     // (the session record goes dormant, not deleted) so a late delivery is never
     // silently dropped (007 §4.4 default retention, PP1).
     this.store.reapEphemeralMonitorsForSession(sessionId);
+    for (const record of ephemerals) this.retirePollAdmission(record.id);
     this.refreshHookState(session.id);
     return session;
   }
@@ -807,6 +823,7 @@ export class AgentMonitorRuntime {
       );
     }
     this.store.reapEphemeralMonitor(ephemeralId);
+    this.retirePollAdmission(ephemeralId);
     return this.store.getEphemeralMonitorById(ephemeralId);
   }
 
@@ -2648,6 +2665,47 @@ export class AgentMonitorRuntime {
    * definition is blocked; the current yield remains on the consumer's stack.
    */
   private readonly watchPolicies = new Map<string, MonitorDefinition | null>();
+  /** Only live watcher/poll admissions own cached definitions; durable holds live in SQLite. */
+  private readonly notifyPolicyUsers = new Map<string, number>();
+  /** In-flight or blocked poll results retain their execution snapshot until admitted or retired. */
+  private readonly pollAdmissions = new Map<string, PollAdmission>();
+
+  /** Cache ownership spans async work, never the lifetime of a retired declaration. */
+  private retainNotifyPolicy(id: string, workspacePath: string): void {
+    const key = JSON.stringify([workspacePath, id]);
+    this.notifyPolicyUsers.set(key, (this.notifyPolicyUsers.get(key) ?? 0) + 1);
+    if (!this.watchPolicies.has(key)) this.watchPolicies.set(key, null);
+  }
+
+  /** Release only process-local admission metadata; accepted durable work is never deleted here. */
+  private releaseNotifyPolicy(id: string, workspacePath: string): void {
+    const key = JSON.stringify([workspacePath, id]);
+    const remaining = (this.notifyPolicyUsers.get(key) ?? 1) - 1;
+    if (remaining > 0) this.notifyPolicyUsers.set(key, remaining);
+    else {
+      this.notifyPolicyUsers.delete(key);
+      this.watchPolicies.delete(key);
+    }
+  }
+
+  /** A reaped declaration cannot admit late source results or retain deferred instruction snapshots. */
+  private retirePollAdmission(id: string): void {
+    for (const [key, admission] of this.pollAdmissions) {
+      if (admission.monitor.id !== id) continue;
+      admission.retired = true;
+      if (admission.result) {
+        this.pollAdmissions.delete(key);
+        this.releaseNotifyPolicy(id, admission.workspacePath);
+        this.wakeNotifyPolicy(key);
+      }
+    }
+  }
+
+  /** Poll completion and reconciliation both unblock source admission without polling. */
+  private wakeNotifyPolicy(key: string): void {
+    for (const wake of this.watchPolicyWaiters.get(key) ?? []) wake();
+  }
+
   /** Waiting source acceptance/checkpoints wake on reconciliation or teardown. */
   private readonly watchPolicyWaiters = new Map<string, Set<() => void>>();
 
@@ -2658,10 +2716,9 @@ export class AgentMonitorRuntime {
     definition: MonitorDefinition | null,
   ): void {
     const key = JSON.stringify([workspacePath, id]);
+    if (!this.notifyPolicyUsers.has(key)) return;
     this.watchPolicies.set(key, definition);
-    for (const wake of this.watchPolicyWaiters.get(key) ?? []) {
-      wake();
-    }
+    this.wakeNotifyPolicy(key);
   }
 
   /**
@@ -2678,7 +2735,10 @@ export class AgentMonitorRuntime {
     if (!this.watchPolicies.has(key)) {
       throw new Error('Watcher notify acceptance was not initialized.');
     }
-    while (!signal.aborted && this.watchPolicies.get(key) === null) {
+    while (
+      !signal.aborted &&
+      (this.watchPolicies.get(key) === null || this.pollAdmissions.has(key))
+    ) {
       await new Promise<void>((resolve) => {
         const waiters =
           this.watchPolicyWaiters.get(key) ?? new Set<() => void>();
@@ -2718,9 +2778,10 @@ export class AgentMonitorRuntime {
       await this.waitForWatchPolicy(monitor, workspacePath, signal);
       const current = this.watchPolicies.get(key);
       if (signal.aborted) return undefined;
-      if (!current) continue;
-      // No await separates this read from work's synchronous mutation phase.
-      return work(this.applyWatchPolicy(monitor, current));
+      if (!current || this.pollAdmissions.has(key)) continue;
+      // Factory callers use this entire definition as their initial snapshot;
+      // established sources merge only pacing into their pinned snapshot.
+      return work(current);
     }
   }
 
@@ -2898,7 +2959,49 @@ export class AgentMonitorRuntime {
         ephemeralSessionId,
       );
       acc.emittedEventIds.push(...drained.map((item) => item.event.id));
+      // Wake-ups resume only after this synchronous turn. Publish before
+      // invoking ingestion so a reentrant Interpret edit cannot be overwritten
+      // by this older preparation after the retained span's writes finish.
       this.setWatchPolicy(monitor.id, workspacePath, monitor);
+      const key = JSON.stringify([workspacePath, monitor.id]);
+      const pending = this.pollAdmissions.get(key);
+      let resumed: Promise<string[]> | undefined;
+      if (pending?.result) {
+        this.pollAdmissions.delete(key);
+        // Invocation performs the deterministic writes synchronously, before
+        // any woken watcher can resume or optional Interpret can yield.
+        resumed = this.ingest(
+          this.applyWatchPolicy(pending.monitor, monitor),
+          pending.result.observations,
+          pending.now,
+          {
+            workspacePath,
+            ...(pending.result.nextState !== undefined
+              ? { nextSourceState: { value: pending.result.nextState } }
+              : {}),
+            ...(pending.result.outcome
+              ? { sourceOutcome: pending.result.outcome }
+              : {}),
+            ...(pending.ephemeralSessionId !== undefined
+              ? { ephemeralSessionId: pending.ephemeralSessionId }
+              : {}),
+          },
+        );
+        this.releaseNotifyPolicy(monitor.id, workspacePath);
+      }
+      if (resumed) {
+        try {
+          acc.emittedEventIds.push(...(await resumed));
+        } catch (error) {
+          this.reportNotifyEditFailure(
+            monitor.id,
+            workspacePath,
+            sourceName,
+            `Deferred observation failed after notify reconciliation committed: ${error instanceof Error ? error.message : String(error)}`,
+            acc,
+          );
+        }
+      }
       for (const item of drained) {
         if (
           item.monitor.frontmatter.payload?.form === 'prose' &&
@@ -2952,6 +3055,32 @@ export class AgentMonitorRuntime {
     acc: TickAccumulator,
     ephemeralSessionId?: string,
   ): Promise<void> {
+    this.retainNotifyPolicy(monitor.id, workspacePath);
+    try {
+      await this.evaluateOwnedMonitorOnTick(
+        monitor,
+        source,
+        now,
+        workspacePath,
+        acc,
+        ephemeralSessionId,
+      );
+    } finally {
+      this.releaseNotifyPolicy(monitor.id, workspacePath);
+    }
+  }
+
+  /** Evaluate one leased scope; concurrent rescans may reconcile it while observe is in flight. */
+  private async evaluateOwnedMonitorOnTick(
+    monitor: MonitorDefinition,
+    source: ObservationSource,
+    now: Date,
+    workspacePath: string,
+    acc: TickAccumulator,
+    ephemeralSessionId?: string,
+  ): Promise<void> {
+    const key = JSON.stringify([workspacePath, monitor.id]);
+    const resuming = this.pollAdmissions.get(key)?.result !== undefined;
     const sourceName = monitor.frontmatter.watch.type;
     if (
       !(await this.prepareNotifyPolicy(
@@ -2964,6 +3093,11 @@ export class AgentMonitorRuntime {
     ) {
       return;
     }
+
+    // Preparation can await Interpret while another rescan closes/replaces the gate.
+    const current = this.watchPolicies.get(key);
+    if (!current || resuming || this.pollAdmissions.has(key)) return;
+    monitor = this.applyWatchPolicy(monitor, current);
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
@@ -3093,6 +3227,13 @@ export class AgentMonitorRuntime {
     // Skipping ingest() means setMonitorState() is never called, which is
     // what preserves the previously-persisted sourceState so the next tick's
     // diff spans from the last good baseline rather than an empty state.
+    const admission: PollAdmission = {
+      monitor,
+      now,
+      workspacePath,
+      ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+    };
+    this.pollAdmissions.set(key, admission);
     let observationResult;
     try {
       const monitorState = this.store.getMonitorState(
@@ -3108,6 +3249,8 @@ export class AgentMonitorRuntime {
         },
       );
     } catch (observeError) {
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
       // observe() failed: record errored outcome (best-effort) and skip
       // this monitor entirely for this tick. ingest() is NOT called, which
       // preserves sourceState as described above.
@@ -3135,14 +3278,41 @@ export class AgentMonitorRuntime {
       return;
     }
 
+    if (admission.retired) {
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
+      return;
+    }
+
+    // A returned result is retained in process memory until a later public
+    // rescan admits it. Returning this tick keeps the daemon free to recover the
+    // failed edit; no new source call or baseline can overtake the retained result.
+    const latest = this.watchPolicies.get(key);
+    if (!latest) {
+      admission.result = observationResult;
+      this.retainNotifyPolicy(monitor.id, workspacePath);
+      this.reportNotifyEditFailure(
+        monitor.id,
+        workspacePath,
+        sourceName,
+        'Notify admission blocked; returned observation retained until reconciliation succeeds.',
+        acc,
+      );
+      return;
+    }
+    monitor = this.applyWatchPolicy(monitor, latest);
+
     // Block 2 — ingest(): ingest() now isolates per-observation materialization
     // failures internally (see ingest()), so it should not normally throw.
     // This outer catch is a defence-in-depth safety net: if ingest() itself
     // throws (e.g. setMonitorState fails), record errored best-effort and
     // continue so the tick is not aborted.
     try {
-      acc.emittedEventIds.push(
-        ...(await this.ingest(monitor, observationResult.observations, now, {
+      const ingestion = this.ingest(
+        monitor,
+        observationResult.observations,
+        now,
+        {
           workspacePath,
           ...(observationResult.nextState !== undefined
             ? { nextSourceState: { value: observationResult.nextState } }
@@ -3151,9 +3321,14 @@ export class AgentMonitorRuntime {
             ? { sourceOutcome: observationResult.outcome }
             : {}),
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
-        })),
+        },
       );
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
+      acc.emittedEventIds.push(...(await ingestion));
     } catch (ingestError) {
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
       const message =
         ingestError instanceof Error
           ? ingestError.message
@@ -3522,40 +3697,48 @@ export class AgentMonitorRuntime {
         );
       }
       if (!source.watch) continue;
-      const errorStart = startup.erroredObservations.length;
-      const emittedStart = startup.emittedEventIds.length;
-      await this.prepareNotifyPolicy(monitor, source, workspacePath, startup);
-      // Startup may never receive a yield or tick. Publish committed projections
-      // to the workspace's hook files even for an idle or completed source.
-      if (startup.emittedEventIds.length > emittedStart) {
-        this.refreshWorkspaceSessions(workspacePath);
-      }
-      for (const error of startup.erroredObservations.slice(errorStart)) {
-        options.onError?.(error.monitorId, new Error(error.message));
-      }
-      if (this.activeWatchers.has(JSON.stringify([workspacePath, monitor.id])))
-        continue;
-
+      const key = JSON.stringify([workspacePath, monitor.id]);
+      const existing = this.activeWatchers.has(key);
       const controller = new AbortController();
-      controllers.set(monitor.id, controller);
-      // Identity token for THIS watcher: `consumeWatch` releases the slot only
-      // while its own token is still current, and a superseded watcher's
-      // straggling checkpoint is rejected on token mismatch (002 §2.4).
       const watcherToken = Symbol(monitor.id);
-      this.activeWatchers.set(
-        JSON.stringify([workspacePath, monitor.id]),
-        watcherToken,
-      );
+      if (!existing) {
+        controllers.set(monitor.id, controller);
+        this.activeWatchers.set(key, watcherToken);
+        this.retainNotifyPolicy(monitor.id, workspacePath);
+      }
+      try {
+        const errorStart = startup.erroredObservations.length;
+        const emittedStart = startup.emittedEventIds.length;
+        await this.prepareNotifyPolicy(monitor, source, workspacePath, startup);
+        // Startup may never receive a yield or tick. Publish committed projections
+        // to the workspace's hook files even for an idle or completed source.
+        if (startup.emittedEventIds.length > emittedStart) {
+          this.refreshWorkspaceSessions(workspacePath);
+        }
+        for (const error of startup.erroredObservations.slice(errorStart)) {
+          options.onError?.(error.monitorId, new Error(error.message));
+        }
+        if (existing) continue;
 
-      tasks.push(
-        this.consumeWatch(
-          monitor,
-          workspacePath,
-          controller.signal,
-          watcherToken,
-          options.onError,
-        ),
-      );
+        tasks.push(
+          this.consumeWatch(
+            monitor,
+            workspacePath,
+            controller.signal,
+            watcherToken,
+            options.onError,
+          ),
+        );
+      } catch (error) {
+        if (!existing) {
+          controller.abort();
+          controllers.delete(monitor.id);
+          if (this.activeWatchers.get(key) === watcherToken)
+            this.activeWatchers.delete(key);
+          this.releaseNotifyPolicy(monitor.id, workspacePath);
+        }
+        throw error;
+      }
     }
 
     const monitorIds = [...controllers.keys()];
@@ -3649,31 +3832,33 @@ export class AgentMonitorRuntime {
       // No source factory or checkpoint exists until durable reconciliation
       // permits admission. A corrected blocked declaration becomes the initial
       // execution snapshot; later edits can change only its pacing/urgency.
-      const admitted = await this.waitForWatchDefinition(
-        monitor.id,
+      const iterable = await this.acceptWatchWork(
+        monitor,
         workspacePath,
         signal,
+        (admitted) => {
+          monitor = admitted;
+          const source = this.registry.get(monitor.frontmatter.watch.type);
+          if (!source?.watch) {
+            throw new Error(
+              `Monitor "${monitor.id}" has no available watch source after reconciliation.`,
+            );
+          }
+          const watch = source.watch.bind(source);
+          const monitorState = this.store.getMonitorState(
+            monitor.id,
+            workspacePath,
+          );
+          return watch(watchConfig(monitor.frontmatter.watch), {
+            previousState: monitorState.sourceState,
+            now: new Date(),
+            workspacePath,
+            signal,
+            checkpoint,
+          });
+        },
       );
-      if (!admitted) return;
-      monitor = admitted;
-      const source = this.registry.get(monitor.frontmatter.watch.type);
-      if (!source?.watch) {
-        throw new Error(
-          `Monitor "${monitor.id}" has no available watch source after reconciliation.`,
-        );
-      }
-      const watch = source.watch.bind(source);
-      const monitorState = this.store.getMonitorState(
-        monitor.id,
-        workspacePath,
-      );
-      const iterable = watch(watchConfig(monitor.frontmatter.watch), {
-        previousState: monitorState.sourceState,
-        now: new Date(),
-        workspacePath,
-        signal,
-        checkpoint,
-      });
+      if (!iterable) return;
       for await (const observation of iterable) {
         if (signal.aborted) break;
         // Per-observation isolation (issue #46): an ingest() failure on one
@@ -3692,9 +3877,14 @@ export class AgentMonitorRuntime {
               workspacePath,
               signal,
               (accepted) =>
-                this.ingest(accepted, [observation], new Date(), {
-                  workspacePath,
-                }),
+                this.ingest(
+                  this.applyWatchPolicy(monitor, accepted),
+                  [observation],
+                  new Date(),
+                  {
+                    workspacePath,
+                  },
+                ),
             );
           });
           this.refreshWorkspaceSessions(workspacePath);
@@ -3760,6 +3950,7 @@ export class AgentMonitorRuntime {
         settled = chain;
         await settled;
       }
+      this.releaseNotifyPolicy(monitor.id, workspacePath);
     }
   }
 

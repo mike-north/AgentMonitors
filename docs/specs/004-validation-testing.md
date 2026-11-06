@@ -82,6 +82,15 @@ policy identity; equivalent policies and prior private-key encodings retain unch
 sources MUST update actual lead hook files without tick/new observations, preserving workspace and
 session isolation and publishing no unread state before transaction commit.
 
+`runtime/notify-admission-lifetime.test.ts` MUST use concurrent public ticks and actual controlled
+source effects to fail an edit while `observe()` awaits. The completed observation must neither
+advance durable state while blocked nor prevent the tick returning for recovery; retry/startup
+admits it in order using current pacing and captured handling. Cover restart from the unchanged
+cursor, healthy sibling/workspace isolation and startup overlapping a valid poll. At the actual
+factory boundary, exercise a gate closing, cancellation and replacement with a newer initial
+definition. Repeated declare/tick/cancel, close and dormancy cycles must release cached definitions
+without deleting accepted history; live blocked watcher/poll waiters and teardown remain functional.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart
