@@ -40,7 +40,7 @@
     "gray-matter": "^4.0.3",
     "jq-in-the-browser": "0.7.2",
     "ulid": "^2.3.0",
-    "zod": "^3.25.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
