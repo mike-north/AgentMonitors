@@ -628,6 +628,17 @@ an overdue debounce batch untouched; changing it to `value: fixed` allows the ne
 due tick to observe using the retained baseline and flush the captured batch.
 Healthy sibling monitors **MUST** continue progressing.
 
+Validation **MUST NOT** mutate the plugin's JSON Schema. The shared helper uses a
+private copy because validator setup may annotate schema nodes. Frozen valid schemas remain valid and
+must not prevent observation or watcher startup. A schema setup/evaluation exception
+(such as a malformed regular expression) **MUST** fail closed for that monitor with
+`Source schema validation failed: <cause>` through the existing joined validation
+diagnostics: tick `skippedMonitors`, watcher startup `onError`/stderr, and definition
+validation in explain/doctor/validate. It must not execute the affected source,
+consume its baseline/cursor/held notify work, or abort healthy siblings, final
+suppression cleanup, or hook-state refresh. Correcting the schema permits normal
+preflight and recovery; ordinary scope rejections retain their existing messages.
+
 Dormant verify-session cleanup runs before observation preflight. It **MUST**
 preserve safely derivable runtime cadence when sizing scratch-event suppression,
 independently of unrelated source-schema rejection. Authored parseable intervals

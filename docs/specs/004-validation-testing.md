@@ -36,6 +36,18 @@ When parse-time validation sees the old top-level `source:` + `scope:` shape, `v
 
 The validator is `@cfworker/json-schema`, which walks the schema at runtime rather than compiling with the `Function` constructor, so validation is safe under restrictive CSP / Workers-style environments.
 
+The shared helper validates a private schema copy and does not annotate plugin-owned
+schema objects. A frozen valid schema must still validate normally. Setup/evaluation
+exceptions are nonempty `Source schema validation failed: <cause>` diagnostics,
+not successful validation and not a reason to abort the whole monitor set. Existing
+scope mismatch and collection/timezone messages remain unchanged. Tests must cover
+malformed patterns, deep-frozen valid schemas, ordinary valid/invalid scopes, and
+schema immutability, using real registered-source/SQLite tick and watcher-startup
+boundaries. Assert healthy sibling effects, per-monitor diagnostics, retained
+baseline/cursor/overdue notify work, and repair/restart recovery. Tick failures must
+not strand suppression cleanup or hook refresh. Covered by
+`schema/validate-scope.test.ts` and `runtime/validation-exceptions.test.ts` in core.
+
 > **Target extension (not yet implemented).** Validation of `shape` predicate determinism and
 > `payload.form` / `payload.transform` / `payload.encoding` is a **_target_** obligation for the
 > `validate` surface. When implemented, `validate` will additionally reject: a `shape.derive.when`
