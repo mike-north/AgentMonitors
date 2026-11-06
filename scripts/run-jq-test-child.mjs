@@ -1,6 +1,9 @@
 /**
  * Run an owned Vitest child with a deadline and cleanup of its worker group.
- * Async spawn supports private process groups; synchronous spawn does not.
+ * Node 24 also supports spawnSync with detached private groups at runtime;
+ * its synchronous typings omit that option. Async spawn is used here for
+ * streaming output and observing exit so surviving workers can be killed
+ * before their inherited pipes prevent closure.
  * The caller's deadline must exceed this child's bound so cleanup can finish.
  */
 import { spawn } from 'node:child_process';
