@@ -21,10 +21,12 @@ function isEntry(candidate, manager) {
 }
 
 /**
- * Return a Node-executable launcher, or undefined when no supported installation
- * is present. Prefer the invoking manager, then Node's official layout, then
- * PATH symlinks and npm/Corepack-style adjacent installations. Never interpret
- * shell wrapper contents or substitute another manager for the requested one.
+ * Return an absolute Node-executable launcher, or undefined when no supported
+ * installation is present. Anchor paths at discovery time because consumers
+ * choose their own subprocess cwd. Prefer the invoking manager, then Node's
+ * official layout, then PATH symlinks and npm/Corepack-style adjacent installations.
+ * Never interpret shell wrapper contents or substitute another manager for the
+ * requested one.
  * @internal
  */
 export function packageManagerEntry(manager) {
@@ -41,7 +43,7 @@ export function packageManagerEntry(manager) {
         ];
   const invoked = process.env.npm_execpath;
   if (invoked && isEntry(invoked, manager) && existsSync(invoked))
-    return invoked;
+    return path.resolve(invoked);
   const nodeDir = path.dirname(process.execPath);
   const candidates = relatives.map((relative) =>
     path.join(
@@ -79,5 +81,6 @@ export function packageManagerEntry(manager) {
       ),
     );
   }
-  return candidates.find((candidate) => existsSync(candidate));
+  const selected = candidates.find((candidate) => existsSync(candidate));
+  return selected === undefined ? undefined : path.resolve(selected);
 }

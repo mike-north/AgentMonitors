@@ -10,6 +10,7 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
@@ -271,3 +272,84 @@ it('does not treat an arbitrary npm.js file as a Corepack npm proxy', () => {
   process.env = { PATH: '', npm_execpath: entry };
   expect(packageManagerEntry('npm')).toBeUndefined();
 });
+
+/** A launcher selected in one cwd must still identify that file in another cwd. */
+describe.skipIf(process.platform === 'win32').each(['npm', 'pnpm'])(
+  'cwd-independent %s launcher identity',
+  (manager) => {
+    it.each([
+      'relative PATH',
+      'absolute PATH',
+      'relative invoking',
+      'absolute invoking',
+    ])('executes the selected launcher from a child cwd (%s)', (selection) => {
+      const root = realpathSync(
+        mkdtempSync(path.join(os.tmpdir(), 'am launcher identity & spaces-')),
+      );
+      roots.push(root);
+      const bin = path.join(root, 'prefix/bin');
+      const entry = path.join(
+        root,
+        'prefix/lib/node_modules',
+        manager,
+        manager === 'npm' ? 'bin/npm-cli.js' : 'bin/pnpm.cjs',
+      );
+      const packed = path.join(root, 'packed child');
+      const separateNode = path.join(root, 'separate-node/node');
+      mkdirSync(bin, { recursive: true });
+      mkdirSync(path.dirname(entry), { recursive: true });
+      mkdirSync(packed, { recursive: true });
+      mkdirSync(path.dirname(separateNode), { recursive: true });
+      symlinkSync(node, separateNode);
+      symlinkSync(node, path.join(bin, 'node'));
+      writeFileSync(
+        entry,
+        'console.log(JSON.stringify(process.argv.slice(2)));',
+      );
+      // A genuine executable command, not a symlink to the JS launcher: this
+      // keeps discovery on the relative prefix/lib candidate that regressed.
+      writeFileSync(
+        path.join(bin, manager),
+        `#!/usr/bin/env node
+require(${JSON.stringify(entry)});`,
+        { mode: 0o755 },
+      );
+      const searchPath = selection === 'relative PATH' ? './prefix/bin' : bin;
+      const invoking =
+        selection === 'relative invoking'
+          ? path.relative(root, entry)
+          : selection === 'absolute invoking'
+            ? entry
+            : '';
+      const env = { ...process.env, PATH: searchPath, npm_execpath: invoking };
+      const lookup = spawnSync(manager, ['literal & spaces'], {
+        cwd: root,
+        encoding: 'utf8',
+        env,
+      });
+      expect(lookup.status, lookup.stderr).toBe(0);
+      expect(JSON.parse(lookup.stdout)).toEqual(['literal & spaces']);
+      const discovery = spawnSync(
+        node,
+        [
+          '--input-type=module',
+          '-e',
+          `
+          import {spawnSync} from 'node:child_process';
+          import {packageManagerEntry} from ${JSON.stringify(pathToFileURL(path.resolve('scripts/lib/package-manager-entry.mjs')).href)};
+          process.execPath = ${JSON.stringify(separateNode)};
+          const selected = packageManagerEntry(${JSON.stringify(manager)});
+          const result = spawnSync(${JSON.stringify(node)}, [selected, 'literal & spaces'], {cwd:${JSON.stringify(packed)}, encoding:'utf8'});
+          console.log(JSON.stringify({selected, status:result.status, stdout:result.stdout, stderr:result.stderr}));
+        `,
+        ],
+        { cwd: root, encoding: 'utf8', env },
+      );
+      expect(discovery.status, discovery.stderr).toBe(0);
+      const result = JSON.parse(discovery.stdout);
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.selected).toBe(entry);
+      expect(JSON.parse(result.stdout)).toEqual(['literal & spaces']);
+    });
+  },
+);

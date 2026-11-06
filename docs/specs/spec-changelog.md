@@ -9,6 +9,10 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Anchor launcher paths before subprocess cwd changes (004 §2.7) — Refs #520
+
+The package-manager resolver returns absolute launcher paths for both invoking entries and discovered installation candidates. Relative PATH and invoking entries retain their selected file identity when packing or installation changes the child working directory.
+
 ## 2026-11-05 — Retain executable-only pnpm in POSIX fixtures (004 §2.7) — Refs #520
 
 The compatibility wrapper retains inherited PATH when pnpm has no discoverable JavaScript launcher. Its actual nested suites exercise the existing POSIX executable fallback, including real workspace dependency rewriting and the Corepack-context control.
