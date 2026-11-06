@@ -23,3 +23,8 @@ advancing their own baseline. Late, aborted and superseded callbacks cannot rewi
 
 Reporting an older poll's ingestion failure no longer releases a successor's active admission,
 preventing overlapping source observations and baseline regression during failure cleanup.
+
+Tick and watcher startup reread each authored definition immediately before policy reconciliation,
+so delayed discovery cannot restore obsolete pacing or drain newer holds. Deferred-result handoff
+releases its retained snapshot lease even when argument access fails before ingestion, preserving
+other live owners and reporting the already committed edit accurately.

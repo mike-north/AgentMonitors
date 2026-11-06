@@ -110,6 +110,19 @@ Failures before ingestion starts must still clean up their own admission and per
 Scheduling may complete a registered source at registry lookup; runtime/ingestion/admission methods
 must remain actual implementations.
 
+`runtime/notify-discovery-freshness.test.ts` MUST suspend an earlier monitor in public tick and
+startup discovery while a newer tick/startup adopts rollup and holds work in a second actual file.
+The older scan cannot drain that work or restore its obsolete policy even when the source is not
+due. Cover a newer failed gate, invalid/deleted definitions, legitimate return to an earlier policy,
+and independent SQLite reopen. No runtime/store/admission methods may be replaced.
+
+`runtime/notify-deferred-handoff.test.ts` MUST retain a real completed poll behind a failed SQLite
+edit drain, then recover with throwing observation/next-state/outcome getters and an actual ingestion
+failure. Every exit releases exactly the deferred-result lease, preserving a live watcher owner.
+Assert the original error and committed drain truthfully, normal success/recovery, cursor persistence,
+private-cache cleanup after deletion and full SQLite close/reopen. Existing cancellation/retirement,
+scope isolation, writer-lock, killed-process and successor-admission controls remain required.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart

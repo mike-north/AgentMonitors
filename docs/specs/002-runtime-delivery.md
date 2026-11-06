@@ -1151,6 +1151,16 @@ reset across restarts; it is not an authoring field. Changes to that private enc
 not flush unchanged captured work or reset its clocks; complete captured definitions still detect
 real effective edits when older metadata omitted an escalation bit.
 
+**Discovery freshness (current).** A directory scan supplies candidate file paths, not authority
+for a later policy mutation. Tick and watcher startup **MUST** synchronously reread each authored
+definition immediately before its reconciliation transaction, without an intervening await. That
+read is the admission linearization point: a file edit after it belongs to a subsequent discovery.
+An older scan delayed on another monitor cannot restore obsolete pacing, drain newer held work,
+or reopen a gate blocked by a newer edit. Missing/invalid scan diagnostics likewise recheck the
+captured file before closing its gate. A later authored return to a previously used policy remains
+a legitimate edit. This needs no historical generation cache and does not restart/reconfigure
+established source or handling snapshots; independent scopes remain able to progress.
+
 **Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
 reread current held state under that writer boundary, and commit the entire old batch's events,
 projections, cursor seeds, snapshots and removal of corresponding holds together. No stale read
@@ -1195,8 +1205,12 @@ pacing changes preserve that established execution/handling snapshot. Outstandin
 factory creation, including a startup overlapping polling without a failed edit.
 
 Cached notify definitions **MUST** belong only to live watcher/poll admissions or locally retained
-results. Poll completion and watcher teardown release their ownership; cancellation/session close/
-dormancy also retire unadmitted ephemeral results. Reaping cannot resurrect their timing/baselines
+results. Removing a deferred result for handoff **MUST** release exactly its retained lease on
+every invocation exit, including definition assembly or source-result argument getters failing
+before ingestion starts. Other live watcher/poll owners keep their leases. Such handoff failures
+remain visible as ordinary observation failures **after** the edit transaction committed; they
+cannot claim the drained holds were retained or restore them. Poll completion and watcher teardown
+release their ownership; cancellation/session close/dormancy also retire unadmitted ephemeral results. Reaping cannot resurrect their timing/baselines
 or keep private instruction snapshots as historical cache entries. Cleanup of this process-local
 metadata does not delete durable holds, event history or diagnostics. Missing/invalid definitions
 with operational work retain that work until valid reconciliation or its existing lifetime rules.

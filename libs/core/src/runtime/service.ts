@@ -3,6 +3,7 @@ import path from 'node:path';
 import { ulid } from 'ulid';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
+import { parseMonitorFile } from '../parser/parse-monitor.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
@@ -2535,7 +2536,12 @@ export class AgentMonitorRuntime {
     // Persistent monitors (directory-authored). An unknown source is a hard tick
     // failure — the author can fix the file.
     for (const parsed of result.monitors) {
-      const monitor = parsed.monitor;
+      const monitor = this.revalidateDiscoveredMonitor(
+        parsed.monitor,
+        workspacePath,
+        acc,
+      );
+      if (!monitor) continue;
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
@@ -2619,6 +2625,32 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /**
+   * Discovery supplies candidate paths, not continuing authority to edit policy.
+   * Reread one authored definition immediately before its synchronous preparation:
+   * an earlier scope may have awaited source/Interpret work since the directory
+   * scan. This read linearizes admission with the following writer transaction
+   * in the same JS turn; later file edits require subsequent discovery. It adds
+   * no revision history and never reloads an established source/handling snapshot.
+   */
+  private revalidateDiscoveredMonitor(
+    discovered: MonitorDefinition,
+    workspacePath: string,
+    acc: TickAccumulator,
+  ): MonitorDefinition | undefined {
+    const current = parseMonitorFile(discovered.filePath);
+    if (current.ok) return current.monitor;
+    this.setWatchPolicy(discovered.id, workspacePath, null);
+    this.reportNotifyEditFailure(
+      discovered.id,
+      workspacePath,
+      discovered.frontmatter.watch.type,
+      `Notify edit blocked: ${current.error}; accepted holds retained.`,
+      acc,
+    );
+    return undefined;
+  }
+
   /** Diagnose operational holds whose authored definition cannot be admitted. */
   private reportMissingHeldDefinitions(
     result: Awaited<ReturnType<typeof scanMonitors>>,
@@ -2642,10 +2674,13 @@ export class AgentMonitorRuntime {
         held.pendingDebounce?.observations.at(0) ??
           held.pendingRollup?.observations.at(0),
       );
-      const parseError = result.errors.find(
-        (error) => error.filePath === captured.filePath,
-      );
-      const message = `Notify edit blocked: ${parseError?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
+      // The scan itself can finish out of order with a newer discovery. A stale
+      // missing/invalid result must not close that newer definition's live gate.
+      const current = captured.filePath
+        ? parseMonitorFile(captured.filePath)
+        : undefined;
+      if (current?.ok) continue;
+      const message = `Notify edit blocked: ${current?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
       this.setWatchPolicy(id, workspacePath, null);
       this.reportNotifyEditFailure(
         id,
@@ -2965,34 +3000,39 @@ export class AgentMonitorRuntime {
       this.setWatchPolicy(monitor.id, workspacePath, monitor);
       const key = JSON.stringify([workspacePath, monitor.id]);
       const pending = this.pollAdmissions.get(key);
-      let resumed: Promise<string[]> | undefined;
       if (pending?.result) {
         this.pollAdmissions.delete(key);
-        // Invocation performs the deterministic writes synchronously, before
-        // any woken watcher can resume or optional Interpret can yield.
-        resumed = this.ingest(
-          this.applyWatchPolicy(pending.monitor, monitor),
-          pending.result.observations,
-          pending.now,
-          {
-            workspacePath,
-            ...(pending.result.nextState !== undefined
-              ? { nextSourceState: { value: pending.result.nextState } }
-              : {}),
-            ...(pending.result.outcome
-              ? { sourceOutcome: pending.result.outcome }
-              : {}),
-            ...(pending.ephemeralSessionId !== undefined
-              ? { ephemeralSessionId: pending.ephemeralSessionId }
-              : {}),
-          },
-        );
-        this.releaseNotifyPolicy(monitor.id, workspacePath);
-      }
-      if (resumed) {
         try {
+          let resumed: Promise<string[]>;
+          try {
+            // Argument getters and definition assembly can fail before ingest
+            // starts. The removed result owns exactly one retained lease; release
+            // it on every invocation exit without disturbing other live owners.
+            // Ingest performs deterministic writes synchronously before yielding.
+            resumed = this.ingest(
+              this.applyWatchPolicy(pending.monitor, monitor),
+              pending.result.observations,
+              pending.now,
+              {
+                workspacePath,
+                ...(pending.result.nextState !== undefined
+                  ? { nextSourceState: { value: pending.result.nextState } }
+                  : {}),
+                ...(pending.result.outcome
+                  ? { sourceOutcome: pending.result.outcome }
+                  : {}),
+                ...(pending.ephemeralSessionId !== undefined
+                  ? { ephemeralSessionId: pending.ephemeralSessionId }
+                  : {}),
+              },
+            );
+          } finally {
+            this.releaseNotifyPolicy(monitor.id, workspacePath);
+          }
           acc.emittedEventIds.push(...(await resumed));
         } catch (error) {
+          // The edit transaction already committed. A failed ordinary handoff
+          // cannot restore those holds or truthfully report a blocked edit.
           this.reportNotifyEditFailure(
             monitor.id,
             workspacePath,
@@ -3680,7 +3720,18 @@ export class AgentMonitorRuntime {
     const tasks: Promise<void>[] = [];
 
     for (const parsed of result.monitors) {
-      const monitor = parsed.monitor;
+      const errorStart = startup.erroredObservations.length;
+      const monitor = this.revalidateDiscoveredMonitor(
+        parsed.monitor,
+        workspacePath,
+        startup,
+      );
+      if (!monitor) {
+        for (const error of startup.erroredObservations.slice(errorStart)) {
+          options.onError?.(error.monitorId, new Error(error.message));
+        }
+        continue;
+      }
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
