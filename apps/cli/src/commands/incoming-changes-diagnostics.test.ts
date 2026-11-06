@@ -82,7 +82,7 @@ function git(repo: string, args: string[]): string {
   ).trim();
 }
 
-function fixture() {
+function fixture(format = 'sha1') {
   // Keep macOS Unix socket paths below sockaddr_un's length limit.
   const root = mkdtempSync(
     path.join(process.platform === 'win32' ? tmpdir() : '/tmp', 'am305-'),
@@ -90,7 +90,7 @@ function fixture() {
   roots.push(root);
   const repo = path.join(root, 'repo');
   mkdirSync(repo);
-  git(repo, ['init', '-b', 'main']);
+  git(repo, ['init', `--object-format=${format}`, '-b', 'main']);
   writeFileSync(path.join(repo, 'a.txt'), 'A\n');
   git(repo, ['add', '.']);
   git(repo, ['commit', '-m', 'Initial fixture']);
@@ -185,6 +185,70 @@ describe('incoming-changes unavailable diagnosis', () => {
         baseline: true,
         observations: [],
       });
+    },
+  );
+
+  it.each(['sha1', 'sha256'])(
+    'rejects a suffix-named blob baseline in real %s CLI text/JSON',
+    async (format) => {
+      const f = fixture(format);
+      writeFileSync(path.join(f.repo, 'payload'), 'ordinary payload\n');
+      writeFileSync(path.join(f.repo, 'payload^{commit}'), 'not a commit\n');
+      git(f.repo, ['add', 'payload', 'payload^{commit}']);
+      git(f.repo, ['commit', '-m', 'Revision payload fixture']);
+      const file = f.monitor(f.repo, 'HEAD:payload');
+      for (const output of ['json', 'text']) {
+        const result = await run(f.root, [
+          'monitor',
+          'test',
+          file,
+          '--format',
+          output,
+        ]);
+        expect(result.code, result.stdout).toBe(1);
+        if (output === 'json') {
+          expect(JSON.parse(result.stdout)).toEqual({
+            error: `Observation failed: ${DIAGNOSTIC}`,
+          });
+          expect(result.stderr).toBe('');
+        } else {
+          expect(result.stdout).toBe(
+            'Testing monitor "Incoming" (source: incoming-changes)...\n',
+          );
+          expect(result.stderr).toBe(
+            `Error: Observation failed: ${DIAGNOSTIC}\n`,
+          );
+        }
+        expect(existsSync(path.join(f.root, 'state.db'))).toBe(false);
+      }
+    },
+  );
+
+  it.each(['sha1', 'sha256'])(
+    'accepts an authored commit-message search in real %s CLI text/JSON',
+    async (format) => {
+      const f = fixture(format);
+      const file = f.monitor(f.repo, ':/Initial');
+      for (const output of ['json', 'text']) {
+        const result = await run(f.root, [
+          'monitor',
+          'test',
+          file,
+          '--format',
+          output,
+        ]);
+        expect(result.code, result.stderr).toBe(0);
+        expect(result.stderr).toBe('');
+        if (output === 'json')
+          expect(JSON.parse(result.stdout)).toEqual({
+            monitor: 'Incoming',
+            source: 'incoming-changes',
+            baseline: true,
+            observations: [],
+          });
+        else expect(result.stdout).toContain('Baseline established.');
+        expect(existsSync(path.join(f.root, 'state.db'))).toBe(false);
+      }
     },
   );
 

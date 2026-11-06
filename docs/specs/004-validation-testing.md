@@ -69,6 +69,14 @@ Required regression scenarios for Refs #305 / decision #555:
 - Real Git non-repo/missing cwd, missing Git, unknown/option-looking/non-commit refs reject with
   the exact 003 §6.5 diagnostic; child stderr is quiet. Commit and annotated commit-tag controls
   baseline successfully; absent old SHA rebaselines and failed show omits only the snapshot.
+- In both SHA-1 and SHA-256 repositories, source and built-source tests MUST reject
+  `HEAD:payload` even when `payload^{commit}` is also a tracked blob. They MUST preserve
+  `:/Initial` commit-search semantics with a matching commit distinct from HEAD. Built CLI
+  text/JSON must report the existing failure envelope and exit 1 for the blob expression,
+  successfully baseline the valid search expression, and create no database in either case.
+  Keep HEAD/full-ID/tag/extended-commit positive controls and raw blob/tree/range/option-looking
+  negative controls. A narrow reversion to suffixing authored expressions must fail these
+  regressions while the controls continue to pass.
 - Last-good SHA survives an outage and SQLite reopen; recovery emits the exact net change from
   that SHA. A failing source does not prevent a sibling from observing.
 - Pin the current error-path consequences: due errors retry without advancing the timestamp,
@@ -80,6 +88,7 @@ Required regression scenarios for Refs #305 / decision #555:
   bytes or leaking another workspace's history.
 
 Verified by `plugins/source-incoming-changes/src/unavailable.test.ts`,
+`plugins/source-incoming-changes/src/revision-expressions.test.ts`,
 `libs/core/src/runtime/source-error-state.test.ts`,
 `apps/cli/src/commands/monitor-test.test.ts`, and
 `apps/cli/src/commands/incoming-changes-diagnostics.test.ts`.

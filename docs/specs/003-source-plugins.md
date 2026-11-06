@@ -1318,7 +1318,11 @@ Required field: `paths` (array of strings — path prefixes or globs passed to `
 
 ### 6.2 Behavior
 
-`incoming-changes` is `stateful: true`. The first call resolves the current commit SHA via `git rev-parse --verify --end-of-options <ref>^{commit}`, stores it as `nextState: { ref: '<sha>' }`, and returns an empty `observations` array — this is the baseline run; it does **not** report the existing tree as changed.
+`incoming-changes` is `stateful: true`. The first call resolves the authored revision unchanged
+via `git rev-parse --verify --end-of-options <ref>` to one complete object ID, then separately
+resolves `<object-id>^{commit}` to a commit SHA. It stores that SHA as `nextState: { ref: '<sha>' }`
+and returns an empty `observations` array. This is the baseline run; it does **not** report the
+existing tree as changed.
 
 On subsequent calls, the source:
 
@@ -1354,6 +1358,16 @@ with `git ls-remote origin refs/heads/<branch>` (§11.8).
   peeling to commits are accepted; tree/blob objects, unknown refs, option-looking invalid refs,
   inaccessible/non-repository cwd, and unavailable Git reject with an ordinary source `Error`.
   Arguments use an array with an option terminator; SHA-1 and SHA-256 object IDs are supported.
+  Resolve the authored expression **unchanged** to a single complete object ID before adding
+  commit-peeling syntax to that validated ID. Appending `^{commit}` directly to authored input
+  can change a file path (`HEAD:payload`) or a commit-search regex (`:/Initial`) instead of
+  verifying object type. For example, tracking files `payload` and `payload^{commit}` MUST NOT
+  allow `HEAD:payload` to establish a blob baseline. Conversely, `:/Initial` MUST retain its
+  ordinary Git meaning and baseline the matching commit, even when it differs from HEAD.
+  HEAD, full object IDs, annotated commit tags and extended single-commit expressions remain
+  valid. This preserves [Git revision syntax](https://git-scm.com/docs/gitrevisions); it is object
+  verification, not a restriction to branch-name syntax.
+
 - The exact error message is:
 
   > incoming-changes: could not resolve the configured ref to a commit. Check watch.cwd (an accessible Git repository), watch.branch (default HEAD), and that git is installed. No baseline was established or advanced; continuous monitoring will retry.

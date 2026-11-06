@@ -93,10 +93,12 @@ const REF_UNAVAILABLE_MESSAGE =
 const MAX_BUFFER = 64 * 1024 * 1024;
 
 /**
- * Resolve one commit object, including tags that peel to a commit. Verification
- * rejects trees, blobs and multi-revision expressions; the option terminator
- * keeps authored refs from changing Git's invocation. Failure leaves the last
- * successful source checkpoint authoritative.
+ * Resolve the authored revision unchanged to one object ID, then separately
+ * peel that ID to a commit. Appending syntax to an authored expression can
+ * change a path or search regex instead of checking its type (e.g. HEAD:path
+ * or :/message). Only a complete validated ID is safe to extend with ^{commit}.
+ * The option terminator prevents authored refs from changing Git's invocation;
+ * failures leave the last successful source checkpoint authoritative.
  */
 function tryResolveCurrentRef(
   cwd: string,
@@ -104,19 +106,25 @@ function tryResolveCurrentRef(
 ): string | undefined {
   const ref = branch ?? 'HEAD';
   try {
-    const sha = execFileSync(
-      'git',
-      ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`],
-      {
-        cwd,
-        encoding: 'utf-8',
-        maxBuffer: MAX_BUFFER,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    ).trim();
-    // Git supports SHA-1 and SHA-256 repositories. Only a complete object ID
-    // can become the resumption token, never echoed arguments or partial output.
-    return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha) ? sha : undefined;
+    // Each invocation must resolve exactly one complete object, in either Git
+    // hash format. Never treat echoed arguments or multi-object output as state.
+    const resolveObjectId = (revision: string): string | undefined => {
+      const sha = execFileSync(
+        'git',
+        ['rev-parse', '--verify', '--end-of-options', revision],
+        {
+          cwd,
+          encoding: 'utf-8',
+          maxBuffer: MAX_BUFFER,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      ).trim();
+      return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha) ? sha : undefined;
+    };
+    const objectId = resolveObjectId(ref);
+    return objectId === undefined
+      ? undefined
+      : resolveObjectId(`${objectId}^{commit}`);
   } catch {
     return undefined;
   }
