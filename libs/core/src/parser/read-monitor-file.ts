@@ -36,9 +36,14 @@ function* monitorReadBudget(): Generator<Buffer, string | undefined, number> {
 }
 
 /**
- * Read one monitor within the shared byte budget, closing its descriptor on
- * success, rejection, or failure. I/O errors remain the caller's diagnostics.
- * @internal
+ * Read monitor content without parsing, using the same admission budget as
+ * discovery and direct parsing. Diagnostic consumers must retain this boundary
+ * even when a file grows or is replaced after discovery.
+ *
+ * @returns UTF-8 content for files at or below the monitor byte limit, or
+ * undefined for oversized input, which is never decoded. The descriptor closes
+ * on success, rejection, or failure; filesystem errors propagate to the caller.
+ * @public
  */
 export function readMonitorFileSync(filePath: string): string | undefined {
   const fd = openSync(filePath, 'r');

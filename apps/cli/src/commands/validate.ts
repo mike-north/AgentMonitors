@@ -1,8 +1,8 @@
 import { Command, Option } from 'commander';
-import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import {
   scanMonitors,
+  readMonitorFileSync,
   SourceRegistry,
   validateWatchScope,
 } from '@agentmonitors/core';
@@ -36,7 +36,11 @@ function monitorIdFromPath(filePath: string): string {
 function oldSourceScopeShapeHint(filePath: string): string | null {
   let content: string;
   try {
-    content = readFileSync(filePath, 'utf-8');
+    // A parse failure does not authorize an unbounded second intake: the file
+    // may have grown or been replaced since discovery inspected it.
+    const bounded = readMonitorFileSync(filePath);
+    if (bounded === undefined) return null;
+    content = bounded;
   } catch {
     return null;
   }
@@ -148,7 +152,14 @@ export const validateCommand = new Command('validate')
         // which already uses the ID. Fall back to the file path if ID derivation
         // returns an empty/dot-prefixed string (e.g. an unusual path).
         filePath: monitorIdFromPath(e.filePath) || e.filePath,
-        error: [e.error, oldSourceScopeShapeHint(e.filePath)]
+        // Admission failures already have their complete diagnostic. Migration
+        // advice is optional and must never reopen rejected input.
+        error: [
+          e.error,
+          e.code === 'INPUT_LIMIT_EXCEEDED'
+            ? null
+            : oldSourceScopeShapeHint(e.filePath),
+        ]
           .filter(Boolean)
           .join('; '),
       })),

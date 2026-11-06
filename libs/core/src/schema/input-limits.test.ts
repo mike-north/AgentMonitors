@@ -6,8 +6,9 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import { parseMonitor, parseMonitorFile } from '../parser/parse-monitor.js';
+import * as shapeRuntime from '../runtime/shape.js';
 import { generateMonitorSchema } from '../observation/schema-generator.js';
-import { monitorFrontmatterSchema } from './monitor-schema.js';
+import { monitorFrontmatterSchema, shapeSchema } from './monitor-schema.js';
 
 // Observe real filesystem reads without using heap measurements as an oracle.
 vi.mock('node:fs/promises', async (importOriginal) => {
@@ -23,6 +24,149 @@ const monitorPath = '/workspace/bounded/MONITOR.md';
 const header = '---\nwatch:\n  type: file-fingerprint\n---\n';
 
 describe('monitor input admission (001)', () => {
+  // Collection declarations are raw arrays, not asynchronous producers of one.
+  // In particular, an async parser must not unwrap a Promise past admission.
+  describe.each([
+    {
+      label: 'tags',
+      path: ['tags'],
+      schema: monitorFrontmatterSchema,
+      wrap: (value: unknown) => ({ watch: { type: 'schedule' }, tags: value }),
+      limit: 256,
+      element: 'tag',
+    },
+    {
+      label: 'direct derive',
+      path: ['derive'],
+      schema: shapeSchema,
+      wrap: (value: unknown) => ({ derive: value }),
+      limit: 128,
+      element: { name: 'rule', when: 'true' },
+    },
+    {
+      label: 'nested derive',
+      path: ['shape', 'derive'],
+      schema: monitorFrontmatterSchema,
+      wrap: (value: unknown) => ({
+        watch: { type: 'schedule' },
+        shape: { derive: value },
+      }),
+      limit: 128,
+      element: { name: 'rule', when: 'true' },
+    },
+  ])('$label raw-array boundary', ({ schema, wrap, path, limit, element }) => {
+    const inputs = [
+      {
+        label: 'valid promised array',
+        create: () => Promise.resolve([element]),
+      },
+      {
+        label: 'oversized promised array',
+        create: () => Promise.resolve(Array(limit + 1).fill(element)),
+      },
+      {
+        label: 'callable then/catch',
+        create: () => ({
+          then() {
+            throw new Error('must not invoke then');
+          },
+          catch() {
+            throw new Error('must not invoke catch');
+          },
+        }),
+      },
+      {
+        label: 'then-only object',
+        create: () => ({
+          then() {
+            throw new Error('must not invoke then');
+          },
+        }),
+      },
+      { label: 'ordinary object', create: () => ({}) },
+      { label: 'Date', create: () => new Date('2026-11-03') },
+      { label: 'Map', create: () => new Map() },
+      { label: 'Set', create: () => new Set() },
+      { label: 'typed array', create: () => new Uint8Array([1]) },
+      { label: 'RegExp', create: () => /tags/ },
+      { label: 'WeakMap', create: () => new WeakMap() },
+      { label: 'WeakSet', create: () => new WeakSet() },
+      { label: 'null', create: () => null },
+      { label: 'string', create: () => 'tag' },
+    ];
+    it.each(inputs)(
+      'rejects synchronous $label input as an array type error',
+      ({ create }) => {
+        // Resolved arrays contain valid elements: a pre-fix synchronous Promise
+        // probe can throw, but cannot leave a rejected element-validation task.
+        const result = schema.safeParse(wrap(create()));
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error.issues).toMatchObject([
+            { code: 'invalid_type', expected: 'array', path },
+          ]);
+      },
+    );
+    it.each(inputs)(
+      'rejects asynchronous $label input as an array type error',
+      async ({ create }) => {
+        const result = await schema.safeParseAsync(wrap(create()));
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(result.error.issues).toMatchObject([
+            { code: 'invalid_type', expected: 'array', path },
+          ]);
+      },
+    );
+    it('rejects a promised oversized collection without reading an element or predicate', async () => {
+      let visits = 0;
+      const values = new Array<unknown>(limit + 1);
+      Object.defineProperty(values, 0, {
+        get() {
+          visits += 1;
+          throw new Error('element/predicate must not be read');
+        },
+      });
+      // Await the probe so a pre-fix getter rejection is handled by the test.
+      const result = await schema.safeParseAsync(wrap(Promise.resolve(values)));
+      expect(result.success).toBe(false);
+      expect(visits).toBe(0);
+      if (!result.success)
+        expect(result.error.issues).toMatchObject([
+          { code: 'invalid_type', expected: 'array', path },
+        ]);
+    });
+    it('accepts exact raw-array boundaries in both parse modes', async () => {
+      const input = wrap(Array(limit).fill(element));
+      expect(schema.safeParse(input).success).toBe(true);
+      expect((await schema.safeParseAsync(input)).success).toBe(true);
+      expect(schema.safeParse(wrap(undefined)).success).toBe(true);
+      expect((await schema.safeParseAsync(wrap(undefined))).success).toBe(true);
+    });
+  });
+
+  it('rejects promised derive input before compiling any CEL predicate', async () => {
+    const compile = vi.spyOn(shapeRuntime, 'validateCelPredicate');
+    try {
+      const result = await shapeSchema.safeParseAsync({
+        derive: Promise.resolve(
+          Array.from({ length: 129 }, (_, i) => ({
+            name: `rule-${i}`,
+            when: 'true',
+          })),
+        ),
+      });
+      expect(compile).not.toHaveBeenCalled();
+      expect(result.success).toBe(false);
+      if (!result.success)
+        expect(result.error.issues).toMatchObject([
+          { code: 'invalid_type', expected: 'array', path: ['derive'] },
+        ]);
+    } finally {
+      compile.mockRestore();
+    }
+  });
+
   it('advertises the tag bound to editor schema consumers', () => {
     expect(generateMonitorSchema([])).toMatchObject({
       properties: { tags: { maxItems: 256 } },

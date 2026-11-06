@@ -1200,6 +1200,9 @@ export const PRIVATE_FILE_MODE = 384;
 export function readBridgeState(statePath: string): HookState | null;
 
 // @public
+export function readMonitorFileSync(filePath: string): string | undefined;
+
+// @public
 export function renderArtifact(snapshot: unknown, facts: readonly DerivedFact[]): string;
 
 // @public

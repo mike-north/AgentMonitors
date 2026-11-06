@@ -143,6 +143,25 @@ evidence renders and the subprocess bound stays inside the test budget). The evi
 exposed the race is in
 [`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
 
+### 2.10 Admission boundaries through diagnostics and asynchronous parsing (current)
+
+Admission regressions MUST exercise the actual built CLI formatting path, in text
+and JSON modes, rather than stopping at scanner results. An oversized monitor
+must not be reopened for migration advice. Optional hint reads must stay bounded
+when an ordinary invalid file grows or is replaced after discovery; assertions
+cover MAX+1 bytes, descriptor closure, valid siblings, exact boundaries, and the
+positive legacy source/scope hint.
+
+Exported collection schemas MUST reject raw non-arrays consistently in sync and
+async parsing. A Promise resolving to a valid or oversized array is not another
+input format. Tests cover direct Shape and frontmatter fields, thenable controls,
+array type versus admission diagnostics, and zero element visits or CEL compilation
+for rejected inputs. Synchronous probes must not leave unhandled rejections.
+
+Verified in `apps/cli/src/commands/validate-admission.test.ts` and
+`libs/core/src/schema/input-limits.test.ts`. Tests consume prebuilt artifacts under
+§2.9; narrow repair reversions must reproduce each admission failure independently.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.

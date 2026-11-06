@@ -68,7 +68,18 @@ CLI scans therefore reject oversized files before allocating or decoding their f
 contain at most **256** entries and `shape.derive` at most **128** rules. These
 collection limits apply to exported schemas as well as the parser; an oversized collection
 produces one issue at its field path without inspecting its elements or compiling
-its predicates. Exact limits are accepted; ordinary field validation still applies.
+its predicates. The declaration MUST itself be a raw array: Promises and other
+non-arrays are rejected as array type errors in both synchronous and asynchronous
+parsing, before any implicit unwrapping. An oversized raw array remains an
+`INPUT_LIMIT_EXCEEDED` admission error. Exact limits are accepted; ordinary field
+validation still applies.
+
+Diagnostic formatting MUST retain the same file budget. CLI `validate` skips
+legacy-shape hint reads for admission errors; ordinary parse errors may receive a
+hint only after another bounded read, including when the file grows or is replaced
+after discovery. The shared `readMonitorFileSync` helper reads without parsing,
+returns `undefined` without decoding oversized content, closes its descriptor on
+every path, and propagates filesystem errors to the caller.
 
 These budgets allow generous human-authored configuration while bounding validation
 work. Derive rules have a tighter budget because each rule compiles a predicate.
