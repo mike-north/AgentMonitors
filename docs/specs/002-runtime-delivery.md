@@ -1572,6 +1572,11 @@ root at depth zero. Iterative admission checks prevent schema traversal or runti
 mutation on rejection. These budgets support bulk control operations while
 bounding validation work; they do not apply to response payloads or the MCP transport.
 
+The decoded traversal MUST avoid copying container values into intermediate
+collections after counting their widths. Admission responses correlate only an
+own string `id` from the decoded envelope; inherited IDs are ignored. Raw-frame
+limit diagnostics describe bytes because rejection precedes UTF-8 decoding.
+
 Admission failures return one bounded error with `code: INPUT_LIMIT_EXCEEDED`.
 Collection failures preserve a string request ID when available; byte failures use
 `id: invalid` because no JSON is parsed. The daemon remains available and existing

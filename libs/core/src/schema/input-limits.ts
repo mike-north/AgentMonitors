@@ -15,8 +15,10 @@ export const MAX_MONITOR_DERIVE_RULES = 128;
 
 /**
  * Reject the collection as a whole before Zod can visit any element. A plain
- * array `.max()` is insufficient on Zod 3, which validates elements first.
- * Non-arrays still reach the ordinary schema to retain its type diagnostics.
+ * array `.max()` was insufficient on Zod 3, which validated elements first.
+ * Keep admission explicit on Zod 4 so collection-level rejection remains
+ * independent of element or predicate validation. Non-arrays still reach the
+ * ordinary schema to retain its type diagnostics.
  * @internal
  */
 export function boundedMonitorArray<T extends z.ZodType>(

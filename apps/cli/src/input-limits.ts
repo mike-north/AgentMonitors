@@ -49,8 +49,17 @@ export function requestInputLimitViolation(input: unknown): string | undefined {
     if (admittedValues > MAX_REQUEST_VALUES) {
       return `Request must contain at most ${String(MAX_REQUEST_VALUES)} values`;
     }
-    for (const value of Object.values(item.value)) {
-      pending.push({ value, depth: item.depth + 1 });
+    // Width/aggregate admission has already bounded this container. Walk its
+    // existing array or own keys without allocating a second values collection.
+    if (Array.isArray(item.value)) {
+      for (const value of item.value) {
+        pending.push({ value, depth: item.depth + 1 });
+      }
+    } else {
+      for (const key of keys ?? []) {
+        const value: unknown = Reflect.get(item.value, key);
+        pending.push({ value, depth: item.depth + 1 });
+      }
     }
   }
   return undefined;

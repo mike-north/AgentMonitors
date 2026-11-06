@@ -1,8 +1,25 @@
 /** Exact budget boundaries for plain JSON data, independent of socket chunking. */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { requestInputLimitViolation } from './input-limits.js';
 
 describe('decoded request budgets', () => {
+  it('checks near-budget arrays and records without copying their values', () => {
+    const input = Object.fromEntries(
+      Array.from({ length: 9 }, (_, i) => [`k${i}`, Array(1000).fill(null)]),
+    );
+    const values = vi.spyOn(Object, 'values');
+    let copies: number;
+    let violation: string | undefined;
+    try {
+      violation = requestInputLimitViolation(input);
+      copies = values.mock.calls.length;
+    } finally {
+      values.mockRestore();
+    }
+    expect(violation).toBeUndefined();
+    expect(copies).toBe(0);
+  });
+
   it('admits depth 32 and rejects depth 33 without recursive traversal', () => {
     let value: unknown = null;
     for (let depth = 0; depth < 32; depth++) {

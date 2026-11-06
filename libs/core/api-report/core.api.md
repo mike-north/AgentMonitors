@@ -831,133 +831,102 @@ export type MonitorExplainStageStatus = 'ok' | 'pending' | 'healthy' | 'failure'
 export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
 
 // @public (undocumented)
-export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
-    name: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
+export const monitorFrontmatterSchema: z.ZodPipe<z.ZodObject<{
+    name: z.ZodOptional<z.ZodString>;
     watch: z.ZodObject<{
         type: z.ZodString;
-    }, "strip", z.ZodUnknown, z.objectOutputType<{
-        type: z.ZodString;
-    }, z.ZodUnknown, "strip">, z.objectInputType<{
-        type: z.ZodString;
-    }, z.ZodUnknown, "strip">>;
-    urgency: z.ZodOptional<z.ZodEffects<z.ZodString, {
+    }, z.core.$catchall<z.ZodUnknown>>;
+    urgency: z.ZodOptional<z.ZodPipe<z.ZodString, z.ZodTransform<{
         lo: "low" | "normal" | "high";
         hi: "low" | "normal" | "high";
-    }, string>>;
-    notify: z.ZodOptional<z.ZodDiscriminatedUnion<"strategy", [z.ZodObject<{
+    }, string>>>;
+    notify: z.ZodOptional<z.ZodDiscriminatedUnion<[z.ZodObject<{
         strategy: z.ZodLiteral<"debounce">;
         'settle-for': z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        strategy: "debounce";
-        'settle-for': string;
-    }, {
-        strategy: "debounce";
-        'settle-for': string;
-    }>, z.ZodObject<{
+    }, z.core.$strip>, z.ZodObject<{
         strategy: z.ZodLiteral<"throttle">;
         'suppress-for': z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        strategy: "throttle";
-        'suppress-for': string;
-    }, {
-        strategy: "throttle";
-        'suppress-for': string;
-    }>, z.ZodObject<{
+    }, z.core.$strip>, z.ZodObject<{
         strategy: z.ZodLiteral<"rollup">;
         window: z.ZodString;
-        timezone: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
-    }, "strip", z.ZodTypeAny, {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    }, {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    }>]>>;
-    'baseline-strategy': z.ZodDefault<z.ZodEnum<["incremental", "net"]>>;
-    tags: z.ZodOptional<z.ZodEffects<z.ZodArray<z.ZodString, "many">, string[], unknown>>;
-    shape: z.ZodOptional<z.ZodEffects<z.ZodObject<{
-        derive: z.ZodOptional<z.ZodEffects<z.ZodArray<z.ZodObject<{
+        timezone: z.ZodOptional<z.ZodString>;
+    }, z.core.$strip>], "strategy">>;
+    'baseline-strategy': z.ZodDefault<z.ZodEnum<{
+        incremental: "incremental";
+        net: "net";
+    }>>;
+    tags: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodString>, unknown>>;
+    shape: z.ZodOptional<z.ZodPreprocess<z.ZodObject<{
+        derive: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodObject<{
             name: z.ZodString;
             when: z.ZodString;
-        }, "strip", z.ZodTypeAny, {
-            name: string;
-            when: string;
-        }, {
-            name: string;
-            when: string;
-        }>, "many">, {
-            name: string;
-            when: string;
-        }[], unknown>>;
+        }, z.core.$strip>>, unknown>>;
         render: z.ZodOptional<z.ZodLiteral<"rendered">>;
-    }, "strip", z.ZodTypeAny, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    }, {
-        derive?: unknown;
-        render?: "rendered" | undefined;
-    }>, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    }, {
+    }, z.core.$strip>, {
         derive?: unknown;
         render?: "rendered" | undefined;
     }>>;
-    payload: z.ZodOptional<z.ZodEffects<z.ZodObject<{
-        form: z.ZodEnum<["prose", "structured", "artifact", "rendered"]>;
+    payload: z.ZodOptional<z.ZodObject<{
+        form: z.ZodEnum<{
+            rendered: "rendered";
+            prose: "prose";
+            structured: "structured";
+            artifact: "artifact";
+        }>;
         transform: z.ZodOptional<z.ZodObject<{
-            language: z.ZodEnum<["jq", "cel"]>;
+            language: z.ZodEnum<{
+                jq: "jq";
+                cel: "cel";
+            }>;
             expression: z.ZodString;
-        }, "strip", z.ZodTypeAny, {
-            language: "jq" | "cel";
-            expression: string;
-        }, {
-            language: "jq" | "cel";
-            expression: string;
+        }, z.core.$strip>>;
+        encoding: z.ZodOptional<z.ZodEnum<{
+            json: "json";
+            yaml: "yaml";
+            toon: "toon";
+            toml: "toml";
         }>>;
-        encoding: z.ZodOptional<z.ZodEnum<["json", "yaml", "toon", "toml"]>>;
-    }, "strip", z.ZodTypeAny, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }>, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }>>;
-}, "strip", z.ZodTypeAny, {
+    }, z.core.$strip>>;
+}, z.core.$strip>, z.ZodTransform<{
+    baselineStrategy: "incremental" | "net";
+    urgency: "low" | "normal" | "high";
+    urgencyMax: "low" | "normal" | "high";
     watch: {
+        [x: string]: unknown;
         type: string;
-    } & {
-        [k: string]: unknown;
+    };
+    name?: string | undefined;
+    notify?: {
+        strategy: "debounce";
+        'settle-for': string;
+    } | {
+        strategy: "throttle";
+        'suppress-for': string;
+    } | {
+        strategy: "rollup";
+        window: string;
+        timezone?: string | undefined;
+    } | undefined;
+    tags?: string[] | undefined;
+    shape?: {
+        derive?: {
+            name: string;
+            when: string;
+        }[] | undefined;
+        render?: "rendered" | undefined;
+    } | undefined;
+    payload?: {
+        form: "rendered" | "prose" | "structured" | "artifact";
+        transform?: {
+            language: "jq" | "cel";
+            expression: string;
+        } | undefined;
+        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
+    } | undefined;
+}, {
+    watch: {
+        [x: string]: unknown;
+        type: string;
     };
     'baseline-strategy': "incremental" | "net";
     name?: string | undefined;
@@ -965,13 +934,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         lo: "low" | "normal" | "high";
         hi: "low" | "normal" | "high";
     } | undefined;
-    shape?: {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    } | undefined;
     notify?: {
         strategy: "debounce";
         'settle-for': string;
@@ -984,57 +946,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         timezone?: string | undefined;
     } | undefined;
     tags?: string[] | undefined;
-    payload?: {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    } | undefined;
-}, {
-    watch: {
-        type: string;
-    } & {
-        [k: string]: unknown;
-    };
-    name?: string | undefined;
-    urgency?: string | undefined;
-    shape?: {
-        derive?: unknown;
-        render?: "rendered" | undefined;
-    } | undefined;
-    notify?: {
-        strategy: "debounce";
-        'settle-for': string;
-    } | {
-        strategy: "throttle";
-        'suppress-for': string;
-    } | {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    } | undefined;
-    'baseline-strategy'?: "incremental" | "net" | undefined;
-    tags?: unknown;
-    payload?: {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    } | undefined;
-}>, {
-    baselineStrategy: "incremental" | "net";
-    urgency: "low" | "normal" | "high";
-    urgencyMax: "low" | "normal" | "high";
-    watch: {
-        type: string;
-    } & {
-        [k: string]: unknown;
-    };
-    name?: string | undefined;
     shape?: {
         derive?: {
             name: string;
@@ -1042,18 +953,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     } | undefined;
-    notify?: {
-        strategy: "debounce";
-        'settle-for': string;
-    } | {
-        strategy: "throttle";
-        'suppress-for': string;
-    } | {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    } | undefined;
-    tags?: string[] | undefined;
     payload?: {
         form: "rendered" | "prose" | "structured" | "artifact";
         transform?: {
@@ -1062,40 +961,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         } | undefined;
         encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
     } | undefined;
-}, {
-    watch: {
-        type: string;
-    } & {
-        [k: string]: unknown;
-    };
-    name?: string | undefined;
-    urgency?: string | undefined;
-    shape?: {
-        derive?: unknown;
-        render?: "rendered" | undefined;
-    } | undefined;
-    notify?: {
-        strategy: "debounce";
-        'settle-for': string;
-    } | {
-        strategy: "throttle";
-        'suppress-for': string;
-    } | {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    } | undefined;
-    'baseline-strategy'?: "incremental" | "net" | undefined;
-    tags?: unknown;
-    payload?: {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    } | undefined;
-}>;
+}>>;
 
 // @public (undocumented)
 export interface MonitorRuntimeState {
@@ -1131,37 +997,17 @@ export interface NotifyRuntimeState {
 }
 
 // @public (undocumented)
-export const notifySchema: z.ZodDiscriminatedUnion<"strategy", [z.ZodObject<{
+export const notifySchema: z.ZodDiscriminatedUnion<[z.ZodObject<{
     strategy: z.ZodLiteral<"debounce">;
     'settle-for': z.ZodString;
-}, "strip", z.ZodTypeAny, {
-    strategy: "debounce";
-    'settle-for': string;
-}, {
-    strategy: "debounce";
-    'settle-for': string;
-}>, z.ZodObject<{
+}, z.core.$strip>, z.ZodObject<{
     strategy: z.ZodLiteral<"throttle">;
     'suppress-for': z.ZodString;
-}, "strip", z.ZodTypeAny, {
-    strategy: "throttle";
-    'suppress-for': string;
-}, {
-    strategy: "throttle";
-    'suppress-for': string;
-}>, z.ZodObject<{
+}, z.core.$strip>, z.ZodObject<{
     strategy: z.ZodLiteral<"rollup">;
     window: z.ZodString;
-    timezone: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
-}, "strip", z.ZodTypeAny, {
-    strategy: "rollup";
-    window: string;
-    timezone?: string | undefined;
-}, {
-    strategy: "rollup";
-    window: string;
-    timezone?: string | undefined;
-}>]>;
+    timezone: z.ZodOptional<z.ZodString>;
+}, z.core.$strip>], "strategy">;
 
 // @public (undocumented)
 export type NotifyStrategy = 'debounce' | 'throttle' | 'rollup';
@@ -1302,48 +1148,27 @@ export type PayloadEncoding = 'json' | 'yaml' | 'toon' | 'toml';
 export type PayloadForm = 'prose' | 'structured' | 'artifact' | 'rendered';
 
 // @public
-export const payloadSchema: z.ZodEffects<z.ZodObject<{
-    form: z.ZodEnum<["prose", "structured", "artifact", "rendered"]>;
+export const payloadSchema: z.ZodObject<{
+    form: z.ZodEnum<{
+        rendered: "rendered";
+        prose: "prose";
+        structured: "structured";
+        artifact: "artifact";
+    }>;
     transform: z.ZodOptional<z.ZodObject<{
-        language: z.ZodEnum<["jq", "cel"]>;
+        language: z.ZodEnum<{
+            jq: "jq";
+            cel: "cel";
+        }>;
         expression: z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        language: "jq" | "cel";
-        expression: string;
-    }, {
-        language: "jq" | "cel";
-        expression: string;
+    }, z.core.$strip>>;
+    encoding: z.ZodOptional<z.ZodEnum<{
+        json: "json";
+        yaml: "yaml";
+        toon: "toon";
+        toml: "toml";
     }>>;
-    encoding: z.ZodOptional<z.ZodEnum<["json", "yaml", "toon", "toml"]>>;
-}, "strip", z.ZodTypeAny, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}>, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}>;
+}, z.core.$strip>;
 
 // @public
 export interface PayloadTransform {
@@ -1667,38 +1492,14 @@ export interface ShapedObservation {
 // @public
 export function shapeObservation(observation: Observation, now: Date, config: ShapeStageConfig): ShapedObservation;
 
-// @public (undocumented)
-export const shapeSchema: z.ZodEffects<z.ZodObject<{
-    derive: z.ZodOptional<z.ZodEffects<z.ZodArray<z.ZodObject<{
+// @public
+export const shapeSchema: z.ZodPreprocess<z.ZodObject<{
+    derive: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodObject<{
         name: z.ZodString;
         when: z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        name: string;
-        when: string;
-    }, {
-        name: string;
-        when: string;
-    }>, "many">, {
-        name: string;
-        when: string;
-    }[], unknown>>;
+    }, z.core.$strip>>, unknown>>;
     render: z.ZodOptional<z.ZodLiteral<"rendered">>;
-}, "strip", z.ZodTypeAny, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
-    render?: "rendered" | undefined;
-}, {
-    derive?: unknown;
-    render?: "rendered" | undefined;
-}>, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
-    render?: "rendered" | undefined;
-}, {
+}, z.core.$strip>, {
     derive?: unknown;
     render?: "rendered" | undefined;
 }>;

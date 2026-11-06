@@ -208,6 +208,7 @@ describe('daemon input admission (002 §10.4)', () => {
       id: 'invalid',
       code: 'INPUT_LIMIT_EXCEEDED',
     });
+    expect(response['error']).toBe('Request must be at most 1048576 bytes');
     expect(await callDaemon('session.list', {}, { socketPath })).toEqual(
       sessionsBefore,
     );

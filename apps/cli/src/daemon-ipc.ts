@@ -1004,7 +1004,7 @@ export function createDaemonServer({
         respond({
           id: UNPARSEABLE_REQUEST_ID,
           code: INPUT_LIMIT_ERROR_CODE,
-          error: `Request must be at most ${String(MAX_DAEMON_REQUEST_BYTES)} UTF-8 bytes`,
+          error: `Request must be at most ${String(MAX_DAEMON_REQUEST_BYTES)} bytes`,
         });
         return;
       }
@@ -1035,6 +1035,8 @@ export function createDaemonServer({
           const id =
             decoded !== null &&
             typeof decoded === 'object' &&
+            // Only the sender's own id can correlate an admission response.
+            Object.hasOwn(decoded, 'id') &&
             'id' in decoded &&
             typeof decoded.id === 'string'
               ? decoded.id
