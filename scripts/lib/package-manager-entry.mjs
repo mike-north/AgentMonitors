@@ -113,7 +113,8 @@ export function packageManagerEntry(manager) {
   for (const candidate of candidates) {
     if (!existsSync(candidate)) continue;
     const selected = physicalPath(candidate, 'file');
-    if (selected) return selected;
+    // A nominal installation path can link to another manager's launcher.
+    if (selected && isEntry(selected, manager)) return selected;
   }
   return undefined;
 }
