@@ -1,3 +1,8 @@
+/**
+ * Validates authored monitor declarations before runtime use. Mapping fields
+ * retain their authored meaning across YAML loading and schema normalization;
+ * this module does not coerce scalar declarations into configuration objects.
+ */
 import { z } from 'zod';
 import { validateCelPredicate } from '../runtime/shape.js';
 import {
@@ -128,7 +133,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
 
   if (parts.length !== 2) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message:
         'urgency must be a single level (e.g. "normal") or a range "lo..hi" (e.g. "normal..high")',
     });
@@ -143,7 +148,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
 
   if (!isLevel(loRaw) || !isLevel(hiRaw)) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: `urgency bounds must each be one of ${urgencyLevels
         .map((level) => `"${level}"`)
         .join(', ')}`,
@@ -153,7 +158,7 @@ const urgencyBandSchema = z.string().transform((raw, ctx) => {
 
   if (urgencyRank[loRaw] > urgencyRank[hiRaw]) {
     ctx.addIssue({
-      code: z.ZodIssueCode.custom,
+      code: 'custom',
       message: `range "${loRaw}..${hiRaw}" is inverted — the low bound must not exceed the high bound`,
     });
     return z.NEVER;
@@ -191,7 +196,7 @@ const deriveRuleSchema = z.object({
   when: z.string().min(1, 'shape.derive[].when must be a CEL predicate'),
 });
 
-const shapeSchema = z
+const shapeMappingSchema = z
   .object({
     derive: z.array(deriveRuleSchema).optional(),
     render: z.literal('rendered').optional(),
@@ -201,13 +206,53 @@ const shapeSchema = z
       const error = validateCelPredicate(rule.when);
       if (error) {
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: 'custom',
           path: ['derive', index, 'when'],
           message: `malformed CEL predicate: ${error}`,
         });
       }
     }
   });
+
+/**
+ * Classify raw programmatic inputs independently of the authored TypeScript
+ * type: safeParse accepts unknown values, including native non-declarations.
+ * Other object prototypes remain eligible for ordinary mapping validation.
+ */
+function isNonMappingShapeInput(value: unknown): boolean {
+  return (
+    value instanceof Date ||
+    value instanceof Map ||
+    value instanceof Set ||
+    (typeof value === 'object' &&
+      value !== null &&
+      'then' in value &&
+      typeof value.then === 'function' &&
+      'catch' in value &&
+      typeof value.catch === 'function')
+  );
+}
+
+/**
+ * Preserve the historical Shape object boundary before normalization: Date
+ * (including YAML timestamps), Map, Set, and objects with callable then/catch
+ * are not declarations. Reject promise-like inputs before preprocessing can
+ * await them or object parsing can erase them to an empty declaration.
+ * Other objects retain their existing admission and unknown-key policy; this
+ * is not a plain-object restriction. Authored and parsed types stay unchanged.
+ *
+ * @see docs/specs/001-monitor-definition.md §5.1
+ */
+const shapeSchema = z.preprocess(
+  (value: z.input<typeof shapeMappingSchema>, ctx) => {
+    if (isNonMappingShapeInput(value)) {
+      ctx.addIssue({ code: 'invalid_type', expected: 'object', input: value });
+      return z.NEVER;
+    }
+    return value;
+  },
+  shapeMappingSchema,
+);
 
 const transformLanguages = ['jq', 'cel'] as const satisfies readonly [
   TransformLanguage,
@@ -268,7 +313,7 @@ const payloadSchema = z
   .superRefine((payload, ctx) => {
     if (payload.transform && payload.form !== 'structured') {
       ctx.addIssue({
-        code: z.ZodIssueCode.custom,
+        code: 'custom',
         path: ['transform'],
         message:
           'payload.transform is only valid when payload.form is "structured"',
@@ -279,7 +324,7 @@ const payloadSchema = z
       const error = validatePayloadTransform(payload.transform);
       if (error) {
         ctx.addIssue({
-          code: z.ZodIssueCode.custom,
+          code: 'custom',
           path: ['transform', 'expression'],
           message: `malformed ${payload.transform.language} transform: ${error}`,
         });
