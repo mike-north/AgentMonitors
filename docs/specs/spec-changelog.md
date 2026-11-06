@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-06 — Avoid payload writes for no-input jq probes (004 §2.10) — Refs #458
+
+A no-input version probe closes unused stdin without writing an empty payload that
+can race jq's valid early exit. Explicit reduction input, including an empty string,
+still requires delivery and rejects stdin errors. This resolves the Linux CI discovery
+EPIPE failure without suppressing filter transport failures, retrying or increasing
+any command/outer deadline. The canonical jq programs and source boundary are unchanged.
+
 ## 2026-11-06 — Bound jq commands and release query handles (004 §2.10) — Refs #458
 
 Facility probes and canonical jq reductions now use asynchronous total verdicts within

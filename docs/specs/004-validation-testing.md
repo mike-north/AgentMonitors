@@ -171,7 +171,10 @@ skip naming the omitted surface, never a passing no-op. CI without jq MUST fail;
 jq is present the real reduction cases MUST execute. Facility probes and canonical
 filter executions use an asynchronous total verdict within the existing 1,000ms
 per-command budget, including during test discovery. A hanging or broken executable
-MUST fail visibly; only ENOENT permits the optional local omission.
+MUST fail visibly; only ENOENT permits the optional local omission. A no-input
+version probe closes unused stdin without writing a payload. Explicit reduction
+input, including an empty string, retains its delivery obligation: stdin transport
+errors cannot be ignored or overridden by a successful command exit.
 
 The script facility control executes the actual jq programs extracted from the shipped
 preset templates directly against authored raw-GitHub fixtures. It does not start

@@ -12,11 +12,11 @@ const JQ_COMMAND_TIMEOUT = 1_000;
 
 /**
  * @param {readonly string[]} args - jq's real argv, including the canonical program.
- * @param {string} [input] - Authored raw fixture input; never interpreted by a shell.
+ * @param {string} [input] - Authored fixture input; undefined means no input transport, while an explicit empty string still requires delivery.
  * @returns {Promise<{stdout: string, stderr: string}>} Successful jq output; failures remain visible.
  * @internal
  */
-export function runJqCommand(args, input = '') {
+export function runJqCommand(args, input) {
   const deadline = Date.now() + JQ_COMMAND_TIMEOUT;
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -63,10 +63,12 @@ export function runJqCommand(args, input = '') {
       () => fail(new Error('jq command deadline expired (1000ms)')),
       Math.max(0, deadline - Date.now()),
     );
-    // A failed executable or early exit can close stdin before fixture input is
-    // written. Report it as command failure rather than an unhandled pipe error.
+    // A version probe has no input to deliver: close the unused pipe without
+    // a payload write that can race jq's early exit. Explicit reduction input,
+    // including an empty string, must still surface transport failures.
     child.stdin?.on('error', fail);
-    child.stdin?.end(input);
+    if (input === undefined) child.stdin?.destroy();
+    else child.stdin?.end(input);
   });
 }
 
