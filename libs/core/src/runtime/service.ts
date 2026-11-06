@@ -43,6 +43,7 @@ import {
   heldMonitorIds,
   withStoreWriter,
   learnNotifyPolicyIdentity,
+  commitNotifyPolicyEdit,
 } from './store-writer.js';
 import {
   notifyPolicyKey,
@@ -3097,10 +3098,9 @@ export class AgentMonitorRuntime {
       delete nextNotify.pendingRollup;
       delete nextNotify.suppressedUntil;
       delete nextNotify.rollupLastFiredMinute;
-      this.store.setMonitorState(monitor.id, workspacePath, {
-        ...state,
-        notifyState: nextNotify,
-      });
+      // Pacing adoption owns notify metadata and the materialized held batch,
+      // never the source's opaque baseline or its observation clock.
+      commitNotifyPolicyEdit(this.store, monitor.id, workspacePath, nextNotify);
       if (drained.length)
         this.store.recordObservationHistory({
           monitorId: monitor.id,

@@ -49,3 +49,7 @@ state without resetting clocks, holds or source baselines, so later effective ed
 guards across restart. Watcher startup also reconciles existing scoped ownership before skipping
 a current source without a watch factory; it neither polls nor creates replacement watchers and
 leaves unowned observe-only state untouched.
+
+Effective policy adoption now preserves opaque source baselines, legacy fingerprints and observation
+clocks exactly while resetting guards or draining held work, so the next source call receives its
+original previous state across restart. Notify-only persistence remains in the same atomic drain.

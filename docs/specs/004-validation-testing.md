@@ -166,6 +166,15 @@ new work under current pacing. Cover evaluating/deferred polls, no replacement f
 healthy scoped progress, unowned ordinary state untouched and same-ID foreign ownership isolation.
 Full SQLite reopen and independent identity-learning/factory-skip reversions remain required.
 
+`runtime/notify-only-baseline.test.ts` MUST seed controlled raw legacy JSON `null` and other
+opaque source representations with a fingerprint, learn identity, then apply a not-due effective
+edit. Guard-only resets and held drains through tick/startup must preserve raw `source_state`,
+`last_fingerprint` and `last_observation_at` through full SQLite reopen. Make the next poll due
+with a clock-only SQL update, never the broad state setter, and assert the actual source receives
+the original `previousState`. Include equivalent-policy controls, real notify-update failure with
+complete materialization rollback/retry, and a narrow reversion of only the edit's notify-only
+persistence. Prior identity, startup, scoped ownership and atomic-drain controls remain required.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart

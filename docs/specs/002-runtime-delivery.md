@@ -1161,6 +1161,19 @@ historical key or held definition, edits before that first successful scan are u
 not retroactively inferred. Failed validation or identity persistence does not record a successful
 key; existing compatible key encodings retain unchanged clocks.
 
+**Source-baseline preservation (current).** Every notify-only reconciliation commit, including
+retiring guards without held work and atomically draining holds, **MUST** update only notify-owned
+metadata and its legitimate materialization artifacts. It must preserve the persisted
+`source_state`, `last_fingerprint` and `last_observation_at` columns exactly, without decoding and
+reserializing the source baseline. Source ingestion/checkpoints retain their existing ownership.
+For example, a legacy raw JSON `null` baseline with a fingerprint remains `null` after a not-due
+throttle `1h` → `1s` edit and SQLite reopen; the next actual source call receives `previousState:
+null`, not `{}`. The edit neither makes observation due nor creates a fresh baseline. Failed
+notify persistence rolls back held materialization and metadata together, preserving those same
+source columns. This extends the source ownership rule in §3 and 003 §2 to effective edits;
+`runtime/notify-only-baseline.test.ts` verifies tick/startup, guard resets, drains, rollback and the
+next real source input across restart.
+
 **Discovery freshness (current).** A directory scan supplies candidate file paths, not authority
 for a later policy mutation. Tick and watcher startup **MUST** synchronously reread each authored
 definition immediately before its reconciliation transaction, without an intervening await. That

@@ -77,3 +77,28 @@ export function learnNotifyPolicyIdentity(
     )
     .run(policyKey, monitorId, workspacePath);
 }
+
+/**
+ * Adopt an effective pacing edit on its existing scoped row without interpreting
+ * or reserializing source-owned state. The caller's owned writer transaction also
+ * contains every held event/projection/snapshot/cursor write: this update removes
+ * retired holds and guards in that same commit. Only source ingestion/checkpoints
+ * may replace the opaque baseline; a notify-only edit cannot create a state row
+ * or change the next observation's previousState, fingerprint or scheduling clock.
+ * @internal
+ */
+export function commitNotifyPolicyEdit(
+  store: object,
+  monitorId: string,
+  workspacePath: string,
+  notifyState: unknown,
+): void {
+  const result = storeWriter(store)
+    .prepare(
+      'UPDATE monitor_state SET notify_state = ? WHERE monitor_id = ? AND workspace_path = ?',
+    )
+    .run(JSON.stringify(notifyState), monitorId, workspacePath);
+  if (result.changes !== 1) {
+    throw new Error('Notify edit requires one existing scoped state row.');
+  }
+}
