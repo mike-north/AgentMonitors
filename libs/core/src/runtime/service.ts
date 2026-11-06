@@ -39,7 +39,11 @@ import {
   computeNetCollapseView,
   netCollapseGroupKey,
 } from './store.js';
-import { heldMonitorIds, withStoreWriter } from './store-writer.js';
+import {
+  heldMonitorIds,
+  withStoreWriter,
+  learnNotifyPolicyIdentity,
+} from './store-writer.js';
 import {
   notifyPolicyKey,
   storedNotifyPolicyMatches,
@@ -3053,7 +3057,15 @@ export class AgentMonitorRuntime {
         held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
         (notify.policyKey !== undefined &&
           !storedNotifyPolicyMatches(notify.policyKey, key));
-      if (!changed) return [];
+      if (!changed) {
+        // A successful current scan establishes future comparison identity even
+        // when legacy state has only guards. Missing metadata is not an edit:
+        // preserve every clock/hold and never infer an unknowable earlier policy.
+        if (notify.policyKey === undefined) {
+          learnNotifyPolicyIdentity(this.store, monitor.id, workspacePath, key);
+        }
+        return [];
+      }
       const drained = held
         .map(hydrateStoredObservationEnvelope)
         .sort((a, b) => a.observedAt.getTime() - b.observedAt.getTime())
@@ -3821,8 +3833,9 @@ export class AgentMonitorRuntime {
    * pipeline as a ticked `observe()` (notify dispatch → materialization →
    * projection). Returns a handle whose `stop()` aborts and awaits every watcher.
    * While a watcher is active, the tick loop skips that monitor's `observe()`, so
-   * it is never driven twice. Sources without `watch()` are untouched and keep
-   * running on the tick loop.
+   * it is never driven twice. A source without `watch()` creates no factory:
+   * only already-owned scopes reconcile here, and unowned polling state remains
+   * untouched for the tick loop.
    *
    * Restart-safety: watchers are re-established on restart; a `watch()` source's
    * own change-detection state is in-memory (the runtime does not persist it).
@@ -3884,12 +3897,16 @@ export class AgentMonitorRuntime {
           `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
       }
-      if (!source.watch) continue;
       const key = JSON.stringify([workspacePath, monitor.id]);
       const existing = this.activeWatchers.has(key);
+      const canWatch = typeof source.watch === 'function';
+      // Factory capability does not exempt existing watcher/poll ownership from
+      // the current definition's admission boundary. Unowned observe-only scopes
+      // remain ordinary polling work, untouched by watcher startup.
+      if (!canWatch && !this.notifyPolicyUsers.has(key)) continue;
       const controller = new AbortController();
       const watcherToken = Symbol(monitor.id);
-      if (!existing) {
+      if (canWatch && !existing) {
         controllers.set(monitor.id, controller);
         this.activeWatchers.set(key, watcherToken);
         this.retainNotifyPolicy(monitor.id, workspacePath);
@@ -3906,7 +3923,7 @@ export class AgentMonitorRuntime {
         for (const error of startup.erroredObservations.slice(errorStart)) {
           options.onError?.(error.monitorId, new Error(error.message));
         }
-        if (existing) continue;
+        if (!canWatch || existing) continue;
 
         tasks.push(
           this.consumeWatch(
@@ -3918,7 +3935,7 @@ export class AgentMonitorRuntime {
           ),
         );
       } catch (error) {
-        if (!existing) {
+        if (canWatch && !existing) {
           controller.abort();
           controllers.delete(monitor.id);
           if (this.activeWatchers.get(key) === watcherToken)

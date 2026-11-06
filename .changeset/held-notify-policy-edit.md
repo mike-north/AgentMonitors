@@ -43,3 +43,9 @@ Closing admission now retains the current admitted or blocked location within it
 owner. Repeated unchanged discovery cannot reopen fallback while that location is still invalid
 or unreadable. The one pathname retires with the last live lease; new owners read fresh definitions
 and no historical paths or extra instruction snapshots are retained.
+
+Successful unchanged reconciliation learns missing private policy identity on existing legacy
+state without resetting clocks, holds or source baselines, so later effective edits retire old
+guards across restart. Watcher startup also reconciles existing scoped ownership before skipping
+a current source without a watch factory; it neither polls nor creates replacement watchers and
+leaves unowned observe-only state untouched.

@@ -1151,6 +1151,16 @@ reset across restarts; it is not an authoring field. Changes to that private enc
 not flush unchanged captured work or reset its clocks; complete captured definitions still detect
 real effective edits when older metadata omitted an escalation bit.
 
+**Legacy identity learning (current).** If successful unchanged reconciliation finds no private
+policy key on an existing scoped row, it **MUST** record the current effective identity under the
+same owned writer boundary. This is metadata learning, not an edit: preserve all guards, holds,
+observation clocks, opaque source state and materialized artifacts. It must not make observation
+due or create a synthetic previous-state baseline for a fresh scope. A later known effective edit,
+including after restart, can then retire its suppression/minute guards before new work. With no
+historical key or held definition, edits before that first successful scan are unknowable and are
+not retroactively inferred. Failed validation or identity persistence does not record a successful
+key; existing compatible key encodings retain unchanged clocks.
+
 **Discovery freshness (current).** A directory scan supplies candidate file paths, not authority
 for a later policy mutation. Tick and watcher startup **MUST** synchronously reread each authored
 definition immediately before its reconciliation transaction, without an intervening await. That
@@ -1206,7 +1216,14 @@ deterministic writes finish before optional async Interpret can interleave anoth
 not add ordinary ingest/flush batch rollback or retry guarantees.
 Reconciliation can resume it without reloading the live source. Its reconciled pacing and
 urgency band govern future yields; its established execution/handling snapshot remains until an
-explicit restart. Successful startup drains **MUST** refresh the affected workspace's session
+explicit restart.
+Watcher startup **MUST** reconcile existing scoped watcher/evaluating-poll/deferred-result ownership
+even when the current registered source has no watch factory. Factory capability controls creation,
+not admission for live work. Invalid scope or failed drain blocks actual checkpoint/yield and
+baseline writes; valid recovery commits old work before they resume. No new watcher, source reload
+or polling is introduced. An observe-only scope without its own live ownership remains untouched
+by watcher startup, even if other scopes have owners.
+Successful startup drains **MUST** refresh the affected workspace's session
 hook state after commit, even if the source never yields and no tick follows; failed transactions
 must not publish an unread prefix. This rule does not introduce unrelated live-definition reload behavior.
 

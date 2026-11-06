@@ -1,6 +1,7 @@
 /**
- * Internal store connection ownership for synchronous runtime write units. This
- * keeps transaction capabilities out of the published RuntimeStore surface.
+ * Internal connection ownership and narrow runtime-only persistence operations.
+ * Keep transaction capabilities and private notify metadata out of the published
+ * RuntimeStore surface.
  */
 import type { Database } from 'better-sqlite3';
 import type { InboxDb } from '../inbox/db.js';
@@ -55,4 +56,24 @@ export function heldMonitorIds(store: object, workspacePath: string): string[] {
     )
     .all(workspacePath) as { monitor_id: string }[];
   return rows.map((row) => row.monitor_id);
+}
+
+/**
+ * Learn private pacing identity on an existing scoped row without changing source
+ * representation, observation clocks or accepted work. Caller owns the synchronous
+ * writer boundary. UPDATE-only leaves a fresh scope absent until ordinary ingestion
+ * establishes its first source baseline; an existing identity is never overwritten.
+ * @internal
+ */
+export function learnNotifyPolicyIdentity(
+  store: object,
+  monitorId: string,
+  workspacePath: string,
+  policyKey: string,
+): void {
+  storeWriter(store)
+    .prepare(
+      "UPDATE monitor_state SET notify_state = json_set(COALESCE(notify_state, '{}'), '$.policyKey', ?) WHERE monitor_id = ? AND workspace_path = ? AND json_type(notify_state, '$.policyKey') IS NULL",
+    )
+    .run(policyKey, monitorId, workspacePath);
 }

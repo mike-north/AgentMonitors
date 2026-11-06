@@ -151,6 +151,21 @@ Current path and cache ownership must retire together; a new owner must use fres
 A narrow loss-of-location-on-gate-close reversion must fail these regressions while all prior
 freshness, absence, scope, duplicate, lease and checkpoint/successor controls remain meaningful.
 
+`runtime/notify-legacy-policy-identity.test.ts` MUST seed the exact older private-key-missing
+shape in an owned SQLite fixture, fully close/reopen and learn identity on an unchanged not-due
+scan while preserving guards, holds, clocks, opaque/raw baselines and event/cursor artifacts.
+Cover throttle guard-only and rollup-minute state, equivalent policies, a later known edit across
+restart, actual B delivery, identical legacy holds, failed identity writes/validation and owned
+writer refusal. Fresh scopes must retain absent previousState; keyed unchanged rows need no rewrite.
+Do not infer policy history before the first successful identity-learning scan.
+
+`runtime/notify-observe-only-startup.test.ts` MUST reconcile existing watcher/poll ownership
+before skipping a factory-less current source. Actual checkpoint/yield and cursor stay blocked on
+invalid scope or real SQLite drain failure; startup recovery commits captured old handling before
+new work under current pacing. Cover evaluating/deferred polls, no replacement factory or polling,
+healthy scoped progress, unowned ordinary state untouched and same-ID foreign ownership isolation.
+Full SQLite reopen and independent identity-learning/factory-skip reversions remain required.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart
