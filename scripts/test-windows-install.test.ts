@@ -3,7 +3,16 @@
  * keeping spaces in every isolated path. Native Windows execution belongs to CI.
  */
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -29,6 +38,7 @@ vi.mock('./lib/pack-helpers.mjs', async (importOriginal) => {
   };
 });
 
+const nodeExecutable = process.execPath;
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 afterEach(() => {
   for (const result of vi.mocked(mkdtempSync).mock.results) {
@@ -36,6 +46,7 @@ afterEach(() => {
       rmSync(result.value, { recursive: true, force: true });
     }
   }
+  process.execPath = nodeExecutable;
   vi.clearAllMocks();
   vi.restoreAllMocks();
   if (platformDescriptor) {
@@ -48,11 +59,22 @@ describe('Windows install harness argv (#520)', () => {
     'resolves npm beside Node for the %s layout without a shell',
     async (platform) => {
       Object.defineProperty(process, 'platform', { value: platform });
+      // Model a real installed file so physical launcher identity is observable.
+      const layoutRoot = realpathSync.native(
+        mkdtempSync(path.join(os.tmpdir(), 'am npm layout-')),
+      );
+      process.execPath = path.join(layoutRoot, 'bin', 'node');
+      mkdirSync(path.dirname(process.execPath), { recursive: true });
       const npmCli = path.join(
         path.dirname(process.execPath),
         platform === 'win32'
           ? 'node_modules/npm/bin/npm-cli.js'
           : '../lib/node_modules/npm/bin/npm-cli.js',
+      );
+      mkdirSync(path.dirname(npmCli), { recursive: true });
+      writeFileSync(
+        npmCli,
+        '// npm launcher fixture; subprocess behavior is mocked here.',
       );
       vi.mocked(existsSync).mockImplementation(
         (candidate) => candidate === npmCli,
@@ -82,7 +104,7 @@ describe('Windows install harness argv (#520)', () => {
         '--prefix',
       ]);
       expect(existsSync).toHaveBeenCalledWith(npmCli);
-      expect(vi.mocked(mkdtempSync).mock.calls[0]?.[0]).toContain(
+      expect(vi.mocked(mkdtempSync).mock.lastCall?.[0]).toContain(
         'am windows install-',
       );
       expect(args?.[4]).toContain('am windows install-');

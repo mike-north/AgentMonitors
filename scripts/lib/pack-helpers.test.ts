@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -44,7 +45,9 @@ afterEach(() => {
 
 /** A real JS entrypoint records what Node received, independent of shell syntax. */
 function fixture(extension: string): { root: string; entry: string } {
-  const root = mkdtempSync(path.join(os.tmpdir(), 'am pack & spaces-'));
+  const root = realpathSync.native(
+    mkdtempSync(path.join(os.tmpdir(), 'am pack & spaces-')),
+  );
   roots.push(root);
   const entry = path.join(root, `pnpm${extension}`);
   writeFileSync(

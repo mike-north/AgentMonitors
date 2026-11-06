@@ -9,6 +9,10 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Preserve physical lookup and explicit POSIX PATH components (004 §2.7) — Refs #520
+
+Launcher discovery uses native physical file and directory identities before lexical joins can change symlink/`..` traversal. Explicit empty POSIX PATH components retain discovery-time cwd, while unset PATH does not; unusable directories are skipped so later valid entries remain discoverable.
+
 ## 2026-11-05 — Anchor launcher paths before subprocess cwd changes (004 §2.7) — Refs #520
 
 The package-manager resolver returns absolute launcher paths for both invoking entries and discovered installation candidates. Relative PATH and invoking entries retain their selected file identity when packing or installation changes the child working directory.
