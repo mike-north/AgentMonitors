@@ -15,7 +15,7 @@ const readiness = script
     script.indexOf('phase "daemon-status-probe"'),
   )
   .replace('READY_TIMEOUT_S=60', 'READY_TIMEOUT_S=0');
-function shell(body: string) {
+function shell(body: string, env: NodeJS.ProcessEnv = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'am-shell-'));
   try {
     return spawnSync(
@@ -29,7 +29,12 @@ function shell(body: string) {
             `DAEMON_LOG=${dir}/daemon.log`,
           ) + body,
       ],
-      { encoding: 'utf8', timeout: 3000, killSignal: 'SIGKILL' },
+      {
+        encoding: 'utf8',
+        timeout: 3000,
+        killSignal: 'SIGKILL',
+        env: { ...process.env, ...env },
+      },
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -57,19 +62,79 @@ it('reports the early daemon exit code', () => {
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('exit code 23');
 });
-it('does not mask a failed workspace-copy producer', () => {
+/**
+ * Exercise the shipped copy command with independently controlled tar stages.
+ * The extractor must drain and accept the producer payload in an owned directory;
+ * a shared failing stub or ambient missing destination would hide lost pipefail.
+ */
+function workspaceCopy(producerExit: number, extractorExit: number) {
   const line = script
     .split('\n')
     .find(
       (value) =>
         value.startsWith('run_logged bash') && value.includes('tar --exclude'),
     );
-  expect(line).toBeDefined();
-  const result = shell(
-    'phase extract-workspace\ntar() { return 17; }; export -f tar\n' + line,
-  );
-  expect(result.status).not.toBe(0);
+  if (line === undefined) throw new Error('workspace-copy command is missing');
+  const destination = mkdtempSync(path.join(tmpdir(), 'am-copy-'));
+  try {
+    return shell(
+      `
+phase extract-workspace
+tar() {
+  if [ "$1" = "--exclude=node_modules" ]; then
+    printf archive-payload
+    echo "producer exit $PRODUCER_EXIT" >&2
+    return "$PRODUCER_EXIT"
+  fi
+  if [ "$1" = "-xf" ]; then
+    local input
+    input="$(cat)"
+    [ "$input" = "archive-payload" ] || return 91
+    [ "$PWD" = "$COPY_DEST" ] || return 92
+    echo "extractor consumed payload in owned destination; exit $EXTRACTOR_EXIT"
+    return "$EXTRACTOR_EXIT"
+  fi
+  return 93
+}
+export -f tar
+${line.replace('cd /tmp/repo', 'cd "$COPY_DEST"')}
+`,
+      {
+        COPY_DEST: destination,
+        PRODUCER_EXIT: String(producerExit),
+        EXTRACTOR_EXIT: String(extractorExit),
+      },
+    );
+  } finally {
+    rmSync(destination, { recursive: true, force: true });
+  }
+}
+it('does not mask a failed workspace-copy producer when extraction succeeds', () => {
+  const result = workspaceCopy(17, 0);
+  expect(result.status).toBe(17);
   expect(result.stderr).toContain('extract-workspace');
+  expect(result.stderr).toContain('producer exit 17');
+  expect(result.stderr).toContain(
+    'extractor consumed payload in owned destination; exit 0',
+  );
+});
+it('accepts a successful workspace-copy producer and extractor', () => {
+  const result = workspaceCopy(0, 0);
+  expect(result.status).toBe(0);
+  expect(result.stdout).toContain('producer exit 0');
+  expect(result.stdout).toContain(
+    'extractor consumed payload in owned destination; exit 0',
+  );
+  expect(result.stderr).not.toContain('SMOKE TEST FAILURE');
+});
+it('reports a failed workspace-copy extractor independently of the producer', () => {
+  const result = workspaceCopy(0, 23);
+  expect(result.status).toBe(23);
+  expect(result.stderr).toContain('extract-workspace');
+  expect(result.stderr).toContain('producer exit 0');
+  expect(result.stderr).toContain(
+    'extractor consumed payload in owned destination; exit 23',
+  );
 });
 
 // Valid phase volume must not consume the outer helper's 20 MiB budget, even
