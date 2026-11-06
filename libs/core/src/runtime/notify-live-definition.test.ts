@@ -58,6 +58,24 @@ vi.mock('node:fs', async (importActual) => {
   };
 });
 
+vi.mock('node:fs/promises', async (importActual) => {
+  const actual = await importActual<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    // Repeated discovery must observe the same targeted I/O failure as the
+    // synchronous admission read; otherwise a valid async read would be a duplicate.
+    readFile: async (...args: Parameters<typeof actual.readFile>) => {
+      if (args[0] === locationFault.path && locationFault.readCode) {
+        throw Object.assign(
+          new Error(locationFault.readCode + ': owned filesystem fault'),
+          { code: locationFault.readCode },
+        );
+      }
+      return await actual.readFile(...args);
+    },
+  };
+});
+
 /** Barriers suspend actual sources/Interpret, never runtime, store or admission implementations. */
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -108,6 +126,7 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
   let context: (ObservationContext & { signal: AbortSignal }) | undefined;
   let next: ((result: IteratorResult<Observation>) => void) | undefined;
   let bFactories = 0;
+  let bPolls = 0;
   let cCalls = 0;
   let cFactories = 0;
   const tasks: Promise<unknown>[] = [];
@@ -172,6 +191,7 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
     name: 'watched',
     scopeSchema: { type: 'object', properties: { token: { type: 'string' } } },
     async observe() {
+      bPolls++;
       return { observations: [] };
     },
     watch(_config, ctx) {
@@ -275,6 +295,13 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
     originalFile,
     get bFactories() {
       return bFactories;
+    },
+    get bPolls() {
+      return bPolls;
+    },
+    async stop() {
+      for (const handle of handles.splice(0)) await handle.stop();
+      await Promise.allSettled(tasks);
     },
     get cCalls() {
       return cCalls;
@@ -869,3 +896,360 @@ for (const missingCode of ['ENOENT', 'ENOTDIR'] as const) {
     },
   );
 }
+
+/** Read-only ownership inspection accepts the former count representation for parent negative runs. */
+function liveOwnership(f: Awaited<ReturnType<typeof fixture>>) {
+  const metadata = f.runtime as unknown as {
+    notifyPolicyUsers: Map<
+      string,
+      number | { users: number; currentPath?: string }
+    >;
+    watchPolicies: Map<string, unknown>;
+  };
+  const value = metadata.notifyPolicyUsers.get(JSON.stringify([f.root, 'b']));
+  return {
+    users: typeof value === 'number' ? value : (value?.users ?? 0),
+    currentPath: typeof value === 'object' ? value.currentPath : undefined,
+    owners: metadata.notifyPolicyUsers,
+    policies: metadata.watchPolicies,
+  };
+}
+
+/** A discovery with no changed definition must revalidate the same current location. */
+async function unchangedDiscovery(
+  f: Awaited<ReturnType<typeof fixture>>,
+  mode: 'tick' | 'startup' | 'captured',
+): Promise<string[]> {
+  if (mode !== 'startup') {
+    const result = await f.tick(mode === 'captured' ? f.empty : f.dir);
+    return result.erroredObservations
+      .filter((item) => item.monitorId === 'b')
+      .map((item) => item.message);
+  }
+  const start = f.errors.length;
+  await f.watch();
+  return f.errors.slice(start);
+}
+
+for (const first of ['tick', 'startup'] as const) {
+  for (const repeated of ['tick', 'startup'] as const) {
+    it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+      first +
+        ' denial retains its location across unchanged ' +
+        repeated +
+        ' rescans',
+      async () => {
+        const f = await fixture(first);
+        const pending = await f.suspend();
+        await f.emit('Held B');
+        f.move();
+        await f.tick();
+        const retained = f.state();
+        const admitted = f.file;
+        let checkpoint: Promise<void> | undefined;
+        let settled = false;
+        let initiallySettled: boolean;
+        let readCode: unknown;
+        const repeatedErrors: string[][] = [];
+        const repeatedStates: ReturnType<typeof f.state>[] = [];
+        const repeatedSettled: boolean[] = [];
+        const locations: (string | undefined)[] = [];
+        const counts: number[] = [];
+        let firstErrors: string[];
+        let healthyProgress: number;
+        try {
+          chmodSync(path.dirname(admitted), 0);
+          writeFileSync(
+            f.originalFile,
+            f.text('watched', DEBOUNCE, 'Conflicting fallback'),
+          );
+          try {
+            readFileSync(admitted);
+          } catch (error) {
+            if (error instanceof Error && 'code' in error)
+              readCode = error.code;
+          }
+          const old = await pending.finish();
+          firstErrors =
+            'result' in old && old.result && 'erroredObservations' in old.result
+              ? old.result.erroredObservations.map((item) => item.message)
+              : f.errors.slice();
+          checkpoint = f.checkpoint().then(() => {
+            settled = true;
+          });
+          await f.emit('Later B');
+          initiallySettled = settled;
+          const initialHealthy = repeated === 'tick' ? f.cCalls : f.cFactories;
+          for (let i = 0; i < 3; i++) {
+            // New independent scopes prove progress without changing either b definition.
+            writeFileSync(path.join(f.dir, 'd' + i + '.md'), f.text('healthy'));
+            repeatedErrors.push(await unchangedDiscovery(f, repeated));
+            await settle();
+            repeatedStates.push(f.state());
+            repeatedSettled.push(settled);
+            locations.push(liveOwnership(f).currentPath);
+            counts.push(liveOwnership(f).users);
+          }
+          healthyProgress =
+            (repeated === 'tick' ? f.cCalls : f.cFactories) - initialHealthy;
+        } finally {
+          chmodSync(path.dirname(admitted), 0o700);
+          rmSync(f.originalFile, { force: true });
+          await pending.finish();
+          await f.tick();
+          await checkpoint;
+        }
+        await until(() => f.heldCount() === 2);
+        expect(readCode).toBe('EACCES');
+        expect(firstErrors.some((message) => message.includes('EACCES'))).toBe(
+          true,
+        );
+        expect(initiallySettled).toBe(false);
+        expect(
+          repeatedErrors.every((errors) =>
+            errors.some((message) => message.includes('EACCES')),
+          ),
+        ).toBe(true);
+        expect(repeatedStates).toEqual([retained, retained, retained]);
+        expect(repeatedSettled).toEqual([false, false, false]);
+        expect(locations).toEqual([admitted, admitted, admitted]);
+        expect(counts).toEqual([1, 1, 1]);
+        expect(healthyProgress).toBeGreaterThanOrEqual(3);
+        expect(f.bFactories).toBe(1);
+        expect(f.bPolls).toBe(0);
+        expect(f.rows()).toEqual([]);
+        expect(f.state().sourceState).toEqual({ cursor: 999 });
+        expect(
+          f.state().notifyState.pendingDebounce?.observations[1]?.monitor
+            .instructions,
+        ).toBe('Original handling');
+        await f.reopen();
+        expect(liveOwnership(f).owners.size).toBe(0);
+        expect(liveOwnership(f).policies.size).toBe(0);
+      },
+    );
+  }
+}
+
+for (const repeated of ['tick', 'startup', 'captured'] as const) {
+  it(
+    'closed location survives repeated ' +
+      repeated +
+      ' discovery under faithful read/metadata I/O failure',
+    async () => {
+      const f = await fixture();
+      const pending = await f.suspend();
+      await f.emit('Held B');
+      f.move();
+      await f.tick();
+      const admitted = f.file;
+      const retained = f.state();
+      let checkpoint: Promise<void> | undefined;
+      let settled = false;
+      let initiallySettled: boolean;
+      const diagnostics: string[][] = [];
+      const states: ReturnType<typeof f.state>[] = [];
+      const accepted: boolean[] = [];
+      const locations: (string | undefined)[] = [];
+      try {
+        writeFileSync(
+          f.originalFile,
+          f.text('watched', DEBOUNCE, 'Conflicting fallback'),
+        );
+        locationFault.path = admitted;
+        locationFault.readCode = 'EIO';
+        locationFault.statCode = 'EIO';
+        locationFault.looksAbsent = true;
+        await pending.finish();
+        checkpoint = f.checkpoint().then(() => {
+          settled = true;
+        });
+        await f.emit('Later B');
+        initiallySettled = settled;
+        for (let i = 0; i < 3; i++) {
+          diagnostics.push(await unchangedDiscovery(f, repeated));
+          // Captured-route-only diagnostics do not themselves open a gate; the following
+          // complete discovery must still consult the same blocked location.
+          if (repeated === 'captured')
+            diagnostics.push(await unchangedDiscovery(f, 'tick'));
+          await settle();
+          states.push(f.state());
+          accepted.push(settled);
+          locations.push(liveOwnership(f).currentPath);
+        }
+      } finally {
+        delete locationFault.path;
+        delete locationFault.readCode;
+        delete locationFault.statCode;
+        delete locationFault.looksAbsent;
+        rmSync(f.originalFile, { force: true });
+        await pending.finish();
+        await f.tick();
+        await checkpoint;
+      }
+      await until(() => f.heldCount() === 2);
+      expect(initiallySettled).toBe(false);
+      expect(
+        diagnostics.every((errors) =>
+          errors.some((message) => message.includes('EIO')),
+        ),
+      ).toBe(true);
+      expect(states).toEqual([retained, retained, retained]);
+      expect(accepted).toEqual([false, false, false]);
+      expect(locations).toEqual([admitted, admitted, admitted]);
+      expect(f.bFactories).toBe(1);
+      expect(f.bPolls).toBe(0);
+      expect(f.state().sourceState).toEqual({ cursor: 999 });
+      await f.reopen();
+      expect(liveOwnership(f).owners.size).toBe(0);
+    },
+  );
+}
+
+it('a newly discovered unresolved location stays authoritative while blocked and sees later invalid-file edits', async () => {
+  const f = await fixture();
+  await f.emit('Held B');
+  f.move();
+  f.edit('absent-source');
+  // This location has never successfully reconciled; source resolution closes its gate.
+  const first = await f.tick();
+  const admitted = f.file;
+  const retained = f.state();
+  const initiallyBlockedLocation = liveOwnership(f).currentPath;
+  let checkpoint: Promise<void> | undefined;
+  let settled = false;
+  const diagnostics: string[][] = [];
+  const states: ReturnType<typeof f.state>[] = [];
+  const accepted: boolean[] = [];
+  try {
+    writeFileSync(admitted, '---\nwatch: invalid\n---');
+    writeFileSync(
+      f.originalFile,
+      f.text('watched', DEBOUNCE, 'Conflicting fallback'),
+    );
+    checkpoint = f.checkpoint().then(() => {
+      settled = true;
+    });
+    await f.emit('Later B');
+    for (let i = 0; i < 3; i++) {
+      diagnostics.push(await unchangedDiscovery(f, 'tick'));
+      await settle();
+      states.push(f.state());
+      accepted.push(settled);
+    }
+  } finally {
+    rmSync(f.originalFile, { force: true });
+    f.edit();
+    await f.tick();
+    await checkpoint;
+  }
+  await until(() => f.heldCount() === 2);
+  expect(
+    first.erroredObservations.some((item) =>
+      item.message.includes('unknown source'),
+    ),
+  ).toBe(true);
+  expect(initiallyBlockedLocation).toBe(admitted);
+  expect(diagnostics.every((errors) => errors.length > 0)).toBe(true);
+  expect(states).toEqual([retained, retained, retained]);
+  expect(accepted).toEqual([false, false, false]);
+  expect(f.bFactories).toBe(1);
+  expect(f.bPolls).toBe(0);
+  await f.reopen();
+});
+
+for (const absence of ['ENOENT', 'ENOTDIR'] as const) {
+  it.skipIf(process.platform === 'win32' && absence === 'ENOTDIR')(
+    'a closed location permits genuine ' +
+      absence +
+      ' moveback and updates its one owned path',
+    async () => {
+      const f = await fixture();
+      await f.emit('Held B');
+      f.move();
+      await f.tick();
+      const admitted = f.file;
+      writeFileSync(admitted, '---\nwatch: invalid\n---');
+      await f.tick();
+      let settled = false;
+      const checkpoint = f.checkpoint().then(() => {
+        settled = true;
+      });
+      await f.emit('Later B');
+      const before = settled;
+      const blockedPath = liveOwnership(f).currentPath;
+      writeFileSync(
+        f.originalFile,
+        f.text('watched', DEBOUNCE, 'Fresh authored candidate'),
+      );
+      rmSync(admitted);
+      if (absence === 'ENOTDIR') {
+        rmSync(path.dirname(admitted), { recursive: true });
+        writeFileSync(
+          path.dirname(admitted),
+          'The previous parent is now a file.',
+        );
+      }
+      const recovery = await f.tick();
+      await checkpoint;
+      await until(() => f.heldCount() === 2);
+      expect(before).toBe(false);
+      expect(blockedPath).toBe(admitted);
+      expect(recovery.erroredObservations).toEqual([]);
+      expect(liveOwnership(f).currentPath).toBe(f.originalFile);
+      expect(liveOwnership(f).users).toBe(1);
+      expect(f.bFactories).toBe(1);
+      expect(f.state().sourceState).toEqual({ cursor: 999 });
+      expect(
+        f.state().notifyState.pendingDebounce?.observations[1]?.monitor
+          .instructions,
+      ).toBe('Original handling');
+      await f.reopen();
+      expect(liveOwnership(f).owners.size).toBe(0);
+    },
+  );
+}
+
+it('last live owner retires closed location metadata and a later owner pins fresh authored handling', async () => {
+  const f = await fixture();
+  await f.emit('Held B');
+  f.move();
+  await f.tick();
+  const retiredPath = f.file;
+  writeFileSync(retiredPath, '---\nwatch: invalid\n---');
+  await f.tick();
+  const blockedPath = liveOwnership(f).currentPath;
+  const retained = f.state();
+  const checkpoint = f.checkpoint();
+  await f.emit('Unaccepted old-owner yield');
+  await f.stop();
+  await checkpoint;
+  const retired = liveOwnership(f);
+  expect(blockedPath).toBe(retiredPath);
+  expect(retired.owners.size).toBe(0);
+  expect(retired.policies.size).toBe(0);
+  expect(f.state()).toEqual(retained);
+  expect(
+    JSON.stringify([...retired.owners.values(), ...retired.policies.values()]),
+  ).not.toContain(retiredPath);
+  rmSync(retiredPath);
+  writeFileSync(
+    f.originalFile,
+    f.text('watched', DEBOUNCE, 'Fresh owner handling'),
+  );
+  await f.watch();
+  await settle();
+  await f.checkpoint();
+  await f.emit('Fresh B');
+  expect(f.bFactories).toBe(2);
+  expect(liveOwnership(f).currentPath).toBe(f.originalFile);
+  expect(liveOwnership(f).users).toBe(1);
+  expect(f.state().notifyState.pendingDebounce?.observations).toHaveLength(2);
+  expect(
+    f.state().notifyState.pendingDebounce?.observations[1]?.monitor
+      .instructions,
+  ).toBe('Fresh owner handling');
+  await f.reopen();
+  expect(liveOwnership(f).owners.size).toBe(0);
+  expect(liveOwnership(f).policies.size).toBe(0);
+});

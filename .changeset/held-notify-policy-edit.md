@@ -38,3 +38,8 @@ files and source semantics are reread; invalid definitions and duplicate IDs rem
 A valid earlier location can replace an admitted path only when metadata proves that location
 absent (ENOENT/ENOTDIR). Permission and I/O failures retain the blocked gate, original holds and
 read diagnostic instead of being mistaken for deletion by a boolean existence check.
+
+Closing admission now retains the current admitted or blocked location within its existing live
+owner. Repeated unchanged discovery cannot reopen fallback while that location is still invalid
+or unreadable. The one pathname retires with the last live lease; new owners read fresh definitions
+and no historical paths or extra instruction snapshots are retained.

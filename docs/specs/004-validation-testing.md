@@ -141,6 +141,15 @@ I/O and unclassified query errors elsewhere; never replace runtime/store/admissi
 checkpoint/yield, original holds/baseline and healthy sibling progress must remain intact until
 permission restoration and valid reconciliation. Genuine ENOENT/ENOTDIR moveback must still succeed
 without another scan, and a narrow absence-classification reversion must fail the denial cases.
+After the first denial, one and multiple **unchanged** tick/startup/captured-route discoveries MUST
+still revalidate the same denied location: actual checkpoint/yield remains unsettled, original holds
+and baseline stay unchanged, no source factory/poll bypasses it, and healthy scopes progress.
+Require actual POSIX first/repeated tick/startup pairs and faithful synchronous/asynchronous read
+fault controls. Cover a never-admitted location first blocked by unresolved source, later invalid
+edits at that location, genuine absence after a closed gate, and last-owner stop/abort cleanup.
+Current path and cache ownership must retire together; a new owner must use fresh authored handling.
+A narrow loss-of-location-on-gate-close reversion must fail these regressions while all prior
+freshness, absence, scope, duplicate, lease and checkpoint/successor controls remain meaningful.
 
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,

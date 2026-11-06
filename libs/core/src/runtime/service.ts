@@ -2546,7 +2546,7 @@ export class AgentMonitorRuntime {
       if (!source) {
         // Source resolution is an admission boundary even without held work.
         // A live watcher can create its first hold while an earlier scope awaits.
-        this.setWatchPolicy(monitor.id, workspacePath, null);
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
         if (this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
           this.reportNotifyEditFailure(
             monitor.id,
@@ -2676,17 +2676,15 @@ export class AgentMonitorRuntime {
         error: `Candidate definition does not identify monitor "${id}".`,
       };
     }
-    const admitted = this.watchPolicies.get(
+    const admittedPath = this.notifyPolicyUsers.get(
       JSON.stringify([workspacePath, id]),
-    );
-    if (admitted?.id !== id || admitted.filePath === candidatePath) {
-      return candidate;
-    }
-    const current = parseMonitorFile(admitted.filePath);
+    )?.currentPath;
+    if (!admittedPath || admittedPath === candidatePath) return candidate;
+    const current = parseMonitorFile(admittedPath);
     if (current.ok && current.monitor.id !== id) {
       return {
         ok: false,
-        filePath: admitted.filePath,
+        filePath: admittedPath,
         error: `Current definition does not identify monitor "${id}".`,
       };
     }
@@ -2699,7 +2697,7 @@ export class AgentMonitorRuntime {
     // Moving back is legitimate only when the admitted location is proven
     // absent. An unreadable location remains authoritative until validated;
     // permission/query failures must not turn another file into its replacement.
-    if (candidate?.ok && this.isNotifyDefinitionPathAbsent(admitted.filePath)) {
+    if (candidate?.ok && this.isNotifyDefinitionPathAbsent(admittedPath)) {
       return candidate;
     }
     return current;
@@ -2724,7 +2722,12 @@ export class AgentMonitorRuntime {
       discovered.filePath,
     );
     if (current?.ok) return current.monitor;
-    this.setWatchPolicy(discovered.id, workspacePath, null);
+    this.setWatchPolicy(
+      discovered.id,
+      workspacePath,
+      null,
+      current?.filePath ?? discovered.filePath,
+    );
     this.reportNotifyEditFailure(
       discovered.id,
       workspacePath,
@@ -2780,7 +2783,14 @@ export class AgentMonitorRuntime {
         }
       }
       const message = `Notify edit blocked: ${reason ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
-      this.setWatchPolicy(id, workspacePath, null);
+      this.setWatchPolicy(
+        id,
+        workspacePath,
+        null,
+        current?.ok
+          ? current.monitor.filePath
+          : (current?.filePath ?? captured.filePath),
+      );
       this.reportNotifyEditFailure(
         id,
         workspacePath,
@@ -2795,26 +2805,44 @@ export class AgentMonitorRuntime {
    * Scanned notify definitions gate watcher acceptance, without restarting or
    * reconfiguring the live source. A null definition means old held work or its
    * definition is blocked; the current yield remains on the consumer's stack.
+   * Location provenance belongs to its counted owner and survives a closed gate.
    */
   private readonly watchPolicies = new Map<string, MonitorDefinition | null>();
-  /** Only live watcher/poll admissions own cached definitions; durable holds live in SQLite. */
-  private readonly notifyPolicyUsers = new Map<string, number>();
+  /**
+   * Counted live ownership carries one current location separately from gate
+   * permission. Blocking cannot erase that authority; the last user retires it.
+   * This private record holds no instructions or path history. Durable holds
+   * remain in SQLite and are not deleted with process-local ownership.
+   */
+  private readonly notifyPolicyUsers = new Map<
+    string,
+    {
+      /** Watchers, evaluating polls and deferred results each retain their own lease. */
+      users: number;
+      /** Latest selected location, including a definition that has not reconciled successfully. */
+      currentPath?: string;
+    }
+  >();
   /** In-flight or blocked poll results retain their execution snapshot until admitted or retired. */
   private readonly pollAdmissions = new Map<string, PollAdmission>();
 
   /** Cache ownership spans async work, never the lifetime of a retired declaration. */
   private retainNotifyPolicy(id: string, workspacePath: string): void {
     const key = JSON.stringify([workspacePath, id]);
-    this.notifyPolicyUsers.set(key, (this.notifyPolicyUsers.get(key) ?? 0) + 1);
+    const owner = this.notifyPolicyUsers.get(key);
+    if (owner) owner.users++;
+    else this.notifyPolicyUsers.set(key, { users: 1 });
     if (!this.watchPolicies.has(key)) this.watchPolicies.set(key, null);
   }
 
   /** Release only process-local admission metadata; accepted durable work is never deleted here. */
   private releaseNotifyPolicy(id: string, workspacePath: string): void {
     const key = JSON.stringify([workspacePath, id]);
-    const remaining = (this.notifyPolicyUsers.get(key) ?? 1) - 1;
-    if (remaining > 0) this.notifyPolicyUsers.set(key, remaining);
+    const owner = this.notifyPolicyUsers.get(key);
+    if (owner && owner.users > 1) owner.users--;
     else {
+      // Permission, current location and cached instructions share this exact
+      // lifetime; no retired owner can govern a future declaration or discovery.
       this.notifyPolicyUsers.delete(key);
       this.watchPolicies.delete(key);
     }
@@ -2841,14 +2869,23 @@ export class AgentMonitorRuntime {
   /** Waiting source acceptance/checkpoints wake on reconciliation or teardown. */
   private readonly watchPolicyWaiters = new Map<string, Set<() => void>>();
 
-  /** Wake backpressured watcher work only when a reconciliation changes its gate. */
+  /**
+   * Publish permission and current location within existing ownership. A blocked
+   * definition may identify a new location before it ever reconciles successfully.
+   * Closing without a new location preserves the latest authority, including
+   * when an older asynchronous failure reports after a newer scan.
+   */
   private setWatchPolicy(
     id: string,
     workspacePath: string,
     definition: MonitorDefinition | null,
+    blockedPath?: string,
   ): void {
     const key = JSON.stringify([workspacePath, id]);
-    if (!this.notifyPolicyUsers.has(key)) return;
+    const owner = this.notifyPolicyUsers.get(key);
+    if (!owner) return;
+    const currentPath = definition?.filePath ?? blockedPath;
+    if (currentPath !== undefined) owner.currentPath = currentPath;
     this.watchPolicies.set(key, definition);
     this.wakeNotifyPolicy(key);
   }
@@ -3080,7 +3117,7 @@ export class AgentMonitorRuntime {
     acc: TickAccumulator,
     ephemeralSessionId?: string,
   ): Promise<boolean> {
-    this.setWatchPolicy(monitor.id, workspacePath, null);
+    this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
     const sourceName = monitor.frontmatter.watch.type;
 
     try {
@@ -3830,7 +3867,7 @@ export class AgentMonitorRuntime {
       if (!source) {
         // Never leave an existing watcher open under an unresolved definition;
         // classify retained work from current scoped state, not the earlier scan.
-        this.setWatchPolicy(monitor.id, workspacePath, null);
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
         if (this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
           const message = `Notify edit blocked: unknown source "${sourceName}"; accepted holds retained.`;
           this.reportNotifyEditFailure(

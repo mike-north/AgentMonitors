@@ -106,12 +106,19 @@ for (const failure of [
       const state = () => store.getMonitorState('held', root);
       // Read-only lifetime assertions do not grant or revoke ownership themselves.
       const metadata = runtime as unknown as {
-        notifyPolicyUsers: Map<string, number>;
+        notifyPolicyUsers: Map<
+          string,
+          number | { users: number; currentPath?: string }
+        >;
         pollAdmissions: Map<string, unknown>;
         watchPolicies: Map<string, unknown>;
       };
+      const leaseCount = () => {
+        const owner = metadata.notifyPolicyUsers.get(key);
+        return typeof owner === 'number' ? owner : (owner?.users ?? 0);
+      };
       const counts = () => ({
-        leases: metadata.notifyPolicyUsers.get(key) ?? 0,
+        leases: leaseCount(),
         admissions: metadata.pollAdmissions.size,
         policies: metadata.watchPolicies.size,
       });

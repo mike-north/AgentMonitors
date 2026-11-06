@@ -1168,8 +1168,14 @@ remains legitimate. Fallback requires genuine absence evidence: a metadata query
 ENOENT or ENOTDIR for the admitted location. A false boolean existence probe also represents access
 or query failure and **MUST NOT** authorize replacement. Permission, other I/O or unclassified
 metadata failures keep admission blocked with the original read diagnostic and retained holds.
-No path/generation history outlives its actual admission owner, and established source/handling
-snapshots are not restarted or reconfigured; independent scopes continue.
+Closing permission **MUST NOT** forget the current location to revalidate: repeated unchanged
+tick/startup and captured-route discoveries remain blocked until that location is valid or genuine
+absence permits moveback. A newly selected location that fails source resolution or reconciliation
+also becomes the current location while blocked; subsequent file edits there are reread, not replaced
+with cached contents. One current pathname belongs to the existing counted live ownership, separately
+from open/closed permission. It contains no instruction snapshot or historical locations and retires
+with the last watcher/poll/deferred-result lease. No retired location governs a future owner.
+Established source/handling snapshots are not restarted or reconfigured; independent scopes continue.
 
 **Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
 reread current held state under that writer boundary, and commit the entire old batch's events,
