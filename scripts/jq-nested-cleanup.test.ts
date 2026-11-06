@@ -61,3 +61,31 @@ it.each(['timeout', 'natural exit'])(
   },
   10_000,
 );
+
+it('confirms ignored-stdio workers are terminal when the helper returns', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'jq-completion-state-'));
+  const file = join(dir, 'workers.json');
+  let pids: number[] = [];
+  try {
+    const code = `const {spawn}=require('node:child_process');const pids=[];for(let i=0;i<2;i++){const c=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore'});pids.push(c.pid);c.unref()}require('node:fs').writeFileSync(${JSON.stringify(file)},JSON.stringify(pids));`;
+    const result = await runJqTestChild(['-e', code], {
+      cwd: dir,
+      env: process.env,
+      timeout: 1_000,
+    });
+    pids = JSON.parse(readFileSync(file, 'utf8'));
+    expect(result.status).toBe(0);
+    expect(result.error).toBeUndefined();
+    // No caller-side polling: completion itself must carry this guarantee.
+    expect(pids.map((pid) => ownedWorkerTerminated(pid))).toEqual([true, true]);
+  } finally {
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch (error) {
+        expect(error).toMatchObject({ code: 'ESRCH' });
+      }
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

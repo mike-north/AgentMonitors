@@ -39,14 +39,14 @@ for (const mode of ['local missing', 'CI missing', 'present']) {
           [
             join(root, 'node_modules/vitest/vitest.mjs'),
             'run',
-            'src/commands/pr-alerting-presets.test.ts',
-            '-t',
-            'the presets’ jq reduction over raw gh output',
+            '--config',
+            'scripts/vitest.config.ts',
+            'scripts/jq-direct-presets.test.ts',
             '--reporter=json',
             `--outputFile=${report}`,
           ],
           {
-            cwd: join(root, 'apps/cli'),
+            cwd: root,
             env,
             // Bound the owned child below the enclosing test deadline. A private
             // process group also cleans up surviving Vitest workers on exit.
@@ -66,6 +66,9 @@ for (const mode of ['local missing', 'CI missing', 'present']) {
         } else {
           expect(result.status, result.stdout + result.stderr).toBe(0);
           expect(summary.numPassedTests).toBeGreaterThan(1);
+          expect(JSON.stringify(summary)).toContain(
+            'direct shipped jq reductions',
+          );
         }
       } finally {
         rmSync(dir, { recursive: true, force: true });

@@ -168,8 +168,19 @@ it is not proof of another OS, a fresh runner, or suites skipped for missing fac
 The PR-alerting preset reduction tests require the external `jq` executable. Local
 contributors without jq MAY omit those reductions, but Vitest MUST report an explicit
 skip naming the omitted surface, never a passing no-op. CI without jq MUST fail; when
-jq is present the real reduction cases MUST execute. The partial-test notice calls out
-this facility-dependent coverage. A reported skip means that surface remains unverified.
+jq is present the real reduction cases MUST execute.
+
+The script facility control executes the actual jq programs extracted from the shipped
+preset templates directly against authored raw-GitHub fixtures. It does not start
+command-poll observations or prove source/preset integration; those unchanged integration
+cases remain in the normal CLI package suite run by `pnpm test` and `pnpm verify`.
+The facility driver's owned boundary covers its Node/jq process group, not production
+observations that deliberately create separate groups. An error-free outermost return
+requires bounded terminal-state confirmation for that known group (including Linux
+zombie/dead states), rather than merely a SIGKILL request. Cleanup time is reserved
+inside the existing total bound; child/parent deadlines are not increased.
+
+The partial-test notice calls out this facility-dependent coverage. A reported skip means that surface remains unverified.
 
 The mandatory `test` job MUST NOT acquire unreviewed `needs` prerequisites: a skipped
 path-filtered prerequisite can skip the job even when it has no explicit condition.
