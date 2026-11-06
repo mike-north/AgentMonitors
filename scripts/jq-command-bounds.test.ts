@@ -18,6 +18,12 @@ import { waitForOwnedGroupTermination } from './owned-test-group.mjs';
 
 const root = resolve(import.meta.dirname, '..');
 
+// Measured cold/contended Vitest launch/import/report work approaches 3s. Give
+// that framework work its own 4s allowance plus the independently proven 1s jq
+// verdict; framework scheduling does not extend jq's execution deadline.
+const FRAMEWORK_ALLOWANCE = 4_000;
+const NEGATIVE_PHASE_ALLOWANCE = FRAMEWORK_ALLOWANCE + 1_000;
+
 /**
  * Close only this fixture's detached Vitest driver group within its reserved
  * cleanup deadline. A signal request/error is not terminal evidence. Query and
@@ -145,7 +151,7 @@ it.each([
       let status: 'reported' | 'blocked' | number | null = 'blocked';
       // Vitest's JSON reporter publishes only at onTestRunEnd. Process close
       // also includes reporter/pool teardown, which is not the jq verdict.
-      const phaseDeadline = started + 4_000;
+      const phaseDeadline = started + NEGATIVE_PHASE_ALLOWANCE;
       while (Date.now() < phaseDeadline) {
         if (existsSync(reportFile)) {
           try {
@@ -169,7 +175,7 @@ it.each([
       const phaseEvidence = existsSync(phases)
         ? readFileSync(phases, 'utf8')
         : 'No jq phase began';
-      const evidence = `${output}\nComplete phase report: ${JSON.stringify(phaseReport)}\nDriver elapsed: ${Date.now() - started}ms\nOwned phases:\n${phaseEvidence}`;
+      const evidence = `${output}\nComplete phase report: ${JSON.stringify(phaseReport)}\nDriver started: ${started}\nDriver elapsed: ${Date.now() - started}ms\nFramework/command phase allowance: ${NEGATIVE_PHASE_ALLOWANCE}ms\nOwned phases:\n${phaseEvidence}`;
       const registeredPids = existsSync(pids)
         ? readFileSync(pids, 'utf8').trim().split('\n').map(Number)
         : [];
@@ -230,8 +236,8 @@ it.each([
     } catch (error) {
       phaseFailure = error;
     } finally {
-      // Keep the phase's 4s bound and reserve at most 1s for driver cleanup
-      // inside the existing 6s test, independent of incidental reporter exit.
+      // Reserve 1s for cleanup after the 5s framework/command phase, with 1s
+      // harness margin in the 7s test. Natural reporter exit is not the verdict.
       try {
         await finishNegativeJqDriver(child, completion, Date.now() + 1_000);
       } catch (error) {
@@ -249,5 +255,5 @@ it.each([
     if (phaseFailure) throw phaseFailure;
     if (cleanupFailure) throw cleanupFailure;
   },
-  6_000,
+  7_000,
 );

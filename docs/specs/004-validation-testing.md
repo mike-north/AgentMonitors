@@ -180,14 +180,18 @@ The script facility control executes the actual jq programs extracted from the s
 preset templates directly against authored raw-GitHub fixtures. It does not start
 command-poll observations or prove source/preset integration; those unchanged integration
 cases remain in the normal CLI package suite run by `pnpm test` and `pnpm verify`.
-Each negative command-deadline phase selects one actual command invocation; both
-positive canonical reductions still execute. Within the unchanged 4-second phase
-bound, the driver requires Vitest's complete end-of-run result for the intended module
-and selected test, a visible jq deadline failure, and its sole owned jq command terminal
-before fixture force-cleanup. Natural reporter/process close is not the command outcome.
-Driver-group close and terminal confirmation have a separate hard 1-second cleanup
-reservation inside the existing 6-second enclosing test. No partial/first-test error
-may stand in for the whole intended phase.
+Script test files run serially so nested Vitest/package-manager processes cannot
+multiply outer worker pools. Package `pnpm test` scheduling and aggregate commands
+remain unchanged. Each negative command-deadline phase selects one actual command
+invocation; both positive canonical reductions still execute. The private fixture
+allows 4 seconds for framework launch/import/report work plus the independently strict
+1,000ms jq verdict: a 5-second complete-phase allowance. It requires the complete
+end-of-run result for the intended module/test, a visible jq deadline failure, and
+its sole owned jq terminal before fixture force-cleanup. Natural reporter/process
+close is not the command outcome. Driver close and group-terminal confirmation have
+a separate hard 1-second cleanup reservation, with harness margin in a 7-second test.
+No partial/first-test error may stand in for the whole intended phase. The framework
+allowance does not extend jq execution or child/query helper deadlines.
 The facility driver's owned boundary covers its Node/jq process group, not production
 observations that deliberately create separate groups. An error-free outermost return
 requires bounded terminal-state confirmation for that known group (including Linux
