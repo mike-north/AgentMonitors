@@ -30,10 +30,8 @@ it
       mkdirSync(toolsDir, { recursive: true });
       const npm = packageManagerEntry('npm');
       const pnpm = packageManagerEntry('pnpm');
-      if (!npm || !pnpm)
-        throw new Error(
-          'real npm and pnpm are required for compatibility fixtures',
-        );
+      if (!npm)
+        throw new Error('real npm is required for compatibility fixtures');
       const selectedNpm =
         layout === 'Corepack context proxy'
           ? path.join(root, 'node_modules/corepack/dist/npm.js')
@@ -69,7 +67,9 @@ it
         );
       }
       symlinkSync(selectedNpm, path.join(toolsDir, 'npm'));
-      symlinkSync(pnpm, path.join(toolsDir, 'pnpm'));
+      // POSIX packing also supports executable-only pnpm. When JS discovery is
+      // absent, retain inherited PATH so the real suite exercises that fallback.
+      if (pnpm) symlinkSync(pnpm, path.join(toolsDir, 'pnpm'));
       const separateNode = path.join(nodeDir, 'node');
       symlinkSync(process.execPath, separateNode);
       // Preload applies to Vitest and its workers, so the actual committed helper
