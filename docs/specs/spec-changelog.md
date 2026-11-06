@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Explicit local gate scheduling, facilities, and audit boundaries (004 §2.10) — Refs #458
+
+Preserve valid job metadata in negative guard fixtures, reject prerequisites that could
+skip the mandatory test job, and report optional local jq preset-reduction coverage as
+skipped rather than a passing no-op. CI still requires jq; available jq runs real cases.
+Document and guard the existing independent live dependency-audit exclusion, including
+its separate command and the distinction from script-suite audit fixtures/version floors.
+The aggregate sequence, security workflow cadence, and website exclusion are unchanged.
+
 ## 2026-11-05 — Preserve native Shape input rejection (001 §5.1) — Refs #542
 
 Extend the pre-normalization guard to the verified historical non-mapping family:

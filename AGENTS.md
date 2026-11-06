@@ -64,6 +64,9 @@ Docker smoke is included in `test:serial` but self-skips without a reachable Doc
 so a local pass without Docker does not verify that CI coverage. `apps/website` remains
 excluded from root build/check/format/lint; its CI link check does not validate copy-paste
 commands or semantic documentation correctness. Website changes need separate verification.
+The independent live advisory audit runs separately via `pnpm check:dependency-audit`;
+audit fixture/floor tests in `test:scripts` do not run that live gate. Local missing-jq
+preset reductions are reported skips; CI requires jq.
 See [004 §2.10](docs/specs/004-validation-testing.md#210-repository-pre-push-gate) for the
 gate contract and the website decision still reserved for a human.
 

@@ -135,6 +135,8 @@ function assertLocalGate(
     }
     if (id === 'test') {
       expect(job).not.toHaveProperty('if');
+      // A skipped prerequisite skips this job even without an explicit if.
+      expect(job).not.toHaveProperty('needs');
     }
     expect(job).not.toHaveProperty('continue-on-error');
     for (const step of runs) {
@@ -235,6 +237,13 @@ describe('local verification gate (issue #458)', () => {
     );
   });
 
+  it('rejects prerequisites that can skip the mandatory test job', () => {
+    const changed = structuredClone(workflow);
+    const job = { ...changed.jobs.test, needs: 'website-link-check' };
+    changed.jobs.test = job;
+    expect(() => assertLocalGate(changed, completeScripts)).toThrow();
+  });
+
   it('rejects the old build/check/test gate', () => {
     expect(() =>
       assertLocalGate(workflow, {
@@ -266,6 +275,7 @@ describe('local verification gate (issue #458)', () => {
   it('rejects a newly added CI command missing locally', () => {
     const changed = structuredClone(workflow);
     changed.jobs.test = {
+      ...changed.jobs.test,
       steps: [...changed.jobs.test.steps, { run: 'pnpm test:new-suite' }],
     };
     expect(() => assertLocalGate(changed, completeScripts)).toThrow();
@@ -285,6 +295,7 @@ describe('local verification gate (issue #458)', () => {
   it('requires a coverage decision for an unfamiliar action', () => {
     const changed = structuredClone(workflow);
     changed.jobs.test = {
+      ...changed.jobs.test,
       steps: [...changed.jobs.test.steps, { uses: 'example/validation@v1' }],
     };
     expect(() => assertLocalGate(changed, completeScripts)).toThrow();
@@ -307,6 +318,7 @@ describe('local verification gate (issue #458)', () => {
     (weakening) => {
       const changed = structuredClone(workflow);
       changed.jobs.test = {
+        ...changed.jobs.test,
         steps: changed.jobs.test.steps.map((step) =>
           step.run === 'pnpm test:serial' ? { ...step, ...weakening } : step,
         ),
@@ -342,5 +354,78 @@ describe('local verification gate (issue #458)', () => {
     expect(test).toBe(
       'NX_TUI=false nx run-many --target=test --exclude=agentmonitors-workspace',
     );
+  });
+});
+
+/** The advisory gate has its own security cadence, separate from ci.yml parity. */
+const independentAudit = {
+  path: '.github/workflows/dependency-audit.yml',
+  command: 'pnpm check:dependency-audit',
+  reason:
+    'Independent scheduled production-advisory audit; run separately from pnpm verify.',
+};
+const auditWorkflow: IWorkflow = parse(
+  readFileSync(resolve(root, independentAudit.path), 'utf8'),
+);
+
+/** Require an explicit decision when the excluded portable audit surface changes. */
+function assertIndependentAudit(candidate: IWorkflow): void {
+  expect(Object.keys(candidate.jobs)).toEqual(['dependency-audit']);
+  for (const key of Object.keys(candidate)) {
+    expect(['name', 'on', 'jobs']).toContain(key);
+  }
+  const job = candidate.jobs['dependency-audit'];
+  for (const key of Object.keys(job)) {
+    expect(['name', 'runs-on', 'timeout-minutes', 'steps']).toContain(key);
+  }
+  expect(job['runs-on']).toBe('ubuntu-latest');
+  for (const step of job.steps) {
+    for (const key of Object.keys(step)) {
+      expect(
+        step.uses === undefined ? ['name', 'run'] : ['name', 'uses', 'with'],
+      ).toContain(key);
+    }
+    if (step.uses !== undefined) {
+      expect(step.uses).toMatch(
+        /^(actions\/checkout|pnpm\/action-setup|actions\/setup-node)@[^\s]+$/,
+      );
+    }
+  }
+  expect(
+    job.steps.flatMap((step) => (step.run === undefined ? [] : [step.run])),
+  ).toEqual(['pnpm install --frozen-lockfile', independentAudit.command]);
+}
+
+describe('independent production audit exclusion', () => {
+  it('classifies the actual workflow and keeps its live command separate', () => {
+    assertIndependentAudit(auditWorkflow);
+    expect(independentAudit.reason).toContain('scheduled');
+    expect(pkg.scripts.verify).not.toContain(independentAudit.command);
+    expect(pkg.scripts['check:dependency-audit']).toBe(
+      'node scripts/check-dependency-audit.mjs',
+    );
+  });
+
+  it.each([
+    { run: 'pnpm check:new-audit' },
+    { run: 'pnpm check:dependency-audit', 'working-directory': 'apps/website' },
+  ])('requires a decision for an extra excluded audit step: %j', (step) => {
+    const changed = structuredClone(auditWorkflow);
+    changed.jobs['dependency-audit'] = {
+      ...changed.jobs['dependency-audit'],
+      steps: [...changed.jobs['dependency-audit'].steps, step],
+    };
+    expect(() => assertIndependentAudit(changed)).toThrow();
+  });
+
+  it('rejects removing the live audit command', () => {
+    const changed = structuredClone(auditWorkflow);
+    changed.jobs['dependency-audit'] = {
+      ...changed.jobs['dependency-audit'],
+      steps: changed.jobs['dependency-audit'].steps.filter(
+        (step) => step.run !== independentAudit.command,
+      ),
+    };
+    expect(() => assertIndependentAudit(changed)).toThrow();
   });
 });

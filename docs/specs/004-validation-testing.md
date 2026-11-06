@@ -165,6 +165,17 @@ Nx still schedules dependency builds and caches eligible package targets, includ
 A green result means these commands succeeded on this host, subject to reported skips;
 it is not proof of another OS, a fresh runner, or suites skipped for missing facilities.
 
+The PR-alerting preset reduction tests require the external `jq` executable. Local
+contributors without jq MAY omit those reductions, but Vitest MUST report an explicit
+skip naming the omitted surface, never a passing no-op. CI without jq MUST fail; when
+jq is present the real reduction cases MUST execute. The partial-test notice calls out
+this facility-dependent coverage. A reported skip means that surface remains unverified.
+
+The mandatory `test` job MUST NOT acquire unreviewed `needs` prerequisites: a skipped
+path-filtered prerequisite can skip the job even when it has no explicit condition.
+Guard regressions MUST preserve unrelated valid job metadata so each negative case
+proves the intended execution or command obligation.
+
 The explicit CI-only responsibilities are:
 
 - Checkout, Node/pnpm provisioning, dependency installation, and GitHub event/path filters.
@@ -175,6 +186,14 @@ The explicit CI-only responsibilities are:
 - `website-link-check`: website build and internal-link validation remain a separate,
   path-filtered CI gate. Root build/check/format/lint exclusion is unchanged; the existing
   website unit tests are already included by root `pnpm test`.
+
+The independent `.github/workflows/dependency-audit.yml` is a separately guarded
+exclusion from `pnpm verify`. Its daily security cadence, path-filtered PR/main triggers,
+and advisory guarantee remain unchanged. Run `pnpm check:dependency-audit` separately
+for the live production-advisory gate. `test:scripts` exercises audit fixtures and
+version-floor regressions; it does **not** substitute for a live advisory query. The
+parity guard pins the excluded workflow's known `pnpm check:dependency-audit` command
+and rejects unfamiliar executable steps/contexts rather than silently excluding additions.
 
 Docker smoke is **not** a separate job: `test:serial` discovers it on both hosts, but it
 self-skips without a reachable Docker daemon. Report this as unverified Docker coverage

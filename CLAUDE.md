@@ -62,6 +62,10 @@ semantic documentation correctness; verify website changes separately. The human
 on adding website coverage to the root gate remains open; see
 [004 §2.10](docs/specs/004-validation-testing.md#210-repository-pre-push-gate).
 
+The independent live advisory audit remains separate: run `pnpm check:dependency-audit`.
+Script-suite audit fixtures/version floors do not replace that live query. Preset jq
+reductions report skipped coverage when jq is unavailable locally; CI requires jq.
+
 Per-package / single-test:
 
 ```bash
