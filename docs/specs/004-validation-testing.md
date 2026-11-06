@@ -181,9 +181,13 @@ preset templates directly against authored raw-GitHub fixtures. It does not star
 command-poll observations or prove source/preset integration; those unchanged integration
 cases remain in the normal CLI package suite run by `pnpm test` and `pnpm verify`.
 Each negative command-deadline phase selects one actual command invocation; both
-positive canonical reductions still execute. Startup and teardown remain inside the
-unchanged hard driver watchdog, and the owned negative command must be terminal
-before fixture force-cleanup.
+positive canonical reductions still execute. Within the unchanged 4-second phase
+bound, the driver requires Vitest's complete end-of-run result for the intended module
+and selected test, a visible jq deadline failure, and its sole owned jq command terminal
+before fixture force-cleanup. Natural reporter/process close is not the command outcome.
+Driver-group close and terminal confirmation have a separate hard 1-second cleanup
+reservation inside the existing 6-second enclosing test. No partial/first-test error
+may stand in for the whole intended phase.
 The facility driver's owned boundary covers its Node/jq process group, not production
 observations that deliberately create separate groups. An error-free outermost return
 requires bounded terminal-state confirmation for that known group (including Linux

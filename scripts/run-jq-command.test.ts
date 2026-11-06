@@ -16,12 +16,24 @@ interface IOwnedCommand {
 interface ITransportControl {
   rejectPayload: boolean;
   payloadWrites: number;
+  holdCallback: boolean;
+  releaseCallback: (() => void) | undefined;
   owned: IOwnedCommand[];
 }
 const transport = vi.hoisted<ITransportControl>(() => ({
   rejectPayload: false,
   payloadWrites: 0,
+  holdCallback: false,
+  releaseCallback: undefined,
   owned: [],
+}));
+// Keep imported driver timers on the test's clock; real executable I/O stays
+// real. Without this seam, fake global time cannot advance node:timers bindings.
+vi.mock('node:timers', () => ({
+  setTimeout: (callback: () => void, ms: number) =>
+    globalThis.setTimeout(callback, ms),
+  clearTimeout: (timer: ReturnType<typeof setTimeout> | undefined) =>
+    globalThis.clearTimeout(timer),
 }));
 vi.mock('node:child_process', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:child_process')>();
@@ -40,7 +52,16 @@ vi.mock('node:child_process', async (importOriginal) => {
       // Keep the actual host executable and result. Only the owned stdin transport
       // is controlled, so this fixture cannot manufacture positive jq evidence.
       expect(file).toBe('jq');
-      const child = actual.execFile(file, args, options, callback);
+      const child = actual.execFile(
+        file,
+        args,
+        options,
+        (error, stdout, stderr) => {
+          if (transport.holdCallback)
+            transport.releaseCallback = () => callback(error, stdout, stderr);
+          else callback(error, stdout, stderr);
+        },
+      );
       const closed = new Promise<void>((resolve) =>
         child.once('close', () => resolve()),
       );
@@ -85,6 +106,8 @@ const jqOnPath = (process.env.PATH ?? '').split(delimiter).some((dir) => {
 beforeEach(() => {
   transport.rejectPayload = false;
   transport.payloadWrites = 0;
+  transport.holdCallback = false;
+  transport.releaseCallback = undefined;
   transport.owned = [];
 });
 afterEach(async () => {
@@ -133,6 +156,47 @@ describe.skipIf(!jqOnPath && !process.env.CI)(
         expect(transport.payloadWrites).toBe(1);
       },
     );
+
+    it('enforces the exact 1000ms verdict budget before a late real-jq callback', async () => {
+      // Keep real executable/lifecycle evidence while delaying only its callback.
+      // Fake time proves the command budget independently of Vitest teardown.
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      vi.setSystemTime(1_000);
+      transport.holdCallback = true;
+      let settled = false;
+      const operation = runJqCommand(['--version']).then(
+        () => {
+          settled = true;
+          return 'success';
+        },
+        (error: unknown) => {
+          settled = true;
+          return error;
+        },
+      );
+      try {
+        const owned = transport.owned[0];
+        if (!owned) throw new Error('real jq did not spawn');
+        await owned.closed;
+        expect(transport.releaseCallback).toBeTypeOf('function');
+        await vi.advanceTimersByTimeAsync(999);
+        expect(settled).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(
+          settled,
+          'the existing command budget must settle at 1000ms',
+        ).toBe(true);
+        const result = await operation;
+        expect(result).toBeInstanceOf(Error);
+        if (!(result instanceof Error))
+          throw new Error('late callback became success');
+        expect(result.message).toMatch(/jq command deadline expired/);
+      } finally {
+        transport.releaseCallback?.();
+        await operation;
+        vi.useRealTimers();
+      }
+    });
 
     it('retains a natural nonzero no-input command result', async () => {
       await expect(runJqCommand(['-n', '-e', 'false'])).rejects.toMatchObject({
