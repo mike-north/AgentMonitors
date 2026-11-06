@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-06 — Late poll errors preserve successor admissions (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify source exclusion after a poll relinquishes its synchronous admission: its later asynchronous
+ingestion error reporting cannot remove a successor's slot or wake work through it. Require public
+overlapping ticks, a real SQLite fault, ordered durable reopen and watcher/checkpoint/scope controls.
+This does not add ordinary ingestion rollback or a durable recovery queue.
+
 ## 2026-11-05 — Close checkpoint admission before scope retirement (002 §2.4, 004 §2.5) — Refs #537
 
 Clarify the existing G14/notify-boundary guarantee across natural completion and iterator error.

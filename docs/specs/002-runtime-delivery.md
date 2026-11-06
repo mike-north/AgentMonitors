@@ -1180,7 +1180,9 @@ must not publish an unread prefix. This rule does not introduce unrelated live-d
 Polling shares this boundary: concurrent rescans may reconcile a monitor while its `observe()` is
 in flight. The runtime **MUST** recheck current admission before the returned result's deterministic
 writes, applying current pacing with the established execution/handling snapshot. Only one source
-observation may be in flight or awaiting admission per monitor/workspace. If reconciliation is
+observation may be in flight or awaiting admission per monitor/workspace. Once an operation
+relinquishes that admission, its later completion/error reporting **MUST NOT** remove a successor's
+slot or wake waiters as if that successor had finished. If reconciliation is
 blocked, retain that returned result locally and finish the tick with an explainable error, so the
 daemon can run a later recovery scan. A successful rescan drains the old captured holds and admits
 the retained result before another observation or watcher factory can overtake its source baseline.

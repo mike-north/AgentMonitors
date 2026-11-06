@@ -20,3 +20,6 @@ retired monitor instructions.
 Watcher completion/error closes checkpoint admission while retaining its scoped ownership until
 accepted queued writes settle, so recovery polling or replacement watchers read those writes before
 advancing their own baseline. Late, aborted and superseded callbacks cannot rewind a newer cursor.
+
+Reporting an older poll's ingestion failure no longer releases a successor's active admission,
+preventing overlapping source observations and baseline regression during failure cleanup.

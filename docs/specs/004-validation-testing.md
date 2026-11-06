@@ -100,6 +100,16 @@ preserve the later baseline. Include abort/stop, superseded actual-write tokens,
 workspace/monitor scopes and completion with no queued work; no retired cache owner may delete a
 successor's slot.
 
+`runtime/notify-failed-poll-successor.test.ts` MUST schedule overlapping public ticks so a real
+SQLite ingestion failure resumes its error handler after a successor observation has started.
+The older handler must preserve that successor's admission: a third poll stays excluded and
+watcher factory/checkpoint work waits until the successor's writes finish. Assert correctly ordered
+baselines/events through full SQLite close/reopen, the original ingestion error, ordinary observe
+failure/success controls, valid later wakeups and healthy sibling/foreign-workspace progress.
+Failures before ingestion starts must still clean up their own admission and permit a later poll.
+Scheduling may complete a registered source at registry lookup; runtime/ingestion/admission methods
+must remain actual implementations.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart

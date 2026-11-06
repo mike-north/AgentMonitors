@@ -3327,8 +3327,13 @@ export class AgentMonitorRuntime {
       this.wakeNotifyPolicy(key);
       acc.emittedEventIds.push(...(await ingestion));
     } catch (ingestError) {
-      this.pollAdmissions.delete(key);
-      this.wakeNotifyPolicy(key);
+      // A synchronous failure may still own admission; an asynchronous
+      // rejection may resume after this poll relinquished it to a successor.
+      // Only the current owner can retire the slot and wake its waiters.
+      if (this.pollAdmissions.get(key) === admission) {
+        this.pollAdmissions.delete(key);
+        this.wakeNotifyPolicy(key);
+      }
       const message =
         ingestError instanceof Error
           ? ingestError.message
