@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -16,6 +17,7 @@ import { packageManagerEntry } from './package-manager-entry.mjs';
 
 /** Restore selection inputs so host installations cannot make absence tests pass. */
 const node = process.execPath;
+const originalEnv = { ...process.env };
 const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
 const roots: string[] = [];
 afterEach(() => {
@@ -23,6 +25,7 @@ afterEach(() => {
   if (platformDescriptor)
     Object.defineProperty(process, 'platform', platformDescriptor);
   vi.unstubAllEnvs();
+  process.env = { ...originalEnv };
   for (const root of roots.splice(0))
     rmSync(root, { recursive: true, force: true });
 });
@@ -122,3 +125,149 @@ describe.each(['official Windows', 'official POSIX', 'Windows PATH'])(
     );
   },
 );
+
+/** Corepack's named proxies belong to their manager, even under another launcher. */
+describe.each(['official Windows', 'Windows PATH'])(
+  'Corepack pnpm (%s)',
+  (layout) => {
+    it.each(['npm-cli.js', 'yarn.js', 'bun.js', undefined])(
+      'discovers pnpm under %s',
+      (parent) => {
+        const root = realpathSync(
+          mkdtempSync(path.join(os.tmpdir(), 'am corepack & spaces-')),
+        );
+        roots.push(root);
+        const nodeDir = path.join(root, 'node');
+        const toolsDir = path.join(root, 'tools');
+        mkdirSync(nodeDir, { recursive: true });
+        mkdirSync(toolsDir, { recursive: true });
+        process.execPath = path.join(nodeDir, 'node.exe');
+        Object.defineProperty(process, 'platform', { value: 'win32' });
+        process.env = { PATH: toolsDir };
+        if (parent) {
+          process.env.npm_execpath = path.join(root, parent);
+          writeFileSync(
+            process.env.npm_execpath,
+            'throw new Error("wrong manager");',
+          );
+        }
+        writeFileSync(
+          path.join(toolsDir, 'pnpm.cmd'),
+          '@echo never execute this shim',
+        );
+        const entry = path.join(
+          layout === 'official Windows' ? nodeDir : toolsDir,
+          'node_modules/corepack/dist/pnpm.js',
+        );
+        mkdirSync(path.dirname(entry), { recursive: true });
+        writeFileSync(
+          entry,
+          'console.log(JSON.stringify(process.argv.slice(2)));',
+        );
+        const resolved = packageManagerEntry('pnpm');
+        expect(resolved).toBe(entry);
+        if (!resolved) throw new Error('Corepack pnpm was not found');
+        const result = spawnSync(node, [resolved, 'literal & spaces'], {
+          encoding: 'utf8',
+        });
+        expect(result.status, result.stderr).toBe(0);
+        expect(JSON.parse(result.stdout)).toEqual(['literal & spaces']);
+      },
+    );
+  },
+);
+
+it.each(['invoking', 'PATH'])(
+  'recognizes the named Corepack npm proxy via %s',
+  (selection) => {
+    const root = realpathSync(
+      mkdtempSync(path.join(os.tmpdir(), 'am corepack npm-')),
+    );
+    roots.push(root);
+    const tools = path.join(root, 'tools');
+    const entry = path.join(root, 'packages/corepack/dist/npm.js');
+    mkdirSync(tools, { recursive: true });
+    mkdirSync(path.dirname(entry), { recursive: true });
+    writeFileSync(entry, 'console.log(JSON.stringify(process.argv.slice(2)));');
+    process.execPath = path.join(root, 'separate-node/node');
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+    process.env = { PATH: selection === 'PATH' ? tools : '' };
+    if (selection === 'invoking') process.env.npm_execpath = entry;
+    // A PATH link must resolve to the Corepack proxy, not to npm-cli.js.
+    if (selection === 'PATH') symlinkSync(entry, path.join(tools, 'npm'));
+    const resolved = packageManagerEntry('npm');
+    expect(resolved).toBe(entry);
+    if (!resolved) throw new Error('Corepack npm was not found');
+    const result = spawnSync(node, [resolved, 'literal & spaces'], {
+      encoding: 'utf8',
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(['literal & spaces']);
+  },
+);
+
+it.each(['pnpm.js', 'yarn.js', 'bun.js'])(
+  'rejects another Corepack manager (%s) as npm',
+  (filename) => {
+    const root = realpathSync(
+      mkdtempSync(path.join(os.tmpdir(), 'am corepack isolation-')),
+    );
+    roots.push(root);
+    const entry = path.join(root, 'node_modules/corepack/dist', filename);
+    mkdirSync(path.dirname(entry), { recursive: true });
+    writeFileSync(entry, 'throw new Error("wrong manager");');
+    process.execPath = path.join(root, 'node');
+    process.env = { PATH: root, npm_execpath: entry };
+    expect(packageManagerEntry('npm')).toBeUndefined();
+  },
+);
+
+/** POSIX treats differently cased variables as unrelated; Windows accepts Path. */
+it.each([
+  ['linux', 'PATH'],
+  ['linux', 'Path-before-PATH'],
+  ['linux', 'Path-only'],
+  ['win32', 'Path-only'],
+  ['win32', 'missing'],
+])('selects the correct path variable for %s with %s', (platform, variant) => {
+  const root = realpathSync(
+    mkdtempSync(path.join(os.tmpdir(), 'am path case-')),
+  );
+  roots.push(root);
+  const tools = path.join(root, 'tools');
+  const entry = path.join(tools, 'node_modules/npm/bin/npm-cli.js');
+  mkdirSync(path.dirname(entry), { recursive: true });
+  writeFileSync(entry, 'console.log(JSON.stringify(process.argv.slice(2)));');
+  process.execPath = path.join(root, 'separate-node/node');
+  Object.defineProperty(process, 'platform', { value: platform });
+  process.env = {};
+  if (variant === 'Path-before-PATH')
+    process.env.Path = path.join(root, 'unrelated');
+  if (variant === 'PATH' || variant === 'Path-before-PATH')
+    process.env.PATH = tools;
+  if (variant === 'Path-only') process.env.Path = tools;
+  const shouldFind =
+    variant !== 'missing' && !(platform === 'linux' && variant === 'Path-only');
+  const resolved = packageManagerEntry('npm');
+  expect(resolved).toBe(shouldFind ? entry : undefined);
+  if (resolved) {
+    const result = spawnSync(node, [resolved, 'literal & spaces'], {
+      encoding: 'utf8',
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual(['literal & spaces']);
+  }
+});
+
+it('does not treat an arbitrary npm.js file as a Corepack npm proxy', () => {
+  const root = realpathSync(
+    mkdtempSync(path.join(os.tmpdir(), 'am npm identity-')),
+  );
+  roots.push(root);
+  const entry = path.join(root, 'unrelated/dist/npm.js');
+  mkdirSync(path.dirname(entry), { recursive: true });
+  writeFileSync(entry, 'throw new Error("not Corepack npm");');
+  process.execPath = path.join(root, 'node');
+  process.env = { PATH: '', npm_execpath: entry };
+  expect(packageManagerEntry('npm')).toBeUndefined();
+});

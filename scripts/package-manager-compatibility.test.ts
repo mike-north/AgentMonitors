@@ -4,7 +4,6 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
-  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -16,6 +15,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, expect, it } from 'vitest';
 
 import { packPackage } from './lib/pack-helpers.mjs';
+import { packageManagerEntry } from './lib/package-manager-entry.mjs';
 
 /** Disposable workspace and tool installations never alter the developer's tools. */
 const roots: string[] = [];
@@ -26,9 +26,12 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
 });
 
-/** The real npm bundled with the test runner's Node is copied only by symlink. */
+/** Use an installed npm launcher without assuming it shares Node's directory. */
 function npmEntry(): string {
-  return realpathSync(path.join(path.dirname(process.execPath), 'npm'));
+  const entry = packageManagerEntry('npm');
+  if (!entry)
+    throw new Error('npm is required for real compatibility fixtures');
+  return entry;
 }
 
 it.skipIf(process.platform === 'win32')(

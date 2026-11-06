@@ -9,6 +9,10 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Resolve Corepack proxies and platform PATH semantics (004 §2.7) — Refs #520
+
+Discover the requested manager through named Corepack proxies, honor exact POSIX `PATH` independently of Windows casing, and discover npm fixture tools separately from Node. The actual compatibility suite is exercised under separate Node/npm installations.
+
 ## 2026-11-05 — Discover every supported pnpm launcher extension (004 §2.7) — Refs #520
 
 Official Node and adjacent PATH package discovery now considers pnpm `.cjs`, `.js`, and `.mjs` entrypoints under other invoking package managers, matching direct pnpm invocation support.
