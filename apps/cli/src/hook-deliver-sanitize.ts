@@ -11,6 +11,8 @@
  * @see ../../../docs/specs/005-cli-reference.md §12.2.1
  */
 
+import { truncateAtCodePointBoundary } from './truncate-at-code-point-boundary.js';
+
 /**
  * Force an untrusted string field from the stdin payload into a single-line,
  * control-safe, quoted form suitable for a stderr line. Any of the callers'
@@ -31,16 +33,13 @@ export function sanitizeUntrustedField(value: string): string {
   const MAX_LENGTH = 128;
   let truncated = value;
   if (value.length > MAX_LENGTH) {
-    let out = '';
-    for (const ch of value) {
-      if (out.length + ch.length > MAX_LENGTH) break;
-      out += ch;
-    }
-    truncated = `${out}…`;
+    truncated = `${truncateAtCodePointBoundary(value, MAX_LENGTH)}…`;
   }
   // None of these code points can appear inside an escape sequence
   // JSON.stringify already produced, so a post-pass over the serialized string
   // is safe and keeps the output a valid, round-trippable JSON string.
+  // DEL/C1 (U+007F–U+009F) matches hook-deliver-render.ts's sanitize range;
+  // stderr escapes it while delivery content strips it.
   return JSON.stringify(truncated).replace(
     /[\u007f-\u009f\u2028\u2029]/g,
     (ch) => `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`,
