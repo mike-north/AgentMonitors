@@ -4,7 +4,6 @@
  * scopes are outside this boundary and must not be started by facility controls.
  */
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { readdir, readFile } from 'node:fs/promises';
 import { platform } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -25,21 +24,71 @@ function checkBudget(group, deadline, signal) {
   if (signal.aborted || Date.now() >= deadline) throw expired(group);
 }
 
+/**
+ * The Darwin membership query owns a direct child outside the group it inspects.
+ * Retain that handle so a deadline verdict also releases the driver's readers/ref,
+ * even when cancellation cannot make the query exit. This proves no termination.
+ * @param {number} group
+ * @param {number} deadline
+ * @param {AbortSignal} signal
+ * @returns {Promise<string>}
+ */
+async function darwinGroupState(group, deadline, signal) {
+  checkBudget(group, deadline, signal);
+  /** @type {import('node:child_process').ChildProcess | undefined} */
+  let child;
+  /** @type {(() => void) | undefined} */
+  let onAbort;
+  /** Release only this query's owned handles; late callback/error events stay handled. */
+  function release() {
+    if (!child) return;
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* Preserve the original query failure. */
+    }
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    child.unref();
+  }
+  try {
+    return await new Promise((resolve, reject) => {
+      child = execFile(
+        '/bin/ps',
+        ['-axo', 'pid=,pgid=,stat='],
+        {
+          encoding: 'utf8',
+          timeout: Math.max(1, deadline - Date.now()),
+          killSignal: 'SIGKILL',
+          signal,
+        },
+        (error, stdout, stderr) => {
+          if (error) reject(Object.assign(error, { stdout, stderr }));
+          else resolve(stdout);
+        },
+      );
+      onAbort = () => {
+        release();
+        reject(expired(group));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    });
+  } catch (error) {
+    release();
+    throw error;
+  } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort);
+  }
+}
+
 /** @param {number} group @param {number} deadline @param {AbortSignal} signal @returns {Promise<boolean>} */
 async function terminated(group, deadline, signal) {
   checkBudget(group, deadline, signal);
   if (platform() === 'darwin') {
     // Use OS membership/state instead of unreliable Darwin group-zero probes.
-    const { stdout } = await promisify(execFile)(
-      '/bin/ps',
-      ['-axo', 'pid=,pgid=,stat='],
-      {
-        encoding: 'utf8',
-        timeout: deadline - Date.now(),
-        killSignal: 'SIGKILL',
-        signal,
-      },
-    );
+    const stdout = await darwinGroupState(group, deadline, signal);
     checkBudget(group, deadline, signal);
     for (const line of stdout.trim().split('\n').filter(Boolean)) {
       checkBudget(group, deadline, signal);

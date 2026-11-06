@@ -168,7 +168,10 @@ it is not proof of another OS, a fresh runner, or suites skipped for missing fac
 The PR-alerting preset reduction tests require the external `jq` executable. Local
 contributors without jq MAY omit those reductions, but Vitest MUST report an explicit
 skip naming the omitted surface, never a passing no-op. CI without jq MUST fail; when
-jq is present the real reduction cases MUST execute.
+jq is present the real reduction cases MUST execute. Facility probes and canonical
+filter executions use an asynchronous total verdict within the existing 1,000ms
+per-command budget, including during test discovery. A hanging or broken executable
+MUST fail visibly; only ENOENT permits the optional local omission.
 
 The script facility control executes the actual jq programs extracted from the shipped
 preset templates directly against authored raw-GitHub fixtures. It does not start
@@ -185,7 +188,13 @@ kill request never produces exit/close, the driver still returns a visible deadl
 error, releases its readers and unreferences the child handle. Signal success and
 handle release do not prove termination. If confirmation
 fails, the driver releases inherited readers and returns the error rather than waiting
-for the failed group's pipe closure; reader release is not termination evidence.
+for the failed group's pipe closure; reader release is not termination evidence. The
+Darwin membership query owns a separate direct child: its failure/deadline path must
+release that child's streams and reference even if cancellation does not produce exit.
+Late query callbacks remain handled and cannot authorize success or further scans.
+On Linux, a listed proc entry disappearing with ENOENT does not establish group
+termination: the fresh group probe must also establish absence. A still-present group
+with no readable members remains unconfirmed until the existing deadline.
 
 The partial-test notice calls out this facility-dependent coverage. A reported skip means that surface remains unverified.
 

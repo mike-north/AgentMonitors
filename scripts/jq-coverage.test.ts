@@ -6,7 +6,7 @@
 import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { jqAvailable } from './run-jq-command.mjs';
 
 import { expect, it } from 'vitest';
 import { runJqTestChild } from './run-jq-test-child.mjs';
@@ -15,8 +15,7 @@ const root = resolve(import.meta.dirname, '..');
 
 // Probe the outer host, not just the private child PATH. Only the positive
 // control needs host jq; missing-facility controls must always execute.
-const hostHasJq =
-  spawnSync('jq', ['--version'], { timeout: 1_000 }).status === 0;
+const hostHasJq = await jqAvailable();
 
 for (const mode of ['local missing', 'CI missing', 'present']) {
   it.skipIf(mode === 'present' && !hostHasJq && !process.env.CI)(

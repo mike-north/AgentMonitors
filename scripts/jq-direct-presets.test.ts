@@ -3,14 +3,14 @@
  * gh stub, or command-poll observation is started here. Real source integration
  * remains in the unchanged CLI package preset suite, run by pnpm test/verify.
  */
-import { spawnSync } from 'node:child_process';
+import { jqAvailable, runJqCommand } from './run-jq-command.mjs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { parseMonitor } from '../libs/core/src/parser/parse-monitor.js';
 import { describe, expect, it } from 'vitest';
 import { TEMPLATES } from '../apps/cli/src/commands/init.js';
 
-const hasJq = spawnSync('jq', ['--version'], { timeout: 1_000 }).status === 0;
+const hasJq = await jqAvailable();
 
 describe('direct shipped jq reductions', () => {
   if (!hasJq) {
@@ -27,7 +27,7 @@ describe('direct shipped jq reductions', () => {
 
   it.each(['pr-review', 'my-prs'] as const)(
     'executes the actual %s program on authored fixtures',
-    (preset) => {
+    async (preset) => {
       const parsed = parseMonitor(
         TEMPLATES[preset],
         join(tmpdir(), preset, 'MONITOR.md'),
@@ -86,13 +86,7 @@ describe('direct shipped jq reductions', () => {
           },
         ];
       }
-      const result = spawnSync('jq', [...args, program], {
-        input,
-        encoding: 'utf8',
-        timeout: 1_000,
-      });
-      expect(result.error).toBeUndefined();
-      expect(result.status, result.stderr).toBe(0);
+      const result = await runJqCommand([...args, program], input);
       expect(JSON.parse(result.stdout)).toEqual(expected);
     },
   );

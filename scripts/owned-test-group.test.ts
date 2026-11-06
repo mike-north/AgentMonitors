@@ -8,7 +8,10 @@ const { list, stat } = vi.hoisted(() => ({
 }));
 vi.mock('node:fs/promises', () => ({ readdir: list, readFile: stat }));
 vi.mock('node:os', () => ({ platform: () => 'linux' }));
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 it('waits for a pending-kill worker to reach terminal state', async () => {
   vi.spyOn(process, 'kill').mockReturnValue(true);
@@ -46,12 +49,58 @@ it('fails within the existing deadline if a worker is not terminal', async () =>
 });
 
 it('does not equate a disappearing proc entry with group termination', async () => {
-  vi.spyOn(process, 'kill').mockReturnValue(true);
-  list.mockResolvedValue(['123']);
-  stat.mockRejectedValue(Object.assign(new Error('gone'), { code: 'ENOENT' }));
+  vi.useFakeTimers();
+  vi.setSystemTime(1_000);
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  list.mockClear().mockResolvedValue(['123']);
+  stat
+    .mockClear()
+    .mockRejectedValue(Object.assign(new Error('gone'), { code: 'ENOENT' }));
+  const verdict = waitForOwnedGroupTermination(456, 1_010).then(
+    () => 'success',
+    (error) =>
+      error instanceof Error && /deadline/.test(error.message)
+        ? 'deadline'
+        : 'other error',
+  );
+  // The initial budget is live. Complete the ENOENT scan and fresh group probe
+  // before advancing time; an existing group with no readable members is unknown.
+  await vi.advanceTimersByTimeAsync(0);
+  expect(list).toHaveBeenCalledExactlyOnceWith('/proc');
+  expect(stat).toHaveBeenCalledExactlyOnceWith(
+    '/proc/123/stat',
+    expect.objectContaining({ encoding: 'utf8' }),
+  );
+  expect(kill.mock.calls).toEqual([
+    [-456, 0],
+    [-456, 0],
+  ]);
+  await vi.advanceTimersByTimeAsync(10);
+  expect(await verdict).toBe('deadline');
+});
+
+it('accepts a disappearing proc entry only after a fresh gone-group probe', async () => {
+  const kill = vi
+    .spyOn(process, 'kill')
+    .mockReturnValueOnce(true)
+    .mockImplementationOnce(() => {
+      throw Object.assign(new Error('gone group'), { code: 'ESRCH' });
+    });
+  list.mockClear().mockResolvedValue(['123']);
+  stat
+    .mockClear()
+    .mockRejectedValue(
+      Object.assign(new Error('gone entry'), { code: 'ENOENT' }),
+    );
   await expect(
-    waitForOwnedGroupTermination(456, Date.now() - 1),
-  ).rejects.toThrow('not terminated');
+    waitForOwnedGroupTermination(456, Date.now() + 1_000),
+  ).resolves.toBeUndefined();
+  expect(list).toHaveBeenCalledTimes(1);
+  expect(stat).toHaveBeenCalledTimes(1);
+  expect(kill.mock.calls).toEqual([
+    [-456, 0],
+    [-456, 0],
+  ]);
 });
 
 it('rejects a terminal proc result that arrives after the absolute deadline', async () => {
