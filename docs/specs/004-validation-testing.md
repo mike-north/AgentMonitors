@@ -123,6 +123,18 @@ Assert the original error and committed drain truthfully, normal success/recover
 private-cache cleanup after deletion and full SQLite close/reopen. Existing cancellation/retirement,
 scope isolation, writer-lock, killed-process and successor-admission controls remain required.
 
+`runtime/notify-live-definition.test.ts` MUST create the first actual watcher hold **after** an
+older tick/startup captured held membership, then edit its source to an unknown name. Checkpoint
+and yield must stay blocked without cursor/baseline advancement, the error remains scoped and a
+healthy sibling progresses. No-held unknown-source errors remain fatal but close existing admission.
+Exercise flat→folder and folder→flat same-ID moves with old/new tick and startup discovery; actual
+checkpoints must use the newer admitted path without a third scan, while established handling stays
+pinned. Captured-route missing diagnostics share that protection. Reread invalid/deleted/current
+unknown-source or invalid-scope replacements, retain fatal duplicates and isolate foreign workspace
+identities. Assert actual watcher effects, recovery and full SQLite close/reopen; do not replace
+runtime/store/admission methods. Independent hold-classification/path-resolution reversions must
+reproduce their own failures while the earlier freshness/handoff controls remain green.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart

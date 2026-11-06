@@ -3,7 +3,10 @@ import path from 'node:path';
 import { ulid } from 'ulid';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
-import { parseMonitorFile } from '../parser/parse-monitor.js';
+import {
+  parseMonitorFile,
+  type ParseOutcome,
+} from '../parser/parse-monitor.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
@@ -2527,11 +2530,7 @@ export class AgentMonitorRuntime {
     );
     this.reapDormantSessions(now, workspacePath, monitorsById);
 
-    const heldIds = this.reportMissingHeldDefinitions(
-      result,
-      workspacePath,
-      acc,
-    );
+    this.reportMissingHeldDefinitions(result, workspacePath, acc);
 
     // Persistent monitors (directory-authored). An unknown source is a hard tick
     // failure — the author can fix the file.
@@ -2545,8 +2544,10 @@ export class AgentMonitorRuntime {
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
-        if (heldIds.has(monitor.id)) {
-          this.setWatchPolicy(monitor.id, workspacePath, null);
+        // Source resolution is an admission boundary even without held work.
+        // A live watcher can create its first hold while an earlier scope awaits.
+        this.setWatchPolicy(monitor.id, workspacePath, null);
+        if (this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
           this.reportNotifyEditFailure(
             monitor.id,
             workspacePath,
@@ -2625,6 +2626,64 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /** Hold membership can change across source/Interpret awaits; only this scope's live state counts. */
+  private hasCurrentNotifyHold(id: string, workspacePath: string): boolean {
+    const notify = this.store.getMonitorState(id, workspacePath).notifyState;
+    return (
+      (notify.pendingDebounce?.observations.length ?? 0) > 0 ||
+      (notify.pendingRollup?.observations.length ?? 0) > 0
+    );
+  }
+
+  /**
+   * A path is a location, not monitor identity. A live scoped owner's latest
+   * admitted path may supersede a discovered/captured path after relocation.
+   * Reread both files: cached contents never authorize admission, and two valid
+   * same-id definitions remain a duplicate error rather than a preference rule.
+   * Only the existing owner's one path is consulted; no path history survives it.
+   */
+  private readCurrentNotifyDefinition(
+    id: string,
+    workspacePath: string,
+    candidatePath?: string,
+  ): ParseOutcome | undefined {
+    const candidate = candidatePath
+      ? parseMonitorFile(candidatePath)
+      : undefined;
+    if (candidate?.ok && candidate.monitor.id !== id) {
+      return {
+        ok: false,
+        filePath: candidate.monitor.filePath,
+        error: `Candidate definition does not identify monitor "${id}".`,
+      };
+    }
+    const admitted = this.watchPolicies.get(
+      JSON.stringify([workspacePath, id]),
+    );
+    if (admitted?.id !== id || admitted.filePath === candidatePath) {
+      return candidate;
+    }
+    const current = parseMonitorFile(admitted.filePath);
+    if (current.ok && current.monitor.id !== id) {
+      return {
+        ok: false,
+        filePath: admitted.filePath,
+        error: `Current definition does not identify monitor "${id}".`,
+      };
+    }
+    if (candidate?.ok && current.ok) {
+      throw new Error(
+        `Duplicate monitor ids: "${id}" (${candidate.monitor.filePath}, ${current.monitor.filePath}).`,
+      );
+    }
+    if (current.ok) return current;
+    // Moving back to a previous location is legitimate when the admitted path
+    // has disappeared. An extant but invalid current file cannot be hidden by
+    // another location; its current validation error must still close the gate.
+    if (candidate?.ok && !existsSync(admitted.filePath)) return candidate;
+    return current;
+  }
+
   /**
    * Discovery supplies candidate paths, not continuing authority to edit policy.
    * Reread one authored definition immediately before its synchronous preparation:
@@ -2638,14 +2697,18 @@ export class AgentMonitorRuntime {
     workspacePath: string,
     acc: TickAccumulator,
   ): MonitorDefinition | undefined {
-    const current = parseMonitorFile(discovered.filePath);
-    if (current.ok) return current.monitor;
+    const current = this.readCurrentNotifyDefinition(
+      discovered.id,
+      workspacePath,
+      discovered.filePath,
+    );
+    if (current?.ok) return current.monitor;
     this.setWatchPolicy(discovered.id, workspacePath, null);
     this.reportNotifyEditFailure(
       discovered.id,
       workspacePath,
       discovered.frontmatter.watch.type,
-      `Notify edit blocked: ${current.error}; accepted holds retained.`,
+      `Notify edit blocked: ${current?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`,
       acc,
     );
     return undefined;
@@ -2656,7 +2719,7 @@ export class AgentMonitorRuntime {
     result: Awaited<ReturnType<typeof scanMonitors>>,
     workspacePath: string,
     acc: TickAccumulator,
-  ): Set<string> {
+  ): void {
     const knownIds = new Set(
       result.monitors.map((parsed) => parsed.monitor.id),
     );
@@ -2676,11 +2739,26 @@ export class AgentMonitorRuntime {
       );
       // The scan itself can finish out of order with a newer discovery. A stale
       // missing/invalid result must not close that newer definition's live gate.
-      const current = captured.filePath
-        ? parseMonitorFile(captured.filePath)
-        : undefined;
-      if (current?.ok) continue;
-      const message = `Notify edit blocked: ${current?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
+      const current = this.readCurrentNotifyDefinition(
+        id,
+        workspacePath,
+        captured.filePath,
+      );
+      let reason = current?.ok ? undefined : current?.error;
+      if (current?.ok) {
+        const sourceName = current.monitor.frontmatter.watch.type;
+        const source = this.registry.get(sourceName);
+        if (!source) reason = `unknown source "${sourceName}"`;
+        else {
+          const errors = validateWatchScope(
+            watchConfig(current.monitor.frontmatter.watch),
+            source.scopeSchema,
+          );
+          if (!errors.length) continue;
+          reason = `Invalid monitor definition: ${errors.join('; ')}`;
+        }
+      }
+      const message = `Notify edit blocked: ${reason ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
       this.setWatchPolicy(id, workspacePath, null);
       this.reportNotifyEditFailure(
         id,
@@ -2690,8 +2768,6 @@ export class AgentMonitorRuntime {
         acc,
       );
     }
-
-    return heldIds;
   }
 
   /**
@@ -3707,11 +3783,7 @@ export class AgentMonitorRuntime {
       erroredObservations: [],
       skippedMonitors: [],
     };
-    const heldIds = this.reportMissingHeldDefinitions(
-      result,
-      workspacePath,
-      startup,
-    );
+    this.reportMissingHeldDefinitions(result, workspacePath, startup);
     for (const error of startup.erroredObservations) {
       options.onError?.(error.monitorId, new Error(error.message));
     }
@@ -3735,9 +3807,11 @@ export class AgentMonitorRuntime {
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
-        if (heldIds.has(monitor.id)) {
+        // Never leave an existing watcher open under an unresolved definition;
+        // classify retained work from current scoped state, not the earlier scan.
+        this.setWatchPolicy(monitor.id, workspacePath, null);
+        if (this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
           const message = `Notify edit blocked: unknown source "${sourceName}"; accepted holds retained.`;
-          this.setWatchPolicy(monitor.id, workspacePath, null);
           this.reportNotifyEditFailure(
             monitor.id,
             workspacePath,

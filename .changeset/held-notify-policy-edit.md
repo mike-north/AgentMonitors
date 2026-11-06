@@ -28,3 +28,9 @@ Tick and watcher startup reread each authored definition immediately before poli
 so delayed discovery cannot restore obsolete pacing or drain newer holds. Deferred-result handoff
 releases its retained snapshot lease even when argument access fails before ingestion, preserving
 other live owners and reporting the already committed edit accurately.
+
+Unknown-source admission checks current scoped holds, including a watcher's first hold created while
+another monitor awaits, and blocks invalid-definition checkpoints/yields without skipping healthy
+siblings. A live same-ID/workspace definition moved between flat and folder forms remains usable
+when an older discovery or captured envelope still names its obsolete path. Current replacement
+files and source semantics are reread; invalid definitions and duplicate IDs remain rejected.

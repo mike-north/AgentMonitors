@@ -1157,9 +1157,15 @@ definition immediately before its reconciliation transaction, without an interve
 read is the admission linearization point: a file edit after it belongs to a subsequent discovery.
 An older scan delayed on another monitor cannot restore obsolete pacing, drain newer held work,
 or reopen a gate blocked by a newer edit. Missing/invalid scan diagnostics likewise recheck the
-captured file before closing its gate. A later authored return to a previously used policy remains
-a legitimate edit. This needs no historical generation cache and does not restart/reconfigure
-established source or handling snapshots; independent scopes remain able to progress.
+captured file before closing its gate. File location is not identity (001 §2): if a live owner's latest
+admitted definition for the **same monitor ID and workspace** has a different path, both locations
+are reread. A valid current replacement protects admission from an obsolete path's disappearance;
+cached contents alone never authorize it. A missing/invalid current replacement or unresolved source
+still blocks. Two valid same-ID locations remain a fatal duplicate, not a cached-path preference.
+Missing-definition diagnostics use this same scoped resolution, including current source/scope
+validation for held work. Returning to a previously used policy or moving back to a previous location
+remains legitimate. No path/generation history outlives its actual admission owner, and established
+source/handling snapshots are not restarted or reconfigured; independent scopes continue.
 
 **Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
 reread current held state under that writer boundary, and commit the entire old batch's events,
@@ -1169,6 +1175,13 @@ savepoints; the edit drain must not join an externally owned transaction. This p
 runtimes from duplicating or overwriting one drain. Optional Interpret runs after commit using
 each event's own projected recipients. This does not guarantee exactly-once downstream effects
 (000 NP2).
+
+Unknown-source handling **MUST** inspect current workspace-scoped operational holds at source
+resolution, not membership captured before an earlier monitor awaited. A live watcher may create
+its first hold during that await. Existing admission closes on unresolved source even without holds;
+with current held work the failure is scoped, the holds remain, and healthy siblings continue. The
+existing fatal unknown-source behavior without held work is preserved. Checkpoint/yield work cannot
+advance under that invalid definition and resumes only after valid reconciliation or cancellation.
 
 Any deterministic write failure **MUST** roll back every event and all original held/source/timing
 state. The runtime reports the blocked edit through existing tick errors and best-effort history,
