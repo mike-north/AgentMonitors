@@ -5,6 +5,9 @@ import {
   writeFileSync,
   renameSync,
   rmSync,
+  chmodSync,
+  readFileSync,
+  existsSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -18,6 +21,43 @@ import type { Observation, ObservationContext } from '../observation/types.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 
+/** Only the named filesystem location is faulted; all other I/O remains actual. */
+const locationFault = vi.hoisted(
+  (): {
+    path?: string;
+    readCode?: string;
+    statCode?: string;
+    looksAbsent?: boolean;
+  } => ({}),
+);
+vi.mock('node:fs', async (importActual) => {
+  const actual = await importActual<typeof import('node:fs')>();
+  /** Faithful errno failures retain the code that a metadata classifier must inspect. */
+  function failure(code: string): Error {
+    return code === 'unclassified'
+      ? new Error('owned unclassified metadata failure')
+      : Object.assign(new Error(code + ': owned filesystem fault'), { code });
+  }
+  return {
+    ...actual,
+    readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
+      if (args[0] === locationFault.path && locationFault.readCode)
+        throw failure(locationFault.readCode);
+      return actual.readFileSync(...args);
+    },
+    statSync: (...args: Parameters<typeof actual.statSync>) => {
+      if (args[0] === locationFault.path && locationFault.statCode)
+        throw failure(locationFault.statCode);
+      return actual.statSync(...args);
+    },
+    existsSync: (filePath: Parameters<typeof actual.existsSync>[0]) => {
+      if (filePath === locationFault.path && locationFault.looksAbsent)
+        return false;
+      return actual.existsSync(filePath);
+    },
+  };
+});
+
 /** Barriers suspend actual sources/Interpret, never runtime, store or admission implementations. */
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -28,6 +68,10 @@ function deferred<T>() {
 }
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
+  delete locationFault.path;
+  delete locationFault.readCode;
+  delete locationFault.statCode;
+  delete locationFault.looksAbsent;
   for (const cleanup of cleanups.splice(0)) await cleanup();
   vi.useRealTimers();
 });
@@ -617,4 +661,211 @@ for (const invalid of ['unknown', 'invalid-scope'] as const) {
     expect(blocked).toEqual(retained);
     await f.reopen();
   });
+}
+
+it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+  'permission-denied admitted parent cannot masquerade as deletion to admit a valid old path',
+  async () => {
+    const f = await fixture();
+    const pending = await f.suspend();
+    await f.emit('Held B');
+    f.move();
+    await f.tick();
+    const retained = f.state();
+    const admittedParent = path.dirname(f.file);
+    let readCode: unknown;
+    let ambiguousAbsence: boolean;
+    let old: Awaited<ReturnType<typeof pending.finish>> | undefined;
+    let checkpoint: Promise<void> | undefined;
+    let settled = false;
+    let acceptedWhileDenied: boolean;
+    let blocked: ReturnType<typeof f.state>;
+    let siblingProgress: number;
+    let admittedStillExists: boolean;
+    try {
+      chmodSync(admittedParent, 0);
+      writeFileSync(
+        f.originalFile,
+        f.text('watched', DEBOUNCE, 'Conflicting fallback'),
+      );
+      try {
+        readFileSync(f.file);
+      } catch (error) {
+        if (error instanceof Error && 'code' in error) readCode = error.code;
+      }
+      ambiguousAbsence = !existsSync(f.file);
+      old = await pending.finish();
+      checkpoint = f.checkpoint().then(() => {
+        settled = true;
+      });
+      await f.emit('Later B');
+      acceptedWhileDenied = settled;
+      blocked = f.state();
+      siblingProgress = f.cCalls;
+    } finally {
+      // Permission restoration precedes every await/cleanup so failure cannot strand owned resources.
+      chmodSync(admittedParent, 0o700);
+      admittedStillExists = existsSync(f.file);
+      rmSync(f.originalFile, { force: true });
+      await pending.finish();
+      await f.tick();
+      await checkpoint;
+    }
+    await until(() => f.heldCount() === 2);
+    expect(readCode).toBe('EACCES');
+    expect(ambiguousAbsence).toBe(true);
+    expect(admittedStillExists).toBe(true);
+    expect(old && 'error' in old).toBe(false);
+    const diagnostics =
+      old &&
+      'result' in old &&
+      old.result &&
+      'erroredObservations' in old.result
+        ? old.result.erroredObservations.map((error) => error.message)
+        : [];
+    expect(diagnostics.some((message) => message.includes('EACCES'))).toBe(
+      true,
+    );
+    expect(acceptedWhileDenied).toBe(false);
+    expect(blocked).toEqual(retained);
+    expect(siblingProgress).toBe(1);
+    expect(f.rows()).toEqual([]);
+    expect(f.state().sourceState).toEqual({ cursor: 999 });
+    expect(f.bFactories).toBe(1);
+    expect(
+      f.state().notifyState.pendingDebounce?.observations[1]?.monitor
+        .instructions,
+    ).toBe('Original handling');
+    await f.reopen();
+  },
+);
+
+for (const metadataCode of [
+  'EACCES',
+  'EPERM',
+  'EIO',
+  'unclassified',
+  undefined,
+]) {
+  it(
+    'an unreadable admitted file with metadata ' +
+      (metadataCode ?? 'present') +
+      ' cannot authorize ambiguous fallback',
+    async () => {
+      const f = await fixture();
+      const pending = await f.suspend();
+      await f.emit('Held B');
+      f.move();
+      await f.tick();
+      const retained = f.state();
+      writeFileSync(
+        f.originalFile,
+        f.text('watched', DEBOUNCE, 'Conflicting fallback'),
+      );
+      let old: Awaited<ReturnType<typeof pending.finish>> | undefined;
+      let checkpoint: Promise<void> | undefined;
+      let settled = false;
+      let acceptedWhileFaulted: boolean;
+      let blocked: ReturnType<typeof f.state>;
+      let siblingProgress: number;
+      try {
+        locationFault.path = f.file;
+        locationFault.readCode = 'EIO';
+        locationFault.statCode = metadataCode;
+        // Like existsSync's permission/query-error result, false alone carries no absence evidence.
+        locationFault.looksAbsent = true;
+        old = await pending.finish();
+        checkpoint = f.checkpoint().then(() => {
+          settled = true;
+        });
+        await f.emit('Later B');
+        acceptedWhileFaulted = settled;
+        blocked = f.state();
+        siblingProgress = f.cCalls;
+      } finally {
+        delete locationFault.path;
+        delete locationFault.readCode;
+        delete locationFault.statCode;
+        delete locationFault.looksAbsent;
+        rmSync(f.originalFile, { force: true });
+        await pending.finish();
+        await f.tick();
+        await checkpoint;
+      }
+      await until(() => f.heldCount() === 2);
+      expect(existsSync(f.file)).toBe(true);
+      expect(old && 'error' in old).toBe(false);
+      const diagnostics =
+        old &&
+        'result' in old &&
+        old.result &&
+        'erroredObservations' in old.result
+          ? old.result.erroredObservations.map((error) => error.message)
+          : [];
+      expect(
+        diagnostics.some((message) =>
+          message.includes('EIO: owned filesystem fault'),
+        ),
+      ).toBe(true);
+      expect(acceptedWhileFaulted).toBe(false);
+      expect(blocked).toEqual(retained);
+      expect(siblingProgress).toBe(1);
+      expect(f.rows()).toEqual([]);
+      expect(f.state().sourceState).toEqual({ cursor: 999 });
+      expect(f.bFactories).toBe(1);
+      await f.reopen();
+    },
+  );
+}
+
+for (const missingCode of ['ENOENT', 'ENOTDIR'] as const) {
+  it.skipIf(process.platform === 'win32' && missingCode === 'ENOTDIR')(
+    'genuine ' +
+      missingCode +
+      ' at the admitted location permits legitimate moveback without a third scan',
+    async () => {
+      const f = await fixture();
+      const pending = await f.suspend();
+      await f.emit('Held B');
+      f.move();
+      const admitted = f.file;
+      await f.tick();
+      f.move();
+      if (missingCode === 'ENOTDIR') {
+        rmSync(path.dirname(admitted), { recursive: true });
+        writeFileSync(
+          path.dirname(admitted),
+          'The previous parent is now a regular file.',
+        );
+      }
+      let actualCode: unknown;
+      try {
+        readFileSync(admitted);
+      } catch (error) {
+        if (error instanceof Error && 'code' in error) actualCode = error.code;
+      }
+      const old = await pending.finish();
+      let settled = false;
+      const checkpoint = f.checkpoint().then(() => {
+        settled = true;
+      });
+      await settle();
+      const workedWithoutThirdScan = settled;
+      if (!settled) await f.tick();
+      await checkpoint;
+      await f.emit('Later B');
+      expect(actualCode).toBe(missingCode);
+      expect('error' in old).toBe(false);
+      const diagnostics =
+        'result' in old && old.result && 'erroredObservations' in old.result
+          ? old.result.erroredObservations
+          : [];
+      expect(diagnostics).toEqual([]);
+      expect(workedWithoutThirdScan).toBe(true);
+      expect(f.heldCount()).toBe(2);
+      expect(f.state().sourceState).toEqual({ cursor: 999 });
+      expect(f.bFactories).toBe(1);
+      await f.reopen();
+    },
+  );
 }

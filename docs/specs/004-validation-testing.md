@@ -134,6 +134,13 @@ unknown-source or invalid-scope replacements, retain fatal duplicates and isolat
 identities. Assert actual watcher effects, recovery and full SQLite close/reopen; do not replace
 runtime/store/admission methods. Independent hold-classification/path-resolution reversions must
 reproduce their own failures while the earlier freshness/handoff controls remain green.
+It MUST also deny fallback when an admitted parent is mode 000 and read fails EACCES even though
+an existence probe returns false. Use actual POSIX permissions when supported, restoring them in
+finally before fixture cleanup. Faithful targeted filesystem read/metadata faults cover permission,
+I/O and unclassified query errors elsewhere; never replace runtime/store/admission methods. Actual
+checkpoint/yield, original holds/baseline and healthy sibling progress must remain intact until
+permission restoration and valid reconciliation. Genuine ENOENT/ENOTDIR moveback must still succeed
+without another scan, and a narrow absence-classification reversion must fail the denial cases.
 
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,

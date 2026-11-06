@@ -34,3 +34,7 @@ another monitor awaits, and blocks invalid-definition checkpoints/yields without
 siblings. A live same-ID/workspace definition moved between flat and folder forms remains usable
 when an older discovery or captured envelope still names its obsolete path. Current replacement
 files and source semantics are reread; invalid definitions and duplicate IDs remain rejected.
+
+A valid earlier location can replace an admitted path only when metadata proves that location
+absent (ENOENT/ENOTDIR). Permission and I/O failures retain the blocked gate, original holds and
+read diagnostic instead of being mistaken for deletion by a boolean existence check.

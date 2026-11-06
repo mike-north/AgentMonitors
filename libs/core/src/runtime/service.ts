@@ -2636,6 +2636,25 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Fallback is authorized only by positive evidence that the admitted location
+   * is absent. A boolean existence probe also hides permission and I/O failures;
+   * those cannot retire an unreadable current definition in favor of another.
+   * Preserve the original read diagnostic when metadata cannot prove absence.
+   */
+  private isNotifyDefinitionPathAbsent(filePath: string): boolean {
+    try {
+      statSync(filePath);
+      return false;
+    } catch (error) {
+      return (
+        error instanceof Error &&
+        'code' in error &&
+        (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+      );
+    }
+  }
+
+  /**
    * A path is a location, not monitor identity. A live scoped owner's latest
    * admitted path may supersede a discovered/captured path after relocation.
    * Reread both files: cached contents never authorize admission, and two valid
@@ -2677,10 +2696,12 @@ export class AgentMonitorRuntime {
       );
     }
     if (current.ok) return current;
-    // Moving back to a previous location is legitimate when the admitted path
-    // has disappeared. An extant but invalid current file cannot be hidden by
-    // another location; its current validation error must still close the gate.
-    if (candidate?.ok && !existsSync(admitted.filePath)) return candidate;
+    // Moving back is legitimate only when the admitted location is proven
+    // absent. An unreadable location remains authoritative until validated;
+    // permission/query failures must not turn another file into its replacement.
+    if (candidate?.ok && this.isNotifyDefinitionPathAbsent(admitted.filePath)) {
+      return candidate;
+    }
     return current;
   }
 

@@ -1164,8 +1164,12 @@ cached contents alone never authorize it. A missing/invalid current replacement 
 still blocks. Two valid same-ID locations remain a fatal duplicate, not a cached-path preference.
 Missing-definition diagnostics use this same scoped resolution, including current source/scope
 validation for held work. Returning to a previously used policy or moving back to a previous location
-remains legitimate. No path/generation history outlives its actual admission owner, and established
-source/handling snapshots are not restarted or reconfigured; independent scopes continue.
+remains legitimate. Fallback requires genuine absence evidence: a metadata query must report
+ENOENT or ENOTDIR for the admitted location. A false boolean existence probe also represents access
+or query failure and **MUST NOT** authorize replacement. Permission, other I/O or unclassified
+metadata failures keep admission blocked with the original read diagnostic and retained holds.
+No path/generation history outlives its actual admission owner, and established source/handling
+snapshots are not restarted or reconfigured; independent scopes continue.
 
 **Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
 reread current held state under that writer boundary, and commit the entire old batch's events,
