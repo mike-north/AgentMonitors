@@ -856,13 +856,19 @@ export const monitorFrontmatterSchema: z.ZodPipe<z.ZodObject<{
         net: "net";
     }>>;
     tags: z.ZodOptional<z.ZodArray<z.ZodString>>;
-    shape: z.ZodOptional<z.ZodObject<{
+    shape: z.ZodOptional<z.ZodPreprocess<z.ZodObject<{
         derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
             name: z.ZodString;
             when: z.ZodString;
         }, z.core.$strip>>>;
         render: z.ZodOptional<z.ZodLiteral<"rendered">>;
-    }, z.core.$strip>>;
+    }, z.core.$strip>, {
+        derive?: {
+            name: string;
+            when: string;
+        }[] | undefined;
+        render?: "rendered" | undefined;
+    }>>;
     payload: z.ZodOptional<z.ZodObject<{
         form: z.ZodEnum<{
             rendered: "rendered";
@@ -1488,14 +1494,20 @@ export interface ShapedObservation {
 // @public
 export function shapeObservation(observation: Observation, now: Date, config: ShapeStageConfig): ShapedObservation;
 
-// @public (undocumented)
-export const shapeSchema: z.ZodObject<{
+// @public
+export const shapeSchema: z.ZodPreprocess<z.ZodObject<{
     derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
         name: z.ZodString;
         when: z.ZodString;
     }, z.core.$strip>>>;
     render: z.ZodOptional<z.ZodLiteral<"rendered">>;
-}, z.core.$strip>;
+}, z.core.$strip>, {
+    derive?: {
+        name: string;
+        when: string;
+    }[] | undefined;
+    render?: "rendered" | undefined;
+}>;
 
 // @public
 export interface ShapeStageConfig {

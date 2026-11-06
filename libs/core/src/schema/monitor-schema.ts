@@ -1,3 +1,8 @@
+/**
+ * Validates authored monitor declarations before runtime use. Mapping fields
+ * retain their authored meaning across YAML loading and schema normalization;
+ * this module does not coerce scalar declarations into configuration objects.
+ */
 import { z } from 'zod';
 import { validateCelPredicate } from '../runtime/shape.js';
 import {
@@ -191,7 +196,7 @@ const deriveRuleSchema = z.object({
   when: z.string().min(1, 'shape.derive[].when must be a CEL predicate'),
 });
 
-const shapeSchema = z
+const shapeMappingSchema = z
   .object({
     derive: z.array(deriveRuleSchema).optional(),
     render: z.literal('rendered').optional(),
@@ -208,6 +213,25 @@ const shapeSchema = z
       }
     }
   });
+
+/**
+ * A YAML timestamp is a scalar, even though gray-matter loads it as a Date.
+ * Reject it before object parsing can strip it to an empty Shape declaration.
+ * Other inputs retain the mapping schema's validation and unknown-key policy.
+ * Keep the authored input type as well as the parsed output type unchanged.
+ *
+ * @see docs/specs/001-monitor-definition.md §5.1
+ */
+const shapeSchema = z.preprocess(
+  (value: z.input<typeof shapeMappingSchema>, ctx) => {
+    if (value instanceof Date) {
+      ctx.addIssue({ code: 'invalid_type', expected: 'object', input: value });
+      return z.NEVER;
+    }
+    return value;
+  },
+  shapeMappingSchema,
+);
 
 const transformLanguages = ['jq', 'cel'] as const satisfies readonly [
   TransformLanguage,

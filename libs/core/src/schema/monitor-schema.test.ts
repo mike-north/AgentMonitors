@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { monitorFrontmatterSchema } from './monitor-schema.js';
+import { monitorFrontmatterSchema, shapeSchema } from './monitor-schema.js';
 
 const validMinimal = {
   name: 'Test monitor',
@@ -518,6 +518,53 @@ describe('monitorFrontmatterSchema', () => {
 
   // ── Shape / payload frontmatter (G15, 001 §5.1–§5.2) ────────────────────
   describe('shape declaration (001 §5.1)', () => {
+    // Direct consumers must enforce the same mapping boundary as YAML parsing.
+    it('rejects Date scalars through both exported schema surfaces', () => {
+      const timestamp = new Date('2026-11-03T00:00:00Z');
+      const direct = shapeSchema.safeParse(timestamp);
+      expect(direct.success).toBe(false);
+      if (!direct.success) {
+        expect(direct.error.issues).toMatchObject([
+          { code: 'invalid_type', path: [], expected: 'object' },
+        ]);
+      }
+      const frontmatter = monitorFrontmatterSchema.safeParse({
+        ...validMinimal,
+        shape: timestamp,
+      });
+      expect(frontmatter.success).toBe(false);
+      if (!frontmatter.success) {
+        expect(frontmatter.error.issues).toMatchObject([
+          { code: 'invalid_type', path: ['shape'], expected: 'object' },
+        ]);
+      }
+    });
+
+    it.each([{}, { render: 'rendered' }, { derive: [] }, { future: true }])(
+      'retains mapping admission and unknown-key stripping: %j',
+      (shape) => {
+        const result = shapeSchema.safeParse(shape);
+        expect(result.success).toBe(true);
+        if (result.success)
+          expect(result.data).toEqual('future' in shape ? {} : shape);
+      },
+    );
+
+    it.each(['watch', 'notify', 'payload'])(
+      'keeps timestamp rejection for the neighboring %s declaration',
+      (field) => {
+        const result = monitorFrontmatterSchema.safeParse({
+          ...validMinimal,
+          [field]: new Date('2026-11-03T00:00:00Z'),
+        });
+        expect(result.success).toBe(false);
+        if (!result.success)
+          expect(
+            result.error.issues.some((issue) => issue.path[0] === field),
+          ).toBe(true);
+      },
+    );
+
     it('accepts a monitor without shape (backward compatible)', () => {
       const result = monitorFrontmatterSchema.safeParse(validMinimal);
       expect(result.success).toBe(true);

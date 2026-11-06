@@ -347,6 +347,12 @@ shape:
 
 Authoring rules:
 
+- **`shape` MUST be a mapping (current).** An omitted declaration, `{}`, and a
+  mapping such as `{render: rendered}` are valid. Scalar timestamps such as
+  `shape: 2026-11-03` are rejected even when the YAML loader represents them as
+  `Date` objects; they MUST NOT normalize to an empty declaration. The exported
+  `shapeSchema` and `monitorFrontmatterSchema` enforce the same boundary for
+  direct consumers. Parser and schema regression tests cover both paths.
 - **`shape.derive`** is an ordered list of named derived facts. Each entry has a `name` (the marker
   surfaced in the rendered artifact) and a deterministic `when` **CEL boolean predicate** evaluated
   over `(snapshot, now)` — the shaped snapshot plus the runtime-injected `now` (never an ambient
@@ -739,4 +745,7 @@ required test matrix.
 
 The exported monitor schemas use Zod 4 types. Parsed monitor fields and authored
 validation messages retain their contracts; consumers composing exported schemas
-must use Zod 4-compatible APIs. Library-generated issue details follow Zod 4.
+must use Zod 4-compatible APIs. `shapeSchema` is a preprocessing pipe into its
+mapping validator so scalar admission is checked before object normalization;
+its authored input and parsed output types are unchanged. Library-generated
+issue details follow Zod 4.
