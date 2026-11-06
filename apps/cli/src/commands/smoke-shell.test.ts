@@ -1,9 +1,10 @@
 /** Execute the shipped diagnostic shell fragments without installs or Docker. */
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it } from 'vitest';
+import { runShellProbe } from './fixtures/shell-probe.js';
 const script = readFileSync(
   path.join(import.meta.dirname, 'fixtures/cli-docker-smoke.sh'),
   'utf8',
@@ -18,23 +19,12 @@ const readiness = script
 function shell(body: string, env: NodeJS.ProcessEnv = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'am-shell-'));
   try {
-    return spawnSync(
-      'bash',
-      [
-        '-c',
-        preamble
-          .replace('LOG_DIR=/tmp/logs', `LOG_DIR=${dir}`)
-          .replace(
-            'DAEMON_LOG=/tmp/daemon.log',
-            `DAEMON_LOG=${dir}/daemon.log`,
-          ) + body,
-      ],
-      {
-        encoding: 'utf8',
-        timeout: 3000,
-        killSignal: 'SIGKILL',
-        env: { ...process.env, ...env },
-      },
+    return runShellProbe(
+      preamble
+        .replace('LOG_DIR=/tmp/logs', `LOG_DIR=${dir}`)
+        .replace('DAEMON_LOG=/tmp/daemon.log', `DAEMON_LOG=${dir}/daemon.log`) +
+        body,
+      { env },
     );
   } finally {
     rmSync(dir, { recursive: true, force: true });
