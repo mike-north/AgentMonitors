@@ -660,7 +660,7 @@ as an observation-stage failure, not a crash") and `doctor-report.test.ts`.
 
 In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<Observation>`, funnelling each yielded observation through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
 
-While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source owns its change-detection state in memory; the runtime does not persist it automatically, so watchers otherwise re-establish fresh on restart — unless the source durably checkpoints its state via `context.checkpoint` ([§2.4](#24-watch-mode-source-state-checkpointing)), in which case a restart reconciles from the last checkpointed baseline.
+While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after its accepted queued writes settle, after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source owns its change-detection state in memory; the runtime does not persist it automatically, so watchers otherwise re-establish fresh on restart — unless the source durably checkpoints its state via `context.checkpoint` ([§2.4](#24-watch-mode-source-state-checkpointing)), in which case a restart reconciles from the last checkpointed baseline.
 
 > **Example:** a source that opens an OS file-system watcher yields a `modified` observation the instant a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
 >
@@ -687,7 +687,7 @@ Verified: `libs/core/src/runtime/service.ts` — `watchMonitors()`, `consumeWatc
 > (`process.stderr`) and resolves rather than aborting the watcher. A checkpoint delivered after the
 > watcher is torn down (its `AbortSignal` aborted, or it is no longer the current active watcher for
 > its id) is rejected — one warning, no write — and watcher shutdown flushes the serialization chain
-> to a stable reference so an in-flight checkpoint is still awaited. Proven by the
+> after closing admission, retaining scope ownership until accepted writes settle. Proven by the
 > `watch-mode source-state checkpointing (002 §2.4)` suite in
 > `libs/core/src/runtime/service.test.ts`, whose cases cover: checkpoint supplied on the `watch()`
 > path and persisting the updated state before it resolves; the callback absent from the `observe()`
@@ -777,14 +777,30 @@ write.
 
 #### Teardown and post-stop rejection
 
-Once a watcher is torn down — its `AbortSignal` aborted by `stop()`, or it is no longer the current
-active watcher for its monitor id (it exited and was superseded) — the runtime **MUST reject** any
-further `checkpoint` call from that watcher: it writes nothing and logs a single warning, then
-resolves. This prevents a straggling `checkpoint(staleState)` (e.g. from a timer that fires after
-shutdown) from clobbering a newer baseline written by `observe()` or a re-established watcher. Because
-a rejected checkpoint is never enqueued, watcher shutdown — which flushes the per-watcher
-serialization chain until its reference stabilizes so an in-flight checkpoint enqueued as shutdown
-begins is still awaited — is guaranteed to terminate.
+Watcher completion or iterator error **MUST** close checkpoint admission before draining accepted
+work. Further calls from that closing watcher resolve with one warning and no write or new chain
+link, even while its scope is still reserved. Closing and retirement are distinct: the runtime
+**MUST** keep polling/replacement-watcher exclusion for that monitor/workspace until all accepted
+pre-close checkpoint/ingest operations settle. Those operations remain legitimate while their
+token owns the scope and their signal is not aborted. A recovery tick may reconcile the failed
+notify edit and open their gate without waiting for teardown or starting another source early.
+After accepted writes settle, retire only that owner's slot/cache lease; later source construction
+or polling must read the resulting durable checkpoint first.
+
+At the actual synchronous checkpoint write, cancellation and token ownership **MUST** still hold.
+`stop()`/abort cancels blocked unadmitted operations and wakes teardown; a superseded token cannot
+write or release a successor's slot. Calls after closure, abort or retirement never enqueue, so
+straggling callbacks cannot extend the closed drain or overwrite a newer baseline. This preserves
+accepted pre-close writes on natural/error completion rather than silently discarding them.
+
+**Example.** A checkpoint for cursor 111 is queued while an edited-policy drain fails at cursor 1.
+The source completes. Closing rejects later calls but retains its scope. Recovery commits the old
+hold and allows checkpoint 111 to settle; only then may polling observe from 111 and advance to 999. Reopening SQLite must show 999, never a later stale overwrite back to 111.
+
+`runtime/notify-checkpoint-teardown.test.ts` verifies natural/error completion, accepted writes
+before due polling/replacement, post-close rejection, abort, actual-write token checks, workspace/
+monitor isolation and independent SQLite reopen. This does not add ordinary source retry/outbox
+semantics.
 
 > **Test implication.** A test that stops the watcher and then invokes the checkpoint callback
 > captured before `stop()` MUST observe no state write and exactly one warning

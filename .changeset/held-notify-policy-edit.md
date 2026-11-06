@@ -16,3 +16,7 @@ Concurrent polling rechecks admission after observation and retains blocked resu
 later tick can recover without advancing the old cursor. Watcher creation uses the latest admitted
 initial definition, and policy snapshots retire with their live admission instead of accumulating
 retired monitor instructions.
+
+Watcher completion/error closes checkpoint admission while retaining its scoped ownership until
+accepted queued writes settle, so recovery polling or replacement watchers read those writes before
+advancing their own baseline. Late, aborted and superseded callbacks cannot rewind a newer cursor.

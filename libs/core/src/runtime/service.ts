@@ -3782,6 +3782,9 @@ export class AgentMonitorRuntime {
     //    stale-baseline ingest clobber a newer checkpoint, or vice versa).
     // A task's rejection is isolated so it never poisons the chain for the next
     // task (each caller handles its own failure).
+    // Closing freezes admission but retains scope ownership while accepted
+    // work drains. Retirement happens only after that fixed chain settles.
+    let closing = false;
     let chain: Promise<unknown> = Promise.resolve();
     const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
       const result = chain.then(task);
@@ -3792,17 +3795,14 @@ export class AgentMonitorRuntime {
       return result;
     };
 
-    // A checkpoint delivered after this watcher is torn down — its AbortSignal
-    // aborted (stop()), or it is no longer the current active watcher for this
-    // monitor id (it exited and was superseded) — is REJECTED rather than
-    // enqueued (002 §2.4): a straggling `checkpoint(staleState)` must never
-    // clobber a newer baseline written by observe() or a re-established watcher.
-    // Rejecting at call time (not enqueuing) is also what keeps the shutdown
-    // flush below terminating — no new chain links appear once the watcher is
-    // torn down. The checkpoint is scoped to this watcher's own
-    // `(monitorId, workspacePath)` state row (002 §3, #345/#307).
+    // Closing rejects new calls without relinquishing this scope: previously
+    // accepted work may still be waiting on reconciliation. Rejecting before
+    // enqueue freezes the chain, so it can drain and retire without a stream of
+    // stragglers extending teardown. Abort and token mismatch also reject at
+    // call time; queued work rechecks both before its scoped durable mutation.
     const checkpoint = (nextState: unknown): Promise<void> => {
       if (
+        closing ||
         signal.aborted ||
         this.activeWatchers.get(JSON.stringify([workspacePath, monitor.id])) !==
           watcherToken
@@ -3814,9 +3814,18 @@ export class AgentMonitorRuntime {
         return Promise.resolve();
       }
       return enqueue(async () => {
-        await this.acceptWatchWork(monitor, workspacePath, signal, () =>
-          this.writeCheckpoint(monitor.id, workspacePath, nextState),
-        );
+        await this.acceptWatchWork(monitor, workspacePath, signal, () => {
+          // Queued pre-close writes remain legitimate while this token owns the
+          // scope. Recheck identity at the synchronous mutation, not only when
+          // enqueueing; cancellation is rechecked by acceptWatchWork here too.
+          if (
+            this.activeWatchers.get(
+              JSON.stringify([workspacePath, monitor.id]),
+            ) !== watcherToken
+          )
+            return;
+          return this.writeCheckpoint(monitor.id, workspacePath, nextState);
+        });
       });
     };
 
@@ -3908,6 +3917,7 @@ export class AgentMonitorRuntime {
         }
       }
     } catch (error) {
+      closing = true;
       if (!signal.aborted) {
         onError?.(
           monitor.id,
@@ -3915,42 +3925,27 @@ export class AgentMonitorRuntime {
         );
       }
     } finally {
-      // This watcher is done (normal completion, iterator error, or abort):
-      // release its active-watcher slot IF it is still the current watcher for
-      // this monitor id, so the tick loop resumes driving observe() (a watch()
-      // that completes normally must not permanently pin the id and starve
-      // observe()) and a future watchMonitors() can re-establish it. A watcher
-      // already superseded by a newer one leaves that newer entry untouched.
-      if (
-        this.activeWatchers.get(JSON.stringify([workspacePath, monitor.id])) ===
-        watcherToken
-      ) {
-        this.activeWatchers.delete(JSON.stringify([workspacePath, monitor.id]));
+      // Reject new checkpoint calls immediately, including on iterator error.
+      // Accepted pre-close work keeps the monitor/workspace slot until it has
+      // settled, so a recovery rescan may open its gate without allowing a new
+      // poll or watcher to overtake that work's durable source baseline.
+      closing = true;
+      try {
+        await chain;
+      } finally {
+        // A superseded owner can retire its own cache lease, never its
+        // successor's active slot. Abort wakes blocked work before this drain.
+        if (
+          this.activeWatchers.get(
+            JSON.stringify([workspacePath, monitor.id]),
+          ) === watcherToken
+        ) {
+          this.activeWatchers.delete(
+            JSON.stringify([workspacePath, monitor.id]),
+          );
+        }
+        this.releaseNotifyPolicy(monitor.id, workspacePath);
       }
-      // Flush every still-pending checkpoint/ingest before the watcher task
-      // resolves, so `stop()` (which awaits every watcher task) truly waits for
-      // in-flight durable writes rather than racing shutdown against them.
-      //
-      // Under the CURRENT invariants — the slot delete above always precedes
-      // this flush, `checkpoint()`'s post-teardown guard rejects (rather than
-      // enqueuing) once the slot is deleted/superseded, and `writeCheckpoint`'s
-      // persistence is synchronous better-sqlite3 work — no NEW link can be
-      // appended to `chain` once we start reading it here, so a single
-      // `await chain` would already be sufficient. The re-read loop below is
-      // deliberately kept anyway as a defensive guard against a future change
-      // to any of those three invariants (e.g. an async checkpoint backend, or
-      // a reordering of the delete relative to this flush) reintroducing a
-      // window where a link is enqueued between the read and its settle; it is
-      // not compensating for a race that exists today. Do not reorder the slot
-      // delete relative to this flush — that ordering is what the guarantee
-      // depends on.
-      let settled = chain;
-      await settled;
-      while (settled !== chain) {
-        settled = chain;
-        await settled;
-      }
-      this.releaseNotifyPolicy(monitor.id, workspacePath);
     }
   }
 

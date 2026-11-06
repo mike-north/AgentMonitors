@@ -91,6 +91,15 @@ factory boundary, exercise a gate closing, cancellation and replacement with a n
 definition. Repeated declare/tick/cancel, close and dormancy cycles must release cached definitions
 without deleting accepted history; live blocked watcher/poll waiters and teardown remain functional.
 
+`runtime/notify-checkpoint-teardown.test.ts` MUST block an actual unawaited source checkpoint
+with a failed SQLite edit drain, then naturally complete or fail the iterator. Closing rejects new
+calls, keeps its scoped exclusion/cache ownership while accepted writes drain, and permits recovery
+rescans without a deadlocked tick. Assert that polling/replacement reads the accepted checkpoint
+before its own baseline advancement, not a silently discarded write. Independent reopen must
+preserve the later baseline. Include abort/stop, superseded actual-write tokens, healthy foreign
+workspace/monitor scopes and completion with no queued work; no retired cache owner may delete a
+successor's slot.
+
 Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
 including a later batch write and failed diagnostics. Assert full rollback of original state,
 no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart
