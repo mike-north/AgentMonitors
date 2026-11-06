@@ -120,7 +120,9 @@ it.skipIf(process.platform === 'win32')(
       }
       if (args.includes('install')) {
         if (options.shell) throw new Error('shell forbidden');
-        const result = realSpawn(command, [args[0], '--version'], {encoding:'utf8'});
+        // Corepack dispatch depends on project cwd and environment; preserve the
+        // real installation context when replacing install with a version probe.
+        const result = realSpawn(command, [args[0], '--version'], {...options, encoding:'utf8'});
         if (result.status !== 0) throw new Error(result.stderr);
         console.log('resolved-real-npm:' + result.stdout.trim());
         throw new Error('installation boundary reached');

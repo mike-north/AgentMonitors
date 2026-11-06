@@ -15,9 +15,11 @@ import { expect, it } from 'vitest';
 
 import { packageManagerEntry } from './lib/package-manager-entry.mjs';
 
-it.skipIf(process.platform === 'win32')(
-  'runs the actual compatibility suite with separate Node/npm installations',
-  () => {
+it
+  .skipIf(process.platform === 'win32')
+  .each(['real npm', 'Corepack context proxy'])(
+  'runs the actual compatibility suite with separate Node/npm installations (%s)',
+  (layout) => {
     const root = mkdtempSync(
       path.join(os.tmpdir(), 'am actual suite & spaces-'),
     );
@@ -32,7 +34,41 @@ it.skipIf(process.platform === 'win32')(
         throw new Error(
           'real npm and pnpm are required for compatibility fixtures',
         );
-      symlinkSync(npm, path.join(toolsDir, 'npm'));
+      const selectedNpm =
+        layout === 'Corepack context proxy'
+          ? path.join(root, 'node_modules/corepack/dist/npm.js')
+          : npm;
+      if (layout === 'Corepack context proxy') {
+        mkdirSync(path.dirname(selectedNpm), { recursive: true });
+        // Model Corepack's context-sensitive dispatch without a global Corepack
+        // installation or downloads, then execute the actual installed npm CLI.
+        writeFileSync(
+          selectedNpm,
+          `
+          const path = require('node:path');
+          const {spawnSync} = require('node:child_process');
+          const {realpathSync} = require('node:fs');
+          const installRoot = path.dirname(process.cwd());
+          if (path.basename(process.cwd()) !== 'packed') {
+            throw new Error('npm probe lost install cwd');
+          }
+          // Canonicalize parent directories for macOS /var versus /private/var aliases.
+          const matchesInstallPath = (value, basename) => typeof value === 'string' &&
+            realpathSync(path.dirname(value)) === installRoot && path.basename(value) === basename;
+          if (!matchesInstallPath(process.env.NODE_GYP_FORCE_PYTHON, 'deliberately-missing-python-so-node-gyp-fails.exe') ||
+              !matchesInstallPath(process.env.npm_config_cache, 'npm-cache') ||
+              !matchesInstallPath(process.env.HOME, 'home')) {
+            throw new Error('npm probe lost install env');
+          }
+          const result = spawnSync(process.execPath, [${JSON.stringify(npm)}, ...process.argv.slice(2)], {encoding:'utf8', env:process.env});
+          if (result.error) throw result.error;
+          process.stdout.write(result.stdout);
+          process.stderr.write(result.stderr);
+          process.exit(result.status ?? 1);
+        `,
+        );
+      }
+      symlinkSync(selectedNpm, path.join(toolsDir, 'npm'));
       symlinkSync(pnpm, path.join(toolsDir, 'pnpm'));
       const separateNode = path.join(nodeDir, 'node');
       symlinkSync(process.execPath, separateNode);
@@ -63,6 +99,7 @@ it.skipIf(process.platform === 'win32')(
             PATH: toolsDir + path.delimiter + (process.env.PATH ?? ''),
             TMPDIR: root,
             npm_execpath: '',
+            COREPACK_ENABLE_NETWORK: '0',
             NO_COLOR: '1',
             FORCE_COLOR: '0',
           },
