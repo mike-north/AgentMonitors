@@ -9,6 +9,30 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-05 — Preserve native Shape input rejection (001 §5.1) — Refs #542
+
+Extend the pre-normalization guard to the verified historical non-mapping family:
+`Date`, `Map`, `Set`, and objects with callable `then` and `catch`. Synchronous
+validation returns failure for native Promises rather than throwing, and async
+validation rejects them without awaiting a resolved mapping. Preserve the existing
+admission of other objects, mapping/default/CEL behavior, public input/output types,
+and preprocessing composition surface; do not impose a plain-object restriction.
+
+## 2026-11-05 — Preserve Shape mapping admission (001 §5.1) — Refs #542
+
+Clarify the current mapping-only contract: YAML timestamps are scalar declarations
+and must be rejected, including the Date values produced by the YAML loader.
+Restore this rejection before Zod 4 object normalization can erase the scalar to
+`{}`. Valid mappings, omission, authored input types, and parsed output types are
+unchanged. The exported Shape validator now uses a preprocessing pipe; its API
+report records that schema-composition surface.
+
+## 2026-11-03 — Migrate exported validation schemas to Zod 4 (001) — Refs #530
+
+Direct core and CLI validation uses patched Zod 4. Exported schema types now follow
+Zod 4; parsed monitor data and authored messages are unchanged. This dependency
+change does not impose input limits or establish safety of SDK v3 compatibility code.
+
 ## 2026-11-03 — Nested worktrees stay out of the local gate (008 §10) — Refs #458
 
 `pnpm check` could not pass in a main checkout holding worktrees under `.claude/worktrees/`. With 16
