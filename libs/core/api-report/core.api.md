@@ -855,18 +855,15 @@ export const monitorFrontmatterSchema: z.ZodPipe<z.ZodObject<{
         incremental: "incremental";
         net: "net";
     }>>;
-    tags: z.ZodOptional<z.ZodArray<z.ZodString>>;
+    tags: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodString>, unknown>>;
     shape: z.ZodOptional<z.ZodPreprocess<z.ZodObject<{
-        derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
+        derive: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodObject<{
             name: z.ZodString;
             when: z.ZodString;
-        }, z.core.$strip>>>;
+        }, z.core.$strip>>, unknown>>;
         render: z.ZodOptional<z.ZodLiteral<"rendered">>;
     }, z.core.$strip>, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
+        derive?: unknown;
         render?: "rendered" | undefined;
     }>>;
     payload: z.ZodOptional<z.ZodObject<{
@@ -1109,6 +1106,7 @@ export function parseDuration(duration: string): number;
 
 // @public (undocumented)
 export interface ParseError {
+    code?: 'INPUT_LIMIT_EXCEEDED';
     // (undocumented)
     error: string;
     // (undocumented)
@@ -1200,6 +1198,9 @@ export const PRIVATE_FILE_MODE = 384;
 
 // @public
 export function readBridgeState(statePath: string): HookState | null;
+
+// @public
+export function readMonitorFileSync(filePath: string): string | undefined;
 
 // @public
 export function renderArtifact(snapshot: unknown, facts: readonly DerivedFact[]): string;
@@ -1496,16 +1497,13 @@ export function shapeObservation(observation: Observation, now: Date, config: Sh
 
 // @public
 export const shapeSchema: z.ZodPreprocess<z.ZodObject<{
-    derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
+    derive: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodObject<{
         name: z.ZodString;
         when: z.ZodString;
-    }, z.core.$strip>>>;
+    }, z.core.$strip>>, unknown>>;
     render: z.ZodOptional<z.ZodLiteral<"rendered">>;
 }, z.core.$strip>, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
+    derive?: unknown;
     render?: "rendered" | undefined;
 }>;
 

@@ -58,6 +58,40 @@ The parser **MUST**:
 
 > Verified: `libs/core/src/parser/parse-monitor.ts` — trimming at line 49 (`parsed.content.trim()`); `filePath` stored at line 51; schema validation via `monitorFrontmatterSchema.safeParse` at line 36.
 
+### Monitor input admission (current)
+
+Before YAML parsing, monitor content (frontmatter and body together) MUST be at
+most **1,048,576 UTF-8 bytes**. File reads are bounded to that limit plus one byte,
+so file growth cannot bypass admission. Direct `parseMonitorFile` calls and asynchronous
+`scanMonitors` discovery share this read budget; runtime ticks, CLI validation, and
+CLI scans therefore reject oversized files before allocating or decoding their full contents. Before element validation, `tags` MUST
+contain at most **256** entries and `shape.derive` at most **128** rules. These
+collection limits apply to exported schemas as well as the parser; an oversized collection
+produces one issue at its field path without inspecting its elements or compiling
+its predicates. The declaration MUST itself be a raw array: Promises and other
+non-arrays are rejected as array type errors in both synchronous and asynchronous
+parsing, before any implicit unwrapping. An oversized raw array remains an
+`INPUT_LIMIT_EXCEEDED` admission error. Exact limits are accepted; ordinary field
+validation still applies.
+
+Diagnostic formatting MUST retain the same file budget. CLI `validate` skips
+legacy-shape hint reads for admission errors; ordinary parse errors may receive a
+hint only after another bounded read, including when the file grows or is replaced
+after discovery. The shared `readMonitorFileSync` helper reads without parsing,
+returns `undefined` without decoding oversized content, closes its descriptor on
+every path, and propagates filesystem errors to the caller.
+
+These budgets allow generous human-authored configuration while bounding validation
+work. Derive rules have a tighter budget because each rule compiles a predicate.
+They do not limit observation payloads or claim safety for arbitrary YAML aliases
+or source-plugin validation. `parseMonitor`/`parseMonitorFile` return `ok: false`,
+`filePath`, a bounded error message, and `code: INPUT_LIMIT_EXCEEDED` for admission
+failures. Other parse errors retain their existing shape.
+
+Verified: `libs/core/src/schema/input-limits.test.ts` and
+`libs/core/src/parser/parse-monitor.ts`. The editor schema advertises the tag cap;
+its existing lack of a complete shape schema is unchanged.
+
 The scanner discovers monitors using two glob passes relative to the supplied base directory:
 
 1. **Folder monitors**: `**/MONITOR.md`, then excluding any match at depth-0 — a folder monitor is

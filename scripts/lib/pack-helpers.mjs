@@ -1,8 +1,9 @@
+/** Packing and installed-file lookup shared by isolated consumer checks. */
 import { spawnSync } from 'node:child_process';
 import { readdirSync } from 'node:fs';
 import path from 'node:path';
 
-const PNPM_BIN = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+import { packageManagerEntry } from './package-manager-entry.mjs';
 
 /**
  * Pack one workspace package with `pnpm pack`, resolving the tarball it
@@ -17,26 +18,33 @@ const PNPM_BIN = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
  * previously a verbatim copy maintained in both files.
  */
 export function packPackage(packageDir, packDestDir) {
+  // Only pnpm rewrites workspace dependencies into consumer-installable versions.
+  const entry = packageManagerEntry('pnpm');
+  const useEntry = entry !== undefined;
+  if (!useEntry && process.platform === 'win32') {
+    throw new Error(
+      'On Windows, run via pnpm so its JavaScript entrypoint is available.',
+    );
+  }
+  const command = useEntry ? process.execPath : 'pnpm';
+  const args = [
+    ...(useEntry ? [entry] : []),
+    'pack',
+    '--pack-destination',
+    packDestDir,
+  ];
   const before = new Set(readdirSync(packDestDir));
-  const result = spawnSync(
-    PNPM_BIN,
-    ['pack', '--pack-destination', packDestDir],
-    {
-      cwd: packageDir,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      // Node's CVE-2024-27980 hardening makes spawning `pnpm.cmd` without a
-      // shell throw EINVAL on win32. Arguments here are workspace/temp paths
-      // with no spaces or shell metacharacters, so shelling the shim is safe.
-      shell: PNPM_BIN.endsWith('.cmd'),
-    },
-  );
+  const result = spawnSync(command, args, {
+    cwd: packageDir,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
   if (result.status !== 0) {
     if (typeof result.stderr === 'string' && result.stderr.length > 0) {
       process.stderr.write(result.stderr);
     }
     const errorMessageParts = [
-      `Command failed (${String(result.status ?? 'unknown')}): ${PNPM_BIN} pack --pack-destination ${packDestDir} (cwd: ${packageDir})`,
+      `Command failed (${String(result.status ?? 'unknown')}): ${command} pack --pack-destination ${packDestDir} (cwd: ${packageDir})`,
     ];
     if (result.error?.message) {
       errorMessageParts.push(`Spawn error: ${result.error.message}`);
