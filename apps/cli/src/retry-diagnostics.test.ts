@@ -18,6 +18,7 @@ import type { Database } from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it } from 'vitest';
 import { doctorReportClient, explainMonitorClient } from './runtime-client.js';
 import { writeLocalState } from './local-state.js';
+import { decodeToon } from './toon-format.js';
 
 /** Deliberately different times detect swapped/missing revival fields. */
 const created = new Date('2026-10-01T01:02:03Z');
@@ -179,7 +180,7 @@ async function serve(fixture: ReturnType<typeof reports>): Promise<void> {
 /** Execute asynchronously so the in-process static socket can answer the CLI. */
 async function run(
   command: 'explain' | 'doctor',
-  format: 'json' | 'text',
+  format: 'json' | 'toon' | 'text',
   db = ':memory:',
   id = 'wire-monitor',
 ): Promise<{ stdout: string; code: number }> {
@@ -234,6 +235,257 @@ async function run(
     throw error;
   }
 }
+
+/**
+ * Valid definitions expose retained work twice: at report level and directly in
+ * materialization details. Ordinary details may also contain payload/records
+ * keys; only the recognized materialization retry summary has a projection contract.
+ */
+function materializationReports(
+  status: 'pending' | 'terminal',
+): ReturnType<typeof reports> {
+  const fixture = reports();
+  const retained = summary('stage');
+  retained.pending = status === 'pending' ? 1 : 0;
+  retained.terminal = status === 'terminal' ? 1 : 0;
+  retained.records = retained.records.filter(
+    (record) => record.status === status,
+  );
+  const reason =
+    status === 'pending'
+      ? '1 observation(s) are durably queued for materialization retry.'
+      : '1 observation(s) exhausted automatic materialization retries and require operator repair.';
+  fixture.explain.materializationRetries = retained;
+  fixture.explain.stages = [
+    {
+      id: 'definition',
+      label: 'Definition',
+      status: 'ok',
+      reason: 'Definition parsed.',
+      details: {
+        payload: 'ORDINARY-DEFINITION',
+        records: ['definition-record'],
+      },
+    },
+    {
+      id: 'observation',
+      label: 'Observation',
+      status: 'ok',
+      reason: 'Observation recorded.',
+      details: {
+        pending: 1,
+        terminal: 0,
+        bytes: 7,
+        records: [],
+        payload: 'ORDINARY-OBSERVATION',
+      },
+    },
+    {
+      id: 'materialization',
+      label: 'Materialization',
+      status: status === 'pending' ? 'pending' : 'failure',
+      reason,
+      details: { ...retained },
+    },
+  ];
+  fixture.explain.verdict = {
+    stage: 'materialization',
+    status: status === 'pending' ? 'pending' : 'failure',
+    reason,
+  };
+  return fixture;
+}
+
+/** Expected metadata is handwritten from 002's safe fields and fixed retry fixture values. */
+function expectedStageSummary(
+  status: 'pending' | 'terminal',
+  serialized: boolean,
+) {
+  return {
+    pending: status === 'pending' ? 1 : 0,
+    terminal: status === 'terminal' ? 1 : 0,
+    bytes: 321,
+    records: [
+      {
+        id: `stage-${status}`,
+        status,
+        attemptCount: status === 'pending' ? 2 : 5,
+        createdAt: serialized ? created.toISOString() : created,
+        updatedAt: serialized ? updated.toISOString() : updated,
+        nextAttemptAt:
+          status === 'pending'
+            ? serialized
+              ? next.toISOString()
+              : next
+            : null,
+        lastError: safeError,
+      },
+    ],
+  };
+}
+
+it.each(['pending', 'terminal'] as const)(
+  'normalizes both %s retry copies and revives nested Dates over the real socket',
+  async (status) => {
+    const fixture = materializationReports(status);
+    await serve(fixture);
+    const report = await explainMonitorClient(
+      {
+        monitorId: 'wire-monitor',
+        monitorsDir: root,
+        workspacePath: root,
+      },
+      socketPath,
+    );
+    const stage = report.stages.find((value) => value.id === 'materialization');
+    expect(report.materializationRetries).toEqual(
+      expectedStageSummary(status, false),
+    );
+    expect(stage?.details).toEqual(expectedStageSummary(status, false));
+    // Serialized ISO equality cannot establish the client-object Date contract.
+    expect(stage?.details?.records).toEqual([
+      expect.objectContaining({
+        createdAt: expect.any(Date),
+        updatedAt: expect.any(Date),
+        nextAttemptAt: status === 'pending' ? expect.any(Date) : null,
+      }),
+    ]);
+    expect(report.stages.slice(0, 2)).toEqual(
+      fixture.explain.stages.slice(0, 2),
+    );
+    expect(stage).toMatchObject({
+      id: 'materialization',
+      label: 'Materialization',
+      status: fixture.explain.stages[2]?.status,
+      reason: fixture.explain.stages[2]?.reason,
+    });
+    expect(report.verdict).toEqual(fixture.explain.verdict);
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it.each([
+  ['pending', 'json'],
+  ['pending', 'toon'],
+  ['pending', 'text'],
+  ['terminal', 'json'],
+  ['terminal', 'toon'],
+  ['terminal', 'text'],
+] as const)(
+  'renders both %s retry copies safely through the compiled CLI in %s',
+  async (status, format) => {
+    const fixture = materializationReports(status);
+    await serve(fixture);
+    const output = await run('explain', format);
+    expect(output.code).toBe(0);
+    if (format === 'text') {
+      const errorLines = output.stdout
+        .split('\n')
+        .filter((line) => line.includes('Last error:'));
+      expect(errorLines).toEqual([`    Last error: ${safeError}`]);
+      expect(output.stdout).not.toContain('PRIVATE');
+      expect(output.stdout).not.toContain('\u2028');
+      expect(output.stdout).not.toContain('\u2029');
+    } else {
+      // TOON must be decoded: escaping a raw value does not project safe metadata.
+      const value =
+        format === 'json'
+          ? JSON.parse(output.stdout)
+          : decodeToon(output.stdout);
+      expect(value).toMatchObject({
+        materializationRetries: expectedStageSummary(status, true),
+        verdict: fixture.explain.verdict,
+      });
+      expect(value.materializationRetries).toEqual(
+        expectedStageSummary(status, true),
+      );
+      expect(value.stages).toEqual([
+        ...fixture.explain.stages.slice(0, 2),
+        {
+          ...fixture.explain.stages[2],
+          details: expectedStageSummary(status, true),
+        },
+      ]);
+    }
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it('normalizes recognized nested retries when an older report omits the top-level summary', async () => {
+  const fixture = materializationReports('pending');
+  delete fixture.explain.materializationRetries;
+  await serve(fixture);
+  const report = await explainMonitorClient(
+    {
+      monitorId: 'wire-monitor',
+      monitorsDir: root,
+      workspacePath: root,
+    },
+    socketPath,
+  );
+  expect(report.materializationRetries).toBeUndefined();
+  expect(
+    report.stages.find((stage) => stage.id === 'materialization')?.details,
+  ).toEqual(expectedStageSummary('pending', false));
+});
+
+it.each([
+  undefined,
+  {
+    eventIds: ['ordinary-event'],
+    payload: 'ORDINARY-MATERIALIZATION',
+    records: ['ordinary-record'],
+  },
+  { pending: 1, terminal: 0, records: [] },
+  { pending: 1, terminal: 0, bytes: 7, records: 'ordinary-records' },
+])(
+  'preserves absent/ordinary materialization details %# with legacy summary omission',
+  async (details) => {
+    const fixture = materializationReports('pending');
+    delete fixture.explain.materializationRetries;
+    fixture.explain.stages[2] = {
+      id: 'materialization',
+      label: 'Materialization',
+      status: 'ok',
+      reason: 'Existing materialization diagnosis.',
+      ...(details === undefined ? {} : { details }),
+    };
+    await serve(fixture);
+    const report = await explainMonitorClient(
+      {
+        monitorId: 'wire-monitor',
+        monitorsDir: root,
+        workspacePath: root,
+      },
+      socketPath,
+    );
+    expect(report).toEqual({
+      ...fixture.explain,
+      generatedAt: updated.toISOString(),
+    });
+    for (const format of ['json', 'toon'] as const) {
+      const output = await run('explain', format);
+      expect(output.code).toBe(0);
+      const value =
+        format === 'json'
+          ? JSON.parse(output.stdout)
+          : decodeToon(output.stdout);
+      expect(value).toEqual({
+        ...fixture.explain,
+        generatedAt: updated.toISOString(),
+      });
+    }
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+      'monitor.explain',
+      'monitor.explain',
+    ]);
+  },
+);
 
 it('revives every attached and orphan retry date through real socket requests', async () => {
   await serve(reports());

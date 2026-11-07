@@ -10,6 +10,7 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
+  MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -283,6 +284,25 @@ export async function listObservationHistoryClient(
   );
 }
 
+/**
+ * Materialization details have a retry-summary variant and ordinary variants
+ * such as event IDs. Recognize only the summary shape; unrelated stage details
+ * retain their own semantics, even when they contain payload or records keys.
+ * Socket timestamps are revived by normalizeRetrySummary, just as for the
+ * report-level summary; this guard does not reinterpret persisted statuses.
+ */
+function isMaterializationRetrySummary(
+  details: Record<string, unknown> | undefined,
+): details is Record<string, unknown> & MaterializationRetrySummary {
+  return (
+    details != null &&
+    typeof details['pending'] === 'number' &&
+    typeof details['terminal'] === 'number' &&
+    typeof details['bytes'] === 'number' &&
+    Array.isArray(details['records'])
+  );
+}
+
 export async function explainMonitorClient(
   input: MonitorExplainInput,
   socketPath?: string,
@@ -294,6 +314,14 @@ export async function explainMonitorClient(
   );
   return {
     ...report,
+    // Project the service's second public retry copy without rewriting other
+    // stage details, diagnosis order, or the primary verdict.
+    stages: report.stages.map((stage) =>
+      stage.id === 'materialization' &&
+      isMaterializationRetrySummary(stage.details)
+        ? { ...stage, details: { ...normalizeRetrySummary(stage.details) } }
+        : stage,
+    ),
     ...(report.materializationRetries
       ? {
           materializationRetries: normalizeRetrySummary(
