@@ -15,17 +15,22 @@
 import { execFileSync } from 'node:child_process';
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   symlinkSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { parseMonitor } from '@agentmonitors/core';
 import commandPoll from '@agentmonitors/source-command-poll';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { assertPresetOutput } from './fixtures/assert-preset-output.js';
+import { PRESET_CAPTURE_COMMAND } from './fixtures/preset-capture-command.js';
 import { TEMPLATES } from './init.js';
 
 /** Where the scaffolded template's `watch:` block lands after parsing. */
@@ -218,17 +223,93 @@ async function observe(
 ): Promise<ObserveResult> {
   const fixtureFile = path.join(tempDir('fixture'), 'fixture.json');
   writeFileSync(fixtureFile, fixture, 'utf-8');
+  // Preserve subprocess diagnostics outside the source's successful baseline,
+  // which intentionally retains stdout but not successful stderr (003 §11).
+  const diagnostics = tempDir('jq-diagnostics');
+  const stderrFile = path.join(diagnostics, 'stderr');
+  const exitFile = path.join(diagnostics, 'exit');
+  const command = scope.command;
+  if (
+    !Array.isArray(command) ||
+    !command.every((arg) => typeof arg === 'string')
+  ) {
+    throw new Error('Expected preset command argv');
+  }
   const result = await commandPoll.observe(
     {
       ...scope,
-      env: { PATH: pathWith(stubDir), AM444_FIXTURE: fixtureFile },
+      command: ['sh', '-c', PRESET_CAPTURE_COMMAND, 'preset-jq', ...command],
+      env: {
+        PATH: pathWith(stubDir),
+        AM444_FIXTURE: fixtureFile,
+        AM475_STDERR: stderrFile,
+        AM475_EXIT: exitFile,
+        AM475_NODE: process.execPath,
+        AM475_READER: path.join(
+          import.meta.dirname,
+          'fixtures/capture-preset-stderr.ts',
+        ),
+        AM475_TOTAL: path.join(diagnostics, 'total'),
+      },
     },
     {
       now: new Date('2026-01-15T10:00:00.000Z'),
       ...(previousState === undefined ? {} : { previousState }),
     },
   );
-  const state = result.nextState as { stdout?: string } | undefined;
+  const state = result.nextState as
+    | { stdout?: string; truncated?: boolean; health?: 'ok' | 'failing' }
+    | undefined;
+  // Current health establishes whether execution produced a result (003 §11.5).
+  // Failure observations are edge-triggered: their absence on repeated failure
+  // cannot imply success. An emitted reason can refine failure diagnostics only.
+  const outcome =
+    state?.health === 'ok'
+      ? 'result'
+      : result.observations.some(
+            (o) =>
+              typeof o.payload?.error === 'string' &&
+              o.payload.error.startsWith('Command timed out after '),
+          )
+        ? 'timeout'
+        : result.observations.some(
+              (o) =>
+                typeof o.payload?.error === 'string' &&
+                o.payload.error.startsWith('Command terminated by signal '),
+            )
+          ? 'signal'
+          : 'source-failure';
+  // EOF files establish capture completion only for a current successful result,
+  // never for failed source execution retaining a previous successful baseline.
+  const tail = existsSync(stderrFile)
+    ? readFileSync(stderrFile)
+    : Buffer.alloc(0);
+  const totalFile = path.join(diagnostics, 'total');
+  const totalText = existsSync(totalFile)
+    ? readFileSync(totalFile, 'utf8')
+    : '';
+  const total = Number(totalText);
+  const complete =
+    outcome === 'result' &&
+    existsSync(stderrFile) &&
+    /^\d+$/.test(totalText) &&
+    Number.isSafeInteger(total) &&
+    total >= 0 &&
+    tail.length === Math.min(total, 4096);
+  assertPresetOutput(
+    command,
+    existsSync(exitFile) ? readFileSync(exitFile, 'utf8') : 'unavailable',
+    tail,
+    state?.stdout ?? '',
+    state?.truncated ?? false,
+    complete ? total > 4096 : 'unknown',
+    {
+      outcome,
+      ...(scope.key === 'my-prs' || scope.key === 'pr-review'
+        ? { preset: scope.key }
+        : {}),
+    },
+  );
   return {
     titles: result.observations.map((o) => o.title),
     stdout: state?.stdout ?? '',
@@ -2056,5 +2137,379 @@ describe('preset portability guarantees (issue #444)', () => {
   it('both presets are high urgency', () => {
     expect(TEMPLATES['my-prs'] ?? '').toMatch(/^urgency: high$/m);
     expect(TEMPLATES['pr-review'] ?? '').toMatch(/^urgency: high$/m);
+  });
+});
+
+/** Exercise the same subprocess boundary used by every real-jq preset case. */
+describe('real-jq helper diagnostics (issue #475)', () => {
+  it('captures valid output using sh when bash cannot run', async () => {
+    const stub = tempDir('no-bash');
+    // Shadow any installed bash to enforce the helper's POSIX-shell boundary.
+    writeExecutable(path.join(stub, 'bash'), '#!/bin/sh\nexit 99\n');
+    const result = await observe(
+      { command: ['sh', '-c', 'printf "[]"'] },
+      stub,
+      '[]',
+    );
+    expect(result.stdout).toBe('[]');
+  });
+  it.each([
+    ['0', ''],
+    ['7', 'jq: invalid filter'],
+  ])(
+    'reports empty or failed subprocess output before parsing',
+    async (code, stderr) => {
+      const scope = {
+        command: ['sh', '-c', `printf '%s' '${stderr}' >&2; exit ${code}`],
+      };
+      await expect(observe(scope, tempDir('empty-jq'), '[]')).rejects.toThrow(
+        new RegExp(`exit code: ${code}\\nfailure category:`),
+      );
+    },
+  );
+});
+
+describe('partial nonzero results (003 §11.2)', () => {
+  it('preserves valid nonzero source results but rejects them at the JSON test boundary', async () => {
+    const scope = { command: ['sh', '-c', 'printf "[]"; exit 7'] };
+    const raw = await commandPoll.observe(scope, { now: new Date() });
+    expect(raw.nextState).toMatchObject({
+      stdout: '[]',
+      exitCode: 7,
+      truncated: false,
+      health: 'ok',
+      baselined: true,
+    });
+    await expect(observe(scope, tempDir('partial-jq'), '[]')).rejects.toThrow(
+      /exit code: 7/,
+    );
+  });
+  it('retains only the last 4 KiB of multi-megabyte jq stderr before reading and emits no private input', async () => {
+    if (!hasJq) return;
+    const start = createdTempDirs.length;
+    const privateInput =
+      'PRIVATE_JQ_INPUT_' + 'x'.repeat(5 * 1024 * 1024) + '_PRIVATE_TAIL';
+    const input = path.join(tempDir('private-jq'), 'input.json');
+    writeFileSync(input, JSON.stringify(privateInput));
+    const scope = { command: ['jq', '-r', 'error(.)', input] };
+    let failure = '';
+    try {
+      await observe(scope, tempDir('error-jq'), '[]');
+    } catch (error) {
+      failure = String(error);
+    }
+    expect(failure).toContain('exit code: 5');
+    expect(failure).not.toContain('PRIVATE_JQ_INPUT');
+    expect(failure).not.toContain('PRIVATE_TAIL');
+    expect(failure).not.toContain('error(.)');
+    expect(failure).not.toContain(input);
+    expect(failure).toContain('stderr empty: false');
+    expect(failure).toContain('stderr truncated: true');
+    expect(failure.length).toBeLessThan(600);
+    const dirs = createdTempDirs
+      .slice(start)
+      .filter((dir) => existsSync(path.join(dir, 'stderr')));
+    expect(dirs).toHaveLength(1);
+    for (const dir of dirs) {
+      // stat occurs BEFORE read: the capture itself must be bounded on disk.
+      expect(statSync(path.join(dir, 'stderr')).size).toBeLessThanOrEqual(4096);
+      const tail = readFileSync(path.join(dir, 'stderr'), 'utf8');
+      expect(tail).toContain('PRIVATE_TAIL');
+      expect(tail).not.toContain('PRIVATE_JQ_INPUT');
+    }
+  });
+});
+it('classifies jq compile errors without forwarding the filter or stderr', async () => {
+  if (!hasJq) return;
+  let failure = '';
+  try {
+    await observe(
+      { command: ['jq', '-n', 'PRIVATE_FILTER('] },
+      tempDir('compile-jq'),
+      '[]',
+    );
+  } catch (error) {
+    failure = String(error);
+  }
+  expect(failure).toContain('exit code: 3');
+  expect(failure).toContain(
+    'failure category: jq compile error (check filter syntax)',
+  );
+  expect(failure).not.toContain('PRIVATE_FILTER');
+});
+
+it('rejects real jq partial stdout at the helper while preserving source nonzero semantics', async () => {
+  if (!hasJq) return;
+  const scope = {
+    command: ['jq', '-n', '[], error("PRIVATE_FILTER_PAYLOAD")'],
+  };
+  const result = await commandPoll.observe(scope, { now: new Date() });
+  expect(result.nextState).toMatchObject({
+    stdout: '[]\n',
+    exitCode: 5,
+    truncated: false,
+    health: 'ok',
+    baselined: true,
+  });
+  let failure = '';
+  try {
+    await observe(scope, tempDir('partial-real-jq'), '[]');
+  } catch (error) {
+    failure = String(error);
+  }
+  expect(failure).toContain('exit code: 5');
+  expect(failure).toContain('stdout empty: false; truncated: false');
+  expect(failure).not.toContain('PRIVATE_FILTER_PAYLOAD');
+});
+
+/** Remove only a group recorded by the timeout fixture; source cleanup may win. */
+function killOwnedCaptureGroup(group: number): void {
+  try {
+    process.kill(-group, 'SIGKILL');
+  } catch (error) {
+    if (
+      !(error instanceof Error) ||
+      !('code' in error) ||
+      error.code !== 'ESRCH'
+    )
+      throw error;
+  }
+}
+describe('interrupted capture metadata', () => {
+  it.each([100, 4097])(
+    'does not call %i completed stderr bytes empty after timeout',
+    async (size) => {
+      const dir = tempDir('interrupted-capture');
+      const marker = path.join(dir, 'written.json');
+      const script = `const fs = require('node:fs'); setInterval(() => {}, 1000); process.stdout.write('[]'); process.stderr.write(Buffer.alloc(${size}, 'x'), () => fs.writeFileSync(process.argv[1], JSON.stringify({ pid: process.pid, group: process.ppid })));`;
+      let failure = '';
+      try {
+        try {
+          await observe(
+            {
+              command: [process.execPath, '-e', script, marker],
+              timeout: '2s',
+            },
+            tempDir('timeout-command'),
+            '[]',
+          );
+        } catch (error) {
+          failure = String(error);
+        }
+        expect(existsSync(marker)).toBe(true); // confirms the write completed before interruption
+        expect(failure).toContain('stderr capture: incomplete');
+        expect(failure).toContain(
+          'stderr empty: unknown; retained bytes: unknown; stderr truncated: unknown',
+        );
+        expect(failure).toContain('failure category: command timeout');
+        expect(failure).not.toContain(marker);
+        expect(failure.length).toBeLessThan(600);
+      } finally {
+        if (existsSync(marker)) {
+          const owned = JSON.parse(readFileSync(marker, 'utf8')) as {
+            pid: number;
+            group: number;
+          };
+          // This fixture records only the detached wrapper group which owns it.
+          killOwnedCaptureGroup(owned.group);
+        }
+      }
+    },
+  );
+});
+it('classifies real jq runtime errors by status rather than private syntax-error wording', async () => {
+  if (!hasJq) return;
+  let failure = '';
+  try {
+    await observe(
+      {
+        command: ['jq', '-n', 'error("PRIVATE syntax error DATA\\u001b[31m")'],
+      },
+      tempDir('runtime-jq'),
+      '[]',
+    );
+  } catch (error) {
+    failure = String(error);
+  }
+  expect(failure).toContain('context: jq');
+  expect(failure).toContain('failure category: jq runtime error');
+  expect(failure).not.toContain('jq compile error');
+  expect(failure).not.toContain('PRIVATE');
+  expect(
+    Array.from(failure, (char) => char.charCodeAt(0)).filter(
+      (code) => (code < 32 && code !== 10) || code === 127,
+    ),
+  ).toEqual([]);
+});
+it.each(['my-prs', 'pr-review'] as const)(
+  'identifies the fixed %s preset without copying argv',
+  async (preset) => {
+    await expect(
+      observe(
+        { ...presetScope(preset), command: ['sh', '-c', 'exit 7'] },
+        tempDir('preset-failure'),
+        '[]',
+      ),
+    ).rejects.toThrow(`context: ${preset}; argv withheld`);
+  },
+);
+
+/** Produce real failing health while preserving a private prior-success baseline. */
+async function failingPresetBaseline(): Promise<unknown> {
+  const result = await commandPoll.observe(
+    { command: ['sh', '-c', 'kill -TERM $$'] },
+    {
+      now: new Date(),
+      previousState: {
+        stdout: 'PRIVATE_OLD_BASELINE',
+        exitCode: 0,
+        truncated: true,
+        health: 'ok',
+        baselined: true,
+      },
+    },
+  );
+  expect(result.observations).toHaveLength(1);
+  expect(result.nextState).toMatchObject({
+    stdout: 'PRIVATE_OLD_BASELINE',
+    health: 'failing',
+    truncated: true,
+  });
+  return result.nextState;
+}
+
+describe('consecutive source failures with surviving capture (003 §11.5)', () => {
+  it.each(['signal', 'timeout'] as const)(
+    'reports unknown capture for repeated %s without a new health observation',
+    async (mode) => {
+      const previousState = await failingPresetBaseline();
+      const start = createdTempDirs.length;
+      const marker = path.join(tempDir('repeated-write'), 'written.json');
+      const producer = `const fs=require('node:fs'); const bytes=Buffer.alloc(4097,'x'); bytes.write('PRIVATE_CAPTURE_TAIL',4065); process.stderr.write(bytes,()=>fs.writeFileSync(process.argv[1],JSON.stringify({writtenBytes:4097,group:Number(process.argv[2])})));`;
+      const script = `"$1" -e "$2" "$3" "$PPID"
+exec 2>/dev/null
+while [ ! -f "$AM475_TOTAL" ]; do sleep 0.01; done
+printf '[]'
+if [ "$4" = signal ]; then kill -TERM "$PPID"; else sleep 60; fi`;
+      const scope = {
+        command: [
+          'sh',
+          '-c',
+          script,
+          'owned-repeated-fixture',
+          process.execPath,
+          producer,
+          marker,
+          mode,
+        ],
+        timeout: '2s',
+      };
+      const observed = vi.spyOn(commandPoll, 'observe');
+      let failure = '';
+      try {
+        try {
+          await observe(
+            scope,
+            tempDir('repeated-command'),
+            '[]',
+            previousState,
+          );
+        } catch (error) {
+          failure = String(error);
+        }
+        expect(existsSync(marker)).toBe(true);
+        const written = JSON.parse(readFileSync(marker, 'utf8')) as {
+          writtenBytes: number;
+        };
+        expect(written.writtenBytes).toBe(4097);
+        const raw = await observed.mock.results[0]?.value;
+        expect(raw.observations).toEqual([]);
+        expect(raw.nextState).toMatchObject({
+          health: 'failing',
+          stdout: 'PRIVATE_OLD_BASELINE',
+          truncated: true,
+        });
+        const dirs = createdTempDirs
+          .slice(start)
+          .filter((dir) => existsSync(path.join(dir, 'total')));
+        expect(dirs).toHaveLength(1);
+        for (const dir of dirs) {
+          expect(readFileSync(path.join(dir, 'total'), 'utf8')).toBe('4097');
+          expect(statSync(path.join(dir, 'stderr')).size).toBe(4096);
+          expect(readFileSync(path.join(dir, 'stderr'), 'utf8')).toContain(
+            'PRIVATE_CAPTURE_TAIL',
+          );
+        }
+        expect(failure).toContain(
+          'failure category: source failure (specific reason unavailable)',
+        );
+        expect(failure).not.toContain('command timeout');
+        expect(failure).not.toContain('command interrupted by signal');
+        expect(failure).toContain('stderr capture: incomplete');
+        expect(failure).toContain(
+          'stderr empty: unknown; retained bytes: unknown; stderr truncated: unknown',
+        );
+        expect(failure).toContain('stdout empty: unknown; truncated: unknown');
+        expect(failure).not.toContain('PRIVATE');
+        expect(failure).not.toContain(marker);
+        expect(failure.length).toBeLessThan(600);
+      } finally {
+        observed.mockRestore();
+        if (existsSync(marker)) {
+          const owned = JSON.parse(readFileSync(marker, 'utf8')) as {
+            group: number;
+          };
+          killOwnedCaptureGroup(owned.group);
+        }
+      }
+    },
+  );
+
+  it('uses current healthy recovery rather than prior failing health', async () => {
+    const previousState = await failingPresetBaseline();
+    const recovered = await observe(
+      { command: ['sh', '-c', 'printf "[]"'] },
+      tempDir('recovery-command'),
+      '[]',
+      previousState,
+    );
+    expect(recovered.stdout).toBe('[]');
+    expect(recovered.state).toMatchObject({
+      health: 'ok',
+      truncated: false,
+      stdout: '[]',
+    });
+    expect(
+      recovered.titles.some((title) => title.startsWith('Command recovered:')),
+    ).toBe(true);
+  });
+
+  it('keeps recovered nonzero jq results healthy in the source but rejects partial JSON in this helper', async () => {
+    if (!hasJq) return;
+    const previousState = await failingPresetBaseline();
+    const scope = {
+      command: ['jq', '-n', '[], error("PRIVATE_RECOVERY_INPUT")'],
+    };
+    const raw = await commandPoll.observe(scope, {
+      now: new Date(),
+      previousState,
+    });
+    expect(raw.nextState).toMatchObject({
+      health: 'ok',
+      stdout: '[]\n',
+      exitCode: 5,
+      truncated: false,
+    });
+    let failure = '';
+    try {
+      await observe(scope, tempDir('recovery-jq'), '[]', previousState);
+    } catch (error) {
+      failure = String(error);
+    }
+    expect(failure).toContain('exit code: 5');
+    expect(failure).toContain('failure category: jq runtime error');
+    expect(failure).toContain('stderr capture: complete');
+    expect(failure).toContain('stdout empty: false; truncated: false');
+    expect(failure).not.toContain('PRIVATE');
   });
 });

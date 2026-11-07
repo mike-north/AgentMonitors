@@ -31,6 +31,44 @@ migration is added. Required tests cover real Git/CLI, SQLite reopen and socket/
 Existing error retry cadence and held-notify deferral remain unchanged; #558 and #559 track those
 separately rather than silently broadening this repair.
 
+## 2026-11-05 — Source validation parity verification (004 §2.2/§2.4/§3.5/§5.1, 005 §3/§6) — Refs #301
+
+Clarify the existing pre-observation `validateWatchScope` contract for `monitor test` and its
+shared diagnostics with `validate`, retaining each command's text/JSON channels and exit code 1.
+Replace the incomplete verification evidence with a paired-command invalid-scope matrix covering
+enums, unknown properties, types, required fields, nested collections, and composite parts. Live
+HTTP and command/file sentinels prove rejection precedes source effects; valid controls establish
+that both sentinels detect execution. Correct the stale 004 §5.1 bullets to reflect current duplicate
+ID rejection by `validate` and full source-schema validation shared with `monitor test`.
+Persistent runtime tick validation remains separately tracked. No production behavior changes.
+
+## 2026-11-05 — Bounded Docker phase diagnostics (004 §2.10) — Refs #509
+
+Separate valid install/build output volume from the outer smoke helper's runaway-output bound.
+Replace full phase streaming with capped periodic byte tails and final tails, preserving recent
+phase/daemon evidence when retrieval fails and force removal destroys files. Add successful 21 MiB,
+ordinary failure and active-termination regressions; retain the existing timeout/cleanup allocation
+and zero-exit overflow guard. This test-fixture contract does not establish repeated-CI reliability.
+
+## 2026-11-05 — Retain admission through hints and async parsing (001, 004) — Refs #546
+
+Optional validation diagnostics must not bypass bounded monitor intake: skip hints
+for admission errors and use the shared bounded reader for ordinary-error hints,
+even if a file grows or is replaced after discovery. Export the existing synchronous
+reader for this composition and record its API. Collection declarations must be raw
+arrays; reject non-array Promise/thenable inputs before preprocessing can unwrap
+them or visit elements/compile CEL. Preserve exact array boundaries, ordinary type
+diagnostics, native Shape guards, and legacy-hint controls.
+
+## 2026-11-05 — Integrate admission limits with Zod 4 (001, 002) — Refs #546
+
+Preserve the bounded monitor reader and early collection admission alongside the
+Zod 4 migration and native Shape rejection. Regenerate public declarations from
+installed Zod 4. Require own envelope IDs for admission-error correlation, avoid
+copying decoded container values during traversal, and describe raw-frame caps
+as bytes before decoding. Regression tests cover the review points and preserve
+session state, liveness, and exact admission boundaries.
+
 ## 2026-11-05 — Preserve native Shape input rejection (001 §5.1) — Refs #542
 
 Extend the pre-normalization guard to the verified historical non-mapping family:
@@ -49,11 +87,94 @@ Restore this rejection before Zod 4 object normalization can erase the scalar to
 unchanged. The exported Shape validator now uses a preprocessing pipe; its API
 report records that schema-composition surface.
 
+## 2026-11-05 — Make physical PATH controls portable across POSIX utilities (004 §2.7) — Refs #520
+
+Physical PATH controls now use owned non-JS shell executables and an explicit failing lexical decoy, preserving native lookup and literal argv assertions without depending on renamed host printf/false utilities.
+
+## 2026-11-05 — Validate the manager of every physical candidate (004 §2.7) — Refs #520
+
+Official and adjacent installation candidates now apply the same requested-manager predicate as invoking entries and direct PATH targets after physical canonicalization. A symlink to another manager is skipped so a later valid installation can be selected.
+
+## 2026-11-05 — Preserve physical lookup and explicit POSIX PATH components (004 §2.7) — Refs #520
+
+Launcher discovery uses native physical file and directory identities before lexical joins can change symlink/`..` traversal. Explicit empty POSIX PATH components retain discovery-time cwd, while unset PATH does not; unusable directories are skipped so later valid entries remain discoverable.
+
+## 2026-11-05 — Anchor launcher paths before subprocess cwd changes (004 §2.7) — Refs #520
+
+The package-manager resolver returns absolute launcher paths for both invoking entries and discovered installation candidates. Relative PATH and invoking entries retain their selected file identity when packing or installation changes the child working directory.
+
+## 2026-11-05 — Retain executable-only pnpm in POSIX fixtures (004 §2.7) — Refs #520
+
+The compatibility wrapper retains inherited PATH when pnpm has no discoverable JavaScript launcher. Its actual nested suites exercise the existing POSIX executable fallback, including real workspace dependency rewriting and the Corepack-context control.
+
+## 2026-11-05 — Retain installation context in npm fixture probes (004 §2.7) — Refs #520
+
+The compatibility fixture forwards intercepted install options to its real npm version probe, retaining the isolated working directory and environment required by context-sensitive Corepack dispatch. A named Corepack-layout fixture checks both while delegating the version query to installed npm.
+
+## 2026-11-05 — Resolve Corepack proxies and platform PATH semantics (004 §2.7) — Refs #520
+
+Discover the requested manager through named Corepack proxies, honor exact POSIX `PATH` independently of Windows casing, and discover npm fixture tools separately from Node. The actual compatibility suite is exercised under separate Node/npm installations.
+
+## 2026-11-05 — Discover every supported pnpm launcher extension (004 §2.7) — Refs #520
+
+Official Node and adjacent PATH package discovery now considers pnpm `.cjs`, `.js`, and `.mjs` entrypoints under other invoking package managers, matching direct pnpm invocation support.
+
+## 2026-11-05 — Preserve package-manager identity and separate installations (004 §2.7) — Refs #520
+
+Packing resolves pnpm independently of the invoking manager so workspace dependencies remain installable. The install harness discovers npm JavaScript entrypoints from PATH as well as beside Node, preserving shell-free literal arguments across separate installations.
+
+## 2026-11-03 — Preserve package-manager arguments in install checks (004 §2.7) — Refs #520
+
+Run package-manager JavaScript entrypoints without a shell and exercise temporary paths containing spaces in the install check.
+
 ## 2026-11-03 — Migrate exported validation schemas to Zod 4 (001) — Refs #530
 
 Direct core and CLI validation uses patched Zod 4. Exported schema types now follow
 Zod 4; parsed monitor data and authored messages are unchanged. This dependency
 change does not impose input limits or establish safety of SDK v3 compatibility code.
+
+## 2026-11-03 — Nested worktrees stay out of the local gate (008 §10) — Refs #458
+
+`pnpm check` could not pass in a main checkout holding worktrees under `.claude/worktrees/`. With 16
+of them, `eslint .` ran out of memory at its 4 GB heap limit after 90 seconds, and `prettier --check .`
+reported 372 files inside them, because anchored rules such as `apps/website/` do not reach a
+worktree's copy. The directory was excluded only through `.git/info/exclude`, which neither tool reads.
+
+- **008 §10 — extends "Local gate ≡ CI gate"** to these worktrees, and adds the guard to the test
+  implications. CI has no such directory, so only asking the tools directly can catch a missing rule.
+- **No change to what the gate checks inside a worktree.** A check run from a worktree's own root
+  still covers that worktree; only a run from above it skips it.
+
+## 2026-11-03 — Runtime state stays out of the local gate (008 §10, 002 §11.3) — Refs #458
+
+`pnpm check` failed in any checkout of this repo with an open session, because
+`prettier --check .` read `.agentmonitors/sessions/<id>/hook-state.json`. CI never has that file.
+`init` has ignored the directory in users' projects since #336, but this repo's own `.gitignore`
+never had the rule.
+
+- **008 §10 — extends "Local gate ≡ CI gate"** to files that exist only because a tool is running
+  on this machine, and adds the guard to the test implications.
+- **002 §11.3 — records the format-check consequence** of the `.gitignore` line, including that
+  Prettier reads only the `.gitignore` in the directory it runs from.
+- **No change to what the runtime writes or to `init`.** Only this repo's ignore rules and its
+  guard change.
+
+## 2026-11-03 — Apply bounded reads to production monitor discovery (001) — Refs #546
+
+Route asynchronous scans through the same byte-budget reader as direct file
+parsing. Previously scans allocated and decoded complete files before rejecting
+them. Deterministic admission tests now observe scan read counts, descriptor
+closure, oversized flat/folder diagnostics, exact-boundary acceptance, and valid
+sibling results. Discovery retains asynchronous filesystem I/O.
+
+## 2026-11-03 — Bound monitor and daemon inputs before validation (001, 002, 005) — Refs #530
+
+Specify monitor byte/tag/derive limits and daemon byte/collection/depth/aggregate
+budgets. Reject before element validation or runtime mutation with a bounded,
+machine-classified error; preserve ordinary validation and session isolation.
+Raw-socket tests against a spawned daemon cover unterminated and fragmented input,
+valid boundaries, liveness, and unchanged sessions. These guards do not remediate
+SDK Zod v3 compatibility code or replace dependency upgrades.
 
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
@@ -64,6 +185,14 @@ CLI's test targets depend on `build`, and requires the launcher to pass on its f
 unknown-subcommand assertion requires the CLI's own error, because a load failure also exits 1.
 Its subprocess bound drops from a nominal 30s, which vitest's 5s test timeout already overrode
 without evidence, to 4.5s, so overruns report their status and output.
+
+## 2026-11-03 — First-attempt daemon gate and literal-path proof (004) — Refs #452
+
+Require the literal-path verification regression to prove cleanup, exact real contents and event
+identity surviving completed subsequent observations. Replace the fixed survival sleep with bounded
+condition polling. Remove the serial suite's blanket retries after all 64 cases pass with retries
+disabled; a script test guards the configuration. Product observation-boundary behavior remains the
+#532/#533 contract. Historical command-trigger attribution remains tracked in #540.
 
 ## 2026-11-03 — Update milestone references after the roadmap reorganization (008, roadmap) — Refs #539
 

@@ -1554,9 +1554,39 @@ Verified: `apps/cli/src/daemon-ipc.ts` — `resolveSocketPath()`, `ResolveSocket
 
 ### 10.4 IPC wire protocol
 
-Each request/response is a single newline-delimited JSON object. The server reads until it finds `\n`, parses the JSON, dispatches the method, and writes `{ id, result? }` or `{ id, error }` back before closing the connection.
+Each request/response is a single newline-delimited JSON object. A connection
+admits **one request** and then closes after `{ id, result? }` or `{ id, error, code? }`.
+Additional frames cannot dispatch while the first request is in flight.
 
-Verified: `apps/cli/src/daemon-ipc.ts` — server `socket.on('data', ...)` handler (lines 244–278); `respond()` writes `JSON.stringify(payload) + '\n'` (line 241).
+Before JSON parsing, the first frame MUST be at most **1,048,576 bytes**, excluding
+its newline. The server counts raw bytes across chunks, including split UTF-8
+characters, and rejects an oversized frame even when no newline arrives. Retained
+frame storage is bounded independently of fragment count; trailing frames are not
+retained. Exact byte limits are accepted.
+
+Before envelope or method schema validation, every decoded array and record
+(including unknown fields) MUST have at most **1,000** elements or own keys.
+The complete request MUST contain at most **10,000 values**, counting the root,
+containers, and scalar values once each, and have depth at most **32**, with the
+root at depth zero. Iterative admission checks prevent schema traversal or runtime
+mutation on rejection. These budgets support bulk control operations while
+bounding validation work; they do not apply to response payloads or the MCP transport.
+
+The decoded traversal MUST avoid copying container values into intermediate
+collections after counting their widths. Admission responses correlate only an
+own string `id` from the decoded envelope; inherited IDs are ignored. Raw-frame
+limit diagnostics describe bytes because rejection precedes UTF-8 decoding.
+
+Admission failures return one bounded error with `code: INPUT_LIMIT_EXCEEDED`.
+Collection failures preserve a string request ID when available; byte failures use
+`id: invalid` because no JSON is parsed. The daemon remains available and existing
+sessions are unchanged. Ordinary malformed JSON and unsupported envelopes retain
+the legacy error and unsupported-request code. Connection resets are local to the
+peer and cannot terminate the daemon.
+
+Verified: `apps/cli/src/input-limits.test.ts`,
+`apps/cli/src/input-limits.integration.test.ts` (spawned daemon, two sessions,
+raw sockets, exact boundaries), and `apps/cli/src/daemon-ipc.test.ts`.
 
 ### 10.5 Exposed socket commands
 
@@ -1709,6 +1739,9 @@ Verified: `libs/core/src/adapter/claude.ts` — `safeSessionPathSegment()` (line
 > tick. It is project-local (rooted at the workspace, not the user's data dir), so it is a
 > `.gitignore` concern like `.claude/*.local.*`: `agentmonitors init` (bare or `--enable-only`)
 > ensures `.gitignore` ignores both (`apps/cli/src/commands/init.ts` — `ensureGitignore()`).
+> Prettier reads `.gitignore` by default, so that line also keeps these files out of a project's
+> format check. Prettier reads only the `.gitignore` in the directory it runs from, so a format
+> check run from above a nested workspace needs its own rule.
 
 ### 11.4 Hook-state materialization
 
