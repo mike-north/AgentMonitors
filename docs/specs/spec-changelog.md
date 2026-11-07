@@ -319,6 +319,16 @@ evidence across window rotation, and refuse negative verdicts when history gaps 
 Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
 equal-second rows; a real daemon regression waits for durable triggered history before command exit.
 
+## 2026-11-01 — CLI retained-work diagnostics across IPC and definition failures (002, 004, 005) — Refs #496
+
+Adopt optional orphan groups alongside current-monitor summaries in doctor text/JSON. Preserve
+original definition errors while adding failing retained-work checks and actionable record IDs.
+Reconstruct all retry Dates through real socket clients and normalize legacy error controls/length
+while projecting only safe metadata. Older daemons may omit both attached summaries and orphan
+groups. Explain retains retry-only fallback reports. Tests use actual JSONL sockets, the built CLI,
+and legacy SQLite rows to verify metadata privacy, exactly-once scope, and diagnostic nonmutation.
+Remediation does not claim an available retry command or automatic retry adoption.
+
 ## 2026-10-31 — Retained-work diagnostics independent of definitions (002 persistence, 004 §3.4) — Refs #495
 
 Require retry metadata in every core explain outcome, preserving the actual definition/scheduling
@@ -472,7 +482,9 @@ checked before mutation, and safe errors are control-stripped and bounded. The l
 fixed retry delays, terminal state after five failures, explicit re-arm, and transaction-coupled
 completion so a thrown materialization cannot delete its durable retry. Operator diagnostics follow
 with bounded id/status/attempt/error/timestamp metadata in core reports; stored envelopes and
-payloads never cross that reporting boundary. CLI rendering follows in the next stack layer.
+payloads never cross that reporting boundary. `monitor explain` renders those records, `doctor`
+names the exact monitor command and fails for pending or terminal work, and reports from older
+daemons default to an empty outbox instead of breaking the CLI.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 
