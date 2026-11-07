@@ -33,6 +33,7 @@ export type {
 
 // Parser
 export { parseMonitor, parseMonitorFile } from './parser/parse-monitor.js';
+export { readMonitorFileSync } from './parser/read-monitor-file.js';
 export type {
   ParseResult,
   ParseError,

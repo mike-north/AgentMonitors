@@ -281,6 +281,10 @@ agentmonitors validate [path] [options]
 | `[path]`            | positional (optional) | `.claude/monitors` | Path to monitors directory    |
 | `--format <format>` | option (choices)      | `text`             | Output format: `text`, `json` |
 
+Monitor admission follows [001](./001-monitor-definition.md#monitor-input-admission-current):
+at most 1 MiB of UTF-8 content, 256 tags, and 128 derive rules. Oversized monitors
+are invalid and produce a bounded diagnostic naming `INPUT_LIMIT_EXCEEDED`.
+
 ### Output
 
 **Text format:**
@@ -2423,3 +2427,12 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `watch`    | `list`     | daemon (read-only)                                            | **Target** (§14.4, [007 §4](./007-agent-facing-interaction.md))   |
 | `watch`    | `cancel`   | daemon                                                        | **Target** (§14.4, [007 §4.4](./007-agent-facing-interaction.md)) |
 | `inspect`  | —          | daemon (read-only)                                            | **Target** (§14.5, [007 §5](./007-agent-facing-interaction.md))   |
+
+### Daemon request admission errors
+
+Socket-backed commands obey [002 §10.4](./002-runtime-delivery.md#104-ipc-wire-protocol):
+at most 1 MiB before the newline, 1,000 entries per array or record, 10,000 total
+values, and depth 32. Callers issuing bulk requests must keep each request within
+these budgets. The wire response carries `INPUT_LIMIT_EXCEEDED`; the CLI surfaces
+the daemon's error as an application error, not an unavailable-daemon fallback.
+The rejected request performs no runtime operation, and other sessions remain usable.
