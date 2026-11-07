@@ -29,12 +29,13 @@ and add a [`spec-changelog.md`](docs/specs/spec-changelog.md) entry
 
 ## Commands
 
-pnpm + Nx monorepo (version pinned via package.json#packageManager). All targets run through Nx with caching and dependency ordering.
+pnpm + Nx monorepo (version pinned via package.json#packageManager). Package targets run through Nx with caching and dependency ordering; root scripts also run workspace and packaging checks directly.
 
 ```bash
+pnpm verify         # pre-push gate: CI portable checks/suites and publish dry-run
 pnpm build          # build all publishable packages (excludes workspace root + website)
-pnpm test           # run all package test suites (vitest), build deps first
-pnpm check          # check:packages (tsc --noEmit per package) + check:workspace (eslint + prettier)
+pnpm test           # fast package suites only; prints omitted suites (not the pre-push gate)
+pnpm check          # package checks (excludes website) + workspace checks + aipm validation
 pnpm check:api-report   # validate every checked-in api-report/*.api.md against the compiled surface (CI; no --local)
 pnpm fix:api-report     # regenerate api-report/*.api.md + dist rollups locally (--local; commit the diff)
 pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
@@ -43,6 +44,27 @@ pnpm fix:lint-ts    # eslint --fix
 pnpm fix:format     # prettier --write
 pnpm clean          # remove dist/ + api-extractor temp/ dirs and reset the nx cache
 ```
+
+Use `pnpm verify` before pushing from macOS/Linux (POSIX shell), after `pnpm install --frozen-lockfile` with Node 24 and
+the pinned pnpm. It sequentially runs build, check, API-report validation, fast tests,
+serial daemon tests, script tests, standalone-consumer tests, fresh-install hook E2E,
+and publish dry-run. The packaging tests require registry network access; the dry-run
+does not publish. Nx caching still applies; `NX_SKIP_NX_CACHE=true pnpm verify` requests
+fresh execution evidence. Sequential execution keeps daemon suites isolated and prevents
+concurrent packaging/API-report builds from writing the same outputs.
+
+CI-only coverage consists of GitHub checkout/toolchain setup and change filters, Windows
+native installation, and the separately filtered website build/link job. Docker smoke is
+part of `test:serial` but self-skips without a reachable Docker daemon: report that skip
+instead of claiming Docker coverage. `apps/website` stays excluded from root
+build/check/format/lint. Its existing CI link check does not prove copy-paste commands or
+semantic documentation correctness; verify website changes separately. The human decision
+on adding website coverage to the root gate remains open; see
+[004 §2.10](docs/specs/004-validation-testing.md#210-repository-pre-push-gate).
+
+The independent live advisory audit remains separate: run `pnpm check:dependency-audit`.
+Script-suite audit fixtures/version floors do not replace that live query. Preset jq
+reductions report skipped coverage when jq is unavailable locally; CI requires jq.
 
 Per-package / single-test:
 
