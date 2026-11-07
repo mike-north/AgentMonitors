@@ -143,6 +143,30 @@ evidence renders and the subprocess bound stays inside the test budget). The evi
 exposed the race is in
 [`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
 
+### 2.10 Docker smoke diagnostic capture (current)
+
+The Docker smoke fixture MUST allow a successful install/build phase emitting more than 20 MiB
+while preserving the caller's literal success markers. Phase volume is written to container-local
+logs; the outer combined 20 MiB capture limit remains a failure boundary for runaway outer output,
+including a zero exit with all markers. Named ordinary failures MUST include recent phase and daemon
+evidence with byte-bounded tails, including single-line logs.
+
+During active work, a bounded periodic stream MUST retain recent phase/daemon evidence before forced
+removal when diagnostic retrieval fails. This samples history rather than preserving every byte:
+output after the last sample can be lost on SIGKILL. Current sampling emits at most 240 one-second
+snapshots of two 8 KiB tails, plus final phase/failure tails. Container-local full logs are temporary
+and can grow with command output; this is an outer-capture bound, not a disk quota.
+
+The unchanged 300s caller budget includes 210.5s execution, 59.5s logical retrieval/cleanup, and a 30s
+reporting reserve. Tests MUST retain pre-creation client termination, late removal retries, and
+reason-specific failure reporting. These bounds assume ordinary OS scheduling and client reaping;
+they do not establish repeated-CI reliability or protection from arbitrary Docker/server stalls.
+
+**Verified in:** `apps/cli/src/commands/smoke-shell.test.ts` (21 MiB success, ordinary failure,
+abrupt active termination), `smoke-container.test.ts` (retrieval failure, retained diagnostics,
+270s logical completion, cleanup and zero-exit overflow rejection), and `cli.docker.test.ts`
+(the complete container workflow).
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.
