@@ -450,6 +450,11 @@ export interface MonitorExplainReport {
   events: MonitorEventRecord[];
   projections: MonitorDeliveryProjection[];
   leadSessions: AgentSessionRecord[];
+  /**
+   * Durable materialization work still pending or terminal for this monitor.
+   * Optional for compatibility with reports returned by older daemons.
+   */
+  materializationRetries?: MaterializationRetrySummary;
 }
 
 /**
@@ -507,6 +512,13 @@ export interface DoctorMonitorRollup {
   lastEventAt?: Date;
   /** Delivery-state tallies across this workspace's lead-session projections. */
   delivery: DoctorDeliveryCounts;
+  /**
+   * Durable failed observations awaiting retry or operator repair. Duplicated
+   * ids omit this summary: their one outbox belongs to the report's orphaned
+   * groups instead of being attributed to each conflicting definition.
+   * Optional for compatibility with reports returned by older daemons.
+   */
+  materializationRetries?: MaterializationRetrySummary;
 }
 
 /** A parse-level failure attributed to a monitor id (or file path fallback). */
@@ -553,6 +565,14 @@ export interface MonitorDoctorReport {
   monitorsDirExists: boolean;
   /** Every discovered monitor's rollup (both valid and invalid definitions). */
   monitors: DoctorMonitorRollup[];
+  /**
+   * Retained outboxes without one unambiguous parsed current definition:
+   * missing/parse-failed definitions and duplicated ids. These are recovery
+   * obligations, not synthetic monitor definitions. A represented outbox appears
+   * here or on its monitor rollup, never both. Ordered by monitor id.
+   * Optional for compatibility with older daemon reports.
+   */
+  orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
   /** Count of discovered monitors that failed validation. */
   invalidCount: number;
   /** Monitor-id collisions across the tree (001 §4). */
@@ -717,7 +737,38 @@ export interface MaterializationRetryQuery {
   limit?: number;
 }
 
-/** Aggregate capacity and lifecycle counts for one retry outbox. @public */
+/**
+ * Safe retained-work summary for a route with no unambiguous parsed current
+ * monitor definition. The containing doctor report supplies its workspace;
+ * captured source/configuration metadata is deliberately not reconstructed.
+ * @public
+ */
+export interface OrphanedMaterializationRetrySummary {
+  /** Durable route identity needed to inspect and repair the retained work. */
+  monitorId: string;
+  /** Exact route's lifecycle totals and bounded metadata, never its envelopes. */
+  summary: MaterializationRetrySummary;
+}
+
+/** Operator-safe retry metadata that never contains an envelope or payload. @public */
+export interface MaterializationRetryDiagnostic {
+  /** Stable retry id used by the operator re-arm flow. */
+  id: string;
+  /** Whether automatic work remains eligible or requires operator re-arm. */
+  status: MaterializationRetryStatus;
+  /** Number of failed automatic attempts since enqueue or re-arm. */
+  attemptCount: number;
+  /** Next eligible attempt; null while terminal. */
+  nextAttemptAt: Date | null;
+  /** Control-stripped, 1,024-character failure summary. */
+  lastError: string | null;
+  /** Time the failed observation first entered the outbox. */
+  createdAt: Date;
+  /** Time of the most recent failed attempt or operator re-arm. */
+  updatedAt: Date;
+}
+
+/** Aggregate and bounded record-level diagnostics for one retry outbox. @public */
 export interface MaterializationRetrySummary {
   /** Records still eligible for automatic retry. */
   pending: number;
@@ -725,6 +776,8 @@ export interface MaterializationRetrySummary {
   terminal: number;
   /** Total UTF-8 bytes occupied by stored envelopes in both states. */
   bytes: number;
+  /** Oldest-first safe metadata, without stored envelopes or payloads. */
+  records: MaterializationRetryDiagnostic[];
 }
 
 export interface ProcessObservationInput {
