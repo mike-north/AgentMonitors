@@ -1,5 +1,8 @@
 /**
- * Migration coverage for the workspace-namespacing of `monitor_state` and
+ * Database migration contracts, including dependency-safe materialization table
+ * rebuilds that preserve retained triggers, rows and logical references.
+ *
+ * Workspace-namespacing coverage for `monitor_state` and
  * `observation_history` (issue #345 / #307).
  *
  * A database created before this change keyed `monitor_state` by `monitor_id`
@@ -24,11 +27,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createDb } from './db.js';
 import { RuntimeStore } from '../runtime/store.js';
 
 const tempRoots: string[] = [];
+/** Native migration handles remain owned even when createDb throws before returning. */
+const migrationClients = new Set<Database.Database>();
 
 function tempDbPath(): string {
   const root = mkdtempSync(path.join(tmpdir(), 'agentmon-migrate-'));
@@ -37,6 +42,11 @@ function tempDbPath(): string {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  for (const client of migrationClients) {
+    if (client.open) client.close();
+  }
+  migrationClients.clear();
   for (const root of tempRoots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
   }
@@ -389,4 +399,451 @@ describe('monitor_state / observation_history workspace migration (#345 / #307)'
       '/projects/gamma/g.ts',
     ]);
   });
+});
+
+/** Public identities and reference targets belong to retained input, not migration output. */
+const retainedEventId = '01M6BFP5G00000000000000001';
+const retainedSnapshotId = '01M6BFP5G00000000000000002';
+const retainedSessionId = '01M6BFP5G00000000000000003';
+const probeEventId = '01M6BFP5G00000000000000004';
+const probeSnapshotId = '01M6BFP5G00000000000000005';
+
+/** Legacy table inputs omit only the private ordering key introduced by materialization migration. */
+const legacyEventsDDL = `CREATE TABLE monitor_events (
+  id TEXT PRIMARY KEY, workspace_path TEXT, monitor_id TEXT NOT NULL,
+  source_name TEXT NOT NULL, urgency TEXT NOT NULL, title TEXT NOT NULL,
+  body TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '{}', snapshot_metadata TEXT NOT NULL DEFAULT '{}',
+  snapshot_text TEXT, diff_text TEXT, object_key TEXT, baseline_strategy TEXT,
+  query_scope TEXT NOT NULL DEFAULT '{}', tags TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL
+)`;
+const legacySnapshotsDDL = `CREATE TABLE monitor_snapshots (
+  id TEXT PRIMARY KEY, workspace_path TEXT, monitor_id TEXT NOT NULL,
+  object_key TEXT NOT NULL, event_id TEXT NOT NULL, content TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+)`;
+
+/** Native schema rows are input-preservation evidence, including exact stored SQL. */
+interface IMigrationSchemaObject {
+  type: string;
+  name: string;
+  tbl_name: string;
+  sql: string | null;
+}
+
+/** Each relationship exercises a trigger that remains valid in the original durable schema. */
+type TriggerDependency =
+  | 'snapshots-events'
+  | 'events-snapshots'
+  | 'auxiliary-events'
+  | 'auxiliary-snapshots';
+interface ITriggerMigrationCase {
+  name: string;
+  legacy: 'both' | 'events' | 'snapshots' | 'neither';
+  dependencies: readonly TriggerDependency[];
+  quoted?: boolean;
+}
+
+/** SQL identifiers may contain quotes and punctuation; fixture names must retain their exact identity. */
+function quoteMigrationIdentifier(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+/** Public InboxDb deliberately hides native access; only migration fixtures inspect SQLite directly. */
+function migrationClient(dbPath: string): Database.Database {
+  const client = (createDb(dbPath) as unknown as { $client: Database.Database })
+    .$client;
+  migrationClients.add(client);
+  return client;
+}
+
+/** Capture supplied durable input for equality checks; this is not a generated expected-output snapshot. */
+function retainedMigrationState(client: Database.Database) {
+  const schema = client
+    .prepare<
+      [],
+      IMigrationSchemaObject
+    >('SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY type,name')
+    .all();
+  const data = Object.fromEntries(
+    schema
+      .filter((row) => row.type === 'table')
+      .map((row) => [
+        row.name,
+        client
+          .prepare<
+            [],
+            Record<string, unknown>
+          >(`SELECT * FROM ${quoteMigrationIdentifier(row.name)} ORDER BY rowid`)
+          .all(),
+      ]),
+  );
+  const metadata = Object.fromEntries(
+    [
+      'schema_version',
+      'user_version',
+      'application_id',
+      'journal_mode',
+      'foreign_keys',
+      'busy_timeout',
+      'legacy_alter_table',
+      'writable_schema',
+      'recursive_triggers',
+    ].map((name) => [name, client.pragma(name, { simple: true })]),
+  );
+  return { schema, data, metadata };
+}
+
+/** Seed ordinary rows and references before installing triggers, so any later audit row is an actual side effect. */
+function seedTriggerMigration(
+  dbPath: string,
+  fixture: ITriggerMigrationCase,
+): void {
+  const client = migrationClient(dbPath);
+  if (fixture.legacy === 'both' || fixture.legacy === 'events') {
+    client.exec(`DROP TABLE monitor_events; ${legacyEventsDDL}`);
+  }
+  if (fixture.legacy === 'both' || fixture.legacy === 'snapshots') {
+    client.exec(`DROP TABLE monitor_snapshots; ${legacySnapshotsDDL}`);
+  }
+  client.exec(`
+    CREATE INDEX retained_events_scope ON monitor_events(workspace_path, monitor_id, object_key);
+    CREATE INDEX retained_snapshots_scope ON monitor_snapshots(workspace_path, monitor_id, object_key);
+    CREATE TABLE retained_audit (kind TEXT NOT NULL, ref TEXT NOT NULL, related_count INTEGER NOT NULL);
+    CREATE TABLE retained_auxiliary (id TEXT PRIMARY KEY, value TEXT NOT NULL);
+    INSERT INTO retained_auxiliary VALUES ('aux', 'unchanged');
+    PRAGMA user_version=41;
+    PRAGMA application_id=534;
+  `);
+  client
+    .prepare(
+      `INSERT INTO monitor_events
+    (id,workspace_path,monitor_id,source_name,urgency,title,summary,snapshot_text,object_key,baseline_strategy,created_at)
+    VALUES (?, '/workspace', 'monitor', 'manual', 'normal', 'retained event', 'original summary', 'original content', 'object', 'net', 1793534400)`,
+    )
+    .run(retainedEventId);
+  client
+    .prepare(
+      `INSERT INTO monitor_snapshots
+    (id,workspace_path,monitor_id,object_key,event_id,content,created_at) VALUES (?, '/workspace', 'monitor', 'object', ?, 'original content',1793534400)`,
+    )
+    .run(retainedSnapshotId, retainedEventId);
+  client
+    .prepare(
+      `INSERT INTO agent_sessions
+    (id,adapter,host_session_id,agent_identity,role,workspace_path,hook_state_path,status,baseline_at,last_active_at,created_at,updated_at)
+    VALUES (?, 'fixture','host','fixture','lead','/workspace','/owned/hook.json','active',1793534400,1793534400,1793534400,1793534400)`,
+    )
+    .run(retainedSessionId);
+  client
+    .prepare(
+      `INSERT INTO session_event_state
+    (id,session_id,event_id,diff_text,created_at,updated_at) VALUES ('projection',?,?,'recipient delta',1793534400,1793534400)`,
+    )
+    .run(retainedSessionId, retainedEventId);
+  client
+    .prepare(
+      `INSERT INTO session_object_cursor
+    (id,session_id,monitor_id,object_key,workspace_path,baseline_snapshot_id,baseline_content,updated_at)
+    VALUES ('cursor',?,'monitor','object','/workspace',?,'original content',1793534400)`,
+    )
+    .run(retainedSessionId, retainedSnapshotId);
+  client.exec(`CREATE TRIGGER "ordinary event audit" AFTER INSERT ON monitor_events
+    BEGIN INSERT INTO retained_audit VALUES ('ordinary-event',NEW.id,0); END`);
+  client.exec(`CREATE TRIGGER "ordinary snapshot audit" AFTER INSERT ON monitor_snapshots
+    BEGIN INSERT INTO retained_audit VALUES ('ordinary-snapshot',NEW.id,0); END`);
+  for (const dependency of fixture.dependencies) {
+    const name = fixture.quoted ? `cross "${dependency}"; trigger` : dependency;
+    const target = dependency.startsWith('snapshots')
+      ? 'monitor_snapshots'
+      : dependency.startsWith('events')
+        ? 'monitor_events'
+        : 'retained_auxiliary';
+    const action =
+      target === 'retained_auxiliary' ? 'UPDATE OF value' : 'INSERT';
+    const source = dependency.endsWith('events')
+      ? 'monitor_events'
+      : 'monitor_snapshots';
+    const condition =
+      dependency === 'snapshots-events' ? ' WHERE id=NEW.event_id' : '';
+    client.exec(`CREATE TRIGGER ${quoteMigrationIdentifier(name)} AFTER ${action} ON ${target}
+      BEGIN INSERT INTO retained_audit SELECT '${dependency}',NEW.id,COUNT(*) FROM ${source}${condition}; END`);
+  }
+  client.close();
+}
+
+/** Exercise retained SQL on real inserts/updates, then undo only the probe work. */
+function expectTriggerBehavior(
+  client: Database.Database,
+  dependencies: readonly TriggerDependency[],
+): void {
+  client.exec('SAVEPOINT retained_trigger_behavior');
+  try {
+    client
+      .prepare(
+        `INSERT INTO monitor_events (id,monitor_id,source_name,urgency,title,created_at)
+      VALUES (?,'monitor','manual','normal','probe event',1793534401)`,
+      )
+      .run(probeEventId);
+    client
+      .prepare(
+        `INSERT INTO monitor_snapshots (id,monitor_id,object_key,event_id,content,created_at)
+      VALUES (?,'monitor','object',?,'probe content',1793534401)`,
+      )
+      .run(probeSnapshotId, probeEventId);
+    client.exec("UPDATE retained_auxiliary SET value='probe' WHERE id='aux'");
+    const expected = [
+      { kind: 'ordinary-event', ref: probeEventId, related_count: 0 },
+      { kind: 'ordinary-snapshot', ref: probeSnapshotId, related_count: 0 },
+      ...dependencies.map((dependency) => ({
+        kind: dependency,
+        ref: dependency.startsWith('snapshots')
+          ? probeSnapshotId
+          : dependency.startsWith('events')
+            ? probeEventId
+            : 'aux',
+        related_count: dependency.startsWith('auxiliary') ? 2 : 1,
+      })),
+    ].sort((a, b) => a.kind.localeCompare(b.kind));
+    expect(
+      client
+        .prepare(
+          'SELECT kind,ref,related_count FROM retained_audit ORDER BY kind',
+        )
+        .all(),
+    ).toEqual(expected);
+  } finally {
+    client.exec(
+      'ROLLBACK TO retained_trigger_behavior; RELEASE retained_trigger_behavior',
+    );
+  }
+}
+
+/** Spec 002 §1.1.7/§5.2 promises exact trigger preservation across the coordinated rebuild. */
+describe('materialization migration preserves dependent legacy triggers (#534)', () => {
+  const nativeExec = Database.prototype.exec;
+  let nativeFailure: 'second-rebuild' | 'trigger-restoration' | undefined;
+  let failureBoundary:
+    | { eventOrdered: boolean; snapshotOrdered: boolean }
+    | undefined;
+
+  beforeEach(() => {
+    nativeFailure = undefined;
+    failureBoundary = undefined;
+    // Delegate every production statement to native SQLite. Fault cases add an actual
+    // duplicate-table DDL statement at a chosen boundary, never a fabricated Error.
+    vi.spyOn(Database.prototype, 'exec').mockImplementation(function (
+      this: Database.Database,
+      statement: string,
+    ) {
+      migrationClients.add(this);
+      const atSecondRebuild =
+        nativeFailure === 'second-rebuild' &&
+        statement.includes('CREATE TABLE monitor_snapshots_ordered');
+      const atRestoration =
+        nativeFailure === 'trigger-restoration' &&
+        statement.startsWith('CREATE TRIGGER "ordinary snapshot audit"');
+      if (atSecondRebuild || atRestoration) {
+        failureBoundary = {
+          eventOrdered: this.prepare<[], { name: string }>(
+            'PRAGMA table_info(monitor_events)',
+          )
+            .all()
+            .some((row) => row.name === 'sequence'),
+          snapshotOrdered: this.prepare<[], { name: string }>(
+            'PRAGMA table_info(monitor_snapshots)',
+          )
+            .all()
+            .some((row) => row.name === 'sequence'),
+        };
+        return nativeExec.call(
+          this,
+          'CREATE TABLE retained_auxiliary (id TEXT)',
+        );
+      }
+      return nativeExec.call(this, statement);
+    });
+  });
+
+  const cases: readonly ITriggerMigrationCase[] = [
+    {
+      name: 'snapshot trigger reading events',
+      legacy: 'both',
+      dependencies: ['snapshots-events'],
+    },
+    {
+      name: 'event trigger reading snapshots',
+      legacy: 'both',
+      dependencies: ['events-snapshots'],
+    },
+    {
+      name: 'mutually dependent triggers',
+      legacy: 'both',
+      dependencies: ['snapshots-events', 'events-snapshots'],
+    },
+    {
+      name: 'third-table trigger reading events',
+      legacy: 'both',
+      dependencies: ['auxiliary-events'],
+    },
+    {
+      name: 'third-table trigger reading snapshots',
+      legacy: 'both',
+      dependencies: ['auxiliary-snapshots'],
+    },
+    { name: 'ordinary non-cross triggers', legacy: 'both', dependencies: [] },
+    {
+      name: 'quoted cross-trigger names',
+      legacy: 'both',
+      dependencies: ['snapshots-events', 'events-snapshots'],
+      quoted: true,
+    },
+    {
+      name: 'only events require rebuilding',
+      legacy: 'events',
+      dependencies: ['snapshots-events', 'auxiliary-events'],
+    },
+    {
+      name: 'only snapshots require rebuilding',
+      legacy: 'snapshots',
+      dependencies: ['events-snapshots', 'auxiliary-snapshots'],
+    },
+  ];
+
+  it.each(cases)(
+    'opens and preserves $name without replaying copied rows',
+    (fixture) => {
+      const filename = tempDbPath();
+      seedTriggerMigration(filename, fixture);
+      const original = new Database(filename);
+      migrationClients.add(original);
+      original.pragma('foreign_keys=ON');
+      const before = retainedMigrationState(original);
+      expectTriggerBehavior(original, fixture.dependencies);
+      expect(retainedMigrationState(original)).toEqual(before);
+      original.close();
+
+      // Expected success is derived from retained-trigger compatibility, not the old failure.
+      const migrated = migrationClient(filename);
+      const after = retainedMigrationState(migrated);
+      for (const table of ['monitor_events', 'monitor_snapshots']) {
+        expect(
+          migrated
+            .prepare<[], { name: string }>(`PRAGMA table_info(${table})`)
+            .all()
+            .map((row) => row.name),
+        ).toContain('sequence');
+        expect(after.data[table]?.map((row) => row['sequence'])).toEqual([1]);
+      }
+      for (const row of before.schema.filter(
+        (row) =>
+          row.type === 'trigger' || (row.type === 'index' && row.sql !== null),
+      )) {
+        expect(
+          after.schema.find((candidate) => candidate.name === row.name),
+        ).toEqual(row);
+      }
+      for (const [table, rows] of Object.entries(before.data)) {
+        if (table === 'sqlite_sequence') continue;
+        const actual = after.data[table];
+        expect(
+          actual?.map((row) => {
+            if (table !== 'monitor_events' && table !== 'monitor_snapshots')
+              return row;
+            const { sequence: _sequence, ...publicRow } = row;
+            return publicRow;
+          }),
+        ).toEqual(
+          rows.map((row) => {
+            if (table !== 'monitor_events' && table !== 'monitor_snapshots')
+              return row;
+            const { sequence: _sequence, ...publicRow } = row;
+            return publicRow;
+          }),
+        );
+      }
+      for (const [name, value] of Object.entries(before.metadata)) {
+        if (name !== 'schema_version')
+          expect(after.metadata[name]).toEqual(value);
+      }
+      expect(after.data['retained_audit']).toEqual([]);
+      expect(migrated.pragma('integrity_check', { simple: true })).toBe('ok');
+      expect(migrated.pragma('foreign_key_check')).toEqual([]);
+      expectTriggerBehavior(migrated, fixture.dependencies);
+      expect(retainedMigrationState(migrated)).toEqual(after);
+      migrated.close();
+
+      const reopened = migrationClient(filename);
+      expect(retainedMigrationState(reopened)).toEqual(after);
+      expectTriggerBehavior(reopened, fixture.dependencies);
+    },
+  );
+
+  it('does not churn retained triggers or schema on an already-current open', () => {
+    const filename = tempDbPath();
+    const fixture: ITriggerMigrationCase = {
+      name: 'current',
+      legacy: 'neither',
+      dependencies: [
+        'snapshots-events',
+        'events-snapshots',
+        'auxiliary-events',
+        'auxiliary-snapshots',
+      ],
+      quoted: true,
+    };
+    seedTriggerMigration(filename, fixture);
+    const client = migrationClient(filename);
+    const before = retainedMigrationState(client);
+    expectTriggerBehavior(client, fixture.dependencies);
+    client.close();
+    const reopened = migrationClient(filename);
+    expect(retainedMigrationState(reopened)).toEqual(before);
+    expectTriggerBehavior(reopened, fixture.dependencies);
+  });
+
+  it.each(['second-rebuild', 'trigger-restoration'] as const)(
+    'rolls back every retained object after native DDL failure at %s',
+    (boundary) => {
+      const filename = tempDbPath();
+      seedTriggerMigration(filename, {
+        name: 'rollback',
+        legacy: 'both',
+        dependencies: [],
+      });
+      const observer = new Database(filename);
+      migrationClients.add(observer);
+      observer.pragma('foreign_keys=ON');
+      const before = retainedMigrationState(observer);
+      nativeFailure = boundary;
+      let caught: unknown;
+      try {
+        migrationClient(filename);
+      } catch (error) {
+        caught = error;
+      }
+      nativeFailure = undefined;
+      expect(caught).toMatchObject({
+        name: 'SqliteError',
+        code: 'SQLITE_ERROR',
+        message: 'table retained_auxiliary already exists',
+      });
+      expect(failureBoundary).toEqual({
+        eventOrdered: true,
+        snapshotOrdered: boundary === 'trigger-restoration',
+      });
+      expect(retainedMigrationState(observer)).toEqual(before);
+      observer.close();
+      const fresh = new Database(filename);
+      migrationClients.add(fresh);
+      fresh.pragma('foreign_keys=ON');
+      expect(retainedMigrationState(fresh)).toEqual(before);
+      expectTriggerBehavior(fresh, []);
+      fresh.close();
+      // A later successful retry still owns the complete migration and original SQL.
+      const recovered = migrationClient(filename);
+      expectTriggerBehavior(recovered, []);
+    },
+  );
 });

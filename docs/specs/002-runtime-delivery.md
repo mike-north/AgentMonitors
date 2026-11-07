@@ -1194,6 +1194,14 @@ counter. Existing event/projection/snapshot atomicity is unchanged.
 A legacy snapshot table is rebuilt atomically under the schema migration's immediate
 transaction. All public IDs, contents, timestamps, scope and event references survive;
 explicit indexes and triggers are recreated without replaying insertion side effects.
+The event and snapshot rebuilds share one trigger-preservation scope inside that
+transaction. When either retained legacy table needs rebuilding, all persisted
+main-schema triggers are temporarily suspended, including triggers owned by other
+tables that reference either rebuilt table. Their exact stored SQL is restored only
+after both final table names exist. A copy, index or trigger-restoration failure rolls
+back the complete original schema and data. Already-current/new schemas do not churn
+triggers; connection pragmas, public identities and ordering policies remain unchanged.
+
 Retained rows receive sequence numbers in their **current hidden rowid order**. This is
 an explicit bootstrap policy: it cannot recover chronology already lost before migration
 (for example through historical `VACUUM`) or repair previously generated diffs. Reopening

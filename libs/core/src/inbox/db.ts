@@ -354,6 +354,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // missing so the per-recipient `net` collapse can read each event's strategy
   // at claim time; legacy rows keep NULL and are treated as `incremental`.
   addColumnIfMissing(sqlite, 'monitor_events', 'baseline_strategy', 'TEXT');
+  const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
 
   db.run(sql`
@@ -370,6 +371,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   `);
 
   migrateSnapshotMaterializationOrder(sqlite);
+  for (const trigger of retainedTriggers) sqlite.exec(trigger.sql);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS materialization_retry_outbox (
@@ -482,6 +484,41 @@ interface LegacyMonitorStateRow {
 }
 
 /**
+ * Keep retained trigger dependencies valid across the two ordering-table rebuilds.
+ * A trigger can belong to any table while reading either rebuilt table; SQLite
+ * validates those references during RENAME, when a dropped name is temporarily
+ * absent. Suspending every persisted main-schema trigger avoids guessing SQL
+ * dependencies and prevents copied rows from replaying trigger side effects.
+ *
+ * The caller's existing immediate schema transaction owns suspension, both
+ * rebuilds, and exact-SQL restoration after both final table names exist. Any
+ * failure rolls back the original definitions with their rows and indexes.
+ * Current and new schemas leave triggers untouched when no legacy table needs
+ * rebuilding. Connection pragmas and public schema contracts are unchanged.
+ */
+function suspendMaterializationMigrationTriggers(
+  sqlite: BetterSQLiteClient,
+): { name: string; sql: string }[] {
+  const needsRebuild = ['monitor_events', 'monitor_snapshots'].some(
+    (table) =>
+      tableExists(sqlite, table) && !tableHasColumn(sqlite, table, 'sequence'),
+  );
+  if (!needsRebuild) return [];
+
+  const triggers = sqlite
+    .prepare<[], { name: string; sql: string }>(
+      `SELECT name, sql FROM main.sqlite_schema
+       WHERE type = 'trigger' AND sql IS NOT NULL ORDER BY name`,
+    )
+    .all();
+  for (const trigger of triggers) {
+    const identifier = `"${trigger.name.replaceAll('"', '""')}"`;
+    sqlite.exec(`DROP TRIGGER main.${identifier}`);
+  }
+  return triggers;
+}
+
+/**
  * Preserve event identities and their projection/snapshot/cursor references
  * while adding a private tie-break for equal persisted observation timestamps.
  * This runs under the schema-build immediate transaction, after older additive
@@ -490,16 +527,17 @@ interface LegacyMonitorStateRow {
  * Current hidden rowid orders the retained legacy bootstrap only; lost earlier
  * chronology is not reconstructible. SQLite allocates all subsequent positions
  * atomically, preserves them across VACUUM/reopen and does not reuse committed
- * deleted positions. Copy before recreating triggers to avoid replaying events.
+ * deleted positions. The coordinator suspends triggers across both rebuilds;
+ * this table-local helper restores only retained indexes.
  * The repository's event relationships are logical IDs, not SQLite foreign keys.
  */
 function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
   if (tableHasColumn(sqlite, 'monitor_events', 'sequence')) return;
 
-  const schemaObjects = sqlite
+  const indexes = sqlite
     .prepare<[], { sql: string }>(
       `SELECT sql FROM sqlite_master
-       WHERE tbl_name = 'monitor_events' AND type IN ('index', 'trigger')
+       WHERE tbl_name = 'monitor_events' AND type = 'index'
          AND sql IS NOT NULL ORDER BY type, name`,
     )
     .all();
@@ -535,7 +573,7 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
     DROP TABLE monitor_events;
     ALTER TABLE monitor_events_ordered RENAME TO monitor_events;
   `);
-  for (const object of schemaObjects) sqlite.exec(object.sql);
+  for (const index of indexes) sqlite.exec(index.sql);
 }
 
 /**
@@ -547,16 +585,16 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
  * of historical chronology lost before migration (for example by VACUUM).
  * New explicit integer keys survive VACUUM and reopen; AUTOINCREMENT prevents
  * reuse after committed deletion. Rolled-back allocations may be reused because
- * no committed snapshot ever acquired them. Existing indexes/triggers are
- * recreated after copying so bootstrap does not replay insertion side effects.
+ * no committed snapshot ever acquired them. This helper restores retained indexes;
+ * the coordinator restores triggers only after both table names are valid.
  */
 function migrateSnapshotMaterializationOrder(sqlite: BetterSQLiteClient): void {
   if (tableHasColumn(sqlite, 'monitor_snapshots', 'sequence')) return;
 
-  const schemaObjects = sqlite
+  const indexes = sqlite
     .prepare<[], { sql: string }>(
       `SELECT sql FROM sqlite_master
-       WHERE tbl_name = 'monitor_snapshots' AND type IN ('index', 'trigger')
+       WHERE tbl_name = 'monitor_snapshots' AND type = 'index'
          AND sql IS NOT NULL ORDER BY type, name`,
     )
     .all();
@@ -578,7 +616,7 @@ function migrateSnapshotMaterializationOrder(sqlite: BetterSQLiteClient): void {
     DROP TABLE monitor_snapshots;
     ALTER TABLE monitor_snapshots_ordered RENAME TO monitor_snapshots;
   `);
-  for (const object of schemaObjects) sqlite.exec(object.sql);
+  for (const index of indexes) sqlite.exec(index.sql);
 }
 
 /**

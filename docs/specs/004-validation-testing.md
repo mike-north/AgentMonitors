@@ -436,6 +436,17 @@ with unchanged public data/indexes/triggers and no replayed trigger effects, mig
 idempotence, and simultaneous first-open migration. The existing transactional
 materialization suite retains event/projection/cursor/snapshot rollback coverage.
 
+`inbox/db.migration.test.ts` additionally requires the coordinated event/snapshot
+rebuild to preserve cross-table triggers in both directions, mutual dependencies,
+third-table dependencies, quoted names and only-one-legacy-table cases. Ordinary
+triggers remain controls. Assertions retain exact stored trigger/index SQL, public
+rows and logical references, compatibility metadata and pragmas, prohibit copy-time
+trigger replay, exercise explicit behavior after open/reopen, and require no schema
+churn on an already-current open. Native duplicate-table DDL faults at the second
+rebuild and trigger restoration boundaries must roll back the whole original schema,
+rows, indexes, trigger definitions and metadata; tests inject real SQLite DDL rather
+than a fabricated error or public fault-injection API.
+
 ### Equal-time event order
 
 `runtime/event-materialization-order.test.ts` uses two genuine independent event ULID
