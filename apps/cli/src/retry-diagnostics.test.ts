@@ -4,13 +4,7 @@
  * accidentally satisfy wire-date, compatibility, privacy, or rendering checks.
  */
 import { execFile } from 'node:child_process';
-import {
-  copyFileSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -21,7 +15,7 @@ import type {
 } from '@agentmonitors/core';
 import { createDb, RuntimeStore } from '@agentmonitors/core';
 import type { Database } from 'better-sqlite3';
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it } from 'vitest';
 import { doctorReportClient, explainMonitorClient } from './runtime-client.js';
 import { writeLocalState } from './local-state.js';
 
@@ -42,41 +36,13 @@ const recordKeys = [
   'status',
   'updatedAt',
 ];
-const packageRoot = path.resolve(import.meta.dirname, '..');
-let cli: string;
-let buildRoot: string | undefined;
+/** Nx completes the package build before this suite consumes the shared bundle. */
+const cli = path.resolve(import.meta.dirname, '../dist/index.cjs');
 const execute = promisify(execFile);
 let root: string;
 let socketPath: string;
 let requests: { method: string; params: Record<string, unknown> }[];
 let server: net.Server | undefined;
-
-/**
- * Build an owned artifact: the default CLI integration suite cleans/rebuilds
- * dist concurrently, so consuming that shared output would race its deletion.
- * Keep the package-relative manifest and installed native dependency resolution
- * intact, under an ignored fixture directory with explicit cleanup.
- */
-beforeAll(async () => {
-  buildRoot = mkdtempSync(
-    path.join(packageRoot, 'node_modules', '.retry-cli-'),
-  );
-  copyFileSync(
-    path.join(packageRoot, 'package.json'),
-    path.join(buildRoot, 'package.json'),
-  );
-  const output = path.join(buildRoot, 'dist');
-  await execute('pnpm', ['exec', 'tsup', '--out-dir', output], {
-    cwd: packageRoot,
-    timeout: 30000,
-  });
-  cli = path.join(output, 'index.cjs');
-}, 30000);
-afterAll(() => {
-  if (buildRoot) {
-    rmSync(buildRoot, { recursive: true, force: true });
-  }
-});
 
 beforeEach(() => {
   // A short owned path respects macOS's Unix socket pathname limit.
