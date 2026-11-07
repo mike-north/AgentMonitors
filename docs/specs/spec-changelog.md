@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
+
+The incoming-changes Nx test target requires both dependency builds and its own build because
+the revision-expression suite executes `dist/index.js`. Require a first-attempt cold-target
+pass with caching disabled, and an own-build-edge-only reversion that exposes the six compiled
+failures while the 52 controls pass. Direct vitest still consumes prebuilt output; no build
+moves into test code. Source behavior, public API, feature tests and global Nx defaults remain
+unchanged.
+
 ## 2026-11-05 — Verify resolved Git objects without rewriting authored revisions (003–004) — Refs #305
 
 Resolve an authored incoming-changes revision unchanged to one complete SHA-1/SHA-256 object ID,

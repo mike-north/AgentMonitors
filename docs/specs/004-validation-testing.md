@@ -176,6 +176,15 @@ status, signal and output rather than vitest's bare timeout.
 Running a CLI test file directly with vitest bypasses the Nx dependency and executes whatever bundle
 already exists; build first, or use `pnpm nx test @agentmonitors/cli`.
 
+**Current, normative:** the `source-incoming-changes` test target also declares its own `build`
+alongside dependency builds. Its revision-expression tests execute both TypeScript source and
+`dist/index.js`, so `pnpm nx test @agentmonitors/source-incoming-changes` MUST build core, then
+the plugin, before running the suite. This ordering must hold with the plugin's `dist` absent
+and Nx caching disabled; all 58 existing cases must pass on their first attempt. Removing only
+the own-build prerequisite under the same cold conditions must expose the six compiled-surface
+failures while the 52 source/control cases pass. A direct vitest invocation still requires a
+prior build; tests MUST NOT start builds themselves.
+
 **Verified in:** `scripts/cli-build-ownership.test.ts` (the CLI's `test` and `test:serial` targets
 depend on `build`; no tracked test source starts a build), `scripts/vitest-launcher-retry.test.ts`
 (the launcher config's resolved retry count is zero; run under `pnpm test:scripts`, wired into CI
@@ -183,6 +192,9 @@ per-PR), and `apps/agentmonitors/test/launcher.test.ts` (forced crash and hang c
 evidence renders and the subprocess bound stays inside the test budget). The evidence that first
 exposed the race is in
 [`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
+The incoming-changes cold-target check executes `src/index.test.ts`, `src/unavailable.test.ts`
+and `src/revision-expressions.test.ts` in `plugins/source-incoming-changes`; the last suite's
+compiled cases enforce that the Nx prerequisite produces a usable current artifact.
 
 ### 2.10 Repository pre-push gate
 
