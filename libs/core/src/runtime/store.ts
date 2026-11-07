@@ -443,15 +443,23 @@ export class RuntimeStore {
     // Runtime-owned spans compose store operations without adding executable
     // callbacks to the published store API. Cache visibility follows the outer
     // commit, including when nested event savepoints succeeded before rollback.
-    registerRuntimeTransaction(this, (operation) => {
-      const previousProjectedSessionIds = this.lastProjectedSessionIds;
-      try {
-        return asInternalDb(this.db).$client.transaction(operation).immediate();
-      } catch (error) {
-        this.lastProjectedSessionIds = previousProjectedSessionIds;
-        throw error;
-      }
-    });
+    // The liveness predicate reads this same owned native connection: SQLite
+    // may end the outer transaction without returning through its runner first.
+    registerRuntimeTransaction(
+      this,
+      (operation) => {
+        const previousProjectedSessionIds = this.lastProjectedSessionIds;
+        try {
+          return asInternalDb(this.db)
+            .$client.transaction(operation)
+            .immediate();
+        } catch (error) {
+          this.lastProjectedSessionIds = previousProjectedSessionIds;
+          throw error;
+        }
+      },
+      () => asInternalDb(this.db).$client.inTransaction,
+    );
   }
 
   openSession(input: OpenSessionInput): AgentSessionRecord {
@@ -1068,6 +1076,20 @@ export class RuntimeStore {
         asc(materializationRetryOutbox.id),
       )
       .all();
+    // SQLite TEXT is not validated by the lifecycle type annotation. Reject
+    // unsupported persisted states before constructing totals or records; a
+    // diagnostic read must preserve retained evidence rather than relabel it.
+    // Keep the failure fixed and bounded without echoing private stored text.
+    if (
+      rows.some(
+        ({ status }: { status: unknown }) =>
+          status !== 'pending' && status !== 'terminal',
+      )
+    ) {
+      throw new Error(
+        'Cannot summarize materialization retries: unsupported persisted status.',
+      );
+    }
     return rows.reduce<MaterializationRetrySummary>(
       (summary, row) => {
         summary[row.status] += 1;

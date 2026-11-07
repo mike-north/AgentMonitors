@@ -12,18 +12,33 @@
 /** An implementation-owned SQLite boundary; its store also restores caches on rollback. */
 type RuntimeTransaction = <T>(operation: () => T) => T;
 
-/** Weak ownership keeps a store's database private without extending its public interface. */
-const transactions = new WeakMap<object, RuntimeTransaction>();
+/**
+ * Weak registration keeps the database private. Each runner and native liveness
+ * predicate belong to the same store-owned SQLite connection; a separate flag
+ * could miss SQLite ending a transaction underneath a nested savepoint.
+ */
+const transactions = new WeakMap<
+  object,
+  {
+    /** Owns synchronous admission and restores the last committed recipient cache on failure. */
+    readonly transaction: RuntimeTransaction;
+    /** Reads SQLite's actual transaction state without beginning or repairing a transaction. */
+    readonly isActive: () => boolean;
+  }
+>();
 
 /**
- * Connect a newly constructed store to its implementation-owned transaction boundary.
+ * Register the store's synchronous runner and a read-only native predicate for
+ * that same connection. Registration composes library-owned persistence only;
+ * it does not expose the connection or accept a source/plugin transaction mode.
  * @internal
  */
 export function registerRuntimeTransaction(
   store: object,
   transaction: RuntimeTransaction,
+  isActive: () => boolean,
 ): void {
-  transactions.set(store, transaction);
+  transactions.set(store, { transaction, isActive });
 }
 
 /**
@@ -39,5 +54,25 @@ export function runRuntimeTransaction<T>(
   const transaction = transactions.get(store);
   if (!transaction)
     throw new Error('Runtime store transaction is not registered.');
-  return transaction(operation);
+  return transaction.transaction(operation);
+}
+
+/**
+ * Preserve the original materialization error when SQLite has ended the owning
+ * transaction. Retrying a suffix in that state would create an unrelated commit
+ * after its successful prefix was rolled back. A live savepoint-local failure
+ * remains eligible for ordinary suffix admission.
+ * @internal
+ */
+export function rethrowIfRuntimeTransactionAborted(
+  store: object,
+  error: unknown,
+): void {
+  const transaction = transactions.get(store);
+  if (!transaction) {
+    throw new Error('Runtime store transaction is not registered.');
+  }
+  if (!transaction.isActive()) {
+    throw error;
+  }
 }

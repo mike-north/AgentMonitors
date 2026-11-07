@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { setTimeout } from 'node:timers/promises';
 import { Command, Option } from 'commander';
@@ -7,6 +8,7 @@ import {
   SourceRegistry,
   validateWatchScope,
   type MonitorExplainReport,
+  type ObservationHistoryRecord,
   type MonitorExplainStageId,
   type MonitorExplainStageStatus,
   type ObservationContext,
@@ -15,7 +17,11 @@ import {
   type Observation,
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
-import { retryRecordLines } from '../retry-diagnostics.js';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetrySummary,
+  retryRecordLines,
+} from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
 import { appendErrorHints } from '../command-hints.js';
@@ -94,12 +100,51 @@ function statusGlyph(status: MonitorExplainStageStatus): string {
   return '✗';
 }
 
+/**
+ * Render legacy error text without allowing terminal commands, line injection
+ * or unbounded headlines. This mirrors core's private explain display policy
+ * (runtime/service.ts); persisted/structured audit data remains untouched.
+ */
+function displayObservationError(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const line = stripVTControlCharacters(value)
+    // eslint-disable-next-line no-control-regex -- Remove literal terminal control bytes from legacy diagnostics.
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const points = Array.from(line);
+  return points.length > 512
+    ? `${points.slice(0, 509).join('')}...`
+    : line || undefined;
+}
+
+/** History's human view includes the failure reason already present in its audit row. */
+function formatHistoryText(record: ObservationHistoryRecord): string {
+  const error =
+    record.result === 'errored'
+      ? displayObservationError(record.observationData['error'])
+      : undefined;
+  return `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})${error ? `  ${error}` : ''}`;
+}
+
 function printExplainText(report: MonitorExplainReport): void {
   console.log(`Monitor ${report.monitorId}`);
   for (const stage of report.stages) {
     console.log(`${statusGlyph(stage.status)} ${stage.label}: ${stage.reason}`);
   }
-  for (const line of retryRecordLines(report.materializationRetries)) {
+  // An existing report summary is authoritative, even when explicitly empty.
+  // Partial legacy reports can retain known stage metadata while omitting that
+  // field; choose a local text source without changing structured omission.
+  let retries = report.materializationRetries;
+  if (retries === undefined) {
+    const details = report.stages.find(
+      (stage) => stage.id === 'materialization',
+    )?.details;
+    if (isMaterializationRetrySummary(details)) {
+      retries = normalizeRetrySummary(details);
+    }
+  }
+  for (const line of retryRecordLines(retries)) {
     console.log(line);
   }
   console.log(
@@ -446,6 +491,16 @@ monitorTestCommand
           formatGlobsForMessage(monitorWatchConfig),
         );
       } else if (observations.length === 0 && source.stateful) {
+        // State is source-owned and may be a primitive. Only nullish absence
+        // disproves an initial baseline; scope diagnostics take precedence above.
+        if (
+          firstResult.nextState === undefined ||
+          firstResult.nextState === null
+        ) {
+          throw new Error(
+            `Stateful source "${source.name}" returned no baseline state.`,
+          );
+        }
         await handleStatefulSource(
           source,
           monitorWatchConfig,
@@ -754,9 +809,7 @@ const monitorHistoryCommand = monitorTestCommand
           return;
         }
         for (const record of records) {
-          console.log(
-            `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})`,
-          );
+          console.log(formatHistoryText(record));
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -803,9 +856,7 @@ const monitorHistoryCommand = monitorTestCommand
         }
         console.log(NO_DAEMON_BANNER);
         for (const record of records) {
-          console.log(
-            `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})`,
-          );
+          console.log(formatHistoryText(record));
         }
       }
     },

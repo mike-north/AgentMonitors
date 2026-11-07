@@ -4,13 +4,7 @@
  * accidentally satisfy wire-date, compatibility, privacy, or rendering checks.
  */
 import { execFile } from 'node:child_process';
-import {
-  copyFileSync,
-  mkdirSync,
-  mkdtempSync,
-  rmSync,
-  writeFileSync,
-} from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -21,9 +15,10 @@ import type {
 } from '@agentmonitors/core';
 import { createDb, RuntimeStore } from '@agentmonitors/core';
 import type { Database } from 'better-sqlite3';
-import { afterAll, afterEach, beforeAll, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it } from 'vitest';
 import { doctorReportClient, explainMonitorClient } from './runtime-client.js';
 import { writeLocalState } from './local-state.js';
+import { decodeToon } from './toon-format.js';
 
 /** Deliberately different times detect swapped/missing revival fields. */
 const created = new Date('2026-10-01T01:02:03Z');
@@ -42,41 +37,13 @@ const recordKeys = [
   'status',
   'updatedAt',
 ];
-const packageRoot = path.resolve(import.meta.dirname, '..');
-let cli: string;
-let buildRoot: string | undefined;
+/** Nx completes the package build before this suite consumes the shared bundle. */
+const cli = path.resolve(import.meta.dirname, '../dist/index.cjs');
 const execute = promisify(execFile);
 let root: string;
 let socketPath: string;
 let requests: { method: string; params: Record<string, unknown> }[];
 let server: net.Server | undefined;
-
-/**
- * Build an owned artifact: the default CLI integration suite cleans/rebuilds
- * dist concurrently, so consuming that shared output would race its deletion.
- * Keep the package-relative manifest and installed native dependency resolution
- * intact, under an ignored fixture directory with explicit cleanup.
- */
-beforeAll(async () => {
-  buildRoot = mkdtempSync(
-    path.join(packageRoot, 'node_modules', '.retry-cli-'),
-  );
-  copyFileSync(
-    path.join(packageRoot, 'package.json'),
-    path.join(buildRoot, 'package.json'),
-  );
-  const output = path.join(buildRoot, 'dist');
-  await execute('pnpm', ['exec', 'tsup', '--out-dir', output], {
-    cwd: packageRoot,
-    timeout: 30000,
-  });
-  cli = path.join(output, 'index.cjs');
-}, 30000);
-afterAll(() => {
-  if (buildRoot) {
-    rmSync(buildRoot, { recursive: true, force: true });
-  }
-});
 
 beforeEach(() => {
   // A short owned path respects macOS's Unix socket pathname limit.
@@ -213,7 +180,7 @@ async function serve(fixture: ReturnType<typeof reports>): Promise<void> {
 /** Execute asynchronously so the in-process static socket can answer the CLI. */
 async function run(
   command: 'explain' | 'doctor',
-  format: 'json' | 'text',
+  format: 'json' | 'toon' | 'text',
   db = ':memory:',
   id = 'wire-monitor',
 ): Promise<{ stdout: string; code: number }> {
@@ -268,6 +235,257 @@ async function run(
     throw error;
   }
 }
+
+/**
+ * Valid definitions expose retained work twice: at report level and directly in
+ * materialization details. Ordinary details may also contain payload/records
+ * keys; only the recognized materialization retry summary has a projection contract.
+ */
+function materializationReports(
+  status: 'pending' | 'terminal',
+): ReturnType<typeof reports> {
+  const fixture = reports();
+  const retained = summary('stage');
+  retained.pending = status === 'pending' ? 1 : 0;
+  retained.terminal = status === 'terminal' ? 1 : 0;
+  retained.records = retained.records.filter(
+    (record) => record.status === status,
+  );
+  const reason =
+    status === 'pending'
+      ? '1 observation(s) are durably queued for materialization retry.'
+      : '1 observation(s) exhausted automatic materialization retries and require operator repair.';
+  fixture.explain.materializationRetries = retained;
+  fixture.explain.stages = [
+    {
+      id: 'definition',
+      label: 'Definition',
+      status: 'ok',
+      reason: 'Definition parsed.',
+      details: {
+        payload: 'ORDINARY-DEFINITION',
+        records: ['definition-record'],
+      },
+    },
+    {
+      id: 'observation',
+      label: 'Observation',
+      status: 'ok',
+      reason: 'Observation recorded.',
+      details: {
+        pending: 1,
+        terminal: 0,
+        bytes: 7,
+        records: [],
+        payload: 'ORDINARY-OBSERVATION',
+      },
+    },
+    {
+      id: 'materialization',
+      label: 'Materialization',
+      status: status === 'pending' ? 'pending' : 'failure',
+      reason,
+      details: { ...retained },
+    },
+  ];
+  fixture.explain.verdict = {
+    stage: 'materialization',
+    status: status === 'pending' ? 'pending' : 'failure',
+    reason,
+  };
+  return fixture;
+}
+
+/** Expected metadata is handwritten from 002's safe fields and fixed retry fixture values. */
+function expectedStageSummary(
+  status: 'pending' | 'terminal',
+  serialized: boolean,
+) {
+  return {
+    pending: status === 'pending' ? 1 : 0,
+    terminal: status === 'terminal' ? 1 : 0,
+    bytes: 321,
+    records: [
+      {
+        id: `stage-${status}`,
+        status,
+        attemptCount: status === 'pending' ? 2 : 5,
+        createdAt: serialized ? created.toISOString() : created,
+        updatedAt: serialized ? updated.toISOString() : updated,
+        nextAttemptAt:
+          status === 'pending'
+            ? serialized
+              ? next.toISOString()
+              : next
+            : null,
+        lastError: safeError,
+      },
+    ],
+  };
+}
+
+it.each(['pending', 'terminal'] as const)(
+  'normalizes both %s retry copies and revives nested Dates over the real socket',
+  async (status) => {
+    const fixture = materializationReports(status);
+    await serve(fixture);
+    const report = await explainMonitorClient(
+      {
+        monitorId: 'wire-monitor',
+        monitorsDir: root,
+        workspacePath: root,
+      },
+      socketPath,
+    );
+    const stage = report.stages.find((value) => value.id === 'materialization');
+    expect(report.materializationRetries).toEqual(
+      expectedStageSummary(status, false),
+    );
+    expect(stage?.details).toEqual(expectedStageSummary(status, false));
+    // Serialized ISO equality cannot establish the client-object Date contract.
+    expect(stage?.details?.records).toEqual([
+      expect.objectContaining({
+        createdAt: expect.any(Date),
+        updatedAt: expect.any(Date),
+        nextAttemptAt: status === 'pending' ? expect.any(Date) : null,
+      }),
+    ]);
+    expect(report.stages.slice(0, 2)).toEqual(
+      fixture.explain.stages.slice(0, 2),
+    );
+    expect(stage).toMatchObject({
+      id: 'materialization',
+      label: 'Materialization',
+      status: fixture.explain.stages[2]?.status,
+      reason: fixture.explain.stages[2]?.reason,
+    });
+    expect(report.verdict).toEqual(fixture.explain.verdict);
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it.each([
+  ['pending', 'json'],
+  ['pending', 'toon'],
+  ['pending', 'text'],
+  ['terminal', 'json'],
+  ['terminal', 'toon'],
+  ['terminal', 'text'],
+] as const)(
+  'renders both %s retry copies safely through the compiled CLI in %s',
+  async (status, format) => {
+    const fixture = materializationReports(status);
+    await serve(fixture);
+    const output = await run('explain', format);
+    expect(output.code).toBe(0);
+    if (format === 'text') {
+      const errorLines = output.stdout
+        .split('\n')
+        .filter((line) => line.includes('Last error:'));
+      expect(errorLines).toEqual([`    Last error: ${safeError}`]);
+      expect(output.stdout).not.toContain('PRIVATE');
+      expect(output.stdout).not.toContain('\u2028');
+      expect(output.stdout).not.toContain('\u2029');
+    } else {
+      // TOON must be decoded: escaping a raw value does not project safe metadata.
+      const value =
+        format === 'json'
+          ? JSON.parse(output.stdout)
+          : decodeToon(output.stdout);
+      expect(value).toMatchObject({
+        materializationRetries: expectedStageSummary(status, true),
+        verdict: fixture.explain.verdict,
+      });
+      expect(value.materializationRetries).toEqual(
+        expectedStageSummary(status, true),
+      );
+      expect(value.stages).toEqual([
+        ...fixture.explain.stages.slice(0, 2),
+        {
+          ...fixture.explain.stages[2],
+          details: expectedStageSummary(status, true),
+        },
+      ]);
+    }
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it('normalizes recognized nested retries when an older report omits the top-level summary', async () => {
+  const fixture = materializationReports('pending');
+  delete fixture.explain.materializationRetries;
+  await serve(fixture);
+  const report = await explainMonitorClient(
+    {
+      monitorId: 'wire-monitor',
+      monitorsDir: root,
+      workspacePath: root,
+    },
+    socketPath,
+  );
+  expect(report.materializationRetries).toBeUndefined();
+  expect(
+    report.stages.find((stage) => stage.id === 'materialization')?.details,
+  ).toEqual(expectedStageSummary('pending', false));
+});
+
+it.each([
+  undefined,
+  {
+    eventIds: ['ordinary-event'],
+    payload: 'ORDINARY-MATERIALIZATION',
+    records: ['ordinary-record'],
+  },
+  { pending: 1, terminal: 0, records: [] },
+  { pending: 1, terminal: 0, bytes: 7, records: 'ordinary-records' },
+])(
+  'preserves absent/ordinary materialization details %# with legacy summary omission',
+  async (details) => {
+    const fixture = materializationReports('pending');
+    delete fixture.explain.materializationRetries;
+    fixture.explain.stages[2] = {
+      id: 'materialization',
+      label: 'Materialization',
+      status: 'ok',
+      reason: 'Existing materialization diagnosis.',
+      ...(details === undefined ? {} : { details }),
+    };
+    await serve(fixture);
+    const report = await explainMonitorClient(
+      {
+        monitorId: 'wire-monitor',
+        monitorsDir: root,
+        workspacePath: root,
+      },
+      socketPath,
+    );
+    expect(report).toEqual({
+      ...fixture.explain,
+      generatedAt: updated.toISOString(),
+    });
+    for (const format of ['json', 'toon'] as const) {
+      const output = await run('explain', format);
+      expect(output.code).toBe(0);
+      const value =
+        format === 'json'
+          ? JSON.parse(output.stdout)
+          : decodeToon(output.stdout);
+      expect(value).toEqual({
+        ...fixture.explain,
+        generatedAt: updated.toISOString(),
+      });
+    }
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+      'monitor.explain',
+      'monitor.explain',
+    ]);
+  },
+);
 
 it('revives every attached and orphan retry date through real socket requests', async () => {
   await serve(reports());
@@ -572,5 +790,179 @@ it.each([
     } finally {
       client.close();
     }
+  },
+);
+
+/**
+ * The text contract exposes one useful safe record, not every report copy.
+ * These expectations spell out the published field layout and fixed fixture
+ * values without using the formatter or captured output as an oracle.
+ */
+function expectedRetryTextLines(
+  status: 'pending' | 'terminal',
+  id: string,
+): string[] {
+  return [
+    `  Retry ${id}: status=${status}  attempts=${status === 'pending' ? '2' : '5'}  next-at=${status === 'pending' ? '2026-10-03T07:08:09.000Z' : 'none'}  updated-at=2026-10-02T04:05:06.000Z`,
+    `    Last error: ${safeError}`,
+  ];
+}
+
+it.each([
+  ['pending', 'text'],
+  ['pending', 'json'],
+  ['pending', 'toon'],
+  ['terminal', 'text'],
+  ['terminal', 'json'],
+  ['terminal', 'toon'],
+] as const)(
+  'preserves nested-only %s record details and top omission in compiled %s',
+  async (status, format) => {
+    const fixture = materializationReports(status);
+    delete fixture.explain.materializationRetries;
+    await serve(fixture);
+    const output = await run('explain', format);
+    expect(output.code).toBe(0);
+    if (format === 'text') {
+      const recordLines = output.stdout
+        .split('\n')
+        .filter(
+          (line) =>
+            line.startsWith('  Retry ') || line.startsWith('    Last error:'),
+        );
+      expect(recordLines).toEqual(
+        expectedRetryTextLines(status, `stage-${status}`),
+      );
+      expect(output.stdout).toContain(fixture.explain.verdict.reason);
+      expect(output.stdout).toContain(
+        `Verdict: ${status === 'pending' ? 'pending' : 'failure'} at Materialization - ${fixture.explain.verdict.reason}`,
+      );
+      expect(output.stdout).not.toContain('PRIVATE');
+      expect(output.stdout).not.toContain('\u2028');
+      expect(output.stdout).not.toContain('\u2029');
+    } else {
+      const value =
+        format === 'json'
+          ? JSON.parse(output.stdout)
+          : decodeToon(output.stdout);
+      expect(value).not.toHaveProperty('materializationRetries');
+      expect(value.stages).toEqual([
+        ...fixture.explain.stages.slice(0, 2),
+        {
+          ...fixture.explain.stages[2],
+          details: expectedStageSummary(status, true),
+        },
+      ]);
+      expect(value.verdict).toEqual(fixture.explain.verdict);
+    }
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it.each(['pending', 'terminal'] as const)(
+  'prefers existing top-level %s records and renders them once in text',
+  async (status) => {
+    const fixture = materializationReports(status);
+    const top = fixture.explain.materializationRetries;
+    if (top === undefined)
+      throw new Error('fixture requires its canonical summary');
+    // Distinct IDs make source preference observable independently of deduplication.
+    fixture.explain.materializationRetries = {
+      ...top,
+      records: top.records.map((record) => ({
+        ...record,
+        id: `preferred-${status}`,
+      })),
+    };
+    await serve(fixture);
+    const output = await run('explain', 'text');
+    expect(output.code).toBe(0);
+    const recordLines = output.stdout
+      .split('\n')
+      .filter(
+        (line) =>
+          line.startsWith('  Retry ') || line.startsWith('    Last error:'),
+      );
+    expect(recordLines).toEqual(
+      expectedRetryTextLines(status, `preferred-${status}`),
+    );
+    expect(output.stdout).not.toContain(`stage-${status}`);
+    expect(output.stdout).toContain(fixture.explain.verdict.reason);
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it('keeps an explicitly empty top-level summary authoritative over nested text details', async () => {
+  const fixture = materializationReports('pending');
+  fixture.explain.materializationRetries = {
+    pending: 0,
+    terminal: 0,
+    bytes: 0,
+    records: [],
+  };
+  await serve(fixture);
+  const output = await run('explain', 'text');
+  expect(output.code).toBe(0);
+  expect(output.stdout).not.toContain('  Retry ');
+  expect(output.stdout).not.toContain('Last error:');
+  expect(output.stdout).not.toContain('stage-pending');
+  expect(output.stdout).toContain(fixture.explain.verdict.reason);
+  expect(requests.map((request) => request.method)).toEqual([
+    'monitor.explain',
+  ]);
+});
+
+it.each(['absent', 'events', 'partial', 'ordinary'] as const)(
+  'does not fabricate text retry records from %s materialization details',
+  async (kind) => {
+    const fixture = materializationReports('pending');
+    delete fixture.explain.materializationRetries;
+    const details =
+      kind === 'absent'
+        ? undefined
+        : kind === 'events'
+          ? {
+              eventIds: ['ordinary-event'],
+              payload: 'ORDINARY-MATERIALIZATION',
+              records: ['ordinary-record'],
+            }
+          : kind === 'partial'
+            ? { pending: 1, terminal: 0, records: [] }
+            : {
+                pending: 1,
+                terminal: 0,
+                bytes: 7,
+                records: 'ordinary-records',
+              };
+    fixture.explain.stages[2] = {
+      id: 'materialization',
+      label: 'Materialization',
+      status: 'ok',
+      reason: 'Existing materialization diagnosis.',
+      ...(details === undefined ? {} : { details }),
+    };
+    fixture.explain.verdict = {
+      stage: 'materialization',
+      status: 'ok',
+      reason: 'Existing materialization diagnosis.',
+    };
+    await serve(fixture);
+    const output = await run('explain', 'text');
+    expect(output.code).toBe(0);
+    expect(output.stdout).not.toContain('  Retry ');
+    expect(output.stdout).not.toContain('Last error:');
+    expect(output.stdout).not.toContain('stage-pending');
+    expect(output.stdout).not.toContain('ordinary-record');
+    expect(output.stdout).toContain('Existing materialization diagnosis.');
+    expect(output.stdout).toContain(
+      'Verdict: ok at Materialization - Existing materialization diagnosis.',
+    );
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
   },
 );

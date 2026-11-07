@@ -459,11 +459,6 @@ async function startStaticResultDaemon(
 let tempDir: string;
 
 beforeAll(() => {
-  execFileSync('pnpm', ['build'], {
-    cwd: CLI_PACKAGE_DIR,
-    stdio: 'pipe',
-    env: process.env,
-  });
   tempDir = mkdtempSync(path.join(tmpdir(), 'agentmonitors-test-'));
 });
 

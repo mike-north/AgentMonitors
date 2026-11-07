@@ -281,6 +281,10 @@ agentmonitors validate [path] [options]
 | `[path]`            | positional (optional) | `.claude/monitors` | Path to monitors directory    |
 | `--format <format>` | option (choices)      | `text`             | Output format: `text`, `json` |
 
+Monitor admission follows [001](./001-monitor-definition.md#monitor-input-admission-current):
+at most 1 MiB of UTF-8 content, 256 tags, and 128 derive rules. Oversized monitors
+are invalid and produce a bounded diagnostic naming `INPUT_LIMIT_EXCEEDED`.
+
 ### Output
 
 **Text format:**
@@ -352,7 +356,7 @@ so `invalid`/`errors` already reflect the duplicate without requiring a consumer
 
 1. Parses all `MONITOR.md` files via `scanMonitors()` from `@agentmonitors/core` (parse errors are included in `errors`).
 2. Checks each monitor's `watch.type` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
-3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
+3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateWatchScope` helper (wrapping `validateScope`) — types, enums, `required`, `items`, and other keywords, plus actionable collection-strategy and timezone diagnostics.
 4. Rejects duplicate monitor IDs within the scanned tree (see [001 §4](./001-monitor-definition.md)).
 5. If a parse failure appears to use the pre-migration top-level `source:` + `scope:` shape, appends a hint to rewrite it as `watch: { type, ... }`.
 
@@ -513,6 +517,19 @@ All transition subcommands (`ack`, `start`, `complete`, `fail`, `archive`) print
 
 Reads a single `MONITOR.md` file, resolves its source, and runs a live observation cycle to verify configuration without writing to the database. For stateful sources (`source.stateful === true`), automatically runs a second observation after 100 ms to demonstrate change detection.
 
+### Source configuration validation
+
+Before calling `source.observe()`, validates `watch` minus `type` through the same
+`validateWatchScope` helper as `validate` (§3). Invalid source configuration exits 1 before any
+source network request or command execution. Rejection details match `validate`; the command adds
+an `Invalid monitor scope: ` prefix. Text errors go only to stderr as `Error: <message>`; JSON errors
+go only to stdout as `{ "error": "<message>" }`. `validate` retains its stdout summary/error-list
+contract in both formats.
+
+**Verified in:** `apps/cli/src/commands/monitor-scope-parity.integration.test.ts` —
+`monitor test / validate scope parity` covers identical invalid scopes in both formats and checks
+HTTP/file sentinels before `monitor test` error-output assertions, with valid source controls.
+
 ### Usage
 
 ```
@@ -532,7 +549,11 @@ agentmonitors monitor test <path> [options]
 - If a source reports `outcome: "no-files-matched"` (currently `file-fingerprint` when its
   scope expands to zero files), prints an error naming `watch.globs` / `watch.cwd` and does not
   establish a baseline or run the second observation.
-- For stateful sources with no first-run observations: prints baseline message, runs second observation, then either prints observations or explains no changes were detected.
+- For stateful sources with no first-run observations and non-nullish `nextState`: prints
+  baseline message, runs second observation, then either prints observations or explains no
+  changes were detected. State is source-owned; primitives such as `0`, `false`, and `""` are valid.
+  Absent/null initial state fails with `Observation failed: Stateful source "<sourceName>" returned no baseline state.`
+  The `no-files-matched` diagnostic above takes precedence over this guard.
 - Prints observation titles and snapshots.
 - If a directory (rather than a single file) is passed: prints an error to stderr naming
   `agentmonitors validate` as the symmetric command for a whole directory, and exits 1 — instead of
@@ -553,6 +574,15 @@ agentmonitors monitor test <path> [options]
 ```
 
 `baseline: true` indicates the JSON result is from the second (post-baseline) observation.
+It MUST NOT be reported when initial baseline establishment failed. An unavailable
+`incoming-changes` repo/ref rejects with the exact source diagnostic in 003 §6.5. Text prints
+`Error: Observation failed: <diagnostic>` to stderr (after the existing testing banner on stdout),
+exits 1, and prints no baseline/second-observation/configured-correctly success claim. JSON writes
+only `{ "error": "Observation failed: <diagnostic>" }` to stdout, stderr empty, exit 1. There is no
+new unavailable outcome field. If the initial observation established a baseline but the second
+rejects, use the same failure envelope/exit 1; the baseline line already printed in text remains
+truthful, but no successful follow-up summary is printed. Neither failure nor success writes DB
+state in `monitor test` (Refs #305, decision #555).
 
 When a source reports `outcome: "no-files-matched"`, JSON output is:
 
@@ -571,9 +601,9 @@ When a source reports `outcome: "no-files-matched"`, JSON output is:
 
 ### Exit codes
 
-Exits 1 on: file not found, parse error, unknown source, observation exception, or
-`no-files-matched`. Exits 0 on successful dry-run, including genuine quiet/no-change runs where the
-source matched its scope.
+Exits 1 on: file not found, parse error, unknown source, observation exception,
+`no-files-matched`, or absent/null initial state from a stateful source. Exits 0 on successful
+dry-run, including genuine quiet/no-change runs where the source matched its scope.
 
 ### `monitor history` — Observation audit trail
 
@@ -638,6 +668,13 @@ threw; the failure was isolated so other monitors still ran — see
 baseline without computing a delta, e.g. after a force-pushed/gc'd ref; distinct from `no-change`) —
 plus the monitor id, source name, and timestamp.
 
+For an `errored` row, text appends two spaces and its nonempty string
+`observationData.error` after the source column. Strip VT sequences and C0/DEL/C1 controls,
+collapse whitespace to one line, and cap the displayed error at 512 Unicode code points including
+`...` when truncated. Rows without a usable error keep the existing columns. JSON/toon retain the
+existing row shape and original error value; no stored bytes change. Socket and offline fallback
+use the same text rendering apart from the existing no-daemon banner.
+
 ### `monitor explain` — Pipeline diagnosis
 
 **Status:** Fully implemented (socket with a no-daemon in-process DB fallback).
@@ -672,6 +709,14 @@ Text output prints one line per stage with a status glyph, followed by a verdict
 - `⏳` — `pending` (intentionally holding, e.g. debounce/throttle, or upstream hasn't produced input)
 - `✗` — `failure` (a real fault: invalid definition, errored observe, missing projection, daemon
   down)
+
+For an errored observation with a usable error string, the observation reason is
+`Source observation failed: <displayed error>` using the same bounded single-line error policy as
+history text. For example: `✗ Observation: Source observation failed: <003 §6.5 diagnostic>`.
+JSON/toon expose this reason and `status: "failure"`, while `details` and the included history
+retain the original error data. Another stage can still win the verdict under the existing
+severity order. History/explain exit codes are unchanged: a successfully retrieved diagnostic
+report exits 0 even when it reports a source failure.
 
 A genuinely idle monitor therefore renders `○` at the observation stage with an affirmative verdict
 (e.g. "Source ran, observed 0 changes — your watched target genuinely hasn't changed (not a bug)."),
@@ -1976,6 +2021,10 @@ terminal next-attempt stays null. Unknown retry fields are excluded, and errors 
 Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
 is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
 doctor JSON defaults them to empty summaries/arrays, explain preserves the omitted optional field.
+Text explain uses an existing top-level summary, including an explicitly empty one, in preference
+to recognized materialization-stage details. If that optional field is omitted, it displays the
+available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
+summaries and unrelated stage details do not fabricate retry records.
 
 Explain's local fallback preserves definition/scheduling failures with their retained work. A
 valid definition with retry-only state is a persisted report with the no-daemon notice, not a
@@ -2456,3 +2505,12 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `watch`    | `list`     | daemon (read-only)                                            | **Target** (§14.4, [007 §4](./007-agent-facing-interaction.md))   |
 | `watch`    | `cancel`   | daemon                                                        | **Target** (§14.4, [007 §4.4](./007-agent-facing-interaction.md)) |
 | `inspect`  | —          | daemon (read-only)                                            | **Target** (§14.5, [007 §5](./007-agent-facing-interaction.md))   |
+
+### Daemon request admission errors
+
+Socket-backed commands obey [002 §10.4](./002-runtime-delivery.md#104-ipc-wire-protocol):
+at most 1 MiB before the newline, 1,000 entries per array or record, 10,000 total
+values, and depth 32. Callers issuing bulk requests must keep each request within
+these budgets. The wire response carries `INPUT_LIMIT_EXCEEDED`; the CLI surfaces
+the daemon's error as an application error, not an unavailable-daemon fallback.
+The rejected request performs no runtime operation, and other sessions remain usable.

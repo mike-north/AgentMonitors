@@ -19,7 +19,10 @@ import type {
   OpenSessionInput,
   RuntimeTickResult,
 } from '@agentmonitors/core';
-import { normalizeRetrySummary } from './retry-diagnostics.js';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetrySummary,
+} from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
 
@@ -294,6 +297,14 @@ export async function explainMonitorClient(
   );
   return {
     ...report,
+    // Project the service's second public retry copy without rewriting other
+    // stage details, diagnosis order, or the primary verdict.
+    stages: report.stages.map((stage) =>
+      stage.id === 'materialization' &&
+      isMaterializationRetrySummary(stage.details)
+        ? { ...stage, details: { ...normalizeRetrySummary(stage.details) } }
+        : stage,
+    ),
     ...(report.materializationRetries
       ? {
           materializationRetries: normalizeRetrySummary(

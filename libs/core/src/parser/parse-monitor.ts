@@ -1,8 +1,10 @@
-import matter from 'gray-matter';
-import { readFileSync } from 'node:fs';
+/** Read and validate bounded monitor definitions while preserving file-local diagnostics. */
 import path from 'node:path';
+import matter from 'gray-matter';
+import { MAX_MONITOR_BYTES } from '../schema/input-limits.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import type { MonitorDefinition } from '../schema/types.js';
+import { readMonitorFileSync } from './read-monitor-file.js';
 
 export interface ParseResult {
   ok: true;
@@ -13,6 +15,8 @@ export interface ParseError {
   ok: false;
   filePath: string;
   error: string;
+  /** Machine-readable admission failure; ordinary parse errors omit it. */
+  code?: 'INPUT_LIMIT_EXCEEDED';
 }
 
 export type ParseOutcome = ParseResult | ParseError;
@@ -24,6 +28,9 @@ export type ParseOutcome = ParseResult | ParseError;
  * @param filePath - Absolute path to the MONITOR.md file
  */
 export function parseMonitor(content: string, filePath: string): ParseOutcome {
+  if (Buffer.byteLength(content, 'utf8') > MAX_MONITOR_BYTES) {
+    return monitorByteLimitError(filePath);
+  }
   // Folder monitor: `<id>/MONITOR.md` (id = parent dir). Flat monitor: `<id>.md`
   // (id = path.parse stem). Guard empty/dot-prefixed ids (e.g. `.md`, `.foo.md`).
   const base = path.basename(filePath);
@@ -52,7 +59,17 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
     const messages = result.error.issues
       .map((issue) => `${issue.path.join('.')}: ${issue.message}`)
       .join('; ');
-    return { ok: false, filePath, error: messages };
+    return {
+      ok: false,
+      filePath,
+      error: messages,
+      ...(result.error.issues.some(
+        (issue) =>
+          issue.code === 'custom' && issue.params?.['inputLimit'] === true,
+      )
+        ? { code: 'INPUT_LIMIT_EXCEEDED' as const }
+        : {}),
+    };
   }
 
   return {
@@ -74,10 +91,22 @@ export function parseMonitor(content: string, filePath: string): ParseOutcome {
  */
 export function parseMonitorFile(filePath: string): ParseOutcome {
   try {
-    const content = readFileSync(filePath, 'utf-8');
-    return parseMonitor(content, filePath);
+    const content = readMonitorFileSync(filePath);
+    return content === undefined
+      ? monitorByteLimitError(filePath)
+      : parseMonitor(content, filePath);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { ok: false, filePath, error: `Failed to read file: ${message}` };
   }
+}
+
+/** A shared admission diagnostic for direct file parsing and discovery. @internal */
+export function monitorByteLimitError(filePath: string): ParseError {
+  return {
+    ok: false,
+    filePath,
+    code: 'INPUT_LIMIT_EXCEEDED',
+    error: `INPUT_LIMIT_EXCEEDED: monitor must be at most ${String(MAX_MONITOR_BYTES)} UTF-8 bytes`,
+  };
 }

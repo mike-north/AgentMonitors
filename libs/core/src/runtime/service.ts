@@ -5,6 +5,7 @@
  */
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 import { ulid } from 'ulid';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
@@ -42,7 +43,10 @@ import {
   netCollapseGroupKey,
 } from './store.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
-import { runRuntimeTransaction } from './runtime-transaction.js';
+import {
+  rethrowIfRuntimeTransactionAborted,
+  runRuntimeTransaction,
+} from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   DeclareEphemeralMonitorInput,
@@ -306,6 +310,25 @@ function explainVerdict(stages: MonitorExplainStage[]): {
     stage: stage?.id ?? 'delivery',
     reason: stage?.reason ?? 'Monitor delivered successfully.',
   };
+}
+
+/**
+ * Explain reasons are display text, not a replacement for source audit bytes.
+ * Keep legacy errors to one terminal-safe line and 512 Unicode code points,
+ * including the truncation marker. CLI history mirrors this private policy
+ * without expanding the core plugin API with a presentation-only helper.
+ */
+function displayObservationError(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const line = stripVTControlCharacters(value)
+    // eslint-disable-next-line no-control-regex -- Remove literal terminal control bytes from legacy diagnostics.
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const points = Array.from(line);
+  return points.length > 512
+    ? `${points.slice(0, 509).join('')}...`
+    : line || undefined;
 }
 
 const URGENCY_BY_RANK = ['low', 'normal', 'high'] as const satisfies Urgency[];
@@ -1311,11 +1334,16 @@ export class AgentMonitorRuntime {
         ),
       );
     } else if (latestObservation.result === 'errored') {
+      const error = displayObservationError(
+        latestObservation.observationData['error'],
+      );
       stages.push(
         explainStage(
           'observation',
           'failure',
-          'The most recent source observation errored.',
+          error
+            ? `Source observation failed: ${error}`
+            : 'The most recent source observation errored.',
           latestObservation.observationData,
         ),
       );
@@ -3133,6 +3161,7 @@ export class AgentMonitorRuntime {
           });
         }
       } catch (materializeError) {
+        rethrowIfRuntimeTransactionAborted(this.store, materializeError);
         deferRemaining = true;
         failures.push({
           envelope,
@@ -3147,7 +3176,7 @@ export class AgentMonitorRuntime {
         failures.map((failure) => ({
           workspacePath: options.workspacePath,
           monitorId: monitor.id,
-          sourceName: monitor.frontmatter.watch.type,
+          sourceName: failure.envelope.monitor.frontmatter.watch.type,
           envelope: failure.envelope,
           error: failure.message,
         })),

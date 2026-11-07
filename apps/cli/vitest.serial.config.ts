@@ -28,6 +28,7 @@ export default defineConfig({
   test: {
     include: [
       'src/concurrent-spawn.test.ts',
+      'src/input-limits.integration.test.ts',
       'src/detached-spawn.test.ts',
       'src/commands/daemon-detach.integration.test.ts',
       'src/commands/daemon-crash-recovery.integration.test.ts',
@@ -46,7 +47,9 @@ export default defineConfig({
     maxWorkers: 1,
     isolate: false,
     testTimeout: 30_000,
-    retry: 2,
+    // A failed first attempt must fail the gate; durable-state regressions
+    // must never be converted to green by a suite-wide retry budget.
+    retry: 0,
     passWithNoTests: false,
   },
 });
