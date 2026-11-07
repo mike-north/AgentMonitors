@@ -35,6 +35,46 @@ Restore this rejection before Zod 4 object normalization can erase the scalar to
 unchanged. The exported Shape validator now uses a preprocessing pipe; its API
 report records that schema-composition surface.
 
+## 2026-11-05 — Make physical PATH controls portable across POSIX utilities (004 §2.7) — Refs #520
+
+Physical PATH controls now use owned non-JS shell executables and an explicit failing lexical decoy, preserving native lookup and literal argv assertions without depending on renamed host printf/false utilities.
+
+## 2026-11-05 — Validate the manager of every physical candidate (004 §2.7) — Refs #520
+
+Official and adjacent installation candidates now apply the same requested-manager predicate as invoking entries and direct PATH targets after physical canonicalization. A symlink to another manager is skipped so a later valid installation can be selected.
+
+## 2026-11-05 — Preserve physical lookup and explicit POSIX PATH components (004 §2.7) — Refs #520
+
+Launcher discovery uses native physical file and directory identities before lexical joins can change symlink/`..` traversal. Explicit empty POSIX PATH components retain discovery-time cwd, while unset PATH does not; unusable directories are skipped so later valid entries remain discoverable.
+
+## 2026-11-05 — Anchor launcher paths before subprocess cwd changes (004 §2.7) — Refs #520
+
+The package-manager resolver returns absolute launcher paths for both invoking entries and discovered installation candidates. Relative PATH and invoking entries retain their selected file identity when packing or installation changes the child working directory.
+
+## 2026-11-05 — Retain executable-only pnpm in POSIX fixtures (004 §2.7) — Refs #520
+
+The compatibility wrapper retains inherited PATH when pnpm has no discoverable JavaScript launcher. Its actual nested suites exercise the existing POSIX executable fallback, including real workspace dependency rewriting and the Corepack-context control.
+
+## 2026-11-05 — Retain installation context in npm fixture probes (004 §2.7) — Refs #520
+
+The compatibility fixture forwards intercepted install options to its real npm version probe, retaining the isolated working directory and environment required by context-sensitive Corepack dispatch. A named Corepack-layout fixture checks both while delegating the version query to installed npm.
+
+## 2026-11-05 — Resolve Corepack proxies and platform PATH semantics (004 §2.7) — Refs #520
+
+Discover the requested manager through named Corepack proxies, honor exact POSIX `PATH` independently of Windows casing, and discover npm fixture tools separately from Node. The actual compatibility suite is exercised under separate Node/npm installations.
+
+## 2026-11-05 — Discover every supported pnpm launcher extension (004 §2.7) — Refs #520
+
+Official Node and adjacent PATH package discovery now considers pnpm `.cjs`, `.js`, and `.mjs` entrypoints under other invoking package managers, matching direct pnpm invocation support.
+
+## 2026-11-05 — Preserve package-manager identity and separate installations (004 §2.7) — Refs #520
+
+Packing resolves pnpm independently of the invoking manager so workspace dependencies remain installable. The install harness discovers npm JavaScript entrypoints from PATH as well as beside Node, preserving shell-free literal arguments across separate installations.
+
+## 2026-11-03 — Preserve package-manager arguments in install checks (004 §2.7) — Refs #520
+
+Run package-manager JavaScript entrypoints without a shell and exercise temporary paths containing spaces in the install check.
+
 ## 2026-11-03 — Migrate exported validation schemas to Zod 4 (001) — Refs #530
 
 Direct core and CLI validation uses patched Zod 4. Exported schema types now follow
