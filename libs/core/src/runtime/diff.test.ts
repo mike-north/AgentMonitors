@@ -10,7 +10,7 @@
  * @see ../../../../docs/specs/002-runtime-delivery.md §5.2
  * @see ../../../../docs/specs/003-source-plugins.md §11.3, §4.2 (json-diff strategy)
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   buildDiff,
   buildJsonDiff,
@@ -435,11 +435,10 @@ describe('buildJsonDiff — untrusted path escaping and bounding (issue #437 rev
 describe('buildJsonDiff — performance (issue #437 review)', () => {
   // REGRESSION: the no-identity array matcher previously did a full
   // JSON.stringify(sortKeysDeep(...)) of both elements PER PROBE (O(N*M)),
-  // making a reversed 5,000-element array take roughly 1.5s of synchronous
-  // daemon-tick time. The counted-multiset rework is O(N+M); this must stay
-  // comfortably under a generous bound even on a slow CI runner.
-  it('diffs a reversed 5,000-element array (no identity key) well under a bounded time', () => {
-    const prev = Array.from({ length: 5000 }, (_, i) => ({
+  // causing quadratic serialization work. Count that work directly so a
+  // busy runner cannot fail the guard merely by delaying execution.
+  it('diffs a reversed array without pairwise serialization work', () => {
+    const prev = Array.from({ length: 200 }, (_, i) => ({
       // Two fields so no single field is a usable identity key, forcing the
       // deep-equality multiset matcher.
       a: i,
@@ -447,52 +446,91 @@ describe('buildJsonDiff — performance (issue #437 review)', () => {
     }));
     const curr = [...prev].reverse();
 
-    const start = performance.now();
-    const diff = buildJsonDiff(JSON.stringify(prev), JSON.stringify(curr));
-    const elapsedMs = performance.now() - start;
-
-    expect(diff).toBeDefined();
-    // A pure reorder of every element renders as one `reordered` entry, not
-    // 5,000 remove/add pairs.
-    expect(diff).toContain('reordered');
-    expect(elapsedMs).toBeLessThan(300);
+    const prevText = JSON.stringify(prev);
+    const currText = JSON.stringify(curr);
+    const stringify = vi.spyOn(JSON, 'stringify');
+    try {
+      const diff = buildJsonDiff(prevText, currText);
+      expect(diff).toContain('reordered');
+      // Canonicalizing each input once costs N+M calls; allow twice that
+      // budget for rendering and other linear work. Pairwise probes on this
+      // reversed fixture require N*(N+1) calls and exceed it decisively.
+      expect(stringify.mock.calls.length).toBeLessThanOrEqual(
+        2 * (prev.length + curr.length),
+      );
+    } finally {
+      stringify.mockRestore();
+    }
   });
 
-  // REGRESSION: the reversed-unique fixture above only ever produces
-  // multiset buckets of length 1 (every element is distinct), so it cannot
-  // catch a bucket-internal quadratic blowup. Each successful match used to
-  // call `bucket.shift()`, which re-indexes every remaining element in that
-  // bucket — with one large duplicate-value bucket this degenerates to
-  // `O(M^2)` in the bucket size alone, independent of overall array length.
-  // Measured on the pre-fix code: ~3ms at 5k, 28ms at 20k, 162ms at 50k,
-  // 601ms at 100k, 2.3s at 200k duplicate elements — clearly superlinear. A
-  // single distinguishable "moved" element plus a large duplicate bucket
-  // reproduces this without relying on identity-key matching.
-  it('diffs a large duplicate-value bucket plus one moved element well under a bounded time', () => {
-    const DUPLICATE_COUNT = 200_000;
+  // Unique buckets cannot expose the duplicate-bucket shift regression (#437).
+  // Count slots reindexed by front removal, rather than elapsed time: removing
+  // N duplicates with shift costs N*(N-1)/2 regardless of scheduler pauses.
+  it('consumes duplicate buckets without quadratic reindexing work', () => {
+    const duplicateCount = 200;
     const duplicate = { a: 'same', b: 'same' };
     const moved = { a: 'unique', b: 'unique' };
-
-    const prev = [
-      ...Array.from({ length: DUPLICATE_COUNT }, () => duplicate),
-      moved,
-    ];
-    // `moved` relocates to the front; every duplicate stays a duplicate.
-    const curr = [
-      moved,
-      ...Array.from({ length: DUPLICATE_COUNT }, () => duplicate),
-    ];
-
-    const start = performance.now();
-    const diff = buildJsonDiff(JSON.stringify(prev), JSON.stringify(curr));
-    const elapsedMs = performance.now() - start;
-
-    expect(diff).toBeDefined();
-    expect(diff).toContain('reordered');
-    // Generous enough for a slow CI runner under linear (O(N+M)) behavior,
-    // but well under the ~2.3s the quadratic `shift()`-based implementation
-    // took at this same duplicate-bucket size.
-    expect(elapsedMs).toBeLessThan(1000);
+    const duplicates = Array.from({ length: duplicateCount }, () => duplicate);
+    const prev = JSON.stringify([...duplicates, moved]);
+    const curr = JSON.stringify([moved, ...duplicates]);
+    let reindexedSlots = 0;
+    const originalShift = Array.prototype.shift;
+    // Observe only the fixture's duplicate buckets, leaving unrelated arrays
+    // and all real mutation semantics intact. Restore the global seam on failure.
+    Array.prototype.shift = function (this: unknown[]) {
+      const first = this[0];
+      if (
+        typeof first === 'object' &&
+        first !== null &&
+        'a' in first &&
+        first.a === 'same' &&
+        'b' in first &&
+        first.b === 'same'
+      ) {
+        reindexedSlots += Math.max(0, this.length - 1);
+      }
+      return originalShift.call(this);
+    };
+    try {
+      expect(buildJsonDiff(prev, curr)).toContain('reordered');
+      // Allow linear reindexing work; the old shift implementation performs
+      // 19,900 slot moves here, exceeding this 400-slot budget decisively.
+      expect(reindexedSlots).toBeLessThanOrEqual(2 * duplicateCount);
+    } finally {
+      Array.prototype.shift = originalShift;
+    }
+  });
+  // Array-method-independent guard: shift, splice, and copying removals all
+  // increase elapsed work quadratically, even if they bypass the slot counter.
+  it('bounds duplicate-bucket growth using fastest samples at each size', () => {
+    function fastest(duplicateCount: number): number {
+      const duplicate = { a: 'same', b: 'same' };
+      const moved = { a: 'unique', b: 'unique' };
+      const duplicates = Array.from(
+        { length: duplicateCount },
+        () => duplicate,
+      );
+      const previous = JSON.stringify([...duplicates, moved]);
+      const current = JSON.stringify([moved, ...duplicates]);
+      let best = Infinity;
+      for (let sample = 0; sample < 3; sample++) {
+        const start = performance.now();
+        // Sample operation: fixture construction is deliberately outside timing.
+        const diff = buildJsonDiff(previous, current);
+        const elapsed = performance.now() - start;
+        expect(diff).toContain('reordered');
+        best = Math.min(best, elapsed);
+      }
+      return best;
+    }
+    // Four times the input implies about 4x linear or 16x quadratic work.
+    // An 8x ceiling separates them with headroom; the fastest of three samples
+    // per size discards an isolated scheduling/GC pause on either side. This
+    // is still timing evidence, not proof against sustained unequal slowdowns.
+    // 25k/100k keeps the correct path modest while exposing bucket-copy costs.
+    const small = fastest(25_000);
+    const large = fastest(100_000);
+    expect(large / small).toBeLessThan(8);
   });
 });
 

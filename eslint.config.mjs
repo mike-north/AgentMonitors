@@ -13,6 +13,9 @@ export default tseslint.config(
       '.Codex/**',
       '.codex/**',
       '.worktrees/**',
+      // Whole checkouts of this repo, outside every tsconfig and each as large as
+      // the repo itself. ESLint does not read .gitignore, which also lists them.
+      '.claude/worktrees/**',
       'scratch/**',
       'experiments/**',
       'apps/website/**',

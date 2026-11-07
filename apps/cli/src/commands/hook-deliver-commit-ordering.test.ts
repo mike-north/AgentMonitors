@@ -32,9 +32,6 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
 import { spawn } from 'node:child_process';
-import { closeSync, createWriteStream, mkdtempSync, openSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 vi.mock('../runtime-client.js', () => ({
   claimDeliveryClient: vi.fn(),
@@ -61,6 +58,7 @@ import {
   reserveDeliveryClient,
 } from '../runtime-client.js';
 import type { HookDeliveryOutput } from '../hook-deliver-render.js';
+import { openUnwritableFileStream } from './unwritable-file-stream.test-support.js';
 
 const previewMock = vi.mocked(previewSettledHighDeliveryClient);
 const previewReminderMock = vi.mocked(previewCoalescedReminderClient);
@@ -361,16 +359,14 @@ describe('writeStreamChunk (issue #442, round-10 review)', () => {
  * `'error'` listener as soon as the callback settled the promise, so that
  * paired emission had no listener and became an UNCAUGHT exception (issue
  * #442, PR #442 round-11 review). These tests install a real
- * `process.on('uncaughtException', ...)` guard and drive an actually-closed
- * pipe/fd so both signals genuinely fire, proving the promise still rejects
- * exactly once with no uncaught exception and no nonzero-exit crash.
+ * `process.on('uncaughtException', ...)` guard and drive a real unwritable fd
+ * and an actually-closed pipe so both signals genuinely fire, proving the
+ * promise still rejects exactly once with no uncaught exception and no
+ * nonzero-exit crash.
  */
 describe('writeStreamChunk against a REAL Writable that pairs a callback error with a later error event (issue #442, round-11 review)', () => {
-  it('an fs write stream on a closed fd: callback error, then the paired error event, reject exactly once with no uncaught exception', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'am-write-stream-chunk-'));
-    const fd = openSync(join(dir, 'target.txt'), 'w');
-    closeSync(fd); // the fd is now invalid; every write to it fails with EBADF
-    const stream = createWriteStream('', { fd, autoClose: false });
+  it('an fs write stream on a read-only fd: callback error, then the paired error event, reject exactly once with no uncaught exception', async () => {
+    const { stream, dispose } = openUnwritableFileStream();
 
     const uncaughtErrors: Error[] = [];
     const onUncaught = (error: Error): void => {
@@ -398,11 +394,11 @@ describe('writeStreamChunk against a REAL Writable that pairs a callback error w
       expect(uncaughtErrors).toEqual([]);
     } finally {
       process.removeListener('uncaughtException', onUncaught);
-      stream.destroy();
+      await dispose();
     }
   });
 
-  it('a spawned child process with its stdin closed: writing produces the paired EPIPE/EBADF callback-then-event without crashing the process', async () => {
+  it('a spawned child process with its stdin closed: writing produces the paired EPIPE callback-then-event without crashing the process', async () => {
     // The child closes its OWN stdin (`exec 0<&-`) immediately, then sleeps —
     // so our end of the pipe genuinely has no reader. A short delay lets
     // that close land before we write; a multi-megabyte chunk exceeds the
@@ -410,9 +406,7 @@ describe('writeStreamChunk against a REAL Writable that pairs a callback error w
     // rather than merely being buffered in-process, reproducing a REAL
     // failed write — both the write callback AND the paired `'error'` event
     // fire for it, unlike the single-signal fakes in the describe blocks
-    // above. Which errno surfaces is a kernel/libuv timing race, not
-    // something this test controls — see the comment on the assertion
-    // below (issue #506).
+    // above.
     const child = spawn('sh', ['-c', 'exec 0<&-; sleep 2']);
     try {
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -432,11 +426,11 @@ describe('writeStreamChunk against a REAL Writable that pairs a callback error w
           },
         );
 
-        // Whether the OS reports EPIPE or EBADF for this write depends on
-        // whether fd teardown completes before the kernel write starts
-        // (EBADF) or races with it mid-write (EPIPE) — both mean "the
-        // destination is gone and the write correctly failed" (issue #506).
-        await expect(pending).rejects.toThrow(/EPIPE|EBADF/);
+        // The child closing its copy of the socket can only surface as EPIPE
+        // here. EBADF would mean this process's own descriptor was closed
+        // underneath the stream, which is a defect rather than a timing
+        // variant of this failure (issues #506, #548).
+        await expect(pending).rejects.toThrow(/EPIPE/);
 
         // Give the paired 'error' event (queued on a later tick) a chance
         // to fire before asserting nothing leaked as uncaught.

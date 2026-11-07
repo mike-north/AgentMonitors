@@ -9,6 +9,307 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
+
+The incoming-changes Nx test target requires both dependency builds and its own build because
+the revision-expression suite executes `dist/index.js`. Require a first-attempt cold-target
+pass with caching disabled, and an own-build-edge-only reversion that exposes the six compiled
+failures while the 52 controls pass. Direct vitest still consumes prebuilt output; no build
+moves into test code. Source behavior, public API, feature tests and global Nx defaults remain
+unchanged.
+
+## 2026-11-05 — Verify resolved Git objects without rewriting authored revisions (003–004) — Refs #305
+
+Resolve an authored incoming-changes revision unchanged to one complete SHA-1/SHA-256 object ID,
+then separately peel that ID to a commit. Suffixing arbitrary input can turn a commit-type check
+into a blob filename or alter a commit-message search regex. Both hash formats now require real
+source/built-source/CLI regressions for suffix-named blob paths and valid commit-search expressions,
+with ordinary commit/tag/extended-expression controls. The accepted #555 ordinary error diagnostic,
+baseline/state/history contracts, quiet recovery and public API remain unchanged.
+
+## 2026-11-05 — Truthful incoming-changes failures (002–005) — Refs #305
+
+Adopt [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474):
+replace 003 §6.5's silent unavailable result with the existing recoverable source-error contract.
+Verify commit-ish refs, capture Git stderr, retain the last-good SHA and notify state, and preserve
+quiet missing-old-SHA rebaseline/per-file snapshot omission. Require non-nullish state before a
+CLI initial baseline; retain no-files-matched precedence and source-owned primitive states.
+History text and explain now include the existing error payload using bounded, terminal-safe
+single-line display; stored/structured audit data stays intact. No public outcome, schema or
+migration is added. Required tests cover real Git/CLI, SQLite reopen and socket/offline diagnosis.
+Existing error retry cadence and held-notify deferral remain unchanged; #558 and #559 track those
+separately rather than silently broadening this repair.
+
+## 2026-11-06 — Bound script scheduling and fixture startup (004 §2.10) — Refs #458
+
+Script files run serially to bound nested Vitest/package-manager resource contention.
+An actual-worker capacity-lease test enforces this policy rather than inspecting config
+text. Traced one-CPU runs show roughly 3s pre-command startup plus an unchanged 1s jq
+verdict; the private negative fixture now explicitly separates 4s of framework allowance
+from that 1s command, for a 5s complete-phase bound, 1s cleanup and 7s outer test.
+This supersedes the former combined 4s/6s fixture assumption only. Exact 1,000ms jq,
+child/query helper contracts, complete-phase/terminal-worker checks, both positive
+canonical controls, package `pnpm test` scheduling and aggregate/workflow surface remain.
+
+## 2026-11-06 — Separate jq phase evidence from driver close (004 §2.10) — Refs #458
+
+The negative driver accepts the complete Vitest end-of-run report for the exact intended
+module/test plus one terminal owned jq command within the existing 4-second phase bound.
+It does not substitute a first error message or natural reporter/process close for whole
+phase evidence. A separate hard 1-second driver close/group-confirmation reservation
+fits inside the unchanged 6-second test. A signal error is not termination evidence;
+cleanup still requires independent terminal/close confirmation and retains signal failure
+when that confirmation fails. The jq 1,000ms budget, one-filter selection, both positive
+canonical controls and production helpers remain unchanged.
+
+## 2026-11-06 — Isolate the negative filter deadline phase (004 §2.10) — Refs #458
+
+The negative filter driver selects exactly one actual canonical PR-review invocation,
+rather than spending both canonical filters' separate 1,000ms budgets inside one
+4-second driver watchdog. Both positive canonical controls still execute. The fixture
+asserts one owned negative command and terminal state before force-cleanup, and reports
+child output, phase timestamps and elapsed time on failure. No helper/runtime deadline,
+watchdog, retry, positive control or production source changed.
+
+## 2026-11-06 — Avoid payload writes for no-input jq probes (004 §2.10) — Refs #458
+
+A no-input version probe closes unused stdin without writing an empty payload that
+can race jq's valid early exit. Explicit reduction input, including an empty string,
+still requires delivery and rejects stdin errors. This resolves the Linux CI discovery
+EPIPE failure without suppressing filter transport failures, retrying or increasing
+any command/outer deadline. The canonical jq programs and source boundary are unchanged.
+
+## 2026-11-06 — Bound jq commands and release query handles (004 §2.10) — Refs #458
+
+Facility probes and canonical jq reductions now use asynchronous total verdicts within
+the unchanged 1,000ms command budget. A hung/broken executable fails rather than becoming
+optional omitted coverage; genuine ENOENT retains local skip/CI failure semantics.
+Darwin membership queries retain and release their own child streams/reference on
+failure or expiry without claiming termination. The Linux disappearing-proc regression
+now reaches ENOENT and the fresh group probe under a live initial budget, and rejects
+a still-present group; the fresh ESRCH success case remains distinct. No production
+source, API, owned scope, aggregate or timeout budget expanded.
+
+## 2026-11-06 — Cover every facility-child phase with the total deadline (004 §2.10) — Refs #458
+
+The existing total deadline bounds the verdict before direct-child exit as well as
+through pipe closure and group confirmation. A successful timeout SIGKILL request
+without exit cannot leave the helper blocked: expiry returns a visible error,
+releases readers and unreferences the direct-child handle while retaining lifecycle
+error handling. This is not proof of termination or synchronous kernel interruption.
+The cleanup reservation, timeout budgets, owned boundary and production sources are unchanged.
+
+## 2026-11-06 — Bound failed confirmation results and reject late evidence (004 §2.10) — Refs #458
+
+An asynchronous confirmation failure releases held driver readers and returns its error
+without waiting for the failed group to close inherited pipes. Confirmation checks its
+absolute budget before and after asynchronous queries, between proc reads, and before
+accepting success. Pending supported queries are aborted best-effort and the verdict is
+raced against the existing deadline; this does not claim synchronous kernel-I/O interruption.
+No normal diagnostic-drain policy, deadline, facility boundary, or production source changed.
+
+## 2026-11-06 — Bound facility controls to direct jq and confirm owned termination (004 §2.10) — Refs #458
+
+Clarify the accepted script-control boundary: real shipped jq programs execute directly
+on authored fixtures, while real command-poll/preset integration remains in the unchanged
+CLI package suite. Do not start detached production observations in the facility driver.
+Outermost error-free helper completion confirms terminal state of its known owned group,
+including Linux zombies, within its existing bound. A signal request alone is insufficient.
+No production source owner-death behavior, API, dependency, deadline, or aggregate changed.
+
+## 2026-11-05 — Explicit local gate scheduling, facilities, and audit boundaries (004 §2.10) — Refs #458
+
+Preserve valid job metadata in negative guard fixtures, reject prerequisites that could
+skip the mandatory test job, and report optional local jq preset-reduction coverage as
+skipped rather than a passing no-op. CI still requires jq; available jq runs real cases.
+Document and guard the existing independent live dependency-audit exclusion, including
+its separate command and the distinction from script-suite audit fixtures/version floors.
+The aggregate sequence, security workflow cadence, and website exclusion are unchanged.
+
+## 2026-11-05 — Source validation parity verification (004 §2.2/§2.4/§3.5/§5.1, 005 §3/§6) — Refs #301
+
+Clarify the existing pre-observation `validateWatchScope` contract for `monitor test` and its
+shared diagnostics with `validate`, retaining each command's text/JSON channels and exit code 1.
+Replace the incomplete verification evidence with a paired-command invalid-scope matrix covering
+enums, unknown properties, types, required fields, nested collections, and composite parts. Live
+HTTP and command/file sentinels prove rejection precedes source effects; valid controls establish
+that both sentinels detect execution. Correct the stale 004 §5.1 bullets to reflect current duplicate
+ID rejection by `validate` and full source-schema validation shared with `monitor test`.
+Persistent runtime tick validation remains separately tracked. No production behavior changes.
+
+## 2026-11-05 — Bounded Docker phase diagnostics (004 §2.11) — Refs #509
+
+Separate valid install/build output volume from the outer smoke helper's runaway-output bound.
+Replace full phase streaming with capped periodic byte tails and final tails, preserving recent
+phase/daemon evidence when retrieval fails and force removal destroys files. Add successful 21 MiB,
+ordinary failure and active-termination regressions; retain the existing timeout/cleanup allocation
+and zero-exit overflow guard. This test-fixture contract does not establish repeated-CI reliability.
+
+## 2026-11-05 — Retain admission through hints and async parsing (001, 004 §2.12) — Refs #546
+
+Optional validation diagnostics must not bypass bounded monitor intake: skip hints
+for admission errors and use the shared bounded reader for ordinary-error hints,
+even if a file grows or is replaced after discovery. Export the existing synchronous
+reader for this composition and record its API. Collection declarations must be raw
+arrays; reject non-array Promise/thenable inputs before preprocessing can unwrap
+them or visit elements/compile CEL. Preserve exact array boundaries, ordinary type
+diagnostics, native Shape guards, and legacy-hint controls.
+
+## 2026-11-05 — Integrate admission limits with Zod 4 (001, 002) — Refs #546
+
+Preserve the bounded monitor reader and early collection admission alongside the
+Zod 4 migration and native Shape rejection. Regenerate public declarations from
+installed Zod 4. Require own envelope IDs for admission-error correlation, avoid
+copying decoded container values during traversal, and describe raw-frame caps
+as bytes before decoding. Regression tests cover the review points and preserve
+session state, liveness, and exact admission boundaries.
+
+## 2026-11-05 — Preserve native Shape input rejection (001 §5.1) — Refs #542
+
+Extend the pre-normalization guard to the verified historical non-mapping family:
+`Date`, `Map`, `Set`, and objects with callable `then` and `catch`. Synchronous
+validation returns failure for native Promises rather than throwing, and async
+validation rejects them without awaiting a resolved mapping. Preserve the existing
+admission of other objects, mapping/default/CEL behavior, public input/output types,
+and preprocessing composition surface; do not impose a plain-object restriction.
+
+## 2026-11-05 — Preserve Shape mapping admission (001 §5.1) — Refs #542
+
+Clarify the current mapping-only contract: YAML timestamps are scalar declarations
+and must be rejected, including the Date values produced by the YAML loader.
+Restore this rejection before Zod 4 object normalization can erase the scalar to
+`{}`. Valid mappings, omission, authored input types, and parsed output types are
+unchanged. The exported Shape validator now uses a preprocessing pipe; its API
+report records that schema-composition surface.
+
+## 2026-11-05 — Make physical PATH controls portable across POSIX utilities (004 §2.7) — Refs #520
+
+Physical PATH controls now use owned non-JS shell executables and an explicit failing lexical decoy, preserving native lookup and literal argv assertions without depending on renamed host printf/false utilities.
+
+## 2026-11-05 — Validate the manager of every physical candidate (004 §2.7) — Refs #520
+
+Official and adjacent installation candidates now apply the same requested-manager predicate as invoking entries and direct PATH targets after physical canonicalization. A symlink to another manager is skipped so a later valid installation can be selected.
+
+## 2026-11-05 — Preserve physical lookup and explicit POSIX PATH components (004 §2.7) — Refs #520
+
+Launcher discovery uses native physical file and directory identities before lexical joins can change symlink/`..` traversal. Explicit empty POSIX PATH components retain discovery-time cwd, while unset PATH does not; unusable directories are skipped so later valid entries remain discoverable.
+
+## 2026-11-05 — Anchor launcher paths before subprocess cwd changes (004 §2.7) — Refs #520
+
+The package-manager resolver returns absolute launcher paths for both invoking entries and discovered installation candidates. Relative PATH and invoking entries retain their selected file identity when packing or installation changes the child working directory.
+
+## 2026-11-05 — Retain executable-only pnpm in POSIX fixtures (004 §2.7) — Refs #520
+
+The compatibility wrapper retains inherited PATH when pnpm has no discoverable JavaScript launcher. Its actual nested suites exercise the existing POSIX executable fallback, including real workspace dependency rewriting and the Corepack-context control.
+
+## 2026-11-05 — Retain installation context in npm fixture probes (004 §2.7) — Refs #520
+
+The compatibility fixture forwards intercepted install options to its real npm version probe, retaining the isolated working directory and environment required by context-sensitive Corepack dispatch. A named Corepack-layout fixture checks both while delegating the version query to installed npm.
+
+## 2026-11-05 — Resolve Corepack proxies and platform PATH semantics (004 §2.7) — Refs #520
+
+Discover the requested manager through named Corepack proxies, honor exact POSIX `PATH` independently of Windows casing, and discover npm fixture tools separately from Node. The actual compatibility suite is exercised under separate Node/npm installations.
+
+## 2026-11-05 — Discover every supported pnpm launcher extension (004 §2.7) — Refs #520
+
+Official Node and adjacent PATH package discovery now considers pnpm `.cjs`, `.js`, and `.mjs` entrypoints under other invoking package managers, matching direct pnpm invocation support.
+
+## 2026-11-05 — Preserve package-manager identity and separate installations (004 §2.7) — Refs #520
+
+Packing resolves pnpm independently of the invoking manager so workspace dependencies remain installable. The install harness discovers npm JavaScript entrypoints from PATH as well as beside Node, preserving shell-free literal arguments across separate installations.
+
+## 2026-11-03 — Preserve package-manager arguments in install checks (004 §2.7) — Refs #520
+
+Run package-manager JavaScript entrypoints without a shell and exercise temporary paths containing spaces in the install check.
+
+## 2026-11-03 — Migrate exported validation schemas to Zod 4 (001) — Refs #530
+
+Direct core and CLI validation uses patched Zod 4. Exported schema types now follow
+Zod 4; parsed monitor data and authored messages are unchanged. This dependency
+change does not impose input limits or establish safety of SDK v3 compatibility code.
+
+## 2026-11-03 — Nested worktrees stay out of the local gate (008 §10) — Refs #458
+
+`pnpm check` could not pass in a main checkout holding worktrees under `.claude/worktrees/`. With 16
+of them, `eslint .` ran out of memory at its 4 GB heap limit after 90 seconds, and `prettier --check .`
+reported 372 files inside them, because anchored rules such as `apps/website/` do not reach a
+worktree's copy. The directory was excluded only through `.git/info/exclude`, which neither tool reads.
+
+- **008 §10 — extends "Local gate ≡ CI gate"** to these worktrees, and adds the guard to the test
+  implications. CI has no such directory, so only asking the tools directly can catch a missing rule.
+- **No change to what the gate checks inside a worktree.** A check run from a worktree's own root
+  still covers that worktree; only a run from above it skips it.
+
+## 2026-11-03 — Runtime state stays out of the local gate (008 §10, 002 §11.3) — Refs #458
+
+`pnpm check` failed in any checkout of this repo with an open session, because
+`prettier --check .` read `.agentmonitors/sessions/<id>/hook-state.json`. CI never has that file.
+`init` has ignored the directory in users' projects since #336, but this repo's own `.gitignore`
+never had the rule.
+
+- **008 §10 — extends "Local gate ≡ CI gate"** to files that exist only because a tool is running
+  on this machine, and adds the guard to the test implications.
+- **002 §11.3 — records the format-check consequence** of the `.gitignore` line, including that
+  Prettier reads only the `.gitignore` in the directory it runs from.
+- **No change to what the runtime writes or to `init`.** Only this repo's ignore rules and its
+  guard change.
+
+## 2026-11-03 — Apply bounded reads to production monitor discovery (001) — Refs #546
+
+Route asynchronous scans through the same byte-budget reader as direct file
+parsing. Previously scans allocated and decoded complete files before rejecting
+them. Deterministic admission tests now observe scan read counts, descriptor
+closure, oversized flat/folder diagnostics, exact-boundary acceptance, and valid
+sibling results. Discovery retains asynchronous filesystem I/O.
+
+## 2026-11-03 — Bound monitor and daemon inputs before validation (001, 002, 005) — Refs #530
+
+Specify monitor byte/tag/derive limits and daemon byte/collection/depth/aggregate
+budgets. Reject before element validation or runtime mutation with a bounded,
+machine-classified error; preserve ordinary validation and session isolation.
+Raw-socket tests against a spawned daemon cover unterminated and fragmented input,
+valid boundaries, liveness, and unchanged sessions. These guards do not remediate
+SDK Zod v3 compatibility code or replace dependency upgrades.
+
+## 2026-11-03 — Correct the no-masked-flakes exemplar (008 §10) — Refs #548
+
+Replace #506 as the fixed exemplar. It widened an assertion to accept `write EBADF`, which hid a test
+closing a descriptor twice. #548 removes that double close and narrows the assertion again. The contract
+text is unchanged.
+
+## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
+
+Remove the launcher suite's blanket retry after tracing the failure it masked to a real race: a CLI
+integration test ran `pnpm build`, whose clean step removed `apps/cli/dist` while the concurrent
+launcher suite executed it. The contract now forbids a test from starting a package build, makes the
+CLI's test targets depend on `build`, and requires the launcher to pass on its first attempt. Its
+unknown-subcommand assertion requires the CLI's own error, because a load failure also exits 1.
+Its subprocess bound drops from a nominal 30s, which vitest's 5s test timeout already overrode
+without evidence, to 4.5s, so overruns report their status and output.
+
+## 2026-11-03 — Align the local pre-push gate with portable CI validation (004 §2.10) — Refs #458
+
+Define `pnpm verify` as the sequential aggregate of CI's portable checks, including the
+serial daemon suite, standalone consumer, fresh-install hook E2E, and publish dry-run.
+Keep the fast `pnpm test` workload and print its omissions. A guard compares the actual
+workflow and root scripts, requiring explicit decisions for new CI jobs or commands.
+Document setup, platform, Docker availability, and website exceptions; website exclusion
+is unchanged and expanding it remains a human decision.
+
+## 2026-11-03 — First-attempt daemon gate and literal-path proof (004) — Refs #452
+
+Require the literal-path verification regression to prove cleanup, exact real contents and event
+identity surviving completed subsequent observations. Replace the fixed survival sleep with bounded
+condition polling. Remove the serial suite's blanket retries after all 64 cases pass with retries
+disabled; a script test guards the configuration. Product observation-boundary behavior remains the
+#532/#533 contract. Historical command-trigger attribution remains tracked in #540.
+
+## 2026-11-03 — Update milestone references after the roadmap reorganization (008, roadmap) — Refs #539
+
+Point the milestone citations in 008 §9–§10 and the G21 proof at the milestones in
+[docs/product/roadmap.md](../product/roadmap.md). Contract text is unchanged; only the planned
+sequencing of these targets moved.
+
 ## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004) — Refs #293
 
 The event-order boundary retains raw shared input representation and refreshes explicit

@@ -17,7 +17,7 @@
  * @see https://pnpm.io/cli/audit
  * @see https://pnpm.io/cli/why
  */
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -541,24 +541,31 @@ describe('versionAtLeast', () => {
 // GitHub advisory. Runs the real `pnpm why --json` against the workspace's
 // actual node_modules/lockfile resolution.
 const PATCHED_MINIMUMS = [
+  // GHSA-mrhx-c7xc-m3w5: direct validation must resolve patched Zod 4.
+  { package: 'zod', minVersion: '4.6.6' },
+  // Published dependency floors must cover the advisory fixes even outside
+  // this workspace, where pnpm overrides do not accompany our packages.
+  // GHSA-p95v-992w-h6c3 (TOON); GHSA-46jr-4wx8-v453 and related SDK advisories.
+  { package: '@toon-format/toon', minVersion: '2.3.1' },
+  { package: '@modelcontextprotocol/sdk', minVersion: '1.32.0' },
   // drizzle-orm: GHSA (libs/core) — patched >=0.45.2
   { package: 'drizzle-orm', minVersion: '0.45.2' },
-  // lodash-es via cel-js>chevrotain (libs/core) — GHSA-r5fr-rjxr-66jc, patched >=4.17.24
-  { package: 'lodash-es', minVersion: '4.17.24' },
+  // lodash-es via cel-js>chevrotain (libs/core) — GHSA-r5fr-rjxr-66jc, patched >=4.18.0
+  { package: 'lodash-es', minVersion: '4.18.0' },
   // fast-uri via @modelcontextprotocol/sdk>ajv (apps/cli) — GHSA-v39h-62p7-jpjc,
-  // GHSA-v2hh-gcrm-f6hx, GHSA-7p8r-x3mc-p8w7, patched >=3.1.5
-  { package: 'fast-uri', minVersion: '3.1.5' },
-  // hono via @modelcontextprotocol/sdk (apps/cli) — GHSA-88fw-hqm2-52qc, patched >=4.12.25
-  { package: 'hono', minVersion: '4.12.25' },
-  // next (apps/website) — multiple GHSAs, most recent (GHSA-6gpp-xcg3-4w24,
-  // GHSA-m99w-x7hq-7vfj, GHSA-89xv-2m56-2m9x, GHSA-p9j2-gv94-2wf4) patched >=16.2.11
-  { package: 'next', minVersion: '16.2.11' },
+  // GHSA-w74x-v6f9-j3xg and authority normalization fixes, patched >=3.1.9
+  { package: 'fast-uri', minVersion: '3.1.9' },
+  // hono via MCP — GHSA-5r4p-p66f-jhc7, patched >=4.13.11
+  { package: 'hono', minVersion: '4.13.11' },
+  // next — GHSA-2464-fhr4-w9xw, GHSA-p3m5-59mp-jv5r,
+  // GHSA-673q-mjm6-r5xr, patched >=16.4.1
+  { package: 'next', minVersion: '16.4.1' },
   // ip-address via @modelcontextprotocol/sdk>express-rate-limit (apps/cli) —
-  // GHSA-mwp4-54f8-5fhr, patched >=10.3.1
-  { package: 'ip-address', minVersion: '10.3.1' },
-  // sharp, an optional dependency of next (apps/website) — GHSA-f88m-g3jw-g9cj,
-  // patched >=0.35.0
-  { package: 'sharp', minVersion: '0.35.0' },
+  // GHSA-rxp7-6hxx-x8q5, patched >=10.7.4
+  { package: 'ip-address', minVersion: '10.7.4' },
+  // sharp, an optional dependency of next — GHSA-wq5f-xc86-pv6w,
+  // patched >=0.35.5
+  { package: 'sharp', minVersion: '0.35.5' },
 ];
 
 describe('resolved dependency versions clear known high-severity advisories (lockfile regression)', () => {
@@ -586,6 +593,19 @@ describe('resolved dependency versions clear known high-severity advisories (loc
 // advisory's `paths` (via `resolvedVersionsUnderAncestor`'s ancestor-scoped
 // search of the `pnpm why --json` tree).
 const PATCHED_MINIMUMS_UNDER_ANCESTOR = [
+  // GHSA-68fv-2mgg-jv7q, GHSA-jqcg-44mw-7w3h, GHSA-27r3-jxmh-p828:
+  // check the affected production paths independently of development tools.
+  { package: 'source-map-js', ancestor: 'next', minVersion: '1.2.2' },
+  {
+    package: 'proxy-addr',
+    ancestor: '@modelcontextprotocol/sdk',
+    minVersion: '2.0.8',
+  },
+  {
+    package: 'body-parser',
+    ancestor: '@modelcontextprotocol/sdk',
+    minVersion: '2.4.0',
+  },
   // gray-matter (libs/core, a direct dependency) pins the js-yaml 3.x line —
   // GHSA-52cp-r559-cp3m, GHSA-5p4m-2wfm-xmqj, patched >=3.15.1. The other
   // resolved js-yaml@3.x instances (nx>@yarnpkg/parsers, nx>front-matter,
@@ -598,14 +618,14 @@ const PATCHED_MINIMUMS_UNDER_ANCESTOR = [
   // Our own `glob` dependency (libs/core, apps/cli,
   // plugins/source-file-fingerprint) resolves minimatch@10.x, which pulls
   // brace-expansion — GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg,
-  // GHSA-rgw5-rvv9-x895, patched >=5.0.9. Scoped to the `@agentmonitors/core`
+  // GHSA-rgw5-rvv9-x895 and later fixes, enforced floor >=5.0.12. Scoped to the `@agentmonitors/core`
   // ancestor (rather than `glob` or `minimatch`, whose names are also used,
   // at different unrelated majors, by devDependency-only tooling such as
   // fixturify-project and nx) to isolate this exact path.
   {
     package: 'brace-expansion',
     ancestor: '@agentmonitors/core',
-    minVersion: '5.0.9',
+    minVersion: '5.0.12',
   },
   // postcss, a dependency of next (apps/website) — GHSA-r28c-9q8g-f849,
   // patched >=8.5.18. The `vite` (via vitest) devDependency chain resolves
@@ -633,6 +653,73 @@ describe('resolved dependency versions clear known high-severity advisories on t
           versionAtLeast(version, minVersion),
           `expected ${pkg}@${version} (under ${ancestor}) to be >= ${minVersion}`,
         ).toBe(true);
+      }
+    });
+  }
+});
+
+// These experiments are independent npm projects. Root workspace overrides
+// cannot protect them; each committed npm lock must select the patched code.
+// Selected packages are checked throughout the lock, including development paths.
+describe('standalone experiment security resolutions', () => {
+  for (const experiment of ['channel-probe', 'channel-uat', 'host-probe']) {
+    it(`${experiment} resolves patched dependencies throughout its lockfile`, () => {
+      const lock = JSON.parse(
+        readFileSync(
+          new URL(
+            `../experiments/${experiment}/package-lock.json`,
+            import.meta.url,
+          ),
+          'utf8',
+        ),
+      );
+      expect(lock, `${experiment}: expected a parsed npm lockfile`).toBeTypeOf(
+        'object',
+      );
+      expect(
+        lock,
+        `${experiment}: expected npm lockfile packages map`,
+      ).toHaveProperty('packages');
+      expect(
+        lock.packages,
+        `${experiment}: packages must be a record`,
+      ).toBeTypeOf('object');
+      expect(
+        lock.packages,
+        `${experiment}: packages must not be null`,
+      ).not.toBeNull();
+      expect(
+        Array.isArray(lock.packages),
+        `${experiment}: packages must not be an array`,
+      ).toBe(false);
+      for (const [pkg, minimum] of [
+        ['@modelcontextprotocol/sdk', '1.32.0'],
+        ['fast-uri', '3.1.9'],
+        ['body-parser', '2.4.0'],
+        ['proxy-addr', '2.0.8'],
+        ['hono', '4.13.11'],
+        ['ip-address', '10.7.4'],
+      ]) {
+        const versions: string[] = Object.entries(lock.packages)
+          .filter(([key]) => key.endsWith(`node_modules/${pkg}`))
+          .map(([, value]) => {
+            if (
+              typeof value !== 'object' ||
+              value === null ||
+              !('version' in value) ||
+              typeof value.version !== 'string'
+            ) {
+              throw new Error(`Missing resolved version for ${pkg}`);
+            }
+            return value.version;
+          });
+        expect(versions.length, pkg).toBeGreaterThan(0);
+        for (const version of versions) {
+          expect(
+            versionAtLeast(version, minimum),
+            `${pkg}@${version} must be >=${minimum}`,
+          ).toBe(true);
+        }
       }
     });
   }
