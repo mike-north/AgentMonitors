@@ -9,6 +9,37 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
+
+The incoming-changes Nx test target requires both dependency builds and its own build because
+the revision-expression suite executes `dist/index.js`. Require a first-attempt cold-target
+pass with caching disabled, and an own-build-edge-only reversion that exposes the six compiled
+failures while the 52 controls pass. Direct vitest still consumes prebuilt output; no build
+moves into test code. Source behavior, public API, feature tests and global Nx defaults remain
+unchanged.
+
+## 2026-11-05 — Verify resolved Git objects without rewriting authored revisions (003–004) — Refs #305
+
+Resolve an authored incoming-changes revision unchanged to one complete SHA-1/SHA-256 object ID,
+then separately peel that ID to a commit. Suffixing arbitrary input can turn a commit-type check
+into a blob filename or alter a commit-message search regex. Both hash formats now require real
+source/built-source/CLI regressions for suffix-named blob paths and valid commit-search expressions,
+with ordinary commit/tag/extended-expression controls. The accepted #555 ordinary error diagnostic,
+baseline/state/history contracts, quiet recovery and public API remain unchanged.
+
+## 2026-11-05 — Truthful incoming-changes failures (002–005) — Refs #305
+
+Adopt [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474):
+replace 003 §6.5's silent unavailable result with the existing recoverable source-error contract.
+Verify commit-ish refs, capture Git stderr, retain the last-good SHA and notify state, and preserve
+quiet missing-old-SHA rebaseline/per-file snapshot omission. Require non-nullish state before a
+CLI initial baseline; retain no-files-matched precedence and source-owned primitive states.
+History text and explain now include the existing error payload using bounded, terminal-safe
+single-line display; stored/structured audit data stays intact. No public outcome, schema or
+migration is added. Required tests cover real Git/CLI, SQLite reopen and socket/offline diagnosis.
+Existing error retry cadence and held-notify deferral remain unchanged; #558 and #559 track those
+separately rather than silently broadening this repair.
+
 ## 2026-11-06 — Bound script scheduling and fixture startup (004 §2.10) — Refs #458
 
 Script files run serially to bound nested Vitest/package-manager resource contention.
