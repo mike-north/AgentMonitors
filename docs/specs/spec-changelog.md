@@ -28,6 +28,25 @@ phase/daemon evidence when retrieval fails and force removal destroys files. Add
 ordinary failure and active-termination regressions; retain the existing timeout/cleanup allocation
 and zero-exit overflow guard. This test-fixture contract does not establish repeated-CI reliability.
 
+## 2026-11-05 — Retain admission through hints and async parsing (001, 004) — Refs #546
+
+Optional validation diagnostics must not bypass bounded monitor intake: skip hints
+for admission errors and use the shared bounded reader for ordinary-error hints,
+even if a file grows or is replaced after discovery. Export the existing synchronous
+reader for this composition and record its API. Collection declarations must be raw
+arrays; reject non-array Promise/thenable inputs before preprocessing can unwrap
+them or visit elements/compile CEL. Preserve exact array boundaries, ordinary type
+diagnostics, native Shape guards, and legacy-hint controls.
+
+## 2026-11-05 — Integrate admission limits with Zod 4 (001, 002) — Refs #546
+
+Preserve the bounded monitor reader and early collection admission alongside the
+Zod 4 migration and native Shape rejection. Regenerate public declarations from
+installed Zod 4. Require own envelope IDs for admission-error correlation, avoid
+copying decoded container values during traversal, and describe raw-frame caps
+as bytes before decoding. Regression tests cover the review points and preserve
+session state, liveness, and exact admission boundaries.
+
 ## 2026-11-05 — Preserve native Shape input rejection (001 §5.1) — Refs #542
 
 Extend the pre-normalization guard to the verified historical non-mapping family:
@@ -117,6 +136,23 @@ never had the rule.
   Prettier reads only the `.gitignore` in the directory it runs from.
 - **No change to what the runtime writes or to `init`.** Only this repo's ignore rules and its
   guard change.
+
+## 2026-11-03 — Apply bounded reads to production monitor discovery (001) — Refs #546
+
+Route asynchronous scans through the same byte-budget reader as direct file
+parsing. Previously scans allocated and decoded complete files before rejecting
+them. Deterministic admission tests now observe scan read counts, descriptor
+closure, oversized flat/folder diagnostics, exact-boundary acceptance, and valid
+sibling results. Discovery retains asynchronous filesystem I/O.
+
+## 2026-11-03 — Bound monitor and daemon inputs before validation (001, 002, 005) — Refs #530
+
+Specify monitor byte/tag/derive limits and daemon byte/collection/depth/aggregate
+budgets. Reject before element validation or runtime mutation with a bounded,
+machine-classified error; preserve ordinary validation and session isolation.
+Raw-socket tests against a spawned daemon cover unterminated and fragmented input,
+valid boundaries, liveness, and unchanged sessions. These guards do not remediate
+SDK Zod v3 compatibility code or replace dependency upgrades.
 
 ## 2026-11-03 — Test-run build ownership and first-attempt launcher gate (004 §2.9) — Refs #547
 
