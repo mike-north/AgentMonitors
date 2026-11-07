@@ -1554,9 +1554,39 @@ Verified: `apps/cli/src/daemon-ipc.ts` — `resolveSocketPath()`, `ResolveSocket
 
 ### 10.4 IPC wire protocol
 
-Each request/response is a single newline-delimited JSON object. The server reads until it finds `\n`, parses the JSON, dispatches the method, and writes `{ id, result? }` or `{ id, error }` back before closing the connection.
+Each request/response is a single newline-delimited JSON object. A connection
+admits **one request** and then closes after `{ id, result? }` or `{ id, error, code? }`.
+Additional frames cannot dispatch while the first request is in flight.
 
-Verified: `apps/cli/src/daemon-ipc.ts` — server `socket.on('data', ...)` handler (lines 244–278); `respond()` writes `JSON.stringify(payload) + '\n'` (line 241).
+Before JSON parsing, the first frame MUST be at most **1,048,576 bytes**, excluding
+its newline. The server counts raw bytes across chunks, including split UTF-8
+characters, and rejects an oversized frame even when no newline arrives. Retained
+frame storage is bounded independently of fragment count; trailing frames are not
+retained. Exact byte limits are accepted.
+
+Before envelope or method schema validation, every decoded array and record
+(including unknown fields) MUST have at most **1,000** elements or own keys.
+The complete request MUST contain at most **10,000 values**, counting the root,
+containers, and scalar values once each, and have depth at most **32**, with the
+root at depth zero. Iterative admission checks prevent schema traversal or runtime
+mutation on rejection. These budgets support bulk control operations while
+bounding validation work; they do not apply to response payloads or the MCP transport.
+
+The decoded traversal MUST avoid copying container values into intermediate
+collections after counting their widths. Admission responses correlate only an
+own string `id` from the decoded envelope; inherited IDs are ignored. Raw-frame
+limit diagnostics describe bytes because rejection precedes UTF-8 decoding.
+
+Admission failures return one bounded error with `code: INPUT_LIMIT_EXCEEDED`.
+Collection failures preserve a string request ID when available; byte failures use
+`id: invalid` because no JSON is parsed. The daemon remains available and existing
+sessions are unchanged. Ordinary malformed JSON and unsupported envelopes retain
+the legacy error and unsupported-request code. Connection resets are local to the
+peer and cannot terminate the daemon.
+
+Verified: `apps/cli/src/input-limits.test.ts`,
+`apps/cli/src/input-limits.integration.test.ts` (spawned daemon, two sessions,
+raw sockets, exact boundaries), and `apps/cli/src/daemon-ipc.test.ts`.
 
 ### 10.5 Exposed socket commands
 
@@ -1624,6 +1654,16 @@ Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 - `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, or a missing expected projection.
   (An unreachable daemon is **not** itself a stage failure: the CLI falls back to an in-process read
   of the persisted store — see the no-daemon fallback below.)
+
+For an `errored` observation with a nonempty string `observationData.error`, the observation
+stage is `failure` with reason `Source observation failed: <displayed error>` and the existing
+observation data in `details`. Reasons strip VT escape sequences and C0/DEL/C1 controls, collapse
+whitespace to a single line, and cap the error at 512 Unicode code points including a trailing
+`...` when truncated. Missing/empty/non-string errors retain the generic errored-stage reason.
+This is a read-only display transformation: `details`, history JSON and stored audit bytes remain
+unchanged. The existing verdict severity ordering still applies; another failure may win the
+verdict without removing this observation-stage diagnostic. Verified: `source-error-state.test.ts`
+and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -1699,6 +1739,9 @@ Verified: `libs/core/src/adapter/claude.ts` — `safeSessionPathSegment()` (line
 > tick. It is project-local (rooted at the workspace, not the user's data dir), so it is a
 > `.gitignore` concern like `.claude/*.local.*`: `agentmonitors init` (bare or `--enable-only`)
 > ensures `.gitignore` ignores both (`apps/cli/src/commands/init.ts` — `ensureGitignore()`).
+> Prettier reads `.gitignore` by default, so that line also keeps these files out of a project's
+> format check. Prettier reads only the `.gitignore` in the directory it runs from, so a format
+> check run from above a nested workspace needs its own rule.
 
 ### 11.4 Hook-state materialization
 
@@ -1922,6 +1965,12 @@ Outbox discovery is not capped by the per-monitor 256-row limit: one full outbox
 Every summary excludes other workspaces and NULL-scope records unless that exact scope is requested
 at the store boundary. Diagnostic reads never re-arm, discard, observe or materialize retained work.
 
+Only `pending` and `terminal` are supported lifecycle values. If an exact-route summary encounters
+an unsupported persisted status (for example `records`, `bytes`, or `blocked`), it **MUST** fail
+explicitly before constructing summary data, with a bounded diagnostic that does not echo the stored
+value. It **MUST NOT** skip or relabel the row or return fabricated healthy totals. The row and its
+private envelope remain unchanged; this adds no lifecycle value or automatic repair behavior.
+
 Report additions remain optional for older-daemon compatibility. _Current:_ core retry metadata
 reports. _Target:_ CLI rendering and socket date revival, including orphan groups, in #496. Core
 Date values are not evidence of correctly reconstructed dates after a JSON IPC roundtrip.
@@ -2049,6 +2098,14 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
     `emittedEventIds` reflects only durably committed events.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
+
+  An unavailable `incoming-changes` repository/ref uses this existing source-error path (003 §6.5,
+  decision #555, Refs #305). Source state, notify state and `lastObservationAt` remain unchanged,
+  including across reopening the store. Once due, rejection is retried on each daemon tick;
+  ordinary debounce/rollup dispatch in that monitor's due-ingest path waits for observation to
+  succeed. These are current error-path consequences, not a guarantee that accepted held work
+  can wait indefinitely: #558 tracks held-work flushing and #559 tracks retry cost separately.
+  Other monitors continue, and already-materialized events remain deliverable.
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 

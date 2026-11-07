@@ -2380,7 +2380,7 @@ Handle unchanged.
     });
     expect(errored.stages.find((stage) => stage.id === 'observation')).toEqual(
       expect.objectContaining({
-        reason: expect.stringContaining('errored'),
+        reason: 'Source observation failed: source failed',
       }),
     );
 

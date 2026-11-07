@@ -382,3 +382,154 @@ describe('retained-work diagnostics', () => {
     ).toEqual([last.id]);
   });
 });
+
+/**
+ * Persisted TEXT is outside the lifecycle type's runtime guarantees. These
+ * owned on-disk fixtures model status-only corruption, never supported writes.
+ * Spec 002 requires exact route totals and non-mutating metadata diagnostics;
+ * the bounded corruption boundary rejects an unsupported status explicitly.
+ */
+describe('#495 malformed persisted retry status', () => {
+  /** Own every connection and directory, including connections opened after reopen. */
+  function diskFixture() {
+    const directory = mkdtempSync(path.join(tmpdir(), 'retry-status-owned-'));
+    directories.push(directory);
+    const databasePath = path.join(directory, 'status.sqlite');
+    const reopen = () => {
+      const db = createDb(databasePath);
+      // The public DB brand intentionally hides native SQL; this fixture alone
+      // owns the connection used to inject unsupported persisted state.
+      const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+      cleanups.push(() => {
+        if (client.open) client.close();
+      });
+      return { client, store: new RuntimeStore(db) };
+    };
+    return { ...reopen(), reopen };
+  }
+
+  /** Include raw envelope/error bytes as well as every durable column. */
+  function durableRows(client: BetterSQLiteClient) {
+    return client
+      .prepare(
+        'SELECT *, hex(envelope) AS envelope_hex, hex(last_error) AS error_hex FROM materialization_retry_outbox ORDER BY id',
+      )
+      .all();
+  }
+
+  for (const status of ['records', 'bytes', 'blocked']) {
+    it(`rejects persisted ${status} without changing retained rows across reopen`, () => {
+      const { client, store, reopen } = diskFixture();
+      seed(store, '/workspace', false);
+      const damaged = seed(store, '/workspace', true);
+      const other = seed(store, '/other', false);
+      const global = seed(store, null, true);
+      client
+        .prepare(
+          'UPDATE materialization_retry_outbox SET status = ? WHERE id = ?',
+        )
+        .run(status, damaged.id);
+      const before = durableRows(client);
+      console.info(
+        'persisted-status durable before',
+        JSON.stringify({ status, rows: before }),
+      );
+      let observed: unknown;
+      try {
+        observed = store.materializationRetrySummary('retained', '/workspace');
+      } catch (error) {
+        observed = error instanceof Error ? error.message : String(error);
+      }
+      // Record actual pre-fix outcomes without turning them into expectations.
+      console.info('persisted-status repro', { status, observed });
+      expect(durableRows(client)).toEqual(before);
+      expect(
+        store.materializationRetrySummary('retained', '/other'),
+      ).toMatchObject({
+        pending: 1,
+        terminal: 0,
+        bytes: other.envelopeBytes,
+        records: [{ id: other.id, status: 'pending' }],
+      });
+      expect(store.materializationRetrySummary('retained', null)).toMatchObject(
+        {
+          pending: 0,
+          terminal: 1,
+          bytes: global.envelopeBytes,
+          records: [{ id: global.id, status: 'terminal' }],
+        },
+      );
+      client.close();
+      const reopened = reopen();
+      expect(durableRows(reopened.client)).toEqual(before);
+      try {
+        expect(() =>
+          reopened.store.materializationRetrySummary('retained', '/workspace'),
+        ).toThrow(
+          'Cannot summarize materialization retries: unsupported persisted status.',
+        );
+      } finally {
+        // Even a failing rejection assertion must check retained evidence.
+        const after = durableRows(reopened.client);
+        console.info(
+          'persisted-status durable after reopen',
+          JSON.stringify({ status, rows: after }),
+        );
+        expect(after).toEqual(before);
+      }
+      expect(observed).toBe(
+        'Cannot summarize materialization retries: unsupported persisted status.',
+      );
+    });
+  }
+
+  it('keeps pending/terminal totals, exact route isolation, and useful error text', () => {
+    const { store, client } = diskFixture();
+    const pending = seed(
+      store,
+      '/workspace',
+      false,
+      'retained',
+      'token=useful\ncontext',
+    );
+    const terminal = seed(store, '/workspace', true);
+    const damaged = seed(store, '/other', false);
+    const global = seed(store, null, false);
+    const sibling = seed(store, '/workspace', false, 'sibling');
+    for (const row of [damaged, global, sibling]) {
+      client
+        .prepare(
+          'UPDATE materialization_retry_outbox SET status = ? WHERE id = ?',
+        )
+        .run('blocked', row.id);
+    }
+    const before = durableRows(client);
+    const summary = store.materializationRetrySummary('retained', '/workspace');
+    expect(summary).toEqual({
+      pending: 1,
+      terminal: 1,
+      bytes: pending.envelopeBytes + terminal.envelopeBytes,
+      records: [
+        {
+          id: pending.id,
+          status: 'pending',
+          attemptCount: 0,
+          nextAttemptAt: new Date('2026-10-31T12:00:01Z'),
+          lastError: 'token=useful context',
+          createdAt: NOW,
+          updatedAt: NOW,
+        },
+        {
+          id: terminal.id,
+          status: 'terminal',
+          attemptCount: 5,
+          nextAttemptAt: null,
+          lastError: 'safe error',
+          createdAt: NOW,
+          updatedAt: new Date('2026-10-31T12:00:05Z'),
+        },
+      ],
+    });
+    expect(durableRows(client)).toEqual(before);
+  });
+});
