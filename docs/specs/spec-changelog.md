@@ -33,6 +33,20 @@ Direct core and CLI validation uses patched Zod 4. Exported schema types now fol
 Zod 4; parsed monitor data and authored messages are unchanged. This dependency
 change does not impose input limits or establish safety of SDK v3 compatibility code.
 
+## 2026-11-03 — Runtime state stays out of the local gate (008 §10, 002 §11.3) — Refs #458
+
+`pnpm check` failed in any checkout of this repo with an open session, because
+`prettier --check .` read `.agentmonitors/sessions/<id>/hook-state.json`. CI never has that file.
+`init` has ignored the directory in users' projects since #336, but this repo's own `.gitignore`
+never had the rule.
+
+- **008 §10 — extends "Local gate ≡ CI gate"** to files that exist only because a tool is running
+  on this machine, and adds the guard to the test implications.
+- **002 §11.3 — records the format-check consequence** of the `.gitignore` line, including that
+  Prettier reads only the `.gitignore` in the directory it runs from.
+- **No change to what the runtime writes or to `init`.** Only this repo's ignore rules and its
+  guard change.
+
 ## 2026-11-03 — Correct the no-masked-flakes exemplar (008 §10) — Refs #548
 
 Replace #506 as the fixed exemplar. It widened an assertion to accept `write EBADF`, which hid a test
@@ -48,6 +62,14 @@ CLI's test targets depend on `build`, and requires the launcher to pass on its f
 unknown-subcommand assertion requires the CLI's own error, because a load failure also exits 1.
 Its subprocess bound drops from a nominal 30s, which vitest's 5s test timeout already overrode
 without evidence, to 4.5s, so overruns report their status and output.
+
+## 2026-11-03 — First-attempt daemon gate and literal-path proof (004) — Refs #452
+
+Require the literal-path verification regression to prove cleanup, exact real contents and event
+identity surviving completed subsequent observations. Replace the fixed survival sleep with bounded
+condition polling. Remove the serial suite's blanket retries after all 64 cases pass with retries
+disabled; a script test guards the configuration. Product observation-boundary behavior remains the
+#532/#533 contract. Historical command-trigger attribution remains tracked in #540.
 
 ## 2026-11-03 — Update milestone references after the roadmap reorganization (008, roadmap) — Refs #539
 

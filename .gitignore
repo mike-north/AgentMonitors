@@ -161,6 +161,11 @@ temp/
 !.claude/monitors/spec-changes/
 !.claude/monitors/spec-changes/MONITOR.md
 
+# Agent Monitors runtime state: regenerable, written wherever a session opens.
+# Deliberately unanchored: Prettier reads only the root .gitignore, and a gate run
+# from the main checkout also walks each worktree under .claude/worktrees/.
+.agentmonitors/
+
 
 # Channel probe findings (experiments/channel-probe)
 agentmon-channel-probe.json
