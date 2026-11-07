@@ -1965,6 +1965,12 @@ Outbox discovery is not capped by the per-monitor 256-row limit: one full outbox
 Every summary excludes other workspaces and NULL-scope records unless that exact scope is requested
 at the store boundary. Diagnostic reads never re-arm, discard, observe or materialize retained work.
 
+Only `pending` and `terminal` are supported lifecycle values. If an exact-route summary encounters
+an unsupported persisted status (for example `records`, `bytes`, or `blocked`), it **MUST** fail
+explicitly before constructing summary data, with a bounded diagnostic that does not echo the stored
+value. It **MUST NOT** skip or relabel the row or return fabricated healthy totals. The row and its
+private envelope remain unchanged; this adds no lifecycle value or automatic repair behavior.
+
 Report additions remain optional for older-daemon compatibility. _Current:_ core retry metadata
 reports, CLI text/JSON rendering, and socket Date revival for explain, attached doctor summaries,
 and orphan groups. The CLI projects only the documented retry metadata fields and normalizes legacy

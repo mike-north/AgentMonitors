@@ -1054,6 +1054,20 @@ export class RuntimeStore {
         asc(materializationRetryOutbox.id),
       )
       .all();
+    // SQLite TEXT is not validated by the lifecycle type annotation. Reject
+    // unsupported persisted states before constructing totals or records; a
+    // diagnostic read must preserve retained evidence rather than relabel it.
+    // Keep the failure fixed and bounded without echoing private stored text.
+    if (
+      rows.some(
+        ({ status }: { status: unknown }) =>
+          status !== 'pending' && status !== 'terminal',
+      )
+    ) {
+      throw new Error(
+        'Cannot summarize materialization retries: unsupported persisted status.',
+      );
+    }
     return rows.reduce<MaterializationRetrySummary>(
       (summary, row) => {
         summary[row.status] += 1;

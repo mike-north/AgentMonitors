@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-07 — Reject unsupported persisted retry status (002) — Refs #495
+
+Retry diagnostics now fail explicitly before constructing a summary when an exact-route row
+contains an unsupported persisted status. Lifecycle remains `pending`/`terminal`; rows and private
+envelopes remain unchanged. The status TEXT annotation does not validate SQLite reads. The reducer
+previously allowed malformed values to corrupt summary fields; this does not establish a failure
+from supported writers. Owned on-disk regression tests cover `records`, `bytes`, `blocked`, reopen,
+valid totals, workspace isolation, and useful control-stripped diagnostic text. No new public API,
+status, schema policy, automatic repair, or arbitrary secret redaction is introduced.
+
 ## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
 
 The incoming-changes Nx test target requires both dependency builds and its own build because
