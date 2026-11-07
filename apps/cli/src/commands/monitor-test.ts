@@ -17,7 +17,11 @@ import {
   type Observation,
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
-import { retryRecordLines } from '../retry-diagnostics.js';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetrySummary,
+  retryRecordLines,
+} from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
 import { appendErrorHints } from '../command-hints.js';
@@ -128,7 +132,19 @@ function printExplainText(report: MonitorExplainReport): void {
   for (const stage of report.stages) {
     console.log(`${statusGlyph(stage.status)} ${stage.label}: ${stage.reason}`);
   }
-  for (const line of retryRecordLines(report.materializationRetries)) {
+  // An existing report summary is authoritative, even when explicitly empty.
+  // Partial legacy reports can retain known stage metadata while omitting that
+  // field; choose a local text source without changing structured omission.
+  let retries = report.materializationRetries;
+  if (retries === undefined) {
+    const details = report.stages.find(
+      (stage) => stage.id === 'materialization',
+    )?.details;
+    if (isMaterializationRetrySummary(details)) {
+      retries = normalizeRetrySummary(details);
+    }
+  }
+  for (const line of retryRecordLines(retries)) {
     console.log(line);
   }
   console.log(

@@ -2021,6 +2021,10 @@ terminal next-attempt stays null. Unknown retry fields are excluded, and errors 
 Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
 is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
 doctor JSON defaults them to empty summaries/arrays, explain preserves the omitted optional field.
+Text explain uses an existing top-level summary, including an explicitly empty one, in preference
+to recognized materialization-stage details. If that optional field is omitted, it displays the
+available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
+summaries and unrelated stage details do not fabricate retry records.
 
 Explain's local fallback preserves definition/scheduling failures with their retained work. A
 valid definition with retry-only state is a persisted report with the no-daemon notice, not a

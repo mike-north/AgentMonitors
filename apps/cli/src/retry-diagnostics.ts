@@ -10,6 +10,27 @@ import type { MaterializationRetrySummary } from '@agentmonitors/core';
 const RETRY_ERROR_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/gu;
 
 /**
+ * Materialization details have a retry-summary variant and ordinary variants
+ * such as event IDs. Recognize only the summary shape; unrelated stage details
+ * retain their own semantics, even when they contain payload or records keys.
+ * Socket timestamps are revived by normalizeRetrySummary, just as for the
+ * report-level summary; this guard does not reinterpret persisted statuses.
+ * Wire projection and text rendering share this app-internal discriminator.
+ * @internal
+ */
+export function isMaterializationRetrySummary(
+  details: Record<string, unknown> | undefined,
+): details is Record<string, unknown> & MaterializationRetrySummary {
+  return (
+    details != null &&
+    typeof details['pending'] === 'number' &&
+    typeof details['terminal'] === 'number' &&
+    typeof details['bytes'] === 'number' &&
+    Array.isArray(details['records'])
+  );
+}
+
+/**
  * Keep legacy failure text on one bounded terminal line. This is control
  * normalization, not secret redaction; callers must supply error metadata only.
  * @internal

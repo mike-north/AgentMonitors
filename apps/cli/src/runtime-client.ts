@@ -10,7 +10,6 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
-  MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -20,7 +19,10 @@ import type {
   OpenSessionInput,
   RuntimeTickResult,
 } from '@agentmonitors/core';
-import { normalizeRetrySummary } from './retry-diagnostics.js';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetrySummary,
+} from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
 
@@ -281,25 +283,6 @@ export async function listObservationHistoryClient(
     'history.list',
     query as unknown as Record<string, unknown>,
     socketPath ? { socketPath } : {},
-  );
-}
-
-/**
- * Materialization details have a retry-summary variant and ordinary variants
- * such as event IDs. Recognize only the summary shape; unrelated stage details
- * retain their own semantics, even when they contain payload or records keys.
- * Socket timestamps are revived by normalizeRetrySummary, just as for the
- * report-level summary; this guard does not reinterpret persisted statuses.
- */
-function isMaterializationRetrySummary(
-  details: Record<string, unknown> | undefined,
-): details is Record<string, unknown> & MaterializationRetrySummary {
-  return (
-    details != null &&
-    typeof details['pending'] === 'number' &&
-    typeof details['terminal'] === 'number' &&
-    typeof details['bytes'] === 'number' &&
-    Array.isArray(details['records'])
   );
 }
 

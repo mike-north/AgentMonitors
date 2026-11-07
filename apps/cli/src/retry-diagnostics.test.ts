@@ -792,3 +792,177 @@ it.each([
     }
   },
 );
+
+/**
+ * The text contract exposes one useful safe record, not every report copy.
+ * These expectations spell out the published field layout and fixed fixture
+ * values without using the formatter or captured output as an oracle.
+ */
+function expectedRetryTextLines(
+  status: 'pending' | 'terminal',
+  id: string,
+): string[] {
+  return [
+    `  Retry ${id}: status=${status}  attempts=${status === 'pending' ? '2' : '5'}  next-at=${status === 'pending' ? '2026-10-03T07:08:09.000Z' : 'none'}  updated-at=2026-10-02T04:05:06.000Z`,
+    `    Last error: ${safeError}`,
+  ];
+}
+
+it.each([
+  ['pending', 'text'],
+  ['pending', 'json'],
+  ['pending', 'toon'],
+  ['terminal', 'text'],
+  ['terminal', 'json'],
+  ['terminal', 'toon'],
+] as const)(
+  'preserves nested-only %s record details and top omission in compiled %s',
+  async (status, format) => {
+    const fixture = materializationReports(status);
+    delete fixture.explain.materializationRetries;
+    await serve(fixture);
+    const output = await run('explain', format);
+    expect(output.code).toBe(0);
+    if (format === 'text') {
+      const recordLines = output.stdout
+        .split('\n')
+        .filter(
+          (line) =>
+            line.startsWith('  Retry ') || line.startsWith('    Last error:'),
+        );
+      expect(recordLines).toEqual(
+        expectedRetryTextLines(status, `stage-${status}`),
+      );
+      expect(output.stdout).toContain(fixture.explain.verdict.reason);
+      expect(output.stdout).toContain(
+        `Verdict: ${status === 'pending' ? 'pending' : 'failure'} at Materialization - ${fixture.explain.verdict.reason}`,
+      );
+      expect(output.stdout).not.toContain('PRIVATE');
+      expect(output.stdout).not.toContain('\u2028');
+      expect(output.stdout).not.toContain('\u2029');
+    } else {
+      const value =
+        format === 'json'
+          ? JSON.parse(output.stdout)
+          : decodeToon(output.stdout);
+      expect(value).not.toHaveProperty('materializationRetries');
+      expect(value.stages).toEqual([
+        ...fixture.explain.stages.slice(0, 2),
+        {
+          ...fixture.explain.stages[2],
+          details: expectedStageSummary(status, true),
+        },
+      ]);
+      expect(value.verdict).toEqual(fixture.explain.verdict);
+    }
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it.each(['pending', 'terminal'] as const)(
+  'prefers existing top-level %s records and renders them once in text',
+  async (status) => {
+    const fixture = materializationReports(status);
+    const top = fixture.explain.materializationRetries;
+    if (top === undefined)
+      throw new Error('fixture requires its canonical summary');
+    // Distinct IDs make source preference observable independently of deduplication.
+    fixture.explain.materializationRetries = {
+      ...top,
+      records: top.records.map((record) => ({
+        ...record,
+        id: `preferred-${status}`,
+      })),
+    };
+    await serve(fixture);
+    const output = await run('explain', 'text');
+    expect(output.code).toBe(0);
+    const recordLines = output.stdout
+      .split('\n')
+      .filter(
+        (line) =>
+          line.startsWith('  Retry ') || line.startsWith('    Last error:'),
+      );
+    expect(recordLines).toEqual(
+      expectedRetryTextLines(status, `preferred-${status}`),
+    );
+    expect(output.stdout).not.toContain(`stage-${status}`);
+    expect(output.stdout).toContain(fixture.explain.verdict.reason);
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
+
+it('keeps an explicitly empty top-level summary authoritative over nested text details', async () => {
+  const fixture = materializationReports('pending');
+  fixture.explain.materializationRetries = {
+    pending: 0,
+    terminal: 0,
+    bytes: 0,
+    records: [],
+  };
+  await serve(fixture);
+  const output = await run('explain', 'text');
+  expect(output.code).toBe(0);
+  expect(output.stdout).not.toContain('  Retry ');
+  expect(output.stdout).not.toContain('Last error:');
+  expect(output.stdout).not.toContain('stage-pending');
+  expect(output.stdout).toContain(fixture.explain.verdict.reason);
+  expect(requests.map((request) => request.method)).toEqual([
+    'monitor.explain',
+  ]);
+});
+
+it.each(['absent', 'events', 'partial', 'ordinary'] as const)(
+  'does not fabricate text retry records from %s materialization details',
+  async (kind) => {
+    const fixture = materializationReports('pending');
+    delete fixture.explain.materializationRetries;
+    const details =
+      kind === 'absent'
+        ? undefined
+        : kind === 'events'
+          ? {
+              eventIds: ['ordinary-event'],
+              payload: 'ORDINARY-MATERIALIZATION',
+              records: ['ordinary-record'],
+            }
+          : kind === 'partial'
+            ? { pending: 1, terminal: 0, records: [] }
+            : {
+                pending: 1,
+                terminal: 0,
+                bytes: 7,
+                records: 'ordinary-records',
+              };
+    fixture.explain.stages[2] = {
+      id: 'materialization',
+      label: 'Materialization',
+      status: 'ok',
+      reason: 'Existing materialization diagnosis.',
+      ...(details === undefined ? {} : { details }),
+    };
+    fixture.explain.verdict = {
+      stage: 'materialization',
+      status: 'ok',
+      reason: 'Existing materialization diagnosis.',
+    };
+    await serve(fixture);
+    const output = await run('explain', 'text');
+    expect(output.code).toBe(0);
+    expect(output.stdout).not.toContain('  Retry ');
+    expect(output.stdout).not.toContain('Last error:');
+    expect(output.stdout).not.toContain('stage-pending');
+    expect(output.stdout).not.toContain('ordinary-record');
+    expect(output.stdout).toContain('Existing materialization diagnosis.');
+    expect(output.stdout).toContain(
+      'Verdict: ok at Materialization - Existing materialization diagnosis.',
+    );
+    expect(requests.map((request) => request.method)).toEqual([
+      'monitor.explain',
+    ]);
+  },
+);
