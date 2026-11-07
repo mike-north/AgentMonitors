@@ -72,7 +72,42 @@ Before any source observation, `monitor test` applies the same `validateWatchSco
 
 `monitor test` is a source exerciser, not a proof of long-running runtime correctness. For stateful sources, it proves: the source can establish a baseline; a follow-up observe call can run without losing state inside the command. It does **not** prove that a real change occurred during that command invocation.
 
-**Verified in:** `apps/cli/src/commands/monitor-test.ts` — when the first observe call returns zero observations and `source.stateful` is true, the command calls `createFollowupObservationContext()` (which reuses `previousState` from the baseline result) and runs a second observe call. Both calls happen within the same process. No file-system or external change can realistically occur in the 100 ms `setTimeout` between calls, so "no changes detected" is the expected and documented outcome.
+**Verified in:** `apps/cli/src/commands/monitor-test.ts` — when the first observe call returns zero observations, `source.stateful` is true and `nextState` is non-nullish, the command calls `createFollowupObservationContext()` (which reuses `previousState` from the baseline result) and runs a second observe call. Both calls happen within the same process. No file-system or external change can realistically occur in the 100 ms `setTimeout` between calls, so "no changes detected" is the expected and documented outcome.
+
+A missing/null initial baseline MUST fail before the baseline message or second call, preserving
+`no-files-matched` diagnostic precedence and accepting non-nullish primitive source states.
+Unavailable `incoming-changes` observation MUST fail through the existing error envelope, not
+claim a baseline or configuration success. A failed follow-up also fails the overall dry-run,
+although an already-established first baseline remains a truthful text statement.
+
+Required regression scenarios for Refs #305 / decision #555:
+
+- Real Git non-repo/missing cwd, missing Git, unknown/option-looking/non-commit refs reject with
+  the exact 003 §6.5 diagnostic; child stderr is quiet. Commit and annotated commit-tag controls
+  baseline successfully; absent old SHA rebaselines and failed show omits only the snapshot.
+- In both SHA-1 and SHA-256 repositories, source and built-source tests MUST reject
+  `HEAD:payload` even when `payload^{commit}` is also a tracked blob. They MUST preserve
+  `:/Initial` commit-search semantics with a matching commit distinct from HEAD. Built CLI
+  text/JSON must report the existing failure envelope and exit 1 for the blob expression,
+  successfully baseline the valid search expression, and create no database in either case.
+  Keep HEAD/full-ID/tag/extended-commit positive controls and raw blob/tree/range/option-looking
+  negative controls. A narrow reversion to suffixing authored expressions must fail these
+  regressions while the controls continue to pass.
+- Last-good SHA survives an outage and SQLite reopen; recovery emits the exact net change from
+  that SHA. A failing source does not prevent a sibling from observing.
+- Pin the current error-path consequences: due errors retry without advancing the timestamp,
+  and held debounce/rollup work survives reopen without flushing until a successful observe.
+  Do not fold #558/#559 into this repair.
+- Real bundled CLI text/JSON rejects unavailable inputs without writing the DB. History and
+  explain expose the error over a real daemon socket and the offline DB fallback, in all supported
+  formats. Legacy error display strips controls and bounds Unicode text without rewriting audit
+  bytes or leaking another workspace's history.
+
+Verified by `plugins/source-incoming-changes/src/unavailable.test.ts`,
+`plugins/source-incoming-changes/src/revision-expressions.test.ts`,
+`libs/core/src/runtime/source-error-state.test.ts`,
+`apps/cli/src/commands/monitor-test.test.ts`, and
+`apps/cli/src/commands/incoming-changes-diagnostics.test.ts`.
 
 ### 2.5 Runtime tests
 
@@ -187,6 +222,15 @@ status, signal and output rather than vitest's bare timeout.
 Running a CLI test file directly with vitest bypasses the Nx dependency and executes whatever bundle
 already exists; build first, or use `pnpm nx test @agentmonitors/cli`.
 
+**Current, normative:** the `source-incoming-changes` test target also declares its own `build`
+alongside dependency builds. Its revision-expression tests execute both TypeScript source and
+`dist/index.js`, so `pnpm nx test @agentmonitors/source-incoming-changes` MUST build core, then
+the plugin, before running the suite. This ordering must hold with the plugin's `dist` absent
+and Nx caching disabled; all 58 existing cases must pass on their first attempt. Removing only
+the own-build prerequisite under the same cold conditions must expose the six compiled-surface
+failures while the 52 source/control cases pass. A direct vitest invocation still requires a
+prior build; tests MUST NOT start builds themselves.
+
 **Verified in:** `scripts/cli-build-ownership.test.ts` (the CLI's `test` and `test:serial` targets
 depend on `build`; no tracked test source starts a build), `scripts/vitest-launcher-retry.test.ts`
 (the launcher config's resolved retry count is zero; run under `pnpm test:scripts`, wired into CI
@@ -194,8 +238,121 @@ per-PR), and `apps/agentmonitors/test/launcher.test.ts` (forced crash and hang c
 evidence renders and the subprocess bound stays inside the test budget). The evidence that first
 exposed the race is in
 [`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
+The incoming-changes cold-target check executes `src/index.test.ts`, `src/unavailable.test.ts`
+and `src/revision-expressions.test.ts` in `plugins/source-incoming-changes`; the last suite's
+compiled cases enforce that the Nx prerequisite produces a usable current artifact.
 
-### 2.10 Docker smoke diagnostic capture (current)
+### 2.10 Repository pre-push gate
+
+**Current, normative:** after installing the frozen lockfile with Node 24 and the pinned
+pnpm, contributors on macOS/Linux (POSIX shell) MUST use `pnpm verify` for the portable pre-push gate. It runs these
+root commands sequentially, stopping on failure: `build`, `check`, `check:api-report`,
+`test`, `test:serial`, `test:scripts`, `test:standalone-consumer`,
+`test:e2e-fresh-install-hooks`, and `publish:packages:dry-run`.
+
+`verify` names an aggregate spanning build, tool checks, authored tests, and packaging;
+`check:*` remains tool validation and `test:*` remains authored tests. `pnpm test` retains
+its fast package-suite workload and MUST print its omitted suites and point to `pnpm verify`.
+The aggregate preserves CI's test ordering: daemon tests run after the parallel suite,
+with no overlapping packaging builds. The publish dry-run runs locally regardless of
+CI's release-collateral path filter, and the duplicated CI `test:scripts` step runs once.
+The dry-run reads the registry and packs artifacts without publishing; packaging tests
+perform fresh installs and require network access.
+
+Nx still schedules dependency builds and caches eligible package targets, including
+`test:serial`. Use `NX_SKIP_NX_CACHE=true pnpm verify` for fresh execution evidence.
+A green result means these commands succeeded on this host, subject to reported skips;
+it is not proof of another OS, a fresh runner, or suites skipped for missing facilities.
+
+The PR-alerting preset reduction tests require the external `jq` executable. Local
+contributors without jq MAY omit those reductions, but Vitest MUST report an explicit
+skip naming the omitted surface, never a passing no-op. CI without jq MUST fail; when
+jq is present the real reduction cases MUST execute. Facility probes and canonical
+filter executions use an asynchronous total verdict within the existing 1,000ms
+per-command budget, including during test discovery. A hanging or broken executable
+MUST fail visibly; only ENOENT permits the optional local omission. A no-input
+version probe closes unused stdin without writing a payload. Explicit reduction
+input, including an empty string, retains its delivery obligation: stdin transport
+errors cannot be ignored or overridden by a successful command exit.
+
+The script facility control executes the actual jq programs extracted from the shipped
+preset templates directly against authored raw-GitHub fixtures. It does not start
+command-poll observations or prove source/preset integration; those unchanged integration
+cases remain in the normal CLI package suite run by `pnpm test` and `pnpm verify`.
+Script test files run serially so nested Vitest/package-manager processes cannot
+multiply outer worker pools. Package `pnpm test` scheduling and aggregate commands
+remain unchanged. Each negative command-deadline phase selects one actual command
+invocation; both positive canonical reductions still execute. The private fixture
+allows 4 seconds for framework launch/import/report work plus the independently strict
+1,000ms jq verdict: a 5-second complete-phase allowance. It requires the complete
+end-of-run result for the intended module/test, a visible jq deadline failure, and
+its sole owned jq terminal before fixture force-cleanup. Natural reporter/process
+close is not the command outcome. Driver close and group-terminal confirmation have
+a separate hard 1-second cleanup reservation, with harness margin in a 7-second test.
+No partial/first-test error may stand in for the whole intended phase. The framework
+allowance does not extend jq execution or child/query helper deadlines.
+The facility driver's owned boundary covers its Node/jq process group, not production
+observations that deliberately create separate groups. An error-free outermost return
+requires bounded terminal-state confirmation for that known group (including Linux
+zombie/dead states), rather than merely a SIGKILL request. Cleanup time is reserved
+inside the existing total bound; child/parent deadlines are not increased. Late
+terminal evidence cannot turn an expired confirmation into success. The same total
+deadline owns execution, direct-child exit, pipe closure and confirmation: if a timeout
+kill request never produces exit/close, the driver still returns a visible deadline
+error, releases its readers and unreferences the child handle. Signal success and
+handle release do not prove termination. If confirmation
+fails, the driver releases inherited readers and returns the error rather than waiting
+for the failed group's pipe closure; reader release is not termination evidence. The
+Darwin membership query owns a separate direct child: its failure/deadline path must
+release that child's streams and reference even if cancellation does not produce exit.
+Late query callbacks remain handled and cannot authorize success or further scans.
+On Linux, a listed proc entry disappearing with ENOENT does not establish group
+termination: the fresh group probe must also establish absence. A still-present group
+with no readable members remains unconfirmed until the existing deadline.
+
+The partial-test notice calls out this facility-dependent coverage. A reported skip means that surface remains unverified.
+
+The mandatory `test` job MUST NOT acquire unreviewed `needs` prerequisites: a skipped
+path-filtered prerequisite can skip the job even when it has no explicit condition.
+Guard regressions MUST preserve unrelated valid job metadata so each negative case
+proves the intended execution or command obligation.
+
+The explicit CI-only responsibilities are:
+
+- Checkout, Node/pnpm provisioning, dependency installation, and GitHub event/path filters.
+  Local installation is a prerequisite; local verification always runs release validation.
+- `windows-install-check`: Windows build and packed CLI native-module installation require
+  Windows. The hosted runner includes build tools, so even CI does not prove toolchain-free
+  installation.
+- `website-link-check`: website build and internal-link validation remain a separate,
+  path-filtered CI gate. Root build/check/format/lint exclusion is unchanged; the existing
+  website unit tests are already included by root `pnpm test`.
+
+The independent `.github/workflows/dependency-audit.yml` is a separately guarded
+exclusion from `pnpm verify`. Its daily security cadence, path-filtered PR/main triggers,
+and advisory guarantee remain unchanged. Run `pnpm check:dependency-audit` separately
+for the live production-advisory gate. `test:scripts` exercises audit fixtures and
+version-floor regressions; it does **not** substitute for a live advisory query. The
+parity guard pins the excluded workflow's known `pnpm check:dependency-audit` command
+and rejects unfamiliar executable steps/contexts rather than silently excluding additions.
+
+Docker smoke is **not** a separate job: `test:serial` discovers it on both hosts, but it
+self-skips without a reachable Docker daemon. Report this as unverified Docker coverage
+when running locally without Docker; CI's Ubuntu runner normally executes it.
+
+**Human decision pending:** whether website validation should join the root gate.
+Recommendation: keep the site build/link checks separate and path-filtered, then add
+executable documentation-example checks before claiming semantic documentation correctness.
+The existing link checker cannot catch a CLI example missing a required argument.
+Website changes need separate build/link and example verification meanwhile.
+
+**Verified in:** `scripts/local-gate.test.ts` reads the real CI workflow and package scripts,
+rejects missing local commands (including the old build/check/test gate), unclassified jobs,
+new executable steps in excluded jobs, skipped or failure-tolerant portable steps, and
+local failure masking or parallel execution. Changes to the command contract or exclusions
+MUST update this guard and the documented coverage together.
+
+### 2.11 Docker smoke diagnostic capture (current)
 
 The Docker smoke fixture MUST allow a successful install/build phase emitting more than 20 MiB
 while preserving the caller's literal success markers. Phase volume is written to container-local
@@ -219,7 +376,7 @@ abrupt active termination), `smoke-container.test.ts` (retrieval failure, retain
 270s logical completion, cleanup and zero-exit overflow rejection), and `cli.docker.test.ts`
 (the complete container workflow).
 
-### 2.11 Admission boundaries through diagnostics and asynchronous parsing (current)
+### 2.12 Admission boundaries through diagnostics and asynchronous parsing (current)
 
 Admission regressions MUST exercise the actual built CLI formatting path, in text
 and JSON modes, rather than stopping at scanner results. An oversized monitor

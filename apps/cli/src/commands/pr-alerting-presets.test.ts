@@ -384,27 +384,23 @@ const hasJq = (() => {
   }
 })();
 
-// `describe.skipIf(!hasJq)` would silently report this entire suite as
-// SKIPPED rather than FAILED if a CI runner ever lost its `jq` install —
-// the one environment where that must be loud. Instead the suite always
-// registers; when `jq` is missing, it registers a single test that only
-// throws when `process.env.CI` is set (so a jq-less local machine still
-// gets a quiet, explicit pass rather than a spurious failure) and returns
-// before registering the real jq-dependent tests, which would otherwise
-// fail with a much less legible "jq: command not found" per test.
+// Local contributors may omit jq, but that loss of real reduction coverage
+// must be a reported skip. CI requires the facility and fails explicitly.
 describe('the presets’ jq reduction over raw gh output', () => {
   if (!hasJq) {
-    it('requires jq to be installed', () => {
-      if (process.env.CI) {
-        throw new Error(
-          'jq was not found on PATH. This suite must run for real in CI ' +
-            '(the ubuntu-latest runner ships jq) — check the runner image ' +
-            'or install step rather than silently skipping this coverage.',
-        );
-      }
-      // Not CI: no jq on a contributor's machine is expected; this test
-      // passing (without exercising real jq) is the intended no-op.
-    });
+    const missingJqTest = process.env.CI ? it : it.skip;
+    missingJqTest(
+      'jq preset reductions omitted: install jq to exercise real reductions',
+      () => {
+        if (process.env.CI) {
+          throw new Error(
+            'jq was not found on PATH. This suite must run for real in CI ' +
+              '(the ubuntu-latest runner ships jq) — check the runner image ' +
+              'or install step rather than silently skipping this coverage.',
+          );
+        }
+      },
+    );
     return;
   }
 

@@ -1731,6 +1731,16 @@ Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
   (An unreachable daemon is **not** itself a stage failure: the CLI falls back to an in-process read
   of the persisted store — see the no-daemon fallback below.)
 
+For an `errored` observation with a nonempty string `observationData.error`, the observation
+stage is `failure` with reason `Source observation failed: <displayed error>` and the existing
+observation data in `details`. Reasons strip VT escape sequences and C0/DEL/C1 controls, collapse
+whitespace to a single line, and cap the error at 512 Unicode code points including a trailing
+`...` when truncated. Missing/empty/non-string errors retain the generic errored-stage reason.
+This is a read-only display transformation: `details`, history JSON and stored audit bytes remain
+unchanged. The existing verdict severity ordering still applies; another failure may win the
+verdict without removing this observation-stage diagnostic. Verified: `source-error-state.test.ts`
+and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
+
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
 materialization stage filters `monitor_events` to `workspacePath` (plus workspace-agnostic events)
@@ -2100,6 +2110,14 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
     `emittedEventIds` reflects only durably committed events.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
+
+  An unavailable `incoming-changes` repository/ref uses this existing source-error path (003 §6.5,
+  decision #555, Refs #305). Source state, notify state and `lastObservationAt` remain unchanged,
+  including across reopening the store. Once due, rejection is retried on each daemon tick;
+  ordinary debounce/rollup dispatch in that monitor's due-ingest path waits for observation to
+  succeed. These are current error-path consequences, not a guarantee that accepted held work
+  can wait indefinitely: #558 tracks held-work flushing and #559 tracks retry cost separately.
+  Other monitors continue, and already-materialized events remain deliverable.
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
