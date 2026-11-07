@@ -1729,6 +1729,9 @@ Verified: `libs/core/src/adapter/claude.ts` — `safeSessionPathSegment()` (line
 > tick. It is project-local (rooted at the workspace, not the user's data dir), so it is a
 > `.gitignore` concern like `.claude/*.local.*`: `agentmonitors init` (bare or `--enable-only`)
 > ensures `.gitignore` ignores both (`apps/cli/src/commands/init.ts` — `ensureGitignore()`).
+> Prettier reads `.gitignore` by default, so that line also keeps these files out of a project's
+> format check. Prettier reads only the `.gitignore` in the directory it runs from, so a format
+> check run from above a nested workspace needs its own rule.
 
 ### 11.4 Hook-state materialization
 
