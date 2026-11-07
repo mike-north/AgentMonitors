@@ -352,7 +352,7 @@ so `invalid`/`errors` already reflect the duplicate without requiring a consumer
 
 1. Parses all `MONITOR.md` files via `scanMonitors()` from `@agentmonitors/core` (parse errors are included in `errors`).
 2. Checks each monitor's `watch.type` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
-3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
+3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateWatchScope` helper (wrapping `validateScope`) — types, enums, `required`, `items`, and other keywords, plus actionable collection-strategy and timezone diagnostics.
 4. Rejects duplicate monitor IDs within the scanned tree (see [001 §4](./001-monitor-definition.md)).
 5. If a parse failure appears to use the pre-migration top-level `source:` + `scope:` shape, appends a hint to rewrite it as `watch: { type, ... }`.
 
@@ -512,6 +512,19 @@ All transition subcommands (`ack`, `start`, `complete`, `fail`, `archive`) print
 ### Purpose
 
 Reads a single `MONITOR.md` file, resolves its source, and runs a live observation cycle to verify configuration without writing to the database. For stateful sources (`source.stateful === true`), automatically runs a second observation after 100 ms to demonstrate change detection.
+
+### Source configuration validation
+
+Before calling `source.observe()`, validates `watch` minus `type` through the same
+`validateWatchScope` helper as `validate` (§3). Invalid source configuration exits 1 before any
+source network request or command execution. Rejection details match `validate`; the command adds
+an `Invalid monitor scope: ` prefix. Text errors go only to stderr as `Error: <message>`; JSON errors
+go only to stdout as `{ "error": "<message>" }`. `validate` retains its stdout summary/error-list
+contract in both formats.
+
+**Verified in:** `apps/cli/src/commands/monitor-scope-parity.integration.test.ts` —
+`monitor test / validate scope parity` covers identical invalid scopes in both formats and checks
+HTTP/file sentinels before `monitor test` error-output assertions, with valid source controls.
 
 ### Usage
 

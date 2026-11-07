@@ -372,7 +372,8 @@ carries commitments (#504's verification-gate expectations):
   what CI enforces; a suite that runs only in CI (or only locally) is drift
   ([#458](https://github.com/mike-north/AgentMonitors/issues/458)). Files that exist only
   because a tool is running on this machine are drift too: `.agentmonitors/` runtime state
-  ([002](./002-runtime-delivery.md) §11.3) MUST NOT reach a workspace check.
+  ([002](./002-runtime-delivery.md) §11.3) and the worktrees nested under `.claude/worktrees/`
+  MUST NOT reach a workspace check.
 - **No masked flakes.** Retry budgets absorb the environment, never hide defects: a test
   that consumes its full retry budget on every run is a defect
   ([#452](https://github.com/mike-north/AgentMonitors/issues/452)), and a nondeterministic
@@ -388,7 +389,9 @@ carries commitments (#504's verification-gate expectations):
 **Test implications (executable, not historical):** a gate-parity check asserting the CI
 workflow's test commands are derivable from the workspace scripts (#458's acceptance bar); a
 guard asking git and Prettier whether the adapter's hook-state path is ignored, which fails in CI
-even though CI never has such a file (`scripts/runtime-state-ignored.test.ts`); a retry-budget assertion that the guarded suite passes with retries disabled (`--retry=0`) so a
+even though CI never has such a file (`scripts/runtime-state-ignored.test.ts`); a guard asking git,
+Prettier and ESLint the same about a nested worktree path (`scripts/nested-worktrees-ignored.test.ts`);
+a retry-budget assertion that the guarded suite passes with retries disabled (`--retry=0`) so a
 budget-exhausting test fails loudly instead of masking (#452); a suite-teardown guard
 asserting `PATH` (and equivalent mutated global state) is restored even when a test times out
 (#477); and a forced-failure test per instrumented subprocess harness asserting its
