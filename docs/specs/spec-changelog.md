@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-07 — Build core before API-source-backed tests (004 §2.9) — Refs #554
+
+The core Nx test target declares both dependency builds and its own build because its runtime
+regression suite imports the real API source, which resolves core runtime values through compiled
+package exports. Require a cold uncached first-attempt pass, an own-build-edge-only reversion that
+reproduces the package-entry module-load failure, and an exact-restored cold pass. Direct Vitest
+still requires a prior build; no build moves into tests. Production/test source, module resolution,
+public API, preflight behavior and the accepted #561/#562 boundaries remain unchanged.
+
 ## 2026-11-05 — Isolate source validator exceptions (002 §2.0, 004 §2.2/§2.5) — Refs #554
 
 Validate plugin-owned schemas on a private copy so frozen valid schemas remain

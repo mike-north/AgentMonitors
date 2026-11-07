@@ -222,6 +222,16 @@ status, signal and output rather than vitest's bare timeout.
 Running a CLI test file directly with vitest bypasses the Nx dependency and executes whatever bundle
 already exists; build first, or use `pnpm nx test @agentmonitors/cli`.
 
+**Current, normative:** the core test target declares its own `build` alongside dependency
+builds. Its runtime regression suite imports the real API source, whose runtime package imports
+resolve to core's compiled exports. `pnpm nx test @agentmonitors/core` therefore MUST build core
+before running tests, including when core's `dist` is absent and caching is disabled. The
+`object-event-suppressions` suite must pass all 14 existing cases on its first attempt. Removing
+only the own-build prerequisite under the same cold conditions must expose the package-entry
+module-load failure; restoring it must restore the cold pass. Direct Vitest invocation bypasses
+this prerequisite and requires a prior core build. Tests MUST NOT start builds themselves; the
+source/test module graph remains unchanged.
+
 **Current, normative:** the `source-incoming-changes` test target also declares its own `build`
 alongside dependency builds. Its revision-expression tests execute both TypeScript source and
 `dist/index.js`, so `pnpm nx test @agentmonitors/source-incoming-changes` MUST build core, then
