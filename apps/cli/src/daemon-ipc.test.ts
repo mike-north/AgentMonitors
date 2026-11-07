@@ -253,6 +253,45 @@ describe('callDaemon', () => {
 // createDaemonServer: one bad request must not crash the daemon (issue #292)
 // ---------------------------------------------------------------------------
 describe('createDaemonServer — request-handling resilience', () => {
+  it('uses only an own envelope id when reporting admission rejection', async () => {
+    const socketPath = tempSocketPath('own-id');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    const parse = JSON.parse;
+    // Simulate an inherited id without changing any global object prototype.
+    const decoded = {
+      method: 'ping',
+      params: { ignored: Array(1001).fill(null) },
+    };
+    Object.setPrototypeOf(decoded, { id: 'inherited' });
+    await server.listen();
+    const parser = vi.spyOn(JSON, 'parse').mockReturnValueOnce(decoded);
+    try {
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let response = '';
+        socket.setEncoding('utf8');
+        socket.on('connect', () => socket.end('parent-id-probe\n'));
+        socket.on('data', (chunk: string) => {
+          response += chunk;
+        });
+        socket.on('end', () => resolve(response));
+        socket.on('error', reject);
+      });
+      parser.mockRestore();
+      expect(parse(raw)).toMatchObject({
+        id: 'invalid',
+        code: 'INPUT_LIMIT_EXCEEDED',
+      });
+      expect(await daemonAvailable(socketPath)).toBe(true);
+    } finally {
+      parser.mockRestore();
+      await server.close();
+    }
+  });
+
   it('answers an error response and stays alive when a request fails synchronous param validation', async () => {
     const socketPath = tempSocketPath('bad-params');
     const server = createDaemonServer({
