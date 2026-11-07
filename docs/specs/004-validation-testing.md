@@ -96,6 +96,8 @@ indirection under a real global install.
 wired into CI per-PR). The MCP/channel transport ([006 §4](./006-agent-integration.md)) has no
 equivalent fresh-environment proof yet — tracked as a follow-up, not this surface's scope.
 
+The packed Windows install check invokes package-manager JavaScript entrypoints through Node without a shell. Packing MUST use pnpm, including when the parent script was launched by npm: pnpm owns rewriting `workspace:` dependencies into installable versions. pnpm discovery MUST recognize `.cjs`, `.js`, and `.mjs` launchers in both official Node and adjacent PATH package installations, including under an npm launcher. npm installation MUST support JavaScript entrypoints discovered from PATH installations separate from Node as well as the official Node layout. Named Corepack `dist/pnpm.js` and `dist/npm.js` proxies are supported without substituting another manager. Every physical installation candidate, including official and adjacent layouts, MUST identify the requested manager; a mismatch continues discovery rather than masking a later valid installation. POSIX discovery uses exactly `PATH`; explicit empty components (including an empty `PATH`) mean discovery-time cwd, while an unset `PATH` does not imply cwd. Windows also accepts case variants such as `Path` and retains its existing empty-component behavior. Unusable PATH directories must not prevent discovery through later valid entries. Resolved JavaScript launcher paths MUST be absolute physical identities anchored at discovery time so changing a subprocess working directory preserves the selected file. Filesystem symlink traversal MUST be preserved: resolve existing directories before joining candidates, and use native physical canonicalization rather than lexically collapsing symlink/`..` paths. Physical PATH test controls use owned non-JS POSIX shell executables with explicit output and decoy failures, avoiding host utility alias restrictions. Command shims are never passed to a shell. Its isolated temporary root includes spaces so packing and installation exercise literal path arguments on every platform. `scripts/package-manager-compatibility.test.ts` verifies real workspace packing and a real npm subprocess in a separate installation on POSIX. Version probes substituted for installation MUST retain the installation working directory and environment so Corepack project selection reflects the real install context. Its fixture tools also use PATH-aware discovery and retain the POSIX pnpm executable fallback when no JavaScript launcher is discoverable; `scripts/package-manager-fixture.test.ts` executes that actual suite with Node isolated from npm to prevent fixture assumptions from hiding supported layouts. Windows CI verifies the native Windows path.
+
 ### 2.8 Suite-discovery integrity (zero-test guard)
 
 A package-level test suite is only useful evidence if it can fail. Every test-bearing package's
@@ -146,6 +148,30 @@ per-PR), and `apps/agentmonitors/test/launcher.test.ts` (forced crash and hang c
 evidence renders and the subprocess bound stays inside the test budget). The evidence that first
 exposed the race is in
 [`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
+
+### 2.10 Docker smoke diagnostic capture (current)
+
+The Docker smoke fixture MUST allow a successful install/build phase emitting more than 20 MiB
+while preserving the caller's literal success markers. Phase volume is written to container-local
+logs; the outer combined 20 MiB capture limit remains a failure boundary for runaway outer output,
+including a zero exit with all markers. Named ordinary failures MUST include recent phase and daemon
+evidence with byte-bounded tails, including single-line logs.
+
+During active work, a bounded periodic stream MUST retain recent phase/daemon evidence before forced
+removal when diagnostic retrieval fails. This samples history rather than preserving every byte:
+output after the last sample can be lost on SIGKILL. Current sampling emits at most 240 one-second
+snapshots of two 8 KiB tails, plus final phase/failure tails. Container-local full logs are temporary
+and can grow with command output; this is an outer-capture bound, not a disk quota.
+
+The unchanged 300s caller budget includes 210.5s execution, 59.5s logical retrieval/cleanup, and a 30s
+reporting reserve. Tests MUST retain pre-creation client termination, late removal retries, and
+reason-specific failure reporting. These bounds assume ordinary OS scheduling and client reaping;
+they do not establish repeated-CI reliability or protection from arbitrary Docker/server stalls.
+
+**Verified in:** `apps/cli/src/commands/smoke-shell.test.ts` (21 MiB success, ordinary failure,
+abrupt active termination), `smoke-container.test.ts` (retrieval failure, retained diagnostics,
+270s logical completion, cleanup and zero-exit overflow rejection), and `cli.docker.test.ts`
+(the complete container workflow).
 
 ## 3. Required Test Scenarios
 
@@ -266,6 +292,17 @@ adjacent and truncated windows, retained settling evidence and manual-mode/expli
 that waits for its durable `triggered` history row before returning; verification must still succeed.
 Run the daemon suite serially with retries disabled when accepting this boundary repair. This proves
 the deterministic recording-order defect and repair, not that every historical CI failure had that cause.
+
+### 3.5.2 Literal-path verify cleanup and first-attempt acceptance
+
+The literal-glob integration scenario must prove that verify removes the file it created and its
+create/delete events, then materializes the user's later file contents for the existing lead session.
+The same event identity must survive at least two subsequent completed observations. A filename
+substring or a fixed sleep cannot establish those durable-state guarantees on a loaded daemon.
+
+Acceptance for #452 runs the entire verification integration file repeatedly with retries disabled,
+including bounded CPU contention whose workers are reaped afterward. Failed verification assertions
+include the command report; the literal-path assertion also includes retained observation history.
 
 ### 3.6 PR-alerting presets (`init --type pr-review` / `--type my-prs`, issue #444)
 
