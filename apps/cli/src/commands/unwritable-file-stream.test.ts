@@ -53,27 +53,35 @@ describe('openUnwritableFileStream (stale-descriptor double close, issue #548)',
   });
 
   it('dispose closes the descriptor exactly once, successfully, before it resolves', async () => {
-    // A second close of the number reports EBADF, or succeeds against whatever
-    // reused it; recording the results catches the former deterministically.
+    const { stream, fd, dispose } = openUnwritableFileStream();
+    // Count attempts for this owned descriptor before delegating: the first
+    // completion can resolve dispose while a duplicate callback is still pending.
+    // Successful completion alone therefore cannot prove exactly-once ownership.
+    const closeAttempts: number[] = [];
     const closeResults: (NodeJS.ErrnoException | null)[] = [];
     const realClose = fs.close;
     vi.spyOn(fs, 'close').mockImplementation(((
-      fd: number,
+      closingFd: number,
       callback: (error: NodeJS.ErrnoException | null) => void,
     ) => {
-      realClose(fd, (error) => {
-        closeResults.push(error);
+      if (closingFd === fd) {
+        closeAttempts.push(closingFd);
+      }
+      realClose(closingFd, (error) => {
+        if (closingFd === fd) {
+          closeResults.push(error);
+        }
         callback(error);
       });
     }) as typeof fs.close);
 
-    const { stream, dispose } = openUnwritableFileStream();
     try {
       await failWrite(stream);
     } finally {
       await dispose();
     }
 
+    expect(closeAttempts).toEqual([fd]);
     expect(closeResults).toEqual([null]);
   });
 });
