@@ -30,7 +30,7 @@ The repository currently exposes several different validation surfaces. They do 
 
 The `validate` command proves: the monitor directory exists; monitor files parse; monitor IDs are unique within the tree (see [001 §4](./001-monitor-definition.md)); the selected source name is known; and each monitor's watch config (the `watch` block minus `type`) is **fully valid** against its source's `scopeSchema`.
 
-**Verified implementation detail (current):** source config validation runs full JSON Schema (draft-07) checks — types, enums, `required`, `items`, and other keywords — via the exported core helper `validateScope(scope, scopeSchema)` (`libs/core/src/schema/validate-scope.ts`), which `apps/cli/src/commands/validate.ts` calls after extracting `watch` minus `type`. A monitor with `watch: { type: file-fingerprint, globs: 42 }` is now **rejected** (validate exits non-zero) because `globs` must be an array of strings.
+**Verified implementation detail (current):** source config validation runs full JSON Schema (draft-07) checks — types, enums, `required`, `items`, and other keywords — via the exported core helper `validateWatchScope(scope, scopeSchema)` (`libs/core/src/schema/validate-scope.ts`), which wraps `validateScope` with actionable collection-strategy and timezone diagnostics. Both `validate` and `monitor test` call it after extracting `watch` minus `type`. A monitor with `watch: { type: file-fingerprint, globs: 42 }` is now **rejected** (validate exits non-zero) because `globs` must be an array of strings.
 
 When parse-time validation sees the old top-level `source:` + `scope:` shape, `validate` keeps the parse error but appends a targeted hint to move those fields into `watch: { type, ... }`.
 
@@ -53,6 +53,10 @@ The schema-generation path proves that the source registry can produce a combine
 **Verified in:** `libs/core/src/observation/schema-generator.ts` — `generateMonitorSchema()` produces a JSON Schema draft-07 document with `if/then` conditionals per source, a `source` enum drawn from registered source names, `urgency` constrained to `['low', 'normal', 'high']`, and a `notify` `oneOf` covering `debounce` and `throttle` strategies.
 
 ### 2.4 `agentmonitors monitor test`
+
+Before any source observation, `monitor test` applies the same `validateWatchScope` check as `validate`. Invalid scopes exit 1 with identical rejection details inside each command's existing output envelope: `monitor test` uses stderr in text mode and stdout `{ "error": "..." }` in JSON mode; `validate` reports invalid monitors on stdout in both formats.
+
+**Verified in:** `apps/cli/src/commands/monitor-scope-parity.integration.test.ts` — `monitor test / validate scope parity` runs identical monitor files through both commands in text and JSON modes for invalid enums, unknown properties, wrong types, missing required fields, nested collection items/required fields, collection-strategy constraints, and nested composite parts. Real HTTP and command/file sentinels must remain untouched for rejected scopes; valid controls prove both sentinels detect source execution.
 
 `monitor test` is a source exerciser, not a proof of long-running runtime correctness. For stateful sources, it proves: the source can establish a baseline; a follow-up observe call can run without losing state inside the command. It does **not** prove that a real change occurred during that command invocation.
 
@@ -91,6 +95,8 @@ indirection under a real global install.
 **Verified in:** `scripts/test-e2e-fresh-install-hooks.mjs` (`pnpm test:e2e-fresh-install-hooks`,
 wired into CI per-PR). The MCP/channel transport ([006 §4](./006-agent-integration.md)) has no
 equivalent fresh-environment proof yet — tracked as a follow-up, not this surface's scope.
+
+The packed Windows install check invokes package-manager JavaScript entrypoints through Node without a shell. Packing MUST use pnpm, including when the parent script was launched by npm: pnpm owns rewriting `workspace:` dependencies into installable versions. pnpm discovery MUST recognize `.cjs`, `.js`, and `.mjs` launchers in both official Node and adjacent PATH package installations, including under an npm launcher. npm installation MUST support JavaScript entrypoints discovered from PATH installations separate from Node as well as the official Node layout. Named Corepack `dist/pnpm.js` and `dist/npm.js` proxies are supported without substituting another manager. Every physical installation candidate, including official and adjacent layouts, MUST identify the requested manager; a mismatch continues discovery rather than masking a later valid installation. POSIX discovery uses exactly `PATH`; explicit empty components (including an empty `PATH`) mean discovery-time cwd, while an unset `PATH` does not imply cwd. Windows also accepts case variants such as `Path` and retains its existing empty-component behavior. Unusable PATH directories must not prevent discovery through later valid entries. Resolved JavaScript launcher paths MUST be absolute physical identities anchored at discovery time so changing a subprocess working directory preserves the selected file. Filesystem symlink traversal MUST be preserved: resolve existing directories before joining candidates, and use native physical canonicalization rather than lexically collapsing symlink/`..` paths. Physical PATH test controls use owned non-JS POSIX shell executables with explicit output and decoy failures, avoiding host utility alias restrictions. Command shims are never passed to a shell. Its isolated temporary root includes spaces so packing and installation exercise literal path arguments on every platform. `scripts/package-manager-compatibility.test.ts` verifies real workspace packing and a real npm subprocess in a separate installation on POSIX. Version probes substituted for installation MUST retain the installation working directory and environment so Corepack project selection reflects the real install context. Its fixture tools also use PATH-aware discovery and retain the POSIX pnpm executable fallback when no JavaScript launcher is discoverable; `scripts/package-manager-fixture.test.ts` executes that actual suite with Node isolated from npm to prevent fixture assumptions from hiding supported layouts. Windows CI verifies the native Windows path.
 
 ### 2.8 Suite-discovery integrity (zero-test guard)
 
@@ -142,6 +148,49 @@ per-PR), and `apps/agentmonitors/test/launcher.test.ts` (forced crash and hang c
 evidence renders and the subprocess bound stays inside the test budget). The evidence that first
 exposed the race is in
 [`docs/work-records/2026-11-03-launcher-first-attempt-acceptance.md`](../work-records/2026-11-03-launcher-first-attempt-acceptance.md).
+
+### 2.10 Docker smoke diagnostic capture (current)
+
+The Docker smoke fixture MUST allow a successful install/build phase emitting more than 20 MiB
+while preserving the caller's literal success markers. Phase volume is written to container-local
+logs; the outer combined 20 MiB capture limit remains a failure boundary for runaway outer output,
+including a zero exit with all markers. Named ordinary failures MUST include recent phase and daemon
+evidence with byte-bounded tails, including single-line logs.
+
+During active work, a bounded periodic stream MUST retain recent phase/daemon evidence before forced
+removal when diagnostic retrieval fails. This samples history rather than preserving every byte:
+output after the last sample can be lost on SIGKILL. Current sampling emits at most 240 one-second
+snapshots of two 8 KiB tails, plus final phase/failure tails. Container-local full logs are temporary
+and can grow with command output; this is an outer-capture bound, not a disk quota.
+
+The unchanged 300s caller budget includes 210.5s execution, 59.5s logical retrieval/cleanup, and a 30s
+reporting reserve. Tests MUST retain pre-creation client termination, late removal retries, and
+reason-specific failure reporting. These bounds assume ordinary OS scheduling and client reaping;
+they do not establish repeated-CI reliability or protection from arbitrary Docker/server stalls.
+
+**Verified in:** `apps/cli/src/commands/smoke-shell.test.ts` (21 MiB success, ordinary failure,
+abrupt active termination), `smoke-container.test.ts` (retrieval failure, retained diagnostics,
+270s logical completion, cleanup and zero-exit overflow rejection), and `cli.docker.test.ts`
+(the complete container workflow).
+
+### 2.11 Admission boundaries through diagnostics and asynchronous parsing (current)
+
+Admission regressions MUST exercise the actual built CLI formatting path, in text
+and JSON modes, rather than stopping at scanner results. An oversized monitor
+must not be reopened for migration advice. Optional hint reads must stay bounded
+when an ordinary invalid file grows or is replaced after discovery; assertions
+cover MAX+1 bytes, descriptor closure, valid siblings, exact boundaries, and the
+positive legacy source/scope hint.
+
+Exported collection schemas MUST reject raw non-arrays consistently in sync and
+async parsing. A Promise resolving to a valid or oversized array is not another
+input format. Tests cover direct Shape and frontmatter fields, thenable controls,
+array type versus admission diagnostics, and zero element visits or CEL compilation
+for rejected inputs. Synchronous probes must not leave unhandled rejections.
+
+Verified in `apps/cli/src/commands/validate-admission.test.ts` and
+`libs/core/src/schema/input-limits.test.ts`. Tests consume prebuilt artifacts under
+§2.9; narrow repair reversions must reproduce each admission failure independently.
 
 ## 3. Required Test Scenarios
 
@@ -246,6 +295,7 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | `events list/ack` round-trips through daemon runtime behavior, including `deliveryState` tracking unread -> claimed -> acknowledged (issue #338 item 1)                            | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "opens a session, detects file changes through the daemon, claims a hook delivery, and acknowledges events"; `libs/core/src/runtime/service.test.ts` — "reports deliveryState on session-scoped listEvents, tracking unread -> claimed -> acknowledged")                                                                                                                                                                                                                                                                                                                   |
 | `session open --format id` prints the bare session id (issue #338 item 4)                                                                                                          | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "prints only the bare session id, matching the id from --format json")                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `hook claim` returns lifecycle-appropriate payloads                                                                                                                                | Covered (`apps/cli/src/commands/cli.integration.test.ts` — `hook claim --lifecycle turn-interruptible` in the runtime flow test; `libs/core/src/runtime/service.test.ts` — various `claimDelivery` lifecycle tests)                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `monitor test` / `validate` scope rejection parity before source side effects                                                                                                      | Covered (`apps/cli/src/commands/monitor-scope-parity.integration.test.ts` — `monitor test / validate scope parity`, text/JSON matrix and live sentinel controls)                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `monitor test` stateful baseline flow                                                                                                                                              | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "tests a valid file-fingerprint monitor"; `apps/cli/src/commands/monitor-test.test.ts` — "preserves previousState and refreshes now")                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `monitor test` errors on missing or unparseable file                                                                                                                               | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "errors on missing file", "errors on invalid MONITOR.md content")                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `inbox list` argument validation                                                                                                                                                   | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "rejects invalid --state value", "rejects invalid --urgency value", "rejects invalid --since date")                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -339,8 +389,8 @@ When sources disagree, the spec process MUST NOT silently average them together.
 - `low` urgency is real and MUST be treated as first-class. The schema generator correctly includes it in the `urgency` enum (`schema-generator.ts` line 31). The `monitor-schema.test.ts` "accepts all urgency values" test currently omits `low` from its loop — this is a test gap, not an implementation gap.
 - The runtime/session event pipeline is the primary delivery path.
 - The inbox item lifecycle is separate from the event pipeline, not merely another view of the same data.
-- Duplicate monitor IDs are a correctness hazard even though explicit rejection is not yet implemented at scan or validate time.
-- Source-specific validation is only partially enforced by the current `validate` command: required field presence is checked but full JSON Schema validation (type checking, format constraints, enum values within scope) is not yet enforced. This limitation is intentional current behavior.
+- Duplicate monitor IDs are a correctness hazard: `scanMonitors()` reports collisions, and `validate` rejects duplicate IDs within the scanned tree (§2.2).
+- Source-specific validation is fully enforced by `validate` against each source's `scopeSchema` using draft-07 JSON Schema checks, including types, enums, required fields, and nested items. Both `validate` and `monitor test` use `validateWatchScope` for the same rejection details; `monitor test` rejects invalid scopes before source observation (§2.2/§2.4).
 
 ### 5.2 Evidence priority during this transition
 

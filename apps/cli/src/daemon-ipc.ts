@@ -1,3 +1,4 @@
+/** Local daemon transport: bounded request admission, dispatch, and connection lifecycle. */
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
@@ -30,6 +31,11 @@ import type {
   Urgency,
 } from '@agentmonitors/core';
 import { z } from 'zod';
+import {
+  INPUT_LIMIT_ERROR_CODE,
+  MAX_DAEMON_REQUEST_BYTES,
+  requestInputLimitViolation,
+} from './input-limits.js';
 import { resolveDbPath } from './db-path.js';
 import { resolveDataRoot } from './workspace-paths.js';
 
@@ -970,30 +976,78 @@ export function createDaemonServer({
 
   let serverClosed = false;
   const server = net.createServer((socket) => {
-    let buffer = '';
-    socket.setEncoding('utf-8');
+    let buffer = Buffer.alloc(0);
+    let byteLength = 0;
+    // One connection admits one request, even when more frames arrive while
+    // asynchronous dispatch is in flight. Rejection cannot dispatch a suffix.
+    let admitted = false;
 
     const respond = (payload: DaemonResponse) => {
+      admitted = true;
+      buffer = Buffer.alloc(0);
       socket.end(`${JSON.stringify(payload)}\n`);
     };
 
-    socket.on('data', (chunk) => {
-      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
-      const newline = buffer.indexOf('\n');
+    // A peer may disconnect after rejection. Its reset is connection-local,
+    // never an uncaught error that terminates unrelated sessions' daemon.
+    socket.on('error', () => {
+      admitted = true;
+      buffer = Buffer.alloc(0);
+    });
+    socket.on('data', (chunk: Buffer) => {
+      if (admitted) {
+        return;
+      }
+      const newline = chunk.indexOf(0x0a);
+      const part = newline === -1 ? chunk : chunk.subarray(0, newline);
+      if (byteLength + part.length > MAX_DAEMON_REQUEST_BYTES) {
+        respond({
+          id: UNPARSEABLE_REQUEST_ID,
+          code: INPUT_LIMIT_ERROR_CODE,
+          error: `Request must be at most ${String(MAX_DAEMON_REQUEST_BYTES)} bytes`,
+        });
+        return;
+      }
+      // Grow a single bounded allocation. Retaining one Buffer per chunk
+      // would let tiny fragments amplify memory beyond the byte budget.
+      const needed = byteLength + part.length;
+      if (needed > buffer.length) {
+        const capacity = Math.min(
+          MAX_DAEMON_REQUEST_BYTES,
+          Math.max(needed, buffer.length * 2, 4096),
+        );
+        const grown = Buffer.allocUnsafe(capacity);
+        buffer.copy(grown, 0, 0, byteLength);
+        buffer = grown;
+      }
+      part.copy(buffer, byteLength);
+      byteLength = needed;
       if (newline === -1) return;
-
-      const raw = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
+      admitted = true;
+      const raw = buffer.subarray(0, byteLength).toString('utf8');
+      buffer = Buffer.alloc(0);
 
       let request: DaemonRequest;
       try {
-        request = daemonRequestSchema.parse(JSON.parse(raw));
+        const decoded: unknown = JSON.parse(raw);
+        const violation = requestInputLimitViolation(decoded);
+        if (violation) {
+          const id =
+            decoded !== null &&
+            typeof decoded === 'object' &&
+            // Only the sender's own id can correlate an admission response.
+            Object.hasOwn(decoded, 'id') &&
+            'id' in decoded &&
+            typeof decoded.id === 'string'
+              ? decoded.id
+              : UNPARSEABLE_REQUEST_ID;
+          respond({ id, code: INPUT_LIMIT_ERROR_CODE, error: violation });
+          return;
+        }
+        request = daemonRequestSchema.parse(decoded);
       } catch {
-        // `error` stays byte-for-byte the legacy text (see
-        // `LEGACY_UNPARSEABLE_REQUEST_MESSAGE`) so an old client sees the same
-        // message as before; `code` is purely additive — an old client's
-        // `daemonResponseSchema` ignores an unrecognized field, so this never
-        // breaks it (issue #382).
+        // Preserve legacy invalid-request diagnostics for existing clients;
+        // admission failures above have their own stable machine code.
         respond({
           id: UNPARSEABLE_REQUEST_ID,
           error: LEGACY_UNPARSEABLE_REQUEST_MESSAGE,
