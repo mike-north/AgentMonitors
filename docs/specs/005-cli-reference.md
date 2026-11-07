@@ -2255,7 +2255,9 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
      whole extra interval + settle cycle and ran ~2× as long as plain `verify` while still showing
      plain `verify`'s ETA — reading as a hang and overrunning default 2-minute timeouts). Instead the
      daemon's tick **sweeps** the pending `File deleted: …/agentmonitors-verify-…` on the very tick it
-     materializes — before any later session can observe it. The sweep deletes **by object key**,
+     materializes while its suppression is active, before a later session can claim it.
+     This is finite-window protection, subject to the known recovery/discovery gaps below.
+     The sweep deletes **by object key**,
      which is safe **only** because the key is synthetic, so it can never touch a real event at a
      genuine path. The tombstone's TTL is derived from the monitor's own detect budget
      (`detect + interval + settle`, min 60s).
@@ -2276,8 +2278,9 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    scoped to the sessions that actually received it (never another session's baseline for the same
    path).
 
-   **Interruption-safety (issue #414).** An interrupted `--use-workspace-daemon` run leaves **no
-   permanent stray state**: (a) on `SIGINT`/`SIGTERM` (e.g. a command/CI timeout) verify's signal
+   **Interruption cleanup (current mechanism; issue #414).** The intended goal is that
+   verification scratch events never reach a later session. The current mechanism is bounded,
+   with the recovery/discovery gaps noted below: (a) on `SIGINT`/`SIGTERM` (e.g. a command/CI timeout) verify's signal
    handler runs the same object-appropriate cleanup best-effort — reverts the file, then tombstones
    (synthetic key) or id-retracts (real created file), and ends the throwaway verify session — before
    exiting; (b) even on an uncatchable kill (`SIGKILL`/crash) that leaves an `active` verify session
@@ -2285,9 +2288,26 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    `agentmonitors-verify-*` session to dormant, tombstones and retracts its scratch objects too (only
    the synthetic scratch keys the session projected — matched by the well-known basename). That
    backstop's tombstone TTL is derived from the object's **own monitor cadence**
-   (`max(5min, interval + settle + margin)`) so a long-interval monitor's deletion still lands inside
-   the window. The only residual is a daemon **death** between materialization and the sweep; the
-   tombstone (or the reap backstop on the next tick) still reconciles it, so it is never permanent.
+   (`max(5min, interval + settle + margin)`) to cover one nominal observe/settle cycle
+   when cadence is safely derivable, even if unrelated source config is rejected.
+   A missing definition or unparseable cadence uses the existing five-minute floor (002 §2.0).
+   Tombstones survive daemon restart and can reconcile materialization/sweep interruption while
+   active; their durability does not remove their wall-clock expiry.
+
+   **Known current gap, until [#562](https://github.com/mike-north/AgentMonitors/issues/562):**
+   if observation/recovery is delayed beyond suppression expiry, a retained scratch fingerprint
+   or already-held scratch deletion may produce a durable event that a later lead claims. A
+   scratch create held without any projected event can escape the reaper's discovery entirely,
+   so no tombstone is installed. Thus the intended unconditional no-later-scratch-event goal
+   is not a current guarantee for these cases. Legitimate mixed-batch work and foreign workspaces
+   must remain intact; real watched paths retain their separate exact-ID cleanup boundary.
+
+   [Mike's accepted decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+   sequences #562 after #305/#537/#554. That separate repair will register durable exact ownership
+   before artifact creation, retain it without TTL until explicit retirement, and leave source
+   contracts unchanged. #557 proceeds after its introduced shorter-window regression and these
+   documentation corrections; it need not wait for that repair. This annotation preserves the
+   no-leak goal and records the current limit rather than claiming the repair has shipped.
 
 If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
 daemon's captured output — never an ambiguous empty result.

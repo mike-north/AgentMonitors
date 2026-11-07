@@ -9,6 +9,74 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-07 — Build core before API-source-backed tests (004 §2.9) — Refs #554
+
+The core Nx test target declares both dependency builds and its own build because its runtime
+regression suite imports the real API source, which resolves core runtime values through compiled
+package exports. Require a cold uncached first-attempt pass, an own-build-edge-only reversion that
+reproduces the package-entry module-load failure, and an exact-restored cold pass. Direct Vitest
+still requires a prior build; no build moves into tests. Production/test source, module resolution,
+public API, preflight behavior and the accepted #561/#562 boundaries remain unchanged.
+
+## 2026-11-05 — Isolate source validator exceptions (002 §2.0, 004 §2.2/§2.5) — Refs #554
+
+Validate plugin-owned schemas on a private copy so frozen valid schemas remain
+usable and validation cannot annotate the registered schema. Convert schema
+setup/evaluation exceptions into explicit per-monitor rejection diagnostics through
+the existing validation channels; never treat an exception as valid config or
+abort healthy siblings, tick cleanup, or hook refresh. Tests-first real-source and
+SQLite regressions cover malformed patterns, frozen schemas, ordinary controls,
+retained baseline/cursor/held notify state, and recovery after correction. Existing
+source-schema format, result types, cadence sizing and accepted #561/#562 deferral
+remain unchanged; no ownership/lifetime repair is implemented here.
+
+## 2026-11-05 — Preserve safely derivable cleanup cadence (002 §2.0, 004 §2.5) — Refs #554, #561
+
+Correct the whole-source-scope guard introduced by the early reaper fix: rejecting
+unrelated source config must not shorten valid runtime cadence protection. Derive
+only poll timing, catching duration parse failure narrowly, and preserve authored
+intervals and known defaults with existing settle/margin sizing. Missing definition
+or unparseable cadence retains the five-minute fallback. Real-source/SQLite tests
+reproduce the parent-head 665000ms-to-5m shortening and actual later-claim leak,
+then verify repair within the restored window, legitimate work and workspace
+isolation. The known finite-lifetime/held-only ownership gap is assigned to #562 by
+Mike's accepted #561 decision, which permits #557 after the introduced regression and
+truthful documentation are corrected. Separate M1 repair #562 follows #305/#537/#554:
+durable exact ownership without TTL and explicit retirement, with source contracts
+unchanged. Annotate current cleanup claims in 002/004/005 with the precise delayed
+recovery and held-only discovery gap; preserve the intended goal and historical records.
+#557 does not wait for that general repair.
+
+## 2026-11-05 — Validate early reaper cadence lookup (002 §2.0, 004 §2.5) — Refs #554
+
+Dormant verify-session cleanup precedes observation preflight. Validate the source
+scope before deriving a suppression lifetime from cadence; invalid or unavailable
+config uses the existing five-minute fallback. Preserve valid interval + settle +
+margin sizing and missing-definition behavior. Real-source regression reproduces
+the malformed-duration throw before cleanup, then proves scratch retraction and
+suppression, honest config skip, healthy sibling progress, and unchanged baseline
+and held legitimate work. No new TTL policy or broad scheduler exception handling. The initial whole-scope
+condition is superseded by the safely derivable cadence correction above.
+
+## 2026-11-05 — Doctor preserves rejected-config diagnostics (002 §2.0, 004 §2.5) — Refs #554
+
+Doctor must not schedule a scope already rejected by `validateWatchScope`. A malformed
+file-fingerprint interval previously threw from scheduling and aborted the report.
+Return the shared validation error, no due time, and healthy sibling results without
+mutating durable state. Add real bundled-source and built-CLI red-to-green regressions.
+Correct the core Changeset to minor under the established pre-1.0 incompatible-change
+policy; the skipped-result union and documented consumer migration remain unchanged.
+
+## 2026-11-05 — Source-config execution preflight (002 §2.0/§2.5, 004 §2.2/§2.5) — Refs #554
+
+Apply Mike's 2026-11-05 decision: schema-invalid configs stop observing, including
+existing configs previously allowed to run. Use the accepted `validateWatchScope`
+helper before tick scheduling/notify processing and continuous watcher startup.
+Report skips visibly with the same diagnostics as validate/explain/doctor; retain
+baseline and pending notify state across restart so a corrected config resumes.
+Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
+and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
+
 ## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
 
 The incoming-changes Nx test target requires both dependency builds and its own build because

@@ -37,6 +37,48 @@ describe('validateScope', () => {
     );
   });
 
+  it('validates a frozen source schema without modifying plugin-owned objects', () => {
+    const valueSchema = Object.freeze({ type: 'string', pattern: '^okay$' });
+    const properties = Object.freeze({ value: valueSchema });
+    const schema = Object.freeze({
+      type: 'object',
+      properties,
+      required: Object.freeze(['value']),
+    });
+    expect(validateScope({ value: 'okay' }, schema)).toEqual([]);
+    expect(validateWatchScope({ value: 42 }, schema).join('; ')).toContain(
+      'scope/value',
+    );
+    expect(Object.keys(schema)).toEqual(['type', 'properties', 'required']);
+    expect(Object.keys(valueSchema)).toEqual(['type', 'pattern']);
+  });
+
+  it('leaves a mutable source schema unchanged through repeated validation', () => {
+    const schema = {
+      type: 'object',
+      properties: { value: { type: 'string' } },
+    };
+    expect(validateScope({ value: 'okay' }, schema)).toEqual([]);
+    expect(validateScope({ value: 42 }, schema).length).toBeGreaterThan(0);
+    expect(schema).toEqual({
+      type: 'object',
+      properties: { value: { type: 'string' } },
+    });
+    expect(Reflect.ownKeys(schema)).toEqual(['type', 'properties']);
+    expect(Reflect.ownKeys(schema.properties.value)).toEqual(['type']);
+  });
+
+  it('reports malformed schema pattern failure instead of throwing or accepting scope', () => {
+    const schema = {
+      type: 'object',
+      properties: { value: { type: 'string', pattern: '[' } },
+    };
+    const errors = validateWatchScope({ value: 'okay' }, schema);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toMatch(/^Source schema validation failed: /);
+    expect(errors[0]).toContain('Invalid regular expression');
+  });
+
   it('accepts a scope with valid optional fields', () => {
     expect(
       validateScope({ globs: ['*.ts'], cwd: '/repo' }, fileFingerprintScope),
