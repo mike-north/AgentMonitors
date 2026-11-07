@@ -65,6 +65,132 @@ Runtime tests are the primary proof surface for: state persistence across runtim
 **Verified in:** `libs/core/src/runtime/service.test.ts` and
 `libs/core/src/runtime/transactional-materialization.test.ts`.
 
+#### Notify-policy-edit durability (002 §4.6)
+
+`runtime/notify-policy-edit.test.ts` MUST prove all six exits from holding strategies, effective
+same-strategy/default changes, unchanged-policy clocks, captured old/new semantics and immutable
+materialized rows. Edits reconcile before source-due/active-watcher skips without new source input.
+Invalid/missing definitions retain holds and report the reason. A blocked watcher retains its yield
+and backpressures further input/checkpoints until reconciliation succeeds.
+`runtime/notify-boundaries.test.ts` MUST exercise actual watcher-chain microtask interleavings:
+queue checkpoint/yield while admission is open, then fail the real SQLite edit drain before the
+mutation. Original holds and cursor remain unchanged, without an event prefix; recovery drains
+captured old work before the retained operation, while cancellation writes nothing. Cover a newer
+successful policy without reloading handling, and prove an accepted span's deterministic writes
+complete before Interpret can close its gate. Immediate/throttle escalation grants participate in
+policy identity; equivalent policies and prior private-key encodings retain unchanged clocks. Restart/startup drains with idle or completed
+sources MUST update actual lead hook files without tick/new observations, preserving workspace and
+session isolation and publishing no unread state before transaction commit.
+
+`runtime/notify-admission-lifetime.test.ts` MUST use concurrent public ticks and actual controlled
+source effects to fail an edit while `observe()` awaits. The completed observation must neither
+advance durable state while blocked nor prevent the tick returning for recovery; retry/startup
+admits it in order using current pacing and captured handling. Cover restart from the unchanged
+cursor, healthy sibling/workspace isolation and startup overlapping a valid poll. At the actual
+factory boundary, exercise a gate closing, cancellation and replacement with a newer initial
+definition. Repeated declare/tick/cancel, close and dormancy cycles must release cached definitions
+without deleting accepted history; live blocked watcher/poll waiters and teardown remain functional.
+
+`runtime/notify-checkpoint-teardown.test.ts` MUST block an actual unawaited source checkpoint
+with a failed SQLite edit drain, then naturally complete or fail the iterator. Closing rejects new
+calls, keeps its scoped exclusion/cache ownership while accepted writes drain, and permits recovery
+rescans without a deadlocked tick. Assert that polling/replacement reads the accepted checkpoint
+before its own baseline advancement, not a silently discarded write. Independent reopen must
+preserve the later baseline. Include abort/stop, superseded actual-write tokens, healthy foreign
+workspace/monitor scopes and completion with no queued work; no retired cache owner may delete a
+successor's slot.
+
+`runtime/notify-failed-poll-successor.test.ts` MUST schedule overlapping public ticks so a real
+SQLite ingestion failure resumes its error handler after a successor observation has started.
+The older handler must preserve that successor's admission: a third poll stays excluded and
+watcher factory/checkpoint work waits until the successor's writes finish. Assert correctly ordered
+baselines/events through full SQLite close/reopen, the original ingestion error, ordinary observe
+failure/success controls, valid later wakeups and healthy sibling/foreign-workspace progress.
+Failures before ingestion starts must still clean up their own admission and permit a later poll.
+Scheduling may complete a registered source at registry lookup; runtime/ingestion/admission methods
+must remain actual implementations.
+
+`runtime/notify-discovery-freshness.test.ts` MUST suspend an earlier monitor in public tick and
+startup discovery while a newer tick/startup adopts rollup and holds work in a second actual file.
+The older scan cannot drain that work or restore its obsolete policy even when the source is not
+due. Cover a newer failed gate, invalid/deleted definitions, legitimate return to an earlier policy,
+and independent SQLite reopen. No runtime/store/admission methods may be replaced.
+
+`runtime/notify-deferred-handoff.test.ts` MUST retain a real completed poll behind a failed SQLite
+edit drain, then recover with throwing observation/next-state/outcome getters and an actual ingestion
+failure. Every exit releases exactly the deferred-result lease, preserving a live watcher owner.
+Assert the original error and committed drain truthfully, normal success/recovery, cursor persistence,
+private-cache cleanup after deletion and full SQLite close/reopen. Existing cancellation/retirement,
+scope isolation, writer-lock, killed-process and successor-admission controls remain required.
+
+`runtime/notify-live-definition.test.ts` MUST create the first actual watcher hold **after** an
+older tick/startup captured held membership, then edit its source to an unknown name. Checkpoint
+and yield must stay blocked without cursor/baseline advancement, the error remains scoped and a
+healthy sibling progresses. No-held unknown-source errors remain fatal but close existing admission.
+Exercise flat→folder and folder→flat same-ID moves with old/new tick and startup discovery; actual
+checkpoints must use the newer admitted path without a third scan, while established handling stays
+pinned. Captured-route missing diagnostics share that protection. Reread invalid/deleted/current
+unknown-source or invalid-scope replacements, retain fatal duplicates and isolate foreign workspace
+identities. Assert actual watcher effects, recovery and full SQLite close/reopen; do not replace
+runtime/store/admission methods. Independent hold-classification/path-resolution reversions must
+reproduce their own failures while the earlier freshness/handoff controls remain green.
+It MUST also deny fallback when an admitted parent is mode 000 and read fails EACCES even though
+an existence probe returns false. Use actual POSIX permissions when supported, restoring them in
+finally before fixture cleanup. Faithful targeted filesystem read/metadata faults cover permission,
+I/O and unclassified query errors elsewhere; never replace runtime/store/admission methods. Actual
+checkpoint/yield, original holds/baseline and healthy sibling progress must remain intact until
+permission restoration and valid reconciliation. Genuine ENOENT/ENOTDIR moveback must still succeed
+without another scan, and a narrow absence-classification reversion must fail the denial cases.
+After the first denial, one and multiple **unchanged** tick/startup/captured-route discoveries MUST
+still revalidate the same denied location: actual checkpoint/yield remains unsettled, original holds
+and baseline stay unchanged, no source factory/poll bypasses it, and healthy scopes progress.
+Require actual POSIX first/repeated tick/startup pairs and faithful synchronous/asynchronous read
+fault controls. Cover a never-admitted location first blocked by unresolved source, later invalid
+edits at that location, genuine absence after a closed gate, and last-owner stop/abort cleanup.
+Current path and cache ownership must retire together; a new owner must use fresh authored handling.
+A narrow loss-of-location-on-gate-close reversion must fail these regressions while all prior
+freshness, absence, scope, duplicate, lease and checkpoint/successor controls remain meaningful.
+
+`runtime/notify-legacy-policy-identity.test.ts` MUST seed the exact older private-key-missing
+shape in an owned SQLite fixture, fully close/reopen and learn identity on an unchanged not-due
+scan while preserving guards, holds, clocks, opaque/raw baselines and event/cursor artifacts.
+Cover throttle guard-only and rollup-minute state, equivalent policies, a later known edit across
+restart, actual B delivery, identical legacy holds, failed identity writes/validation and owned
+writer refusal. Fresh scopes must retain absent previousState; keyed unchanged rows need no rewrite.
+Do not infer policy history before the first successful identity-learning scan.
+
+`runtime/notify-observe-only-startup.test.ts` MUST reconcile existing watcher/poll ownership
+before skipping a factory-less current source. Actual checkpoint/yield and cursor stay blocked on
+invalid scope or real SQLite drain failure; startup recovery commits captured old handling before
+new work under current pacing. Cover evaluating/deferred polls, no replacement factory or polling,
+healthy scoped progress, unowned ordinary state untouched and same-ID foreign ownership isolation.
+Full SQLite reopen and independent identity-learning/factory-skip reversions remain required.
+
+`runtime/notify-only-baseline.test.ts` MUST seed controlled raw legacy JSON `null` and other
+opaque source representations with a fingerprint, learn identity, then apply a not-due effective
+edit. Guard-only resets and held drains through tick/startup must preserve raw `source_state`,
+`last_fingerprint` and `last_observation_at` through full SQLite reopen. Make the next poll due
+with a clock-only SQL update, never the broad state setter, and assert the actual source receives
+the original `previousState`. Include equivalent-policy controls, real notify-update failure with
+complete materialization rollback/retry, and a narrow reversion of only the edit's notify-only
+persistence. Prior identity, startup, scoped ownership and atomic-drain controls remain required.
+
+Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
+including a later batch write and failed diagnostics. Assert full rollback of original state,
+no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart
+recovery. A stale pre-lock read in one independent process must not duplicate or overwrite another
+process's committed drain. Interpret must run after commit against each event's projected recipients.
+
+Kill evidence MUST use bounded owned child processes, actual SIGKILL before and after commit,
+awaited exit and SQLite reopen. Before commit: original holds and no partial events. After commit:
+events and no old holds. Reconciliation after reopen adds exactly the remaining events, with no
+duplicate prefix. Runtime reconstruction alone is not killed-process evidence. Test children may
+load TypeScript source using Node 24 transformation and a narrow local resolver; tests MUST NOT
+start a package build or rely on a previously built dist tree.
+
+This acceptance concerns the effective-edit transaction, not ordinary ingest/flush retry recovery
+or unchanged-policy flushing after source errors. No downstream exactly-once side effects are claimed.
+
 ### 2.6 CLI integration tests
 
 CLI integration tests are the primary proof surface for: command wiring; output shape and argument validation; round-trip behavior through the daemon/runtime interface.

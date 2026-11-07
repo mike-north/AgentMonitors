@@ -96,6 +96,7 @@ import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
 } from './retry-envelope.js';
+import { registerStoreWriter } from './store-writer.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -390,7 +391,10 @@ function scopeMatches(
 }
 
 export class RuntimeStore {
-  constructor(private readonly db: InboxDb) {}
+  /** Share this connection's writer boundary with internal runtime edit drains. */
+  constructor(private readonly db: InboxDb) {
+    registerStoreWriter(this, db);
+  }
 
   openSession(input: OpenSessionInput): AgentSessionRecord {
     const db = asInternalDb(this.db);
