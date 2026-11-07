@@ -1,5 +1,23 @@
 # @agentmonitors/source-incoming-changes
 
+## 0.3.3
+
+### Patch Changes
+
+- d6c56a3: Report unavailable incoming-changes repositories and refs as recoverable source errors instead of successful empty baselines. Resolve authored revision expressions unchanged, then verify the resolved object ID peels to a commit; reject blob paths without changing valid commit-search semantics in SHA-1 or SHA-256 repositories. Capture Git stderr and retain the last-good source state for recovery. Source consumers must now handle observation rejection for unavailable inputs through the existing error contract.
+
+  Require initial state before monitor test claims a baseline. Include source errors in history text and explain using bounded single-line display, without rewriting stored audit data. Existing source-error retry cadence and held-notification deferral remain unchanged.
+
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [65351d0]
+- Updated dependencies [57e2878]
+- Updated dependencies [f194a12]
+- Updated dependencies [d6c56a3]
+- Updated dependencies [ae08f21]
+- Updated dependencies [8ce3139]
+- Updated dependencies [7c30c92]
+  - @agentmonitors/core@0.14.0
+
 ## 0.3.2
 
 ### Patch Changes

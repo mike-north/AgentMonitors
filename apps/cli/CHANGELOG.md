@@ -1,5 +1,44 @@
 # @agentmonitors/cli
 
+## 0.11.1
+
+### Patch Changes
+
+- 65351d0: Bound monitor files to 1 MiB through shared bounded reads in direct parsing and production scans, tags to 256 entries, and derive rules to 128 before element validation. Exported collection schemas now preprocess admission, and parse errors optionally carry INPUT_LIMIT_EXCEEDED. Bound daemon requests to 1 MiB, 1000 entries per collection, 10000 values, and depth 32 before schema validation or runtime mutation. Rejected requests return a structured wire error without affecting existing sessions.
+
+  Integrate with Zod 4 while retaining native Shape rejection. Admission errors use only own envelope IDs, decoded traversal avoids copying container values, and raw-frame diagnostics describe bytes before decoding.
+
+  Keep validation hints within the monitor read budget, including files that grow or are replaced after discovery, and expose the existing bounded synchronous reader for diagnostic consumers. Reject Promise and other non-array collection declarations before async preprocessing can unwrap them; preserve raw-array admission and ordinary type diagnostics.
+
+- f194a12: Allow fresh normal and low reminder batches while older events remain claimed and unacknowledged.
+  Preserve same-band in-flight reservation holds and high-urgency settle coalescing, and update
+  suppression diagnostics to distinguish no new work from a temporary reservation.
+
+  Use the explicit `no-new-work` diagnostic for healthy claimed-only backlogs. Retain conservative
+  health warnings for legacy daemon reasons whose policy can still block future batches.
+
+- d6c56a3: Report unavailable incoming-changes repositories and refs as recoverable source errors instead of successful empty baselines. Resolve authored revision expressions unchanged, then verify the resolved object ID peels to a commit; reject blob paths without changing valid commit-search semantics in SHA-1 or SHA-256 repositories. Capture Git stderr and retain the last-good source state for recovery. Source consumers must now handle observation rejection for unavailable inputs through the existing error contract.
+
+  Require initial state before monitor test claims a baseline. Include source errors in history text and explain using bounded single-line display, without rewriting stored audit data. Existing source-error retry cadence and held-notification deferral remain unchanged.
+
+- ae08f21: Upgrade direct validation to patched Zod 4 and raise MCP SDK and TOON dependency floors. Exported schema objects now use Zod 4 schema types; parsed monitor fields and authored validation messages retain their contracts. Preserve historical Shape admission by rejecting Date (including YAML timestamps), Map, Set, and objects with callable then/catch before normalization or promise assimilation; synchronous and asynchronous validation return failures for these inputs while retaining other object controls; the exported Shape validator uses a preprocessing pipe with unchanged authored input and parsed output types. The MCP SDK v3 compatibility path and external cel-js lodash dependency remain separately documented security limitations.
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+- 16a8c53: Use observation record identities to recognize verification changes within the same persisted second and during long trigger commands. Preserve conservative negative verdicts when history is incomplete or a change is still settling.
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [65351d0]
+- Updated dependencies [57e2878]
+- Updated dependencies [f194a12]
+- Updated dependencies [d6c56a3]
+- Updated dependencies [ae08f21]
+- Updated dependencies [8ce3139]
+- Updated dependencies [7c30c92]
+  - @agentmonitors/core@0.14.0
+  - @agentmonitors/source-incoming-changes@0.3.3
+  - @agentmonitors/source-api-poll@0.5.1
+  - @agentmonitors/source-command-poll@0.4.1
+  - @agentmonitors/source-file-fingerprint@0.4.3
+  - @agentmonitors/source-schedule@0.2.3
+
 ## 0.11.0
 
 ### Minor Changes

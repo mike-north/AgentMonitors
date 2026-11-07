@@ -1,5 +1,43 @@
 # @agentmonitors/core
 
+## 0.14.0
+
+### Minor Changes
+
+- 65351d0: Bound monitor files to 1 MiB through shared bounded reads in direct parsing and production scans, tags to 256 entries, and derive rules to 128 before element validation. Exported collection schemas now preprocess admission, and parse errors optionally carry INPUT_LIMIT_EXCEEDED. Bound daemon requests to 1 MiB, 1000 entries per collection, 10000 values, and depth 32 before schema validation or runtime mutation. Rejected requests return a structured wire error without affecting existing sessions.
+
+  Integrate with Zod 4 while retaining native Shape rejection. Admission errors use only own envelope IDs, decoded traversal avoids copying container values, and raw-frame diagnostics describe bytes before decoding.
+
+  Keep validation hints within the monitor read budget, including files that grow or are replaced after discovery, and expose the existing bounded synchronous reader for diagnostic consumers. Reject Promise and other non-array collection declarations before async preprocessing can unwrap them; preserve raw-array admission and ordinary type diagnostics.
+
+- 57e2878: Add a bounded durable outbox for retrying failed observation materialization.
+
+  Reject values that JSON would silently normalize, including negative zero and customized observation timestamps, before persisting any retry batch member.
+
+  Reject proxy envelopes and proxy prototypes before traps run, using intrinsic Date detection; validate route data before invoking property reads.
+
+  Reject detectable intrinsic built-ins even after their prototypes are replaced. Document the caller-owned plain-data domain and the limits of detecting unobservable private state.
+
+- ae08f21: Upgrade direct validation to patched Zod 4 and raise MCP SDK and TOON dependency floors. Exported schema objects now use Zod 4 schema types; parsed monitor fields and authored validation messages retain their contracts. Preserve historical Shape admission by rejecting Date (including YAML timestamps), Map, Set, and objects with callable then/catch before normalization or promise assimilation; synchronous and asynchronous validation return failures for these inputs while retaining other object controls; the exported Shape validator uses a preprocessing pipe with unchanged authored input and parsed output types. The MCP SDK v3 compatibility path and external cel-js lodash dependency remain separately documented security limitations.
+
+### Patch Changes
+
+- ab9b6ad: Commit event rows, lead-session projections, recipient cursor seeds, and snapshots atomically.
+  Preserve empty snapshots as valid diff baselines, including deletion deltas for late recipients.
+- f194a12: Allow fresh normal and low reminder batches while older events remain claimed and unacknowledged.
+  Preserve same-band in-flight reservation holds and high-urgency settle coalescing, and update
+  suppression diagnostics to distinguish no new work from a temporary reservation.
+
+  Use the explicit `no-new-work` diagnostic for healthy claimed-only backlogs. Retain conservative
+  health warnings for legacy daemon reasons whose policy can still block future batches.
+
+- d6c56a3: Report unavailable incoming-changes repositories and refs as recoverable source errors instead of successful empty baselines. Resolve authored revision expressions unchanged, then verify the resolved object ID peels to a commit; reject blob paths without changing valid commit-search semantics in SHA-1 or SHA-256 repositories. Capture Git stderr and retain the last-good source state for recovery. Source consumers must now handle observation rejection for unavailable inputs through the existing error contract.
+
+  Require initial state before monitor test claims a baseline. Include source errors in history text and explain using bounded single-line display, without rewriting stored audit data. Existing source-error retry cadence and held-notification deferral remain unchanged.
+
+- 8ce3139: Preserve SQLite locks by tightening existing database permissions before opening connections. This prevents stale reads and locking protocol errors across processes while keeping newly created files owner-only.
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+
 ## 0.13.0
 
 ### Minor Changes
