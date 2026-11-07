@@ -380,8 +380,10 @@ carries commitments (#504's verification-gate expectations):
   failure on an unrelated diff is a tracked defect with an owner, never re-rolled as routine
   ([#509](https://github.com/mike-north/AgentMonitors/issues/509),
   [#475](https://github.com/mike-north/AgentMonitors/issues/475),
-  [#477](https://github.com/mike-north/AgentMonitors/issues/477); #506 is the fixed
-  exemplar).
+  [#477](https://github.com/mike-north/AgentMonitors/issues/477);
+  [#548](https://github.com/mike-north/AgentMonitors/issues/548) is the fixed exemplar: #506
+  first widened an assertion to accept the symptom, which hid a test's descriptor double close
+  until the same defect surfaced as `spawn EBADF`).
 - **Failures are diagnosable from artifacts.** A CI-only failure MUST capture enough state
   (spawned daemon/subprocess logs) to be root-caused without re-running (#509's acceptance
   criterion).
