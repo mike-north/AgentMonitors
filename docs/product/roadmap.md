@@ -9,12 +9,9 @@
 > [docs/specs/roadmap.md](../specs/roadmap.md). This doc is the narrative that ties
 > them together.
 
-The roadmap is a sequence of **numbered milestones (M1, M2, …)**, each an outcome that
-unlocks a concrete capability. **Sequencing is the commitment; dates are estimates.**
-The project board carries penciled start/target spans per milestone so its roadmap
-(timeline) view works — treat those as indicative and freely revised, while the M-number
-ordering only changes deliberately. Confidence in scope decreases with the number —
-M1 is being built now; the later milestones are directional and may be reshaped before
+The roadmap is a sequence of **numbered milestones (M0, M1, …)**, each an outcome with a
+test for when it is done. **Sequencing is the commitment.** Milestones carry no due dates.
+Confidence in scope decreases with the number, so later milestones may be reshaped before
 they start. A milestone closes when its issues close, and ordering changes only when new
 information arrives (recorded in the changelog below when it does).
 
@@ -23,108 +20,123 @@ single milestone. Each milestone is a concrete increment of capability; where th
 broad-use line falls is a judgment we make as the increments land, not a promise made
 up front.
 
-## M1 — External ingress
+## How we choose what to firm up
 
-**Unlocks:** the outside world can _push_ events to Agent Monitors — with the same
-durability guarantees as polled observations.
+Agent Monitors has three parts:
 
-Durable, source-neutral ingestion of externally pushed events: versioned envelopes,
-atomic receipt persistence, debounce/deadline scheduling in the daemon, IPC exposure,
-and CLI commands — proven end to end.
+1. **Ingress** — polling sources and an event sink take in changes from the world.
+2. **Delivery** — events reach agents reliably, at an urgency that ranges from interrupting
+   mid-turn to waiting until the agent stops.
+3. **The middle** — filtering, transformation, summarization, policy, pacing and enrichment
+   turn a raw pipe into a distilled signal.
 
-Epic: [#481](https://github.com/mike-north/AgentMonitors/issues/481). The
-implementation is in review as a stacked series of PRs; landing that stack is the
-milestone. **Status: actively being built.**
+We firm up these parts one at a time, in that order, rather than investing in all of them at
+once. The edges come first because a distilled signal is only worth producing if it is
+never lost and always arrives. Nothing that has already landed gets removed. Parked work
+stays open, and the code it touches stays as it is until its part comes up.
 
-## M2 — Runtime containment & cleanup
+## M0 — Trustworthy gate
 
-**Unlocks:** a daemon you can leave running unattended — everything it spawns is
-accounted for up to the posture's documented containment boundary, and it never
-damages unrelated work.
+**Done when:** green means correct, and main's fixes are released.
 
-Reliability is the spine of the product thesis — a monitoring system that loses
-signals, leaks processes, or lies about what it delivered is worse than no monitoring
-at all. M2 and M3 execute the commitments of the
-[reliability & process-hygiene posture](./reliability-and-process-hygiene.md),
-which a numbered spec will make normative
-([#504](https://github.com/mike-north/AgentMonitors/issues/504)).
+Every later milestone relies on this gate as its proof. The dependency audit is clean
+([#530](https://github.com/mike-north/AgentMonitors/issues/530)), masked and load-sensitive
+flakes are gone ([#452](https://github.com/mike-north/AgentMonitors/issues/452),
+[#515](https://github.com/mike-north/AgentMonitors/issues/515),
+[#509](https://github.com/mike-north/AgentMonitors/issues/509),
+[#475](https://github.com/mike-north/AgentMonitors/issues/475),
+[#520](https://github.com/mike-north/AgentMonitors/issues/520)), the local gate matches CI
+([#458](https://github.com/mike-north/AgentMonitors/issues/458)), and issues already fixed
+on main are closed.
 
-The daemon and everything it spawns are accounted for within the documented
-containment boundary. Identity-verified targets are reaped; when ownership cannot be
-positively confirmed, the tool abstains, leaves the process alone, and emits a durable
-user-visible warning ([#507](https://github.com/mike-north/AgentMonitors/issues/507)).
-A fully detached descendant that erases its own identity escapes attribution by
-construction, and the posture says so plainly rather than pretending otherwise.
-Orphaned process trees from a previous daemon life are swept
-([#470](https://github.com/mike-north/AgentMonitors/issues/470),
-[#478](https://github.com/mike-north/AgentMonitors/issues/478)); every cleanup signal
-verifies the target's identity first
-([#479](https://github.com/mike-north/AgentMonitors/issues/479)); containment uses the
-strongest mechanism the platform offers and reports the guarantee achieved
-([#480](https://github.com/mike-north/AgentMonitors/issues/480)); stray daemons,
-channel servers, and sockets are detectable and collectable
-([#426](https://github.com/mike-north/AgentMonitors/issues/426)); and power/battery
-friendliness is a first-class design axis
-([#469](https://github.com/mike-north/AgentMonitors/issues/469)).
+## M1 — Ingress loses nothing
 
-## M3 — Delivery correctness & durability
+**Done when:** faults and kills at every write in the poll and flush paths still produce each
+observed event.
 
-**Unlocks:** delivery you can trust without checking — every signal is either
-delivered, visibly held, or truthfully reported as failed, across restarts.
-
-Every persistence and delivery decision is atomic, truthful, and restart-safe:
-ingest/materialization atomicity
+Today a source's baseline can advance before its event is written, so a failed write loses
+the event. Landing the recovery work
 ([#295](https://github.com/mike-north/AgentMonitors/issues/295),
-[#294](https://github.com/mike-north/AgentMonitors/issues/294)), monotonic
-per-recipient cursors
-([#298](https://github.com/mike-north/AgentMonitors/issues/298)), suppression of
-empty deliveries ([#473](https://github.com/mike-north/AgentMonitors/issues/473)),
-and transport-health surfaces that tell the truth
-([#462](https://github.com/mike-north/AgentMonitors/issues/462)–[#465](https://github.com/mike-north/AgentMonitors/issues/465)).
-The verification gate earns the same trust: no masked flakes, and the local gate
-matches CI ([#452](https://github.com/mike-north/AgentMonitors/issues/452),
-[#458](https://github.com/mike-north/AgentMonitors/issues/458)).
+[#294](https://github.com/mike-north/AgentMonitors/issues/294),
+[#293](https://github.com/mike-north/AgentMonitors/issues/293)) closes that gap. This
+milestone also covers truthful source baselines
+([#305](https://github.com/mike-north/AgentMonitors/issues/305)), held work that survives a
+monitor edit ([#537](https://github.com/mike-north/AgentMonitors/issues/537),
+[#451](https://github.com/mike-north/AgentMonitors/issues/451)), and bounded,
+identity-verified cleanup of the processes polling spawns
+([#470](https://github.com/mike-north/AgentMonitors/issues/470),
+[#478](https://github.com/mike-north/AgentMonitors/issues/478),
+[#479](https://github.com/mike-north/AgentMonitors/issues/479)).
 
-## M4 — Agent-facing interaction (spec 007)
+## M2 — Event sink
 
-**Unlocks:** an agent that receives a signal can act on it directly — no re-fetching
-the world, no guessing what is held back.
+**Done when:** externally pushed events get the same no-loss guarantee as polled ones.
 
-The read-only `snapshot` / `diff` / `summary` verbs
-([#313](https://github.com/mike-north/AgentMonitors/issues/313)) and the `inspect`
-surface that distinguishes armed → pending → received
-([#314](https://github.com/mike-north/AgentMonitors/issues/314)). This completes the
-signal-to-action loop for the existing host and advances epic
-[#259](https://github.com/mike-north/AgentMonitors/issues/259), whose remaining
-host-adapter workstream lands in M5.
+Durable, source-neutral ingestion of pushed events: versioned envelopes, atomic receipt
+persistence, deadline scheduling in the daemon, IPC exposure, and CLI commands, proven end to
+end. Epic: [#481](https://github.com/mike-north/AgentMonitors/issues/481). It depends on M1,
+and its stacked PRs rebase onto that work.
 
-## M5 — Multi-host adapters
+## M3 — Delivery is honest on Claude
 
-**Unlocks:** the same monitors deliver into more than one agent host, with identical
-semantics — the cross-host promise of the standard, made real.
+**Done when:** every event is delivered, visibly held, or reported as failed, and each urgency
+level works as promised, through Claude Code hooks and channels.
 
-The core is host-agnostic by construction; prove it. A Codex adapter
-([#316](https://github.com/mike-north/AgentMonitors/issues/316)) first, then Cursor
-([#317](https://github.com/mike-north/AgentMonitors/issues/317)), each with delivery
-semantics invariant against the Claude Code adapter per
-[spec 006 §11](../specs/006-agent-integration.md).
+A channel claim needs proof that something is listening
+([#535](https://github.com/mike-north/AgentMonitors/issues/535)). A dead daemon must be
+restarted or reported ([#536](https://github.com/mike-north/AgentMonitors/issues/536),
+[#435](https://github.com/mike-north/AgentMonitors/issues/435),
+[#467](https://github.com/mike-north/AgentMonitors/issues/467)). The claim and acknowledgement
+lifecycle needs one clear contract
+([#468](https://github.com/mike-north/AgentMonitors/issues/468),
+[#441](https://github.com/mike-north/AgentMonitors/issues/441),
+[#473](https://github.com/mike-north/AgentMonitors/issues/473),
+[#298](https://github.com/mike-north/AgentMonitors/issues/298)). Sessions must stay reachable
+during long waits ([#396](https://github.com/mike-north/AgentMonitors/issues/396)), and health
+reports must tell the truth
+([#424](https://github.com/mike-north/AgentMonitors/issues/424),
+[#462](https://github.com/mike-north/AgentMonitors/issues/462)).
 
-## M6 — User-level monitors & authoring
+## M4 — A second delivery route
 
-**Unlocks:** monitors that follow the user across workspaces, and an authoring
-experience with the papercuts burned down.
+**Done when:** Codex passes the same delivery test suite as Claude.
 
-User-level monitor scoping
-([#194](https://github.com/mike-north/AgentMonitors/issues/194),
-[#258](https://github.com/mike-north/AgentMonitors/issues/258)), resolution of the
-open design decisions (session dormancy vs long blocking waits
-[#396](https://github.com/mike-north/AgentMonitors/issues/396), claim-TTL decay
-[#468](https://github.com/mike-north/AgentMonitors/issues/468), dependent monitor
-chains [#124](https://github.com/mike-north/AgentMonitors/issues/124)), and the
-remaining authoring-ergonomics papercuts
-([#391](https://github.com/mike-north/AgentMonitors/issues/391),
-[#409](https://github.com/mike-north/AgentMonitors/issues/409),
-[#415](https://github.com/mike-north/AgentMonitors/issues/415)).
+The core is host-agnostic by construction, so prove it through the Codex app server
+([#316](https://github.com/mike-north/AgentMonitors/issues/316)), with semantics invariant
+against the Claude adapter per [spec 006 §11](../specs/006-agent-integration.md). Claude's
+subagent coordination socket gets a probe before anything depends on it
+([#538](https://github.com/mike-north/AgentMonitors/issues/538)).
+
+## M5 — The middle (parked)
+
+**Picked up:** once the edges are proven. Scope will be reshaped before it starts.
+
+Event processing, predicates, policy, enrichment and summarization build on the capability
+model in [monitoring-capability-exercises.md](./monitoring-capability-exercises.md). What
+already ships here, such as debouncing and throttling, keeps working but gets no new
+investment until then; defects that lose events belong to M1.
+
+This milestone also holds work that is real but not next:
+
+- Agent-facing verbs and `inspect`
+  ([#313](https://github.com/mike-north/AgentMonitors/issues/313),
+  [#314](https://github.com/mike-north/AgentMonitors/issues/314),
+  [#259](https://github.com/mike-north/AgentMonitors/issues/259)).
+- The remaining process-hygiene commitments
+  ([#426](https://github.com/mike-north/AgentMonitors/issues/426),
+  [#469](https://github.com/mike-north/AgentMonitors/issues/469),
+  [#480](https://github.com/mike-north/AgentMonitors/issues/480),
+  [#507](https://github.com/mike-north/AgentMonitors/issues/507)). The
+  [reliability posture](./reliability-and-process-hygiene.md) still states these as targets,
+  and they stay unmet until this work is picked up.
+- A Cursor adapter ([#317](https://github.com/mike-north/AgentMonitors/issues/317)).
+- User-level monitors, dependent chains, and authoring papercuts
+  ([#194](https://github.com/mike-north/AgentMonitors/issues/194),
+  [#258](https://github.com/mike-north/AgentMonitors/issues/258),
+  [#124](https://github.com/mike-north/AgentMonitors/issues/124),
+  [#391](https://github.com/mike-north/AgentMonitors/issues/391),
+  [#409](https://github.com/mike-north/AgentMonitors/issues/409),
+  [#415](https://github.com/mike-north/AgentMonitors/issues/415)).
 
 ## Deliberately unscheduled
 
@@ -133,11 +145,17 @@ file watching [#279](https://github.com/mike-north/AgentMonitors/issues/279), th
 macOS notification-observer source
 [#128](https://github.com/mike-north/AgentMonitors/issues/128)), third-party source
 discovery/installation (G4 in [docs/specs/roadmap.md](../specs/roadmap.md)), and
-engineering-debt items labeled `backlog`. These graduate onto a milestone when they
+engineering-debt items with no milestone. These graduate onto a milestone when they
 become the next most valuable thing — not before.
 
 ## Changes
 
+- **2026-11-03** — reorganized around three parts built in order: ingress, delivery, then the
+  middle. A review of the code and backlog found that events could be lost before they were
+  written and that delivery could report success with nothing received, while the previous
+  sequence put external ingress ahead of the durability work it depends on. Added a gate
+  milestone first, replaced the six milestones with M0–M5, and dropped due dates. The previous
+  milestones are closed on GitHub and keep their closed issues.
 - **2026-08-23** — initial version: six numbered milestones (M1–M6),
   reliability-first sequencing after external ingress lands. Penciled indicative
   start/target spans onto the project board to enable its roadmap (timeline) view.

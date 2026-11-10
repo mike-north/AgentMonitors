@@ -23,7 +23,7 @@ import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 import { registerRuntimeTransaction } from './runtime-transaction.js';
 
-/** Source polling is due at08:00/10:00; the independent rollup window is09:00 UTC. */
+/** Source polling is due at 08:00/10:00; the independent rollup window is 09:00 UTC. */
 const BEFORE = Date.parse('2026-11-01T08:00:00Z');
 const WINDOW = Date.parse('2026-11-01T09:00:00Z');
 let clockTime = BEFORE;
@@ -231,7 +231,7 @@ function beforeAdmission(
   return () => expect(ran).toBe(true);
 }
 
-/** The child imports current source using Node24 type transformation and a confined resolver hook. */
+/** The child imports current source using Node 24 type transformation and a confined resolver hook. */
 function competingRuntime(
   f: Awaited<ReturnType<typeof fixture>>,
   mode: 'notdue' | 'due' | 'watch',
