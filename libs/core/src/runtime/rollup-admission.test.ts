@@ -4,7 +4,13 @@
  * checkpoint rewinds, partial admission and interpretation before commit.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -505,4 +511,369 @@ describe('not-due rollup admission', () => {
       );
     });
   }
+});
+
+/**
+ * Native SQLite faults end different scopes (002 §2 admission units, §4.4
+ * held rollup flush, §10.7 observation history; 003 §2.3 opaque baselines;
+ * 004 §3.4). `RAISE(ROLLBACK)` ends the whole owning transaction underneath a
+ * nested savepoint, so no retained suffix may outlive the vanished prefix.
+ * `RAISE(ABORT)` ends only the failing statement's savepoint, so the prefix
+ * commits and the ordered suffix is retained.
+ */
+
+/** Durable admission artifacts; best-effort error history is asserted separately. */
+const rollupArtifactTables = [
+  'monitor_events',
+  'monitor_snapshots',
+  'session_event_state',
+  'session_object_cursor',
+  'materialization_retry_outbox',
+  'monitor_state',
+] as const;
+
+/** Independent full-row reads preserve prior artifacts, not merely row counts. */
+function rollupArtifactRows(f: Awaited<ReturnType<typeof fixture>>) {
+  return rollupArtifactTables.map((table) =>
+    f.observer.client.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all(),
+  );
+}
+
+/**
+ * Commit one event for another workspace's lead before the fault, so the
+ * store's recipient cache and prior rows are non-empty. Its summary collides
+ * with the new prefix; the trigger's monitor/workspace predicates must not
+ * accept it as proof that the new prefix was written.
+ */
+function seedPriorRecipient(f: Awaited<ReturnType<typeof fixture>>) {
+  const workspacePath = path.join(f.root, 'previous-workspace');
+  const session = f.runtime.openSession(
+    claudeCodeAdapter.createSessionInput({
+      hostSessionId: 'previous-rollup-lead',
+      workspacePath,
+    }),
+  );
+  const event = f.store.insertEvent({
+    workspacePath,
+    monitorId: 'previous-monitor',
+    sourceName: 'rollup-source',
+    urgency: 'normal',
+    title: 'Previously committed',
+    body: 'Preserve this recipient.',
+    summary: 'step-1',
+    payload: {},
+    snapshotMetadata: {},
+    snapshotText: null,
+    diffText: null,
+    objectKey: null,
+    baselineStrategy: 'incremental',
+    queryScope: {},
+    tags: [],
+    createdAt: new Date(BEFORE),
+  });
+  expect(f.store.projectedSessionIdsForLastEvent()).toEqual([session.id]);
+  return { event, session };
+}
+
+/**
+ * A real trigger on the second held envelope. It first proves the new prefix
+ * (event, its snapshot, both lead projections) is visible on the owning
+ * connection, i.e. written in the same transaction, then lets SQLite itself
+ * raise the requested native conflict resolution.
+ */
+function installRollupNativeFault(
+  f: Awaited<ReturnType<typeof fixture>>,
+  action: 'ROLLBACK' | 'ABORT',
+): void {
+  f.writer.client.exec(`
+    CREATE TRIGGER native_rollup_fault BEFORE INSERT ON monitor_events
+    WHEN NEW.monitor_id = 'rollup' AND NEW.summary = 'step-2'
+    BEGIN
+      SELECT CASE WHEN (
+        SELECT count(*) FROM monitor_events prefix
+        WHERE prefix.monitor_id = NEW.monitor_id
+          AND prefix.workspace_path = NEW.workspace_path
+          AND prefix.summary = 'step-1'
+          AND (SELECT count(*) FROM monitor_snapshots snapshot
+            WHERE snapshot.event_id = prefix.id) = 1
+          AND (SELECT count(*) FROM session_event_state projection
+            WHERE projection.event_id = prefix.id) = 2
+      ) != 1 THEN RAISE(ABORT, 'missing new rollup prefix artifacts') END;
+      SELECT RAISE(${action}, 'native rollup ${action}');
+    END;
+  `);
+}
+
+/** Errored history rows for the held monitor, in insertion order. */
+function erroredHistory(f: Awaited<ReturnType<typeof fixture>>) {
+  return f.reader
+    .listObservationHistory({ monitorId: 'rollup' })
+    .filter(({ result }) => result === 'errored')
+    .map(({ observationData }) => observationData);
+}
+
+describe('native rollback in held rollup flush', () => {
+  it('surfaces a whole-transaction ROLLBACK without residue, then replays the full held span once on reopen', async () => {
+    const f = await fixture();
+    f.interpretation.release();
+    const prior = seedPriorRecipient(f);
+    const previousRows = rollupArtifactRows(f);
+    const previousHistory = erroredHistory(f);
+    installRollupNativeFault(f, 'ROLLBACK');
+    clockTime = WINDOW;
+    const failed = await f.runtime.tick(f.monitorsDir, f.root);
+    // The original native error is reported, not a follow-on COMMIT failure.
+    expect.soft(failed.emittedEventIds).toEqual([]);
+    expect
+      .soft(failed.erroredObservations)
+      .toEqual([{ monitorId: 'rollup', message: 'native rollup ROLLBACK' }]);
+    expect
+      .soft(erroredHistory(f))
+      .toEqual([...previousHistory, { error: 'native rollup ROLLBACK' }]);
+    expect.soft(f.writer.client.inTransaction).toBe(false);
+    // No new event/snapshot/projection/cursor/retry, no checkpoint or cleared hold.
+    expect.soft(rollupArtifactRows(f)).toEqual(previousRows);
+    expect.soft(f.reader.getMonitorState('rollup', f.root)).toEqual(f.before);
+    expect.soft(f.reader.listMaterializationRetries()).toEqual([]);
+    expect
+      .soft(f.store.projectedSessionIdsForLastEvent())
+      .toEqual([prior.session.id]);
+    expect.soft(f.interpretation.calls).toEqual([]);
+    expect.soft(f.observations()).toBe(1);
+
+    f.writer.client.exec('DROP TRIGGER native_rollup_fault');
+    // Close every original connection: reopen must consume persisted work,
+    // not an old runtime's in-memory scheduling or recipient state.
+    f.writer.client.close();
+    f.observer.client.close();
+    const reopenedConnection = f.connect();
+    const reopenedStore = new RuntimeStore(reopenedConnection.db);
+    expect
+      .soft(reopenedStore.getMonitorState('rollup', f.root))
+      .toEqual(f.before);
+    // Force the source due inside the open window. The replacement
+    // implementation acquires nothing and omits nextState, so only the
+    // retained held span can emit and the opaque baseline must survive.
+    const monitorFile = path.join(f.monitorsDir, 'rollup', 'MONITOR.md');
+    writeFileSync(
+      monitorFile,
+      readFileSync(monitorFile, 'utf8').replace('interval: 2h', 'interval: 1s'),
+    );
+    const acquiredBaselines: unknown[] = [];
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'rollup-source',
+      scopeSchema: { type: 'object' },
+      observe(_config, context) {
+        acquiredBaselines.push(context.previousState);
+        return Promise.resolve({ observations: [] });
+      },
+    });
+    const reopened = new AgentMonitorRuntime(
+      reopenedStore,
+      registry,
+      [claudeCodeAdapter],
+      f.interpretation.adapter,
+    );
+    clockTime = WINDOW + 2000;
+    const replay = await reopened.tick(f.monitorsDir, f.root);
+    expect.soft(replay.erroredObservations).toEqual([]);
+    expect.soft(replay.emittedEventIds).toHaveLength(3);
+    expect.soft(acquiredBaselines).toEqual(['original-source']);
+    const events = reopenedStore
+      .listEvents({ monitorId: 'rollup', workspacePath: f.root })
+      .sort((a, b) => a.id.localeCompare(b.id));
+    expect
+      .soft(events.map(({ summary, snapshotText }) => [summary, snapshotText]))
+      .toEqual([
+        ['step-1', 'alpha'],
+        ['step-2', ''],
+        ['step-3', 'omega'],
+      ]);
+    expect.soft(reopenedStore.getMonitorState('rollup', f.root)).toEqual({
+      sourceState: 'original-source',
+      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+      lastObservationAt: new Date(WINDOW + 2000),
+    });
+    expect.soft(reopenedStore.listMaterializationRetries()).toEqual([]);
+    expect.soft(f.interpretation.calls).toHaveLength(3);
+    expect
+      .soft(
+        reopenedConnection.client
+          .prepare('SELECT content FROM monitor_snapshots ORDER BY rowid')
+          .all(),
+      )
+      .toEqual([{ content: 'alpha' }, { content: '' }, { content: 'omega' }]);
+    // One prior projection plus three events for each of two leads.
+    expect
+      .soft(
+        reopenedConnection.client
+          .prepare('SELECT * FROM session_event_state')
+          .all(),
+      )
+      .toHaveLength(7);
+    expect
+      .soft(reopenedStore.listEvents({ sessionId: prior.session.id }))
+      .toEqual([{ ...prior.event, deliveryState: 'unread' }]);
+    for (const session of f.sessions) {
+      expect
+        .soft(
+          reopenedStore
+            .listEvents({ sessionId: session.id })
+            .map(({ id }) => id)
+            .sort(),
+        )
+        .toEqual(events.map(({ id }) => id));
+      expect
+        .soft(
+          reopenedStore.getSessionObjectCursor(
+            session.id,
+            'rollup',
+            'shared',
+            f.root,
+          ),
+        )
+        .not.toBeNull();
+    }
+    const repeated = await reopened.tick(f.monitorsDir, f.root);
+    expect.soft(repeated.emittedEventIds).toEqual([]);
+    expect.soft(reopenedStore.listEvents()).toHaveLength(4);
+  });
+
+  it('retains the prefix and ordered suffix when a native ABORT leaves the owning transaction alive', async () => {
+    const f = await fixture();
+    f.interpretation.release();
+    installRollupNativeFault(f, 'ABORT');
+    clockTime = WINDOW;
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+    expect(result.emittedEventIds).toHaveLength(1);
+    expect(result.erroredObservations).toHaveLength(1);
+    expect(f.reader.listEvents().map(({ summary }) => summary)).toEqual([
+      'step-1',
+    ]);
+    const retries = f.reader.listMaterializationRetries();
+    expect(
+      retries.map(({ sourceName, envelope }) => [
+        sourceName,
+        envelope.observation.summary,
+        envelope.observation.snapshotText,
+      ]),
+    ).toEqual([
+      ['rollup-source', 'step-2', ''],
+      ['rollup-source', 'step-3', 'omega'],
+    ]);
+    expect(retries[0]?.lastError).toBe('native rollup ABORT');
+    expect(f.reader.getMonitorState('rollup', f.root)).toEqual({
+      ...f.before,
+      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+    });
+    expect(f.interpretation.calls).toHaveLength(1);
+    expect(f.reader.latestSnapshot('rollup', 'shared', f.root)).toEqual({
+      content: 'alpha',
+    });
+    for (const session of f.sessions) {
+      expect(f.reader.listEvents({ sessionId: session.id })).toHaveLength(1);
+      expect(
+        f.reader.getSessionObjectCursor(session.id, 'rollup', 'shared', f.root),
+      ).not.toBeNull();
+    }
+    f.writer.client.close();
+    f.observer.client.close();
+    const reopened = new RuntimeStore(f.connect().db);
+    expect(reopened.listMaterializationRetries()).toEqual(retries);
+    expect(reopened.getMonitorState('rollup', f.root)).toEqual({
+      ...f.before,
+      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+    });
+  });
+
+  it('keeps the captured old-source envelope and opaque baseline through a parsed edit and a failed flush', async () => {
+    const f = await fixture();
+    f.interpretation.release();
+    const held = f.before.notifyState.pendingRollup?.observations;
+    expect(held).toHaveLength(3);
+    expect(f.before.sourceState).toBe('original-source');
+    // A real edit through the normal scanner/parser: new source type,
+    // instructions and urgency, with a short interval so it polls once.
+    const monitorFile = path.join(f.monitorsDir, 'rollup', 'MONITOR.md');
+    writeFileSync(
+      monitorFile,
+      readFileSync(monitorFile, 'utf8')
+        .replace('type: rollup-source', 'type: replacement-source')
+        .replace('interval: 2h', 'interval: 1s')
+        .replace('urgency: normal', 'urgency: low')
+        .replace('Inspect the changes.', 'Replacement instructions.'),
+    );
+    const acquiredBaselines: unknown[] = [];
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'replacement-source',
+      scopeSchema: { type: 'object' },
+      observe(_config, context) {
+        acquiredBaselines.push(context.previousState);
+        // Omitting nextState preserves the source-owned baseline (003 §2.3).
+        return Promise.resolve({ observations: [] });
+      },
+    });
+    const edited = new AgentMonitorRuntime(
+      f.store,
+      registry,
+      [claudeCodeAdapter],
+      f.interpretation.adapter,
+    );
+    // Poll the replacement source while the window is closed: the old hold
+    // must survive and the opaque baseline must not be reset or coerced.
+    clockTime = BEFORE + 1000;
+    const editedPoll = await edited.tick(f.monitorsDir, f.root);
+    expect(editedPoll.emittedEventIds).toEqual([]);
+    expect(editedPoll.erroredObservations).toEqual([]);
+    expect(f.reader.getMonitorState('rollup', f.root)).toEqual({
+      sourceState: 'original-source',
+      notifyState: f.before.notifyState,
+      lastObservationAt: new Date(BEFORE + 1000),
+    });
+    // Lengthen the interval so the window opens on the not-due flush path.
+    writeFileSync(
+      monitorFile,
+      readFileSync(monitorFile, 'utf8').replace('interval: 1s', 'interval: 2h'),
+    );
+    installRollupNativeFault(f, 'ABORT');
+    clockTime = WINDOW;
+    const result = await edited.tick(f.monitorsDir, f.root);
+    expect(acquiredBaselines).toEqual(['original-source']);
+    expect(result.emittedEventIds).toHaveLength(1);
+    expect(result.erroredObservations).toHaveLength(1);
+    const retries = f.reader.listMaterializationRetries();
+    // The retry route is the envelope's captured source, not the edited one.
+    expect(retries.map(({ sourceName }) => sourceName)).toEqual([
+      'rollup-source',
+      'rollup-source',
+    ]);
+    // Serialized equality covers instructions, route, urgency, timestamps,
+    // payload and ordered observation data captured under the old definition.
+    expect(JSON.stringify(retries.map(({ envelope }) => envelope))).toBe(
+      JSON.stringify(held?.slice(1)),
+    );
+    const events = f.reader.listEvents();
+    expect(
+      events.map(({ summary, snapshotText }) => [summary, snapshotText]),
+    ).toEqual([['step-1', 'alpha']]);
+    expect(events[0]).toMatchObject({
+      sourceName: 'rollup-source',
+      body: 'Inspect the changes.',
+      urgency: 'normal',
+    });
+    expect(f.interpretation.calls).toHaveLength(1);
+    const expectedState = {
+      sourceState: 'original-source',
+      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+      lastObservationAt: new Date(BEFORE + 1000),
+    };
+    expect(f.reader.getMonitorState('rollup', f.root)).toEqual(expectedState);
+    f.writer.client.close();
+    f.observer.client.close();
+    const reopened = new RuntimeStore(f.connect().db);
+    expect(reopened.listMaterializationRetries()).toEqual(retries);
+    expect(reopened.getMonitorState('rollup', f.root)).toEqual(expectedState);
+  });
 });
