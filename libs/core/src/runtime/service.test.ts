@@ -5052,7 +5052,9 @@ Handle it.
   // source poll interval has NOT elapsed but the delivery window opens) is the
   // *normal* operating mode for a rollup monitor whose `watch.interval` is
   // relaxed to match the window (002 §4.4), and it had drifted: it applied
-  // neither behavior. Both paths now route through the shared materializeSpan().
+  // neither behavior. Both paths now share admitSpan() for durable admission and
+  // finishMaterializationSpan() for the audit row; the not-due path reaches them
+  // through flushRollupWindow(), which reads the held batch under the writer lock.
   //
   // Expected delta/history counts below are written BY HAND from the spec, not
   // captured from program output.
@@ -5410,7 +5412,9 @@ Daily digest.
     // No regression for the empty not-due tick: the window check runs on EVERY
     // not-due tick, but an empty flush (window closed, or nothing accumulated)
     // must NOT write a `no-change` audit row each tick — only a real flush is
-    // recorded. (The call site guards materializeSpan on emitted.length > 0.)
+    // recorded. (flushRollupWindow() returns before finishMaterializationSpan()
+    // when the window emits nothing; an open empty window still commits its
+    // minute marker.)
     it('does not record an audit row for a not-due tick that flushes nothing', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(ACCUM_BASE);
