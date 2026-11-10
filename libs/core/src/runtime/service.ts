@@ -3771,10 +3771,10 @@ export class AgentMonitorRuntime {
 
   /**
    * Stage one observation's event, recipient projections, cursor seeds and
-   * snapshot inside the caller's span transaction (`admitSpan` runs it under a
-   * savepoint; the outer transaction commits). It neither commits nor invokes
-   * Interpret: optional Interpret runs only after that commit, in
-   * `interpretMaterializedObservation`.
+   * snapshot inside the caller's span transaction (the event insert uses its
+   * own nested savepoint in `store.ts`; the outer transaction commits). It
+   * neither commits nor invokes Interpret: optional Interpret runs only after
+   * that commit, in `interpretMaterializedObservation`.
    */
   private materializeObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;

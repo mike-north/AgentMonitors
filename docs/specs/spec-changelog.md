@@ -23,6 +23,10 @@ longer says a failed observation leaves the rest of its batch unaffected: the co
 and the failed envelope plus later siblings are queued as ordered retries, with `errored` rows
 written by `finishMaterializationSpan()`.
 
+A transaction-wide `RAISE(ROLLBACK)` differs: the whole span rolls back, prefix included, nothing
+is queued, the source baseline does not advance, and the single `errored` row comes from `tick()`'s
+ingest-error catch (or `consumeWatch()`'s outer catch, which also ends the watcher).
+
 ## 2026-11-07 — Keep nested-only retry details visible in text explain (005) — Refs #496
 
 Text explain selects recognized materialization retry details when a partial compatibility report

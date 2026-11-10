@@ -2105,12 +2105,21 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Two sub-cases:
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
-  - A dispatched observation failed to materialize inside `ingest()` (tick or watch path, e.g. an
-    event, projection/cursor, or snapshot write error): that envelope's own materialization
-    rolls back, the earlier committed prefix stays, and the failed envelope plus every later
-    sibling are queued, in order, as retries (see the ordered retry suffix in §2 and the
-    admission-unit rules in §15). `emittedEventIds` reflects only durably committed events. The
-    `errored` row is written by `finishMaterializationSpan()` after the span commits.
+  - A dispatched observation failed to materialize. The same rows are written whether the span
+    came from `ingest()` (tick or watch path) or from the not-due notify-window flush
+    (`materializeSpan()`). The outcome depends on the failure kind (ordered retry suffix and
+    admission-unit rules: §2):
+    - _Savepoint-local failure_ (e.g. `RAISE(ABORT)` on an event, projection/cursor or snapshot
+      write): that envelope's own materialization rolls back, the earlier committed prefix stays,
+      and the failed envelope plus every later sibling are queued, in order, as retries.
+      `emittedEventIds` reflects only durably committed events. `finishMaterializationSpan()`
+      writes one `errored` row for the failed envelope after the span commits; the deferred later
+      siblings get none.
+    - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
+      and nothing is queued. The source baseline does not advance. The single `errored` row comes
+      from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
+      catch, which also ends that watcher. The not-due flush's own catch is best-effort and
+      records no row.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
 
