@@ -1981,6 +1981,15 @@ is missing, parse-invalid, duplicated, source/scope-invalid or unschedulable. It
 or scheduling failure remains the primary diagnosis. Omitted workspace defaults to `monitorsDir`,
 matching tick; it never means an unscoped or NULL-workspace query.
 
+_Current contract:_ `explainMonitor` **MUST** finish asynchronous definition discovery before
+reading retry metadata and the later persisted diagnosis. Work committed on the same runtime/store
+connection while discovery waits must appear in the retry summary returned after discovery, even
+when a definition-error return follows. For example, a committed event prefix with a retained retry
+suffix must report that suffix's count and IDs and, for a valid definition, materialization as
+pending rather than successful solely because the prefix exists. Definition and scheduling failures
+retain their primary diagnosis. This ordering does not provide a cross-process transactional
+snapshot or change the meaning of `generatedAt` or the caller's `now`.
+
 `doctorReport` attaches retry summaries to unambiguous parsed monitor rollups, including those with
 invalid scope or schedule. Its `orphanedMaterializationRetries` groups summaries by monitor id when
 no unambiguous parsed current definition exists: removed/parse-failed definitions and duplicated

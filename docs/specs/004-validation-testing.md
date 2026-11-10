@@ -104,6 +104,16 @@ Runtime tests are the primary proof surface for: state persistence across runtim
 **Verified in:** `libs/core/src/runtime/service.test.ts` and
 `libs/core/src/runtime/transactional-materialization.test.ts`.
 
+For the current retry-diagnostic contract in [002](./002-runtime-delivery.md), a regression **MUST**
+hold the real asynchronous monitor scan at a deterministic test-only barrier, commit valid retry
+work through the public store API while it waits, then release the real parser result. The report
+must retain the committed count and retry IDs; a valid-definition report with a committed event
+prefix must diagnose its retained suffix as pending. Include a no-interleaving control and missing,
+parse-invalid, duplicate and invalid-schedule routes. Assert that native retry/envelope/error bytes,
+opaque source state, event and history rows remain unchanged by diagnosis, and that diagnosis does
+not invoke a source. This is a same-runtime ordering check, not a cross-process snapshot guarantee.
+The permanent scenarios are in `libs/core/src/runtime/retry-diagnostics.test.ts`.
+
 ### 2.6 CLI integration tests
 
 CLI integration tests are the primary proof surface for: command wiring; output shape and argument validation; round-trip behavior through the daemon/runtime interface.
