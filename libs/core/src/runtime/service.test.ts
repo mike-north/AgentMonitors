@@ -1825,7 +1825,7 @@ Handle it.
   // range-urgency upgrade shipped (i.e. the envelope objects have no
   // `effectiveUrgency` field). On the next restart, `hydrateStoredObservationEnvelope`
   // used to pass `effectiveUrgency: envelope.effectiveUrgency` straight through,
-  // yielding `undefined`. That `undefined` flowed to `processObservation` and
+  // yielding `undefined`. That `undefined` flowed to `materializeObservation` and
   // was written as the event's `urgency`, producing an invalid DB row.
   //
   // The fix: backfill with `effectiveObservationUrgency(monitor, observation)` when
@@ -2150,15 +2150,15 @@ Handle it.
   // REGRESSION (issue #437 review, comment 3609314737): the json-diff wiring
   // suite (json-diff-wiring.test.ts) drives RuntimeStore.insertEvent directly
   // with an already-rendered structural diffText — it never routes through
-  // AgentMonitorRuntime.processObservation, so reverting service.ts's
+  // AgentMonitorRuntime.materializeObservation, so reverting service.ts's
   // buildDiff(..., strategy) call back to a bare buildTextDiff would leave
   // every existing test green. This drives a REAL observation through the
-  // actual runtime tick (source -> processObservation -> materialized shared
+  // actual runtime tick (source -> materializeObservation -> materialized shared
   // event), with the object's `snapshot.strategy` declared as `json-diff`,
   // and asserts the persisted diffText is structural (a `~ changed` entry),
   // not the line-diff `-/+ 1:` output buildTextDiff would produce for a
   // single-line compact-JSON snapshot.
-  it('renders a structural json-diff diffText for a real observation routed through processObservation', async () => {
+  it('renders a structural json-diff diffText for a real observation routed through materializeObservation', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');
@@ -4246,7 +4246,7 @@ Handle it.
 
   // Issue #46 / Copilot comment 1: per-observation materialization isolation in
   // ingest(). When a batch of ≥2 dispatched observations is being materialized
-  // and the FIRST processObservation() call succeeds but a LATER one fails,
+  // and the FIRST materializeObservation() call succeeds but a LATER one fails,
   // the successful observation's event id must still appear in emittedEventIds
   // and in the DB — the tick must not reject and already-written ids must not
   // be lost.

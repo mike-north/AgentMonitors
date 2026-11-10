@@ -9,6 +9,52 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-10 — Start materialization retry backoff at enqueue (002 §15; 004 §3.4) — Refs #497
+
+New materialization retry rows first become due at least 1 second after they are enqueued, after
+source acquisition and prefix materialization, rounded up to SQLite's whole-second precision.
+Previously the runtime passed the tick's start time, so slow acquisition consumed the initial delay
+(an observation at `12:00:00.000` admitted at `12:00:03.850` was already due at `12:00:01.000`; the
+contract requires `12:00:05.000`). Observation, event, envelope, source and notify timestamps remain
+observation-time provenance. No public API, schema or retry-schedule change.
+
+A retry row's `createdAt`/`updatedAt` record enqueue time. The `observation_history` contract no
+longer says a failed observation leaves the rest of its batch unaffected: the committed prefix stays
+and the failed envelope plus later siblings are queued as ordered retries, with `errored` rows
+written by `finishMaterializationSpan()`.
+
+A transaction-wide `RAISE(ROLLBACK)` differs: the whole span rolls back, prefix included, nothing
+is queued, the source baseline does not advance, and the single `errored` row comes from `tick()`'s
+ingest-error catch (or `consumeWatch()`'s outer catch, which also ends the watcher).
+
+## 2026-11-07 — Keep nested-only retry details visible in text explain (005) — Refs #496
+
+Text explain selects recognized materialization retry details when a partial compatibility report
+omits the optional top-level summary. It preserves structured omission, existing stage reasons and
+verdict, and canonical top-level precedence; available safe record details appear once. Empty or
+absent summaries and unrelated stage details do not fabricate or duplicate records.
+
+## 2026-11-07 — Reject unsupported persisted retry status (002) — Refs #495
+
+Retry diagnostics now fail explicitly before constructing a summary when an exact-route row
+contains an unsupported persisted status. Lifecycle remains `pending`/`terminal`; rows and private
+envelopes remain unchanged. The status TEXT annotation does not validate SQLite reads. The reducer
+previously allowed malformed values to corrupt summary fields; this does not establish a failure
+from supported writers. Owned on-disk regression tests cover `records`, `bytes`, `blocked`, reopen,
+valid totals, workspace isolation, and useful control-stripped diagnostic text. No new public API,
+status, schema policy, automatic repair, or arbitrary secret redaction is introduced.
+
+## 2026-11-07 — Preserve admission after native rollback and captured-source retry failures (002 §2/§15; 004 §3.4) — Refs #497
+
+Distinguish savepoint-local ABORT from SQLite ending the owning admission transaction. Rethrow the
+original materialization error before fallback retry/checkpoint writes when the native transaction
+is no longer active, preserving the complete replay baseline, held work and prior committed rows/cache.
+Require real later-sibling rollback tests with fresh and held spans, a nonempty prior recipient cache,
+forced-due reopen replay, and an ABORT suffix-retention control. Route retries for old debounce/rollup
+envelopes through their captured source after a source-type edit; preserve captured instructions,
+urgency, content and timestamps without transforming the source baseline. Transaction ownership
+remains package-private and the published API is unchanged.
+
 ## 2026-11-01 — Lock the complete rollup decision and admission (002 §4.4; 004 §3.4) — Refs #498
 
 Require not-due rollup checks to read their authoritative batch, marker, source checkpoint and

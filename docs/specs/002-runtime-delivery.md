@@ -130,7 +130,7 @@ turn-boundary (§9). None of the three is derivable from the others.
 > the source/observation surface ([003 §2.7](./003-source-plugins.md)).
 >
 > Verified: `libs/core/src/runtime/shape.ts` (`computeDerivedFacts` — pure over `(snapshot, now)`,
-> `now` injected, never an ambient clock) wired inside `processObservation`
+> `now` injected, never an ambient clock) wired inside `materializeObservation`
 > (`libs/core/src/runtime/service.ts` via `libs/core/src/runtime/shape-stage.ts`) before Diff. Proven
 > by `libs/core/src/runtime/shape.test.ts` (fixed-`now` purity: a crossed threshold yields exactly
 > `revealed`, one minute earlier none) and `libs/core/src/runtime/shape-stage.test.ts`.
@@ -197,7 +197,7 @@ Rules for the derived-facts step:
 >
 > Verified: `libs/core/src/runtime/shape.ts` (`renderArtifact` — byte-stable, sorted keys, facts in
 > authored order) and `libs/core/src/runtime/diff.ts` (`renderShapeArtifact`); when `shape` is
-> declared, `processObservation` (`libs/core/src/runtime/service.ts`) diffs the rendered artifact, not
+> declared, `materializeObservation` (`libs/core/src/runtime/service.ts`) diffs the rendered artifact, not
 > the raw source. Proven by `libs/core/src/runtime/shape.test.ts` (same shaped state → byte-identical
 > artifact → no phantom diff; one crossed threshold → exactly one added `revealed` line) and
 > `libs/core/src/runtime/shape-stage.test.ts` (the same, end-to-end through a runtime tick: identical
@@ -264,7 +264,7 @@ Rules for the render-then-diff step:
 >
 > Verified: `libs/core/src/runtime/transform.ts` (`applyPayloadTransform` — `jq` reshapes the
 > delivered payload, a `cel` gate of `false` suppresses delivery entirely) wired into
-> `processObservation` (`libs/core/src/runtime/service.ts`), and the stable exported `PayloadForm`
+> `materializeObservation` (`libs/core/src/runtime/service.ts`), and the stable exported `PayloadForm`
 > type (`prose | structured | artifact | rendered`). Both evaluators are CSP/Workers-safe (no
 > `Function`/`eval`): `jq-in-the-browser` and `cel-js`. Proven by
 > `libs/core/src/runtime/transform.test.ts` (a `jq` projection yields the projected fields; a `cel`
@@ -578,7 +578,7 @@ verdict fanned).
 
 Verified: `libs/core/src/adapter/interpret.ts` — `InterpretAdapter` interface and
 `createClaudeInterpretAdapter` (the host-specific `claude -p` argv-only invocation, behind the
-adapter boundary); `libs/core/src/runtime/service.ts` — `processObservation` invokes the stage only
+adapter boundary); `libs/core/src/runtime/service.ts` — `interpretMaterializedObservation` invokes the stage only
 for `payload.form: prose` and only when an adapter is injected, `runInterpret` records each
 per-recipient verdict and falls back on failure; `libs/core/src/runtime/store.ts` —
 `recordInterpretDecision` plus the `notInterpretSuppressed` delivery exclusion;
@@ -609,6 +609,18 @@ Earlier successful siblings remain events; the failed envelope and every later s
 bounded outbox before source/notify state advances. If outbox admission or the state write fails,
 the outer transaction rolls back the batch and retains the prior source baseline. Interpret and
 audit writes run best-effort only after that durable boundary.
+
+Suffix retry admission applies only while the owning SQLite transaction is still active after
+an envelope failure. A savepoint-local `RAISE(ABORT)` may retain an earlier successful prefix
+and queue the suffix. A transaction-wide `RAISE(ROLLBACK)` instead aborts the entire span:
+the runtime **MUST** rethrow the original materialization error before any fallback retry or
+checkpoint write. It must not start a replacement transaction to retain only the suffix after
+the prefix has disappeared. Prior committed events/projections and the recipient cache survive;
+the prior source checkpoint and held notify envelopes remain available for complete replay.
+The native liveness predicate belongs to the same private SQLite connection as the registered
+package-private transaction runner; it is not a source/plugin hook or a public transaction mode.
+Verified by the real SQLite rollback/ABORT, nonempty committed-cache and forced-due reopen cases
+in `poll-admission.test.ts`.
 
 The complete finite span **MUST** be committed before the first Interpret invocation: all successful
 events, every recipient projection/cursor seed, sequential object snapshots (including empty text),
@@ -1111,7 +1123,7 @@ immediate SQLite transaction or all roll back. Optional Interpret work begins on
 transaction commits and remains best-effort; an Interpret failure cannot undo the deterministic
 artifact.
 
-Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()` / `processObservation()`;
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`;
 `libs/core/src/runtime/store.ts` — `insertEvent()`; and
 `libs/core/src/runtime/transactional-materialization.test.ts`.
 
@@ -1131,7 +1143,7 @@ If an emitted observation omits fields, the runtime **MUST** derive them as foll
   `queryScope` so the source-agnostic lifecycle is filterable without each source duplicating it.
 - `snapshotMetadata`: observation `snapshot`, otherwise `{}`
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()`.
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`.
 
 ### 5.2 Snapshots and diffs
 
@@ -1180,7 +1192,7 @@ This makes snapshot history an object-level concern rather than a monitor-level 
 
 > **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
 >
-> Verified: `libs/core/src/runtime/service.ts` — `processObservation()`;
+> Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`;
 > `libs/core/src/runtime/event-title.test.ts` (the core rule) and
 > `apps/cli/src/commands/event-title-transports.test.ts` (the same title on both transports).
 
@@ -1884,6 +1896,13 @@ single typed `observedAt` Date. Class/built-in instances remain outside this sup
 if their prototypes have been replaced. Enqueue rejects detectable domain violations (including
 BigInt, negative zero, nested Dates, proxies, accessors, cycles, and intrinsic object brands exposed
 by Node) with a domain error before database mutation.
+When an already-held debounce or rollup envelope fails materialization after a source-type
+edit, retry admission **MUST** derive its source route from that captured envelope, just as
+materialization does. The current definition must not replace the captured source, instructions,
+effective urgency, observation content or timestamp. This routing rule does not reinterpret or
+transform the source-owned opaque baseline. Verified by source-edit fault/success controls in
+`poll-admission.test.ts`.
+
 The full envelope is validated before route fields are read. Proxies, including revoked proxies,
 are rejected before their traps can run; route accessors are rejected without invoking their getters.
 Date detection uses an intrinsic brand check rather than traversing prototype chains, so an
@@ -1907,9 +1926,13 @@ restored as a Date; a string timestamp is not an accepted substitute. A batch
 enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
 workspace or monitor has independent capacity.
 
-New records first become due after at least 1 second. Because retry timestamps are persisted at
-whole-second precision, deadlines round upward to the next representable second, never downward:
-admission at `12:00:00.850` becomes due at `12:00:02.000`. This can add less than one second to a
+New records first become due after at least 1 second, measured from the instant the retry is
+enqueued (_current_): backoff starts after source acquisition and prefix materialization, not at the
+tick's start. An observation taken at `12:00:00.000` and admitted at `12:00:03.850` first becomes
+due at `12:00:05.000`. Observation, event, envelope, source and notify timestamps remain
+observation-time provenance and are never rewritten to repair the deadline. Because retry
+timestamps are persisted at whole-second precision, deadlines round upward to the next
+representable second, never downward: admission at `12:00:00.850` becomes due at `12:00:02.000`. A retry row's `createdAt`/`updatedAt` record enqueue time. This can add less than one second to a
 backoff, but must not shorten it. `last_error` is a single-line diagnostic: C0/C1 controls, DEL and
 Unicode line/paragraph separators are replaced with spaces, then the result is capped at 1,024
 characters. The same rule applies at admission and every failed-attempt update.
@@ -1967,6 +1990,12 @@ monitor id; each summary orders records by `(createdAt, id)` and includes exact 
 Outbox discovery is not capped by the per-monitor 256-row limit: one full outbox cannot hide another.
 Every summary excludes other workspaces and NULL-scope records unless that exact scope is requested
 at the store boundary. Diagnostic reads never re-arm, discard, observe or materialize retained work.
+
+Only `pending` and `terminal` are supported lifecycle values. If an exact-route summary encounters
+an unsupported persisted status (for example `records`, `bytes`, or `blocked`), it **MUST** fail
+explicitly before constructing summary data, with a bounded diagnostic that does not echo the stored
+value. It **MUST NOT** skip or relabel the row or return fabricated healthy totals. The row and its
+private envelope remain unchanged; this adds no lifecycle value or automatic repair behavior.
 
 Report additions remain optional for older-daemon compatibility. _Current:_ core retry metadata
 reports, CLI text/JSON rendering, and socket Date revival for explain, attached doctor summaries,
@@ -2094,10 +2123,21 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Two sub-cases:
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
-  - A single dispatched observation failed to materialize inside `ingest()` (tick or watch path,
-    e.g. an event, projection/cursor, or snapshot write error): that observation's entire
-    materialization transaction rolls back, the batch's other observations are unaffected, and
-    `emittedEventIds` reflects only durably committed events.
+  - A dispatched observation failed to materialize. The same rows are written whether the span
+    came from `ingest()` (tick or watch path) or from the not-due notify-window flush
+    (`materializeSpan()`). The outcome depends on the failure kind (ordered retry suffix and
+    admission-unit rules: §2):
+    - _Savepoint-local failure_ (e.g. `RAISE(ABORT)` on an event, projection/cursor or snapshot
+      write): that envelope's own materialization rolls back, the earlier committed prefix stays,
+      and the failed envelope plus every later sibling are queued, in order, as retries.
+      `emittedEventIds` reflects only durably committed events. `finishMaterializationSpan()`
+      writes one `errored` row for the failed envelope after the span commits; the deferred later
+      siblings get none.
+    - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
+      and nothing is queued. The source baseline does not advance. The single `errored` row comes
+      from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
+      catch, which also ends that watcher. The not-due flush's own catch is best-effort and
+      records no row.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
 
@@ -2111,7 +2151,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `ingest()` per-observation materialization catch, `ingest()` `sourceOutcome` classification, and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 An observation tick always runs for one concrete workspace, so each row records
 its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and
@@ -2132,7 +2172,7 @@ re-baseline above).
 | `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| no-files-matched \| errored \| rebaselined` |
 | `created_at`       | INTEGER NOT NULL |                                                                                      |
 
-Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `ingest()` per-observation catch, `ingest()` result classification, and `consumeWatch()` inner catch block.
+Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()` inner catch block.
 
 ### `inbox_items`
 

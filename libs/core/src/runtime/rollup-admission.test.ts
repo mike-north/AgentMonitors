@@ -227,13 +227,17 @@ function beforeAdmission(
   competingCommit: () => void,
 ) {
   let ran = false;
-  registerRuntimeTransaction(f.store, (operation) => {
-    if (!ran) {
-      ran = true;
-      competingCommit();
-    }
-    return f.writer.client.transaction(operation).immediate();
-  });
+  registerRuntimeTransaction(
+    f.store,
+    (operation) => {
+      if (!ran) {
+        ran = true;
+        competingCommit();
+      }
+      return f.writer.client.transaction(operation).immediate();
+    },
+    () => f.writer.client.inTransaction,
+  );
   return () => expect(ran).toBe(true);
 }
 

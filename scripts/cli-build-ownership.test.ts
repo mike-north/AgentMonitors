@@ -15,9 +15,9 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { REPO_ROOT } from './publish-release-packages.mjs';
 
-/** A test process starting a package build; test sources have no other reason to do this. */
+/** Package builds belong to Nx, including private fixture builds via promisified execFile. */
 const BUILD_INVOCATION =
-  /\b(?:exec|execFile|execFileSync|execSync|spawn|spawnSync)\(\s*['"`](?:tsup\b|(?:pnpm|npm|npx|nx)\b[^)]*?\bbuild\b)/;
+  /\b(?:exec|execFile|execFileSync|execSync|spawn|spawnSync)\(\s*['"`](?:tsup\b|(?:pnpm|npm|npx|nx)\b[^)]*?\bbuild\b)|\bexecute\(\s*['"]pnpm['"]\s*,\s*\[\s*['"]exec['"]\s*,\s*['"]tsup['"]/;
 
 function trackedTestSources(): string[] {
   return execFileSync(
@@ -67,6 +67,28 @@ describe('CLI build ownership', () => {
       "failingChecks: ['build']",
     ]) {
       expect(unrelated).not.toMatch(BUILD_INVOCATION);
+    }
+  });
+
+  it('rejects a promisified pnpm exec tsup fixture build', () => {
+    // Section 2.9 forbids test-owned package builds even with a private out-dir.
+    const invocation = `const execute = promisify(execFile);
+await execute('pnpm', ['exec', 'tsup', '--out-dir', output], {
+  cwd: packageRoot,
+  timeout: 30000,
+});`;
+
+    expect(invocation).toMatch(BUILD_INVOCATION);
+  });
+
+  it('allows non-build subprocesses through the promisified alias', () => {
+    for (const invocation of [
+      "execute('pnpm', ['exec', 'vitest', 'run'])",
+      "execute('pnpm', ['exec', 'tsup-info'])",
+      "execute('node', ['exec', 'tsup'])",
+      "execute(process.execPath, [cli, 'doctor'])",
+    ]) {
+      expect(invocation).not.toMatch(BUILD_INVOCATION);
     }
   });
 

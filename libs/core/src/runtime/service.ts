@@ -43,7 +43,10 @@ import {
   netCollapseGroupKey,
 } from './store.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
-import { runRuntimeTransaction } from './runtime-transaction.js';
+import {
+  rethrowIfRuntimeTransactionAborted,
+  runRuntimeTransaction,
+} from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   DeclareEphemeralMonitorInput,
@@ -604,7 +607,6 @@ interface MaterializationSpanOptions {
   /** Raw source count before shaping/pacing, used only for audit classification. */
   observed: number;
   workspacePath: string;
-  retryQueuedAt: Date;
   nextMonitorState: {
     sourceState?: unknown;
     notifyState: NotifyRuntimeState;
@@ -2989,7 +2991,7 @@ export class AgentMonitorRuntime {
     // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
     // and are never counted as emitted in the audit history row.  Running it
-    // inside processObservation (after dispatch) was incorrect: the history row
+    // after dispatch (during materialization) was incorrect: the history row
     // would say `triggered` even though no event was ever materialized.
     const passedObservations = observations.filter((obs) => {
       const shaped = shapeObservation(obs, now, {
@@ -3031,7 +3033,6 @@ export class AgentMonitorRuntime {
           notifyState: dispatch.nextState,
           lastObservationAt: now,
         },
-        retryQueuedAt: now,
         ...(options.sourceOutcome
           ? { sourceOutcome: options.sourceOutcome }
           : {}),
@@ -3071,7 +3072,6 @@ export class AgentMonitorRuntime {
       const options: MaterializationSpanOptions = {
         observed: 0,
         workspacePath,
-        retryQueuedAt: now,
         nextMonitorState: {
           sourceState: current.sourceState,
           notifyState: dispatch.nextState,
@@ -3139,6 +3139,7 @@ export class AgentMonitorRuntime {
           });
         }
       } catch (materializeError) {
+        rethrowIfRuntimeTransactionAborted(this.store, materializeError);
         deferRemaining = true;
         failures.push({
           envelope,
@@ -3149,15 +3150,17 @@ export class AgentMonitorRuntime {
     }
 
     if (failures.length > 0) {
+      // The store's default clock starts backoff at enqueue, after acquisition
+      // and prefix materialization. Tick/envelope time is observation provenance
+      // and must not consume the initial delay or be rewritten to repair it.
       this.store.enqueueMaterializationRetries(
         failures.map((failure) => ({
           workspacePath: options.workspacePath,
           monitorId: monitor.id,
-          sourceName: monitor.frontmatter.watch.type,
+          sourceName: failure.envelope.monitor.frontmatter.watch.type,
           envelope: failure.envelope,
           error: failure.message,
         })),
-        options.retryQueuedAt,
       );
     }
 
@@ -3744,24 +3747,13 @@ export class AgentMonitorRuntime {
     return { emitted: [], nextState };
   }
 
-  private async processObservation(input: ProcessObservationInput) {
-    const materialized = this.materializeObservation(input);
-    if (!materialized) return null;
-
-    const { event, diffText } = materialized;
-    // Interpret runs only after the deterministic event, every recipient
-    // projection/cursor seed, and the snapshot have committed atomically.
-    if (
-      input.monitor.frontmatter.payload?.form === 'prose' &&
-      this.interpretAdapter
-    ) {
-      await this.runInterpret(input.monitor, event, diffText);
-    }
-
-    return event;
-  }
-
-  /** Commit the deterministic materialization boundary before optional Interpret. */
+  /**
+   * Stage one observation's event, recipient projections, cursor seeds and
+   * snapshot inside the caller's span transaction (the event insert uses its
+   * own nested savepoint in `store.ts`; the outer transaction commits). It
+   * neither commits nor invokes Interpret: optional Interpret runs only after
+   * that commit, in `interpretMaterializedObservation`.
+   */
   private materializeObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
