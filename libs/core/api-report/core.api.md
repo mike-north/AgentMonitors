@@ -1298,6 +1298,7 @@ export class RuntimeStore {
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    pendingEventIdsOutsideDefinition(monitorId: string, workspacePath: string | null, currentFingerprint: string): string[];
     // (undocumented)
     pendingEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
     perRecipientDiffsForAllSessions(sessionIds: string[], eventId: string): Map<string, string>;
