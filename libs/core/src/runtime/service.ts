@@ -3769,7 +3769,13 @@ export class AgentMonitorRuntime {
     return { emitted: [], nextState };
   }
 
-  /** Commit the deterministic materialization boundary before optional Interpret. */
+  /**
+   * Stage one observation's event, recipient projections, cursor seeds and
+   * snapshot inside the caller's span transaction (`admitSpan` runs it under a
+   * savepoint; the outer transaction commits). It neither commits nor invokes
+   * Interpret: optional Interpret runs only after that commit, in
+   * `interpretMaterializedObservation`.
+   */
   private materializeObservation(input: ProcessObservationInput) {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 

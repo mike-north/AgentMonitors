@@ -2158,7 +2158,7 @@ Handle it.
   // and asserts the persisted diffText is structural (a `~ changed` entry),
   // not the line-diff `-/+ 1:` output buildTextDiff would produce for a
   // single-line compact-JSON snapshot.
-  it('renders a structural json-diff diffText for a real observation routed through processObservation', async () => {
+  it('renders a structural json-diff diffText for a real observation routed through materializeObservation', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');
