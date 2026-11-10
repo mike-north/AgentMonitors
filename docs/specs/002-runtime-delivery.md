@@ -130,7 +130,7 @@ turn-boundary (§9). None of the three is derivable from the others.
 > the source/observation surface ([003 §2.7](./003-source-plugins.md)).
 >
 > Verified: `libs/core/src/runtime/shape.ts` (`computeDerivedFacts` — pure over `(snapshot, now)`,
-> `now` injected, never an ambient clock) wired inside `processObservation`
+> `now` injected, never an ambient clock) wired inside `materializeObservation`
 > (`libs/core/src/runtime/service.ts` via `libs/core/src/runtime/shape-stage.ts`) before Diff. Proven
 > by `libs/core/src/runtime/shape.test.ts` (fixed-`now` purity: a crossed threshold yields exactly
 > `revealed`, one minute earlier none) and `libs/core/src/runtime/shape-stage.test.ts`.
@@ -197,7 +197,7 @@ Rules for the derived-facts step:
 >
 > Verified: `libs/core/src/runtime/shape.ts` (`renderArtifact` — byte-stable, sorted keys, facts in
 > authored order) and `libs/core/src/runtime/diff.ts` (`renderShapeArtifact`); when `shape` is
-> declared, `processObservation` (`libs/core/src/runtime/service.ts`) diffs the rendered artifact, not
+> declared, `materializeObservation` (`libs/core/src/runtime/service.ts`) diffs the rendered artifact, not
 > the raw source. Proven by `libs/core/src/runtime/shape.test.ts` (same shaped state → byte-identical
 > artifact → no phantom diff; one crossed threshold → exactly one added `revealed` line) and
 > `libs/core/src/runtime/shape-stage.test.ts` (the same, end-to-end through a runtime tick: identical
@@ -264,7 +264,7 @@ Rules for the render-then-diff step:
 >
 > Verified: `libs/core/src/runtime/transform.ts` (`applyPayloadTransform` — `jq` reshapes the
 > delivered payload, a `cel` gate of `false` suppresses delivery entirely) wired into
-> `processObservation` (`libs/core/src/runtime/service.ts`), and the stable exported `PayloadForm`
+> `materializeObservation` (`libs/core/src/runtime/service.ts`), and the stable exported `PayloadForm`
 > type (`prose | structured | artifact | rendered`). Both evaluators are CSP/Workers-safe (no
 > `Function`/`eval`): `jq-in-the-browser` and `cel-js`. Proven by
 > `libs/core/src/runtime/transform.test.ts` (a `jq` projection yields the projected fields; a `cel`
@@ -578,7 +578,7 @@ verdict fanned).
 
 Verified: `libs/core/src/adapter/interpret.ts` — `InterpretAdapter` interface and
 `createClaudeInterpretAdapter` (the host-specific `claude -p` argv-only invocation, behind the
-adapter boundary); `libs/core/src/runtime/service.ts` — `processObservation` invokes the stage only
+adapter boundary); `libs/core/src/runtime/service.ts` — `interpretMaterializedObservation` invokes the stage only
 for `payload.form: prose` and only when an adapter is injected, `runInterpret` records each
 per-recipient verdict and falls back on failure; `libs/core/src/runtime/store.ts` —
 `recordInterpretDecision` plus the `notInterpretSuppressed` delivery exclusion;
@@ -1105,7 +1105,7 @@ immediate SQLite transaction or all roll back. Optional Interpret work begins on
 transaction commits and remains best-effort; an Interpret failure cannot undo the deterministic
 artifact.
 
-Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()` / `processObservation()`;
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`;
 `libs/core/src/runtime/store.ts` — `insertEvent()`; and
 `libs/core/src/runtime/transactional-materialization.test.ts`.
 
@@ -1125,7 +1125,7 @@ If an emitted observation omits fields, the runtime **MUST** derive them as foll
   `queryScope` so the source-agnostic lifecycle is filterable without each source duplicating it.
 - `snapshotMetadata`: observation `snapshot`, otherwise `{}`
 
-Verified: `libs/core/src/runtime/service.ts` — `processObservation()`.
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`.
 
 ### 5.2 Snapshots and diffs
 
@@ -1174,7 +1174,7 @@ This makes snapshot history an object-level concern rather than a monitor-level 
 
 > **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
 >
-> Verified: `libs/core/src/runtime/service.ts` — `processObservation()`;
+> Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`;
 > `libs/core/src/runtime/event-title.test.ts` (the core rule) and
 > `apps/cli/src/commands/event-title-transports.test.ts` (the same title on both transports).
 
