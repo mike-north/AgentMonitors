@@ -52,6 +52,10 @@ interface EditOptions {
   interval?: string;
   /** Replaces the lines after `watch.type` verbatim (indentation included). */
   watchLines?: string;
+  /** The monitor's `name`; defaults to `Edit monitor`. */
+  name?: string;
+  /** Extra top-level frontmatter lines (`shape:`, `payload:`, ...), verbatim. */
+  extraFrontmatter?: string;
 }
 
 interface Fixture {
@@ -85,6 +89,8 @@ function createFixture(
   let currentSettle = '30s';
   let currentInterval: string | undefined;
   let currentWatchLines: string | undefined;
+  let currentName = 'Edit monitor';
+  let currentExtra = '';
   const edit = (
     urgency: string,
     body: string,
@@ -94,12 +100,14 @@ function createFixture(
     currentSettle = options.settleFor ?? currentSettle;
     currentInterval = options.interval ?? currentInterval;
     currentWatchLines = options.watchLines ?? currentWatchLines;
+    currentName = options.name ?? currentName;
+    currentExtra = options.extraFrontmatter ?? currentExtra;
     const watchLines =
       currentWatchLines ??
       `  command: ${currentCommand}\n${currentInterval ? `  interval: ${currentInterval}\n` : ''}`;
     writeFileSync(
       path.join(monitorDir, 'MONITOR.md'),
-      `---\nname: Edit monitor\nwatch:\n  type: ${SOURCE_NAME}\n${watchLines}notify:\n  strategy: debounce\n  settle-for: ${currentSettle}\nurgency: ${urgency}\n---\n${body}\n`,
+      `---\nname: ${currentName}\nwatch:\n  type: ${SOURCE_NAME}\n${watchLines}notify:\n  strategy: debounce\n  settle-for: ${currentSettle}\nurgency: ${urgency}\n${currentExtra}---\n${body}\n`,
       'utf-8',
     );
   };
@@ -441,6 +449,33 @@ describe('explain reports pending events that predate the current definition (is
       /1 pending event\(s\) in total predate/,
     );
   });
+
+  // 002 §5.3 lists these top-level fields as part of what an event is: each one
+  // changes the delivered title, the stored snapshot/diff/payload, or how a
+  // catch-up span is collapsed. Editing only that field must flag the event.
+  it.each([
+    ['name', { name: 'Renamed monitor' }],
+    ['shape', { extraFrontmatter: 'shape:\n  render: rendered\n' }],
+    ['payload', { extraFrontmatter: 'payload:\n  form: rendered\n' }],
+    [
+      'baseline-strategy',
+      { extraFrontmatter: 'baseline-strategy: incremental\n' },
+    ],
+  ] satisfies [string, EditOptions][])(
+    'flags an edit that changes only %s',
+    async (_field, change) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(START);
+      const fixture = createFixture({ urgency: 'normal', body: 'SAME.' });
+      const { runtime } = fixture.openRuntime();
+      await materialize(fixture, runtime, 'command-a');
+
+      fixture.edit('normal', 'SAME.', change);
+      expect((await deliveryStage(fixture, runtime)).reason).toMatch(
+        /1 pending event\(s\) in total predate/,
+      );
+    },
+  );
 
   it('counts only the explained workspace’s stale events when two workspaces share a monitor id', async () => {
     vi.useFakeTimers();
