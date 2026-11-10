@@ -44,16 +44,23 @@ afterEach(() => {
   }
 });
 
+/** What a test may change in the monitor's frontmatter besides urgency and body. */
+interface EditOptions {
+  command?: string;
+  settleFor?: string;
+  /** `watch.interval`, a scheduling key read by the engine, not the source. */
+  interval?: string;
+  /** Replaces the lines after `watch.type` verbatim (indentation included). */
+  watchLines?: string;
+}
+
 interface Fixture {
   rootDir: string;
+  dbPath: string;
   monitorsDir: string;
   /** What the scripted source will report on its next observation, then clear. */
   emit(command: string): void;
-  edit(
-    urgency: string,
-    body: string,
-    options?: { command?: string; settleFor?: string },
-  ): void;
+  edit(urgency: string, body: string, options?: EditOptions): void;
   openRuntime(): { runtime: AgentMonitorRuntime; sessionId: string };
 }
 
@@ -62,7 +69,10 @@ interface Fixture {
  * `payload.command`, standing in for the command-poll output the dogfood report
  * saw; its `objectKey` is that command, as command-poll's default is.
  */
-function createFixture(initial: { urgency: string; body: string }): Fixture {
+function createFixture(
+  initial: { urgency: string; body: string },
+  sharedDbPath?: string,
+): Fixture {
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-451-'));
   tempDirs.push(rootDir);
   const monitorsDir = path.join(rootDir, '.claude', 'monitors');
@@ -73,16 +83,23 @@ function createFixture(initial: { urgency: string; body: string }): Fixture {
   // editing it goes through the real parser like any other MONITOR.md edit.
   let currentCommand = 'command-a';
   let currentSettle = '30s';
+  let currentInterval: string | undefined;
+  let currentWatchLines: string | undefined;
   const edit = (
     urgency: string,
     body: string,
-    options: { command?: string; settleFor?: string } = {},
+    options: EditOptions = {},
   ): void => {
     currentCommand = options.command ?? currentCommand;
     currentSettle = options.settleFor ?? currentSettle;
+    currentInterval = options.interval ?? currentInterval;
+    currentWatchLines = options.watchLines ?? currentWatchLines;
+    const watchLines =
+      currentWatchLines ??
+      `  command: ${currentCommand}\n${currentInterval ? `  interval: ${currentInterval}\n` : ''}`;
     writeFileSync(
       path.join(monitorDir, 'MONITOR.md'),
-      `---\nname: Edit monitor\nwatch:\n  type: ${SOURCE_NAME}\n  command: ${currentCommand}\nnotify:\n  strategy: debounce\n  settle-for: ${currentSettle}\nurgency: ${urgency}\n---\n${body}\n`,
+      `---\nname: Edit monitor\nwatch:\n  type: ${SOURCE_NAME}\n${watchLines}notify:\n  strategy: debounce\n  settle-for: ${currentSettle}\nurgency: ${urgency}\n---\n${body}\n`,
       'utf-8',
     );
   };
@@ -113,9 +130,10 @@ function createFixture(initial: { urgency: string; body: string }): Fixture {
     },
   };
 
-  const dbPath = path.join(rootDir, 'agentmon.db');
+  const dbPath = sharedDbPath ?? path.join(rootDir, 'agentmon.db');
   return {
     rootDir,
+    dbPath,
     monitorsDir,
     emit(command) {
       pending = command;
@@ -131,7 +149,7 @@ function createFixture(initial: { urgency: string; body: string }): Fixture {
       );
       const session = runtime.openSession(
         claudeCodeAdapter.createSessionInput({
-          hostSessionId: 'claude-session-451',
+          hostSessionId: `claude-session-451-${path.basename(rootDir)}`,
           workspacePath: rootDir,
         }),
       );
@@ -380,6 +398,69 @@ describe('explain reports pending events that predate the current definition (is
     const stage = await deliveryStage(fixture, runtime, 1);
     expect(stage.reason).toMatch(/3 pending event\(s\) in total predate/);
     expect(stage.details?.['staleDefinitionEventIds']).toHaveLength(3);
+  });
+
+  it('does not flag an edit that only changes watch.interval, a scheduling key', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'normal', body: 'SAME.' });
+    const { runtime } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+
+    fixture.edit('normal', 'SAME.', { interval: '5m' });
+    expect((await deliveryStage(fixture, runtime)).reason).not.toMatch(
+      /predate/,
+    );
+  });
+
+  it('does not flag the same watch config rewritten with different key order and spacing', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'normal', body: 'SAME.' });
+    fixture.edit('normal', 'SAME.', {
+      watchLines:
+        '  command: command-a\n  zeta: [1, 2]\n  alpha:\n    x: 1\n    y: two\n',
+    });
+    const { runtime } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+
+    fixture.edit('normal', 'SAME.', {
+      watchLines:
+        '  alpha: { y:   two,   x: 1 }\n  zeta:\n    - 1\n    - 2\n  command:   command-a\n',
+    });
+    expect((await deliveryStage(fixture, runtime)).reason).not.toMatch(
+      /predate/,
+    );
+
+    // Array order is data, not formatting: reordering it IS a change.
+    fixture.edit('normal', 'SAME.', {
+      watchLines:
+        '  alpha: { y: two, x: 1 }\n  zeta: [2, 1]\n  command: command-a\n',
+    });
+    expect((await deliveryStage(fixture, runtime)).reason).toMatch(
+      /1 pending event\(s\) in total predate/,
+    );
+  });
+
+  it('counts only the explained workspace’s stale events when two workspaces share a monitor id', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const a = createFixture({ urgency: 'normal', body: 'OLD.' });
+    const b = createFixture({ urgency: 'normal', body: 'OLD.' }, a.dbPath);
+    const runtimeA = a.openRuntime().runtime;
+    const runtimeB = b.openRuntime().runtime;
+    await materialize(a, runtimeA, 'a-1');
+    await materialize(b, runtimeB, 'b-1');
+    await materialize(b, runtimeB, 'b-2');
+
+    a.edit('high', 'NEW.');
+    b.edit('high', 'NEW.');
+    expect((await deliveryStage(a, runtimeA)).reason).toMatch(
+      /1 pending event\(s\) in total predate/,
+    );
+    expect((await deliveryStage(b, runtimeB)).reason).toMatch(
+      /2 pending event\(s\) in total predate/,
+    );
   });
 
   it('opens a database created before the column existed: the old row is unknown, a new row is fingerprinted', async () => {

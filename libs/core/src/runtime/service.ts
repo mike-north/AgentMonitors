@@ -386,15 +386,41 @@ function canonicalize(value: unknown): unknown {
 }
 
 /**
+ * `watch` keys the scheduling engine reads to decide WHEN to observe, which no
+ * source reads to decide WHAT it observes. Each bundled poll source declares
+ * `interval` as "used by the scheduling engine, not by this plugin directly"
+ * (`source-api-poll`, `source-command-poll`, `source-incoming-changes`;
+ * `source-file-fingerprint` documents it as the observe interval), and
+ * `scheduleForMonitor` is the only reader. The `schedule` source's `cron` and
+ * `timezone` are NOT listed: the scheduler reads them too, but that source also
+ * writes them into its observation's payload and `objectKey`, so they shape what
+ * an event is.
+ */
+const SCHEDULING_ONLY_WATCH_KEYS: readonly string[] = ['interval'];
+
+/**
  * A short content fingerprint of the parts of a monitor's definition that decide
- * what an event IS: how it was observed and how it is presented (issue #451).
+ * what an event IS: how it was observed, what it carries, and how it is
+ * presented (issue #451).
  *
- * Included: `urgency` and `urgencyMax` (how the event is delivered), the body
- * (`instructions`, what the agent is told to do), and the whole `watch` block —
- * source name plus its configuration, as parsed, in canonical key order — because
- * a changed command, query or glob changes the payload and `objectKey` an event
- * carries. Excluded: fields that change neither the observation nor the delivered
- * text, such as `notify` timing, `tags` and the poll cadence.
+ * Included, with the reason each can change a stored or delivered event:
+ * - `urgency`, `urgencyMax`: the event's delivery urgency.
+ * - the body (`instructions`): the delivered body when the source supplies none.
+ * - `name`: the delivered title (`name` wins over the source's title, 002 §5.4).
+ * - `watch` minus {@link SCHEDULING_ONLY_WATCH_KEYS}: the source and its
+ *   configuration (command, query, globs, ...) decide the payload and `objectKey`.
+ * - `shape` and `payload`: derive facts, render the snapshot, and transform the
+ *   delivered payload before diffing, so they change the stored snapshot, diff
+ *   and payload.
+ * - `baselineStrategy`: stored on the event and decides how each recipient's
+ *   catch-up span is collapsed at delivery.
+ *
+ * Excluded because they change neither the observation nor the delivered text:
+ * `notify` (when events materialize, not what they contain), `tags` (a label
+ * used only to filter `events list`), and the scheduling keys above.
+ *
+ * Objects are hashed in canonical key order, so key order and whitespace in the
+ * source file do not matter; array order does.
  *
  * Persisted on each materialized event and recomputed from the CURRENT monitor in
  * `explainMonitor`, so the two can be compared without touching the event's own
@@ -404,12 +430,22 @@ function canonicalize(value: unknown): unknown {
  * @see docs/specs/002-runtime-delivery.md §5.3
  */
 function definitionFingerprint(monitor: MonitorDefinition): string {
+  const frontmatter = monitor.frontmatter;
+  const watch = Object.fromEntries(
+    Object.entries(frontmatter.watch).filter(
+      ([key]) => !SCHEDULING_ONLY_WATCH_KEYS.includes(key),
+    ),
+  );
   const material = JSON.stringify(
     canonicalize({
-      urgency: monitor.frontmatter.urgency,
-      urgencyMax: monitor.frontmatter.urgencyMax,
+      urgency: frontmatter.urgency,
+      urgencyMax: frontmatter.urgencyMax,
       instructions: monitor.instructions,
-      watch: monitor.frontmatter.watch,
+      name: frontmatter.name,
+      watch,
+      shape: frontmatter.shape,
+      payload: frontmatter.payload,
+      baselineStrategy: frontmatter.baselineStrategy,
     }),
   );
   return createHash('sha256').update(material).digest('hex').slice(0, 16);
