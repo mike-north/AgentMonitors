@@ -370,30 +370,48 @@ function effectiveObservationUrgency(
 }
 
 /**
- * A short content fingerprint of a monitor's DELIVERY-RELEVANT frontmatter —
- * `urgency`, `urgencyMax`, and `instructions` (the markdown body) — the same
- * fields `processObservation` already snapshots onto `MonitorEventRecord`'s
- * `urgency`/`title`/`body` at materialization time (issue #451).
+ * Sorts object keys recursively so equal values serialize identically whatever
+ * order, or whitespace, the author wrote them in.
+ */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * A short content fingerprint of the parts of a monitor's definition that decide
+ * what an event IS: how it was observed and how it is presented (issue #451).
  *
- * Persisted on each materialized event and recomputed fresh from the
- * CURRENTLY-scanned monitor in `explainMonitor`, so the two can be compared
- * WITHOUT re-deriving or mutating the event's own already-correct stored
- * fields — this is a read-only diagnostic aid, never a second source of
- * truth for delivery content.
+ * Included: `urgency` and `urgencyMax` (how the event is delivered), the body
+ * (`instructions`, what the agent is told to do), and the whole `watch` block —
+ * source name plus its configuration, as parsed, in canonical key order — because
+ * a changed command, query or glob changes the payload and `objectKey` an event
+ * carries. Excluded: fields that change neither the observation nor the delivered
+ * text, such as `notify` timing, `tags` and the poll cadence.
  *
- * Deliberately excludes fields that legitimately vary run-to-run without the
- * AUTHORED definition changing (e.g. `watch` scope tweaks that don't affect
- * what gets delivered) — narrowly scoped to the fields whose drift is exactly
- * what produced the #451 report (an edit that changes urgency and/or body).
+ * Persisted on each materialized event and recomputed from the CURRENT monitor in
+ * `explainMonitor`, so the two can be compared without touching the event's own
+ * stored fields. A read-only diagnostic aid, never a second source of truth for
+ * delivery content.
  *
  * @see docs/specs/002-runtime-delivery.md §5.3
  */
 function definitionFingerprint(monitor: MonitorDefinition): string {
-  const material = JSON.stringify({
-    urgency: monitor.frontmatter.urgency,
-    urgencyMax: monitor.frontmatter.urgencyMax,
-    instructions: monitor.instructions,
-  });
+  const material = JSON.stringify(
+    canonicalize({
+      urgency: monitor.frontmatter.urgency,
+      urgencyMax: monitor.frontmatter.urgencyMax,
+      instructions: monitor.instructions,
+      watch: monitor.frontmatter.watch,
+    }),
+  );
   return createHash('sha256').update(material).digest('hex').slice(0, 16);
 }
 
@@ -1571,33 +1589,22 @@ export class AgentMonitorRuntime {
 
       // Definition-drift diagnostic (issue #451): a pending (not yet
       // acknowledged by every recipient) event whose OWN stored
-      // `definitionFingerprint` differs from the monitor's CURRENT
-      // definition fingerprint was materialized under a since-edited
-      // urgency/body. This is not itself a bug — the event's own
-      // urgency/title/body are still exactly what was in force when it was
-      // observed (`processObservation` never re-derives them) — but an
-      // author debugging "why did this deliver at the OLD urgency/body"
-      // needs to be able to see that the definition has since changed. A
-      // `null` fingerprint (a legacy row from before this field existed) is
-      // "unknown," never flagged, to avoid a false positive against rows
-      // with no recorded baseline.
-      const pendingEventIds = new Set(
-        projections
-          .filter((projection) => projection.deliveryState !== 'acknowledged')
-          .map((projection) => projection.eventId),
+      // `definitionFingerprint` differs from the monitor's CURRENT fingerprint
+      // was observed under a since-edited definition (urgency, body, or the
+      // source and its config). Not itself a bug — the event still delivers with
+      // what was in force when it was observed — but an author debugging an
+      // unexpected delivery needs to see that the definition has changed. A
+      // `null` fingerprint (a row from before the field existed) is "unknown",
+      // never flagged. Counted over ALL pending events for the monitor, not the
+      // `eventLimit`-bounded list above, with a single synchronous query.
+      const staleEventIds = this.store.pendingEventIdsOutsideDefinition(
+        input.monitorId,
+        workspacePath,
+        definitionFingerprint(monitor),
       );
-      const currentFingerprint = definitionFingerprint(monitor);
-      const staleEventIds = events
-        .filter(
-          (event) =>
-            pendingEventIds.has(event.id) &&
-            event.definitionFingerprint != null &&
-            event.definitionFingerprint !== currentFingerprint,
-        )
-        .map((event) => event.id);
       const staleSuffix =
         staleEventIds.length > 0
-          ? ` ${String(staleEventIds.length)} pending event(s) predate the monitor's current definition (its urgency and/or body have changed since these were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one.`
+          ? ` ${String(staleEventIds.length)} pending event(s) in total predate the monitor's current definition (its urgency, body or source configuration changed since they were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one.`
           : '';
 
       const deliveryDetails: Record<string, unknown> = { ...counts };

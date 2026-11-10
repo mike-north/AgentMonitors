@@ -1649,6 +1649,48 @@ export class RuntimeStore {
     }));
   }
 
+  /**
+   * Ids of every pending event of a monitor, in one workspace, that was
+   * materialized under a definition other than `currentFingerprint` (issue #451).
+   *
+   * "Pending" means at least one recipient projection has not acknowledged the
+   * event. A row with a NULL fingerprint (materialized before the column existed)
+   * never matches: SQL `<>` against NULL is not true, which is the intended
+   * "unknown, never flagged" reading. Unlike `listEvents`, this is not bounded by
+   * a display limit, so the answer is a total.
+   */
+  pendingEventIdsOutsideDefinition(
+    monitorId: string,
+    workspacePath: string | null,
+    currentFingerprint: string,
+  ): string[] {
+    const workspaceCondition =
+      workspacePath === null
+        ? isNull(monitorEvents.workspacePath)
+        : or(
+            eq(monitorEvents.workspacePath, workspacePath),
+            isNull(monitorEvents.workspacePath),
+          );
+    return asInternalDb(this.db)
+      .selectDistinct({ id: monitorEvents.id })
+      .from(monitorEvents)
+      .innerJoin(
+        sessionEventState,
+        eq(sessionEventState.eventId, monitorEvents.id),
+      )
+      .where(
+        and(
+          eq(monitorEvents.monitorId, monitorId),
+          workspaceCondition,
+          ne(monitorEvents.definitionFingerprint, currentFingerprint),
+          isNull(sessionEventState.acknowledgedAt),
+        ),
+      )
+      .orderBy(asc(monitorEvents.id))
+      .all()
+      .map((row) => row.id);
+  }
+
   listDeliveryProjectionsForMonitor(
     monitorId: string,
     workspacePath?: string,
