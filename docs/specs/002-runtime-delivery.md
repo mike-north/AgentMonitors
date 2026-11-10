@@ -1173,6 +1173,39 @@ This makes snapshot history an object-level concern rather than a monitor-level 
 > `session_event_state.diff_text`; the shared object-level diff here is its degenerate
 > single-baseline case (a recipient at the shared baseline gets a byte-identical span).
 
+### 5.3 Pending events keep the semantics they were observed under
+
+> **Status: current.** Resolves issue [#451](https://github.com/mike-north/AgentMonitors/issues/451).
+
+Editing a monitor's `MONITOR.md` (raising `urgency`, rewriting the body, narrowing a
+`command-poll` filter) is routine, and an edit can land while events from the old definition are
+still pending or while an observation is held in a notify batch.
+
+**Contract.** A monitor event is delivered with the `urgency`, `title` and `body` it was
+materialized under. An edit changes what _future_ observations produce; it never changes an event
+already stored, and it never changes whether that event interrupts a turn. An observation held in a
+debounce/rollup batch across the edit materializes under the definition it was observed under,
+because the batch stores the whole definition snapshot with each observation.
+
+This holds because of how the runtime is built, not because of a special case:
+
+- `processObservation` writes `urgency`, `title` and `body` onto the `monitor_events` row from the
+  observation's stored definition snapshot, and no code path updates those columns afterwards.
+- Every delivery surface (the `turn-interruptible`/`turn-idle`/`post-compact` claims, the hook and
+  channel renderers, hook state, `events` output) renders the stored row, its stored digests and its
+  per-recipient diff. None re-reads the live definition. The live definition is read only to decide
+  _when_ to observe and for `explain`/`scan` display.
+- Observation, event and source timestamps stay as provenance.
+
+**Diagnostic.** Each row also stores `definition_fingerprint`, a short hash of the definition's
+`urgency`, `urgencyMax` and body at materialization (nullable, additive; `NULL` on rows from before
+the column existed). `monitor explain`'s delivery stage compares it with the current definition and
+reports how many pending events predate it, with their ids in
+`details.staleDefinitionEventIds`. `NULL` means unknown and is never reported. The diagnostic is
+read-only and never gates, delays or alters delivery.
+
+**Verified in:** `libs/core/src/runtime/definition-change.test.ts`.
+
 ### 5.4 Event title
 
 > **Status: current.** Resolves issue [#449](https://github.com/mike-north/AgentMonitors/issues/449).
