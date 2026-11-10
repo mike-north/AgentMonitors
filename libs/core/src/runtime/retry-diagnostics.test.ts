@@ -5,9 +5,10 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import { createDb } from '../inbox/db.js';
+import * as monitorScanning from '../parser/scan-monitors.js';
 import { SourceRegistry } from '../observation/registry.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
@@ -532,4 +533,217 @@ describe('#495 malformed persisted retry status', () => {
     });
     expect(durableRows(client)).toEqual(before);
   });
+});
+
+/**
+ * Spec 002's exact retry summaries must describe retained work committed while
+ * the same runtime awaits definition discovery. This tests one event-loop
+ * interleaving, not a cross-process or multi-connection snapshot guarantee.
+ */
+describe('#495 explain scan/admission coherence', () => {
+  /** A manually released scheduling boundary preserves real parser results. */
+  function barrier() {
+    let resolveBarrier: (() => void) | undefined;
+    const promise = new Promise<void>((resolve) => {
+      resolveBarrier = resolve;
+    });
+    return {
+      promise,
+      release() {
+        if (!resolveBarrier) throw new Error('Barrier was not initialized');
+        resolveBarrier();
+      },
+    };
+  }
+
+  /** Capture native durable evidence without reconstructing opaque retry data. */
+  function rawEvidence(client: BetterSQLiteClient) {
+    return {
+      retries: client
+        .prepare(
+          'SELECT *, hex(envelope) AS envelope_hex, hex(last_error) AS error_hex FROM materialization_retry_outbox ORDER BY id',
+        )
+        .all(),
+      states: client.prepare('SELECT * FROM monitor_state ORDER BY id').all(),
+      history: client
+        .prepare('SELECT * FROM observation_history ORDER BY id')
+        .all(),
+      events: client.prepare('SELECT * FROM monitor_events ORDER BY id').all(),
+    };
+  }
+
+  for (const kind of [
+    'valid',
+    'missing',
+    'parse',
+    'duplicate',
+    'schedule',
+  ] as const) {
+    for (const interleaved of [false, true]) {
+      it(`retains committed suffix metadata with ${kind} definition, ${interleaved ? 'admission during scan' : 'no interleaving'}`, async () => {
+        const root = mkdtempSync(
+          path.join(tmpdir(), 'explain-admission-owned-'),
+        );
+        directories.push(root);
+        const monitorsDir = path.join(root, 'explained');
+        const producerDir = path.join(root, 'producer');
+        definition(producerDir, 'valid');
+        definition(monitorsDir, kind);
+        const db = createDb(path.join(root, 'owned.sqlite'));
+        // Only this fixture owns the native connection used for independent
+        // persistence evidence; all writes below use supported public APIs.
+        const client = (db as unknown as { $client: BetterSQLiteClient })
+          .$client;
+        cleanups.push(() => client.close());
+        const store = new RuntimeStore(db);
+        const registry = new SourceRegistry();
+        let sourceCalls = 0;
+        registry.register({
+          name: 'test-source',
+          scopeSchema: { type: 'object' },
+          async observe() {
+            sourceCalls += 1;
+            return {
+              observations: [
+                {
+                  objectKey: 'prefix',
+                  title: 'Committed prefix',
+                  snapshotText: 'prefix',
+                },
+              ],
+              nextState: { opaque: { cursor: 'OPAQUE-SOURCE-STATE' } },
+            };
+          },
+        });
+        registry.register({
+          name: 'schedule',
+          scopeSchema: { type: 'object' },
+          async observe() {
+            throw new Error('Invalid-schedule diagnosis must not observe');
+          },
+        });
+        const runtime = new AgentMonitorRuntime(store, registry, []);
+        const realScan = monitorScanning.scanMonitors;
+        const captured = (await realScan(producerDir)).monitors[0]?.monitor;
+        if (!captured)
+          throw new Error('Expected a real parsed producer definition');
+        const entered = barrier();
+        const resume = barrier();
+        let scanHeld = false;
+        let prefixIds: string[] = [];
+        let retryId = '';
+        let expectedBytes = 0;
+        const admit = async () => {
+          const tick = await runtime.tick(producerDir, root);
+          expect(tick.emittedEventIds).toHaveLength(1);
+          expect(tick.erroredObservations).toEqual([]);
+          prefixIds = tick.emittedEventIds;
+          const row = store.enqueueMaterializationRetries(
+            [
+              {
+                workspacePath: root,
+                monitorId: captured.id,
+                sourceName: 'test-source',
+                error: 'retained suffix',
+                envelope: {
+                  monitor: captured,
+                  observation: {
+                    objectKey: 'suffix',
+                    title: 'Retained suffix',
+                    payload: { opaque: 'PRIVATE-RETRY-PAYLOAD' },
+                  },
+                  observedAt: NOW,
+                  effectiveUrgency: 'normal',
+                },
+              },
+            ],
+            NOW,
+          )[0];
+          if (!row)
+            throw new Error('Expected supported durable retry admission');
+          retryId = row.id;
+          expectedBytes = row.envelopeBytes;
+        };
+        if (!interleaved) await admit();
+        const scanSpy = vi
+          .spyOn(monitorScanning, 'scanMonitors')
+          .mockImplementationOnce(async (directory) => {
+            const parsed = await realScan(directory);
+            scanHeld = true;
+            entered.release();
+            await resume.promise;
+            return parsed;
+          });
+        try {
+          const explaining = runtime.explainMonitor({
+            monitorId: 'retained',
+            monitorsDir,
+            workspacePath: root,
+            now: NOW,
+          });
+          await entered.promise;
+          expect(scanHeld).toBe(true);
+          if (interleaved) await admit();
+          expect(sourceCalls).toBe(1);
+          const before = rawEvidence(client);
+          console.info(
+            'explain/admission durable before',
+            JSON.stringify({
+              kind,
+              interleaved,
+              retryId,
+              prefixIds,
+              rows: before,
+            }),
+          );
+          resume.release();
+          const report = await explaining;
+          const after = rawEvidence(client);
+          console.info(
+            'explain/admission result',
+            JSON.stringify({
+              kind,
+              interleaved,
+              retryId,
+              prefixIds,
+              report,
+              rowsAfter: after,
+            }),
+          );
+          expect(after).toEqual(before);
+          expect(sourceCalls).toBe(1);
+          expect(JSON.stringify(report)).not.toContain('PRIVATE-RETRY-PAYLOAD');
+          expect.soft(report.materializationRetries).toMatchObject({
+            pending: 1,
+            terminal: 0,
+            bytes: expectedBytes,
+          });
+          expect
+            .soft(report.materializationRetries?.records.map((row) => row.id))
+            .toEqual([retryId]);
+          if (kind === 'valid') {
+            expect(report.events.map((event) => event.id)).toEqual(prefixIds);
+            expect(report.observations).toHaveLength(1);
+            expect
+              .soft(
+                report.stages.find((stage) => stage.id === 'materialization'),
+              )
+              .toMatchObject({
+                status: 'pending',
+                details: { pending: 1, records: [{ id: retryId }] },
+              });
+          } else {
+            expect(report.events).toEqual([]);
+            expect(report.verdict).toMatchObject({
+              status: 'failure',
+              stage: kind === 'schedule' ? 'observation' : 'definition',
+            });
+          }
+        } finally {
+          resume.release();
+          scanSpy.mockRestore();
+        }
+      });
+    }
+  }
 });
