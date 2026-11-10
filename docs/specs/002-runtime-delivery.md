@@ -620,7 +620,8 @@ the prior source checkpoint and held notify envelopes remain available for compl
 The native liveness predicate belongs to the same private SQLite connection as the registered
 package-private transaction runner; it is not a source/plugin hook or a public transaction mode.
 Verified by the real SQLite rollback/ABORT, nonempty committed-cache and forced-due reopen cases
-in `poll-admission.test.ts`.
+in `poll-admission.test.ts`, and for a held not-due rollup flush (including an envelope captured
+before a parsed source edit) in `rollup-admission.test.ts`.
 
 The complete finite span **MUST** be committed before the first Interpret invocation: all successful
 events, every recipient projection/cursor seed, sequential object snapshots (including empty text),
@@ -2125,7 +2126,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
   - A dispatched observation failed to materialize. The same rows are written whether the span
     came from `ingest()` (tick or watch path) or from the not-due notify-window flush
-    (`materializeSpan()`). The outcome depends on the failure kind (ordered retry suffix and
+    (`flushRollupWindow()`). The outcome depends on the failure kind (ordered retry suffix and
     admission-unit rules: §2):
     - _Savepoint-local failure_ (e.g. `RAISE(ABORT)` on an event, projection/cursor or snapshot
       write): that envelope's own materialization rolls back, the earlier committed prefix stays,
@@ -2136,8 +2137,9 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
-      catch, which also ends that watcher. The not-due flush's own catch is best-effort and
-      records no row.
+      catch, which also ends that watcher. On the not-due flush it comes from the tick's
+      monitor-local flush catch, which reports the original native error (not a follow-on
+      `COMMIT` failure) and lets healthy siblings continue.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
 

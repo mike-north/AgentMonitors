@@ -459,6 +459,7 @@ uncommitted observation recovery, power-loss durability, or the pending material
 
 | Not-due rollup decisions use current state under the writer lock | Covered (`rollup-admission.test.ts` — controlled owned child runtimes commit competing not-due, due and watch admissions before BEGIN; no duplicate events/Interpret or checkpoint/time rewinds; same-minute newly held work survives). |
 | Rollup suffix, rollback and non-emitting admission are coherent | Covered (`rollup-admission.test.ts` — suspended first Interpret exposes exact prefix/suffix/marker; state/outbox failure restores all durable artifacts and cache, reopens for one flush; empty/closed-window failures preserve state and healthy sibling progress without routine audit spam). |
+| Native rollback in a held not-due rollup flush | Covered (`rollup-admission.test.ts` — a later-sibling trigger first proves the new prefix, snapshot and both projections exist in the same transaction, then real ROLLBACK leaves no event/snapshot/projection/cursor/retry, checkpoint or cleared hold; prior rows and a nonempty recipient cache survive, the original error is reported with one errored history row, no Interpret runs, and a forced-due reopen replays the whole held span once. Real ABORT retains prefix and ordered suffix. A hold captured before a parsed source/instructions/urgency edit keeps its captured route, content and urgency, and the opaque source baseline, through an ABORT flush and reopen). |
 
 ### 3.5 CLI behavior
 
