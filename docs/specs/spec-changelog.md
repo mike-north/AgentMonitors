@@ -18,6 +18,11 @@ Previously the runtime passed the tick's start time, so slow acquisition consume
 contract requires `12:00:05.000`). Observation, event, envelope, source and notify timestamps remain
 observation-time provenance. No public API, schema or retry-schedule change.
 
+A retry row's `createdAt`/`updatedAt` record enqueue time. The `observation_history` contract no
+longer says a failed observation leaves the rest of its batch unaffected: the committed prefix stays
+and the failed envelope plus later siblings are queued as ordered retries, with `errored` rows
+written by `finishMaterializationSpan()`.
+
 ## 2026-11-07 — Keep nested-only retry details visible in text explain (005) — Refs #496
 
 Text explain selects recognized materialization retry details when a partial compatibility report

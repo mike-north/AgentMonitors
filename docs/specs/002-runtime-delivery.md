@@ -1914,7 +1914,7 @@ tick's start. An observation taken at `12:00:00.000` and admitted at `12:00:03.8
 due at `12:00:05.000`. Observation, event, envelope, source and notify timestamps remain
 observation-time provenance and are never rewritten to repair the deadline. Because retry
 timestamps are persisted at whole-second precision, deadlines round upward to the next
-representable second, never downward: admission at `12:00:00.850` becomes due at `12:00:02.000`. This can add less than one second to a
+representable second, never downward: admission at `12:00:00.850` becomes due at `12:00:02.000`. A retry row's `createdAt`/`updatedAt` record enqueue time. This can add less than one second to a
 backoff, but must not shorten it. `last_error` is a single-line diagnostic: C0/C1 controls, DEL and
 Unicode line/paragraph separators are replaced with spaces, then the result is capped at 1,024
 characters. The same rule applies at admission and every failed-attempt update.
@@ -2105,10 +2105,12 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Two sub-cases:
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
-  - A single dispatched observation failed to materialize inside `ingest()` (tick or watch path,
-    e.g. an event, projection/cursor, or snapshot write error): that observation's entire
-    materialization transaction rolls back, the batch's other observations are unaffected, and
-    `emittedEventIds` reflects only durably committed events.
+  - A dispatched observation failed to materialize inside `ingest()` (tick or watch path, e.g. an
+    event, projection/cursor, or snapshot write error): that envelope's own materialization
+    rolls back, the earlier committed prefix stays, and the failed envelope plus every later
+    sibling are queued, in order, as retries (see the ordered retry suffix in §2 and the
+    admission-unit rules in §15). `emittedEventIds` reflects only durably committed events. The
+    `errored` row is written by `finishMaterializationSpan()` after the span commits.
 
   In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
 
@@ -2122,7 +2124,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `ingest()` per-observation materialization catch, `ingest()` `sourceOutcome` classification, and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 An observation tick always runs for one concrete workspace, so each row records
 its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and
@@ -2143,7 +2145,7 @@ re-baseline above).
 | `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| no-files-matched \| errored \| rebaselined` |
 | `created_at`       | INTEGER NOT NULL |                                                                                      |
 
-Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `ingest()` per-observation catch, `ingest()` result classification, and `consumeWatch()` inner catch block.
+Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()` inner catch block.
 
 ### `inbox_items`
 

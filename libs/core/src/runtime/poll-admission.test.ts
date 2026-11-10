@@ -1033,6 +1033,14 @@ describe('retry admission clock after asynchronous observation', () => {
       nextAttemptAt: '2026-11-01T12:00:02.000Z',
     },
     {
+      name: 'slow source with a sub-half-second admission fraction rounds up',
+      observedAt: '2026-11-01T12:00:00.000Z',
+      admittedAt: '2026-11-01T12:00:03.300Z',
+      persistedQueuedAt: '2026-11-01T12:00:03.000Z',
+      // 002: at least 1 s after enqueue (04.300), rounded up, never down.
+      nextAttemptAt: '2026-11-01T12:00:05.000Z',
+    },
+    {
       name: 'slow source across the initial backoff interval',
       observedAt: '2026-11-01T12:00:00.000Z',
       admittedAt: '2026-11-01T12:00:03.850Z',

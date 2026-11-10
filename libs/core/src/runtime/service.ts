@@ -3036,7 +3036,7 @@ export class AgentMonitorRuntime {
     // suppresses delivery entirely (002 §1.1.6). This check MUST run BEFORE
     // dispatchNotify so that suppressed observations never advance notify state
     // and are never counted as emitted in the audit history row.  Running it
-    // inside processObservation (after dispatch) was incorrect: the history row
+    // after dispatch (during materialization) was incorrect: the history row
     // would say `triggered` even though no event was ever materialized.
     const passedObservations = observations.filter((obs) => {
       const shaped = shapeObservation(obs, now, {
@@ -3767,23 +3767,6 @@ export class AgentMonitorRuntime {
       delete nextState.pendingRollup;
     }
     return { emitted: [], nextState };
-  }
-
-  private async processObservation(input: ProcessObservationInput) {
-    const materialized = this.materializeObservation(input);
-    if (!materialized) return null;
-
-    const { event, diffText } = materialized;
-    // Interpret runs only after the deterministic event, every recipient
-    // projection/cursor seed, and the snapshot have committed atomically.
-    if (
-      input.monitor.frontmatter.payload?.form === 'prose' &&
-      this.interpretAdapter
-    ) {
-      await this.runInterpret(input.monitor, event, diffText);
-    }
-
-    return event;
   }
 
   /** Commit the deterministic materialization boundary before optional Interpret. */
