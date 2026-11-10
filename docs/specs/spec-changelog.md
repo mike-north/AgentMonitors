@@ -17,7 +17,10 @@ reported escalation and body swap do not reproduce on current main; delivery ren
 event row on every surface, and a held debounce batch carries its own definition snapshot. Adds
 real-runtime regression scenarios (004 §2.5) and a read-only `explain` diagnostic backed by a
 nullable `monitor_events.definition_fingerprint` column that counts pending events predating the
-current definition. The diagnostic never gates delivery; rows without a fingerprint read as unknown.
+current definition. The fingerprint covers urgency, body and the source's parsed configuration
+(so a command or `--jq` edit is flagged, notify-timing edits are not), and the count is a total
+rather than bounded by the event limit. The diagnostic never gates delivery; rows without a
+fingerprint read as unknown.
 
 ## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
 

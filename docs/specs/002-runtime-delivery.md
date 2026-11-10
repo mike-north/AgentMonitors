@@ -1197,12 +1197,16 @@ This holds because of how the runtime is built, not because of a special case:
   _when_ to observe and for `explain`/`scan` display.
 - Observation, event and source timestamps stay as provenance.
 
-**Diagnostic.** Each row also stores `definition_fingerprint`, a short hash of the definition's
-`urgency`, `urgencyMax` and body at materialization (nullable, additive; `NULL` on rows from before
-the column existed). `monitor explain`'s delivery stage compares it with the current definition and
-reports how many pending events predate it, with their ids in
-`details.staleDefinitionEventIds`. `NULL` means unknown and is never reported. The diagnostic is
-read-only and never gates, delays or alters delivery.
+**Diagnostic.** Each row also stores `definition_fingerprint`, a short hash of the parts of the
+definition that decide what an event is, computed once at materialization (nullable, additive; `NULL`
+on rows from before the column existed). It covers `urgency`, `urgencyMax`, the body, and the whole
+`watch` block (source name plus its configuration as parsed, in canonical key order, so key order and
+whitespace do not matter), because a changed command, query or glob changes the payload and
+`objectKey` the event carries. It leaves out fields that change neither the observation nor the
+delivered text, such as `notify` timing and `tags`. `monitor explain`'s delivery stage compares it
+with the current definition and reports the **total** number of pending events that predate it (not
+bounded by `--limit`), with their ids in `details.staleDefinitionEventIds`. `NULL` means unknown and
+is never reported. The diagnostic is read-only and never gates, delays or alters delivery.
 
 **Verified in:** `libs/core/src/runtime/definition-change.test.ts`.
 
