@@ -728,6 +728,7 @@ export interface MonitorEventRecord {
     body: string;
     // (undocumented)
     createdAt: Date;
+    definitionFingerprint?: string | null;
     deliveryState?: MonitorDeliveryState;
     // (undocumented)
     diffText: string | null;

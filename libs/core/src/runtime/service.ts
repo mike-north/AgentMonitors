@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
@@ -366,6 +367,34 @@ function effectiveObservationUrgency(
   );
   // rank is clamped into [lo, hi] ⊆ [0, 2], so this lookup is always defined.
   return URGENCY_BY_RANK[rank] ?? lo;
+}
+
+/**
+ * A short content fingerprint of a monitor's DELIVERY-RELEVANT frontmatter —
+ * `urgency`, `urgencyMax`, and `instructions` (the markdown body) — the same
+ * fields `processObservation` already snapshots onto `MonitorEventRecord`'s
+ * `urgency`/`title`/`body` at materialization time (issue #451).
+ *
+ * Persisted on each materialized event and recomputed fresh from the
+ * CURRENTLY-scanned monitor in `explainMonitor`, so the two can be compared
+ * WITHOUT re-deriving or mutating the event's own already-correct stored
+ * fields — this is a read-only diagnostic aid, never a second source of
+ * truth for delivery content.
+ *
+ * Deliberately excludes fields that legitimately vary run-to-run without the
+ * AUTHORED definition changing (e.g. `watch` scope tweaks that don't affect
+ * what gets delivered) — narrowly scoped to the fields whose drift is exactly
+ * what produced the #451 report (an edit that changes urgency and/or body).
+ *
+ * @see docs/specs/002-runtime-delivery.md §5.3
+ */
+function definitionFingerprint(monitor: MonitorDefinition): string {
+  const material = JSON.stringify({
+    urgency: monitor.frontmatter.urgency,
+    urgencyMax: monitor.frontmatter.urgencyMax,
+    instructions: monitor.instructions,
+  });
+  return createHash('sha256').update(material).digest('hex').slice(0, 16);
 }
 
 function serializeObservation(
@@ -1539,6 +1568,38 @@ export class AgentMonitorRuntime {
         reminderSuppression.length > 0
           ? ` ${reminderSuppression.map((finding) => finding.message).join(' ')}`
           : '';
+
+      // Definition-drift diagnostic (issue #451): a pending (not yet
+      // acknowledged by every recipient) event whose OWN stored
+      // `definitionFingerprint` differs from the monitor's CURRENT
+      // definition fingerprint was materialized under a since-edited
+      // urgency/body. This is not itself a bug — the event's own
+      // urgency/title/body are still exactly what was in force when it was
+      // observed (`processObservation` never re-derives them) — but an
+      // author debugging "why did this deliver at the OLD urgency/body"
+      // needs to be able to see that the definition has since changed. A
+      // `null` fingerprint (a legacy row from before this field existed) is
+      // "unknown," never flagged, to avoid a false positive against rows
+      // with no recorded baseline.
+      const pendingEventIds = new Set(
+        projections
+          .filter((projection) => projection.deliveryState !== 'acknowledged')
+          .map((projection) => projection.eventId),
+      );
+      const currentFingerprint = definitionFingerprint(monitor);
+      const staleEventIds = events
+        .filter(
+          (event) =>
+            pendingEventIds.has(event.id) &&
+            event.definitionFingerprint != null &&
+            event.definitionFingerprint !== currentFingerprint,
+        )
+        .map((event) => event.id);
+      const staleSuffix =
+        staleEventIds.length > 0
+          ? ` ${String(staleEventIds.length)} pending event(s) predate the monitor's current definition (its urgency and/or body have changed since these were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one.`
+          : '';
+
       const deliveryDetails: Record<string, unknown> = { ...counts };
       if (interpretVerdicts.length > 0) {
         deliveryDetails['interpret'] = interpretVerdicts;
@@ -1546,13 +1607,16 @@ export class AgentMonitorRuntime {
       if (reminderSuppression.length > 0) {
         deliveryDetails['reminderSuppression'] = reminderSuppression;
       }
+      if (staleEventIds.length > 0) {
+        deliveryDetails['staleDefinitionEventIds'] = staleEventIds;
+      }
       stages.push(
         explainStage(
           'delivery',
           'ok',
           `Events are projected to lead sessions (${Object.entries(counts)
             .map(([state, count]) => `${state}: ${String(count)}`)
-            .join(', ')}).${interpretSuffix}${reminderSuffix}`,
+            .join(', ')}).${interpretSuffix}${reminderSuffix}${staleSuffix}`,
           deliveryDetails,
         ),
       );
@@ -3732,6 +3796,10 @@ export class AgentMonitorRuntime {
         // re-scanning monitor definitions (G10 PR-B, 002 §1.1.7). Defaults to
         // `incremental` when the monitor omits the field.
         baselineStrategy: input.monitor.frontmatter.baselineStrategy,
+        // The definition-content fingerprint (issue #451) — computed from
+        // `input.monitor`, the SAME per-observation snapshot `urgency`/`title`/
+        // `body` above were captured from, never a live re-scan.
+        definitionFingerprint: definitionFingerprint(input.monitor),
         // Make the source-agnostic changeKind queryable without each source having
         // to duplicate it into its own queryScope.
         queryScope: {

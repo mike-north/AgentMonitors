@@ -354,6 +354,18 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // at claim time; legacy rows keep NULL and are treated as `incremental`.
   addColumnIfMissing(sqlite, 'monitor_events', 'baseline_strategy', 'TEXT');
 
+  // Additive migration (issue #451): a `monitor_events` table created before
+  // this column existed lacks `definition_fingerprint`. Add it if missing so
+  // `monitor explain` can detect pending events that predate the monitor's
+  // current definition; legacy rows keep NULL (treated as "unknown", never
+  // flagged as stale).
+  addColumnIfMissing(
+    sqlite,
+    'monitor_events',
+    'definition_fingerprint',
+    'TEXT',
+  );
+
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_snapshots (
       id TEXT PRIMARY KEY,

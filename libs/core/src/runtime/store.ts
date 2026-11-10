@@ -155,6 +155,7 @@ function rowToEvent(
     queryScope: parseJson(row.queryScope, {}),
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
+    definitionFingerprint: row.definitionFingerprint ?? null,
   };
 }
 
@@ -1007,6 +1008,7 @@ export class RuntimeStore {
             queryScope: JSON.stringify(input.queryScope),
             tags: JSON.stringify(input.tags),
             createdAt: input.createdAt,
+            definitionFingerprint: input.definitionFingerprint,
           })
           .run();
 

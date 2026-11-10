@@ -75,6 +75,13 @@ export const monitorEvents = sqliteTable('monitor_events', {
   queryScope: text('query_scope').notNull().default('{}'),
   tags: text('tags').notNull().default('[]'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  // A content fingerprint of the monitor's delivery-relevant frontmatter
+  // (urgency, urgencyMax, instructions) at materialization time (issue #451),
+  // letting `monitor explain` detect a pending event that predates the
+  // monitor's current definition without altering the event's own already-
+  // correct urgency/title/body. NULL on legacy rows materialized before this
+  // column existed.
+  definitionFingerprint: text('definition_fingerprint'),
 });
 
 export const monitorSnapshots = sqliteTable('monitor_snapshots', {

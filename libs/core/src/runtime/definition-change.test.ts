@@ -13,6 +13,7 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { createDb } from '../inbox/db.js';
@@ -244,5 +245,73 @@ describe('pending events keep the semantics they were observed under (issue #451
       'turn-interruptible',
     );
     expect(claim?.events).toHaveLength(0);
+  });
+});
+
+describe('explain reports pending events that predate the current definition (issue #451)', () => {
+  async function deliveryStage(
+    fixture: Fixture,
+    runtime: AgentMonitorRuntime,
+  ): Promise<{ reason: string; details?: Record<string, unknown> }> {
+    const explained = await runtime.explainMonitor({
+      monitorId: MONITOR_ID,
+      monitorsDir: fixture.monitorsDir,
+      workspacePath: fixture.rootDir,
+    });
+    const stage = explained.stages.find((s) => s.id === 'delivery');
+    if (!stage) throw new Error('explain returned no delivery stage');
+    return stage;
+  }
+
+  it('flags nothing before the edit, and counts the pending event after it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'normal', body: 'OLD.' });
+    const { runtime } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+
+    const before = await deliveryStage(fixture, runtime);
+    expect(before.reason).not.toMatch(/predate/);
+    expect(before.details?.['staleDefinitionEventIds']).toBeUndefined();
+
+    fixture.edit('high', 'NEW.');
+    const after = await deliveryStage(fixture, runtime);
+    expect(after.reason).toMatch(
+      /1 pending event\(s\) predate the monitor's current definition/,
+    );
+    expect(after.details?.['staleDefinitionEventIds']).toHaveLength(1);
+  });
+
+  it('treats a legacy row with no recorded fingerprint as unknown, never stale', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'normal', body: 'OLD.' });
+    const { runtime } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+
+    const raw = new Database(path.join(fixture.rootDir, 'agentmon.db'));
+    raw
+      .prepare('UPDATE monitor_events SET definition_fingerprint = NULL')
+      .run();
+    raw.close();
+
+    fixture.edit('high', 'NEW.');
+    const stage = await deliveryStage(fixture, runtime);
+    expect(stage.reason).not.toMatch(/predate/);
+  });
+
+  it('never gates delivery: the flagged event is still delivered as observed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'high', body: 'OLD.' });
+    const { runtime, sessionId } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+    fixture.edit('normal', 'NEW.');
+    vi.advanceTimersByTime(PAST_SETTLE_MS);
+
+    expect((await deliveryStage(fixture, runtime)).reason).toMatch(/predate/);
+    const claim = runtime.claimDelivery(sessionId, 'turn-interruptible');
+    expect(claim?.events[0]?.body).toBe('OLD.');
+    expect(claim?.events[0]?.urgency).toBe('high');
   });
 });
