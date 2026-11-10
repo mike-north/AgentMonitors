@@ -607,7 +607,6 @@ interface MaterializationSpanOptions {
   /** Raw source count before shaping/pacing, used only for audit classification. */
   observed: number;
   workspacePath: string;
-  retryQueuedAt: Date;
   nextMonitorState?: {
     sourceState?: unknown;
     notifyState: NotifyRuntimeState;
@@ -2870,7 +2869,6 @@ export class AgentMonitorRuntime {
               {
                 observed: 0,
                 workspacePath,
-                retryQueuedAt: now,
                 ...(ephemeralSessionId !== undefined
                   ? { ephemeralSessionId }
                   : {}),
@@ -3080,7 +3078,6 @@ export class AgentMonitorRuntime {
           notifyState: dispatch.nextState,
           lastObservationAt: now,
         },
-        retryQueuedAt: now,
         ...(options.sourceOutcome
           ? { sourceOutcome: options.sourceOutcome }
           : {}),
@@ -3172,6 +3169,9 @@ export class AgentMonitorRuntime {
     }
 
     if (failures.length > 0) {
+      // The store's default clock starts backoff at enqueue, after acquisition
+      // and prefix materialization. Tick/envelope time is observation provenance
+      // and must not consume the initial delay or be rewritten to repair it.
       this.store.enqueueMaterializationRetries(
         failures.map((failure) => ({
           workspacePath: options.workspacePath,
@@ -3180,7 +3180,6 @@ export class AgentMonitorRuntime {
           envelope: failure.envelope,
           error: failure.message,
         })),
-        options.retryQueuedAt,
       );
     }
 

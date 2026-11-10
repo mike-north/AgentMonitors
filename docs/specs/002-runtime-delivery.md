@@ -1908,9 +1908,13 @@ restored as a Date; a string timestamp is not an accepted substitute. A batch
 enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
 workspace or monitor has independent capacity.
 
-New records first become due after at least 1 second. Because retry timestamps are persisted at
-whole-second precision, deadlines round upward to the next representable second, never downward:
-admission at `12:00:00.850` becomes due at `12:00:02.000`. This can add less than one second to a
+New records first become due after at least 1 second, measured from the instant the retry is
+enqueued (_current_): backoff starts after source acquisition and prefix materialization, not at the
+tick's start. An observation taken at `12:00:00.000` and admitted at `12:00:03.850` first becomes
+due at `12:00:05.000`. Observation, event, envelope, source and notify timestamps remain
+observation-time provenance and are never rewritten to repair the deadline. Because retry
+timestamps are persisted at whole-second precision, deadlines round upward to the next
+representable second, never downward: admission at `12:00:00.850` becomes due at `12:00:02.000`. This can add less than one second to a
 backoff, but must not shorten it. `last_error` is a single-line diagnostic: C0/C1 controls, DEL and
 Unicode line/paragraph separators are replaced with spaces, then the result is capped at 1,024
 characters. The same rule applies at admission and every failed-attempt update.

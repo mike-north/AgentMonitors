@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-10 — Start materialization retry backoff at enqueue (002 §15; 004 §3.4) — Refs #497
+
+New materialization retry rows first become due at least 1 second after they are enqueued, after
+source acquisition and prefix materialization, rounded up to SQLite's whole-second precision.
+Previously the runtime passed the tick's start time, so slow acquisition consumed the initial delay
+(an observation at `12:00:00.000` admitted at `12:00:03.850` was already due at `12:00:01.000`; the
+contract requires `12:00:05.000`). Observation, event, envelope, source and notify timestamps remain
+observation-time provenance. No public API, schema or retry-schedule change.
+
 ## 2026-11-07 — Keep nested-only retry details visible in text explain (005) — Refs #496
 
 Text explain selects recognized materialization retry details when a partial compatibility report

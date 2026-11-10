@@ -1009,3 +1009,241 @@ describe('held retry routing after source-type edits', () => {
     }
   }
 });
+
+/**
+ * Retry eligibility starts at admission, while observation provenance retains
+ * the tick's original timestamp. Clock advancement occurs inside the actual
+ * asynchronous source callback; SQLite alone supplies the materialization fault.
+ * @see docs/specs/002-runtime-delivery.md, retry timestamp/admission contract.
+ */
+describe('retry admission clock after asynchronous observation', () => {
+  for (const scenario of [
+    {
+      name: 'whole-second no-delay control',
+      observedAt: '2026-11-01T12:00:00.000Z',
+      admittedAt: '2026-11-01T12:00:00.000Z',
+      persistedQueuedAt: '2026-11-01T12:00:00.000Z',
+      nextAttemptAt: '2026-11-01T12:00:01.000Z',
+    },
+    {
+      name: 'fractional no-delay rounding control',
+      observedAt: '2026-11-01T12:00:00.850Z',
+      admittedAt: '2026-11-01T12:00:00.850Z',
+      persistedQueuedAt: '2026-11-01T12:00:00.000Z',
+      nextAttemptAt: '2026-11-01T12:00:02.000Z',
+    },
+    {
+      name: 'slow source across the initial backoff interval',
+      observedAt: '2026-11-01T12:00:00.000Z',
+      admittedAt: '2026-11-01T12:00:03.850Z',
+      persistedQueuedAt: '2026-11-01T12:00:03.000Z',
+      nextAttemptAt: '2026-11-01T12:00:05.000Z',
+    },
+  ] as const) {
+    it(`starts the minimum delay at enqueue: ${scenario.name}`, async () => {
+      clockTime = Date.parse(scenario.observedAt);
+      const f = fixture();
+      f.barrier.release();
+      const acquire = f.source.observe;
+      f.source.observe = async (config, context) => {
+        expect(context.now).toEqual(new Date(scenario.observedAt));
+        const result = await acquire(config, context);
+        // Advancing the owned clock after a real await reproduces slow source
+        // acquisition without sleeps, wall-clock races, or altered deadlines.
+        clockTime = Date.parse(scenario.admittedAt);
+        return result;
+      };
+      f.writer.client.exec(`
+        CREATE TRIGGER fail_retry_clock BEFORE INSERT ON monitor_events
+        WHEN NEW.monitor_id = 'span' AND NEW.summary = 'step-2'
+        BEGIN
+          SELECT CASE WHEN (SELECT count(*) FROM monitor_events
+            WHERE monitor_id = NEW.monitor_id AND workspace_path = NEW.workspace_path
+            AND summary = 'step-1') != 1
+            THEN RAISE(ABORT, 'expected new materialized prefix') END;
+          SELECT RAISE(ABORT, 'retry clock materialization fault');
+        END;
+      `);
+
+      const result = await f.runtime.tick(f.monitorsDir, f.root);
+      // Evidence-only reads precede assertions so a real behavioral red still
+      // retains actual deadlines and both sides of the read-only due queries.
+      const evidenceDirectory = process.env['AM497_EVIDENCE_DIR'];
+      if (evidenceDirectory) {
+        const label = `retry-clock-${scenario.name.replace(/[^a-z]+/g, '-')}`;
+        const rowsBefore = f.observer.client
+          .prepare(
+            'SELECT *, hex(envelope) AS envelope_hex FROM materialization_retry_outbox ORDER BY id',
+          )
+          .all();
+        const queryClock = new Date();
+        const dueAtAdmission = f.reader.listMaterializationRetries({
+          monitorId: 'span',
+          workspacePath: f.root,
+          dueAt: queryClock,
+        });
+        const dueBeforeDeadline = f.reader.listMaterializationRetries({
+          monitorId: 'span',
+          workspacePath: f.root,
+          dueAt: new Date(Date.parse(scenario.nextAttemptAt) - 1),
+        });
+        const dueAtDeadline = f.reader.listMaterializationRetries({
+          monitorId: 'span',
+          workspacePath: f.root,
+          dueAt: new Date(scenario.nextAttemptAt),
+        });
+        const rowsAfter = f.observer.client
+          .prepare(
+            'SELECT *, hex(envelope) AS envelope_hex FROM materialization_retry_outbox ORDER BY id',
+          )
+          .all();
+        captureAdmissionEvidence(f, label);
+        writeFileSync(
+          path.join(evidenceDirectory, label, 'clock-admission.json'),
+          JSON.stringify(
+            {
+              scenario,
+              queryClock,
+              result,
+              rowsBefore,
+              rowsAfter,
+              allRetries: f.reader.listMaterializationRetries({
+                monitorId: 'span',
+                workspacePath: f.root,
+              }),
+              dueAtAdmission,
+              dueBeforeDeadline,
+              dueAtDeadline,
+              events: f.reader.listEvents({
+                monitorId: 'span',
+                workspacePath: f.root,
+              }),
+              state: f.reader.getMonitorState('span', f.root),
+            },
+            null,
+            2,
+          ),
+        );
+      }
+      expect(result.emittedEventIds).toHaveLength(1);
+      expect(result.erroredObservations).toEqual([
+        {
+          monitorId: 'span',
+          message:
+            '2 observations were queued for materialization retry. First error: retry clock materialization fault',
+        },
+      ]);
+      const events = f.reader.listEvents({
+        monitorId: 'span',
+        workspacePath: f.root,
+      });
+      expect(events).toHaveLength(1);
+      // Event timestamps retain observation provenance at SQLite's documented
+      // whole-second precision, including the .850 observation control.
+      expect(events[0]).toMatchObject({
+        summary: 'step-1',
+        snapshotText: 'alpha',
+        createdAt: new Date('2026-11-01T12:00:00.000Z'),
+      });
+      const retries = f.reader.listMaterializationRetries({
+        monitorId: 'span',
+        workspacePath: f.root,
+      });
+      expect(retries.map(({ envelope }) => envelope.observation)).toEqual([
+        {
+          title: 'step-2',
+          summary: 'step-2',
+          objectKey: 'shared-object',
+          snapshotText: '',
+        },
+        {
+          title: 'step-3',
+          summary: 'step-3',
+          objectKey: 'shared-object',
+          snapshotText: 'omega',
+        },
+      ]);
+      for (const retry of retries) {
+        expect(retry).toMatchObject({
+          sourceName: 'admission-source',
+          status: 'pending',
+          attemptCount: 0,
+          createdAt: new Date(scenario.persistedQueuedAt),
+          updatedAt: new Date(scenario.persistedQueuedAt),
+          nextAttemptAt: new Date(scenario.nextAttemptAt),
+        });
+        expect(retry.nextAttemptAt).not.toBeNull();
+        expect(retry.nextAttemptAt?.getTime()).toBeGreaterThanOrEqual(
+          Date.parse(scenario.admittedAt) + 1000,
+        );
+        // The retained envelope is supported native-Date/plain-record input;
+        // changing enqueue time must not rewrite the source's original facts.
+        expect(retry.envelope.observedAt).toBeInstanceOf(Date);
+        expect(retry.envelope.observedAt).toEqual(
+          new Date(scenario.observedAt),
+        );
+        expect(retry.envelope.monitor.instructions).toBe(
+          'Inspect the changes.',
+        );
+      }
+      expect(
+        f.reader.listMaterializationRetries({
+          monitorId: 'span',
+          workspacePath: f.root,
+          dueAt: new Date(),
+        }),
+      ).toEqual([]);
+      expect(
+        f.reader.listMaterializationRetries({
+          monitorId: 'span',
+          workspacePath: f.root,
+          dueAt: new Date(Date.parse(scenario.nextAttemptAt) - 1),
+        }),
+      ).toEqual([]);
+      expect(
+        f.reader
+          .listMaterializationRetries({
+            monitorId: 'span',
+            workspacePath: f.root,
+            dueAt: new Date(scenario.nextAttemptAt),
+          })
+          .map(({ id }) => id),
+      ).toEqual(retries.map(({ id }) => id));
+      expect(f.reader.getMonitorState('span', f.root)).toEqual({
+        sourceState: 1,
+        notifyState: {},
+        lastObservationAt: new Date('2026-11-01T12:00:00.000Z'),
+      });
+      expect(f.barrier.calls).toHaveLength(1);
+    });
+  }
+
+  it('keeps successful slow-source observation timestamps unchanged without a retry', async () => {
+    const f = fixture();
+    f.barrier.release();
+    const acquire = f.source.observe;
+    f.source.observe = async (config, context) => {
+      expect(context.now).toEqual(new Date('2026-11-01T12:00:00.000Z'));
+      const result = await acquire(config, context);
+      clockTime = Date.parse('2026-11-01T12:00:03.850Z');
+      return result;
+    };
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+    captureAdmissionEvidence(f, 'retry-clock-successful-slow-source');
+    expect(result.erroredObservations).toEqual([]);
+    expect(result.emittedEventIds).toHaveLength(3);
+    expectPrefix(f, ['step-1', 'step-2', 'step-3'], 'deliver');
+    expect(f.reader.listEvents().map(({ createdAt }) => createdAt)).toEqual([
+      new Date('2026-11-01T12:00:00.000Z'),
+      new Date('2026-11-01T12:00:00.000Z'),
+      new Date('2026-11-01T12:00:00.000Z'),
+    ]);
+    expect(f.reader.listMaterializationRetries()).toEqual([]);
+    expect(f.reader.getMonitorState('span', f.root)).toEqual({
+      sourceState: 1,
+      notifyState: {},
+      lastObservationAt: new Date('2026-11-01T12:00:00.000Z'),
+    });
+    expect(f.barrier.calls).toHaveLength(3);
+  });
+});
