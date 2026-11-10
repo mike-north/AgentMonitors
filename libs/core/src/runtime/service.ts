@@ -1109,12 +1109,15 @@ export class AgentMonitorRuntime {
     // whether its current definition still exists or can be scheduled. Resolve
     // the same default scope as tick before any definition-error return.
     const workspacePath = input.workspacePath ?? input.monitorsDir;
+    const stages: MonitorExplainStage[] = [];
+    const scan = await scanMonitors(input.monitorsDir);
+    // Read retry metadata after asynchronous discovery so work admitted while
+    // it waits is not omitted beside the later event and history reads. Keep
+    // this before definition refusals, which still need retained-work metadata.
     const materializationRetries = this.store.materializationRetrySummary(
       input.monitorId,
       workspacePath,
     );
-    const stages: MonitorExplainStage[] = [];
-    const scan = await scanMonitors(input.monitorsDir);
     const parseError = scan.errors.find(
       (error) => monitorIdFromFilePath(error.filePath) === input.monitorId,
     );
