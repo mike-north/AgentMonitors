@@ -1199,14 +1199,31 @@ This holds because of how the runtime is built, not because of a special case:
 
 **Diagnostic.** Each row also stores `definition_fingerprint`, a short hash of the parts of the
 definition that decide what an event is, computed once at materialization (nullable, additive; `NULL`
-on rows from before the column existed). It covers `urgency`, `urgencyMax`, the body, and the whole
-`watch` block (source name plus its configuration as parsed, in canonical key order, so key order and
-whitespace do not matter), because a changed command, query or glob changes the payload and
-`objectKey` the event carries. It leaves out fields that change neither the observation nor the
-delivered text, such as `notify` timing and `tags`. `monitor explain`'s delivery stage compares it
-with the current definition and reports the **total** number of pending events that predate it (not
-bounded by `--limit`), with their ids in `details.staleDefinitionEventIds`. `NULL` means unknown and
-is never reported. The diagnostic is read-only and never gates, delays or alters delivery.
+on rows from before the column existed). Objects are hashed in canonical key order, so key order and
+whitespace in the file do not matter (array order does).
+
+| Included                                  | Why it can change a stored or delivered event                                                                                    |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `urgency`, `urgencyMax`                   | the event's delivery urgency                                                                                                     |
+| the body                                  | the delivered body when the source supplies none                                                                                 |
+| `name`                                    | the delivered title ([§5.4](#54-event-title))                                                                                    |
+| `watch`, except the scheduling keys below | source and configuration (command, query, globs, …) decide the payload and `objectKey`                                           |
+| `shape`, `payload`                        | derive facts, render the snapshot and transform the payload before diffing, so they change the stored snapshot, diff and payload |
+| `baseline-strategy`                       | stored on the event; decides how each recipient's catch-up span is collapsed                                                     |
+
+| Excluded         | Why                                                                    |
+| ---------------- | ---------------------------------------------------------------------- |
+| `notify`         | decides when events materialize, not what they contain                 |
+| `tags`           | a label used only to filter `events list`                              |
+| `watch.interval` | read by the scheduling engine, not by any source; changes cadence only |
+
+The schedule source's `cron` and `timezone` stay included: the scheduler reads them, but that source
+also writes them into its payload and `objectKey`.
+
+`monitor explain`'s delivery stage compares the stored fingerprint with the current definition and
+reports the **total** number of pending events that predate it (not bounded by `--limit`), with their
+ids in `details.staleDefinitionEventIds`. `NULL` means unknown and is never reported. The diagnostic
+is read-only and never gates, delays or alters delivery.
 
 **Verified in:** `libs/core/src/runtime/definition-change.test.ts`.
 
