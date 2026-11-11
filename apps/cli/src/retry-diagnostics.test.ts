@@ -29,6 +29,7 @@ import {
 } from '@agentmonitors/core';
 import type { Database } from 'better-sqlite3';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { normalizeUnretainedObservationLoss } from './retry-diagnostics.js';
 import { doctorReportClient, explainMonitorClient } from './runtime-client.js';
 import { writeLocalState } from './local-state.js';
 import { decodeToon } from './toon-format.js';
@@ -1334,6 +1335,31 @@ it('fails the doctor monitor check for a dropped observation until a later clean
         `\`agentmonitors monitor explain dropper --workspace ${root}`,
       );
 
+      // Bug (#497 review, finding 4): the history suggestion was bare, so from
+      // another directory it read the wrong workspace's rows. It must carry
+      // `--workspace`, and running it must show this workspace's drop row.
+      const suggestedHistory =
+        /`agentmonitors (monitor history dropper[^`]*)`/.exec(
+          scoped.stdout,
+        )?.[1];
+      expect(suggestedHistory).toBe(
+        `monitor history dropper --workspace ${root}`,
+      );
+      const historyEnv = {
+        ...process.env,
+        HOME: root,
+        XDG_DATA_HOME: path.join(root, 'data'),
+        AGENTMONITORS_DB: dbPath,
+        AGENTMONITORS_SOCKET: socketPath,
+      };
+      const history = await execute(
+        process.execPath,
+        [cli, ...(suggestedHistory ?? '').split(' '), '--format', 'json'],
+        { cwd: realpathSync(elsewhere), timeout: 15000, env: historyEnv },
+      );
+      expect(history.stdout).toContain(`"workspacePath": "${root}"`);
+      expect(history.stdout).toContain('"notRetainedCount": 1');
+
       const json = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
       expect(json.ok).toBe(false);
       expect(json.monitors[0].unretainedObservationLoss).toEqual({
@@ -1367,3 +1393,63 @@ it('fails the doctor monitor check for a dropped observation until a later clean
     vi.unstubAllGlobals();
   }
 });
+
+/**
+ * Bug (#497 review, finding 3): a skewed daemon's loss with a missing or
+ * garbage `recordedAt`, or a non-positive-integer `count`, was kept (as an
+ * Invalid Date / fractional count) and doctor's `recordedAt.toISOString()`
+ * then threw `RangeError`. Such a loss must be treated as absent.
+ */
+const malformedLosses: [string, Record<string, unknown>][] = [
+  ['missing recordedAt', { recordedAt: undefined }],
+  ['garbage recordedAt', { recordedAt: 'not-a-date' }],
+  ['non-ISO recordedAt object', { recordedAt: { when: 'yesterday' } }],
+  ['null recordedAt', { recordedAt: null }],
+  ['count 0', { count: 0 }],
+  ['count 1.5', { count: 1.5 }],
+  ['count -3', { count: -3 }],
+  ['string count', { count: '2' }],
+];
+const validLoss = {
+  count: 2,
+  recordedAt: '2026-11-01T12:00:00.000Z',
+  error: 'native fault',
+};
+
+it('keeps a well-formed unretained-observation loss with a revived Date', () => {
+  const loss = normalizeUnretainedObservationLoss(
+    validLoss as unknown as Parameters<
+      typeof normalizeUnretainedObservationLoss
+    >[0],
+  );
+  expect(loss?.count).toBe(2);
+  expect(loss?.recordedAt.toISOString()).toBe('2026-11-01T12:00:00.000Z');
+});
+
+it.each(malformedLosses)(
+  'drops a malformed unretained-observation loss (%s) so doctor renders normally',
+  async (_name, override) => {
+    const malformed = { ...validLoss, ...override };
+    expect(
+      normalizeUnretainedObservationLoss(
+        malformed as unknown as Parameters<
+          typeof normalizeUnretainedObservationLoss
+        >[0],
+      ),
+    ).toBeUndefined();
+
+    const fixture = reports();
+    const monitor = fixture.doctor.monitors[0];
+    if (!monitor) throw new Error('fixture has a monitor');
+    (monitor as unknown as Record<string, unknown>).unretainedObservationLoss =
+      malformed;
+    await serve(fixture);
+
+    const json = await run('doctor', 'json');
+    const parsed = JSON.parse(json.stdout);
+    expect(parsed.monitors[0].unretainedObservationLoss).toBeNull();
+    const text = await run('doctor', 'text');
+    expect(text.stdout).toContain('monitor:wire-monitor');
+    expect(text.stdout).not.toContain('observation dropped');
+  },
+);

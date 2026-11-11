@@ -163,6 +163,18 @@ function samePath(a: string, b: string): boolean {
   return canonical(a) === canonical(b);
 }
 
+/**
+ * `monitor history <id>` scoped like `explainCommand`. History scopes by
+ * `--workspace` only (it has no `--dir`), so only that flag is carried.
+ */
+function historyCommand(report: MonitorDoctorReport, id: string): string {
+  const flags: string[] = [];
+  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
+    flags.push('--workspace', shellArg(report.workspacePath));
+  }
+  return ['agentmonitors monitor history', shellArg(id), ...flags].join(' ');
+}
+
 /** `monitor explain <id>` carrying the scope doctor was given, so it reads the same workspace. */
 function explainCommand(report: MonitorDoctorReport, id: string): string {
   const flags: string[] = [];
@@ -402,7 +414,7 @@ function buildChecks(
         name,
         status: 'fail',
         detail: `observation dropped, not retained for retry (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}  ${rollup}`,
-        remediation: `Inspect it with \`${explainCommand(report, monitor.id)}\` and \`agentmonitors monitor history ${monitor.id}\`, then repair the reported failure. A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.`,
+        remediation: `Inspect it with \`${explainCommand(report, monitor.id)}\` and \`${historyCommand(report, monitor.id)}\`, then repair the reported failure. A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.`,
       });
     } else if ((retryOutbox?.terminal ?? 0) > 0) {
       checks.push({

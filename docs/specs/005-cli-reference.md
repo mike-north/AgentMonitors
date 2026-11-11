@@ -2009,7 +2009,7 @@ the drop has no retry record. This check outranks the retry checks. Its detail i
 `observation dropped, not retained for retry (<count> outstanding; newest: <which> at <iso8601>):
 <error>` followed by the rollup line. `<which>` uses explain's wording (002 §10.7). The remediation
 names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
-`monitor history <id>`, says the drop cannot be retried, and says
+`monitor history <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
 the check clears once a later observation completes without a drop. Doctor JSON carries the
 same data in `monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients
 revive `recordedAt`, keep only the documented fields and normalize their text like retry errors.

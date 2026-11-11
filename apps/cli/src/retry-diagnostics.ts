@@ -103,7 +103,19 @@ export function normalizeUnretainedObservationLoss(
   if (
     loss == null ||
     typeof loss.count !== 'number' ||
+    !Number.isSafeInteger(loss.count) ||
+    loss.count < 1 ||
     typeof loss.error !== 'string'
+  ) {
+    return undefined;
+  }
+  // A missing or unparseable timestamp would revive as an Invalid Date that
+  // throws when doctor renders it, so the whole loss is treated as absent.
+  const rawRecordedAt: unknown = loss.recordedAt;
+  const recordedAt = new Date(rawRecordedAt as string);
+  if (
+    (typeof rawRecordedAt !== 'string' && typeof rawRecordedAt !== 'number') ||
+    Number.isNaN(recordedAt.getTime())
   ) {
     return undefined;
   }
@@ -121,7 +133,7 @@ export function normalizeUnretainedObservationLoss(
   const title = text(loss.title);
   return {
     count: loss.count,
-    recordedAt: new Date(loss.recordedAt),
+    recordedAt,
     error: text(loss.error) ?? '',
     ...(position !== undefined ? { position } : {}),
     ...(spanSize !== undefined ? { spanSize } : {}),
