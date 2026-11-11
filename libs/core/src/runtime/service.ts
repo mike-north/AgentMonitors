@@ -1640,7 +1640,7 @@ export class AgentMonitorRuntime {
       );
       const staleSuffix =
         staleEventIds.length > 0
-          ? ` ${String(staleEventIds.length)} pending event(s) in total predate the monitor's current definition (its urgency, body or source configuration changed since they were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one.`
+          ? ` ${String(staleEventIds.length)} pending event(s) in total predate the monitor's current definition (its urgency, body, name, source configuration, shape, payload or baseline strategy changed since they were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one.`
           : '';
 
       const deliveryDetails: Record<string, unknown> = { ...counts };

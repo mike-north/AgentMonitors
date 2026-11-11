@@ -153,8 +153,10 @@ export interface MonitorEventRecord {
   tags: string[];
   createdAt: Date;
   /**
-   * A short content fingerprint of the monitor's delivery-relevant frontmatter
-   * (`urgency`, `urgencyMax`, `instructions`) AS IT WAS at materialization time
+   * A short content fingerprint of the parts of the monitor's definition that
+   * decide what an event is (`urgency`, `urgencyMax`, the body, `name`, `watch`
+   * except scheduling keys such as `interval`, `shape`, `payload` and
+   * `baseline-strategy`; 002 §5.3) AS IT WAS at materialization time
    * (issue #451), computed by {@link definitionFingerprint} over the same
    * `StoredObservationEnvelope.monitor` snapshot `urgency`/`title`/`body` were
    * already captured from — never recomputed from the live monitor at delivery
