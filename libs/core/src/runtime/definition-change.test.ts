@@ -601,9 +601,10 @@ describe('stale-definition count excludes projections that never deliver (issue 
     const { runtime, sessionId } = fixture.openRuntime();
     await materialize(fixture, runtime, 'command-a');
     const [event] = runtime.listEvents({ sessionId });
+    if (!event) throw new Error('expected one materialized event');
     new RuntimeStore(createDb(fixture.dbPath)).recordInterpretDecision(
       sessionId,
-      event!.id,
+      event.id,
       { decision: 'suppress', reason: 'not substantive' },
     );
     runtime.acknowledgeSession(sessionId);
