@@ -258,6 +258,56 @@ function expectOutcomes(
   ).toEqual({ n: events.length * 2 });
 }
 
+/** `observationData` of every unretained drop row, newest first. */
+function dropRows(f: Fixture): Record<string, unknown>[] {
+  return f.reader
+    .listObservationHistory({
+      monitorId: MONITOR_ID,
+      workspacePath: f.root,
+      limit: 10_000,
+    })
+    .filter(
+      ({ result, observationData }) =>
+        result === 'errored' && observationData['notRetained'] === true,
+    )
+    .map(({ observationData }) => observationData);
+}
+
+/** The newest history row's outcome. */
+function latestRow(f: Fixture) {
+  const [row] = f.reader.listObservationHistory({
+    monitorId: MONITOR_ID,
+    workspacePath: f.root,
+    limit: 1,
+  });
+  return row && { result: row.result, observationData: row.observationData };
+}
+
+async function explain(f: Fixture) {
+  return f.runtime.explainMonitor({
+    monitorsDir: f.monitorsDir,
+    monitorId: MONITOR_ID,
+    workspacePath: f.root,
+  });
+}
+
+function stage(
+  report: Awaited<ReturnType<typeof explain>>,
+  id: 'observation' | 'materialization',
+) {
+  return report.stages.find((candidate) => candidate.id === id);
+}
+
+async function doctorRollup(f: Fixture) {
+  const report = await f.runtime.doctorReport({
+    monitorsDir: f.monitorsDir,
+    workspacePath: f.root,
+  });
+  const [rollup] = report.monitors;
+  if (!rollup) throw new Error('doctor reported no monitor');
+  return rollup;
+}
+
 const CAPACITY = /retry outbox capacity is exhausted/;
 const DOMAIN = /not serializable for the retry outbox/;
 
@@ -290,19 +340,41 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     expect(f.reader.getMonitorState(MONITOR_ID, f.root).sourceState).toEqual({
       cursor: 1,
     });
-    // Diagnostics read the same durable row.
-    const explained = await f.runtime.explainMonitor({
-      monitorsDir: f.monitorsDir,
-      monitorId: MONITOR_ID,
-      workspacePath: f.root,
-    });
-    expect(
-      explained.observations.some(
-        ({ result, observationData }) =>
-          result === 'errored' &&
-          CAPACITY.test(String(observationData['error'])),
+    // The drop row names the lost observation (002 observation_history):
+    // its 1-based position in the span, objectKey and title; never the payload.
+    const [drop] = dropRows(f);
+    expect(drop).toEqual({
+      error: expect.stringMatching(
+        /^native fault on b0-299 Not retained for retry: the retry outbox capacity is exhausted/,
       ),
-    ).toBe(true);
+      notRetained: true,
+      position: 300,
+      spanSize: 600,
+      objectKey: 'object-299',
+      title: 'b0-299',
+    });
+    // The span's batch row is newer than the drop row and counts the drop.
+    expect(latestRow(f)).toEqual({
+      result: 'triggered',
+      observationData: { observed: 600, emitted: 599, notRetainedCount: 1 },
+    });
+    // Explain and doctor surface the drop even though the newest history row
+    // is that span's `triggered` row (002 §10.7; 005 doctor rollup).
+    const explained = await explain(f);
+    expect(explained.verdict).toEqual({
+      status: 'failure',
+      stage: 'materialization',
+      reason: `1 observation(s) were dropped because the retry outbox could not retain them; the newest, observation 300 of 600 (object-299, "b0-299"), failed: ${String(drop?.['error'])}`,
+    });
+    expect((await doctorRollup(f)).unretainedObservationLoss).toEqual({
+      count: 1,
+      recordedAt: NOW,
+      error: drop?.['error'],
+      position: 300,
+      spanSize: 600,
+      objectKey: 'object-299',
+      title: 'b0-299',
+    });
 
     // The next tick makes progress from the advanced baseline.
     const second = await nextPoll(f);
@@ -311,6 +383,9 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     expect(f.reader.getMonitorState(MONITOR_ID, f.root).sourceState).toEqual({
       cursor: 2,
     });
+    // A later clean observation clears the drop from both diagnostics.
+    expect(stage(await explain(f), 'materialization')?.status).toBe('ok');
+    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
   });
 
   // An outbox filled by earlier partial failures: 251 rows from the first tick,
@@ -602,4 +677,181 @@ describe('watch batch admission when the outbox cannot take the suffix', () => {
       }
     });
   }
+});
+
+describe('a dropped observation stays visible in explain and doctor', () => {
+  // A drop must never be less visible than a recoverable failure (002 §10.7,
+  // 005 doctor rollup): both fail explain's verdict and doctor's monitor check.
+  for (const [name, fault, dropped] of [
+    ['retained (fault at #500, 100-record suffix)', 'b0-499', false],
+    ['dropped (fault at #300, 301-record suffix)', 'b0-299', true],
+  ] as const) {
+    it(`fails explain and doctor for a ${name} failure`, async () => {
+      const f = fixture('poll', (cursor) =>
+        cursor === 0 ? observations(0, 600) : observations(cursor, 3),
+      );
+      abortOn(f, fault);
+
+      await f.runtime.tick(f.monitorsDir, f.root);
+
+      const explained = await explain(f);
+      expect(explained.verdict.status).toBe('failure');
+      expect(explained.verdict.reason).toContain(`native fault on ${fault}`);
+      const rollup = await doctorRollup(f);
+      if (dropped) {
+        expect(rollup.materializationRetries).toMatchObject({
+          pending: 0,
+          terminal: 0,
+        });
+        expect(rollup.unretainedObservationLoss?.error).toContain(
+          `native fault on ${fault}`,
+        );
+      } else {
+        expect(rollup.materializationRetries?.pending).toBe(101);
+        expect(rollup.unretainedObservationLoss).toBeUndefined();
+      }
+    });
+  }
+
+  it('keeps drops outstanding across a later failure and a later drop, tells them apart, and clears on a clean tick', async () => {
+    let call = 0;
+    const f = fixture('poll', () => {
+      const current = call++;
+      if (current === 1) throw new Error('source unavailable');
+      if (current === 0) return observations(0, 10, { 5: { n: 1n } });
+      if (current === 2) return observations(2, 10, { 2: { n: 1n } });
+      return observations(current, 3);
+    });
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 1,
+      position: 6,
+      spanSize: 10,
+      objectKey: 'object-5',
+      title: 'b0-5',
+    });
+
+    // An observe() failure is not a clean outcome: the drop stays outstanding.
+    const failed = await nextPoll(f);
+    expect(failed.erroredObservations).toEqual([
+      { monitorId: MONITOR_ID, message: 'source unavailable' },
+    ]);
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 1,
+      objectKey: 'object-5',
+    });
+    expect((await explain(f)).verdict.status).toBe('failure');
+    expect(stage(await explain(f), 'materialization')?.status).toBe('failure');
+
+    // A second drop in a later span accumulates, and its row is distinct.
+    await nextPoll(f);
+    const rows = dropRows(f);
+    expect(
+      rows.map(({ position, objectKey, title }) => ({
+        position,
+        objectKey,
+        title,
+      })),
+    ).toEqual([
+      { position: 3, objectKey: 'object-2', title: 'b2-2' },
+      { position: 6, objectKey: 'object-5', title: 'b0-5' },
+    ]);
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 2,
+      position: 3,
+      spanSize: 10,
+      objectKey: 'object-2',
+      title: 'b2-2',
+      error: expect.stringMatching(DOMAIN),
+    });
+
+    // A span that completes without a drop clears both diagnostics.
+    const clean = await nextPoll(f);
+    expect(clean.emittedEventIds).toHaveLength(3);
+    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
+    const explained = await explain(f);
+    expect(stage(explained, 'materialization')?.status).toBe('ok');
+    expect(explained.verdict.status).not.toBe('failure');
+  });
+
+  it('reports a span whose only observation was dropped, which writes no batch row', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? observations(0, 1, { 0: { n: 1n } }) : [],
+    );
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+
+    expect(latestRow(f)?.observationData).toMatchObject({
+      notRetained: true,
+      position: 1,
+      spanSize: 1,
+    });
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 1,
+      position: 1,
+      spanSize: 1,
+    });
+    expect((await explain(f)).verdict.status).toBe('failure');
+
+    // A later no-change outcome is clean and clears it.
+    await nextPoll(f);
+    expect(latestRow(f)?.result).toBe('no-change');
+    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
+  });
+
+  it('stores only safe, bounded identity text and never the payload', async () => {
+    // Controls (C0, DEL, C1) and Unicode separators become spaces; every text
+    // field is capped at 1,024 characters (002 materialization_retry_outbox
+    // safe-text rule, applied to observation_history drop rows).
+    const unsafe = 'a\u001b\r\n\t\u007f\u0085\u2028\u2029';
+    const f = fixture('poll', (cursor) =>
+      cursor === 0
+        ? [
+            ...observations(0, 299),
+            {
+              title: unsafe + 't'.repeat(2_000),
+              summary: 'b0-299',
+              objectKey: unsafe + 'k',
+              snapshotText: 'content-b0-299',
+              payload: { secret: 'PRIVATE-PAYLOAD' },
+            },
+            ...observations(0, 600).slice(300),
+          ]
+        : [],
+    );
+    // A long materialization error with an embedded newline.
+    f.writer.client.exec(sql`
+      CREATE TRIGGER fault_long BEFORE INSERT ON monitor_events
+      WHEN NEW.summary = 'b0-299'
+      BEGIN SELECT RAISE(ABORT, 'long fault
+${'y'.repeat(1_500)}'); END;
+    `);
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+
+    const [drop] = dropRows(f);
+    expect(drop?.['title']).toBe('a' + ' '.repeat(8) + 't'.repeat(1_015));
+    expect(drop?.['objectKey']).toBe('a' + ' '.repeat(8) + 'k');
+    const error = String(drop?.['error']);
+    expect(error).toHaveLength(1_024);
+    expect(error.startsWith('long fault y')).toBe(true);
+    // The reason survives the cap.
+    expect(error).toMatch(
+      / Not retained for retry: the retry outbox capacity is exhausted: [^]*\.$/,
+    );
+    // eslint-disable-next-line no-control-regex -- asserts the stored text has none
+    expect(error).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/);
+    const history = JSON.stringify(
+      f.reader.listObservationHistory({
+        monitorId: MONITOR_ID,
+        workspacePath: f.root,
+        limit: 10_000,
+      }),
+    );
+    expect(history).not.toContain('PRIVATE');
+    expect(
+      JSON.stringify((await doctorRollup(f)).unretainedObservationLoss),
+    ).not.toContain('PRIVATE');
+  });
 });

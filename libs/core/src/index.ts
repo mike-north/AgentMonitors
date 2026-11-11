@@ -226,6 +226,7 @@ export type {
   SessionHookState,
   SkippedMonitor,
   StoredObservationEnvelope,
+  UnretainedObservationLoss,
   WatchHandle,
   UrgencyCounts,
 } from './runtime/types.js';

@@ -8,7 +8,10 @@ import type {
   MaterializationRetrySummary,
   MonitorDoctorReport,
 } from '@agentmonitors/core';
-import { retryRecordLines } from '../retry-diagnostics.js';
+import {
+  describeUnretainedObservation,
+  retryRecordLines,
+} from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { readLocalState } from '../local-state.js';
 import {
@@ -339,6 +342,16 @@ function buildChecks(
         name,
         status: 'skip',
         detail: `invalid definition (see monitors-valid)  ${rollup}`,
+      });
+    } else if (monitor.unretainedObservationLoss) {
+      // A drop has no retry record, so the retry counts in the rollup cannot
+      // show it; it outranks them because it cannot be recovered (002 §2).
+      const loss = monitor.unretainedObservationLoss;
+      checks.push({
+        name,
+        status: 'fail',
+        detail: `observation dropped, not retained for retry (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}  ${rollup}`,
+        remediation: `Inspect it with \`agentmonitors monitor explain ${monitor.id}\` and \`agentmonitors monitor history ${monitor.id}\`, then repair the reported failure. A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.`,
       });
     } else if (retryOutbox.terminal > 0) {
       checks.push({
@@ -723,6 +736,13 @@ function toJson(
         : null,
       delivery: monitor.delivery,
       materializationRetries: retryOutboxFor(monitor),
+      unretainedObservationLoss: monitor.unretainedObservationLoss
+        ? {
+            ...monitor.unretainedObservationLoss,
+            recordedAt:
+              monitor.unretainedObservationLoss.recordedAt.toISOString(),
+          }
+        : null,
     })),
     summary: { passed, failed, skipped, idle },
   };

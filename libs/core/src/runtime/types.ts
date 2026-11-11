@@ -470,6 +470,35 @@ export interface DoctorDeliveryCounts {
 }
 
 /**
+ * Observations of one monitor that admission dropped for good, because the
+ * retry outbox could not retain their ordered suffix (002 §2, "Admission
+ * outcomes when the outbox cannot retain a suffix"), and that are still
+ * outstanding: no later observation outcome of that monitor in the same
+ * workspace has completed without such a drop.
+ *
+ * Read from the durable `observation_history` rows that record those drops, so
+ * it survives restarts and reads the same with or without a daemon. Every text
+ * field is the bounded, control-normalized metadata stored on the newest drop
+ * row; the observation's payload is never part of it.
+ */
+export interface UnretainedObservationLoss {
+  /** How many outstanding drops are recorded, across every span since the last clean outcome. */
+  count: number;
+  /** When the newest outstanding drop was recorded. */
+  recordedAt: Date;
+  /** The materialization error followed by `Not retained for retry: <reason>`, for the newest drop. */
+  error: string;
+  /** The newest dropped observation's 1-based position in its span, when recorded. */
+  position?: number;
+  /** How many observations that span dispatched, when recorded. */
+  spanSize?: number;
+  /** The newest dropped observation's source `objectKey`, when it had one. */
+  objectKey?: string;
+  /** The newest dropped observation's source `title`, when it had one. */
+  title?: string;
+}
+
+/**
  * A per-monitor health rollup produced by
  * {@link AgentMonitorRuntime.doctorReport}. Every field is derived from durable
  * state (persisted observation history, `monitor_events`, and session
@@ -519,6 +548,13 @@ export interface DoctorMonitorRollup {
    * Optional for compatibility with reports returned by older daemons.
    */
   materializationRetries?: MaterializationRetrySummary;
+  /**
+   * Present while this monitor has an outstanding observation that admission
+   * dropped because the retry outbox could not retain it. Absent once a later
+   * observation outcome completes without such a drop, and in reports from
+   * older daemons.
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 /** A parse-level failure attributed to a monitor id (or file path fallback). */

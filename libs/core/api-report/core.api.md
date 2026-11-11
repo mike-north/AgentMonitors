@@ -305,6 +305,7 @@ export interface DoctorMonitorRollup {
     nextDueAt?: Date;
     // (undocumented)
     sourceName: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
     // (undocumented)
     urgency: Urgency;
     valid: boolean;
@@ -1355,6 +1356,8 @@ export class RuntimeStore {
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    // @internal
+    outstandingUnretainedObservationLoss(monitorId: string, workspacePath: string): UnretainedObservationLoss | undefined;
     // (undocumented)
     pendingEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
     perRecipientDiffsForAllSessions(sessionIds: string[], eventId: string): Map<string, string>;
@@ -1617,6 +1620,17 @@ export type TransformOutcome = {
     delivered: false;
     value?: undefined;
 };
+
+// @public
+export interface UnretainedObservationLoss {
+    count: number;
+    error: string;
+    objectKey?: string;
+    position?: number;
+    recordedAt: Date;
+    spanSize?: number;
+    title?: string;
+}
 
 // @public (undocumented)
 export type Urgency = 'low' | 'normal' | 'high';

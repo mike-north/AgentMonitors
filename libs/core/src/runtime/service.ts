@@ -46,6 +46,10 @@ import {
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
+  SAFE_DIAGNOSTIC_TEXT_MAX,
+  safeDiagnosticText,
+} from './diagnostic-text.js';
+import {
   rethrowIfRuntimeTransactionAborted,
   runRuntimeTransaction,
 } from './runtime-transaction.js';
@@ -74,6 +78,7 @@ import type {
   OpenSessionInput,
   PollingDecision,
   ProcessObservationInput,
+  UnretainedObservationLoss,
   RuntimeTickResult,
   StoredObservationEnvelope,
   WatchHandle,
@@ -663,6 +668,90 @@ function isObservationBatch(value: unknown): value is ObservationResult {
 /** Preserve a useful failure description without assuming the thrown value is an Error. */
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** Which observation a loss names, for one-line display: `observation 300 of 600 (object-299, "Title")`. */
+function describeUnretainedObservation(
+  loss: UnretainedObservationLoss,
+): string {
+  const position =
+    loss.position !== undefined
+      ? `observation ${String(loss.position)}${loss.spanSize !== undefined ? ` of ${String(loss.spanSize)}` : ''}`
+      : 'an observation';
+  const identity = [
+    ...(loss.objectKey !== undefined ? [loss.objectKey] : []),
+    ...(loss.title !== undefined ? [`"${loss.title}"`] : []),
+  ];
+  return identity.length > 0
+    ? `${position} (${identity.join(', ')})`
+    : position;
+}
+
+/** Explain's materialization-stage reason for an outstanding drop (002 §10.7). */
+function unretainedLossReason(loss: UnretainedObservationLoss): string {
+  const error = displayObservationError(loss.error);
+  return `${String(loss.count)} observation(s) were dropped because the retry outbox could not retain them; the newest, ${describeUnretainedObservation(loss)}, failed: ${error ?? 'no error was recorded'}`;
+}
+
+/** Wire-stable details: ISO timestamps, so socket and in-process reports agree. */
+function unretainedLossDetails(
+  loss: UnretainedObservationLoss,
+): Record<string, unknown> {
+  return {
+    unretainedObservationLoss: {
+      ...loss,
+      recordedAt: loss.recordedAt.toISOString(),
+    },
+  };
+}
+
+/**
+ * The durable outcome of an observation admission dropped because the retry
+ * outbox could not retain its ordered suffix (002 §2 and `observation_history`).
+ * It names which observation was lost (its position in the span, and its
+ * `objectKey`/`title` when they are strings) so separate drops stay
+ * distinguishable, and marks the row `notRetained` for diagnostics. Every text
+ * field is control-normalized and capped like retry errors; the payload is
+ * never copied. The materialization error is shortened, if needed, so the
+ * `Not retained for retry:` reason always fits the cap.
+ */
+function unretainedObservationData(
+  observation: Observation,
+  materializationError: string,
+  refusal: string,
+  index: number,
+  spanSize: number,
+): {
+  error: string;
+  notRetained: true;
+  position: number;
+  spanSize: number;
+  objectKey?: string;
+  title?: string;
+} {
+  const reason = safeDiagnosticText(` Not retained for retry: ${refusal}.`);
+  const error = safeDiagnosticText(
+    safeDiagnosticText(materializationError).slice(
+      0,
+      Math.max(0, SAFE_DIAGNOSTIC_TEXT_MAX - reason.length),
+    ) + reason,
+  );
+  // Source contracts type these as strings, but a failing observation is the
+  // one most likely to break its contract; only strings are recorded.
+  const { objectKey, title } = observation as {
+    objectKey?: unknown;
+    title?: unknown;
+  };
+  return {
+    error,
+    notRetained: true,
+    position: index + 1,
+    spanSize,
+    ...(typeof objectKey === 'string'
+      ? { objectKey: safeDiagnosticText(objectKey) }
+      : {}),
+    ...(typeof title === 'string' ? { title: safeDiagnosticText(title) } : {}),
+  };
 }
 
 /** Report how many failures were queued or recorded errored, preserving the first error. */
@@ -1623,7 +1712,23 @@ export class AgentMonitorRuntime {
         workspacePath,
       })
       .slice(0, eventLimit);
-    if (materializationRetries.terminal > 0) {
+    // A dropped observation was never retained, so no retry summary reflects
+    // it; the durable drop rows are its only trace (002 §2, §10.7). It outranks
+    // the retry branches: retained work can still be recovered, a drop cannot.
+    const unretainedLoss = this.store.outstandingUnretainedObservationLoss(
+      input.monitorId,
+      workspacePath,
+    );
+    if (unretainedLoss) {
+      stages.push(
+        explainStage(
+          'materialization',
+          'failure',
+          unretainedLossReason(unretainedLoss),
+          unretainedLossDetails(unretainedLoss),
+        ),
+      );
+    } else if (materializationRetries.terminal > 0) {
       stages.push(
         explainStage(
           'materialization',
@@ -1948,6 +2053,11 @@ export class AgentMonitorRuntime {
       const materializationRetries = duplicateMonitorIds.has(monitor.id)
         ? undefined
         : this.store.materializationRetrySummary(monitor.id, workspacePath);
+      const unretainedObservationLoss =
+        this.store.outstandingUnretainedObservationLoss(
+          monitor.id,
+          workspacePath,
+        );
 
       monitors.push({
         id: monitor.id,
@@ -1967,6 +2077,7 @@ export class AgentMonitorRuntime {
         ...(lastEventAt ? { lastEventAt } : {}),
         delivery,
         ...(materializationRetries ? { materializationRetries } : {}),
+        ...(unretainedObservationLoss ? { unretainedObservationLoss } : {}),
       });
     }
 
@@ -3091,10 +3202,12 @@ export class AgentMonitorRuntime {
       return;
     }
 
-    // Block 2 — ingest(): a materialization failure is returned after its
-    // envelope is durably queued. A transaction, state, or outbox-admission
-    // failure still throws because no source advance can safely commit; this
-    // catch reports it while leaving the prior source baseline available.
+    // Block 2 — ingest(): a materialization failure is returned once it has a
+    // durable outcome (a queued retry, or an in-transaction `errored` row when
+    // the outbox cannot retain its suffix). Only a transaction-wide ROLLBACK or
+    // a storage failure (outbox, state or that `errored` write) still throws,
+    // because no source advance can safely commit; this catch reports it while
+    // leaving the prior source baseline available.
     try {
       const ingested = await this.ingest(
         monitor,
@@ -3329,13 +3442,20 @@ export class AgentMonitorRuntime {
         // and keep admitting later siblings: nothing older is queued ahead of
         // them. A failure writing this row rolls back the span, like any
         // other storage failure.
-        const unretained = `${message} Not retained for retry: ${refusal}.`;
+        const unretainedData = unretainedObservationData(
+          envelope.observation,
+          message,
+          refusal,
+          index,
+          emitted.length,
+        );
+        const unretained = unretainedData.error;
         this.store.recordObservationHistory({
           monitorId: monitor.id,
           workspacePath: options.workspacePath,
           sourceName: envelope.monitor.frontmatter.watch.type,
           result: 'errored',
-          observationData: { error: unretained },
+          observationData: unretainedData,
         });
         failures.push({
           envelope,
@@ -3385,6 +3505,12 @@ export class AgentMonitorRuntime {
   ): Promise<MaterializationSpanResult> {
     const observed = options.observed;
     const emittedCount = durable.materialized.length;
+    // Drops this span already recorded in its admission transaction. The batch
+    // row carries the count so readers can tell this span did not complete
+    // cleanly, even though its row is newer than the drop rows (002 §2).
+    const notRetainedCount = durable.failures.filter(
+      ({ retained }) => !retained,
+    ).length;
     // Do not write a false batch-level `triggered` row when every dispatched
     // envelope failed. Individual failure rows below are the truthful outcome.
     if (emittedCount > 0 || durable.failures.length === 0) {
@@ -3401,7 +3527,11 @@ export class AgentMonitorRuntime {
                 : observed > 0
                   ? 'suppressed'
                   : 'no-change',
-          observationData: { observed, emitted: emittedCount },
+          observationData: {
+            observed,
+            emitted: emittedCount,
+            ...(notRetainedCount > 0 ? { notRetainedCount } : {}),
+          },
         });
       } catch {
         // Audit is best-effort and cannot roll back committed runtime state.

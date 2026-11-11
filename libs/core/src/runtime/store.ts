@@ -81,6 +81,7 @@ import type {
   RuntimeStatus,
   SessionHookState,
   SessionObjectCursorRecord,
+  UnretainedObservationLoss,
 } from './types.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
@@ -90,6 +91,7 @@ import {
 } from './types.js';
 import type { Urgency } from '../schema/types.js';
 import { buildDiff, changeDetectionStrategyOf } from './diff.js';
+import { safeDiagnosticText } from './diagnostic-text.js';
 import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
@@ -209,12 +211,7 @@ function materializationRetryKey(
 
 /** Bound persisted and projected failure text without letting it control terminal layout. */
 function safeRetryError(message: string): string {
-  return (
-    message
-      // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
-      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
-      .slice(0, 1_024)
-  );
+  return safeDiagnosticText(message);
 }
 
 /**
@@ -1963,6 +1960,105 @@ export class RuntimeStore {
       result: row.result,
       createdAt: row.createdAt,
     }));
+  }
+
+  /**
+   * The outstanding observations admission dropped for one workspace/monitor
+   * because the retry outbox could not retain their suffix (002 §2), or
+   * `undefined` when there are none.
+   *
+   * A drop row is an `errored` history row marked `notRetained: true`. It stays
+   * outstanding until a later history row records a clean outcome: any
+   * non-`errored` result whose span dropped nothing (no positive
+   * `notRetainedCount`). The span that dropped an observation writes its own
+   * batch row after the drop row, carrying that count, so it never clears its
+   * own drop. A later `errored` row (an observe failure, a retained failure's
+   * audit row) is not a clean outcome either. Ordering is the history listing's
+   * `(created_at, id)` order.
+   *
+   * @internal
+   */
+  outstandingUnretainedObservationLoss(
+    monitorId: string,
+    workspacePath: string,
+  ): UnretainedObservationLoss | undefined {
+    const db = asInternalDb(this.db);
+    // json_extract raises on malformed JSON; every row is written with
+    // JSON.stringify, but guard so one bad legacy row cannot fail diagnosis.
+    const field = (path: string) =>
+      sql`CASE WHEN json_valid(${observationHistory.observationData}) THEN json_extract(${observationHistory.observationData}, ${path}) END`;
+    const scope = and(
+      eq(observationHistory.monitorId, monitorId),
+      eq(observationHistory.workspacePath, workspacePath),
+    );
+    const clean = db
+      .select({
+        createdAt: observationHistory.createdAt,
+        id: observationHistory.id,
+      })
+      .from(observationHistory)
+      .where(
+        and(
+          scope,
+          ne(observationHistory.result, 'errored'),
+          sql`coalesce(${field('$.notRetainedCount')}, 0) <= 0`,
+        ),
+      )
+      .orderBy(desc(observationHistory.createdAt), desc(observationHistory.id))
+      .limit(1)
+      .get();
+    const drops = and(
+      scope,
+      eq(observationHistory.result, 'errored'),
+      sql`${field('$.notRetained')} = 1`,
+      clean
+        ? or(
+            gt(observationHistory.createdAt, clean.createdAt),
+            and(
+              eq(observationHistory.createdAt, clean.createdAt),
+              gt(observationHistory.id, clean.id),
+            ),
+          )
+        : undefined,
+    );
+    const newest = db
+      .select()
+      .from(observationHistory)
+      .where(drops)
+      .orderBy(desc(observationHistory.createdAt), desc(observationHistory.id))
+      .limit(1)
+      .get();
+    if (!newest) return undefined;
+    const count =
+      db
+        .select({ n: sql<number>`count(*)` })
+        .from(observationHistory)
+        .where(drops)
+        .get()?.n ?? 1;
+    const data = parseJson<Record<string, unknown>>(newest.observationData, {});
+    const text = (key: string): string | undefined => {
+      const value = data[key];
+      return typeof value === 'string' ? safeDiagnosticText(value) : undefined;
+    };
+    const integer = (key: string): number | undefined => {
+      const value = data[key];
+      return typeof value === 'number' && Number.isSafeInteger(value)
+        ? value
+        : undefined;
+    };
+    const position = integer('position');
+    const spanSize = integer('spanSize');
+    const objectKey = text('objectKey');
+    const title = text('title');
+    return {
+      count,
+      recordedAt: newest.createdAt,
+      error: text('error') ?? '',
+      ...(position !== undefined ? { position } : {}),
+      ...(spanSize !== undefined ? { spanSize } : {}),
+      ...(objectKey !== undefined ? { objectKey } : {}),
+      ...(title !== undefined ? { title } : {}),
+    };
   }
 
   listDeliveryProjectionsForMonitor(

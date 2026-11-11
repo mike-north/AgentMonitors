@@ -13,9 +13,15 @@ import type {
   MonitorDoctorReport,
   MonitorExplainReport,
 } from '@agentmonitors/core';
-import { createDb, RuntimeStore } from '@agentmonitors/core';
+import {
+  AgentMonitorRuntime,
+  claudeCodeAdapter,
+  createDb,
+  RuntimeStore,
+  SourceRegistry,
+} from '@agentmonitors/core';
 import type { Database } from 'better-sqlite3';
-import { afterEach, beforeEach, expect, it } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { doctorReportClient, explainMonitorClient } from './runtime-client.js';
 import { writeLocalState } from './local-state.js';
 import { decodeToon } from './toon-format.js';
@@ -966,3 +972,124 @@ it.each(['absent', 'events', 'partial', 'ordinary'] as const)(
     ]);
   },
 );
+
+/**
+ * Regression for PR #497 review at 784a468f: a permanently dropped observation
+ * (its retry suffix could not be retained) left `doctor` reporting the monitor
+ * healthy, because no retry row exists and the span's newer `triggered` row
+ * hid the drop. Real ticks against a real store with a native SQLite fault;
+ * expected text is written from 005's doctor per-monitor rollup rule.
+ */
+it('fails the doctor monitor check for a dropped observation until a later clean tick, in text and JSON', async () => {
+  // Native Date instances, not vitest's fake-timer subclass: retry envelopes
+  // accept only unmodified Dates, and the fault must be decided on capacity.
+  const tickAt = new Date('2026-11-01T12:00:00.000Z');
+  let clockTime = tickAt.getTime();
+  vi.stubGlobal(
+    'Date',
+    new Proxy(Date, {
+      construct(target, args) {
+        return Reflect.construct(
+          target,
+          args.length === 0 ? [clockTime] : args,
+        );
+      },
+      get(target, key, receiver) {
+        return key === 'now'
+          ? () => clockTime
+          : Reflect.get(target, key, receiver);
+      },
+    }),
+  );
+  try {
+    const monitors = path.join(root, 'monitors');
+    mkdirSync(path.join(monitors, 'dropper'), { recursive: true });
+    writeFileSync(
+      path.join(monitors, 'dropper', 'MONITOR.md'),
+      '---\nwatch:\n  type: schedule\n  cron: "* * * * *"\n  timezone: UTC\nurgency: normal\nbaseline-strategy: incremental\n---\nInspect.\n',
+    );
+    const dbPath = path.join(root, 'state.db');
+    const db = createDb(dbPath);
+    // Native access installs the fault; it bypasses no store write path.
+    const client = (db as unknown as { $client: Database }).$client;
+    const registry = new SourceRegistry();
+    let call = 0;
+    // Stands in for the bundled `schedule` source so the CLI validates the
+    // same definition; it emits 600 distinct observations, then 3.
+    registry.register({
+      name: 'schedule',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe() {
+        const batch = call++;
+        const count = batch === 0 ? 600 : 3;
+        return Promise.resolve({
+          observations: Array.from({ length: count }, (_, index) => ({
+            title: `b${String(batch)}-${String(index)}`,
+            summary: `b${String(batch)}-${String(index)}`,
+            objectKey: `object-${String(index)}`,
+            snapshotText: `content-${String(batch)}-${String(index)}`,
+          })),
+          nextState: { batch },
+        });
+      },
+    });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    // A fault on the 300th observation leaves a 301-record suffix, more than
+    // the 256-record outbox holds (002 §2), so it is dropped for good.
+    client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
+      WHEN NEW.summary = 'b0-299'
+      BEGIN SELECT RAISE(ABORT, 'native fault on b0-299'); END;`);
+    try {
+      const first = await runtime.tick(monitors, root);
+      expect(first.emittedEventIds).toHaveLength(599);
+
+      const text = await run('doctor', 'text', dbPath);
+      expect(text.code).toBe(1);
+      const line = text.stdout
+        .split('\n')
+        .find((candidate) => candidate.startsWith('✗ monitor:dropper: '));
+      expect(line).toBeDefined();
+      expect(line).toContain(
+        `observation dropped, not retained for retry (1 outstanding; newest: observation 300 of 600 (object-299, "b0-299") at ${tickAt.toISOString()}): native fault on b0-299 Not retained for retry: the retry outbox capacity is exhausted`,
+      );
+      expect(line).toContain('retry-outbox=0/0');
+      expect(text.stdout).toContain(
+        'A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.',
+      );
+
+      const json = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+      expect(json.ok).toBe(false);
+      expect(json.monitors[0].unretainedObservationLoss).toEqual({
+        count: 1,
+        recordedAt: tickAt.toISOString(),
+        error: expect.stringMatching(
+          /^native fault on b0-299 Not retained for retry: the retry outbox capacity is exhausted/,
+        ),
+        position: 300,
+        spanSize: 600,
+        objectKey: 'object-299',
+        title: 'b0-299',
+      });
+      expect(json.checks).toContainEqual(
+        expect.objectContaining({ name: 'monitor:dropper', status: 'fail' }),
+      );
+
+      // A later clean tick clears the check.
+      clockTime += 120_000;
+      const second = await runtime.tick(monitors, root);
+      expect(second.emittedEventIds).toHaveLength(3);
+      const cleared = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+      expect(cleared.monitors[0].unretainedObservationLoss).toBeNull();
+      expect(cleared.checks).toContainEqual(
+        expect.objectContaining({ name: 'monitor:dropper', status: 'pass' }),
+      );
+    } finally {
+      client.close();
+    }
+  } finally {
+    vi.unstubAllGlobals();
+  }
+});

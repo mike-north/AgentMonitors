@@ -22,6 +22,7 @@ import type {
 import {
   isMaterializationRetrySummary,
   normalizeRetrySummary,
+  normalizeUnretainedObservationLoss,
 } from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
@@ -499,6 +500,11 @@ function reviveDoctorReportDates(
           revived.materializationRetries,
         );
       }
+      const loss = normalizeUnretainedObservationLoss(
+        revived.unretainedObservationLoss,
+      );
+      if (loss) revived.unretainedObservationLoss = loss;
+      else delete revived.unretainedObservationLoss;
       return revived;
     }),
     leadSessions: report.leadSessions.map((session) => {
