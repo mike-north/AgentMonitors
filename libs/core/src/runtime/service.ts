@@ -3,6 +3,7 @@
  * Deterministic persistence completes before optional interpretation; source plugins
  * own acquisition while adapters own host-specific interaction.
  */
+import { Buffer } from 'node:buffer';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
@@ -43,6 +44,7 @@ import {
   netCollapseGroupKey,
 } from './store.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
+import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
   rethrowIfRuntimeTransactionAborted,
   runRuntimeTransaction,
@@ -589,10 +591,23 @@ interface MaterializedObservation {
   projectedSessionIds: string[];
 }
 
-/** Retained suffix entry; only the first actual write failure warrants an error audit. */
+/**
+ * A dispatched observation that did not become an event in its span. Each one
+ * has exactly one durable outcome, committed with the span's source/notify
+ * state (002 §2): either a retained outbox row (the failed envelope and every
+ * later sibling, in order), or, when the outbox cannot take that whole suffix,
+ * a terminal `errored` observation-history row naming why it was not retained.
+ */
 interface MaterializationFailure {
   envelope: StoredObservationEnvelope;
   message: string;
+  /** True when the retry outbox holds this envelope for a later attempt. */
+  retained: boolean;
+  /**
+   * True only for the first failed write of a retained suffix, which gets a
+   * best-effort post-commit `errored` audit row. Deferred siblings get none,
+   * and an unretained failure's `errored` row was already committed in-span.
+   */
   auditError: boolean;
 }
 
@@ -650,14 +665,116 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Report the failed suffix size while preserving the first materialization error. */
+/** Report how many failures were queued or recorded errored, preserving the first error. */
 function summarizeMaterializationFailures(
   failures: MaterializationFailure[],
 ): string {
   const first = failures[0]?.message ?? 'Unknown materialization failure.';
-  return failures.length === 1
-    ? first
-    : `${String(failures.length)} observations were queued for materialization retry. First error: ${first}`;
+  if (failures.length === 1) return first;
+  const retained = failures.filter((failure) => failure.retained).length;
+  const unretained = failures.length - retained;
+  const outcomes = [
+    ...(retained > 0
+      ? [
+          `${String(retained)} observations were queued for materialization retry`,
+        ]
+      : []),
+    ...(unretained > 0
+      ? [
+          `${String(unretained)} observations could not be retained and were recorded errored`,
+        ]
+      : []),
+  ];
+  return `${outcomes.join('; ')}. First error: ${first}`;
+}
+
+/**
+ * Decides, inside one admission transaction, whether a failed observation can
+ * be retained together with its whole ordered suffix (002 §2). A suffix is
+ * retainable only when every envelope in it is inside the retry outbox's
+ * plain-data domain and all of it fits the monitor's remaining outbox room.
+ * Retaining part of a suffix is never an option: a later sibling would then
+ * materialize ahead of an older queued observation of the same span.
+ *
+ * Each envelope is validated at most once and the outbox room is read once
+ * per span, so a span with many failures stays linear. Nothing is enqueued
+ * between decisions, because admission enqueues the one retained suffix only
+ * after its loop ends.
+ */
+class SuffixRetention {
+  /** First index whose suffix data has been computed; later indices reuse it. */
+  private start: number | undefined;
+  /** Serialized byte count of envelope `i`, or why it is outside the retry domain. */
+  private readonly sizes: (number | string)[] = [];
+  /** Total bytes of envelopes `i..end`, valid for `i >= start`. */
+  private readonly suffixBytes: number[] = [];
+  /** Nearest index `>= i` whose envelope is outside the retry domain. */
+  private readonly firstInvalid: (number | undefined)[] = [];
+  private remaining: { records: number; bytes: number } | undefined;
+
+  constructor(
+    private readonly store: RuntimeStore,
+    private readonly monitorId: string,
+    private readonly workspacePath: string,
+    private readonly emitted: StoredObservationEnvelope[],
+  ) {}
+
+  /** `undefined` when `emitted[index..]` can be retained; otherwise why it cannot. */
+  refusal(index: number): string | undefined {
+    this.prepare(index);
+    const invalid = this.firstInvalid[index];
+    if (invalid !== undefined) {
+      const reason = String(this.sizes[invalid]);
+      return invalid === index
+        ? `its envelope is not serializable for the retry outbox (${reason})`
+        : `a later observation in its ordered suffix is not serializable for the retry outbox (${reason})`;
+    }
+    const remaining = this.remaining ?? { records: 0, bytes: 0 };
+    const records = this.emitted.length - index;
+    const bytes = this.suffixBytes[index] ?? 0;
+    if (records > remaining.records || bytes > remaining.bytes) {
+      return (
+        `the retry outbox capacity is exhausted: its ordered suffix needs ${String(records)} records ` +
+        `(${String(bytes)} bytes) but ${String(remaining.records)} records ` +
+        `(${String(remaining.bytes)} bytes) remain for this monitor`
+      );
+    }
+    return undefined;
+  }
+
+  private prepare(index: number): void {
+    if (this.start !== undefined && index >= this.start) return;
+    const end = this.emitted.length;
+    const from = this.start ?? end;
+    for (let i = index; i < from; i += 1) {
+      const envelope = this.emitted[i];
+      if (envelope === undefined) continue;
+      try {
+        this.sizes[i] = Buffer.byteLength(
+          serializeRetryEnvelope(envelope),
+          'utf8',
+        );
+      } catch (error) {
+        this.sizes[i] = errorMessage(error);
+      }
+    }
+    for (let i = from - 1; i >= index; i -= 1) {
+      const size = this.sizes[i];
+      const next = i + 1 < end ? (this.suffixBytes[i + 1] ?? 0) : 0;
+      this.suffixBytes[i] = (typeof size === 'number' ? size : 0) + next;
+      this.firstInvalid[i] =
+        typeof size === 'string'
+          ? i
+          : i + 1 < end
+            ? this.firstInvalid[i + 1]
+            : undefined;
+    }
+    this.start = index;
+    this.remaining ??= this.store.materializationRetryCapacity(
+      this.monitorId,
+      this.workspacePath,
+    );
+  }
 }
 
 /**
@@ -2850,45 +2967,70 @@ export class AgentMonitorRuntime {
           }
           return;
         }
-        this.store.setMonitorState(monitor.id, workspacePath, {
+        const nextMonitorState = {
           sourceState: monitorStateForSkip.sourceState,
           notifyState: rollupDispatch.nextState,
           lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
-        });
+        };
+        // An empty window check only persists the window bookkeeping
+        // (`rollupLastFiredMinute`); it holds and flushes nothing.
+        if (rollupDispatch.emitted.length === 0) {
+          this.store.setMonitorState(
+            monitor.id,
+            workspacePath,
+            nextMonitorState,
+          );
+          return;
+        }
         // Route the flushed batch through the SAME span materialization as
         // `ingest()` (issue #180) so the not-due path records the `triggered`
         // observation_history row (002 §10.7) and writes every emitted
         // observation onto the shared chain — the due path already does both.
         // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
-        // Only invoke it when the window actually flushed something: an empty
-        // window check runs every not-due tick and must NOT flood the audit
-        // trail with `no-change` rows. `observed: 0` because this path
-        // dispatches no NEW observations — only the already-accumulated batch.
-        if (rollupDispatch.emitted.length > 0) {
+        // The state that clears `pendingRollup` commits in the SAME
+        // transaction as the flushed span, so the held batch either reaches
+        // its durable outcomes (event, retained retry, or `errored` row) or
+        // stays held for the next window check. Only invoked when the window
+        // flushed something: an empty check must NOT flood the audit trail
+        // with `no-change` rows. `observed: 0` because this path dispatches
+        // no NEW observations — only the already-accumulated batch.
+        try {
+          const materialized = await this.materializeSpan(
+            monitor,
+            rollupDispatch.emitted,
+            {
+              observed: 0,
+              workspacePath,
+              nextMonitorState,
+              ...(ephemeralSessionId !== undefined
+                ? { ephemeralSessionId }
+                : {}),
+            },
+          );
+          acc.emittedEventIds.push(...materialized.emittedEventIds);
+          if (materialized.failures.length > 0) {
+            acc.erroredObservations.push({
+              monitorId: monitor.id,
+              message: summarizeMaterializationFailures(materialized.failures),
+            });
+          }
+        } catch (flushError) {
+          // The whole flush rolled back, hold included, so the batch is
+          // still held for the next window check. Reporting it is all that is
+          // left here. This dispatch decision is still read before the write
+          // lock; that separate not-due decision boundary is tracked by #498.
+          const message = errorMessage(flushError);
+          acc.erroredObservations.push({ monitorId: monitor.id, message });
           try {
-            const materialized = await this.materializeSpan(
-              monitor,
-              rollupDispatch.emitted,
-              {
-                observed: 0,
-                workspacePath,
-                ...(ephemeralSessionId !== undefined
-                  ? { ephemeralSessionId }
-                  : {}),
-              },
-            );
-            acc.emittedEventIds.push(...materialized.emittedEventIds);
-            if (materialized.failures.length > 0) {
-              acc.erroredObservations.push({
-                monitorId: monitor.id,
-                message: summarizeMaterializationFailures(
-                  materialized.failures,
-                ),
-              });
-            }
+            this.store.recordObservationHistory({
+              monitorId: monitor.id,
+              workspacePath,
+              sourceName,
+              result: 'errored',
+              observationData: { error: message },
+            });
           } catch {
-            // Best-effort legacy rollup boundary. The next stack layer couples
-            // this state transition to materialization transactionally.
+            // best-effort audit — ignore write failures
           }
         }
       }
@@ -3129,14 +3271,21 @@ export class AgentMonitorRuntime {
   ): DurableMaterializationSpan {
     const materialized: MaterializedObservation[] = [];
     const failures: MaterializationFailure[] = [];
+    const retention = new SuffixRetention(
+      this.store,
+      monitor.id,
+      options.workspacePath,
+      emitted,
+    );
     let deferRemaining = false;
 
-    for (const envelope of emitted) {
+    for (const [index, envelope] of emitted.entries()) {
       if (deferRemaining) {
         failures.push({
           envelope,
           message:
             'Deferred behind an earlier observation that failed materialization.',
+          retained: true,
           auditError: false,
         });
         continue;
@@ -3162,21 +3311,50 @@ export class AgentMonitorRuntime {
         }
       } catch (materializeError) {
         rethrowIfRuntimeTransactionAborted(this.store, materializeError);
-        deferRemaining = true;
+        const message = errorMessage(materializeError);
+        const refusal = retention.refusal(index);
+        if (refusal === undefined) {
+          deferRemaining = true;
+          failures.push({
+            envelope,
+            message,
+            retained: true,
+            auditError: true,
+          });
+          continue;
+        }
+        // The outbox cannot take this suffix, and replaying the span would
+        // fail the same way, so holding the baseline would stop the monitor
+        // for good. Record the terminal outcome in this transaction instead
+        // and keep admitting later siblings: nothing older is queued ahead of
+        // them. A failure writing this row rolls back the span, like any
+        // other storage failure.
+        const unretained = `${message} Not retained for retry: ${refusal}.`;
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: envelope.monitor.frontmatter.watch.type,
+          result: 'errored',
+          observationData: { error: unretained },
+        });
         failures.push({
           envelope,
-          message: errorMessage(materializeError),
-          auditError: true,
+          message: unretained,
+          retained: false,
+          auditError: false,
         });
       }
     }
 
-    if (failures.length > 0) {
+    const retained = failures.filter((failure) => failure.retained);
+    if (retained.length > 0) {
       // The store's default clock starts backoff at enqueue, after acquisition
       // and prefix materialization. Tick/envelope time is observation provenance
       // and must not consume the initial delay or be rewritten to repair it.
+      // `SuffixRetention` already established that this suffix fits and is
+      // serializable; a throw here is a storage failure and rolls back the span.
       this.store.enqueueMaterializationRetries(
-        failures.map((failure) => ({
+        retained.map((failure) => ({
           workspacePath: options.workspacePath,
           monitorId: monitor.id,
           sourceName: failure.envelope.monitor.frontmatter.watch.type,

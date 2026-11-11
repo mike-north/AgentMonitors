@@ -1346,6 +1346,11 @@ export class RuntimeStore {
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    materializationRetryCapacity(monitorId: string, workspacePath: string | null): {
+        records: number;
+        bytes: number;
+    };
     materializationRetryMonitorIds(workspacePath: string | null): string[];
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)

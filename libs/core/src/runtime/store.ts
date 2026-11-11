@@ -924,24 +924,13 @@ export class RuntimeStore {
         }
 
         for (const addition of additions.values()) {
-          const usage = db
-            .select({
-              count: sql<number>`count(*)`,
-              bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
-            })
-            .from(materializationRetryOutbox)
-            .where(
-              materializationRetryKey(
-                addition.monitorId,
-                addition.workspacePath,
-              ),
-            )
-            .get();
+          const remaining = this.materializationRetryCapacity(
+            addition.monitorId,
+            addition.workspacePath,
+          );
           if (
-            (usage?.count ?? 0) + addition.count >
-              MATERIALIZATION_RETRY_MAX_RECORDS ||
-            (usage?.bytes ?? 0) + addition.bytes >
-              MATERIALIZATION_RETRY_MAX_BYTES
+            addition.count > remaining.records ||
+            addition.bytes > remaining.bytes
           ) {
             throw new MaterializationRetryCapacityError(addition.monitorId);
           }
@@ -972,6 +961,37 @@ export class RuntimeStore {
         return prepared.map((item) => this.getMaterializationRetry(item.id));
       })
       .immediate();
+  }
+
+  /**
+   * Room left in one workspace/monitor retry outbox under the bounds that
+   * {@link RuntimeStore.enqueueMaterializationRetries} enforces: 256 rows and
+   * 8 MiB of stored envelopes, terminal rows included. This is the single
+   * definition of that capacity. Runtime admission reads it inside its own
+   * transaction to decide whether a failed observation's whole ordered suffix
+   * can be retained before it asks enqueue to store that suffix.
+   *
+   * @internal
+   */
+  materializationRetryCapacity(
+    monitorId: string,
+    workspacePath: string | null,
+  ): { records: number; bytes: number } {
+    const usage = asInternalDb(this.db)
+      .select({
+        count: sql<number>`count(*)`,
+        bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
+      })
+      .from(materializationRetryOutbox)
+      .where(materializationRetryKey(monitorId, workspacePath))
+      .get();
+    return {
+      records: Math.max(
+        0,
+        MATERIALIZATION_RETRY_MAX_RECORDS - (usage?.count ?? 0),
+      ),
+      bytes: Math.max(0, MATERIALIZATION_RETRY_MAX_BYTES - (usage?.bytes ?? 0)),
+    };
   }
 
   /** Resolve retained work by identity; absence is a typed error, never a successful discard. */
