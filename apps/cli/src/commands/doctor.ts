@@ -122,16 +122,23 @@ const NEVER_OBSERVED_REMEDIATION =
 /**
  * Older daemon reports omit retry metadata entirely (no per-monitor summaries
  * and no orphan groups); for those the empty-summary default is preserved.
- * A report that carries `orphanedMaterializationRetries` is current: a monitor
- * row without `materializationRetries` is then deliberately unattributed (a
- * duplicated id reports its outbox in an orphan group), so no count is claimed.
+ * On a current report, a monitor row without `materializationRetries` whose id
+ * has an orphan group is deliberately unattributed (a duplicated id reports its
+ * outbox there), so no count is claimed; without such a group it has no work.
  */
 function retryOutboxFor(
   report: Pick<MonitorDoctorReport, 'orphanedMaterializationRetries'>,
   monitor: DoctorMonitorRollup,
 ): MaterializationRetrySummary | undefined {
   if (monitor.materializationRetries) return monitor.materializationRetries;
-  if (report.orphanedMaterializationRetries !== undefined) return undefined;
+  // Only an id whose outbox really sits in an orphan group is "orphaned"; a
+  // duplicated id with no retained work has nothing to attribute, so 0/0 is true.
+  if (
+    report.orphanedMaterializationRetries?.some(
+      (group) => group.monitorId === monitor.id,
+    )
+  )
+    return undefined;
   return { pending: 0, terminal: 0, bytes: 0, records: [] };
 }
 
@@ -156,7 +163,10 @@ function samePath(a: string, b: string): boolean {
 /** `monitor explain <id>` carrying the scope doctor was given, so it reads the same workspace. */
 function explainCommand(report: MonitorDoctorReport, id: string): string {
   const flags: string[] = [];
-  if (!samePath(report.workspacePath, process.cwd())) {
+  // Workspace keys are the `path.resolve()` spelling and `monitor explain` uses
+  // `process.cwd()` (already a real path), so a symlinked spelling is a different
+  // workspace and must be carried. `--dir` is only read as files, so realpath is fine.
+  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
     flags.push('--workspace', shellArg(report.workspacePath));
   }
   if (!samePath(report.monitorsDir, '.claude/monitors')) {

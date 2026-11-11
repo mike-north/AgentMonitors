@@ -4,7 +4,14 @@
  * accidentally satisfy wire-date, compatibility, privacy, or rendering checks.
  */
 import { execFile } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -717,8 +724,13 @@ it('carries doctor scope flags into retained-work explain remediation', async ()
   );
 });
 
+/**
+ * The child's cwd is the real path (`/private/tmp/…` on macOS), so the
+ * "invoking workspace" spelling is the realpath; `root` itself may be a symlink.
+ */
 it('keeps the explain remediation bare when doctor uses the invoking workspace defaults', async () => {
   const fixture = reports();
+  fixture.doctor.workspacePath = realpathSync(root);
   fixture.doctor.monitorsDir = path.resolve(root, '.claude/monitors');
   await serve(fixture);
   const result = await run('doctor', 'text');
@@ -726,6 +738,130 @@ it('keeps the explain remediation bare when doctor uses the invoking workspace d
     '`agentmonitors monitor explain wire-monitor`',
   );
   expect(result.stdout).not.toContain('monitor explain wire-monitor --');
+});
+
+/**
+ * Bug (#496 re-review): a symlinked `--workspace` spelling was treated as the
+ * invoking workspace, so the remediation was a bare `monitor explain` that
+ * read the real-path record instead of the one doctor listed. Retry rows are
+ * keyed by the `path.resolve()` spelling, so the link and real paths are
+ * distinct workspaces.
+ */
+it('carries a symlinked --workspace into the explain remediation and the command shows the same records', async () => {
+  const real = path.join(root, 'realc');
+  const link = path.join(root, 'linkc');
+  const monitors = path.join(real, 'monitors');
+  mkdirSync(path.join(monitors, 'alpha'), { recursive: true });
+  writeFileSync(
+    path.join(monitors, 'alpha', 'MONITOR.md'),
+    '---\nwatch:\n  type: schedule\n  cron: "* * * * *"\n  timezone: UTC\nurgency: normal\n---\nInstruction',
+  );
+  symlinkSync(real, link);
+  const dbPath = path.join(root, 'state.db');
+  const db = createDb(dbPath);
+  const store = new RuntimeStore(db);
+  const enqueue = (workspacePath: string) => {
+    const [row] = store.enqueueMaterializationRetries(
+      [
+        {
+          workspacePath,
+          monitorId: 'alpha',
+          sourceName: 'schedule',
+          error: 'initial',
+          envelope: {
+            monitor: {
+              id: 'alpha',
+              displayName: 'alpha',
+              filePath: path.join(monitors, 'alpha', 'MONITOR.md'),
+              instructions: 'Instruction',
+              frontmatter: {
+                watch: { type: 'schedule' },
+                urgency: 'normal',
+                urgencyMax: 'normal',
+                baselineStrategy: 'incremental',
+              },
+            },
+            observation: { title: 't', payload: {}, snapshotText: 's' },
+            observedAt: created,
+            effectiveUrgency: 'normal',
+          },
+        },
+      ],
+      created,
+    );
+    if (!row) throw new Error('fixture admission failed');
+    return row;
+  };
+  const pending = enqueue(link);
+  const terminal = enqueue(real);
+  for (let attempt = 0; attempt < 5; attempt++)
+    store.markMaterializationRetryFailed(terminal.id, 'failed', updated);
+  (db as unknown as { $client: Database }).$client.close();
+
+  const env = {
+    ...process.env,
+    HOME: root,
+    XDG_DATA_HOME: path.join(root, 'data'),
+    AGENTMONITORS_DB: dbPath,
+    AGENTMONITORS_SOCKET: socketPath,
+  };
+  const cwd = realpathSync(real);
+  const doctor = await execute(
+    process.execPath,
+    [
+      cli,
+      'doctor',
+      '--dir',
+      monitors,
+      '--workspace',
+      link,
+      '--socket',
+      socketPath,
+      '--format',
+      'text',
+    ],
+    { cwd, env, timeout: 15000 },
+  ).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
+  expect(doctor.stdout).toContain(pending.id);
+  expect(doctor.stdout).not.toContain(terminal.id);
+  const suggested = /`agentmonitors (monitor explain alpha[^`]*)`/.exec(
+    doctor.stdout,
+  )?.[1];
+  expect(suggested).toBeDefined();
+  expect(suggested).toContain(`--workspace ${link}`);
+  const explain = await execute(
+    process.execPath,
+    [cli, ...(suggested ?? '').split(' '), '--format', 'text'],
+    { cwd, env, timeout: 15000 },
+  );
+  expect(explain.stdout).toContain(pending.id);
+  expect(explain.stdout).not.toContain(terminal.id);
+});
+
+/**
+ * Bug (#496 re-review): a duplicated id with no retained work printed
+ * `retry-outbox=orphaned` although no orphan group or check exists for it.
+ */
+it('prints retry-outbox=0/0 for a duplicated id that has no orphan group', async () => {
+  const fixture = reports();
+  const row = fixture.doctor.monitors[0];
+  if (!row) throw new Error('fixture requires a monitor row');
+  delete row.materializationRetries;
+  row.id = 'dup2';
+  fixture.doctor.monitors = [row, { ...row }];
+  fixture.doctor.duplicateIds = ['dup2'];
+  fixture.doctor.orphanedMaterializationRetries = [];
+  await serve(fixture);
+  const result = await run('doctor', 'text');
+  const rows = result.stdout
+    .split('\n')
+    .filter((line) => line.includes('monitor:dup2'));
+  expect(rows).toHaveLength(2);
+  for (const line of rows) {
+    expect(line).toContain('retry-outbox=0/0');
+    expect(line).not.toContain('orphaned');
+  }
+  expect(result.stdout).not.toContain('retry-outbox:dup2');
 });
 
 it.each([

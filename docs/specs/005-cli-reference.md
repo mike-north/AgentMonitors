@@ -2012,7 +2012,7 @@ Each outbox occurs once, either attached to one current monitor or in an orphan 
 entries carry only `monitorId` and `summary`, never an invented source, urgency or cadence.
 Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
 for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
-`--workspace`/`--dir` whenever doctor was given non-default values. An orphan or invalid-definition outbox with pending/terminal work adds a failing
+`--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
 `retry-outbox:<id>` check independently of the original definition diagnostics. Parse and duplicate
 errors remain visible even when no valid monitor row exists; doctor JSON includes `parseErrors`
 and `duplicateIds` as well as the health checks.
@@ -2023,7 +2023,7 @@ Unicode separator normalized and capped at 1,024 characters for old-daemon compa
 is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
 doctor JSON defaults them to empty summaries/arrays (only when the report carries no orphan groups at
 all; otherwise a monitor row without a summary, such as a duplicated id whose outbox is in an orphan
-group, claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`), explain preserves the omitted optional field.
+group, claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`; a duplicated id with no retained work reads `0/0`), explain preserves the omitted optional field.
 Text explain uses an existing top-level summary, including an explicitly empty one, in preference
 to recognized materialization-stage details. If that optional field is omitted, it displays the
 available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
