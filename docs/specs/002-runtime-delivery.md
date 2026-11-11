@@ -638,9 +638,63 @@ For each runtime tick, the implementation **MUST**:
 
 A materialization failure rolls back that envelope's event/projection/cursor/snapshot transaction.
 Earlier successful siblings remain events; the failed envelope and every later sibling enter the
-bounded outbox before source/notify state advances. If outbox admission or the state write fails,
-the outer transaction rolls back the batch and retains the prior source baseline. Interpret and
-audit writes run best-effort only after that durable boundary.
+bounded outbox before source/notify state advances, when the outbox can retain that whole ordered
+suffix (below). If the outbox write or the state write fails, the outer transaction rolls back the
+batch and retains the prior source baseline. Interpret and the audit rows other than an
+unretained failure's `errored` outcome run best-effort only after that durable boundary.
+
+#### Admission outcomes when the outbox cannot retain a suffix
+
+_Current._ Every observation a span dispatches **MUST** reach exactly one durable outcome,
+committed in the same transaction as the span's source/notify state:
+
+1. a materialized event (with every recipient projection, cursor seed and snapshot);
+2. a queued retry in the bounded outbox; or
+3. an `errored` `observation_history` row whose error says why the observation was not retained.
+
+The outbox can retain a failed observation only together with its whole ordered suffix: the
+failed envelope and every later sibling. The suffix is retainable when every envelope in it is
+inside the outbox's plain-data domain and all of it fits the monitor's remaining capacity
+(256 rows / 8 MiB per workspace/monitor, terminal rows included; see
+[`materialization_retry_outbox`](#materialization_retry_outbox)). The runtime decides this inside
+the admission transaction, before it writes to the outbox:
+
+- **Retainable.** The suffix is queued in order, as above.
+- **Not retainable.** Replaying the span would fail the same way, so holding the baseline would
+  stop the monitor permanently. Instead, the failed observation gets an `errored` row in the
+  admission transaction. Its error is the materialization error followed by
+  `Not retained for retry:` and the reason: either the outbox capacity is exhausted (records and
+  bytes needed vs remaining), or the envelope, or a later sibling in its suffix, is not
+  serializable for the outbox. Admission then continues with the next sibling. Nothing older is queued ahead of
+  it, so materializing it cannot reorder the span. A later failure in the same span is decided
+  the same way, for its own suffix.
+- **Never part of a suffix.** The runtime never queues part of a suffix: a later sibling would
+  then materialize ahead of an older queued observation.
+
+The source baseline advances once every observation has an outcome. Writing an `errored` row is
+a storage write like any other: if it fails, the span rolls back and the baseline is held. A
+transaction-wide failure (below) still rolls back the whole span. So does a storage failure of the
+outbox or state write. Neither is a refusal decided in advance, so both keep the prior baseline
+for replay. No ingest path drops an observation silently. The tick result's
+`erroredObservations` and the watcher's `onError` report the failure, and the committed `errored`
+row is what `monitor history`, `explainMonitor` and `doctorReport` read.
+
+For example, 600 observations with a native `RAISE(ABORT)` on the 300th leave a 301-record suffix,
+which no empty outbox can hold. The span commits 599 events, one `errored` row naming capacity, and
+the advanced baseline. The next tick observes newer input. A BigInt payload fails event persistence
+and is outside the outbox domain: that one observation is `errored` and its siblings materialize.
+
+The same rule applies to the poll path (`ingest()`), the watch path (one yielded batch is one
+span, §2.4), and the not-due rollup window flush (`materializeSpan()`, §4.4). For the rollup
+flush, the notify state that clears `pendingRollup` commits in the same transaction as the
+flushed span. A flush that rolls back leaves the whole window held, records a best-effort
+`errored` row, and reports the error on the tick result. The next window check retries it.
+
+Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts`: a capacity overflow on
+the poll path; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
+outbox; a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
+fit, or roll back; and watch batches over capacity or with a BigInt payload. Each asserts the
+three-outcome invariant and that the next tick or batch makes progress.
 
 Suffix retry admission applies only while the owning SQLite transaction is still active after
 an envelope failure. A savepoint-local `RAISE(ABORT)` may retain an earlier successful prefix
@@ -764,7 +818,9 @@ notify state, successful event prefix (including all recipient projections/curso
 and complete ordered retry suffix in one synchronous transaction. The whole unit **MUST** commit
 before the first Interpret invocation or next iterator pull. No source/plugin callback, Interpret,
 or other external asynchronous effect runs inside that transaction. A materialization failure with
-successful durable retry admission is an admitted batch; an outbox/state/transaction failure is not.
+successful durable retry admission is an admitted batch. So is one whose failed observation the
+outbox could not retain and which was recorded `errored` in the same commit (§2). An
+outbox/state/transaction storage failure is not.
 
 `nextState` is source-owned change-detection/restart state, not a recipient baseline, delivery
 receipt or agent acknowledgement. Omitted or `undefined` preserves the prior source baseline;
@@ -1976,7 +2032,10 @@ supported plain-data inputs.
 without invoking their hooks. The validated instant is serialized explicitly as ISO text and
 restored as a Date; a string timestamp is not an accepted substitute. A batch
 enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
-workspace or monitor has independent capacity.
+workspace or monitor has independent capacity. Runtime admission does not rely on that rejection:
+it checks the domain and remaining capacity (`RuntimeStore.materializationRetryCapacity()`, the
+same bound) first. It enqueues only a suffix that fits, and records an unretainable failure as
+`errored` (§2, "Admission outcomes when the outbox cannot retain a suffix").
 
 New records first become due after at least 1 second, measured from the instant the retry is
 enqueued (_current_): backoff starts after source acquisition and prefix materialization, not at the
@@ -2194,13 +2253,21 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       `emittedEventIds` reflects only durably committed events. `finishMaterializationSpan()`
       writes one `errored` row for the failed envelope after the span commits; the deferred later
       siblings get none.
+    - _Savepoint-local failure the outbox cannot retain_ (its whole ordered suffix exceeds the
+      outbox's remaining capacity or is not serializable for it; §2 "Admission outcomes when the
+      outbox cannot retain a suffix"): nothing is queued for that failure. `admitSpan()` writes
+      its `errored` row **inside** the admission transaction, with an error ending in
+      `Not retained for retry: <reason>`. That row is the observation's durable outcome, not a
+      best-effort audit. Later siblings keep materializing and the source baseline advances.
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
-      catch, which also ends that watcher. The not-due flush's own catch is best-effort and
-      records no row.
+      catch, which also ends that watcher. On the not-due flush it comes from that flush's own
+      catch, and the window stays held because its `pendingRollup` clear rolled back too.
 
-  In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
+  In every case `observationData` is `{ error: "<message>" }`. Except for the unretained-suffix
+  row, which commits with the span, the audit write is best-effort: a `recordObservationHistory`
+  failure is swallowed so a failing audit row can never re-abort the tick.
 
   An unavailable `incoming-changes` repository/ref uses this existing source-error path (003 §6.5,
   decision #555, Refs #305). Source state, notify state and `lastObservationAt` remain unchanged,
@@ -2212,7 +2279,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `admitSpan()` (in-transaction `errored` rows for unretained failures), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), the not-due rollup flush catch, and `consumeWatch()`'s outer catch (which also ends the watcher). Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 An observation tick always runs for one concrete workspace, so each row records
 its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and
@@ -2233,7 +2300,7 @@ re-baseline above).
 | `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| no-files-matched \| errored \| rebaselined` |
 | `created_at`       | INTEGER NOT NULL |                                                                                      |
 
-Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()` inner catch block.
+Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks (including the not-due rollup flush catch), `admitSpan()` unretained-failure rows, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()`'s outer catch block.
 
 ### `inbox_items`
 
