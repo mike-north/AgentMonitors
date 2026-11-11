@@ -840,29 +840,48 @@ it('carries a symlinked --workspace into the explain remediation and the command
 
 /**
  * Bug (#496 re-review): a duplicated id with no retained work printed
- * `retry-outbox=orphaned` although no orphan group or check exists for it.
+ * `retry-outbox=orphaned` (and JSON omitted its summary) although no orphan
+ * group exists for that id. The report also carries an orphan group for a
+ * different id, so only a per-id check (not "any orphan group exists") passes.
  */
-it('prints retry-outbox=0/0 for a duplicated id that has no orphan group', async () => {
-  const fixture = reports();
-  const row = fixture.doctor.monitors[0];
-  if (!row) throw new Error('fixture requires a monitor row');
-  delete row.materializationRetries;
-  row.id = 'dup2';
-  fixture.doctor.monitors = [row, { ...row }];
-  fixture.doctor.duplicateIds = ['dup2'];
-  fixture.doctor.orphanedMaterializationRetries = [];
-  await serve(fixture);
-  const result = await run('doctor', 'text');
-  const rows = result.stdout
-    .split('\n')
-    .filter((line) => line.includes('monitor:dup2'));
-  expect(rows).toHaveLength(2);
-  for (const line of rows) {
-    expect(line).toContain('retry-outbox=0/0');
-    expect(line).not.toContain('orphaned');
-  }
-  expect(result.stdout).not.toContain('retry-outbox:dup2');
-});
+it.each(['text', 'json'] as const)(
+  'reports an empty retry outbox for a duplicated id with no orphan group while another id has one (%s)',
+  async (format) => {
+    const fixture = reports();
+    const row = fixture.doctor.monitors[0];
+    if (!row) throw new Error('fixture requires a monitor row');
+    delete row.materializationRetries;
+    row.id = 'dup2';
+    fixture.doctor.monitors = [row, { ...row }];
+    fixture.doctor.duplicateIds = ['dup2'];
+    fixture.doctor.orphanedMaterializationRetries = [
+      { monitorId: 'other', summary: summary('other-orphan') },
+    ];
+    await serve(fixture);
+    const result = await run('doctor', format);
+    if (format === 'json') {
+      const value = JSON.parse(result.stdout);
+      expect(value.monitors).toHaveLength(2);
+      for (const monitor of value.monitors)
+        expect(monitor.materializationRetries).toEqual({
+          pending: 0,
+          terminal: 0,
+          bytes: 0,
+          records: [],
+        });
+    } else {
+      const rows = result.stdout
+        .split('\n')
+        .filter((line) => line.includes('monitor:dup2'));
+      expect(rows).toHaveLength(2);
+      for (const line of rows) {
+        expect(line).toContain('retry-outbox=0/0');
+        expect(line).not.toContain('orphaned');
+      }
+      expect(result.stdout).not.toContain('retry-outbox:dup2');
+    }
+  },
+);
 
 it.each([
   'missing',
