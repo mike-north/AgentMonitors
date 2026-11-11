@@ -2008,7 +2008,8 @@ monitor has completed without a drop) fails its check even though `retry-outbox`
 the drop has no retry record. This check outranks the retry checks. Its detail is
 `observation dropped, not retained for retry (<count> outstanding; newest: <which> at <iso8601>):
 <error>` followed by the rollup line. `<which>` uses explain's wording (002 §10.7). The remediation
-names `monitor explain <id>` and `monitor history <id>`, says the drop cannot be retried, and says
+names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
+`monitor history <id>`, says the drop cannot be retried, and says
 the check clears once a later observation completes without a drop. Doctor JSON carries the
 same data in `monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients
 revive `recordedAt`, keep only the documented fields and normalize their text like retry errors.
@@ -2025,7 +2026,8 @@ metadata. Outboxes without an unambiguous parsed definition appear in
 Each outbox occurs once, either attached to one current monitor or in an orphan group; orphan
 entries carry only `monitorId` and `summary`, never an invented source, urgency or cadence.
 Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
-for both locations. An orphan or invalid-definition outbox with pending/terminal work adds a failing
+for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
+`--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
 `retry-outbox:<id>` check independently of the original definition diagnostics. Parse and duplicate
 errors remain visible even when no valid monitor row exists; doctor JSON includes `parseErrors`
 and `duplicateIds` as well as the health checks.
@@ -2034,7 +2036,10 @@ Socket clients reconstruct created/updated/non-null next-attempt Dates in all re
 terminal next-attempt stays null. Unknown retry fields are excluded, and errors are C0/C1/DEL and
 Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
 is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
-doctor JSON defaults them to empty summaries/arrays, explain preserves the omitted optional field.
+doctor JSON defaults them to empty summaries/arrays. A monitor row's summary defaults to empty unless that
+id has an orphan group (for example a duplicated id whose outbox is in an orphan group), in which case the row
+claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. For an older daemon that
+reports no orphan groups at all, the empty default applies as before; explain preserves the omitted optional field.
 Text explain uses an existing top-level summary, including an explicitly empty one, in preference
 to recognized materialization-stage details. If that optional field is omitted, it displays the
 available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent

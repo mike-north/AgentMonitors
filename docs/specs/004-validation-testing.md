@@ -435,10 +435,9 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 
 Retry CLI/IPC diagnostics are covered by `apps/cli/src/retry-diagnostics.test.ts`: real socket
 roundtrips revive distinct created/updated/next-attempt Dates for explain, doctor attached summaries
-and orphan groups; older-daemon omissions work in both commands and formats. Its built CLI lives in
-an owned temporary package layout, independent of the shared `dist` cleaned by other parallel
-integration suites; the manifest/native dependency layout is preserved and output is removed after
-all fixture children exit. No retries or timing delays mask artifact ownership. Built CLI text/JSON
+and orphan groups; older-daemon omissions work in both commands and formats. Its CLI subprocesses run the shared Nx-built
+`apps/cli/dist/index.cjs` (built by `nx test`'s dependency, never rebuilt by the test, per §2.9).
+No retries or timing delays mask artifact ownership. Built CLI text/JSON
 preserve missing/invalid/duplicate definition errors and retained IDs exactly once, normalize legacy
 unsafe errors, exclude private metadata fields and other workspaces, and leave durable state unchanged.
 

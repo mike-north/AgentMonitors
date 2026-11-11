@@ -75,6 +75,14 @@ A transaction-wide `RAISE(ROLLBACK)` differs: the whole span rolls back, prefix 
 is queued, the source baseline does not advance, and the single `errored` row comes from `tick()`'s
 ingest-error catch (or `consumeWatch()`'s outer catch, which also ends the watcher).
 
+## 2026-11-10 — Doctor does not invent an outbox for unattributed monitor rows; scoped remediation (004, 005) — Refs #496
+
+Doctor applies the empty retry-summary default only for older daemon reports that carry no orphan
+groups. In a current report a monitor row without a summary (a duplicated id) claims no count: JSON
+omits the field and the text rollup shows `retry-outbox=orphaned`. Retained-work remediation names
+`monitor explain` with `--workspace`/`--dir` when doctor was given non-default values. 004 now
+describes the retry CLI suite as running the shared Nx-built bundle, not an owned package layout.
+
 ## 2026-11-08 — Read retry diagnosis after asynchronous discovery (002, 004) — Refs #495
 
 Clarify that explain reads retained-work metadata after its asynchronous monitor scan, before
