@@ -386,9 +386,15 @@ describe('durable equal-time event order', () => {
     const migratedRows = migrated.client
       .prepare('SELECT * FROM monitor_events ORDER BY sequence')
       .all() as Record<string, unknown>[];
-    expect(migratedRows.map(({ sequence: _sequence, ...row }) => row)).toEqual(
-      originalRows,
+    // `definition_fingerprint` (#451) post-dates the legacy shape; legacy rows read as unknown.
+    expect(migratedRows.map((row) => row['definition_fingerprint'])).toEqual(
+      migratedRows.map(() => null),
     );
+    expect(
+      migratedRows.map(
+        ({ sequence: _sequence, definition_fingerprint: _f, ...row }) => row,
+      ),
+    ).toEqual(originalRows);
     expect(
       migrated.client
         .prepare('SELECT * FROM session_event_state ORDER BY id')

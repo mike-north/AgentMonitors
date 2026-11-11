@@ -553,6 +553,15 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
          AND sql IS NOT NULL ORDER BY type, name`,
     )
     .all();
+  // A table written by the definition-fingerprint change before ordering existed
+  // already holds fingerprints; carry them over rather than resetting to unknown.
+  const fingerprintSource = tableHasColumn(
+    sqlite,
+    'monitor_events',
+    'definition_fingerprint',
+  )
+    ? 'definition_fingerprint'
+    : 'NULL';
   sqlite.exec(`
     CREATE TABLE monitor_events_ordered (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -572,15 +581,16 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
       baseline_strategy TEXT,
       query_scope TEXT NOT NULL DEFAULT '{}',
       tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      definition_fingerprint TEXT
     );
     INSERT INTO monitor_events_ordered
       (id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
        payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-       baseline_strategy, query_scope, tags, created_at)
+       baseline_strategy, query_scope, tags, created_at, definition_fingerprint)
       SELECT id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
         payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-        baseline_strategy, query_scope, tags, created_at
+        baseline_strategy, query_scope, tags, created_at, ${fingerprintSource}
       FROM monitor_events ORDER BY rowid;
     DROP TABLE monitor_events;
     ALTER TABLE monitor_events_ordered RENAME TO monitor_events;
