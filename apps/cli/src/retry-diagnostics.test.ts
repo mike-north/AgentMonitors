@@ -1299,6 +1299,41 @@ it('fails the doctor monitor check for a dropped observation until a later clean
         'A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.',
       );
 
+      // Bug (#496/#497 merge): the drop remediation named a bare
+      // `monitor explain` that read the invoking cwd's workspace. Run from
+      // another directory, it must carry `--workspace` like the retry ones.
+      const elsewhere = path.join(root, 'elsewhere');
+      mkdirSync(elsewhere, { recursive: true });
+      const scoped = await execute(
+        process.execPath,
+        [
+          cli,
+          'doctor',
+          '--dir',
+          monitors,
+          '--workspace',
+          root,
+          '--socket',
+          socketPath,
+          '--format',
+          'text',
+        ],
+        {
+          cwd: realpathSync(elsewhere),
+          timeout: 15000,
+          env: {
+            ...process.env,
+            HOME: root,
+            XDG_DATA_HOME: path.join(root, 'data'),
+            AGENTMONITORS_DB: dbPath,
+            AGENTMONITORS_SOCKET: socketPath,
+          },
+        },
+      ).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
+      expect(scoped.stdout).toContain(
+        `\`agentmonitors monitor explain dropper --workspace ${root}`,
+      );
+
       const json = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
       expect(json.ok).toBe(false);
       expect(json.monitors[0].unretainedObservationLoss).toEqual({
