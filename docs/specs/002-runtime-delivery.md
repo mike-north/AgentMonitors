@@ -665,7 +665,8 @@ the admission transaction, before it writes to the outbox:
   admission transaction. Its error is the materialization error followed by
   `Not retained for retry:` and the reason: either the outbox capacity is exhausted (records and
   bytes needed vs remaining), or the envelope, or a later sibling in its suffix, is not
-  serializable for the outbox. Admission then continues with the next sibling. Nothing older is queued ahead of
+  serializable for the outbox. The row also names which observation was lost (see
+  [`observation_history`](#observation_history)). Admission then continues with the next sibling. Nothing older is queued ahead of
   it, so materializing it cannot reorder the span. A later failure in the same span is decided
   the same way, for its own suffix.
 - **Never part of a suffix.** The runtime never queues part of a suffix: a later sibling would
@@ -676,8 +677,24 @@ a storage write like any other: if it fails, the span rolls back and the baselin
 transaction-wide failure (below) still rolls back the whole span. So does a storage failure of the
 outbox or state write. Neither is a refusal decided in advance, so both keep the prior baseline
 for replay. No ingest path drops an observation silently. The tick result's
-`erroredObservations` and the watcher's `onError` report the failure, and the committed `errored`
-row is what `monitor history`, `explainMonitor` and `doctorReport` read.
+`erroredObservations` and the watcher's `onError` report the failure. `monitor history` lists the
+committed `errored` row.
+
+A dropped observation **MUST NOT** be less visible than a retained one. The span's `triggered` batch
+row is written after commit and is therefore newer than the drop row, so
+diagnostics cannot read only the newest row. Instead, the batch row records the span's drop count
+as `notRetainedCount`, and a drop stays _outstanding_ until a later history row of that
+workspace/monitor records a _clean_ outcome: any result other than `errored` whose
+`notRetainedCount` is absent or zero. A later `errored` row (an observe failure, or a retained
+failure's audit row) does not clear it. While a drop is outstanding:
+
+- `explainMonitor`'s materialization stage is `failure` (§10.7), so its verdict fails;
+- `doctorReport` attaches `unretainedObservationLoss` to that monitor's rollup: the outstanding
+  count and the newest drop's time, error, position, span size, `objectKey` and `title`. `doctor`
+  fails that monitor's check with the reason ([005](./005-cli-reference.md) per-monitor rollup).
+
+Both read the durable rows through `RuntimeStore.outstandingUnretainedObservationLoss()`
+(internal), so the answer is the same with or without a daemon and across restarts.
 
 For example, 600 observations with a native `RAISE(ABORT)` on the 300th leave a 301-record suffix,
 which no empty outbox can hold. The span commits 599 events, one `errored` row naming capacity, and
@@ -691,7 +708,10 @@ flushed span. A flush that rolls back leaves the whole window held, records a be
 `errored` row, and reports the error on the tick result. The next window check retries it.
 
 Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts`: a capacity overflow on
-the poll path; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
+the poll path, with its drop row, batch-row count, explain verdict and doctor rollup, cleared by
+the next clean tick; a drop kept outstanding across a later observe failure and accumulated with a
+later drop; a span whose only observation is dropped; bounded, control-free identity text with no
+payload; explain and doctor failing for both a retained and a dropped failure; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
 outbox; a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
 fit, or roll back; and watch batches over capacity or with a BigInt payload. Each asserts the
 three-outcome invariant and that the next tick or batch makes progress.
@@ -1748,7 +1768,8 @@ monitor through the persisted pipeline state and returns stages for:
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
 3. Observation: recent `observation_history` rows and latest outcome
 4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
-5. Materialization: recent `monitor_events`
+5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
+   `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
    `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
    claimed with no fresh work remaining, or a same-band lease exists, this stage additionally
@@ -1768,7 +1789,7 @@ Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
   expected absence of events/projections. The verdict for a genuinely idle monitor is therefore an
   affirmative `healthy` at the observation stage (e.g. "Source ran, observed 0 changes — your watched
   target genuinely hasn't changed (not a bug).").
-- `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, or a missing expected projection.
+- `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, an outstanding dropped observation, terminal retained work, or a missing expected projection.
   (An unreachable daemon is **not** itself a stage failure: the CLI falls back to an in-process read
   of the persisted store — see the no-daemon fallback below.)
 
@@ -1781,6 +1802,17 @@ This is a read-only display transformation: `details`, history JSON and stored a
 unchanged. The existing verdict severity ordering still applies; another failure may win the
 verdict without removing this observation-stage diagnostic. Verified: `source-error-state.test.ts`
 and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
+
+While the monitor has an outstanding dropped observation (§2, "Admission outcomes when the outbox
+cannot retain a suffix"), the materialization stage is `failure` with reason
+`<count> observation(s) were dropped because the retry outbox could not retain them; the newest,
+<which>, failed: <displayed error>`. `<which>` is `observation <position> of <spanSize>`, followed
+by `(<objectKey>, "<title>")` with whichever of the two were recorded; the error uses the display
+rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
+`unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
+retained-retry branches: retained work can still be recovered and a drop cannot. The observation
+stage still describes the newest history row. Verified: `unretainable-suffix-admission.test.ts`
+(Refs #497).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -2237,7 +2269,7 @@ This is a documented one-time transition, not a per-tick behavior.
 
 An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
-- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`.
+- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2).
 - `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`.
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
@@ -2258,14 +2290,21 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       outbox cannot retain a suffix"): nothing is queued for that failure. `admitSpan()` writes
       its `errored` row **inside** the admission transaction, with an error ending in
       `Not retained for retry: <reason>`. That row is the observation's durable outcome, not a
-      best-effort audit. Later siblings keep materializing and the source baseline advances.
+      best-effort audit. Later siblings keep materializing and the source baseline advances. Its
+      `observationData` is `{ error, notRetained: true, position, spanSize, objectKey?, title? }`:
+      `position` is the observation's 1-based place among the `spanSize` observations the span
+      dispatched, and `objectKey`/`title` are copied only when they are strings. The payload is
+      never copied. Every text field gets the retry-error safe-text rule: C0, DEL, C1, U+2028 and
+      U+2029 become spaces, and each field is capped at 1,024 characters. `error` shortens the
+      materialization error, not the reason, to fit. If every observation of the span was
+      dropped, no batch row is written (as for any span that emitted nothing and failed).
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
       catch, which also ends that watcher. On the not-due flush it comes from that flush's own
       catch, and the window stays held because its `pendingRollup` clear rolled back too.
 
-  In every case `observationData` is `{ error: "<message>" }`. Except for the unretained-suffix
+  In every other case `observationData` is `{ error: "<message>" }`. Except for the unretained-suffix
   row, which commits with the span, the audit write is best-effort: a `recordObservationHistory`
   failure is swallowed so a failing audit row can never re-abort the tick.
 

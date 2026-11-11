@@ -2001,6 +2001,20 @@ as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check 
 exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
 explain <id>` command. Explain lists bounded safe retry metadata (record id, status, attempts,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
+
+A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
+cannot retain a suffix": its retry suffix could not be retained, and no later observation of the
+monitor has completed without a drop) fails its check even though `retry-outbox` shows `0/0`, since
+the drop has no retry record. This check outranks the retry checks. Its detail is
+`observation dropped, not retained for retry (<count> outstanding; newest: <which> at <iso8601>):
+<error>` followed by the rollup line. `<which>` uses explain's wording (002 §10.7). The remediation
+names `monitor explain <id>` and `monitor history <id>`, says the drop cannot be retried, and says
+the check clears once a later observation completes without a drop. Doctor JSON carries the
+same data in `monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients
+revive `recordedAt`, keep only the documented fields and normalize their text like retry errors.
+Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
+through the built CLI, cleared by a later clean tick).
+
 Otherwise the line carries an explicit `never observed` marker (the monitor has no observation
 history) / `lead-session=none` marker (the workspace has no lead session). The three delivery states
 are distinct (000 AP): claiming a delivery never acknowledges it.
@@ -2115,6 +2129,15 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
         "terminal": 0,
         "bytes": 0,
         "records": []
+      },
+      "unretainedObservationLoss": {
+        "count": 1,
+        "recordedAt": "<iso8601>",
+        "error": "<string>",
+        "position": 300,
+        "spanSize": 600,
+        "objectKey": "<string, when recorded>",
+        "title": "<string, when recorded>"
       }
     }
   ],
