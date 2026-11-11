@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Command, Option } from 'commander';
@@ -100,6 +101,11 @@ function shellSingleQuote(value: string): string {
   return `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
+/** Quote only when the value is not already shell-safe, keeping ordinary ids readable. */
+function shellArg(value: string): string {
+  return /^[\w./@:+-]+$/.test(value) ? value : shellSingleQuote(value);
+}
+
 function leadSessionRemediation(workspacePath: string): string {
   // Build the manual stdin payload with JSON.stringify so the embedded path is
   // correctly quoted as JSON; shellSingleQuote then makes the whole payload
@@ -113,18 +119,50 @@ function leadSessionRemediation(workspacePath: string): string {
 const NEVER_OBSERVED_REMEDIATION =
   'The daemon has not observed this monitor yet. Start it with `agentmonitors daemon run` (or wait for the next tick), then check `agentmonitors monitor history <id>`; `agentmonitors monitor test <path>` dry-runs it now.';
 
-/** Older daemon reports omit retry metadata; preserve their empty-summary default. */
+/**
+ * Older daemon reports omit retry metadata entirely (no per-monitor summaries
+ * and no orphan groups); for those the empty-summary default is preserved.
+ * A report that carries `orphanedMaterializationRetries` is current: a monitor
+ * row without `materializationRetries` is then deliberately unattributed (a
+ * duplicated id reports its outbox in an orphan group), so no count is claimed.
+ */
 function retryOutboxFor(
+  report: Pick<MonitorDoctorReport, 'orphanedMaterializationRetries'>,
   monitor: DoctorMonitorRollup,
-): MaterializationRetrySummary {
-  return (
-    monitor.materializationRetries ?? {
-      pending: 0,
-      terminal: 0,
-      bytes: 0,
-      records: [],
+): MaterializationRetrySummary | undefined {
+  if (monitor.materializationRetries) return monitor.materializationRetries;
+  if (report.orphanedMaterializationRetries !== undefined) return undefined;
+  return { pending: 0, terminal: 0, bytes: 0, records: [] };
+}
+
+/** Path equality that tolerates symlinked spellings (e.g. macOS /tmp vs /private/tmp). */
+function samePath(a: string, b: string): boolean {
+  // Resolve symlinks through the nearest existing ancestor so not-yet-created
+  // directories still compare equal.
+  const canonical = (value: string): string => {
+    const resolved = path.resolve(value);
+    try {
+      return realpathSync(resolved);
+    } catch {
+      const parent = path.dirname(resolved);
+      return parent === resolved
+        ? resolved
+        : path.join(canonical(parent), path.basename(resolved));
     }
-  );
+  };
+  return canonical(a) === canonical(b);
+}
+
+/** `monitor explain <id>` carrying the scope doctor was given, so it reads the same workspace. */
+function explainCommand(report: MonitorDoctorReport, id: string): string {
+  const flags: string[] = [];
+  if (!samePath(report.workspacePath, process.cwd())) {
+    flags.push('--workspace', shellArg(report.workspacePath));
+  }
+  if (!samePath(report.monitorsDir, '.claude/monitors')) {
+    flags.push('--dir', shellArg(report.monitorsDir));
+  }
+  return ['agentmonitors monitor explain', shellArg(id), ...flags].join(' ');
 }
 
 const STATUS_GLYPH: Record<DoctorCheckStatus, string> = {
@@ -143,10 +181,11 @@ const STATUS_GLYPH: Record<DoctorCheckStatus, string> = {
  * counts — or the explicit "no lead session" marker when the workspace has none.
  */
 function rollupLine(
+  report: MonitorDoctorReport,
   monitor: DoctorMonitorRollup,
   hasLeadSession: boolean,
 ): string {
-  const retryOutbox = retryOutboxFor(monitor);
+  const retryOutbox = retryOutboxFor(report, monitor);
   return [
     `source=${monitor.sourceName}`,
     `urgency=${monitor.urgency}`,
@@ -154,7 +193,9 @@ function rollupLine(
     `last-observed=${monitor.lastObservedAt ? monitor.lastObservedAt.toISOString() : 'never'}`,
     `next-due=${monitor.nextDueAt ? monitor.nextDueAt.toISOString() : 'unknown'}`,
     `last-event=${monitor.lastEventAt ? monitor.lastEventAt.toISOString() : 'none'}`,
-    `retry-outbox=${String(retryOutbox.pending)}/${String(retryOutbox.terminal)}`,
+    retryOutbox
+      ? `retry-outbox=${String(retryOutbox.pending)}/${String(retryOutbox.terminal)}`
+      : 'retry-outbox=orphaned',
     hasLeadSession
       ? `unread/claimed/acked=${String(monitor.delivery.unread)}/${String(monitor.delivery.claimed)}/${String(monitor.delivery.acknowledged)}`
       : 'lead-session=none',
@@ -332,27 +373,27 @@ function buildChecks(
   // 6. per-monitor health (criterion 2 rollup embedded in each check line)
   for (const monitor of report.monitors) {
     const name = `monitor:${monitor.id}`;
-    const rollup = rollupLine(monitor, hasActiveLeadSession);
-    const retryOutbox = retryOutboxFor(monitor);
+    const rollup = rollupLine(report, monitor, hasActiveLeadSession);
+    const retryOutbox = retryOutboxFor(report, monitor);
     if (!monitor.valid) {
       checks.push({
         name,
         status: 'skip',
         detail: `invalid definition (see monitors-valid)  ${rollup}`,
       });
-    } else if (retryOutbox.terminal > 0) {
+    } else if ((retryOutbox?.terminal ?? 0) > 0) {
       checks.push({
         name,
         status: 'fail',
         detail: `terminal materialization retry  ${rollup}`,
-        remediation: `Inspect safe retry details with \`agentmonitors monitor explain ${monitor.id}\`, investigate the listed record IDs and repair the reported failure. This CLI does not yet provide a retry action.`,
+        remediation: `Inspect safe retry details with \`${explainCommand(report, monitor.id)}\`, investigate the listed record IDs and repair the reported failure. This CLI does not yet provide a retry action.`,
       });
-    } else if (retryOutbox.pending > 0) {
+    } else if ((retryOutbox?.pending ?? 0) > 0) {
       checks.push({
         name,
         status: 'fail',
         detail: `materialization retry pending  ${rollup}`,
-        remediation: `Inspect this monitor with \`agentmonitors monitor explain ${monitor.id}\` and investigate the retained work before advancing source state. This command diagnoses retained work; it does not retry it.`,
+        remediation: `Inspect this monitor with \`${explainCommand(report, monitor.id)}\` and investigate the retained work before advancing source state. This command diagnoses retained work; it does not retry it.`,
       });
     } else if (monitor.neverObserved) {
       checks.push({
@@ -368,11 +409,16 @@ function buildChecks(
 
   for (const monitor of report.monitors) {
     if (!monitor.valid && monitor.materializationRetries) {
-      addRetainedWorkCheck(checks, monitor.id, monitor.materializationRetries);
+      addRetainedWorkCheck(
+        checks,
+        report,
+        monitor.id,
+        monitor.materializationRetries,
+      );
     }
   }
   for (const group of report.orphanedMaterializationRetries ?? []) {
-    addRetainedWorkCheck(checks, group.monitorId, group.summary);
+    addRetainedWorkCheck(checks, report, group.monitorId, group.summary);
   }
 
   return checks;
@@ -381,6 +427,7 @@ function buildChecks(
 /** Recovery obligations remain failures even without one valid current definition. */
 function addRetainedWorkCheck(
   checks: DoctorCheck[],
+  report: MonitorDoctorReport,
   monitorId: string,
   summary: MaterializationRetrySummary,
 ): void {
@@ -391,7 +438,7 @@ function addRetainedWorkCheck(
     name: `retry-outbox:${monitorId}`,
     status: 'fail',
     detail: `retained materialization work  retry-outbox=${String(summary.pending)}/${String(summary.terminal)}  bytes=${String(summary.bytes)}`,
-    remediation: `Inspect retained record IDs with \`agentmonitors monitor explain ${monitorId}\` and repair the definition or reported failure. This CLI does not yet provide a retry action.`,
+    remediation: `Inspect retained record IDs with \`${explainCommand(report, monitorId)}\` and repair the definition or reported failure. This CLI does not yet provide a retry action.`,
   });
 }
 
@@ -722,7 +769,9 @@ function toJson(
         ? monitor.lastEventAt.toISOString()
         : null,
       delivery: monitor.delivery,
-      materializationRetries: retryOutboxFor(monitor),
+      ...(retryOutboxFor(report, monitor)
+        ? { materializationRetries: retryOutboxFor(report, monitor) }
+        : {}),
     })),
     summary: { passed, failed, skipped, idle },
   };

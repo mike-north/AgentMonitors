@@ -652,6 +652,82 @@ it.each(['all-omitted', 'orphans-omitted'] as const)(
   },
 );
 
+/**
+ * @see docs/specs/005-cli-reference.md "Retained-work diagnostics (current)":
+ * each outbox occurs once, attached to one monitor or in an orphan group.
+ * A duplicated id's outbox lives in the orphan group, so neither duplicate row
+ * may claim a count (bug: doctor invented `retry-outbox=0/0` for both rows).
+ */
+it.each(['text', 'json'] as const)(
+  'does not invent an empty retry outbox on duplicate-id monitor rows (%s, daemon path)',
+  async (format) => {
+    const fixture = reports();
+    const row = fixture.doctor.monitors[0];
+    if (!row) throw new Error('fixture requires a monitor row');
+    delete row.materializationRetries;
+    row.id = 'dup';
+    fixture.doctor.monitors = [row, { ...row }];
+    fixture.doctor.duplicateIds = ['dup'];
+    fixture.doctor.orphanedMaterializationRetries = [
+      { monitorId: 'dup', summary: summary('dup-orphan') },
+    ];
+    await serve(fixture);
+    const result = await run('doctor', format);
+    expect(result.code).toBe(1);
+    if (format === 'json') {
+      const value = JSON.parse(result.stdout);
+      expect(value.monitors).toHaveLength(2);
+      for (const monitor of value.monitors)
+        expect(monitor).not.toHaveProperty('materializationRetries');
+      expect(value.orphanedMaterializationRetries[0].monitorId).toBe('dup');
+      expect(value.checks).toContainEqual(
+        expect.objectContaining({ name: 'retry-outbox:dup', status: 'fail' }),
+      );
+    } else {
+      const rows = result.stdout
+        .split('\n')
+        .filter((line) => line.includes('monitor:dup'));
+      expect(rows).toHaveLength(2);
+      for (const line of rows) {
+        expect(line).toContain('retry-outbox=orphaned');
+        expect(line).not.toContain('retry-outbox=0/0');
+      }
+      expect(result.stdout).toContain('retry-outbox:dup');
+    }
+  },
+);
+
+/**
+ * @see docs/specs/005-cli-reference.md: remediation "names the exact … command".
+ * Doctor run for another workspace must suggest an explain that reads that
+ * workspace (bug: the bare command read the invoking workspace's record).
+ */
+it('carries doctor scope flags into retained-work explain remediation', async () => {
+  const fixture = reports();
+  const otherWorkspace = "/tmp/other ws's";
+  fixture.doctor.workspacePath = otherWorkspace;
+  fixture.doctor.monitorsDir = path.join(otherWorkspace, 'custom-monitors');
+  await serve(fixture);
+  const result = await run('doctor', 'text');
+  expect(result.code).toBe(1);
+  const scoped = `agentmonitors monitor explain wire-monitor --workspace '/tmp/other ws'\\''s' --dir '/tmp/other ws'\\''s/custom-monitors'`;
+  expect(result.stdout).toContain(scoped);
+  expect(result.stdout).toContain(
+    `agentmonitors monitor explain removed --workspace '/tmp/other ws'\\''s'`,
+  );
+});
+
+it('keeps the explain remediation bare when doctor uses the invoking workspace defaults', async () => {
+  const fixture = reports();
+  fixture.doctor.monitorsDir = path.resolve(root, '.claude/monitors');
+  await serve(fixture);
+  const result = await run('doctor', 'text');
+  expect(result.stdout).toContain(
+    '`agentmonitors monitor explain wire-monitor`',
+  );
+  expect(result.stdout).not.toContain('monitor explain wire-monitor --');
+});
+
 it.each([
   'missing',
   'invalid',
@@ -777,6 +853,14 @@ it.each([
               .flatMap((s) => s.records.map((r: { id: string }) => r.id))
               .sort(),
           ).toEqual([pending.id, terminal.id].sort());
+          if (kind === 'duplicate') {
+            const dups = value.monitors.filter(
+              (m: { id: string }) => m.id === 'retained',
+            );
+            expect(dups.length).toBeGreaterThan(0);
+            for (const m of dups)
+              expect(m).not.toHaveProperty('materializationRetries');
+          }
           const report = JSON.parse(explain.stdout);
           if (kind !== 'valid') expect(report.verdict.status).toBe('failure');
           else expect(report.notice).toContain('No daemon running');
