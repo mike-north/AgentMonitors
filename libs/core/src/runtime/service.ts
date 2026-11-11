@@ -1623,16 +1623,19 @@ export class AgentMonitorRuntime {
           ? ` ${reminderSuppression.map((finding) => finding.message).join(' ')}`
           : '';
 
-      // Definition-drift diagnostic (issue #451): a pending (not yet
-      // acknowledged by every recipient) event whose OWN stored
-      // `definitionFingerprint` differs from the monitor's CURRENT fingerprint
-      // was observed under a since-edited definition (urgency, body, or the
-      // source and its config). Not itself a bug — the event still delivers with
-      // what was in force when it was observed — but an author debugging an
-      // unexpected delivery needs to see that the definition has changed. A
-      // `null` fingerprint (a row from before the field existed) is "unknown",
-      // never flagged. Counted over ALL pending events for the monitor, not the
-      // `eventLimit`-bounded list above, with a single synchronous query.
+      // Definition-drift diagnostic (issue #451): a pending event whose OWN
+      // stored `definitionFingerprint` differs from the monitor's CURRENT
+      // fingerprint was observed under a since-edited definition (anything
+      // `definitionFingerprint` covers: urgency, body, name, source and its
+      // configuration, shape, payload, baseline strategy). "Pending" means
+      // unacknowledged AND still deliverable: a projection already
+      // net-collapsed or Interpret-suppressed never delivers and is excluded.
+      // Not itself a bug — the event still delivers with what was in force when
+      // it was observed — but an author debugging an unexpected delivery needs
+      // to see that the definition has changed. A `null` fingerprint (a row from
+      // before the field existed) is "unknown", never flagged. Counted over ALL
+      // pending events for the monitor, not the `eventLimit`-bounded list above,
+      // with a single synchronous query.
       const staleEventIds = this.store.pendingEventIdsOutsideDefinition(
         input.monitorId,
         workspacePath,
@@ -1640,7 +1643,7 @@ export class AgentMonitorRuntime {
       );
       const staleSuffix =
         staleEventIds.length > 0
-          ? ` ${String(staleEventIds.length)} pending event(s) in total predate the monitor's current definition (its urgency, body, name, source configuration, shape, payload or baseline strategy changed since they were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one.`
+          ? ` ${String(staleEventIds.length)} pending event(s) in total predate the monitor's current definition (its urgency, body, name, source configuration, shape, payload or baseline strategy changed since they were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one, unless a newer change to the same object supersedes them.`
           : '';
 
       const deliveryDetails: Record<string, unknown> = { ...counts };

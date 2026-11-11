@@ -615,6 +615,31 @@ describe('stale-definition count excludes projections that never deliver (issue 
     expect(stage.reason).not.toMatch(/predate/);
   });
 
+  // 002 §1.1.8: an Interpret `deliver` verdict lets the event through and a
+  // `failed` verdict fails open, so both stay deliverable and must still count.
+  it.each(['deliver', 'failed'] as const)(
+    'still counts a pending event whose Interpret verdict is %s',
+    async (decision) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(START);
+      const fixture = createFixture({ urgency: 'normal', body: 'OLD.' });
+      const { runtime, sessionId } = fixture.openRuntime();
+      await materialize(fixture, runtime, 'command-a');
+      const [event] = runtime.listEvents({ sessionId });
+      if (!event) throw new Error('expected one materialized event');
+      new RuntimeStore(createDb(fixture.dbPath)).recordInterpretDecision(
+        sessionId,
+        event.id,
+        { decision, reason: 'verdict recorded before the edit' },
+      );
+
+      fixture.edit('normal', 'NEW.');
+      const stage = await deliveryStage(fixture, runtime);
+      expect(stage.details?.['staleDefinitionEventIds']).toEqual([event.id]);
+      expect(stage.reason).toMatch(/1 pending event\(s\) in total predate/);
+    },
+  );
+
   it('control: an unacknowledged, deliverable pending event from before the edit still counts as 1', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(START);
