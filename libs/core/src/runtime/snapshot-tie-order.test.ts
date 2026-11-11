@@ -8,8 +8,9 @@
  * succession all tie on `created_at`. Before the fix `latestSnapshot()` ordered
  * ONLY by `created_at DESC` and could return the OLDEST tied snapshot, which
  * corrupts the shared diff chain (`v1, v2, v3` returned `v1` as "latest"). The
- * fix mirrors the `monitor_events` precedent: a monotonic ULID `id` establishes
- * insertion order and `latestSnapshot()` breaks ties with `id DESC`.
+ * durable snapshot sequence establishes insertion order independently of the
+ * public ULID. Cross-process and migration cases live in the companion
+ * snapshot-materialization-order suite.
  *
  * The clock is frozen (`vi.useFakeTimers`) so `saveSnapshot`'s internal
  * `new Date()` — and the event `created_at` passed here — all land in the same
