@@ -1643,7 +1643,10 @@ export class RuntimeStore {
    * materialized under a definition other than `currentFingerprint` (issue #451).
    *
    * "Pending" means at least one recipient projection has not acknowledged the
-   * event. A row with a NULL fingerprint (materialized before the column existed)
+   * event AND can still be delivered: net-collapsed intermediates and
+   * Interpret-suppressed projections never deliver and ack-all never
+   * acknowledges them, so they are excluded by the same rule the unread and
+   * reminder paths use. A row with a NULL fingerprint (materialized before the column existed)
    * never matches: SQL `<>` against NULL is not true, which is the intended
    * "unknown, never flagged" reading. Unlike `listEvents`, this is not bounded by
    * a display limit, so the answer is a total.
@@ -1673,6 +1676,8 @@ export class RuntimeStore {
           workspaceCondition,
           ne(monitorEvents.definitionFingerprint, currentFingerprint),
           isNull(sessionEventState.acknowledgedAt),
+          notInterpretSuppressed(),
+          notNetSuppressed(),
         ),
       )
       .orderBy(asc(monitorEvents.id))

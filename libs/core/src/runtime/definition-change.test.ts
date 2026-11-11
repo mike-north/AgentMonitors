@@ -62,8 +62,12 @@ interface Fixture {
   rootDir: string;
   dbPath: string;
   monitorsDir: string;
-  /** What the scripted source will report on its next observation, then clear. */
-  emit(command: string): void;
+  /**
+   * What the scripted source will report on its next observation, then clear.
+   * `snapshotText` makes the observation a versioned object, which `net`
+   * catch-up collapse (002 §1.1.7) needs.
+   */
+  emit(command: string, snapshotText?: string): void;
   edit(urgency: string, body: string, options?: EditOptions): void;
   openRuntime(): { runtime: AgentMonitorRuntime; sessionId: string };
 }
@@ -113,24 +117,27 @@ function createFixture(
   };
   edit(initial.urgency, initial.body);
 
-  let pending: string | undefined;
+  let pending: { command: string; snapshotText?: string } | undefined;
   const source: ObservationSource = {
     name: SOURCE_NAME,
     scopeSchema: { type: 'object', properties: {}, additionalProperties: true },
     stateful: true,
     observe(): Promise<ObservationResult> {
-      const command = pending;
+      const observed = pending;
       pending = undefined;
       return Promise.resolve({
         observations:
-          command === undefined
+          observed === undefined
             ? []
             : [
                 {
-                  title: `Result of ${command}`,
-                  summary: `output of ${command}`,
-                  objectKey: command,
-                  payload: { command },
+                  title: `Result of ${observed.command}`,
+                  summary: `output of ${observed.command}`,
+                  objectKey: observed.command,
+                  payload: { command: observed.command },
+                  ...(observed.snapshotText === undefined
+                    ? {}
+                    : { snapshotText: observed.snapshotText }),
                 },
               ],
         nextState: {},
@@ -143,8 +150,9 @@ function createFixture(
     rootDir,
     dbPath,
     monitorsDir,
-    emit(command) {
-      pending = command;
+    emit(command, snapshotText) {
+      pending =
+        snapshotText === undefined ? { command } : { command, snapshotText };
     },
     edit,
     openRuntime() {
@@ -171,10 +179,11 @@ async function materialize(
   fixture: Fixture,
   runtime: AgentMonitorRuntime,
   command: string,
+  snapshotText?: string,
 ): Promise<void> {
   // Clear the poll interval so a second materialization in one test is due.
   vi.advanceTimersByTime(POLL_CLEARANCE_MS);
-  fixture.emit(command);
+  fixture.emit(command, snapshotText);
   await runtime.tick(fixture.monitorsDir, fixture.rootDir);
   vi.advanceTimersByTime(PAST_SETTLE_MS);
   const flush = await runtime.tick(fixture.monitorsDir, fixture.rootDir);
@@ -537,5 +546,84 @@ describe('explain reports pending events that predate the current definition (is
     expect((await deliveryStage(fixture, reopened.runtime)).reason).toMatch(
       /1 pending event\(s\) in total predate/,
     );
+  });
+});
+
+// 002 §5.3 / §1.1.7 / §1.1.8: "pending" means a recipient projection that can
+// still be delivered. A net-collapsed intermediate or an Interpret-suppressed
+// projection never delivers and is never acknowledged by ack-all, so it must
+// not be reported as an event that "will still deliver" (bug: stale count
+// included suppressed projections).
+describe('stale-definition count excludes projections that never deliver (issue #451)', () => {
+  const ALL_LIFECYCLES = [
+    'turn-interruptible',
+    'turn-idle',
+    'post-compact',
+  ] as const;
+
+  it('does not count net-collapsed intermediates left unacknowledged after ack-all', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'high', body: 'OLD.' });
+    fixture.edit('high', 'OLD.', {
+      extraFrontmatter: 'baseline-strategy: net\n',
+    });
+    const { runtime, sessionId } = fixture.openRuntime();
+    // Three observations of one object (the fixture's objectKey is the emitted
+    // command), so the `net` span collapses to the newest.
+    for (let i = 0; i < 3; i += 1) {
+      await materialize(fixture, runtime, 'obj', `version ${String(i + 1)}`);
+    }
+    expect(runtime.listEvents({ sessionId })).toHaveLength(3);
+
+    vi.advanceTimersByTime(PAST_SETTLE_MS);
+    const claim = runtime.claimDelivery(sessionId, 'turn-interruptible');
+    expect(claim?.events).toHaveLength(1);
+    runtime.acknowledgeSession(sessionId);
+    for (const lifecycle of ALL_LIFECYCLES) {
+      expect(
+        runtime.claimDelivery(sessionId, lifecycle)?.events ?? [],
+      ).toHaveLength(0);
+    }
+
+    fixture.edit('high', 'NEW.', {
+      extraFrontmatter: 'baseline-strategy: net\n',
+    });
+    const stage = await deliveryStage(fixture, runtime);
+    expect(stage.details?.['staleDefinitionEventIds']).toBeUndefined();
+    expect(stage.reason).not.toMatch(/predate/);
+  });
+
+  it('does not count an Interpret-suppressed projection', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'normal', body: 'OLD.' });
+    const { runtime, sessionId } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+    const [event] = runtime.listEvents({ sessionId });
+    new RuntimeStore(createDb(fixture.dbPath)).recordInterpretDecision(
+      sessionId,
+      event!.id,
+      { decision: 'suppress', reason: 'not substantive' },
+    );
+    runtime.acknowledgeSession(sessionId);
+
+    fixture.edit('normal', 'NEW.');
+    const stage = await deliveryStage(fixture, runtime);
+    expect(stage.details?.['staleDefinitionEventIds']).toBeUndefined();
+    expect(stage.reason).not.toMatch(/predate/);
+  });
+
+  it('control: an unacknowledged, deliverable pending event from before the edit still counts as 1', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(START);
+    const fixture = createFixture({ urgency: 'normal', body: 'OLD.' });
+    const { runtime } = fixture.openRuntime();
+    await materialize(fixture, runtime, 'command-a');
+
+    fixture.edit('normal', 'NEW.');
+    const stage = await deliveryStage(fixture, runtime);
+    expect(stage.details?.['staleDefinitionEventIds']).toHaveLength(1);
+    expect(stage.reason).toMatch(/1 pending event\(s\) in total predate/);
   });
 });
