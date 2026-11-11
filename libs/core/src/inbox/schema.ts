@@ -51,8 +51,14 @@ export const agentSessions = sqliteTable('agent_sessions', {
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 
+/**
+ * Shared observation history. Persisted observation time is the primary event
+ * order; a private SQLite sequence breaks equal-time ties across all writers.
+ * Public event IDs remain stable references for projections and delivery state.
+ */
 export const monitorEvents = sqliteTable('monitor_events', {
-  id: text('id').primaryKey(),
+  sequence: integer('sequence').primaryKey({ autoIncrement: true }),
+  id: text('id').notNull().unique(),
   workspacePath: text('workspace_path'),
   monitorId: text('monitor_id').notNull(),
   sourceName: text('source_name').notNull(),
@@ -84,8 +90,14 @@ export const monitorEvents = sqliteTable('monitor_events', {
   definitionFingerprint: text('definition_fingerprint'),
 });
 
+/**
+ * Retained object artifacts. Public ULIDs identify snapshots; SQLite's private
+ * sequence orders committed materializations across writers independently of
+ * wall clocks. Rolled-back allocations have no durable ordering significance.
+ */
 export const monitorSnapshots = sqliteTable('monitor_snapshots', {
-  id: text('id').primaryKey(),
+  sequence: integer('sequence').primaryKey({ autoIncrement: true }),
+  id: text('id').notNull().unique(),
   workspacePath: text('workspace_path'),
   monitorId: text('monitor_id').notNull(),
   objectKey: text('object_key').notNull(),
