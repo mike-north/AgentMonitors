@@ -2024,7 +2024,7 @@ is not arbitrary secret redaction. Older daemons may omit retry summaries and or
 doctor JSON defaults them to empty summaries/arrays. A monitor row's summary defaults to empty unless that
 id has an orphan group (for example a duplicated id whose outbox is in an orphan group), in which case the row
 claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. For an older daemon that
-reports no orphan groups at all, the empty default applies as before; explain preserves the omitted optional field.
+reports no orphan groups at all, the empty default applies; explain preserves the omitted optional field.
 Text explain uses an existing top-level summary, including an explicitly empty one, in preference
 to recognized materialization-stage details. If that optional field is omitted, it displays the
 available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
