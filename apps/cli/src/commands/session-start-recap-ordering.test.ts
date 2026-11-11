@@ -54,9 +54,6 @@
  */
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import type { DeliveryClaim, DeliveryEventSummary } from '@agentmonitors/core';
-import { closeSync, createWriteStream, mkdtempSync, openSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 
 vi.mock('../runtime-client.js', () => ({
   claimDeliveryClient: vi.fn(),
@@ -77,6 +74,7 @@ import {
   releaseDeliveryClient,
   reserveDeliveryClient,
 } from '../runtime-client.js';
+import { openUnwritableFileStream } from './unwritable-file-stream.test-support.js';
 
 const reserveMock = vi.mocked(reserveDeliveryClient);
 const commitMock = vi.mocked(commitDeliveryClient);
@@ -162,14 +160,11 @@ describe("session.ts's deliverSessionStartRecap: reserve -> render -> write -> c
     });
     releaseMock.mockResolvedValueOnce(undefined);
 
-    // A real fs write stream on an already-closed fd: every write to it fails
-    // with EBADF — the same "real, delayed-failure Writable" shape as
+    // A real fs write stream whose every write fails with EBADF — the same
+    // "real, delayed-failure Writable" shape as
     // `hook-deliver-commit-ordering.test.ts`'s round-11 regressions, not a
     // hand-rolled mock that only fires one of (callback, 'error' event).
-    const dir = mkdtempSync(join(tmpdir(), 'am-session-start-recap-'));
-    const fd = openSync(join(dir, 'target.txt'), 'w');
-    closeSync(fd);
-    const stream = createWriteStream('', { fd, autoClose: false });
+    const { stream, dispose } = openUnwritableFileStream();
 
     try {
       await expect(
@@ -178,7 +173,7 @@ describe("session.ts's deliverSessionStartRecap: reserve -> render -> write -> c
         ),
       ).rejects.toThrow(/EBADF/);
     } finally {
-      stream.destroy();
+      await dispose();
     }
 
     // Never committed: the write failed, so nothing gets durably claimed.
