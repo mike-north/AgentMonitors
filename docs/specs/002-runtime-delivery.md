@@ -1103,8 +1103,9 @@ Proven by `libs/core/src/runtime/held-work-source-errors.test.ts` and
 `agentmonitors verify --use-workspace-daemon` (005 §16) proves a file-fingerprint monitor against
 the user's persistent workspace daemon by creating a synthetic scratch file,
 `agentmonitors-verify-<token><ext>`, whose 12-hex-digit `<token>` is the run's random identity. The
-runtime keeps every observation of that exact file out of every later lead session once the run is
-finished with it, through **durable exact ownership** rather than a time-limited suppression.
+runtime keeps the verified monitor's observations of that exact file out of every later lead session
+once the run is finished with it, through **durable exact ownership** rather than a time-limited
+suppression (sibling monitors are not covered; see "Guarantee and its limits" below).
 
 **Registration (before the artifact exists).** Before creating the file, the run registers one
 ownership record: `runId` (the token), the owner session (the run's own throwaway lead session),
