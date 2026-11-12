@@ -45,6 +45,12 @@ vi.mock('node:fs', async (importActual) => {
         throw failure(locationFault.readCode);
       return actual.readFileSync(...args);
     },
+    // The bounded monitor reader opens a descriptor instead of calling readFileSync.
+    openSync: (...args: Parameters<typeof actual.openSync>) => {
+      if (args[0] === locationFault.path && locationFault.readCode)
+        throw failure(locationFault.readCode);
+      return actual.openSync(...args);
+    },
     statSync: (...args: Parameters<typeof actual.statSync>) => {
       if (args[0] === locationFault.path && locationFault.statCode)
         throw failure(locationFault.statCode);
@@ -72,6 +78,16 @@ vi.mock('node:fs/promises', async (importActual) => {
         );
       }
       return await actual.readFile(...args);
+    },
+    // The bounded monitor reader opens a descriptor instead of calling readFile.
+    open: async (...args: Parameters<typeof actual.open>) => {
+      if (args[0] === locationFault.path && locationFault.readCode) {
+        throw Object.assign(
+          new Error(locationFault.readCode + ': owned filesystem fault'),
+          { code: locationFault.readCode },
+        );
+      }
+      return await actual.open(...args);
     },
   };
 });
