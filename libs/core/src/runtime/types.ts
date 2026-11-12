@@ -1005,9 +1005,34 @@ export interface WatchHandle {
   stop(): Promise<void>;
 }
 
+/**
+ * One notify dispatch decision over a batch of observations.
+ *
+ * `emitted` proceeds to materialization now; `nextState` is the notify state to
+ * persist, including any debounce/rollup hold. `notHeld` lists observations a
+ * hold refused because their envelope cannot be serialized into
+ * `monitor_state.notify_state` (002 §4.7): they are neither emitted nor held,
+ * and the caller reports each as an `errored` outcome.
+ *
+ * @internal
+ */
 export interface NotifyDispatchResult {
   emitted: StoredObservationEnvelope[];
   nextState: NotifyRuntimeState;
+  notHeld: NotHeldObservation[];
+}
+
+/**
+ * An observation a debounce or rollup hold refused at acceptance because its
+ * envelope cannot be serialized (002 §4.7). `message` is the complete,
+ * single-line outcome text: it names the observation, the hold strategy and
+ * the serializer's reason.
+ *
+ * @internal
+ */
+export interface NotHeldObservation {
+  observation: Observation;
+  message: string;
 }
 
 export interface RuntimeStatus {

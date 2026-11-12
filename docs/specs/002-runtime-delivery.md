@@ -1061,7 +1061,7 @@ and replacement exclusion, workspace/monitor isolation and independent SQLite re
 
 - `evaluatedMonitors` — the ids of every monitor whose `observe()` was attempted this tick (including monitors whose outcome was `errored`).
 - `emittedEventIds` — the ids of the durable events materialized this tick.
-- `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
+- `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed), and one per observation a debounce/rollup hold refused because it cannot be serialized (§4.7). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
 - `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
 
 The runtime **MUST** surface `erroredObservations` so a caller (e.g. the CLI tick output, §10.1/§10.2) can report a failed observation rather than print a clean `emitted 0` that an author cannot distinguish from a genuine no-change.
@@ -1258,7 +1258,7 @@ Verified: `libs/core/src/runtime/service.ts` — `dispatchNotify()` throttle bra
 
 ### 4.3 Debounce semantics
 
-For `debounce`: incoming observations are accumulated in a pending batch; each new observation resets the batch's `dueAt` time to `observedAt + settle-for`; a later runtime tick at or after that due time flushes the full pending batch. This means debounce delivery is bounded by both the configured settle interval and the daemon's tick cadence.
+For `debounce`: incoming observations are accumulated in a pending batch; each new observation resets the batch's `dueAt` time to `observedAt + settle-for`; a later runtime tick at or after that due time flushes the full pending batch. An observation that cannot be serialized is not accepted into the batch and does not reset `dueAt` (§4.7). This means debounce delivery is bounded by both the configured settle interval and the daemon's tick cadence.
 
 Verified: `libs/core/src/runtime/service.ts` — `dispatchNotify()` debounce flush path (lines 499–508) and accumulation paths (lines 540–561).
 
@@ -1309,6 +1309,7 @@ three clocks especially visible:
    accumulation batch in `monitorState.notifyState` (analogous to `pendingDebounce` but without a
    `dueAt` reset on each new observation — the flush time is schedule-driven, not settle-driven).
    Observations are accumulated across daemon restarts; the batch **MUST** survive a restart.
+   An observation that cannot be serialized is not accepted into the batch (§4.7).
 
 2. **Window evaluation.** On each runtime tick the runtime evaluates the monitor's `window` cron
    expression against the current time using the configured `timezone` (defaulting to `UTC`). The
@@ -1551,6 +1552,105 @@ matrix, captured fields, unchanged clocks, missing/invalid definitions, SQLite t
 (including a later batch event and hold removal), sibling/workspace isolation, watcher backpressure,
 post-commit Interpret, actual owned-child SIGKILL before/after commit and independent-process stale
 read reconciliation. Child probes load the same TypeScript source without invoking a package build.
+
+### 4.7 Held-work serializability (_current_)
+
+> **Status: current.** Refs #570.
+
+Debounce (§4.3) and rollup (§4.4) holds persist their observation envelopes as JSON in
+`monitor_state.notify_state`. An envelope that JSON cannot encode, such as a payload holding a
+BigInt or a cyclic reference, would make every later state write for that monitor fail. The source
+baseline would then never advance, the same batch would be observed again on every tick, and the
+monitor would stop.
+
+The runtime **MUST** check serializability once per observation, at **hold acceptance**: the
+point where an observation would join `pendingDebounce` or `pendingRollup`. The check uses the
+same serializer as the state write, so an envelope that passes stays serializable in every later
+write of that hold. The check serializes the envelope separately from the write, so it covers
+values that serialize identically each time. A non-deterministic accessor (a getter that returns a
+BigInt only on a later read) can still pass the check and fail the write; the runtime does not
+defend against that. The same rule covers both strategies and every path into a hold: poll and watch
+span admission (§2), a deferred poll result admitted after a notify edit (§4.6), and a debounce hold
+that starts on an escalated observation's urgency. Every one of them reaches the hold through notify
+dispatch, which is where the check runs. An effective edit's drain and startup reconciliation
+(§4.6) only empty holds, and a rollup window check on a tick that is not due carries over envelopes
+that were already accepted; none of them adds a new envelope to a hold.
+
+An observation that fails the check is **not held**:
+
+1. It never joins the hold. The batch's other observations are unaffected: serializable siblings
+   before and after it are held in their original order, and the hold's `dueAt` is not reset on
+   its account.
+2. The span's admission transaction (§2) proceeds. Its state write advances the source baseline
+   past the batch, so the observation is not observed again, including after a restart, and later
+   observations are accepted on following ticks.
+3. It gets one `errored` `observation_history` row, written inside that same admission
+   transaction, before the span's batch row. If the transaction rolls back, the row, the state and
+   every sibling's outcome roll back together, and the batch is decided again from the prior
+   baseline. The row's `observationData.error` is
+   `Observation "<title>" was not held for <debounce|rollup>: it cannot be serialized (<reason>).`
+   The title and reason are each reduced to one terminal-safe line. The title is capped at 200 code
+   points and the reason at 512. The stored row and JSON history keep the whole message; history and
+   explain text, and explain's stage reasons, cap it at 512 code points, so the start of the reason
+   always stays visible there, but a long reason (for example a deep circular-structure path) can be
+   cut. If the serializer's reason cannot be read (it threw a value that cannot be
+   converted to text), the reason is the fixed text `unknown serialization error`; building the
+   message never throws.
+4. The same message is reported where the path reports failures: the tick result's
+   `erroredObservations` (`{ monitorId, message }`), or the watcher's `onError` callback. The
+   report happens only after the admission transaction commits and the span has materialized
+   (including any Interpret), so a callback that throws cannot lose work already committed, such as
+   a debounce batch that flushed in the same dispatch. A throwing callback is ignored. A span that
+   rolls back reports no refusal; it reports its own failure instead.
+
+The span's batch row (§`observation_history`) counts a not-held observation in `observed`, adds
+`notHeld: <n>`, and classifies only the remaining observations: a mixed span that holds a sibling
+is `suppressed`. A span whose only observations were not held writes no batch row, because nothing
+was held or emitted. Its `errored` rows are the outcome. The batch-row rules of §2 still apply to
+the rest of the span: a span that also emitted carries both counts, for example
+`triggered { observed: 3, emitted: 1, notRetainedCount: 1, notHeld: 1 }`, and a span whose
+dispatched observations all failed writes no batch row.
+
+A refusal is **not** a drop (§2 "Admission outcomes when the outbox cannot retain a suffix"). It
+is decided before materialization, never reaches the retry outbox, and its row carries no drop
+identity. Doctor and explain do not count it as outstanding unretained loss.
+
+Hold acceptance applies only where an observation would be held. An observation that goes straight
+to materialization is never checked here: immediate, throttle, an escalation that flushes a
+debounce batch (§4.1), and an observation arriving on the tick a rollup window fires. If it cannot
+be persisted as an event, it fails at materialization (§5), where §2 retains it for retry or drops
+it. That is a separate outcome, decided by the materialization contract, not by this rule.
+
+This rule does not make such payloads round-trip. A value JSON encodes lossily, such as an
+`undefined` member (omitted) or a `Date` inside the payload (an ISO string), is held as it is today.
+The check does not adopt the retry outbox's stricter plain-data domain
+([`materialization_retry_outbox`](#materialization_retry_outbox)).
+
+Since a refused observation never enters a hold, it never contributes held work to an effective
+notify edit's drain (§4.6) or to the admission gate that held work closes. The gate sees only
+serializable holds, and a refusal cannot leave it closed.
+
+**Example.** A debounce monitor's source returns `[Bad, A]`, where `Bad.payload` is `{ count: 10n }`.
+The tick reports `Observation "Bad" was not held for debounce: it cannot be serialized (Do not know
+how to serialize a BigInt).`, records that `errored` row, and holds `A`. The source baseline
+advances. The next tick observes `B` and holds `[A, B]`; after the settle window both materialize.
+
+**Verification:** `runtime/notify-hold-serializability.test.ts` covers debounce and rollup, each with
+a BigInt and a cyclic payload, with and without a restart between ticks. Each case covers the
+sibling held, the baseline advancing, the single `errored` row, and later observations
+materializing. It also covers: a span whose only observation is refused; sibling order around a
+refusal; an effective notify edit draining the accepted hold; the watch path's `onError`; the batch
+row's `notHeld` count; title sanitization and the 200-code-point title cap; a refusal leaving the
+hold's `dueAt` unchanged; a `toJSON` that throws an unconvertible value; a watcher `onError` that
+throws while a due batch flushes; a deferred poll result admitted after a notify edit
+(`runtime/notify-deferred-handoff.test.ts`); a span that mixes a refusal, an admitted observation
+and a drop, counted once each in the batch row, with the drop alone outstanding; a span whose
+admission rolls back reporting and recording no refusal, then refusing once on the retry; a refusal
+row that cannot be written rolling its span back; a refusal leaving the admission gate open for a
+running watcher when a later definition is rejected
+(`runtime/edit-drain-admission-outcomes.test.ts`); the built
+CLI's `monitor history` showing the reason of a long-titled refusal; and JSON-encodable payloads
+(`undefined` members, Dates) still being held.
 
 ## 5. Event Materialization
 
@@ -2756,11 +2856,11 @@ This is a documented one-time transition, not a per-tick behavior.
 
 An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
-- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2).
-- `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`.
+- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2), and `notHeld` (a positive integer) when a hold refused some of the span's observations (§4.7).
+- `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`, plus `notHeld: <n>` when a hold refused some of the observations (§4.7). Refused observations count in `observed`, carry their own `errored` rows, and are not what makes the span `suppressed`; a span whose only observations were refused writes no batch row. A refusal is not a drop: it never sets `notRetainedCount`.
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
-- `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Two sub-cases:
+- `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Three sub-cases:
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
   - A dispatched observation failed to materialize. The same rows are written whether the span
     came from `ingest()` (tick or watch path) or from the not-due notify-window flush
@@ -2797,8 +2897,15 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       catch, which also ends that watcher. On the not-due flush it comes from that flush's own
       catch, and the window stays held because its `pendingRollup` clear rolled back too.
 
+  - A debounce or rollup hold refused an observation because it cannot be serialized (§4.7): one
+    row per refused observation, `{ error: "<message>" }`, written **inside** the span's admission
+    transaction, before the batch row. It commits with the state that advances the baseline past
+    the observation, and a span that rolls back takes the row with it. It is not a drop: it has no
+    `unretained_object_key`/`unretained_event_watermark` and is not outstanding loss. The span's
+    other observations are held, emitted or dropped as usual.
+
   In every other case `observationData` is `{ error: "<message>" }`. Except for the unretained-suffix
-  row, which commits with the span, the audit write is best-effort: a `recordObservationHistory`
+  and hold-refusal rows, which commit with the span, the audit write is best-effort: a `recordObservationHistory`
   failure is swallowed so a failing audit row can never re-abort the tick.
 
   An unavailable `incoming-changes` repository/ref uses this existing source-error path (003 §6.5,
@@ -2811,7 +2918,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `admitSpan()` (in-transaction `errored` rows for unretained failures), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), the not-due rollup flush catch, and `consumeWatch()`'s outer catch (which also ends the watcher). Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `admitSpan()` (in-transaction `errored` rows for unretained failures), `ingest()`'s admission transaction (hold-refusal rows, §4.7), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), the not-due rollup flush catch, and `consumeWatch()`'s outer catch (which also ends the watcher). Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 An observation tick always runs for one concrete workspace, so each row records
 its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and

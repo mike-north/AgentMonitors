@@ -438,3 +438,58 @@ describe('a rejected scope with held work and an outstanding drop', () => {
     }
   });
 });
+
+describe('a refusal at hold acceptance is neither held work nor a drop', () => {
+  it('leaves the admission gate open when a later definition is rejected, so the watcher keeps admitting (002 §2.0/§4.6/§4.7)', async () => {
+    const f = fixture({ watch: true });
+    f.write(DEBOUNCE);
+    const errors: string[] = [];
+    const handle = await f.runtime.watchMonitors(f.monitorsDir, f.root, {
+      onError: (_id, error) => errors.push(error.message),
+    });
+    try {
+      // The debounce hold refuses the only observation: nothing is held, the
+      // baseline advances, and the refusal is not recorded as a drop.
+      f.push({
+        observations: [observation('refused', 'r', true)],
+        nextState: { cursor: 1 },
+      });
+      await vi.waitFor(() =>
+        expect(f.state().sourceState).toEqual({ cursor: 1 }),
+      );
+      expect(f.held()).toEqual([]);
+      expect(errors).toEqual([
+        expect.stringMatching(
+          /^Observation "refused" was not held for debounce:/u,
+        ),
+      ]);
+      expect(f.drops()).toEqual([]);
+      expect(f.loss()).toBeUndefined();
+
+      // A rejected definition closes the gate only for held work. The refusal
+      // is not held work, so the running watcher keeps its startup config.
+      f.write(IMMEDIATE, 'broken');
+      const rejected = await f.tick();
+      expect(rejected.skippedMonitors).toHaveLength(1);
+      f.push({
+        observations: [observation('after', 'a')],
+        nextState: { cursor: 2 },
+      });
+      await vi.waitFor(() =>
+        expect(f.state().sourceState).toEqual({ cursor: 2 }),
+      );
+      const gate = f.runtime as unknown as {
+        watchPolicyWaiters: Map<string, Set<() => void>>;
+      };
+      expect(
+        gate.watchPolicyWaiters.has(JSON.stringify([f.root, MONITOR_ID])),
+      ).toBe(false);
+      expect(f.held()).toEqual(['after']);
+      expect(errors).toHaveLength(1);
+      expect(f.drops()).toEqual([]);
+      expect(f.retries()).toEqual([]);
+    } finally {
+      await handle.stop();
+    }
+  });
+});
