@@ -1,4 +1,11 @@
-/** 002 §4.6 / 001 §2: live holds and scoped identity govern admission after discovery awaits. */
+/**
+ * 002 §4.6 / 001 §2: live holds and scoped identity govern admission after discovery awaits.
+ *
+ * The watched source yields finite batches (002 §2.4). A batch's baseline
+ * (`nextState`) and observations commit together only when the batch is
+ * admitted; while the gate is closed the batch waits and the source is not
+ * asked for newer input.
+ */
 import {
   mkdtempSync,
   mkdirSync,
@@ -17,7 +24,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { SourceRegistry } from '../observation/registry.js';
-import type { Observation, ObservationContext } from '../observation/types.js';
+import type { Observation, ObservationResult } from '../observation/types.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 
@@ -103,6 +110,14 @@ async function until(predicate: () => boolean) {
 async function settle() {
   for (let i = 0; i < 8; i++) await turn();
 }
+/** A yielded batch is admitted (the watcher asks for newer input) or dropped unadmitted. */
+type BatchOutcome = 'admitted' | 'dropped';
+/** One watched-source iterator: its owner signal, pulls, and whether the consumer closed it. */
+interface WatchGeneration {
+  signal: AbortSignal;
+  pulls: number;
+  closed: boolean;
+}
 const DEBOUNCE = 'notify:\n  strategy: debounce\n  settle-for: 1h\n';
 type Layout = 'flat' | 'folder';
 type Discovery = 'tick' | 'startup';
@@ -125,8 +140,13 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
   const entered = deferred<undefined>();
   const release = deferred<undefined>();
   let blocking = false;
-  let context: (ObservationContext & { signal: AbortSignal }) | undefined;
-  let next: ((result: IteratorResult<Observation>) => void) | undefined;
+  let generation: WatchGeneration | undefined;
+  let next: ((result: IteratorResult<ObservationResult>) => void) | undefined;
+  /** Batch outcome checks rerun whenever an iterator is pulled, closed or aborted. */
+  const outcomeChecks: (() => void)[] = [];
+  const wake = () => {
+    for (const check of outcomeChecks.splice(0)) check();
+  };
   let bFactories = 0;
   let bPolls = 0;
   let cCalls = 0;
@@ -198,14 +218,23 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
     },
     watch(_config, ctx) {
       bFactories++;
-      context = ctx;
+      const owner: WatchGeneration = {
+        signal: ctx.signal,
+        pulls: 0,
+        closed: false,
+      };
+      generation = owner;
+      ctx.signal.addEventListener('abort', wake, { once: true });
       return {
         [Symbol.asyncIterator]() {
           return this;
         },
-        next(): Promise<IteratorResult<Observation>> {
+        next(): Promise<IteratorResult<ObservationResult>> {
           return new Promise((resolve) => {
             next = resolve;
+            // The consumer pulls again only after the previous batch was admitted.
+            owner.pulls++;
+            wake();
             if (ctx.signal.aborted) resolve({ done: true, value: undefined });
             else
               ctx.signal.addEventListener(
@@ -214,6 +243,11 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
                 { once: true },
               );
           });
+        },
+        return(): Promise<IteratorResult<ObservationResult>> {
+          owner.closed = true;
+          wake();
+          return Promise.resolve({ done: true, value: undefined });
         },
       };
     },
@@ -268,15 +302,44 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
     handles.push(handle);
     return handle;
   };
+  /**
+   * Yield one batch to the watcher's outstanding pull. The returned promise
+   * settles once the batch is admitted, or when its watcher stops without
+   * admitting it (abort, supersession or a closed iterator).
+   */
+  async function offer(batch: ObservationResult): Promise<BatchOutcome> {
+    await until(() => next !== undefined);
+    const accept = next;
+    const owner = generation;
+    next = undefined;
+    if (!accept || !owner) throw new Error('Watcher is not requesting input');
+    const pulled = owner.pulls;
+    accept({ done: false, value: batch });
+    return await new Promise<BatchOutcome>((resolve) => {
+      const check = () => {
+        if (owner.pulls > pulled) resolve('admitted');
+        else if (owner.closed || owner.signal.aborted) resolve('dropped');
+        else outcomeChecks.push(check);
+      };
+      check();
+    });
+  }
+  const observation = (title: string): Observation => ({
+    title,
+    snapshotText: title,
+    objectKey: 'obj',
+  });
   cleanups.push(async () => {
     release.resolve(undefined);
+    // Stopping first drops any batch still waiting behind a closed gate.
+    for (const handle of handles.splice(0)) await handle.stop();
     await Promise.allSettled(tasks);
     for (const handle of handles.splice(0)) await handle.stop();
     if (client.open) client.close();
     rmSync(root, { recursive: true, force: true });
   });
   await watch();
-  await until(() => context !== undefined && next !== undefined);
+  await until(() => generation !== undefined && next !== undefined);
   return {
     root,
     dir,
@@ -327,21 +390,21 @@ async function fixture(older: Discovery = 'tick', layout: Layout = 'flat') {
         return event;
       });
     },
+    /** Yield one observation as its own batch, without advancing the baseline. */
     async emit(title: string) {
       await until(() => next !== undefined);
-      const accept = next;
-      next = undefined;
-      if (!accept) throw new Error('Watcher is not requesting input');
-      accept({
-        done: false,
-        value: { title, snapshotText: title, objectKey: 'obj' },
-      });
+      tasks.push(offer({ observations: [observation(title)] }));
       await settle();
     },
-    checkpoint() {
-      if (!context?.checkpoint)
-        throw new Error('Watcher checkpoint unavailable');
-      const task = context.checkpoint({ cursor: 999 });
+    /**
+     * Yield one batch advancing the baseline to `{ cursor: 999 }`, carrying any
+     * named observations; resolves with the batch's admission outcome.
+     */
+    checkpoint(...titles: string[]) {
+      const task = offer({
+        observations: titles.map(observation),
+        nextState: { cursor: 999 },
+      });
       tasks.push(task);
       return task;
     },
@@ -415,10 +478,12 @@ for (const older of ['tick', 'startup'] as const) {
     f.edit('absent-source');
     const old = await pending.finish();
     let settled = false;
-    const checkpoint = f.checkpoint().then(() => {
+    // One batch carries the later observation and the advanced baseline.
+    const checkpoint = f.checkpoint('Later B').then((outcome) => {
       settled = true;
+      return outcome;
     });
-    await f.emit('Later B');
+    await settle();
     const blocked = f.state();
     const acceptedBeforeRecovery = settled;
     const siblingProgress = older === 'tick' ? f.cCalls : f.cFactories;
@@ -429,8 +494,9 @@ for (const older of ['tick', 'startup'] as const) {
     // Recover before assertions so even an expected parent failure leaves no blocked fixture work.
     f.edit('watched', '', 'New handling');
     await f.tick();
-    await checkpoint;
+    const outcome = await checkpoint;
     await until(() => f.rows().length === 2);
+    expect(outcome).toBe('admitted');
     expect('error' in old).toBe(false);
     expect(
       errors.some((error) => error.includes('unknown source "absent-source"')),
@@ -448,7 +514,7 @@ for (const older of ['tick', 'startup'] as const) {
     ]);
     expect(f.bFactories).toBe(1);
     expect(f.state().sourceState).toEqual({ cursor: 999 });
-    // The pre-recovery snapshot and actual yield above prove that checkpoint999 stayed blocked.
+    // The pre-recovery snapshot above proves the pending batch's baseline stayed unadmitted.
     expect(retained.sourceState).not.toEqual({ cursor: 999 });
     expect(settled).toBe(true);
     await f.reopen();
@@ -465,15 +531,16 @@ for (const entry of ['tick', 'startup'] as const) {
     );
     const before = f.state();
     let settled = false;
-    const checkpoint = f.checkpoint().then(() => {
+    const checkpoint = f.checkpoint().then((outcome) => {
       settled = true;
+      return outcome;
     });
     await settle();
     const acceptedWhileInvalid = settled;
     const blocked = f.state();
     f.edit();
     await f.tick();
-    await checkpoint;
+    expect(await checkpoint).toBe('admitted');
     expect(String(result)).toContain('unknown source "absent-source"');
     expect(acceptedWhileInvalid).toBe(false);
     expect(blocked).toEqual(before);
@@ -497,14 +564,15 @@ for (const layout of ['flat', 'folder'] as const) {
         const adopted = f.state();
         const old = await pending.finish();
         let settled = false;
-        const checkpoint = f.checkpoint().then(() => {
+        const checkpoint = f.checkpoint().then((outcome) => {
           settled = true;
+          return outcome;
         });
         await settle();
         const workedWithoutThirdScan = settled;
         // Parent closes the gate; unblock only after capturing the required no-third-scan outcome.
         if (!settled) await f.tick();
-        await checkpoint;
+        expect(await checkpoint).toBe('admitted');
         await f.emit('Later B');
         expect('error' in old).toBe(false);
         expect(workedWithoutThirdScan).toBe(true);
@@ -535,13 +603,14 @@ it('captured old path in missing-definition diagnostics cannot close the current
   // An actual discovery omitting b exercises the captured-route path without replacing scan results.
   const scan = await f.tick(f.empty);
   let settled = false;
-  const checkpoint = f.checkpoint().then(() => {
+  const checkpoint = f.checkpoint().then((outcome) => {
     settled = true;
+    return outcome;
   });
   await settle();
   const workedWithoutAnotherScan = settled;
   if (!settled) await f.tick();
-  await checkpoint;
+  expect(await checkpoint).toBe('admitted');
   expect(scan.erroredObservations).toEqual([]);
   expect(workedWithoutAnotherScan).toBe(true);
   expect(f.heldCount()).toBe(1);
@@ -575,15 +644,16 @@ for (const invalid of [
     const old = await pending.finish();
     const missing = await f.tick(f.empty);
     let settled = false;
-    const checkpoint = f.checkpoint().then(() => {
+    const checkpoint = f.checkpoint().then((outcome) => {
       settled = true;
+      return outcome;
     });
     await settle();
     const blocked = f.state();
     const acceptedWhileInvalid = settled;
     f.edit();
     await f.tick();
-    await checkpoint;
+    expect(await checkpoint).toBe('admitted');
     expect('error' in old).toBe(false);
     expect(
       missing.erroredObservations.some((error) => error.monitorId === 'b'),
@@ -612,7 +682,7 @@ it('two valid same-ID files remain a fatal duplicate rather than an arbitrary ca
   );
   rmSync(f.originalFile);
   await f.tick();
-  await f.checkpoint();
+  expect(await f.checkpoint()).toBe('admitted');
   expect('error' in old ? String(old.error) : '').toContain(
     'Duplicate monitor ids',
   );
@@ -637,14 +707,15 @@ it('a valid same-ID foreign workspace cannot authorize a missing local definitio
   rmSync(f.file);
   await f.tick();
   let settled = false;
-  const checkpoint = f.checkpoint().then(() => {
+  const checkpoint = f.checkpoint().then((outcome) => {
     settled = true;
+    return outcome;
   });
   await settle();
   const acceptedWhileMissing = settled;
   f.edit();
   await f.tick();
-  await checkpoint;
+  expect(await checkpoint).toBe('admitted');
   expect(acceptedWhileMissing).toBe(false);
   expect(f.store.getMonitorState('b', foreign).sourceState).toEqual({
     cursor: 77,
@@ -671,15 +742,16 @@ for (const invalid of ['unknown', 'invalid-scope'] as const) {
       );
     const scan = await f.tick(f.empty);
     let settled = false;
-    const checkpoint = f.checkpoint().then(() => {
+    const checkpoint = f.checkpoint().then((outcome) => {
       settled = true;
+      return outcome;
     });
     await settle();
     const acceptedWhileInvalid = settled;
     const blocked = f.state();
     f.edit();
     await f.tick();
-    await checkpoint;
+    expect(await checkpoint).toBe('admitted');
     expect(scan.erroredObservations).toHaveLength(1);
     expect(scan.erroredObservations[0]?.message).toContain(
       invalid === 'unknown'
@@ -705,7 +777,7 @@ it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
     let readCode: unknown;
     let ambiguousAbsence: boolean;
     let old: Awaited<ReturnType<typeof pending.finish>> | undefined;
-    let checkpoint: Promise<void> | undefined;
+    let checkpoint: Promise<BatchOutcome> | undefined;
     let settled = false;
     let acceptedWhileDenied: boolean;
     let blocked: ReturnType<typeof f.state>;
@@ -724,10 +796,11 @@ it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
       }
       ambiguousAbsence = !existsSync(f.file);
       old = await pending.finish();
-      checkpoint = f.checkpoint().then(() => {
+      checkpoint = f.checkpoint('Later B').then((outcome) => {
         settled = true;
+        return outcome;
       });
-      await f.emit('Later B');
+      await settle();
       acceptedWhileDenied = settled;
       blocked = f.state();
       siblingProgress = f.cCalls;
@@ -741,6 +814,7 @@ it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
       await checkpoint;
     }
     await until(() => f.heldCount() === 2);
+    expect(await checkpoint).toBe('admitted');
     expect(readCode).toBe('EACCES');
     expect(ambiguousAbsence).toBe(true);
     expect(admittedStillExists).toBe(true);
@@ -792,7 +866,7 @@ for (const metadataCode of [
         f.text('watched', DEBOUNCE, 'Conflicting fallback'),
       );
       let old: Awaited<ReturnType<typeof pending.finish>> | undefined;
-      let checkpoint: Promise<void> | undefined;
+      let checkpoint: Promise<BatchOutcome> | undefined;
       let settled = false;
       let acceptedWhileFaulted: boolean;
       let blocked: ReturnType<typeof f.state>;
@@ -804,10 +878,11 @@ for (const metadataCode of [
         // Like existsSync's permission/query-error result, false alone carries no absence evidence.
         locationFault.looksAbsent = true;
         old = await pending.finish();
-        checkpoint = f.checkpoint().then(() => {
+        checkpoint = f.checkpoint('Later B').then((outcome) => {
           settled = true;
+          return outcome;
         });
-        await f.emit('Later B');
+        await settle();
         acceptedWhileFaulted = settled;
         blocked = f.state();
         siblingProgress = f.cCalls;
@@ -822,6 +897,7 @@ for (const metadataCode of [
         await checkpoint;
       }
       await until(() => f.heldCount() === 2);
+      expect(await checkpoint).toBe('admitted');
       expect(existsSync(f.file)).toBe(true);
       expect(old && 'error' in old).toBe(false);
       const diagnostics =
@@ -875,13 +951,14 @@ for (const missingCode of ['ENOENT', 'ENOTDIR'] as const) {
       }
       const old = await pending.finish();
       let settled = false;
-      const checkpoint = f.checkpoint().then(() => {
+      const checkpoint = f.checkpoint().then((outcome) => {
         settled = true;
+        return outcome;
       });
       await settle();
       const workedWithoutThirdScan = settled;
       if (!settled) await f.tick();
-      await checkpoint;
+      expect(await checkpoint).toBe('admitted');
       await f.emit('Later B');
       expect(actualCode).toBe(missingCode);
       expect('error' in old).toBe(false);
@@ -948,7 +1025,7 @@ for (const first of ['tick', 'startup'] as const) {
         await f.tick();
         const retained = f.state();
         const admitted = f.file;
-        let checkpoint: Promise<void> | undefined;
+        let checkpoint: Promise<BatchOutcome> | undefined;
         let settled = false;
         let initiallySettled: boolean;
         let readCode: unknown;
@@ -976,10 +1053,11 @@ for (const first of ['tick', 'startup'] as const) {
             'result' in old && old.result && 'erroredObservations' in old.result
               ? old.result.erroredObservations.map((item) => item.message)
               : f.errors.slice();
-          checkpoint = f.checkpoint().then(() => {
+          checkpoint = f.checkpoint('Later B').then((outcome) => {
             settled = true;
+            return outcome;
           });
-          await f.emit('Later B');
+          await settle();
           initiallySettled = settled;
           const initialHealthy = repeated === 'tick' ? f.cCalls : f.cFactories;
           for (let i = 0; i < 3; i++) {
@@ -1002,6 +1080,7 @@ for (const first of ['tick', 'startup'] as const) {
           await checkpoint;
         }
         await until(() => f.heldCount() === 2);
+        expect(await checkpoint).toBe('admitted');
         expect(readCode).toBe('EACCES');
         expect(firstErrors.some((message) => message.includes('EACCES'))).toBe(
           true,
@@ -1046,7 +1125,7 @@ for (const repeated of ['tick', 'startup', 'captured'] as const) {
       await f.tick();
       const admitted = f.file;
       const retained = f.state();
-      let checkpoint: Promise<void> | undefined;
+      let checkpoint: Promise<BatchOutcome> | undefined;
       let settled = false;
       let initiallySettled: boolean;
       const diagnostics: string[][] = [];
@@ -1063,10 +1142,11 @@ for (const repeated of ['tick', 'startup', 'captured'] as const) {
         locationFault.statCode = 'EIO';
         locationFault.looksAbsent = true;
         await pending.finish();
-        checkpoint = f.checkpoint().then(() => {
+        checkpoint = f.checkpoint('Later B').then((outcome) => {
           settled = true;
+          return outcome;
         });
-        await f.emit('Later B');
+        await settle();
         initiallySettled = settled;
         for (let i = 0; i < 3; i++) {
           diagnostics.push(await unchangedDiscovery(f, repeated));
@@ -1090,6 +1170,7 @@ for (const repeated of ['tick', 'startup', 'captured'] as const) {
         await checkpoint;
       }
       await until(() => f.heldCount() === 2);
+      expect(await checkpoint).toBe('admitted');
       expect(initiallySettled).toBe(false);
       expect(
         diagnostics.every((errors) =>
@@ -1118,7 +1199,7 @@ it('a newly discovered unresolved location stays authoritative while blocked and
   const admitted = f.file;
   const retained = f.state();
   const initiallyBlockedLocation = liveOwnership(f).currentPath;
-  let checkpoint: Promise<void> | undefined;
+  let checkpoint: Promise<BatchOutcome> | undefined;
   let settled = false;
   const diagnostics: string[][] = [];
   const states: ReturnType<typeof f.state>[] = [];
@@ -1129,10 +1210,11 @@ it('a newly discovered unresolved location stays authoritative while blocked and
       f.originalFile,
       f.text('watched', DEBOUNCE, 'Conflicting fallback'),
     );
-    checkpoint = f.checkpoint().then(() => {
+    checkpoint = f.checkpoint('Later B').then((outcome) => {
       settled = true;
+      return outcome;
     });
-    await f.emit('Later B');
+    await settle();
     for (let i = 0; i < 3; i++) {
       diagnostics.push(await unchangedDiscovery(f, 'tick'));
       await settle();
@@ -1146,6 +1228,7 @@ it('a newly discovered unresolved location stays authoritative while blocked and
     await checkpoint;
   }
   await until(() => f.heldCount() === 2);
+  expect(await checkpoint).toBe('admitted');
   expect(
     first.erroredObservations.some((item) =>
       item.message.includes('unknown source'),
@@ -1174,10 +1257,11 @@ for (const absence of ['ENOENT', 'ENOTDIR'] as const) {
       writeFileSync(admitted, '---\nwatch: invalid\n---');
       await f.tick();
       let settled = false;
-      const checkpoint = f.checkpoint().then(() => {
+      const checkpoint = f.checkpoint('Later B').then((outcome) => {
         settled = true;
+        return outcome;
       });
-      await f.emit('Later B');
+      await settle();
       const before = settled;
       const blockedPath = liveOwnership(f).currentPath;
       writeFileSync(
@@ -1193,7 +1277,7 @@ for (const absence of ['ENOENT', 'ENOTDIR'] as const) {
         );
       }
       const recovery = await f.tick();
-      await checkpoint;
+      expect(await checkpoint).toBe('admitted');
       await until(() => f.heldCount() === 2);
       expect(before).toBe(false);
       expect(blockedPath).toBe(admitted);
@@ -1222,11 +1306,13 @@ it('last live owner retires closed location metadata and a later owner pins fres
   await f.tick();
   const blockedPath = liveOwnership(f).currentPath;
   const retained = f.state();
-  const checkpoint = f.checkpoint();
-  await f.emit('Unaccepted old-owner yield');
+  // The old owner's batch waits behind its closed gate until the owner stops.
+  const checkpoint = f.checkpoint('Unaccepted old-owner yield');
+  await settle();
   await f.stop();
-  await checkpoint;
+  const outcome = await checkpoint;
   const retired = liveOwnership(f);
+  expect(outcome).toBe('dropped');
   expect(blockedPath).toBe(retiredPath);
   expect(retired.owners.size).toBe(0);
   expect(retired.policies.size).toBe(0);
@@ -1241,7 +1327,7 @@ it('last live owner retires closed location metadata and a later owner pins fres
   );
   await f.watch();
   await settle();
-  await f.checkpoint();
+  expect(await f.checkpoint()).toBe('admitted');
   await f.emit('Fresh B');
   expect(f.bFactories).toBe(2);
   expect(liveOwnership(f).currentPath).toBe(f.originalFile);

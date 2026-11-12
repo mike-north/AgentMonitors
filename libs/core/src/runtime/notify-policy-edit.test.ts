@@ -432,61 +432,75 @@ for (const boundary of ['before', 'after']) {
   }, 12_000);
 }
 
-it('active watcher skip cannot strand a drain and blocked yields are backpressured', async () => {
+it('active watcher skip cannot strand a drain and a blocked batch backpressures the iterator', async () => {
   const f = fixture(policies.rollup);
   await f.accept();
-  const firstYield = Promise.withResolvers<undefined>();
+  const firstBatch = Promise.withResolvers<undefined>();
+  let factories = 0;
   let resumed = 0;
-  let checkpoint: ((nextState: unknown) => Promise<void>) | undefined;
-  f.source.watch = async function* (_config, context) {
-    checkpoint = context.checkpoint;
-    await firstYield.promise;
-    yield { title: 'watch C' };
+  async function* batches(signal: AbortSignal) {
+    await firstBatch.promise;
+    // The first batch carries both a live observation and a new source baseline.
+    yield {
+      observations: [{ title: 'watch C' }],
+      nextState: { cursor: 999 },
+    };
     resumed++;
-    yield { title: 'watch D' };
+    yield { observations: [{ title: 'watch D' }] };
     resumed++;
-    if (!context.signal.aborted)
+    if (!signal.aborted)
       await new Promise<void>((resolve) =>
-        context.signal.addEventListener('abort', () => resolve(), {
-          once: true,
-        }),
+        signal.addEventListener('abort', () => resolve(), { once: true }),
       );
+  }
+  f.source.watch = (_config, context) => {
+    factories++;
+    if (!context.signal) throw new Error('Watcher signal was not supplied.');
+    return batches(context.signal);
   };
   const handle = await f.current.runtime.watchMonitors(
     path.join(f.root, 'monitors'),
     f.root,
   );
   try {
-    await vi.waitFor(() => expect(checkpoint).toBeTypeOf('function'));
+    // The factory runs once the reconciled gate admits it, after startup returns.
+    await vi.waitFor(() => expect(factories).toBe(1));
     f.edit('');
     f.current.client.exec(
       "CREATE TRIGGER edit_fault BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(ABORT, 'blocked'); END",
     );
     expect((await f.tick()).erroredObservations).toHaveLength(1);
     const before = f.state();
-    firstYield.resolve(undefined);
+    firstBatch.resolve(undefined);
     for (let i = 0; i < 30; i++) await Promise.resolve();
+    // The failed drain keeps the gate closed: the batch is neither admitted
+    // nor dropped, and the iterator is not pulled for newer input.
     expect(resumed).toBe(0);
     expect(f.state()).toEqual(before);
-    if (!checkpoint) throw new Error('Watcher checkpoint was not supplied.');
-    let checkpointFinished = false;
-    const checkpointed = checkpoint({ cursor: 999 }).then(() => {
-      checkpointFinished = true;
-    });
-    for (let i = 0; i < 10; i++) await Promise.resolve();
-    expect(checkpointFinished).toBe(false);
-    expect(f.state()).toEqual(before);
+    expect(f.state().sourceState).toEqual({ cursor: 1 });
+    expect(f.events()).toHaveLength(0);
     f.current.client.exec('DROP TRIGGER edit_fault');
     expect((await f.tick()).emittedEventIds).toHaveLength(2);
     await vi.waitFor(() => {
       expect(resumed).toBe(2);
       expect(f.events()).toHaveLength(4);
     });
-    await checkpointed;
+    // Recovery admits the held drain first, then both batches in order
+    // (events are listed newest first).
+    expect(
+      f
+        .events()
+        .map((e) => e.summary)
+        .reverse(),
+    ).toEqual(['A', 'observation body', 'watch C', 'watch D']);
+    // The second batch omitted nextState, so the first batch's baseline stands.
     expect(f.state().sourceState).toEqual({ cursor: 999 });
+    expect(f.state().notifyState).toMatchObject({
+      policyKey: expect.any(String),
+    });
     expect(f.calls).toBe(1);
   } finally {
-    firstYield.resolve(undefined);
+    firstBatch.resolve(undefined);
     await handle.stop();
   }
 });
@@ -820,21 +834,27 @@ it('live watchers adopt reconciled pacing without reloading execution or handlin
   await f.accept();
   const { promise: ready, resolve: release } =
     Promise.withResolvers<undefined>();
-  f.source.watch = async function* (_config, context) {
+  let factories = 0;
+  async function* batches(signal: AbortSignal) {
     await ready;
-    yield { title: 'live C' };
-    if (!context.signal.aborted)
+    yield { observations: [{ title: 'live C' }] };
+    if (!signal.aborted)
       await new Promise<void>((resolve) =>
-        context.signal.addEventListener('abort', () => resolve(), {
-          once: true,
-        }),
+        signal.addEventListener('abort', () => resolve(), { once: true }),
       );
+  }
+  f.source.watch = (_config, context) => {
+    factories++;
+    if (!context.signal) throw new Error('Watcher signal was not supplied.');
+    return batches(context.signal);
   };
   const handle = await f.current.runtime.watchMonitors(
     path.join(f.root, 'monitors'),
     f.root,
   );
   try {
+    // Establish the source (its execution and handling snapshot) before the edit.
+    await vi.waitFor(() => expect(factories).toBe(1));
     f.edit('', 'low', 'new handling', '1h', 'New name');
     expect((await f.tick()).emittedEventIds).toHaveLength(2);
     release(undefined);

@@ -1,4 +1,9 @@
-/** 002 §2.4 / §4.6: close admission before draining, and transfer scope only after accepted writes settle. */
+/**
+ * 002 §2.4 / §4.6: a watch batch waiting at a closed admission gate keeps its
+ * watcher's scope. It is admitted in one transaction when the gate reopens, or
+ * dropped unadmitted on abort or supersession; only then does the source end
+ * and the watcher release its slot and cached-policy lease to a successor.
+ */
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -8,7 +13,6 @@ import { createDb } from '../inbox/db.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
-  Observation,
   ObservationContext,
   ObservationResult,
   ObservationSource,
@@ -16,7 +20,7 @@ import type {
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 
-/** Promise barriers expose actual source completion and polling without timing guesses. */
+/** Promise barriers expose actual source pulls and polling without timing guesses. */
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -41,26 +45,35 @@ async function turns() {
   for (let n = 0; n < 48; n++) await Promise.resolve();
 }
 
+/** One started watch iterator: its context, pull count and the pull it has not answered. */
+interface WatchedSource {
+  context: ObservationContext;
+  /** Every next() call; a pull after a batch means that batch was fully admitted. */
+  pulls: number;
+  /** The outstanding next() the test answers with a batch, completion or failure. */
+  waiting?: ReturnType<typeof deferred<IteratorResult<ObservationResult>>>;
+  /** The runtime closed the iterator early (a dropped batch breaks the consumer loop). */
+  returned: boolean;
+}
+
 /** All handles, callbacks, database connections and controlled results belong to this fixture. */
 function fixture() {
   vi.useFakeTimers();
   vi.setSystemTime(new Date('2026-03-20T08:00:00Z'));
-  const root = mkdtempSync(path.join(tmpdir(), 'notify-checkpoint-close-'));
+  const root = mkdtempSync(path.join(tmpdir(), 'notify-batch-teardown-'));
   roots.push(root);
   const dir = path.join(root, 'monitors');
   mkdirSync(dir);
   const file = path.join(dir, 'held.md');
   const dbPath = path.join(root, 'state.sqlite');
-  const contexts: (ObservationContext & { signal: AbortSignal })[] = [];
-  const completions: ReturnType<
-    typeof deferred<IteratorResult<Observation>>
-  >[] = [];
+  const sources: WatchedSource[] = [];
   const pollStarted = deferred<undefined>();
   const pollResult = deferred<ObservationResult>();
   const previous: unknown[] = [];
   const durableAtPoll: unknown[] = [];
   const errors: string[] = [];
   let calls = 0;
+  let cleanupFailure = false;
   function open() {
     const db = createDb(dbPath);
     // Native access injects real SQLite faults and opens independent durable readers.
@@ -70,7 +83,7 @@ function fixture() {
   }
   const { client, store } = open();
   const source: ObservationSource = {
-    name: 'checkpoint-close',
+    name: 'batch-teardown',
     stateful: true,
     scopeSchema: { type: 'object' },
     async observe(_config, context) {
@@ -91,23 +104,31 @@ function fixture() {
       return pollResult.promise;
     },
     watch(_config, context) {
-      contexts.push(context);
-      const completion = deferred<IteratorResult<Observation>>();
-      completions.push(completion);
+      const watched: WatchedSource = { context, pulls: 0, returned: false };
+      sources.push(watched);
       return {
         [Symbol.asyncIterator]() {
           return this;
         },
         next() {
-          if (context.signal.aborted)
-            completion.resolve({ done: true, value: undefined });
+          watched.pulls++;
+          const pull = deferred<IteratorResult<ObservationResult>>();
+          watched.waiting = pull;
+          if (context.signal?.aborted)
+            pull.resolve({ done: true, value: undefined });
           else
-            context.signal.addEventListener(
+            context.signal?.addEventListener(
               'abort',
-              () => completion.resolve({ done: true, value: undefined }),
+              () => pull.resolve({ done: true, value: undefined }),
               { once: true },
             );
-          return completion.promise;
+          return pull.promise;
+        },
+        return() {
+          watched.returned = true;
+          return cleanupFailure
+            ? Promise.reject(new Error('Owned iterator failure'))
+            : Promise.resolve({ done: true, value: undefined });
         },
       };
     },
@@ -125,16 +146,22 @@ function fixture() {
   const edit = (policy: string) =>
     writeFileSync(
       file,
-      `---\nwatch:\n  type: checkpoint-close\n  interval: 1h\nbaseline-strategy: incremental\n${policy}---\nCaptured handling\n`,
+      `---\nwatch:\n  type: batch-teardown\n  interval: 1h\nbaseline-strategy: incremental\n${policy}---\nCaptured handling\n`,
     );
   edit('notify:\n  strategy: debounce\n  settle-for: 1h\n');
   const key = JSON.stringify([root, 'held']);
   const internals = runtime as unknown as {
     activeWatchers: Map<string, symbol>;
     watchPolicies: Map<string, unknown>;
+    watchPolicyWaiters: Map<string, Set<() => void>>;
     retainNotifyPolicy(id: string, workspace: string): void;
     releaseNotifyPolicy(id: string, workspace: string): void;
   };
+  function watched(index: number) {
+    const entry = sources[index];
+    if (!entry) throw new Error('Source is not ready');
+    return entry;
+  }
   return {
     root,
     dir,
@@ -145,13 +172,14 @@ function fixture() {
     client,
     store,
     state,
-    contexts,
+    sources,
     previous,
     durableAtPoll,
     errors,
     pollStarted,
     pollResult,
     internals,
+    watched,
     get calls() {
       return calls;
     },
@@ -162,6 +190,13 @@ function fixture() {
         )
         .pluck()
         .all(root),
+    /** Errored history rows that carry the iterator cleanup failure. */
+    cleanupHistory: () =>
+      store
+        .listObservationHistory({ monitorId: 'held', workspacePath: root })
+        .filter((row) =>
+          JSON.stringify(row).includes('Owned iterator failure'),
+        ),
     tick: () => runtime.tick(dir, root),
     async start() {
       await runtime.tick(dir, root);
@@ -169,7 +204,9 @@ function fixture() {
         ...state(),
         lastObservationAt: new Date('2000-01-01T00:00:00Z'),
       });
-      return this.watch();
+      const handle = await this.watch();
+      await this.until(() => sources.length === 1, 'the source to start');
+      return handle;
     },
     async watch() {
       const handle = await runtime.watchMonitors(dir, root, {
@@ -179,21 +216,42 @@ function fixture() {
       await turns();
       return handle;
     },
-    checkpoint(cursor: number, index = 0) {
-      const checkpoint = contexts[index]?.checkpoint;
-      if (!checkpoint) throw new Error('Actual checkpoint is not ready');
-      return checkpoint({ cursor });
+    /** Bounded microtask polling for an observable runtime transition. */
+    async until(done: () => boolean, label: string) {
+      for (let round = 0; round < 40; round++) {
+        if (done()) return;
+        await turns();
+      }
+      throw new Error(`Timed out waiting for ${label}`);
+    },
+    /** A batch is parked on the closed gate, not merely slow to be pulled. */
+    gated: () => internals.watchPolicyWaiters.has(key),
+    /** Answer the outstanding pull with a baseline-only batch. */
+    send(cursor: number, index = 0) {
+      const entry = watched(index);
+      const pull = entry.waiting;
+      if (!pull) throw new Error('Source is not waiting for a pull');
+      entry.waiting = undefined;
+      pull.resolve({
+        done: false,
+        value: { observations: [], nextState: { cursor } },
+      });
     },
     finish(error = false, index = 0) {
-      const completion = completions[index];
-      if (!completion) throw new Error('Source is not ready');
-      if (error) completion.reject(new Error('Owned iterator failure'));
-      else completion.resolve({ done: true, value: undefined });
+      const entry = watched(index);
+      const pull = entry.waiting;
+      if (!pull) throw new Error('Source is not waiting for a pull');
+      entry.waiting = undefined;
+      if (error) pull.reject(new Error('Owned iterator failure'));
+      else pull.resolve({ done: true, value: undefined });
+    },
+    failCleanup() {
+      cleanupFailure = true;
     },
     async block() {
       edit('');
       client.exec(
-        "CREATE TRIGGER reject_a BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(FAIL, 'owned closing gate fault'); END",
+        "CREATE TRIGGER reject_a BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(FAIL, 'owned closed gate fault'); END",
       );
       const result = await runtime.tick(dir, root);
       expect(result.erroredObservations).toHaveLength(1);
@@ -212,28 +270,21 @@ function fixture() {
 
 for (const ending of ['completion', 'error'] as const) {
   for (const successor of ['poll', 'watch'] as const) {
-    it(`${ending} drains accepted checkpoints before ${successor} can own the scope`, async () => {
+    it(`a batch waiting at a closed gate keeps ${successor} out until it is admitted and the source's ${ending} settles`, async () => {
       const f = fixture();
       const original = await f.start();
       await f.block();
-      const checkpoint = f.checkpoint(111);
+      f.send(111);
+      await f.until(f.gated, 'the batch to wait at the closed gate');
       await turns();
+      // Backpressure: the waiting batch is neither admitted nor followed by a newer pull.
       expect(f.state().sourceState).toEqual({ cursor: 1 });
-      f.finish(ending === 'error');
-      await turns();
-      const reservedWhileDraining = f.internals.activeWatchers.has(f.key);
-      const late = f.checkpoint(222);
-      let lateSettled = false;
-      void late.then(
-        () => {
-          lateSettled = true;
-        },
-        () => {
-          lateSettled = true;
-        },
-      );
-      await turns();
-      const lateSettledBeforeRecovery = lateSettled;
+      expect(f.readPersisted().sourceState).toEqual({ cursor: 1 });
+      expect(f.watched(0).pulls).toBe(1);
+      const reservedWhileWaiting = f.internals.activeWatchers.has(f.key);
+      // A due poll cannot overtake the waiting batch's baseline while the edit stays blocked.
+      expect((await f.tick()).erroredObservations).toHaveLength(1);
+      expect(f.calls).toBe(1);
       let prematureReplacement: string[] = [];
       if (successor === 'watch')
         prematureReplacement = (await f.watch()).monitorIds;
@@ -251,49 +302,66 @@ for (const ending of ['completion', 'error'] as const) {
           nextState: { cursor: 999 },
         });
       await recovery;
-      await checkpoint;
-      await late;
-      await turns();
+      await f.until(
+        () => f.watched(0).pulls === 2,
+        'the admitted batch to release the next pull',
+      );
+      expect(f.calls).toBe(1);
+      expect(f.state().sourceState).toEqual({ cursor: 111 });
+      expect(f.readPersisted().sourceState).toEqual({ cursor: 111 });
+      // Admission alone does not hand over the scope; the source still owns it.
+      const reservedAfterAdmission = f.internals.activeWatchers.has(f.key);
+      f.finish(ending === 'error');
+      await f.until(
+        () => !f.internals.activeWatchers.has(f.key),
+        'the ended watcher to release its scope',
+      );
+      expect(f.internals.watchPolicies.size).toBe(0);
       if (successor === 'poll') {
-        if (f.calls === 1) {
-          const next = f.tick();
-          await f.pollStarted.promise;
-          f.pollResult.resolve({
-            observations: [{ title: 'B', snapshotText: 'B', objectKey: 'obj' }],
-            nextState: { cursor: 999 },
-          });
-          await next;
-        }
+        // The admitted empty batch counts as an observation; make the scope due again.
+        vi.setSystemTime(new Date('2026-03-20T09:00:01Z'));
+        const next = f.tick();
+        await f.pollStarted.promise;
+        f.pollResult.resolve({
+          observations: [{ title: 'B', snapshotText: 'B', objectKey: 'obj' }],
+          nextState: { cursor: 999 },
+        });
+        await next;
         expect(f.previous[1]).toEqual({ cursor: 111 });
         expect(f.durableAtPoll[0]).toEqual({ cursor: 111 });
         expect(f.rows()).toEqual(['A', 'B']);
         expect(f.state().sourceState).toEqual({ cursor: 999 });
         expect(f.readPersisted().sourceState).toEqual({ cursor: 999 });
+        expect(f.watched(0).context.signal?.aborted).toBe(false);
       } else {
         expect(prematureReplacement).toEqual([]);
         expect(f.readPersisted().sourceState).toEqual({ cursor: 111 });
         const replacement = await f.watch();
         expect(replacement.monitorIds).toEqual(['held']);
-        expect(f.contexts[1]?.previousState).toEqual({ cursor: 111 });
+        await f.until(() => f.sources.length === 2, 'the replacement source');
+        expect(f.watched(1).context.previousState).toEqual({ cursor: 111 });
         const token = f.internals.activeWatchers.get(f.key);
         await original.stop();
         expect(f.internals.activeWatchers.get(f.key)).toBe(token);
-        await f.checkpoint(333);
-        await f.checkpoint(444, 1);
+        // The ended source is never pulled again; only the replacement advances.
+        expect(f.watched(0).pulls).toBe(2);
+        f.send(444, 1);
+        await f.until(
+          () => f.watched(1).pulls === 2,
+          'the replacement batch to be admitted',
+        );
         expect(f.state().sourceState).toEqual({ cursor: 444 });
         expect(f.readPersisted().sourceState).toEqual({ cursor: 444 });
       }
-      if (successor === 'poll')
-        expect(f.contexts[0]?.signal.aborted).toBe(false);
-      expect(reservedWhileDraining).toBe(true);
-      expect(lateSettledBeforeRecovery).toBe(true);
+      expect(reservedWhileWaiting).toBe(true);
+      expect(reservedAfterAdmission).toBe(true);
       expect(f.errors).toEqual([
-        ...(ending === 'error' ? ['Owned iterator failure'] : []),
         ...(successor === 'watch'
           ? [
-              'Notify edit blocked; accepted holds retained: owned closing gate fault',
+              'Notify edit blocked; accepted holds retained: owned closed gate fault',
             ]
           : []),
+        ...(ending === 'error' ? ['Owned iterator failure'] : []),
       ]);
       expect(f.calls).toBe(successor === 'poll' ? 2 : 1);
     });
@@ -301,41 +369,63 @@ for (const ending of ['completion', 'error'] as const) {
 }
 
 for (const error of [false, true]) {
-  it(`stop cancels a blocked closing checkpoint without writes or leaked ownership, iteratorError=${error}`, async () => {
+  it(`stop drops a batch waiting at a closed gate without writes or leaked ownership, cleanupError=${error}`, async () => {
     const f = fixture();
     const handle = await f.start();
     await f.block();
     const original = f.state();
-    const checkpoint = f.checkpoint(111);
-    f.finish(error);
-    await turns();
+    if (error) f.failCleanup();
+    f.send(111);
+    await f.until(f.gated, 'the batch to wait at the closed gate');
     await handle.stop();
-    await checkpoint;
+    // Dropping the batch closes the iterator; a failing cleanup after abort is not reported.
+    expect(f.watched(0).returned).toBe(true);
+    expect(f.watched(0).pulls).toBe(1);
     expect(f.state()).toEqual(original);
     expect(f.readPersisted()).toEqual(original);
     expect(f.internals.activeWatchers.has(f.key)).toBe(false);
     expect(f.internals.watchPolicies.size).toBe(0);
-    await f.checkpoint(222);
-    expect(f.state()).toEqual(original);
+    expect(f.errors).toEqual([]);
+    expect(f.cleanupHistory()).toEqual([]);
+    // Reconciliation after stop cannot resurrect the dropped batch's baseline.
+    f.recover();
+    const next = f.tick();
+    await f.pollStarted.promise;
+    expect(f.durableAtPoll[0]).toEqual({ cursor: 1 });
+    f.pollResult.resolve({ observations: [], nextState: { cursor: 999 } });
+    await next;
+    expect(f.previous[1]).toEqual({ cursor: 1 });
+    expect(f.state().sourceState).toEqual({ cursor: 999 });
   });
 }
 
-it('a checkpoint queued before supersession rechecks identity at its actual write and releases only its own lease', async () => {
+it('a batch waiting when its watcher is superseded is never admitted and releases only its own lease', async () => {
   const f = fixture();
   const handle = await f.start();
-  const checkpoint = f.checkpoint(111);
+  await f.block();
+  f.send(111);
+  await f.until(f.gated, 'the batch to wait at the closed gate');
   // This precise token seam represents a distinct owner; it neither fakes the
-  // actual checkpoint/waiter nor allows the old owner to remove the successor.
+  // actual batch/waiter nor allows the old owner to remove the successor.
   const successor = Symbol('successor');
   f.internals.retainNotifyPolicy('held', f.root);
   f.internals.activeWatchers.set(f.key, successor);
   try {
-    await checkpoint;
-    f.finish();
-    await turns();
+    f.recover();
+    // Reopening the gate wakes the batch, whose admission rechecks ownership in
+    // that same turn; the successor's scope also keeps this tick from polling.
+    await f.tick();
+    await f.until(
+      () => f.watched(0).returned,
+      'the superseded watcher to close its source',
+    );
     await handle.stop();
+    expect(f.watched(0).pulls).toBe(1);
     expect(f.state().sourceState).toEqual({ cursor: 1 });
     expect(f.readPersisted().sourceState).toEqual({ cursor: 1 });
+    expect(f.rows()).toEqual(['A']);
+    expect(f.calls).toBe(1);
+    expect(f.errors).toEqual([]);
     expect(f.internals.activeWatchers.get(f.key)).toBe(successor);
     expect(f.internals.watchPolicies.size).toBe(1);
   } finally {
@@ -344,13 +434,12 @@ it('a checkpoint queued before supersession rechecks identity at its actual writ
   }
 });
 
-it('a draining watcher excludes only its own monitor/workspace while foreign polling advances', async () => {
+it('a watcher with a batch waiting at a closed gate excludes only its own monitor/workspace while foreign polling advances', async () => {
   const f = fixture();
   const handle = await f.start();
   await f.block();
-  const checkpoint = f.checkpoint(111);
-  f.finish();
-  await turns();
+  f.send(111);
+  await f.until(f.gated, 'the batch to wait at the closed gate');
   f.registry.register({
     name: 'healthy',
     scopeSchema: { type: 'object' },
@@ -371,6 +460,7 @@ it('a draining watcher excludes only its own monitor/workspace while foreign pol
   await f.runtime.tick(foreign, foreign);
   await f.tick();
   const reserved = f.internals.activeWatchers.has(f.key);
+  const stillGated = f.gated();
   expect(f.store.getMonitorState('held', foreign).sourceState).toEqual({
     cursor: 555,
   });
@@ -378,12 +468,14 @@ it('a draining watcher excludes only its own monitor/workspace while foreign pol
     cursor: 555,
   });
   await handle.stop();
-  await checkpoint;
   expect(reserved).toBe(true);
+  expect(stillGated).toBe(true);
+  expect(f.calls).toBe(1);
   expect(f.state().sourceState).toEqual({ cursor: 1 });
+  expect(f.readPersisted().sourceState).toEqual({ cursor: 1 });
 });
 
-it('completion without queued work promptly releases polling and cached policy ownership', async () => {
+it('completion without a pending batch promptly releases polling and cached policy ownership', async () => {
   const f = fixture();
   await f.start();
   f.finish();

@@ -239,3 +239,106 @@ for (const failure of [
     });
   }
 }
+
+/**
+ * 002 §4.6: a poll result retained behind a failed notify edit is admitted
+ * against the source baseline it was observed from, not the baseline read when
+ * it resumes. If another connection advanced the baseline meanwhile, the
+ * result is refused rather than rolling the durable baseline back and
+ * replaying input that was already delivered.
+ */
+it('refuses a retained poll result whose source baseline another connection advanced while it waited', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-03-20T08:00:00Z'));
+  const root = mkdtempSync(path.join(tmpdir(), 'notify-retained-baseline-'));
+  const dir = path.join(root, 'monitors');
+  mkdirSync(dir);
+  const file = path.join(dir, 'held.md');
+  const dbPath = path.join(root, 'state.sqlite');
+  const db = createDb(dbPath);
+  const client = (db as unknown as { $client: Database }).$client;
+  const store = new RuntimeStore(db);
+  const started = deferred<undefined>();
+  const result = deferred<ObservationResult>();
+  let calls = 0;
+  const registry = new SourceRegistry();
+  registry.register({
+    name: 'handoff-source',
+    stateful: true,
+    scopeSchema: { type: 'object' },
+    async observe() {
+      calls++;
+      if (calls === 1) {
+        return {
+          observations: [{ title: 'A', snapshotText: 'A', objectKey: 'obj' }],
+          nextState: { cursor: 1 },
+        };
+      }
+      if (calls === 2) {
+        started.resolve(undefined);
+        return result.promise;
+      }
+      return { observations: [], nextState: { cursor: 99 } };
+    },
+  });
+  const runtime = new AgentMonitorRuntime(store, registry, [claudeCodeAdapter]);
+  const session = runtime.openSession(
+    claudeCodeAdapter.createSessionInput({
+      hostSessionId: 'owner',
+      workspacePath: root,
+    }),
+  );
+  const state = () => store.getMonitorState('held', root);
+  const summaries = () =>
+    store.listEvents({ sessionId: session.id }).map((event) => event.summary);
+  const edit = (notify: string) =>
+    writeFileSync(
+      file,
+      `---\nwatch:\n  type: handoff-source\n  interval: 1h\nbaseline-strategy: incremental\n${notify}---\nx\n`,
+    );
+  try {
+    // A is held under a long debounce; the next poll starts and stays in flight.
+    edit('notify:\n  strategy: debounce\n  settle-for: 1h\n');
+    await runtime.tick(dir, root);
+    store.setMonitorState('held', root, {
+      ...state(),
+      lastObservationAt: new Date('2000-01-01T00:00:00Z'),
+    });
+    const slow = runtime.tick(dir, root);
+    await started.promise;
+
+    // The pacing edit's drain fails, so the in-flight result is retained.
+    edit('');
+    client.exec(
+      "CREATE TRIGGER fault BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(FAIL, 'owned edit fault'); END",
+    );
+    await runtime.tick(dir, root);
+    result.resolve({
+      observations: [{ title: 'B', snapshotText: 'B', objectKey: 'obj' }],
+      nextState: { cursor: 2 },
+    });
+    await slow;
+    expect(state().sourceState).toEqual({ cursor: 1 });
+
+    // Another connection admits newer source work while the result waits.
+    const other = createDb(dbPath);
+    const otherStore = new RuntimeStore(other);
+    otherStore.setMonitorState('held', root, {
+      ...otherStore.getMonitorState('held', root),
+      sourceState: { cursor: 7 },
+    });
+    (other as unknown as { $client: Database }).$client.close();
+
+    client.exec('DROP TRIGGER fault');
+    const recovery = await runtime.tick(dir, root);
+    expect(
+      recovery.erroredObservations.map((errored) => errored.message).join(' '),
+    ).toContain('source baseline changed');
+    expect(state().sourceState).toEqual({ cursor: 7 });
+    expect(summaries()).not.toContain('B');
+  } finally {
+    result.resolve({ observations: [] });
+    if (client.open) client.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});

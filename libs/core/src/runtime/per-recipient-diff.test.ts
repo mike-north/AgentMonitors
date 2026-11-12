@@ -7,7 +7,7 @@
  *
  * These exercise the durable substrate directly through {@link RuntimeStore}
  * (the persistence/session-isolation seam — the repo's #1 review priority),
- * mirroring `processObservation`'s materialize flow: read the prior object
+ * mirroring `materializeObservation`'s materialize flow: read the prior object
  * snapshot, compute the shared object-level diff, `insertEvent` (which computes +
  * records each recipient's per-recipient `diff_text`), then `saveSnapshot`.
  *
@@ -51,7 +51,7 @@ function nextTime(): Date {
 
 /**
  * Materialize ONE shared event for {@link OBJECT_KEY} carrying `artifact`,
- * exactly as `processObservation` does: diff against the latest stored object
+ * exactly as `materializeObservation` does: diff against the latest stored object
  * snapshot for the SHARED `monitor_events.diff_text`, project + compute each
  * recipient's per-recipient `diff_text` inside `insertEvent`, then persist the
  * new snapshot. Returns the event id.

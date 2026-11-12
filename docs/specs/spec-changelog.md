@@ -9,6 +9,165 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Notify-policy admission gates whole watch batches; edit drains record no drops (002 §2.3/§2.4/§4.6, 004 §2.5) — Refs #497, #537
+
+Reconcile effective notify-policy edits with explicit watch batches and span admission outcomes.
+The notify admission gate now governs whole batches: while it is closed, a yielded batch waits
+unadmitted on the consumer's stack and the iterator is not pulled again; the gate, cancellation
+and ownership token are rechecked in the same synchronous turn as the batch's transaction. The
+former checkpoint-teardown rules (closing a checkpoint queue, draining accepted checkpoints) are
+restated for batches: one batch is admitted at a time, so completion or an iterator error retires
+the watcher's slot and lease only after its last admitted batch settled; abort releases a waiting
+batch unadmitted, and a superseded watcher's batch is never admitted. A watcher is released "after
+its admitted batch settles" (§2.3). An edit drain stays all-or-nothing and records no drop and
+queues no retry when a held envelope cannot materialize; blocked work records neither; a drop is
+not held work and stays outstanding across an edit unless a drained event supersedes it under §2.
+A retained poll result is later admitted against the source baseline it was observed from.
+004 restates the #537 watcher scenarios for batches and requires the edit/admission-outcome
+interaction tests.
+
+## 2026-11-11 — A rejected source config keeps its outstanding drop visible; the order rebuild carries every additive event column (002 §2/§2.0/`monitor_events`; 004 §3.4) — Refs #497, #557, #451
+
+Compose unretained admission outcomes with the source-config preflight and definition
+fingerprints. The preflight runs before admission (tick step 5), so a rejected config records no
+drop and queues no retry. A drop admitted under the earlier config stays outstanding: doctor keeps
+it on the invalid rollup, and `monitor explain` now reports it as a `failure` materialization stage
+after the definition failure, which stays the verdict (previously the definition-failure return
+omitted it). Explain reports a drop beside the stale-definition delivery note without conflict.
+The `monitor_events` order rebuild now carries `admission_sequence` as well as
+`definition_fingerprint` when a pre-`sequence` table already has them, and the object-key index is
+created after both additive columns. `definition_fingerprint` joins the `monitor_events` schema
+table. A live ephemeral monitor whose persisted scope the source now rejects carries
+`validationError` in its `ephemeralMonitorWork` group, and its doctor checks say no later event
+can clear the work. They say that cancelling and re-declaring the watch restores observation but
+leaves this id's drop and retained work reported under its retired id (002 §2; 005 doctor).
+
+## 2026-11-11 — Ephemeral retained-work remediation names `monitor explain` (005 doctor)
+
+Corrected a false statement in 005: `monitor explain <ephemeral id>` fails its definition stage
+(there is no `MONITOR.md`) but still lists the monitor's retained record IDs, in text and structured
+output. _Current:_ retained-work remediation for a live or retired ephemeral monitor names
+`monitor explain <id>` and `monitor history <id>`, not a text-only doctor heading.
+
+## 2026-11-11 — A drop is superseded by a later observation, not a later write; ephemeral attribution; orphan work renamed (002 §2/`monitor_events`/`materialization_retry_outbox`/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
+
+Correct the entry below. "Later" for a keyed drop was commit order, and 002 said a retained retry
+that materializes counts. A retry admitted before the drop and completed after it commits above
+the drop's watermark although it carries older state for the key, so it cleared the drop while the
+newest state was never delivered. _Current_ rule: an event supersedes a keyed drop only when its
+observation was **admitted** after the drop. Admission order is the `monitor_events`
+materialization order: a queued retry reserves the next position of that table's AUTOINCREMENT
+counter (`materialization_retry_outbox.admission_sequence`) and its completed event keeps it
+(`monitor_events.admission_sequence`); other events are admitted at their own `sequence`. The drop
+row's `unretained_event_watermark` is that counter's high-water mark, so retries admitted after the
+drop, including a retained later sibling of the dropping span, still supersede it. The object-key
+index covers `admission_sequence`.
+
+Doctor scanned only `MONITOR.md` definitions, so a live ephemeral monitor's drop or retained work
+was reported as an orphaned definition, and its check said to repair a definition that never
+existed. _Current:_ a live ephemeral monitor's obligations are attributed to it in
+`ephemeralMonitorWork`; once cancelled or reaped they stay visible in `orphanedMonitorWork` as a
+retired ephemeral monitor (`monitorKind: "ephemeral"`), whose checks say so and do not ask for a
+repair. The rule that nothing but supersession clears a drop is unchanged, so a retired ephemeral
+monitor's drop stays outstanding.
+
+`orphanedMaterializationRetries` (`OrphanedMaterializationRetrySummary`) is renamed
+`orphanedMonitorWork` (`OrphanedMonitorWork`). An entry carries `monitorId`, `monitorKind`, and
+`materializationRetries` / `unretainedObservationLoss` each only when present: a loss-only entry no
+longer carries an invented all-zero retry summary. A duplicated id whose entry holds only a drop
+now shows `retry-outbox=0/0` plus `dropped-observation=orphaned` on its rollups instead of
+`retry-outbox=orphaned`. The entries below keep the names they were written with. Verified by
+`libs/core/src/runtime/unretainable-suffix-admission.test.ts`,
+`libs/core/src/inbox/db.migration.test.ts` and `apps/cli/src/retry-diagnostics.test.ts`.
+
+## 2026-11-11 — A dropped observation stays outstanding until it is superseded (002 §2/§10.7/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
+
+Replace the "later clean outcome" rule from the entry below. It cleared a drop at the next
+non-`errored` history row, so a quiet `no-change` poll, a rollup or debounce hold (`suppressed`),
+or a later span whose only failure was retained made a permanent loss read healthy one interval
+later, and a loss whose definition was removed or no longer parsed vanished from doctor. Both
+contradicted 002 §2's rule that a dropped observation is never less visible than a retained one.
+
+_Current_ rule: a drop with an object key stays outstanding until a later event of the same monitor
+id, workspace and object key materializes; a drop without one, until a later span of that monitor
+in that workspace materializes an event and drops nothing. Nothing else clears it. "Later" for
+events is commit order (`monitor_events.sequence` above a watermark the drop row records), because
+an event's `created_at` is observation time. The supersession is per monitor: another monitor's
+event for the same key does not clear the drop. Without one unambiguous parsed definition, the
+loss is reported in that id's `orphanedMaterializationRetries` entry, following the per-id rule for
+retained work, and doctor fails a `dropped-observation:<id>` check; an invalid parsed definition
+keeps it on its rollup and gets the same check. Storage: two nullable `observation_history` columns
+(`unretained_object_key`, `unretained_event_watermark`), a partial drop-row index, an outcome index
+on `observation_history` and an object-key index on `monitor_events`, all additive. Verified by
+`libs/core/src/runtime/unretainable-suffix-admission.test.ts` and
+`apps/cli/src/retry-diagnostics.test.ts` (including a real `daemon run` socket after a quiet tick).
+
+## 2026-11-10 — Keep a dropped observation visible in explain and doctor (002 §2/§10.7/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
+
+Correct 002 §2's claim that `explainMonitor` and `doctorReport` read the in-transaction `errored`
+row of an observation the outbox could not retain. Neither did in effect. The span's batch
+`triggered` row is written after commit, so it is newer than the drop row; explain read only the
+newest row and reported `ok`. Doctor read history only for `lastObservedAt`, and its retry checks
+count outbox rows, of which a drop has none. A permanently lost observation therefore looked
+healthier than a recoverable one.
+
+_Current_ rule: the batch row records the span's drop count as `notRetainedCount`, and a drop
+stays outstanding until a later clean outcome (a non-`errored` row with no drop count). While one
+is outstanding, explain's materialization stage fails and doctor fails the monitor's check, with
+`unretainedObservationLoss` in the rollup and in doctor JSON. The drop row's `observationData`
+now also names the lost observation: `notRetained: true`, its 1-based `position`, `spanSize`, and
+`objectKey`/`title` when they are strings. Every text field follows the retry-error safe-text
+rule (controls and Unicode separators become spaces, 1,024-character cap), and the reason always
+survives the cap. The payload is never copied. Adds the internal
+`RuntimeStore.outstandingUnretainedObservationLoss()` and the public `UnretainedObservationLoss`
+type. Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts` and
+`apps/cli/src/retry-diagnostics.test.ts`.
+
+## 2026-11-10 — Give every admitted observation one durable outcome when the outbox cannot retain its suffix (002 §2/§2.4/`materialization_retry_outbox`/`observation_history`; 004 §3.4) — Refs #497
+
+Fill a gap in 002: what admission does when the retry outbox rejects a failed observation's ordered
+suffix for a reason that would recur on replay. The suffix can be over the per-monitor capacity
+(256 rows / 8 MiB, terminal rows included), or an envelope can be outside the outbox's plain-data
+domain (BigInt, cycles, nested Dates, ...). Previously the rejection rolled back the whole span,
+committed prefix included, and kept the old baseline. The next tick failed identically, so the
+monitor stopped for good. The not-due rollup flush also cleared `pendingRollup` before a separate
+materialization transaction whose failure an empty catch swallowed, losing the whole held window.
+
+_Current_ rule: every dispatched observation ends in exactly one outcome committed with the
+source/notify state. That outcome is an event, a queued retry, or an in-transaction `errored`
+row whose error ends `Not retained for retry: <reason>` (capacity, or not serializable). A suffix
+is queued whole or not at all. When it cannot be queued, the failed observation is `errored` and
+later siblings keep materializing. The baseline advances once every observation has an outcome.
+The rollup flush now clears its hold in the same transaction as the flushed span; a rollback
+leaves the window held and is reported on the tick result and as an `errored` row.
+
+The 002 §2 sentence "If outbox admission or the state write fails, the outer transaction rolls back
+the batch and retains the prior source baseline" is narrowed to storage failures of the outbox or
+state write. Those, transaction-wide `RAISE(ROLLBACK)`, and a failure writing the new `errored` row
+still roll back and hold the baseline. The `observation_history` Verified lines no longer cite the
+removed `consumeWatch()` inner catch; they cite its outer catch, the in-transaction `admitSpan()`
+rows and the rollup flush catch. Adds the internal `RuntimeStore.materializationRetryCapacity()`,
+the single definition of remaining outbox room shared by enqueue and admission. Verified by
+`libs/core/src/runtime/unretainable-suffix-admission.test.ts`.
+
+## 2026-11-10 — Start materialization retry backoff at enqueue (002 §15; 004 §3.4) — Refs #497
+
+New materialization retry rows first become due at least 1 second after they are enqueued, after
+source acquisition and prefix materialization, rounded up to SQLite's whole-second precision.
+Previously the runtime passed the tick's start time, so slow acquisition consumed the initial delay
+(an observation at `12:00:00.000` admitted at `12:00:03.850` was already due at `12:00:01.000`; the
+contract requires `12:00:05.000`). Observation, event, envelope, source and notify timestamps remain
+observation-time provenance. No public API, schema or retry-schedule change.
+
+A retry row's `createdAt`/`updatedAt` record enqueue time. The `observation_history` contract no
+longer says a failed observation leaves the rest of its batch unaffected: the committed prefix stays
+and the failed envelope plus later siblings are queued as ordered retries, with `errored` rows
+written by `finishMaterializationSpan()`.
+
+A transaction-wide `RAISE(ROLLBACK)` differs: the whole span rolls back, prefix included, nothing
+is queued, the source baseline does not advance, and the single `errored` row comes from `tick()`'s
+ingest-error catch (or `consumeWatch()`'s outer catch, which also ends the watcher).
+
 ## 2026-11-11 — Source-config rejection closes admission only for held work (002 §2.0/§4.6, 004 §2.5) — Refs #537
 
 Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
@@ -170,6 +329,17 @@ from supported writers. Owned on-disk regression tests cover `records`, `bytes`,
 valid totals, workspace isolation, and useful control-stripped diagnostic text. No new public API,
 status, schema policy, automatic repair, or arbitrary secret redaction is introduced.
 
+## 2026-11-07 — Preserve admission after native rollback and captured-source retry failures (002 §2/§15; 004 §3.4) — Refs #497
+
+Distinguish savepoint-local ABORT from SQLite ending the owning admission transaction. Rethrow the
+original materialization error before fallback retry/checkpoint writes when the native transaction
+is no longer active, preserving the complete replay baseline, held work and prior committed rows/cache.
+Require real later-sibling rollback tests with fresh and held spans, a nonempty prior recipient cache,
+forced-due reopen replay, and an ABORT suffix-retention control. Route retries for old debounce/rollup
+envelopes through their captured source after a source-type edit; preserve captured instructions,
+urgency, content and timestamps without transforming the source baseline. Transaction ownership
+remains package-private and the published API is unchanged.
+
 ## 2026-11-07 — Preserve dependent triggers across ordering migrations (002 §5.2, 004 §3.4) — Refs #293
 
 Coordinate event and snapshot sequence rebuilds within their existing immediate
@@ -247,6 +417,28 @@ Report skips visibly with the same diagnostics as validate/explain/doctor; retai
 baseline and pending notify state across restart so a corrected config resumes.
 Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
 and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
+
+## 2026-11-01 — Watch batches bind observations to source checkpoints (002 §2.4; 003 §2; 004 §3.4) — Refs #497, #294, #295
+
+Record the user's accepted explicit-batch decision and its rationale: an independent opaque
+checkpoint can skip not-yet-yielded work, and staging it until one later yield cannot recover the
+covered span. Change watch to yield ObservationResult, remove context.checkpoint, reject legacy bare
+observations, and atomically admit each complete batch before Interpret or the next pull. Empty
+batches are valid; omitted/undefined state preserves and null retains the existing reset-to-{} behavior.
+Whole admission failure stops the iterator with the old baseline and prior committed cache intact.
+Read source/notify state and decide dispatch under the admission write lock; refuse batches whose
+pre-acquisition source token no longer matches, preserving competing writers' checkpoints and held
+work. Document breaking third-party migration, runtime-local ownership, source replay responsibility
+and remaining retry-drain/crash-proof work. File-fingerprint's target watch design adopts the same contract.
+
+## 2026-11-01 — Complete poll admission before interpretation (002 §2; 004 §3.4) — Refs #497, #294, #295
+
+Require the entire finite poll span, successful event prefix, ordered retry suffix and source/notify
+state to commit before the first optional Interpret invocation. Independent-connection barrier tests
+cover multiple recipients, repeated object transitions and empty snapshots. Outer rollback restores
+the last committed recipient cache as well as database rows; held notify work survives failed
+admission and reopens for replay. Transaction composition stays package-private, preserving the
+concrete retry-completion API. The separate watch checkpoint contract is unchanged.
 
 ## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
 
@@ -751,6 +943,13 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
   boundary. Resolution: #478's scope is extended (recorded on the issue) to cover
   detached-but-identifiable descendants; identity-erasing detachment remains the documented
   escape.
+
+## 2026-08-13 — Poll ingest atomically admit failed observations (002 §2, §15; 004 §3.4) — Refs #295, #481
+
+One immediate transaction now commits successful event materializations, ordered retry envelopes,
+and source/notify state. A state or outbox failure rolls the whole batch back to the prior source
+baseline. Tick ids, errors, and history reflect only committed work, and Interpret runs only after
+commit. Retry draining and rollup-window adoption follow in the next stack layers.
 
 ## 2026-08-13 — Failed materialization has a bounded durable retry outbox (002 schema, 004 §3.4, 005 §15) — Refs #295, #481
 

@@ -7,6 +7,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
+import type { ObservationResult } from '../observation/types.js';
 import type { PolicyNotifyState } from './notify-policy.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
@@ -35,6 +36,8 @@ function fixture(policy: string) {
   const file = path.join(dir, 'held.md');
   const dbPath = path.join(root, 'state.sqlite');
   const previous: unknown[] = [];
+  /** previousState handed to each live source factory the runtime admitted. */
+  const watched: unknown[] = [];
   const handles: { stop(): Promise<void> }[] = [];
   const registry = new SourceRegistry();
   registry.register({
@@ -50,12 +53,14 @@ function fixture(policy: string) {
       };
     },
     watch(_config, context) {
-      // A silent live source makes startup reconciliation observable without a checkpoint or yield.
+      watched.push(context.previousState);
+      // A silent live source admits no batch, so startup reconciliation is
+      // observable without any source-owned baseline write.
       return {
         [Symbol.asyncIterator]() {
           return this;
         },
-        next(): Promise<IteratorResult<never>> {
+        next(): Promise<IteratorResult<ObservationResult>> {
           return new Promise((resolve) => {
             if (context.signal.aborted)
               resolve({ done: true, value: undefined });
@@ -139,18 +144,22 @@ function fixture(policy: string) {
     summaries,
     artifacts,
     previous,
+    watched,
     stop,
     get current() {
       return current;
     },
     tick: () => current.runtime.tick(dir, root),
+    /** Start live watching and wait until the gate admits the source factory. */
     async startup() {
       const errors: { monitorId: string; message: string }[] = [];
+      const factories = watched.length;
       handles.push(
         await current.runtime.watchMonitors(dir, root, {
           onError: (error) => errors.push(error),
         }),
       );
+      await vi.waitFor(() => expect(watched).toHaveLength(factories + 1));
       return errors;
     },
     /** Seed only source-owned compatibility columns and absent private identity on this owned fixture. */
@@ -231,6 +240,12 @@ for (const [kind, policy] of Object.entries(policies)) {
         expect((await f.tick()).erroredObservations).toEqual([]);
         expect(f.previous).toEqual([undefined, JSON.parse(rawSource)]);
         expect(f.summaries()).toEqual(['A', 'B']);
+        // Every admitted live factory received the untouched opaque baseline.
+        expect(f.watched).toEqual(
+          Array.from({ length: route === 'tick' ? 1 : 2 }, () =>
+            JSON.parse(rawSource),
+          ),
+        );
         f.restart();
         expect(f.summaries()).toEqual(['A', 'B']);
         expect(f.state().sourceState).toEqual({ cursor: 2 });

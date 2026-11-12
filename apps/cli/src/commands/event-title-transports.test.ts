@@ -9,7 +9,7 @@
  * monitor's own implementation, burning context on every delivery.
  *
  * The rule under test is transport-independent because core owns it: the title
- * is chosen once when the event is materialized (`processObservation`, 002 §5.4),
+ * is chosen once when the event is materialized (`materializeObservation`, 002 §5.4),
  * so the hook and channel renderers cannot diverge. These tests therefore drive
  * a REAL runtime tick against the REAL bundled `command-poll` source, claim a
  * REAL {@link DeliveryClaim}, and render that one claim through BOTH
