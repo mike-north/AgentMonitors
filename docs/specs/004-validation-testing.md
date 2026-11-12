@@ -145,27 +145,74 @@ and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
 with valid globs and a malformed interval: doctor must report the validation error
 without scheduling it or inventing a due time, retain healthy sibling results, and
 leave source/notify state, events, and observation history unchanged. A stale verify
-session with a real projected scratch event and an edited invalid interval must
-be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
-retain the source baseline and held legitimate work, report the config skip, and
-progress a healthy sibling. Assert the existing fallback expiry at five minutes
-for unparseable cadence or a missing definition, and preserve derivable timing despite
-unrelated source-schema errors. A real-source/SQLite delayed-repair case must retain
-665000ms for invalid globs + 10m interval + 5s settle, close/reopen the store, repair
-at 12:08 after a 12:02 reap, and exclude scratch from an actual later-session claim
-while delivering legitimate held work and preserving a foreign workspace. This
-bounded regression does not resolve the known current arbitrary-pause/held-only
-ownership gap: retained fingerprints or held deletions may outlive suppression,
-and held-only creates may escape discovery. The no-later-scratch-event goal remains;
-current tests must not be cited as proof of that unconditional guarantee.
-[Decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
-assigns the complete delayed-repair/held-only claim acceptance to
-[#562](https://github.com/mike-north/AgentMonitors/issues/562), sequenced after
-#305/#537/#554. This known gap does not block #557 after its window/docs correction.
-Covered by `libs/core/src/runtime/cadence-window.test.ts`,
+owner reaped while its monitor's globs are rejected must give its registered artifact cleanup
+authority without deriving any lifetime from the rejected config: retain the source baseline and held
+legitimate work, report the config skip and progress a healthy sibling. A real-source/SQLite case
+must then close and reopen the store, repair the config after an arbitrary pause, and exclude the
+retained scratch deletion from an actual later-session claim while delivering legitimate held work
+and preserving a foreign workspace with the same key. Covered by
+`libs/core/src/runtime/verify-artifact-rejected-config.test.ts`,
 `libs/core/src/runtime/object-event-suppressions.test.ts`,
 `libs/core/src/runtime/source-validation.test.ts` and
 `apps/cli/src/commands/runtime-source-validation.test.ts`.
+
+#### Verify-artifact ownership (002 §2.8, 005 §16 step 9)
+
+`libs/core/src/runtime/verify-artifact-ownership.test.ts` **MUST** drive the real file-fingerprint
+source against real files, close and reopen the SQLite database across an arbitrary pause (hours,
+far beyond any former suppression lifetime), and assert both the durable event table and an
+**actual later-lead claim**. Required scenarios:
+
+- **Delayed recovery:** a deletion retained in the source baseline while the monitor is invalid; an
+  already-held deletion; a held-only create left by a killed run (no event ever projected) that is
+  discovered only through stale-owner reaping; a held envelope drained by a notify-policy edit; a
+  create held in a rollup window that fires after the owner is reaped.
+- **Held flush with nothing else held:** when the only held item is an artifact with cleanup
+  authority, the not-due rollup window check and the debounce and rollup flushes while
+  `observe()` fails (002 §2.6) clear the hold, keep the source baseline and `lastObservationAt`,
+  materialize nothing and write no audit row of their own; on the failing path the source's
+  `errored` row is the only new row.
+- **Incoming boundary:** a filtered observation does not consume a throttle window that a later
+  legitimate change needs; a watcher batch admitted after restart, before any tick has recorded
+  the owner's inactivity, is already filtered.
+- **Retained retries:** in `libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts`, a
+  retry for a registered artifact, queued before cleanup authority took effect, is dropped by the
+  tick drain and by the watcher drain before its next pull (002 §2.7): no event, the row is gone,
+  nothing is reported, and the monitor's later legitimate input materializes. A `terminal` retry
+  for such an artifact no longer pauses its monitor. After a drop the drain continues with the
+  next row: a legitimate retry retained behind the artifact completes before newer input. Cleanup
+  that a second runtime on the same database records after the drain read the row, before its
+  completion commits, still drops it: no lead session receives it. A removal that cannot commit is
+  reported as a failed drain step with an `errored` row, keeps the row, leaves another monitor in
+  the same tick running, and succeeds on the next drain once the fault clears. Controls: a retry
+  for an unregistered scratch-looking key, for a key retired only in a foreign workspace, for a
+  real path beside a retired artifact, and for an artifact still in its proof phase each still
+  materializes.
+- **Refusal placement:** in `libs/core/src/runtime/verify-artifact-ownership-refusal-position.test.ts`,
+  a debounce hold refusal made behind a held artifact whose cleanup authority then took effect is
+  placed among the envelopes that survive the filter (002 §2, §2.8): when an escalation flushes the
+  batch, a newer same-key sibling supersedes the refusal, alone or after an older kept sibling held
+  beside the artifact. Controls: that older kept sibling alone does not supersede it, and with
+  nothing filtered the refusal still sits between the held artifact and the newer sibling.
+- **No expiry:** cleanup authority survives arbitrary wall-clock time and repeated successful polls.
+- **Exactness controls:** a foreign workspace with the same monitor id and key keeps delivering; an
+  unregistered scratch-looking path (even under a reaped verify-named session) is ordinary work; a
+  real watched path cannot be registered; a key owned by another run, a key without the run's
+  token, and an inactive or missing owner are refused. Legitimate items in the same held batches
+  must materialize.
+- **Crashes:** a retried registration before and after restart keeps one record; a run killed after
+  registration but before creating the file is reaped to cleanup once, idempotently across
+  restarts; a retried cleanup request keeps the first request time; a killed run's projected proof
+  event is retracted at reaping and its later deletion filtered; an owner that ended before its
+  cleanup was recorded already supplies authority, and the next tick records it.
+
+`libs/core/src/inbox/db.released-shapes.test.ts` proves every released database shape migrates to
+the `verify_artifacts` table and both indexes, and reopens. `apps/cli/src/daemon-ipc.test.ts`
+round-trips registration and cleanup over the socket, refusing real paths and unregistered runs.
+`apps/cli/src/commands/verify.integration.test.ts` proves the built CLI against a real workspace
+daemon: the run leaves exactly one ownership record with `owner-request`; an interrupted run's
+record has cleanup recorded; and against a daemon that answers registration as unsupported, verify
+takes the legacy fallback, passes, and leaves no scratch event for the later session.
 
 #### Notify-policy-edit durability (002 §4.6)
 
@@ -743,6 +790,8 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | A retry that keeps failing stays isolated and visible every tick _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — eight ticks: one `erroredObservations` entry and one `errored` history row per tick through the terminal state, the failing source called once, and a healthy sibling monitor emitting every tick). |
 | Retained work from before a restart drains first, in order, exactly once _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — three retained retries reopened from the database by a new runtime complete as A, B, C before D is observed, each once; a restarted watcher keeps its gate closed until a tick drains its batch, then pulls the next one). |
 | Held work waits behind retained work while the source fails _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — a debounce flush whose write fails leaves A as a retry while C is held; with the source rejecting and both due, a failing retry and a terminal one each keep C held and no event written, report only the retry failure, and never call the source; once the failing retry completes, the next tick writes A then C through the source-error flush (002 §2.6, §2.7)). |
+| A retired verify artifact's retained retry is dropped, not drained _(current)_ | Covered (`libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts` — a retry queued before cleanup authority took effect is removed by the tick drain and by the watcher drain without an event or an `errored` row, and newer input proceeds; a terminal one no longer pauses the monitor; a legitimate retry behind a dropped one completes before newer input; cleanup recorded by a second writer between the drain's read and completion still drops the row; a removal that cannot commit is a failed drain step contained to its monitor; retries for an unregistered scratch-looking key, a foreign workspace, a real path, and an artifact still in its proof phase materialize (002 §2.7, §2.8)). |
+| A hold refusal behind a dropped verify artifact keeps its place among the kept envelopes _(current)_ | Covered (`libs/core/src/runtime/verify-artifact-ownership-refusal-position.test.ts` — a debounce refusal of key K made while a registered artifact was held, after which cleanup authority took effect, is superseded by a newer same-key sibling an escalation flushes with the batch, with and without an older kept sibling held beside the artifact; that older sibling alone does not supersede it; with nothing filtered the artifact materializes and the newer sibling still supersedes the refusal (002 §2, §2.8, §4.7)). |
 | A session registered after an observation never receives its retry _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — a session opened 500 ms after admission, in the same second, gets no projection or cursor while an earlier session does; a retry without a position reaches no positioned session; a session without a position falls back to time; a resumed session keeps its position. `libs/core/src/inbox/db.released-shapes.test.ts` opens every released `agent_sessions` shape, keeps its rows with no position, and reserves new positions after existing events). |
 
 | Concurrent admission decisions preserve newer durable work | Covered (`poll-admission.test.ts` — independent notify writer commits immediately before BEGIN and its held envelope is materialized; mutation of observation context cannot alter the captured source token; `watch-batch-admission.test.ts` refuses a stale later batch without changing the winning source/notify state). |
@@ -781,14 +830,9 @@ uncommitted observation recovery, power-loss durability, or the pending material
 
 ### 3.5.1 Verify observation boundary
 
-**Current cleanup verification limit:** the observation/claim checks below do not
-prove arbitrary delayed scratch cleanup. Finite tombstones can expire before
-retained baseline/held-envelope recovery, and projected-event discovery misses a
-held-only scratch create. Preserve the intended no-later-scratch-event requirement,
-but track those missing recovery/ownership cases under
-[#562](https://github.com/mike-north/AgentMonitors/issues/562), per
-[decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828),
-until its exact ownership and explicit-retirement repair lands. See 005 §16 step 9.
+Scratch cleanup after arbitrary delay, restart and held-work recovery is proved separately by the
+verify-artifact ownership scenarios ([§2.5](#25-runtime-tests)); the checks below cover the
+observation boundary. See 005 §16 step 9.
 
 `apps/cli/src/verify-observe.test.ts` verifies distinct old/new observation identities with actual
 SQLite second-rounded timestamps, command-start versus completion evidence, repeated-row refusal,

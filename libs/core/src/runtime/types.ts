@@ -1059,6 +1059,10 @@ export interface NotHeldObservation {
    * are the first ones of the flush, and observations held after the refusal
    * follow them. A rollup refusal is always 0: rollup refuses only when its
    * window does not fire, and then it emits nothing.
+   *
+   * The count is over the dispatched list. When admission drops retired
+   * verify artifacts from that list (002 §2.8), it re-counts the position over
+   * the envelopes it keeps.
    */
   emittedBefore: number;
 }
@@ -1165,4 +1169,72 @@ export function defaultNotifyConfigForUrgency(
     };
   }
   return undefined;
+}
+
+/**
+ * Why cleanup authority took effect for a registered verify artifact (002
+ * §2.8): the owner asked for cleanup after its proof, or the owner session was
+ * no longer active (closed, reaped as stale, or missing) when the runtime
+ * reconciled it.
+ *
+ * @public
+ */
+export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';
+
+/**
+ * Durable, exact ownership of one synthetic artifact a `verify` run created
+ * against a persistent workspace daemon (issue #562, 002 §2.8). The record
+ * names one object key in one monitor and workspace. It is retained without
+ * expiry: once cleanup has taken effect the runtime keeps that exact key out of
+ * every later session, and the retained key cannot be registered again.
+ *
+ * @public
+ */
+export interface VerifyArtifactRecord {
+  /** The verify run's random token; one record per run. */
+  runId: string;
+  /** The verify run's throwaway lead session. */
+  ownerSessionId: string;
+  /** The workspace whose daemon owns the artifact; ownership never crosses workspaces. */
+  workspacePath: string;
+  /** The monitor the run verified; the filter is scoped to it. */
+  monitorId: string;
+  /** The exact scratch path, which carries {@link VerifyArtifactRecord.runId}. */
+  objectKey: string;
+  /** When the run registered ownership, before creating the artifact. */
+  registeredAt: Date;
+  /** When cleanup authority was first recorded; never cleared once set. */
+  cleanupRequestedAt: Date | null;
+  /** Why cleanup authority took effect; `null` while the run is still in its proof phase. */
+  cleanupCause: VerifyArtifactCleanupCause | null;
+}
+
+/**
+ * Register exact ownership of a verify scratch artifact before creating it
+ * (002 §2.8). `objectKey` must be a verify scratch path whose token equals
+ * `runId`; real watched paths are refused.
+ *
+ * @public
+ */
+export interface RegisterVerifyArtifactInput {
+  /** The run's random 12-hex-digit token, embedded in `objectKey`. */
+  runId: string;
+  /** The run's own active lead session in `workspacePath`. */
+  ownerSessionId: string;
+  /** The workspace whose daemon owns the artifact. */
+  workspacePath: string;
+  /** The monitor being verified; filtering is scoped to it. */
+  monitorId: string;
+  /** The exact scratch path the run is about to create. */
+  objectKey: string;
+  /** Registration time; defaults to the current clock. */
+  now?: Date;
+}
+
+/** The outcome of a verify artifact cleanup request (002 §2.8). @public */
+export interface VerifyArtifactCleanupResult {
+  /** The record after the request; unchanged when cleanup was already recorded. */
+  artifact: VerifyArtifactRecord;
+  /** Events for the exact key that this request retracted. */
+  retractedEventCount: number;
 }

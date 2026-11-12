@@ -368,6 +368,77 @@ describe('createDaemonServer — request-handling resilience', () => {
     }
   });
 
+  // Issue #562: verify registers exact artifact ownership before creating its
+  // scratch file, then requests cleanup. The socket boundary refuses a real
+  // watched path and a malformed run token, keeps a retried registration to one
+  // record, and refuses cleanup for an unregistered run, staying alive throughout.
+  it('round-trips verify artifact registration and cleanup, refusing real paths and unregistered runs', async () => {
+    const socketPath = tempSocketPath('verify-artifacts');
+    const ws = mkdtempSync(path.join(tmpdir(), 'am-verify-artifacts-'));
+    const runtime = createRuntime(':memory:');
+    const server = createDaemonServer({ runtime, socketPath });
+    const call = <T>(method: string, params: Record<string, unknown>) =>
+      callDaemon<T>(method, params, { socketPath, timeoutMs: 1000 });
+    try {
+      await server.listen();
+      const owner = await call<{ id: string }>('session.open', {
+        adapter: 'claude-code',
+        hostSessionId: 'agentmonitors-verify-0a1b2c3d4e5f',
+        workspacePath: ws,
+        agentIdentity: 'claude-code',
+        hookStatePath: path.join(ws, '.hook-state.json'),
+      });
+      const register = {
+        runId: '0a1b2c3d4e5f',
+        ownerSessionId: owner.id,
+        workspacePath: ws,
+        monitorId: 'm',
+        objectKey: path.join(ws, 'agentmonitors-verify-0a1b2c3d4e5f.md'),
+      };
+
+      for (const params of [
+        { ...register, objectKey: path.join(ws, 'src', 'app.ts') },
+        { ...register, runId: 'not-a-token' },
+      ]) {
+        const rejection = await call('verifyArtifacts.register', params).catch(
+          (error: unknown) => error,
+        );
+        expect(rejection).toBeInstanceOf(Error);
+        expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+      }
+
+      const first = await call<{ runId: string; cleanupCause: unknown }>(
+        'verifyArtifacts.register',
+        register,
+      );
+      expect(first).toMatchObject({
+        runId: '0a1b2c3d4e5f',
+        cleanupCause: null,
+      });
+      await expect(call('verifyArtifacts.register', register)).resolves.toEqual(
+        first,
+      );
+
+      const cleanup = await call<{
+        artifact: { cleanupCause: unknown };
+        retractedEventCount: number;
+      }>('verifyArtifacts.requestCleanup', { runId: '0a1b2c3d4e5f' });
+      expect(cleanup.artifact.cleanupCause).toBe('owner-request');
+      expect(cleanup.retractedEventCount).toBe(0);
+
+      const unregistered = await call('verifyArtifacts.requestCleanup', {
+        runId: 'ffffffffffff',
+      }).catch((error: unknown) => error);
+      expect(unregistered).toBeInstanceOf(Error);
+      expect((unregistered as Error).message).toMatch(/not registered/);
+      expect(runtime.listVerifyArtifacts()).toHaveLength(1);
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   // Issue #382: going forward, a schema-rejected request (e.g. an unknown
   // `method` — what a NEW client sends an OLD daemon build that predates it,
   // or vice versa) must carry a `code` a client can match on WITHOUT relying
