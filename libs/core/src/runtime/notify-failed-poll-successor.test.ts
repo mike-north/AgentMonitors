@@ -68,7 +68,9 @@ function fixture(
   let successor: unknown;
   let factories = 0;
   let factoryPrevious: unknown;
-  let checkpoint: Promise<void> | undefined;
+  // Settles once the watcher asks for input after its baseline batch, i.e. the
+  // batch was admitted, or once the watcher is aborted without admitting it.
+  const baselineSettled = deferred<undefined>();
   const registry = new SourceRegistry();
   const source: ObservationSource = {
     name: 'successor-source',
@@ -105,23 +107,33 @@ function fixture(
           ) {
             factories++;
             factoryPrevious = context.previousState;
-            // This real checkpoint may not cross the successor's outstanding poll.
-            checkpoint = context.checkpoint?.({ cursor: 777 });
+            let pulls = 0;
+            const aborted = () =>
+              new Promise<IteratorResult<ObservationResult>>((resolve) => {
+                const done = () => {
+                  baselineSettled.resolve(undefined);
+                  resolve({ done: true, value: undefined });
+                };
+                if (context.signal.aborted) done();
+                else
+                  context.signal.addEventListener('abort', done, {
+                    once: true,
+                  });
+              });
             return {
               [Symbol.asyncIterator]() {
                 return this;
               },
-              next(): Promise<IteratorResult<never>> {
-                return new Promise((resolve) => {
-                  if (context.signal.aborted)
-                    resolve({ done: true, value: undefined });
-                  else
-                    context.signal.addEventListener(
-                      'abort',
-                      () => resolve({ done: true, value: undefined }),
-                      { once: true },
-                    );
-                });
+              next(): Promise<IteratorResult<ObservationResult>> {
+                pulls++;
+                // This real baseline-only batch may not cross the successor's outstanding poll.
+                if (pulls === 1)
+                  return Promise.resolve({
+                    done: false,
+                    value: { observations: [], nextState: { cursor: 777 } },
+                  });
+                baselineSettled.resolve(undefined);
+                return aborted();
               },
             };
           },
@@ -246,9 +258,9 @@ function fixture(
       await turns();
       return handle;
     },
-    async finishCheckpoint() {
+    async finishBaselineBatch() {
       await turns();
-      await checkpoint;
+      await baselineSettled.promise;
     },
     reopen() {
       client.close();
@@ -307,7 +319,7 @@ for (const failure of ['ingest', 'observe', 'none'] as const) {
   });
 }
 
-it('a failed predecessor cannot wake a watcher factory/checkpoint through its successor poll', async () => {
+it('a failed predecessor cannot wake a watcher factory or admit its baseline batch through its successor poll', async () => {
   const f = fixture('ingest', true);
   const { resultA, b } = await f.overlap();
   const retained = f.admissions().get(f.key) === f.successor;
@@ -318,7 +330,7 @@ it('a failed predecessor cannot wake a watcher factory/checkpoint through its su
   const stateBeforeB = f.state();
   await f.tick();
   await f.finish(b);
-  await f.finishCheckpoint();
+  await f.finishBaselineBatch();
   for (const handle of handles.splice(0)) await handle.stop();
   const persisted = f.reopen();
   expect(retained).toBe(true);

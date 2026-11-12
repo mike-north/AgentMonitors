@@ -1,6 +1,7 @@
 /**
  * 002 §4.6 / accepted #556: watcher startup is an edit-reconciliation boundary.
- * Real restart and SQLite faults prove old holds precede every new checkpoint/yield.
+ * Real restart and SQLite faults prove old holds precede every new watch batch
+ * (its observations and its source baseline commit together, 002 §2.4).
  */
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -32,7 +33,7 @@ afterEach(() => {
     rmSync(root, { recursive: true, force: true });
 });
 
-/** A source whose checkpoint-before-yield matches the daemon startup loss probe. */
+/** A source whose one baseline-advancing batch matches the daemon startup loss probe. */
 function fixture() {
   vi.useFakeTimers();
   vi.setSystemTime(START);
@@ -85,8 +86,12 @@ function fixture() {
         context.previousState.cursor === 999
       )
         return;
-      await context.checkpoint?.({ cursor: 999 });
-      yield { title: 'C', snapshotText: 'C', objectKey: 'obj' };
+      // One admission unit: C and its cursor commit together or not at all.
+      yield {
+        observations: [{ title: 'C', snapshotText: 'C', objectKey: 'obj' }],
+        nextState: { cursor: 999 },
+      };
+      // Pulled again only after the batch above was fully admitted.
       completed++;
     },
   };
@@ -172,7 +177,7 @@ function fixture() {
 }
 
 for (const mode of ['debounce', 'rollup'] as const) {
-  it(`startup ${mode} offline edit drains atomically before checkpoint/C, without a preceding tick`, async () => {
+  it(`startup ${mode} offline edit drains atomically before the C batch, without a preceding tick`, async () => {
     const f = fixture();
     await f.hold(mode);
     f.edit('');
@@ -371,8 +376,10 @@ it('a failed startup leaves healthy sibling/workspace watchers and cancellation 
       return Promise.resolve({ observations: [] });
     },
     async *watch(_config, context) {
-      await context.checkpoint?.({ healthy: true });
-      yield { title: 'healthy' };
+      yield {
+        observations: [{ title: 'healthy' }],
+        nextState: { healthy: true },
+      };
       if (!context.signal.aborted)
         await new Promise<void>((resolve) =>
           context.signal.addEventListener(

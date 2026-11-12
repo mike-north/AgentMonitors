@@ -59,7 +59,7 @@ function freshStore(): RuntimeStore {
 
 /**
  * Materialize ONE shared event carrying `artifact`, exactly as
- * `processObservation` does: read the latest stored snapshot, diff against it
+ * `materializeObservation` does: read the latest stored snapshot, diff against it
  * for the shared `monitor_events.diff_text`, `insertEvent`, then persist the new
  * snapshot. Returns the new event id and the predecessor content that
  * `latestSnapshot()` resolved to (the diff base). All timestamps come from the

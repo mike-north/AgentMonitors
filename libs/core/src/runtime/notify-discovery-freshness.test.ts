@@ -83,7 +83,9 @@ function fixture(older: 'tick' | 'startup', initialHeld = false) {
     async *watch(config, context) {
       if (config.label === 'b' && bCalls === 1 && !initialHeld) {
         bCalls++;
-        yield { title: 'B', snapshotText: 'B', objectKey: 'obj' };
+        yield {
+          observations: [{ title: 'B', snapshotText: 'B', objectKey: 'obj' }],
+        };
       }
       await new Promise<void>((resolve) => {
         if (context.signal.aborted) resolve();

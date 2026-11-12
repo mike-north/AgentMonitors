@@ -10,6 +10,7 @@ import {
   eq,
   gt,
   inArray,
+  isNotNull,
   isNull,
   lte,
   ne,
@@ -61,6 +62,7 @@ import {
   sessionObjectCursor,
 } from '../inbox/schema.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
+import { registerRuntimeTransaction } from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   EnqueueMaterializationRetryInput,
@@ -80,6 +82,7 @@ import type {
   RuntimeStatus,
   SessionHookState,
   SessionObjectCursorRecord,
+  UnretainedObservationLoss,
 } from './types.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
@@ -89,6 +92,7 @@ import {
 } from './types.js';
 import type { Urgency } from '../schema/types.js';
 import { buildDiff, changeDetectionStrategyOf } from './diff.js';
+import { safeDiagnosticText } from './diagnostic-text.js';
 import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
@@ -210,12 +214,7 @@ function materializationRetryKey(
 
 /** Bound persisted and projected failure text without letting it control terminal layout. */
 function safeRetryError(message: string): string {
-  return (
-    message
-      // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
-      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
-      .slice(0, 1_024)
-  );
+  return safeDiagnosticText(message);
 }
 
 /**
@@ -432,9 +431,32 @@ function scopeMatches(
 }
 
 export class RuntimeStore {
-  /** Share this connection's writer boundary with internal runtime edit drains. */
+  /**
+   * Share this connection's writer boundary with internal runtime edit drains
+   * and register the runtime-owned admission span runner.
+   */
   constructor(private readonly db: InboxDb) {
     registerStoreWriter(this, db);
+    // Runtime-owned spans compose store operations without adding executable
+    // callbacks to the published store API. Cache visibility follows the outer
+    // commit, including when nested event savepoints succeeded before rollback.
+    // The liveness predicate reads this same owned native connection: SQLite
+    // may end the outer transaction without returning through its runner first.
+    registerRuntimeTransaction(
+      this,
+      (operation) => {
+        const previousProjectedSessionIds = this.lastProjectedSessionIds;
+        try {
+          return asInternalDb(this.db)
+            .$client.transaction(operation)
+            .immediate();
+        } catch (error) {
+          this.lastProjectedSessionIds = previousProjectedSessionIds;
+          throw error;
+        }
+      },
+      () => asInternalDb(this.db).$client.inTransaction,
+    );
   }
 
   openSession(input: OpenSessionInput): AgentSessionRecord {
@@ -907,24 +929,13 @@ export class RuntimeStore {
         }
 
         for (const addition of additions.values()) {
-          const usage = db
-            .select({
-              count: sql<number>`count(*)`,
-              bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
-            })
-            .from(materializationRetryOutbox)
-            .where(
-              materializationRetryKey(
-                addition.monitorId,
-                addition.workspacePath,
-              ),
-            )
-            .get();
+          const remaining = this.materializationRetryCapacity(
+            addition.monitorId,
+            addition.workspacePath,
+          );
           if (
-            (usage?.count ?? 0) + addition.count >
-              MATERIALIZATION_RETRY_MAX_RECORDS ||
-            (usage?.bytes ?? 0) + addition.bytes >
-              MATERIALIZATION_RETRY_MAX_BYTES
+            addition.count > remaining.records ||
+            addition.bytes > remaining.bytes
           ) {
             throw new MaterializationRetryCapacityError(addition.monitorId);
           }
@@ -938,6 +949,7 @@ export class RuntimeStore {
           db.insert(materializationRetryOutbox)
             .values({
               id: item.id,
+              admissionSequence: this.reserveAdmissionSequence(),
               workspacePath: item.input.workspacePath,
               monitorId: item.input.monitorId,
               sourceName: item.input.sourceName,
@@ -955,6 +967,37 @@ export class RuntimeStore {
         return prepared.map((item) => this.getMaterializationRetry(item.id));
       })
       .immediate();
+  }
+
+  /**
+   * Room left in one workspace/monitor retry outbox under the bounds that
+   * {@link RuntimeStore.enqueueMaterializationRetries} enforces: 256 rows and
+   * 8 MiB of stored envelopes, terminal rows included. This is the single
+   * definition of that capacity. Runtime admission reads it inside its own
+   * transaction to decide whether a failed observation's whole ordered suffix
+   * can be retained before it asks enqueue to store that suffix.
+   *
+   * @internal
+   */
+  materializationRetryCapacity(
+    monitorId: string,
+    workspacePath: string | null,
+  ): { records: number; bytes: number } {
+    const usage = asInternalDb(this.db)
+      .select({
+        count: sql<number>`count(*)`,
+        bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
+      })
+      .from(materializationRetryOutbox)
+      .where(materializationRetryKey(monitorId, workspacePath))
+      .get();
+    return {
+      records: Math.max(
+        0,
+        MATERIALIZATION_RETRY_MAX_RECORDS - (usage?.count ?? 0),
+      ),
+      bytes: Math.max(0, MATERIALIZATION_RETRY_MAX_BYTES - (usage?.bytes ?? 0)),
+    };
   }
 
   /** Resolve retained work by identity; absence is a typed error, never a successful discard. */
@@ -1166,7 +1209,11 @@ export class RuntimeStore {
    * to the caller; this boundary enforces lifecycle and atomic persistence.
    *
    * Input must be the deterministic materialization of the stored envelope,
-   * with the same workspace, monitor, source and object identity. An omitted
+   * with the same workspace, monitor, source and object identity. That
+   * includes `definitionFingerprint`: the fingerprint of the envelope's own
+   * monitor snapshot, the definition the observation was made under, never
+   * the current one (002 §5.3). The event's admission position is stamped
+   * here from the outbox row, not taken from the input (002 §2). An omitted
    * observation key uses the monitor id, matching runtime materialization;
    * explicit keys (including the empty string) keep their identity. Rendering
    * remains the runtime's responsibility. This seam accepts event data, never
@@ -1215,6 +1262,20 @@ export class RuntimeStore {
             );
           }
           const result = this.insertEvent(input, baseline, options);
+          // The event commits now but its observation was admitted when the
+          // retry was queued; supersession of a drop compares admission (002 §2).
+          // A row queued before positions were reserved predates every drop.
+          const admission = db
+            .select({
+              admissionSequence: materializationRetryOutbox.admissionSequence,
+            })
+            .from(materializationRetryOutbox)
+            .where(eq(materializationRetryOutbox.id, id))
+            .get();
+          db.update(monitorEvents)
+            .set({ admissionSequence: admission?.admissionSequence ?? 0 })
+            .where(eq(monitorEvents.id, result.id))
+            .run();
           const deleted = db
             .delete(materializationRetryOutbox)
             .where(eq(materializationRetryOutbox.id, id))
@@ -1878,6 +1939,83 @@ export class RuntimeStore {
   }
 
   /**
+   * Reserve the next position in the `monitor_events` materialization order
+   * for an observation admitted now but materialized later (a retained retry).
+   *
+   * Events take positions from that table's AUTOINCREMENT counter
+   * (`sqlite_sequence`) when they commit. A retained observation has no event
+   * yet, so admission advances the same counter by one and keeps the value: it
+   * is above every event committed and every drop recorded before it, and
+   * below every later one. SQLite documents `sqlite_sequence` as writable;
+   * raising it only makes the next event skip the reserved value. Must run
+   * inside the admitting transaction.
+   */
+  private reserveAdmissionSequence(): number {
+    const client = asInternalDb(this.db).$client;
+    const raised = client
+      .prepare<[], { seq: number }>(
+        `UPDATE sqlite_sequence SET seq = seq + 1
+         WHERE name = 'monitor_events' RETURNING seq`,
+      )
+      .get();
+    if (raised) return raised.seq;
+    // No event has ever been inserted, so the counter has no row yet.
+    const created = client
+      .prepare<[], { seq: number }>(
+        `INSERT INTO sqlite_sequence (name, seq)
+         VALUES ('monitor_events',
+           (SELECT coalesce(max(sequence), 0) FROM monitor_events) + 1)
+         RETURNING seq`,
+      )
+      .get();
+    if (!created) {
+      throw new Error('Could not reserve a materialization position.');
+    }
+    return created.seq;
+  }
+
+  /**
+   * Record that admission dropped one observation because the retry outbox
+   * could not retain its ordered suffix (002 §2). Called inside the admitting
+   * span's transaction, so the drop commits or rolls back with that span.
+   *
+   * Besides the `errored` history row, it stores what supersedes the drop
+   * later: the observation's raw `objectKey` (only a string counts) and the
+   * high-water mark of the event materialization order at this write (see
+   * {@link RuntimeStore.reserveAdmissionSequence}). Events of earlier siblings
+   * in the same span, and retries admitted before the drop, are at or below
+   * that watermark; events of later siblings and later spans, and retries
+   * admitted after the drop, are above it.
+   *
+   * @internal
+   */
+  recordUnretainedObservation(input: {
+    monitorId: string;
+    workspacePath: string | null;
+    sourceName: string;
+    objectKey: string | undefined;
+    observationData: Record<string, unknown>;
+  }): void {
+    asInternalDb(this.db)
+      .insert(observationHistory)
+      .values({
+        id: observationUlid(),
+        monitorId: input.monitorId,
+        workspacePath: input.workspacePath,
+        sourceName: input.sourceName,
+        observationData: JSON.stringify(input.observationData),
+        result: 'errored',
+        createdAt: new Date(),
+        unretainedObjectKey: input.objectKey ?? null,
+        unretainedEventWatermark: sql`(SELECT max(
+          coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'monitor_events'), 0),
+          coalesce((SELECT max(${monitorEvents.sequence}) FROM ${monitorEvents}), 0)
+        ))`,
+      })
+      .run();
+  }
+
+  /**
    * List observation-history rows, newest first. When `query.workspacePath` is
    * provided the result is scoped to that exact workspace (issue #345 / #307) —
    * an observation tick always runs for one concrete workspace, so (unlike
@@ -1927,6 +2065,134 @@ export class RuntimeStore {
       result: row.result,
       createdAt: row.createdAt,
     }));
+  }
+
+  /**
+   * The outstanding observations admission dropped for one workspace/monitor
+   * because the retry outbox could not retain their suffix (002 §2), or
+   * `undefined` when there are none.
+   *
+   * A drop row is an `errored` history row written by
+   * {@link RuntimeStore.recordUnretainedObservation}. It stays outstanding
+   * until it is superseded, and nothing else clears it:
+   * - a drop with an object key, by a `monitor_events` row of the same
+   *   monitor, workspace and object key whose observation was admitted after
+   *   the drop: its `admission_sequence` (a completed retry) or else its
+   *   `sequence` is above the drop's watermark. A retry admitted before the
+   *   drop carries older state, so its completion never clears it;
+   * - a drop without one, by a later `triggered` history row of the same
+   *   monitor and workspace whose span dropped nothing (no positive
+   *   `notRetainedCount`), ordered by `(created_at, id)`. The dropping span's
+   *   own batch row carries its count, so it never supersedes its own drops.
+   *
+   * Quiet ticks, notify holds, observe failures, a span whose only failure was
+   * retained, and events for other keys therefore leave a keyed drop reported.
+   * The partial and outcome indexes on `observation_history` and the
+   * object-key index on `monitor_events` keep this cheap enough for every
+   * doctor/explain call.
+   *
+   * @internal
+   */
+  outstandingUnretainedObservationLoss(
+    monitorId: string,
+    workspacePath: string,
+  ): UnretainedObservationLoss | undefined {
+    const db = asInternalDb(this.db);
+    const drop = observationHistory;
+    // json_extract raises on malformed JSON; every row is written with
+    // JSON.stringify, but guard so one bad legacy row cannot fail diagnosis.
+    const laterNotRetained = sql`CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, '$.notRetainedCount') END`;
+    const drops = and(
+      eq(drop.monitorId, monitorId),
+      eq(drop.workspacePath, workspacePath),
+      isNotNull(drop.unretainedEventWatermark),
+      or(
+        and(
+          isNotNull(drop.unretainedObjectKey),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${monitorEvents} AS superseding
+            WHERE superseding.monitor_id = ${drop.monitorId}
+              AND superseding.workspace_path = ${drop.workspacePath}
+              AND superseding.object_key = ${drop.unretainedObjectKey}
+              AND superseding.sequence > ${drop.unretainedEventWatermark}
+              AND coalesce(superseding.admission_sequence, superseding.sequence)
+                > ${drop.unretainedEventWatermark}
+          )`,
+        ),
+        and(
+          isNull(drop.unretainedObjectKey),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${observationHistory} AS superseding
+            WHERE superseding.monitor_id = ${drop.monitorId}
+              AND superseding.workspace_path = ${drop.workspacePath}
+              AND superseding.result = 'triggered'
+              AND (superseding.created_at, superseding.id) > (${drop.createdAt}, ${drop.id})
+              AND coalesce(${laterNotRetained}, 0) <= 0
+          )`,
+        ),
+      ),
+    );
+    const newest = db
+      .select()
+      .from(observationHistory)
+      .where(drops)
+      .orderBy(desc(observationHistory.createdAt), desc(observationHistory.id))
+      .limit(1)
+      .get();
+    if (!newest) return undefined;
+    const count =
+      db
+        .select({ n: sql<number>`count(*)` })
+        .from(observationHistory)
+        .where(drops)
+        .get()?.n ?? 1;
+    const data = parseJson<Record<string, unknown>>(newest.observationData, {});
+    const text = (key: string): string | undefined => {
+      const value = data[key];
+      return typeof value === 'string' ? safeDiagnosticText(value) : undefined;
+    };
+    const integer = (key: string): number | undefined => {
+      const value = data[key];
+      return typeof value === 'number' && Number.isSafeInteger(value)
+        ? value
+        : undefined;
+    };
+    const position = integer('position');
+    const spanSize = integer('spanSize');
+    const objectKey = text('objectKey');
+    const title = text('title');
+    return {
+      count,
+      recordedAt: newest.createdAt,
+      error: text('error') ?? '',
+      ...(position !== undefined ? { position } : {}),
+      ...(spanSize !== undefined ? { spanSize } : {}),
+      ...(objectKey !== undefined ? { objectKey } : {}),
+      ...(title !== undefined ? { title } : {}),
+    };
+  }
+
+  /**
+   * Monitor ids with at least one drop row in this workspace, whether or not it
+   * is still outstanding, ordered by id. Doctor uses it to report the losses of
+   * monitors that have no one unambiguous parsed definition, including
+   * ephemeral monitors, which never have one (002 §2).
+   *
+   * @internal
+   */
+  unretainedObservationMonitorIds(workspacePath: string): string[] {
+    return asInternalDb(this.db)
+      .selectDistinct({ monitorId: observationHistory.monitorId })
+      .from(observationHistory)
+      .where(
+        and(
+          eq(observationHistory.workspacePath, workspacePath),
+          isNotNull(observationHistory.unretainedEventWatermark),
+        ),
+      )
+      .orderBy(asc(observationHistory.monitorId))
+      .all()
+      .map(({ monitorId }) => monitorId);
   }
 
   /**

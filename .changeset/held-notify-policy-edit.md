@@ -9,17 +9,18 @@ Edit drains atomically commit events and hold removal. Failed drains retain the 
 that monitor's new observation until reconciliation succeeds.
 
 Escalation grants participate in effective policy edits even for immediate/throttle observations.
-Queued watcher checkpoints and yields recheck admission at their durable writes; failed drains
-keep them backpressured. Startup drains refresh session hook state even when the source stays idle.
+A yielded watch batch rechecks admission in the same turn as its durable write; failed drains
+keep it waiting unadmitted, and the source is not pulled again until it is admitted. Startup drains
+refresh session hook state even when the source stays idle.
 
 Concurrent polling rechecks admission after observation and retains blocked results locally so a
 later tick can recover without advancing the old cursor. Watcher creation uses the latest admitted
 initial definition, and policy snapshots retire with their live admission instead of accumulating
 retired monitor instructions.
 
-Watcher completion/error closes checkpoint admission while retaining its scoped ownership until
-accepted queued writes settle, so recovery polling or replacement watchers read those writes before
-advancing their own baseline. Late, aborted and superseded callbacks cannot rewind a newer cursor.
+A watcher retires its scoped ownership only after its admitted batch settles, so recovery polling
+or replacement watchers read that batch's baseline before advancing their own. Aborted and
+superseded watchers never admit a late batch, so they cannot rewind a newer cursor.
 
 Reporting an older poll's ingestion failure no longer releases a successor's active admission,
 preventing overlapping source observations and baseline regression during failure cleanup.
@@ -30,7 +31,7 @@ releases its retained snapshot lease even when argument access fails before inge
 other live owners and reporting the already committed edit accurately.
 
 Unknown-source admission checks current scoped holds, including a watcher's first hold created while
-another monitor awaits, and blocks invalid-definition checkpoints/yields without skipping healthy
+another monitor awaits, and blocks invalid-definition watch batches without skipping healthy
 siblings. A live same-ID/workspace definition moved between flat and folder forms remains usable
 when an older discovery or captured envelope still names its obsolete path. Current replacement
 files and source semantics are reread; invalid definitions and duplicate IDs remain rejected.

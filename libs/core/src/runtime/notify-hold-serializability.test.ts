@@ -15,7 +15,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
-import type { Observation, ObservationSource } from '../observation/types.js';
+import type {
+  Observation,
+  ObservationResult,
+  ObservationSource,
+} from '../observation/types.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 
@@ -71,7 +75,8 @@ type HeldStrategy = 'debounce' | 'rollup';
 function fixture(
   policy: string,
   batches: (() => Observation[])[],
-  watched?: () => Iterable<Observation>,
+  watched?: () => Iterable<ObservationResult>,
+  urgency = 'normal',
 ) {
   vi.useFakeTimers();
   vi.setSystemTime(START);
@@ -84,12 +89,12 @@ function fixture(
   const edit = (nextPolicy: string) =>
     writeFileSync(
       file,
-      `---\nname: Held\nwatch:\n  type: cursor-source\n  interval: 1s\nurgency: normal\nbaseline-strategy: incremental\n${nextPolicy}---\nInstructions\n`,
+      `---\nname: Held\nwatch:\n  type: cursor-source\n  interval: 1s\nurgency: ${urgency}\nbaseline-strategy: incremental\n${nextPolicy}---\nInstructions\n`,
     );
   edit(policy);
 
-  // Resolves once the watcher has finished ingesting every `watched` item: the
-  // generator resumes only when the runtime pulls the next one.
+  // Resolves once the watcher has finished admitting every `watched` batch:
+  // the generator resumes only when the runtime pulls the next one.
   let drained!: () => void;
   const watchDrained = new Promise<void>((resolve) => {
     drained = resolve;
@@ -170,6 +175,10 @@ function fixture(
       current = open();
     },
     state: () => current.store.getMonitorState('held', root),
+    /** Test-only native SQL, used to install and clear storage faults. */
+    exec: (sql: string) => current.client.exec(sql),
+    loss: () =>
+      current.store.outstandingUnretainedObservationLoss('held', root),
     heldTitles() {
       const notify = current.store.getMonitorState('held', root).notifyState;
       return (
@@ -322,9 +331,13 @@ it('an effective notify edit after a rejection drains the accepted hold and admi
 });
 
 it('the watch path rejects an unserializable observation at hold acceptance, reports it through onError, and holds the next one', async () => {
+  // One finite batch (002 §2.4): the refusal and its held sibling are decided
+  // in the same admission transaction that advances the watch baseline.
   const f = fixture(policies.debounce, [], () => [
-    observation('Bad', { count: 1n }),
-    observation('A'),
+    {
+      observations: [observation('Bad', { count: 1n }), observation('A')],
+      nextState: { cursor: 1 },
+    },
   ]);
 
   const errors = await f.watch();
@@ -335,6 +348,7 @@ it('the watch path rejects an unserializable observation at hold acceptance, rep
     },
   ]);
   expect(f.heldTitles()).toEqual(['A']);
+  expect(f.state().sourceState).toEqual({ cursor: 1 });
   expect(f.errored().map((row) => row.observationData)).toEqual([
     { error: errors[0]?.message },
   ]);
@@ -384,9 +398,12 @@ it('a throwing watcher onError cannot lose a debounce batch flushed in the same 
   // report callback throws, as a caller's logger can. The flushed batch and
   // the refusal row are committed work and must survive that.
   const f = fixture(policies.debounce, [], function* () {
-    yield observation('A');
+    yield { observations: [observation('A')], nextState: { cursor: 1 } };
     f.advance(60_000);
-    yield observation('Bad', { count: 1n });
+    yield {
+      observations: [observation('Bad', { count: 1n })],
+      nextState: { cursor: 2 },
+    };
   });
   await f.watch(() => {
     throw new Error('logger down');
@@ -394,6 +411,7 @@ it('a throwing watcher onError cannot lose a debounce batch flushed in the same 
 
   expect(f.eventSummaries()).toEqual(['A']);
   expect(f.state().notifyState.pendingDebounce).toBeUndefined();
+  expect(f.state().sourceState).toEqual({ cursor: 2 });
   expect(
     f.errored().map((row) => (row.observationData as { error: string }).error),
   ).toEqual([
@@ -471,4 +489,148 @@ it('a toJSON that throws a value whose toString throws still yields a refusal wi
   f.advance(2_000);
   await f.tick();
   expect(f.heldTitles()).toEqual(['A', 'B']);
+});
+
+/**
+ * 002 §2 and §4.7: one span can hold, refuse and drop. A debounce monitor with
+ * an escalation band holds A, refuses Bad, then an escalated K flushes the
+ * batch (§4.1); K's BigInt payload can neither persist as an event nor be
+ * retained for retry, so span admission drops it. Each outcome is counted once
+ * in the batch row, and only the drop is outstanding loss.
+ */
+it('a span mixing a refusal, an admitted observation and an unretainable drop counts each once, and only the drop is outstanding (#570, #497)', async () => {
+  const f = fixture(
+    policies.debounce,
+    [
+      () => [
+        observation('A'),
+        observation('Bad', { count: 1n }),
+        { ...observation('K', { count: 2n }), salience: 'high' as const },
+      ],
+    ],
+    undefined,
+    'normal..high',
+  );
+
+  const result = await f.tick();
+  const refusal = notHeldMessage('debounce', unserializable.bigint.reason);
+  expect(result.erroredObservations).toEqual([
+    { monitorId: 'held', message: refusal },
+    {
+      monitorId: 'held',
+      message: expect.stringContaining('Not retained for retry'),
+    },
+  ]);
+  expect(f.eventSummaries()).toEqual(['A']);
+  expect(f.heldTitles()).toEqual([]);
+  expect(f.state().sourceState).toEqual({ cursor: 1 });
+  expect(f.history()).toEqual([
+    // Refusal first: it is decided at dispatch, before any materialization.
+    ['errored', { error: refusal }],
+    [
+      'errored',
+      expect.objectContaining({
+        notRetained: true,
+        objectKey: 'K',
+        title: 'K',
+      }),
+    ],
+    ['triggered', { observed: 3, emitted: 1, notRetainedCount: 1, notHeld: 1 }],
+  ]);
+  // The refusal is not a drop: loss counts K alone.
+  expect(f.loss()).toMatchObject({ count: 1, objectKey: 'K' });
+
+  // Nothing is re-observed; the monitor keeps accepting work.
+  f.advance(2_000);
+  const next = await f.tick();
+  expect(next.erroredObservations).toEqual([]);
+  expect(f.errored()).toHaveLength(2);
+});
+
+/**
+ * 002 §4.7 step 3: the refusal row commits in the span's admission
+ * transaction. When a storage fault rolls that transaction back, the refusal
+ * is neither recorded nor reported, the baseline stays, and the batch is
+ * refused exactly once when it is observed again.
+ */
+it('a span whose admission rolls back records and reports no refusal, and the retry refuses once (#570, #497)', async () => {
+  const f = fixture(policies.debounce, [
+    () => [observation('A')],
+    () => [observation('Bad', { count: 1n }), observation('B')],
+    () => [],
+  ]);
+  await f.tick();
+  expect(f.heldTitles()).toEqual(['A']);
+
+  // Fail only the span's own state write, not identity bookkeeping.
+  f.exec(
+    "CREATE TRIGGER state_fault BEFORE UPDATE ON monitor_state WHEN NEW.last_observation_at IS NOT OLD.last_observation_at BEGIN SELECT RAISE(ABORT, 'state fault'); END",
+  );
+  f.advance(2_000);
+  const failed = await f.tick();
+  expect(failed.erroredObservations).toEqual([
+    { monitorId: 'held', message: expect.stringContaining('state fault') },
+  ]);
+  expect(
+    f
+      .errored()
+      .filter((row) =>
+        JSON.stringify(row.observationData).includes('not held'),
+      ),
+  ).toEqual([]);
+  expect(f.state().sourceState).toEqual({ cursor: 1 });
+  expect(f.heldTitles()).toEqual(['A']);
+
+  f.exec('DROP TRIGGER state_fault');
+  f.advance(2_000);
+  const retried = await f.tick();
+  expect(retried.erroredObservations).toEqual([
+    {
+      monitorId: 'held',
+      message: notHeldMessage('debounce', unserializable.bigint.reason),
+    },
+  ]);
+  expect(
+    f
+      .errored()
+      .filter((row) =>
+        JSON.stringify(row.observationData).includes('not held'),
+      ),
+  ).toHaveLength(1);
+  expect(f.state().sourceState).toEqual({ cursor: 2 });
+  expect(f.heldTitles()).toEqual(['A', 'B']);
+});
+
+/**
+ * 002 §4.7 step 3: the refusal row is the observation's durable outcome, not
+ * a best-effort audit. If it cannot be written, the whole span rolls back with
+ * it: the sibling is not held, the baseline stays, and nothing is reported as
+ * refused. Once the fault clears, the batch is refused exactly once.
+ */
+it('a refusal row that cannot be written rolls back its span instead of advancing past an unrecorded refusal (#570, #497)', async () => {
+  const f = fixture(policies.debounce, [
+    () => [observation('Bad', { count: 1n }), observation('A')],
+    () => [],
+  ]);
+  f.exec(
+    "CREATE TRIGGER refusal_fault BEFORE INSERT ON observation_history WHEN NEW.observation_data LIKE '%was not held%' BEGIN SELECT RAISE(ABORT, 'history fault'); END",
+  );
+  const failed = await f.tick();
+  expect(failed.erroredObservations).toEqual([
+    { monitorId: 'held', message: expect.stringContaining('history fault') },
+  ]);
+  expect(f.heldTitles()).toEqual([]);
+  expect(f.state().sourceState).toBeUndefined();
+
+  f.exec('DROP TRIGGER refusal_fault');
+  f.advance(2_000);
+  const retried = await f.tick();
+  expect(retried.erroredObservations).toEqual([
+    {
+      monitorId: 'held',
+      message: notHeldMessage('debounce', unserializable.bigint.reason),
+    },
+  ]);
+  expect(f.heldTitles()).toEqual(['A']);
+  expect(f.state().sourceState).toEqual({ cursor: 1 });
 });

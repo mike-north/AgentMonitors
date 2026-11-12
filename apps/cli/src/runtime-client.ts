@@ -10,6 +10,7 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
+  MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
   MonitorExplainReport,
@@ -18,10 +19,12 @@ import type {
   ObservationHistoryRecord,
   OpenSessionInput,
   RuntimeTickResult,
+  UnretainedObservationLoss,
 } from '@agentmonitors/core';
 import {
   isMaterializationRetrySummary,
   normalizeRetrySummary,
+  normalizeUnretainedObservationLoss,
 } from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
@@ -464,6 +467,34 @@ const MONITOR_ROLLUP_DATE_FIELDS = [
 ] as const satisfies readonly (keyof DoctorMonitorRollup)[];
 
 /**
+ * The safe projection of one id's recovery obligations off the wire: the retry
+ * summary only when present and well-formed, the loss only when valid, or
+ * `undefined` when nothing reportable is left.
+ */
+function reviveMonitorWork(group: {
+  materializationRetries?: MaterializationRetrySummary;
+  unretainedObservationLoss?: UnretainedObservationLoss;
+}):
+  | {
+      materializationRetries?: MaterializationRetrySummary;
+      unretainedObservationLoss?: UnretainedObservationLoss;
+    }
+  | undefined {
+  // Same projection as an attached rollup summary.
+  const retries = group.materializationRetries
+    ? normalizeRetrySummary(group.materializationRetries)
+    : undefined;
+  const loss = normalizeUnretainedObservationLoss(
+    group.unretainedObservationLoss,
+  );
+  if (!retries && !loss) return undefined;
+  return {
+    ...(retries ? { materializationRetries: retries } : {}),
+    ...(loss ? { unretainedObservationLoss: loss } : {}),
+  };
+}
+
+/**
  * Reconstruct the `Date` fields {@link MonitorDoctorReport} promises, lost to
  * plain ISO strings by the JSON round trip over the daemon socket (issue
  * #373). `doctorReportInProcess` returns real `Date` objects straight from
@@ -479,13 +510,43 @@ function reviveDoctorReportDates(
   return {
     ...report,
     generatedAt: new Date(report.generatedAt),
-    ...(report.orphanedMaterializationRetries
+    ...(report.orphanedMonitorWork
       ? {
-          orphanedMaterializationRetries:
-            report.orphanedMaterializationRetries.map((group) => ({
-              monitorId: group.monitorId,
-              summary: normalizeRetrySummary(group.summary),
-            })),
+          orphanedMonitorWork: report.orphanedMonitorWork.flatMap((group) => {
+            const work = reviveMonitorWork(group);
+            if (!work) return [];
+            return [
+              {
+                monitorId: group.monitorId,
+                // Closed vocabulary on the wire: anything but `ephemeral`
+                // renders as a definition-backed id.
+                monitorKind:
+                  group.monitorKind === 'ephemeral'
+                    ? ('ephemeral' as const)
+                    : ('persistent' as const),
+                ...work,
+              },
+            ];
+          }),
+        }
+      : {}),
+    ...(report.ephemeralMonitorWork
+      ? {
+          ephemeralMonitorWork: report.ephemeralMonitorWork.flatMap((group) => {
+            const work = reviveMonitorWork(group);
+            return work
+              ? [
+                  {
+                    monitorId: group.monitorId,
+                    sessionId: group.sessionId,
+                    ...work,
+                    ...(group.validationError !== undefined
+                      ? { validationError: group.validationError }
+                      : {}),
+                  },
+                ]
+              : [];
+          }),
         }
       : {}),
     monitors: report.monitors.map((monitor) => {
@@ -499,6 +560,11 @@ function reviveDoctorReportDates(
           revived.materializationRetries,
         );
       }
+      const loss = normalizeUnretainedObservationLoss(
+        revived.unretainedObservationLoss,
+      );
+      if (loss) revived.unretainedObservationLoss = loss;
+      else delete revived.unretainedObservationLoss;
       return revived;
     }),
     leadSessions: report.leadSessions.map((session) => {

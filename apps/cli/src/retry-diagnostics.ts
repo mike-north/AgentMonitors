@@ -3,7 +3,10 @@
  * legacy errors and JSON timestamps; normalize those observations without
  * modifying durable work or accepting captured envelopes as diagnostic output.
  */
-import type { MaterializationRetrySummary } from '@agentmonitors/core';
+import type {
+  MaterializationRetrySummary,
+  UnretainedObservationLoss,
+} from '@agentmonitors/core';
 
 /** Terminal controls and Unicode separators cannot carry additional output lines. */
 // eslint-disable-next-line no-control-regex -- These controls are the unsafe input being normalized.
@@ -85,4 +88,77 @@ export function retryRecordLines(
     }
     return lines;
   });
+}
+
+/**
+ * Reconstruct an unretained-observation loss from the wire: revive its Date
+ * and project only its documented metadata fields, with text normalized like
+ * retry errors. A malformed value from a skewed daemon is dropped rather than
+ * rendered, since doctor cannot describe what it cannot read.
+ * @internal
+ */
+export function normalizeUnretainedObservationLoss(
+  loss: UnretainedObservationLoss | undefined,
+): UnretainedObservationLoss | undefined {
+  if (
+    loss == null ||
+    typeof loss.count !== 'number' ||
+    !Number.isSafeInteger(loss.count) ||
+    loss.count < 1 ||
+    typeof loss.error !== 'string'
+  ) {
+    return undefined;
+  }
+  // A missing or unparseable timestamp would revive as an Invalid Date that
+  // throws when doctor renders it, so the whole loss is treated as absent.
+  const rawRecordedAt: unknown = loss.recordedAt;
+  const recordedAt = new Date(rawRecordedAt as string);
+  if (
+    (typeof rawRecordedAt !== 'string' && typeof rawRecordedAt !== 'number') ||
+    Number.isNaN(recordedAt.getTime())
+  ) {
+    return undefined;
+  }
+  const text = (value: unknown): string | undefined =>
+    typeof value === 'string'
+      ? (retryErrorForDisplay(value) ?? undefined)
+      : undefined;
+  const integer = (value: unknown): number | undefined =>
+    typeof value === 'number' && Number.isSafeInteger(value)
+      ? value
+      : undefined;
+  const position = integer(loss.position);
+  const spanSize = integer(loss.spanSize);
+  const objectKey = text(loss.objectKey);
+  const title = text(loss.title);
+  return {
+    count: loss.count,
+    recordedAt,
+    error: text(loss.error) ?? '',
+    ...(position !== undefined ? { position } : {}),
+    ...(spanSize !== undefined ? { spanSize } : {}),
+    ...(objectKey !== undefined ? { objectKey } : {}),
+    ...(title !== undefined ? { title } : {}),
+  };
+}
+
+/**
+ * Which observation a loss names, on one line:
+ * `observation 300 of 600 (object-299, "Title")`. Mirrors explain's wording.
+ * @internal
+ */
+export function describeUnretainedObservation(
+  loss: UnretainedObservationLoss,
+): string {
+  const position =
+    loss.position !== undefined
+      ? `observation ${String(loss.position)}${loss.spanSize !== undefined ? ` of ${String(loss.spanSize)}` : ''}`
+      : 'an observation';
+  const identity = [
+    ...(loss.objectKey !== undefined ? [loss.objectKey] : []),
+    ...(loss.title !== undefined ? [`"${loss.title}"`] : []),
+  ];
+  return identity.length > 0
+    ? `${position} (${identity.join(', ')})`
+    : position;
 }
