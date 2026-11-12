@@ -800,9 +800,10 @@ interface MaterializationSpanOptions {
   observed: number;
   /**
    * How many of the `observed` observations a hold refused (002 §4.7). Each
-   * has its own `errored` row from the admission transaction, so they do not
-   * count toward `suppressed`, and a span made only of them writes no batch
-   * row. Distinct from a drop (`notRetainedCount`): a refusal is not loss.
+   * has its own `errored` loss row from the admission transaction, so they do
+   * not count toward `suppressed`, and a span made only of them writes no
+   * batch row. Kept apart from `notRetainedCount` because the cause differs,
+   * but both are loss: a batch row with either count supersedes no drop.
    */
   notHeld?: number;
   workspacePath: string;
@@ -874,10 +875,14 @@ function describeUnretainedObservation(
     : position;
 }
 
-/** Explain's materialization-stage reason for an outstanding drop (002 §10.7). */
+/**
+ * Explain's materialization-stage reason for outstanding loss (002 §10.7).
+ * One wording covers every kind of loss; the newest loss's own error says why
+ * it was lost (an outbox drop or a hold refusal).
+ */
 function unretainedLossReason(loss: UnretainedObservationLoss): string {
   const error = displayObservationError(loss.error);
-  return `${String(loss.count)} observation(s) were dropped because the retry outbox could not retain them; the newest, ${describeUnretainedObservation(loss)}, failed: ${error ?? 'no error was recorded'}`;
+  return `${String(loss.count)} observation(s) were dropped because the runtime could not keep them; the newest, ${describeUnretainedObservation(loss)}, failed: ${error ?? 'no error was recorded'}`;
 }
 
 /** Wire-stable details: ISO timestamps, so socket and in-process reports agree. */
@@ -923,21 +928,55 @@ function unretainedObservationData(
       Math.max(0, SAFE_DIAGNOSTIC_TEXT_MAX - reason.length),
     ) + reason,
   );
-  // Source contracts type these as strings, but a failing observation is the
-  // one most likely to break its contract; only strings are recorded.
-  const { objectKey, title } = observation as {
-    objectKey?: unknown;
-    title?: unknown;
-  };
   return {
     error,
     notRetained: true,
     position: index + 1,
     spanSize,
+    ...lostObservationIdentity(observation),
+  };
+}
+
+/**
+ * The display-safe identity a loss row stores for the observation it lost
+ * (002 `observation_history`): its `objectKey` and `title`, each only when it
+ * is a string, control-normalized and capped. Source contracts type these as
+ * strings, but a failing observation is the one most likely to break its
+ * contract. The payload is never copied.
+ */
+function lostObservationIdentity(observation: Observation): {
+  objectKey?: string;
+  title?: string;
+} {
+  const { objectKey, title } = observation as {
+    objectKey?: unknown;
+    title?: unknown;
+  };
+  return {
     ...(typeof objectKey === 'string'
       ? { objectKey: safeDiagnosticText(objectKey) }
       : {}),
     ...(typeof title === 'string' ? { title: safeDiagnosticText(title) } : {}),
+  };
+}
+
+/**
+ * The durable outcome of an observation a debounce or rollup hold refused
+ * (002 §4.7), recorded as loss (002 §2). `error` is the refusal's complete
+ * outcome text, unchanged; `holdRefused` marks the row for diagnostics, and
+ * the identity names which observation was lost. A refusal has no position in
+ * a dispatched span, so none is recorded.
+ */
+function heldRefusalData(refusal: NotHeldObservation): {
+  error: string;
+  holdRefused: true;
+  objectKey?: string;
+  title?: string;
+} {
+  return {
+    error: refusal.message,
+    holdRefused: true,
+    ...lostObservationIdentity(refusal.observation),
   };
 }
 
@@ -4609,8 +4648,8 @@ export class AgentMonitorRuntime {
       /**
        * Reports each observation a debounce/rollup hold refused (002 §4.7):
        * the tick loop adds it to `erroredObservations`, a watcher to `onError`.
-       * Its durable `errored` history row is written inside the admission
-       * transaction either way. Called only after that transaction commits
+       * Its durable `errored` loss row (002 §2) is written inside the
+       * admission transaction either way. Called only after that transaction commits
        * and the span has materialized; an exception it throws is ignored.
        */
       onNotHeld?: (message: string) => void;
@@ -4652,20 +4691,6 @@ export class AgentMonitorRuntime {
         now,
         monitorState.notifyState,
       );
-      // An observation a hold refused (002 §4.7) is neither emitted nor held.
-      // Its outcome is this `errored` row, written in the same admission
-      // transaction as the state that advances past it: a rollback undoes
-      // both, so the refusal is decided again from the prior baseline. It is
-      // not a drop and is not tracked as outstanding loss.
-      for (const { message } of dispatch.notHeld) {
-        this.store.recordObservationHistory({
-          monitorId: monitor.id,
-          workspacePath: options.workspacePath,
-          sourceName: monitor.frontmatter.watch.type,
-          result: 'errored',
-          observationData: { error: message },
-        });
-      }
       const spanOptions: MaterializationSpanOptions = {
         observed: observations.length,
         notHeld: dispatch.notHeld.length,
@@ -4690,7 +4715,16 @@ export class AgentMonitorRuntime {
           : {}),
       };
       return {
-        durable: this.admitSpan(monitor, dispatch.emitted, spanOptions),
+        // An observation a hold refused (002 §4.7) is neither emitted nor
+        // held. Admission records it as loss in this transaction, together
+        // with the state that advances past it: a rollback undoes both, so
+        // the refusal is decided again from the prior baseline.
+        durable: this.admitSpan(
+          monitor,
+          dispatch.emitted,
+          spanOptions,
+          dispatch.notHeld,
+        ),
         spanOptions,
         notHeld: dispatch.notHeld,
       };
@@ -4839,14 +4873,51 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Synchronously persist the event prefix, ordered retry suffix and state.
-   * Caller holds the outer immediate transaction; individual events use nested
-   * savepoints. No adapter or producer callback is allowed in this boundary.
+   * Record one observation the runtime could not keep as outstanding loss
+   * (002 §2), whatever the reason: the retry outbox could not retain it, or a
+   * hold refused it (002 §4.7). Every kind of loss goes through here, so each
+   * gets the same drop identity and the same supersession rule. Must run
+   * inside the admitting span's transaction, at the lost observation's place
+   * in the span's order (see {@link RuntimeStore.recordObservationLoss}).
+   */
+  private recordObservationLoss(
+    monitorId: string,
+    sourceName: string,
+    workspacePath: string,
+    observation: Observation,
+    observationData: Record<string, unknown> & { error: string },
+  ): void {
+    // The raw key, not the display-safe copy: a later event for exactly this
+    // key is what supersedes the loss (002 §2).
+    const { objectKey } = observation as { objectKey?: unknown };
+    this.store.recordObservationLoss({
+      monitorId,
+      workspacePath,
+      sourceName,
+      objectKey: typeof objectKey === 'string' ? objectKey : undefined,
+      observationData,
+    });
+  }
+
+  /**
+   * Synchronously persist the event prefix, ordered retry suffix, losses and
+   * state. Caller holds the outer immediate transaction; individual events use
+   * nested savepoints. No adapter or producer callback is allowed in this
+   * boundary.
+   *
+   * `notHeld` are the dispatch's hold refusals (002 §4.7). Each is recorded as
+   * loss at its place in observation order, after the `emittedBefore` events
+   * that precede it, so the drop watermark (002 §2) orders it against its
+   * siblings exactly as an unretained drop is ordered. Once a retained suffix
+   * has started, later refusals are recorded after that suffix is queued: the
+   * suffix's admission positions are reserved only then, and a retry of an
+   * older observation must not supersede a newer loss.
    */
   private admitSpan(
     monitor: MonitorDefinition,
     emitted: StoredObservationEnvelope[],
     options: MaterializationSpanOptions,
+    notHeld: readonly NotHeldObservation[] = [],
   ): DurableMaterializationSpan {
     const materialized: MaterializedObservation[] = [];
     const failures: MaterializationFailure[] = [];
@@ -4857,8 +4928,25 @@ export class AgentMonitorRuntime {
       emitted,
     );
     let deferRemaining = false;
+    let refusalsRecorded = 0;
+    const recordRefusalsBefore = (position: number) => {
+      for (
+        let refusal = notHeld[refusalsRecorded];
+        refusal !== undefined && refusal.emittedBefore <= position;
+        refusal = notHeld[++refusalsRecorded]
+      ) {
+        this.recordObservationLoss(
+          monitor.id,
+          monitor.frontmatter.watch.type,
+          options.workspacePath,
+          refusal.observation,
+          heldRefusalData(refusal),
+        );
+      }
+    };
 
     for (const [index, envelope] of emitted.entries()) {
+      if (!deferRemaining) recordRefusalsBefore(index);
       if (deferRemaining) {
         failures.push({
           envelope,
@@ -4916,16 +5004,13 @@ export class AgentMonitorRuntime {
           emitted.length,
         );
         const unretained = unretainedData.error;
-        // The raw key, not the display-safe copy: a later event for exactly
-        // this key is what supersedes the drop (002 §2).
-        const { objectKey } = envelope.observation as { objectKey?: unknown };
-        this.store.recordUnretainedObservation({
-          monitorId: monitor.id,
-          workspacePath: options.workspacePath,
-          sourceName: envelope.monitor.frontmatter.watch.type,
-          objectKey: typeof objectKey === 'string' ? objectKey : undefined,
-          observationData: unretainedData,
-        });
+        this.recordObservationLoss(
+          monitor.id,
+          envelope.monitor.frontmatter.watch.type,
+          options.workspacePath,
+          envelope.observation,
+          unretainedData,
+        );
         failures.push({
           envelope,
           message: unretained,
@@ -4952,6 +5037,8 @@ export class AgentMonitorRuntime {
         })),
       );
     }
+    // Refusals after every emitted envelope, or after a retained suffix began.
+    recordRefusalsBefore(Number.POSITIVE_INFINITY);
 
     // State follows suffix admission so either failure also rolls back every
     // successful sibling, preserving the prior source/notify replay boundary.
@@ -4978,7 +5065,7 @@ export class AgentMonitorRuntime {
       ({ retained }) => !retained,
     ).length;
     // Refusals at hold acceptance (002 §4.7) already have their own `errored`
-    // rows. They count in `observed` but never make a span `suppressed`.
+    // loss rows. They count in `observed` but never make a span `suppressed`.
     const notHeld = options.notHeld ?? 0;
     // Do not write a false batch-level `triggered` row when every dispatched
     // envelope failed, nor a `suppressed` row for a span whose only
@@ -5564,6 +5651,11 @@ export class AgentMonitorRuntime {
   ): NotifyDispatchResult {
     const emitted: StoredObservationEnvelope[] = [];
     const notHeld: NotHeldObservation[] = [];
+    // Refusals made while a debounce batch was held, each with how many held
+    // observations preceded it. Those held observations are older than the
+    // refusal, so if an escalation later in this dispatch flushes the batch,
+    // the refusal's place moves to just after them (002 §2).
+    let refusedBehindHeld: { refusal: NotHeldObservation; held: number }[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
     // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
@@ -5614,6 +5706,13 @@ export class AgentMonitorRuntime {
       // batch (splitting risks ordering confusion). This is the only path that
       // can short-circuit a settling debounce window before its `dueAt`.
       if (isEscalated && nextState.pendingDebounce) {
+        // The flushed batch keeps arrival order, so a refusal made while `held`
+        // observations were waiting belongs right after those `held` flushed
+        // envelopes and before the newer ones held after it.
+        for (const { refusal, held } of refusedBehindHeld) {
+          refusal.emittedBefore = emitted.length + held;
+        }
+        refusedBehindHeld = [];
         emitted.push(
           ...nextState.pendingDebounce.observations.map(
             hydrateStoredObservationEnvelope,
@@ -5658,7 +5757,14 @@ export class AgentMonitorRuntime {
       // batch's other observations are unaffected.
       const notHeldMessage = notHeldReason(envelope, 'debounce');
       if (notHeldMessage !== undefined) {
-        notHeld.push({ observation, message: notHeldMessage });
+        const refusal: NotHeldObservation = {
+          observation,
+          message: notHeldMessage,
+          emittedBefore: emitted.length,
+        };
+        notHeld.push(refusal);
+        const held = nextState.pendingDebounce?.observations.length ?? 0;
+        if (held > 0) refusedBehindHeld.push({ refusal, held });
         continue;
       }
 
@@ -5768,7 +5874,13 @@ export class AgentMonitorRuntime {
     for (const envelope of arrived) {
       const message = notHeldReason(envelope, 'rollup');
       if (message === undefined) accumulated.push(envelope);
-      else notHeld.push({ observation: envelope.observation, message });
+      // A window that does not fire emits nothing, so nothing precedes it.
+      else
+        notHeld.push({
+          observation: envelope.observation,
+          message,
+          emittedBefore: 0,
+        });
     }
     if (accumulated.length > 0) {
       nextState.pendingRollup = { observations: accumulated };
