@@ -3973,30 +3973,33 @@ export class AgentMonitorRuntime {
     for (const wake of this.retryRepairWaiters.get(key) ?? []) wake();
   }
 
-  /** Wait up to `ms` for an operator repair of this monitor's terminal retry. */
-  private async waitForRetryRepair(
+  /**
+   * Subscribe synchronously before a host is told about terminal work. The
+   * cancellable wait releases its timer, abort listener and route membership
+   * on wake, deadline or teardown; cancellation also covers a throwing host.
+   */
+  private waitForRetryRepair(
     workspacePath: string,
     monitorId: string,
     ms: number,
     signal: AbortSignal,
-  ): Promise<void> {
-    if (signal.aborted) return;
-    const key = JSON.stringify([workspacePath, monitorId]);
+  ): { done: Promise<void>; cancel: () => void } {
     const woken = new AbortController();
     const wake = () => {
       woken.abort();
     };
+    if (signal.aborted) return { done: Promise.resolve(), cancel: wake };
+    const key = JSON.stringify([workspacePath, monitorId]);
     const waiters = this.retryRepairWaiters.get(key) ?? new Set();
     this.retryRepairWaiters.set(key, waiters);
     waiters.add(wake);
     signal.addEventListener('abort', wake, { once: true });
-    try {
-      await abortableDelay(ms, woken.signal);
-    } finally {
+    const done = abortableDelay(ms, woken.signal).finally(() => {
       signal.removeEventListener('abort', wake);
       waiters.delete(wake);
       if (waiters.size === 0) this.retryRepairWaiters.delete(key);
-    }
+    });
+    return { done, cancel: wake };
   }
 
   /**
@@ -4934,25 +4937,35 @@ export class AgentMonitorRuntime {
         onError?.(monitorId, new Error(blocked.message));
         waitMs = this.failedAttemptWaitMs(monitorId, workspacePath);
       } else {
-        if (blocked.message !== reportedTerminal) {
-          reportedTerminal = blocked.message;
-          const sourceName =
-            this.store.oldestMaterializationRetry(monitorId, workspacePath)
-              ?.sourceName ?? 'unknown';
-          this.recordErroredHistory(
-            monitorId,
-            workspacePath,
-            sourceName,
-            blocked.message,
-          );
-          onError?.(monitorId, new Error(blocked.message));
-        }
-        await this.waitForRetryRepair(
+        // A host may synchronously re-arm or skip in onError. Subscribe
+        // first so that repair cannot be lost before the watcher waits.
+        const repairWait = this.waitForRetryRepair(
           workspacePath,
           monitorId,
           TERMINAL_RETRY_RECHECK_MS,
           signal,
         );
+        try {
+          if (blocked.message !== reportedTerminal) {
+            reportedTerminal = blocked.message;
+            const sourceName =
+              this.store.oldestMaterializationRetry(monitorId, workspacePath)
+                ?.sourceName ?? 'unknown';
+            this.recordErroredHistory(
+              monitorId,
+              workspacePath,
+              sourceName,
+              blocked.message,
+            );
+            onError?.(monitorId, new Error(blocked.message));
+          }
+          await repairWait.done;
+        } finally {
+          // A callback/history failure must not leave a timer or subscription
+          // behind after this watcher exits. The wait itself never rejects.
+          repairWait.cancel();
+          await repairWait.done;
+        }
         continue;
       }
       await abortableDelay(waitMs, signal);

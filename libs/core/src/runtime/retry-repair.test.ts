@@ -47,6 +47,7 @@ const tempRoots: string[] = [];
 const clients: BetterSQLiteClient[] = [];
 
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   for (const client of clients.splice(0)) if (client.open) client.close();
   for (const root of tempRoots.splice(0)) {
@@ -646,7 +647,7 @@ describe('a watcher paused on a terminal retry', () => {
    * wait until the watcher reports it terminal and pauses. Its periodic
    * recheck is a minute away, so anything sooner was a wake.
    */
-  async function pausedWatcher() {
+  async function pausedWatcher(action?: 'skip' | 'rearm' | 'throw') {
     const root = mkdtempSync(path.join(tmpdir(), 'agentmon-retry-repair-'));
     tempRoots.push(root);
     const monitorsDir = path.join(root, 'monitors');
@@ -689,7 +690,22 @@ describe('a watcher paused on a terminal retry', () => {
     failSummary(client, 'A');
     const errors: string[] = [];
     const handle = await runtime.watchMonitors(monitorsDir, root, {
-      onError: (_id, error) => errors.push(error.message),
+      onError: (_id, error) => {
+        errors.push(error.message);
+        // A host may repair immediately when terminal work is reported.
+        if (action && error.message.includes('stopped after')) {
+          if (action === 'throw') throw new Error('host error handler failed');
+          const retry = store.listMaterializationRetries({ monitorId: 'w' })[0];
+          if (!retry) throw new Error('terminal retry missing');
+          const input = {
+            monitorId: 'w',
+            retryId: retry.id,
+            workspacePath: root,
+          };
+          if (action === 'skip') runtime.skipMaterializationRetry(input);
+          else runtime.rearmMaterializationRetry(input);
+        }
+      },
     });
     try {
       // A is retained and the watcher waits out its first retry delay.
@@ -717,8 +733,8 @@ describe('a watcher paused on a terminal retry', () => {
         () => expect(errors.join('\n')).toContain('monitor retry rearm w'),
         { timeout: 5_000, interval: 20 },
       );
-      expect(eventSummaries(client)).toEqual([]);
-      return { root, client, runtime, handle, id };
+      if (!action) expect(eventSummaries(client)).toEqual([]);
+      return { root, client, runtime, handle, id, errors };
     } catch (error) {
       await handle.stop();
       throw error;
@@ -762,4 +778,72 @@ describe('a watcher paused on a terminal retry', () => {
       await handle.stop();
     }
   }, 30_000);
+  it.each(['skip', 'rearm'] as const)(
+    'regression: synchronous onError %s cannot lose the repair wake',
+    async (action) => {
+      const { client, handle } = await pausedWatcher(action);
+      try {
+        // Allow only the re-arm's first backoff, far short of the terminal
+        // minute. A lost wake leaves both actions with no events here.
+        await vi.waitFor(
+          () =>
+            expect(eventSummaries(client)).toEqual(
+              action === 'skip' ? ['B'] : ['A', 'B'],
+            ),
+          { timeout: 4_000, interval: 20 },
+        );
+        expect(retryCount(client)).toBe(0);
+      } finally {
+        await handle.stop();
+      }
+    },
+  );
+
+  it.each(['wake', 'stop', 'timeout', 'throw'] as const)(
+    'releases the terminal wait timer on %s',
+    async (exit) => {
+      // Observe owned timers through the public watch lifecycle. Calling the
+      // captured deadline lets timeout cleanup run without a minute-long sleep.
+      const schedule = globalThis.setTimeout;
+      let terminalTimer: ReturnType<typeof setTimeout> | undefined;
+      let deadline: (() => void) | undefined;
+      vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+        (callback, ms, ...args) => {
+          const timer = schedule(callback, ms, ...args);
+          if (ms === 60_000) {
+            terminalTimer = timer;
+            deadline = () => callback(...args);
+          }
+          return timer;
+        },
+      );
+      const clear = vi.spyOn(globalThis, 'clearTimeout');
+      const { root, runtime, handle, id, errors } = await pausedWatcher(
+        exit === 'throw' ? 'throw' : undefined,
+      );
+      try {
+        const timer = terminalTimer;
+        expect(timer).toBeDefined();
+        if (exit === 'wake') {
+          runtime.skipMaterializationRetry({
+            monitorId: 'w',
+            retryId: id,
+            workspacePath: root,
+          });
+        } else if (exit === 'timeout') {
+          deadline?.();
+        } else if (exit === 'stop') {
+          await handle.stop();
+        } else {
+          expect(errors).toContain('host error handler failed');
+        }
+        await vi.waitFor(() => expect(clear).toHaveBeenCalledWith(timer), {
+          timeout: 1_000,
+          interval: 10,
+        });
+      } finally {
+        await handle.stop();
+      }
+    },
+  );
 });
