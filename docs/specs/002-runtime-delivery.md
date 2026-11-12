@@ -1480,7 +1480,7 @@ definitions (§15); one the old table lacks takes its default. Every other colum
 released version later stopped creating (0.0.1–0.3.0's `monitor_events.event_kind`), one a
 later change adds in place, or one an operator added — is carried with its values, its
 declared type and its default; an expression default such as `(datetime('now'))` is carried
-as an expression. A carried column keeps `NOT NULL` only when it has a default, because the
+as an expression, including one that ends in a line comment. A carried column keeps `NOT NULL` only when it has a default, because the
 current writer never names it.
 
 What the rebuild preserves, loses and refuses:
@@ -1498,13 +1498,16 @@ What the rebuild preserves, loses and refuses:
   explicit index and cannot be recreated, and a rowid-alias `INTEGER PRIMARY KEY` on another
   column has none to detect, so it is found through the column's primary-key position); any
   `CHECK` constraint, inline or table-level, found by scanning the stored table text with
-  string literals, quoted identifiers and SQL comments blanked; and any `REFERENCES` clause
+  string literals, quoted identifiers and SQL comments blanked; any `REFERENCES` clause
   (found through `PRAGMA foreign_key_list`), since the connection enforces foreign keys and
-  the rebuilt table would admit orphan rows the old one rejected. Dropping these would
+  the rebuilt table would admit orphan rows the old one rejected; and a `STRICT` table (found
+  through `PRAGMA table_list`), since the rebuilt table is not strict and would admit values
+  the old one rejected. Dropping these would
   silently admit rows the table rejected, so the open stops with a `SchemaMigrationError`
   instead. The message names the table, and the column when one is identifiable (a `CHECK`
-  that mentions no column is reported as table-level), and ends with the remedy: SQLite
-  cannot drop an inline constraint in place, so rebuild the table by hand without it (or
+  that mentions no column is reported as "the table has a table-level CHECK constraint", and
+  a `STRICT` table likewise names no column), and ends with the remedy: SQLite
+  cannot drop a column or table constraint in place, so rebuild the table by hand without it (or
   restore the database), and the open will then proceed.
 
 Since every column survives, every explicit index and trigger still resolves; the rebuild

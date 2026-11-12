@@ -428,6 +428,33 @@ describe('opening a database written by a released version (#569)', () => {
     // datetime('now') renders 'YYYY-MM-DD HH:MM:SS'.
     expect(row?.noted_local).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   });
+
+  it('carries a default that ends in a line comment (#569 review N1: table_xinfo drops the comment newline)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL: EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, ext INTEGER DEFAULT (5 -- note\n)',
+      ),
+    });
+
+    const migrated = openWithCurrentCode(dbPath);
+    expect(rowsByRowid(migrated, 'monitor_events')).toHaveLength(2);
+    migrated
+      .prepare(
+        `INSERT INTO monitor_events (id, monitor_id, source_name, urgency, title, created_at)
+         VALUES ('01M6BSHAPE0000000000000NEW', 'm', 's', 'normal', 't', ?)`,
+      )
+      .run(OBSERVED_AT + 100);
+    const row = migrated
+      .prepare<
+        [],
+        { ext: number }
+      >(`SELECT ext FROM monitor_events WHERE id = '01M6BSHAPE0000000000000NEW'`)
+      .get();
+    expect(row?.ext).toBe(5);
+  });
 });
 
 describe('a materialization-order rebuild that cannot complete (#569)', () => {
@@ -507,7 +534,7 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
   function expectRefusal(
     eventsDDL: string,
     rows: Record<string, unknown>[],
-    expected: { table: string; column: string },
+    expected: { table: string; column: string | undefined },
     extraDDL?: string,
   ): void {
     const dbPath = tempDbPath();
@@ -580,6 +607,13 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
       [eventRow(1)],
       { table: 'monitor_events', column: 'urgency' },
     );
+  });
+
+  it('refuses a STRICT table, which the rebuild would silently loosen (#569 review N2)', () => {
+    expectRefusal(`${EVENTS_0_9_0.trimEnd()} STRICT`, [eventRow(1)], {
+      table: 'monitor_events',
+      column: undefined,
+    });
   });
 
   it('refuses an inline CHECK on a carried column (#569 review F3)', () => {
@@ -697,10 +731,12 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
     }
     const message = (caught as Error).message;
     expect(message).toContain('monitor_events');
-    expect(message).toContain('table-level');
+    expect(message).toContain(
+      'Cannot migrate monitor_events to the current schema: the table has a table-level CHECK constraint the rebuild cannot reproduce.',
+    );
     expect(message).not.toContain('"id"');
     expect(message).toContain(
-      'SQLite cannot drop an inline constraint in place',
+      'SQLite cannot drop a column or table constraint in place',
     );
     expect(message).toContain('rebuild the table by hand without it');
     expect(message).toContain('restore the database');

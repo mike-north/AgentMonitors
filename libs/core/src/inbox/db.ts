@@ -626,7 +626,7 @@ interface LiveColumn {
  * table rebuild or a restore.
  */
 const UNREPRODUCIBLE_CONSTRAINT_REMEDY =
-  'SQLite cannot drop an inline constraint in place; rebuild the table by hand without it ' +
+  'SQLite cannot drop a column or table constraint in place; rebuild the table by hand without it ' +
   '(or restore the database), and the open will then proceed.';
 
 /**
@@ -654,7 +654,7 @@ function blankQuoted(sqlText: string): string {
  * KEY`), and every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX`.
  * Refused: any other UNIQUE or PRIMARY KEY constraint (inline on a carried
  * column or table-level, which SQLite backs with an automatic index), and any
- * CHECK constraint, inline or table-level, any REFERENCES clause (the current
+ * CHECK constraint, inline or table-level, a STRICT table, any REFERENCES clause (the current
  * connection enforces foreign keys, so a carried one would reject rows the
  * rebuilt table admits), and a rowid-alias PRIMARY KEY on any column other than
  * `id` (it has no automatic index to detect). Tolerated losses are collation
@@ -667,6 +667,18 @@ function refuseUnreproducibleConstraints(
   live: readonly LiveColumn[],
   currentNames: ReadonlySet<string>,
 ): void {
+  // The rebuilt table is not STRICT, so it would admit values the live one rejects.
+  const [listed] = sqlite.pragma(`table_list(${table})`) as {
+    strict: number;
+  }[];
+  if (listed?.strict === 1) {
+    throw new SchemaMigrationError(
+      table,
+      undefined,
+      'the table is STRICT, and the rebuild cannot reproduce that',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
   const rowidAlias = live.find(
     (column) => column.pk > 0 && column.name.toLowerCase() !== 'id',
   );
@@ -741,7 +753,7 @@ function refuseUnreproducibleConstraints(
       table,
       mentioned?.name,
       mentioned === undefined
-        ? 'has a table-level CHECK constraint the rebuild cannot reproduce'
+        ? 'the table has a table-level CHECK constraint the rebuild cannot reproduce'
         : 'is covered by a CHECK constraint the rebuild cannot reproduce',
       { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
     );
@@ -764,8 +776,8 @@ function refuseUnreproducibleConstraints(
  *   without a default would reject every new row. So a carried column's
  *   collation, and its NOT NULL when it has no default, are not reproduced: the
  *   rebuilt column admits NULL where the old one did not. CHECK and REFERENCES
- *   clauses are refused rather than dropped, since dropping either changes
- *   which rows the table admits.
+ *   clauses and STRICT tables are refused rather than dropped, since dropping
+ *   any of them changes which rows the table admits.
  * - Because every column survives, every explicit index (and every trigger the
  *   coordinator restores) still resolves. All are recreated from their exact
  *   stored SQL; none is dropped. Automatic indexes behind UNIQUE and PRIMARY KEY
@@ -842,7 +854,9 @@ function rebuildWithMaterializationOrder(
           ? ''
           : // table_xinfo reports the default without its outer parentheses, so
             // restore them: that form is valid for literals and expressions alike.
-            `${column.notnull !== 0 ? ' NOT NULL' : ''} DEFAULT (${column.dflt_value})`;
+            // The newline keeps a trailing line comment from swallowing the
+            // closing parenthesis; table_xinfo drops it.
+            `${column.notnull !== 0 ? ' NOT NULL' : ''} DEFAULT (${column.dflt_value}\n)`;
       return {
         name: column.name,
         definition: `${column.type}${constraint}`,
