@@ -30,6 +30,7 @@ migration), and a completed retry projects only into sessions positioned before 
 so a session opened in the same second is still ordered correctly. Rows written before positions
 existed fall back as described in §2.7. Previously a retry waited on its backoff while newer input
 was admitted ahead of it, and a late retry projected into every matching session.
+A watcher that has just reported a failed attempt waits for the row's persisted next attempt, or for the first retry delay when the failure could not be recorded, so a row left due is never re-attempted in a tight loop (008 §8).
 
 ## 2026-11-12 — Held notify work flushes on time while its source fails (002 §2.6, §2.5, §4.3, §`observation_history`; 003 §6.5; 004 §3.3) — Refs #558
 

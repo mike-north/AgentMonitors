@@ -1,3 +1,4 @@
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import {
   mkdtempSync,
   mkdirSync,
@@ -3983,8 +3984,17 @@ Handle it.
 
     // (a) watcher survived 'boom' — handle still active, 'boom' drained, and
     // 'ok' produced an event after it
-    const events = runtime.listEvents({ sessionId: session.id });
-    expect(events.map((e) => e.summary).sort()).toEqual(['boom', 'ok']);
+    // Materialization order (the private AUTOINCREMENT key), not listEvents
+    // order, which follows observedAt: 'boom' must commit before 'ok'.
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    expect(
+      client
+        .prepare<[], { summary: string }>(
+          'SELECT summary FROM monitor_events ORDER BY sequence',
+        )
+        .all()
+        .map(({ summary }) => summary),
+    ).toEqual(['boom', 'ok']);
 
     // (b) 'ok' produced a triggered history row
     const history = runtime.listObservationHistory({

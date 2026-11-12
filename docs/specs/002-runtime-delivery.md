@@ -1171,7 +1171,9 @@ Other monitors are unaffected: each monitor drains and pauses on its own outbox.
 
 A continuous watcher drains its monitor's outbox before its first pull and after every admitted
 batch, before pulling again. It waits for a backing-off row's next attempt, reports each failed
-attempt through `onError` (with its `errored` row), and reports a terminal row once, then rechecks
+attempt through `onError` (with its `errored` row) and then waits for that row's persisted next
+attempt, or for the first retry delay when the failure could not be recorded (so a row left due
+is never re-attempted in a tight loop), and reports a terminal row once, then rechecks
 it every minute until it is re-armed or the watcher stops. A watched monitor is drained by ticks
 as well, so an edit is not reconciled ahead of its retained work; each completion is one
 synchronous transaction, so a tick and a watcher never complete the same row. Watcher startup

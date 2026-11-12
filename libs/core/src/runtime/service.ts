@@ -107,6 +107,7 @@ import type {
 import {
   defaultNotifyConfigForUrgency,
   EPHEMERAL_MONITOR_ID_PREFIX,
+  MATERIALIZATION_RETRY_DELAYS_MS,
   type NotifyDispatchResult,
   type NotHeldObservation,
   type NotifyRuntimeState,
@@ -4498,11 +4499,12 @@ export class AgentMonitorRuntime {
       }
       const { blocked } = drained;
       if (!blocked) return ownsWatch();
-      let waitMs = 0;
+      let waitMs: number;
       if (blocked.kind === 'backoff') {
         waitMs = blocked.nextAttemptAt.getTime() - Date.now();
       } else if (blocked.kind === 'failed') {
         onError?.(monitorId, new Error(blocked.message));
+        waitMs = this.failedAttemptWaitMs(monitorId, workspacePath);
       } else {
         if (blocked.message !== reportedTerminal) {
           reportedTerminal = blocked.message;
@@ -4521,6 +4523,30 @@ export class AgentMonitorRuntime {
       }
       await abortableDelay(waitMs, signal);
     }
+  }
+
+  /**
+   * How long a watcher waits after a failed drain attempt: until the row's
+   * persisted next attempt when that is still ahead, and otherwise the retry
+   * policy's first delay. The fallback covers a failed attempt whose backoff
+   * could not be recorded (or could not be read back), where the row is still
+   * due and an immediate retry would spin (008 §8).
+   */
+  private failedAttemptWaitMs(
+    monitorId: string,
+    workspacePath: string,
+  ): number {
+    let nextAttemptAt: Date | null | undefined;
+    try {
+      nextAttemptAt = this.store.oldestMaterializationRetry(
+        monitorId,
+        workspacePath,
+      )?.nextAttemptAt;
+    } catch {
+      // The outbox cannot be read; fall back to the floor.
+    }
+    const untilNext = nextAttemptAt ? nextAttemptAt.getTime() - Date.now() : 0;
+    return untilNext > 0 ? untilNext : MATERIALIZATION_RETRY_DELAYS_MS[0];
   }
 
   /** Best-effort `errored` audit row; a failed write cannot change committed work. */

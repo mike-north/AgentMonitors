@@ -442,6 +442,85 @@ describe('watch intake waits for retained work', () => {
   }, 20_000);
 });
 
+describe('watch intake when a failed attempt cannot be recorded', () => {
+  /**
+   * Bug: when `markMaterializationRetryFailed` itself throws, the retry row
+   * stays due, so the watcher drain re-attempted with no delay (about 1,000
+   * attempts, `onError` calls and `errored` rows per second; 008 §8).
+   */
+  it('waits instead of spinning when recording the failed attempt also fails', async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'agentmon-retry-drain-'));
+    tempRoots.push(root);
+    const monitorsDir = path.join(root, 'monitors');
+    writeMonitor(monitorsDir, 'w', 'hot-watch');
+    const db = createDb(path.join(root, 'runtime.db'));
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    clients.push(client);
+    const store = new RuntimeStore(db);
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'hot-watch',
+      scopeSchema: { type: 'object' },
+      observe: () => Promise.resolve({ observations: [] }),
+      async *watch(_config, context) {
+        yield {
+          observations: [
+            { title: 'A', summary: 'A', objectKey: 'A', snapshotText: '' },
+          ],
+          nextState: { a: 1 },
+        };
+        await new Promise<void>((resolve) => {
+          context.signal?.addEventListener('abort', () => resolve(), {
+            once: true,
+          });
+        });
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry, [
+      claudeCodeAdapter,
+    ]);
+    failSummary(client, 'A');
+    let attempts = 0;
+    const realComplete = store.completeMaterializationRetry.bind(store);
+    store.completeMaterializationRetry = ((
+      ...args: Parameters<typeof realComplete>
+    ) => {
+      attempts += 1;
+      return realComplete(...args);
+    }) as typeof realComplete;
+    store.markMaterializationRetryFailed = () => {
+      throw new Error('SQLITE_FULL: database or disk is full');
+    };
+    let errors = 0;
+    const handle = await runtime.watchMonitors(monitorsDir, root, {
+      onError: () => {
+        errors += 1;
+      },
+    });
+    try {
+      // The first attempt follows the batch; then the watcher must wait for
+      // the retry policy's first delay (1s) rather than re-attempt at once.
+      await vi.waitFor(() => expect(attempts).toBeGreaterThan(0), {
+        timeout: 5_000,
+        interval: 10,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      // Spinning gives well over 100 here; a floor-paced loop gives 2 or 3.
+      expect(attempts).toBeLessThanOrEqual(5);
+      expect(errors).toBeLessThanOrEqual(5);
+      const rows = client
+        .prepare<
+          [],
+          { n: number }
+        >("SELECT count(*) AS n FROM observation_history WHERE result = 'errored'")
+        .get();
+      expect(rows?.n).toBeLessThanOrEqual(5);
+    } finally {
+      await handle.stop();
+    }
+  }, 20_000);
+});
+
 describe('watch intake after a restart', () => {
   let clock: ReturnType<typeof stubClock>;
   beforeEach(() => {
