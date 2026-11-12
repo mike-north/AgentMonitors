@@ -751,14 +751,22 @@ describe('materialization migration preserves dependent legacy triggers (#534)',
           actual?.map((row) => {
             if (table !== 'monitor_events' && table !== 'monitor_snapshots')
               return row;
-            const { sequence: _sequence, ...publicRow } = row;
+            const {
+              sequence: _sequence,
+              definition_fingerprint: _fingerprint,
+              ...publicRow
+            } = row;
             return publicRow;
           }),
         ).toEqual(
           rows.map((row) => {
             if (table !== 'monitor_events' && table !== 'monitor_snapshots')
               return row;
-            const { sequence: _sequence, ...publicRow } = row;
+            const {
+              sequence: _sequence,
+              definition_fingerprint: _fingerprint,
+              ...publicRow
+            } = row;
             return publicRow;
           }),
         );
@@ -846,4 +854,60 @@ describe('materialization migration preserves dependent legacy triggers (#534)',
       expectTriggerBehavior(recovered, []);
     },
   );
+});
+
+/**
+ * Regression (#451 composed with #534): a database written by the definition
+ * fingerprint change before materialization ordering existed has
+ * `definition_fingerprint` populated but no `sequence`. The ordering rebuild
+ * must carry the column and its values forward; dropping them would silently
+ * turn every pending event's fingerprint back to "unknown" (002 §5.3: rows
+ * without a fingerprint read as unknown, so staleness detection is lost).
+ */
+describe('ordering migration keeps definition_fingerprint (#451 + #534)', () => {
+  const fingerprintedId = '01M6BFP5G00000000000000010';
+  const unfingerprintedId = '01M6BFP5G00000000000000011';
+
+  function seed(filename: string): void {
+    const raw = new Database(filename);
+    migrationClients.add(raw);
+    raw.exec(
+      legacyEventsDDL.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, definition_fingerprint TEXT',
+      ),
+    );
+    const insert = raw.prepare(
+      `INSERT INTO monitor_events
+         (id, monitor_id, source_name, urgency, title, created_at, definition_fingerprint)
+       VALUES (?, 'm', 's', 'normal', 't', 1, ?)`,
+    );
+    insert.run(fingerprintedId, 'abc123def4567890');
+    insert.run(unfingerprintedId, null);
+    raw.close();
+  }
+
+  it('preserves stored fingerprint values and NULLs when rebuilding for sequence', () => {
+    const filename = tempDbPath();
+    seed(filename);
+    const client = migrationClient(filename);
+    const columns = client
+      .prepare<[], { name: string }>('PRAGMA table_info(monitor_events)')
+      .all()
+      .map((c) => c.name);
+    expect(columns).toContain('sequence');
+    expect(columns.filter((c) => c === 'definition_fingerprint')).toHaveLength(
+      1,
+    );
+    const rows = client
+      .prepare<
+        [],
+        { id: string; definition_fingerprint: string | null }
+      >('SELECT id, definition_fingerprint FROM monitor_events ORDER BY sequence')
+      .all();
+    expect(rows).toEqual([
+      { id: fingerprintedId, definition_fingerprint: 'abc123def4567890' },
+      { id: unfingerprintedId, definition_fingerprint: null },
+    ]);
+  });
 });

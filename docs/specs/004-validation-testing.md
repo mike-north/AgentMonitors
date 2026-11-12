@@ -101,8 +101,15 @@ Verified by `plugins/source-incoming-changes/src/unavailable.test.ts`,
 
 Runtime tests are the primary proof surface for: state persistence across runtime restarts; due scheduling; delivery lifecycle semantics; session projection; hook state correctness; and atomic rollback of deterministic materialization writes.
 
-**Verified in:** `libs/core/src/runtime/service.test.ts` and
-`libs/core/src/runtime/transactional-materialization.test.ts`.
+Definition-change semantics ([002 §5.3](./002-runtime-delivery.md#53-pending-events-keep-the-semantics-they-were-observed-under))
+need real-runtime scenarios: an event materialized at `normal` is not delivered as a high-urgency
+interrupt after an edit to `high`; an event observed under command A renders A's body and payload
+after an edit to command B; a batch held across the edit and a daemon restart after it keep the
+observed semantics; `explain` counts pre-edit pending events and ignores rows with no fingerprint.
+
+**Verified in:** `libs/core/src/runtime/service.test.ts`,
+`libs/core/src/runtime/transactional-materialization.test.ts` and
+`libs/core/src/runtime/definition-change.test.ts`.
 
 For the current retry-diagnostic contract in [002](./002-runtime-delivery.md), a regression **MUST**
 hold the real asynchronous monitor scan at a deterministic test-only barrier, commit valid retry

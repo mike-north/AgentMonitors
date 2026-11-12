@@ -767,6 +767,7 @@ export interface MonitorEventRecord {
     body: string;
     // (undocumented)
     createdAt: Date;
+    definitionFingerprint?: string | null;
     deliveryState?: MonitorDeliveryState;
     // (undocumented)
     diffText: string | null;
@@ -1352,6 +1353,7 @@ export class RuntimeStore {
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    pendingEventIdsOutsideDefinition(monitorId: string, workspacePath: string | null, currentFingerprint: string): string[];
     // (undocumented)
     pendingEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
     perRecipientDiffsForAllSessions(sessionIds: string[], eventId: string): Map<string, string>;

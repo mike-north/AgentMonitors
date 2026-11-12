@@ -153,6 +153,25 @@ export interface MonitorEventRecord {
   tags: string[];
   createdAt: Date;
   /**
+   * A short content fingerprint of the parts of the monitor's definition that
+   * decide what an event is (`urgency`, `urgencyMax`, the body, `name`, `watch`
+   * except scheduling keys such as `interval`, `shape`, `payload` and
+   * `baseline-strategy`; 002 §5.3) AS IT WAS at materialization time
+   * (issue #451), computed by {@link definitionFingerprint} over the same
+   * `StoredObservationEnvelope.monitor` snapshot `urgency`/`title`/`body` were
+   * already captured from — never recomputed from the live monitor at delivery
+   * time. Lets a diagnostic (`monitor explain`) compare a pending event's
+   * fingerprint against the CURRENT monitor's fingerprint and say "this pending
+   * event predates the current definition" without re-deriving or altering the
+   * event's own already-correct `urgency`/`title`/`body`. `null` on legacy rows
+   * materialized before this field existed — treated as "unknown", never
+   * flagged as stale (no false positive from an absent baseline). Optional on
+   * WRITE (`insertEvent` input) — a caller that doesn't compute one (tests,
+   * or a future writer that predates this field) simply omits it and the row
+   * persists NULL — but always present (possibly `null`) on READ.
+   */
+  definitionFingerprint?: string | null;
+  /**
    * The requesting session's delivery state for this event (002 §7):
    * `unread` (not acknowledged), `claimed` (surfaced at least once at a
    * delivery lifecycle, but not acknowledged), or `acknowledged`. Only present

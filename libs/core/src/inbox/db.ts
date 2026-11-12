@@ -357,6 +357,18 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
 
+  // Additive migration (issue #451): a `monitor_events` table created before
+  // this column existed lacks `definition_fingerprint`. Add it if missing so
+  // `monitor explain` can detect pending events that predate the monitor's
+  // current definition; legacy rows keep NULL (treated as "unknown", never
+  // flagged as stale).
+  addColumnIfMissing(
+    sqlite,
+    'monitor_events',
+    'definition_fingerprint',
+    'TEXT',
+  );
+
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_snapshots (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -541,6 +553,15 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
          AND sql IS NOT NULL ORDER BY type, name`,
     )
     .all();
+  // A table written by the definition-fingerprint change before ordering existed
+  // already holds fingerprints; carry them over rather than resetting to unknown.
+  const fingerprintSource = tableHasColumn(
+    sqlite,
+    'monitor_events',
+    'definition_fingerprint',
+  )
+    ? 'definition_fingerprint'
+    : 'NULL';
   sqlite.exec(`
     CREATE TABLE monitor_events_ordered (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -560,15 +581,16 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
       baseline_strategy TEXT,
       query_scope TEXT NOT NULL DEFAULT '{}',
       tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      definition_fingerprint TEXT
     );
     INSERT INTO monitor_events_ordered
       (id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
        payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-       baseline_strategy, query_scope, tags, created_at)
+       baseline_strategy, query_scope, tags, created_at, definition_fingerprint)
       SELECT id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
         payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-        baseline_strategy, query_scope, tags, created_at
+        baseline_strategy, query_scope, tags, created_at, ${fingerprintSource}
       FROM monitor_events ORDER BY rowid;
     DROP TABLE monitor_events;
     ALTER TABLE monitor_events_ordered RENAME TO monitor_events;

@@ -1,0 +1,9 @@
+---
+'@agentmonitors/core': minor
+---
+
+Editing a monitor no longer leaves any doubt about already-pending events: they are delivered with
+the urgency, title and body they were observed under, and this is now covered by tests and stated in
+the delivery spec. `monitor explain` also reports how many pending events predate the monitor's
+current definition (urgency, body, name, source configuration, shape, payload or baseline strategy changed since they were observed), and
+`MonitorEventRecord` gains an optional `definitionFingerprint` field.
