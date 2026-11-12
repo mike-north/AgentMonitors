@@ -1382,7 +1382,9 @@ the blocking reason. Current source-scope validation at this boundary protects e
 it does not introduce general observe-time preflight for monitors without held work. When a tick
 or watcher startup rejects a scope (§2.0) that has durable holds or a retained poll result,
 admission closes and a running watcher's checkpoint/yield waits for valid reconciliation. Without
-such held work, admission is left as it was and a running watcher keeps its startup config.
+such held work, the rejection never closes admission by itself: a watcher whose admission is open
+keeps its startup config, while one already blocked (an unresolved source, a failed drain) stays
+blocked until a valid definition is reconciled, and nothing it yielded is lost.
 There is no implicit cancellation on removal, rename or invalid metadata. Ordinary ingest/flush retry recovery
 and flushing unchanged policies after source errors are separate contracts, not added by this rule.
 

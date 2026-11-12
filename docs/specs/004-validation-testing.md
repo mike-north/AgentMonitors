@@ -286,7 +286,9 @@ or unchanged-policy flushing after source errors. No downstream exactly-once sid
 A source-config rejection (002 §2.0) found by a tick or a watcher-startup rescan MUST block a
 running watcher's yield and checkpoint while the scope has held work, leaving the held batch and
 cursor unchanged until valid recovery commits old and new work. Without held work, the same
-rejection MUST leave that watcher accepting yields and checkpoints under its startup config.
+rejection MUST NOT close admission by itself: a watcher whose admission is open MUST keep accepting
+yields and checkpoints under its startup config. A watcher already blocked (an unresolved source,
+a failed drain) stays blocked until a valid definition is reconciled, losing nothing it yielded.
 `runtime/notify-observe-only-startup.test.ts` covers both paths for tick and rescan.
 
 ### 2.6 CLI integration tests

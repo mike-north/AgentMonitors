@@ -14,7 +14,9 @@ Agent Monitors spec set in `docs/specs/`.
 Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
 rejection closes the scope's admission gate only when it has durable holds or a retained poll
 result, so a running watcher cannot commit beside that work under the rejected definition. Without
-held work, a running watcher keeps its startup config, as 002 §2.0 states. Require tick and rescan
+held work, the rejection never closes admission by itself, so a watcher with open admission keeps
+its startup config, while one already blocked stays blocked until valid reconciliation (002 §4.6).
+Require tick and rescan
 proofs of both cases.
 
 ## 2026-11-06 — Preserve opaque source baselines during notify edits (002 §3/§4.6, 004 §2.5) — Refs #537
