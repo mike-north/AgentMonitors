@@ -394,13 +394,24 @@ describe('a rejected scope with held work and an outstanding drop', () => {
       const rejected = await f.tick();
       expect(rejected.skippedMonitors).toHaveLength(1);
       f.push({
-        observations: [observation('dropped', 'd', true)],
+        observations: [
+          observation('dropped', 'd', true),
+          observation('after', 'a'),
+        ],
         nextState: { cursor: 2 },
       });
       f.push({ observations: [], nextState: { cursor: 3 } });
       await vi.waitFor(() => expect(f.pulled).toHaveLength(2));
       for (let n = 0; n < 64; n++) await Promise.resolve();
-      // The waiting batch is not admitted and the source is not pulled again.
+      // The waiting batch is parked at the closed gate, not admitted and not
+      // failed: the watcher is alive (no error) and the source is not pulled again.
+      const gate = f.runtime as unknown as {
+        watchPolicyWaiters: Map<string, Set<() => void>>;
+      };
+      expect(errors).toEqual([]);
+      expect(
+        gate.watchPolicyWaiters.has(JSON.stringify([f.root, MONITOR_ID])),
+      ).toBe(true);
       expect(f.pulled).toHaveLength(2);
       expect(f.queue).toHaveLength(1);
       expect(f.drops()).toEqual([]);
@@ -408,13 +419,14 @@ describe('a rejected scope with held work and an outstanding drop', () => {
       expect(f.state().sourceState).toEqual({ cursor: 1 });
 
       // Recovery drains the old hold first, then admits the waiting batch
-      // under the edited pacing, where its unretainable observation drops.
+      // under the edited pacing: its unretainable observation drops and its
+      // materializable one follows the drained hold in event order.
       f.write(IMMEDIATE);
       await f.tick();
       await vi.waitFor(() =>
         expect(f.state().sourceState).toEqual({ cursor: 3 }),
       );
-      expect(f.events()).toEqual(['held']);
+      expect(f.events()).toEqual(['held', 'after']);
       expect(f.drops()).toHaveLength(1);
       expect(f.loss()).toMatchObject({ count: 1, objectKey: 'd' });
       expect(f.retries()).toEqual([]);
