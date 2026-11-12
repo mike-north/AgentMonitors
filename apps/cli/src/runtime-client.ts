@@ -19,6 +19,10 @@ import type {
   OpenSessionInput,
   RuntimeTickResult,
 } from '@agentmonitors/core';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetrySummary,
+} from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
 
@@ -286,11 +290,29 @@ export async function explainMonitorClient(
   input: MonitorExplainInput,
   socketPath?: string,
 ): Promise<MonitorExplainReport> {
-  return await callDaemon<MonitorExplainReport>(
+  const report = await callDaemon<MonitorExplainReport>(
     'monitor.explain',
     input as unknown as Record<string, unknown>,
     socketPath ? { socketPath } : {},
   );
+  return {
+    ...report,
+    // Project the service's second public retry copy without rewriting other
+    // stage details, diagnosis order, or the primary verdict.
+    stages: report.stages.map((stage) =>
+      stage.id === 'materialization' &&
+      isMaterializationRetrySummary(stage.details)
+        ? { ...stage, details: { ...normalizeRetrySummary(stage.details) } }
+        : stage,
+    ),
+    ...(report.materializationRetries
+      ? {
+          materializationRetries: normalizeRetrySummary(
+            report.materializationRetries,
+          ),
+        }
+      : {}),
+  };
 }
 
 /**
@@ -448,6 +470,8 @@ const MONITOR_ROLLUP_DATE_FIELDS = [
  * the store; `doctor.ts` calls `.toISOString()` on report dates unconditionally
  * (unlike sibling commands, which only re-serialize their reports), so
  * `doctorReportClient` must uphold the same contract or that call throws.
+ * Attached and orphan retry summaries share the safe metadata projection, so
+ * version-skewed daemon errors and unexpected private fields cannot bypass it.
  */
 function reviveDoctorReportDates(
   report: MonitorDoctorReport,
@@ -455,11 +479,25 @@ function reviveDoctorReportDates(
   return {
     ...report,
     generatedAt: new Date(report.generatedAt),
+    ...(report.orphanedMaterializationRetries
+      ? {
+          orphanedMaterializationRetries:
+            report.orphanedMaterializationRetries.map((group) => ({
+              monitorId: group.monitorId,
+              summary: normalizeRetrySummary(group.summary),
+            })),
+        }
+      : {}),
     monitors: report.monitors.map((monitor) => {
       const revived = { ...monitor };
       for (const field of MONITOR_ROLLUP_DATE_FIELDS) {
         const value = revived[field];
         if (value !== undefined) revived[field] = new Date(value);
+      }
+      if (revived.materializationRetries) {
+        revived.materializationRetries = normalizeRetrySummary(
+          revived.materializationRetries,
+        );
       }
       return revived;
     }),
