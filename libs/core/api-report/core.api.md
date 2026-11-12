@@ -290,6 +290,9 @@ export interface DoctorDeliveryCounts {
 }
 
 // @public
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+// @public
 export interface DoctorMonitorRollup {
     cadence: string;
     delivery: DoctorDeliveryCounts;
@@ -305,6 +308,7 @@ export interface DoctorMonitorRollup {
     nextDueAt?: Date;
     // (undocumented)
     sourceName: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
     // (undocumented)
     urgency: Urgency;
     valid: boolean;
@@ -390,6 +394,15 @@ export interface EphemeralMonitorRecord {
 //
 // @public
 export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
+
+// @public
+export interface EphemeralMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
+    monitorId: string;
+    sessionId: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
+    validationError?: string;
+}
 
 // @public
 export interface ErroredObservation {
@@ -746,6 +759,7 @@ export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 // @public
 export interface MonitorDoctorReport {
     duplicateIds: DuplicateMonitorId[];
+    ephemeralMonitorWork?: EphemeralMonitorWork[];
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
@@ -755,7 +769,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     monitorsDir: string;
     monitorsDirExists: boolean;
-    orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
+    orphanedMonitorWork?: OrphanedMonitorWork[];
     parseErrors: DoctorParseError[];
     workspacePath: string;
 }
@@ -767,6 +781,7 @@ export interface MonitorEventRecord {
     body: string;
     // (undocumented)
     createdAt: Date;
+    definitionFingerprint?: string | null;
     deliveryState?: MonitorDeliveryState;
     // (undocumented)
     diffText: string | null;
@@ -1140,9 +1155,11 @@ export interface OpenSessionInput {
 export const OPERATION_TIMEOUT_PATTERN: string;
 
 // @public
-export interface OrphanedMaterializationRetrySummary {
+export interface OrphanedMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
     monitorId: string;
-    summary: MaterializationRetrySummary;
+    monitorKind: DoctorMonitorKind;
+    unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 // @public
@@ -1346,10 +1363,18 @@ export class RuntimeStore {
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    materializationRetryCapacity(monitorId: string, workspacePath: string | null): {
+        records: number;
+        bytes: number;
+    };
     materializationRetryMonitorIds(workspacePath: string | null): string[];
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    // @internal
+    outstandingUnretainedObservationLoss(monitorId: string, workspacePath: string): UnretainedObservationLoss | undefined;
+    pendingEventIdsOutsideDefinition(monitorId: string, workspacePath: string | null, currentFingerprint: string): string[];
     // (undocumented)
     pendingEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
     perRecipientDiffsForAllSessions(sessionIds: string[], eventId: string): Map<string, string>;
@@ -1371,6 +1396,14 @@ export class RuntimeStore {
         workspacePath: string | null;
         sourceName: string;
         result: ObservationOutcome;
+        observationData: Record<string, unknown>;
+    }): void;
+    // @internal
+    recordUnretainedObservation(input: {
+        monitorId: string;
+        workspacePath: string | null;
+        sourceName: string;
+        objectKey: string | undefined;
         observationData: Record<string, unknown>;
     }): void;
     retractObjectEvents(input: {
@@ -1428,6 +1461,8 @@ export class RuntimeStore {
     touchSession(sessionId: string): void;
     // (undocumented)
     unreadEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
+    // @internal
+    unretainedObservationMonitorIds(workspacePath: string): string[];
     // (undocumented)
     updateSessionRecap(sessionId: string): void;
     upsertObjectSuppression(input: {
@@ -1570,11 +1605,15 @@ export interface ShapeStageConfig {
 }
 
 // @public
-export interface SkippedMonitor {
-    // (undocumented)
+export type SkippedMonitor = {
     monitorId: string;
     nextDueAt: Date;
-}
+    validationError?: never;
+} | {
+    monitorId: string;
+    validationError: string;
+    nextDueAt?: never;
+};
 
 // @public
 export class SourceRegistry {
@@ -1612,6 +1651,17 @@ export type TransformOutcome = {
     delivered: false;
     value?: undefined;
 };
+
+// @public
+export interface UnretainedObservationLoss {
+    count: number;
+    error: string;
+    objectKey?: string;
+    position?: number;
+    recordedAt: Date;
+    spanSize?: number;
+    title?: string;
+}
 
 // @public (undocumented)
 export type Urgency = 'low' | 'normal' | 'high';

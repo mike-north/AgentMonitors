@@ -54,7 +54,7 @@ export default tseslint.config(
   {
     // Owned child-process fixtures are native Node JavaScript outside the
     // TypeScript project, like repository scripts, but still receive lint checks.
-    files: ['scripts/**/*.mjs', '**/test-fixtures/**/*.mjs'],
+    files: ['scripts/**/*.mjs', 'libs/core/src/runtime/test-fixtures/**/*.mjs'],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: {

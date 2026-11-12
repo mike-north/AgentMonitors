@@ -3545,8 +3545,8 @@ This monitor fires on a schedule.
   // Issue #297: a schedule monitor with an invalid IANA timezone made
   // Intl.DateTimeFormat throw OUTSIDE the per-monitor observe/ingest try/catches
   // — aborting the whole tick before any other monitor ran. This proves the
-  // fix at the `daemon once` surface: the bad monitor is isolated (errored, not
-  // a crash) and a sibling schedule monitor with a valid timezone still fires.
+  // bad config is now rejected by source preflight, while a sibling schedule
+  // monitor with a valid timezone still fires.
   it('isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits', () => {
     const dir = path.join(tempDir, 'once-bad-timezone');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
@@ -3570,7 +3570,10 @@ This monitor has a typo'd timezone.
     expect(result.exitCode).toBe(0);
     // The valid sibling still fires — the tick was NOT aborted.
     expect(result.stdout).toContain('emitted 1 event(s)');
-    expect(result.stdout).toContain('1 errored:');
+    expect(result.stdout).toContain(
+      'aaa-bad-timezone: skipped — scope.timezone:',
+    );
+    expect(result.stdout).not.toContain('1 errored:');
     expect(result.stdout).toContain('aaa-bad-timezone:');
     expect(result.stdout).toContain('Not/AZone');
   });
@@ -4625,8 +4628,8 @@ This monitor fires on a schedule.
 
   // Issue #297: `monitor explain` MUST NOT crash for a monitor whose schedule
   // timezone is invalid — it must render the failure as an actionable
-  // observation-stage diagnostic instead of a raw thrown RangeError.
-  it('explains an invalid schedule timezone as an observation-stage failure instead of crashing', () => {
+  // definition-stage diagnostic from source preflight instead of a raw RangeError.
+  it('explains an invalid schedule timezone as a definition-stage failure instead of crashing', () => {
     const dir = path.join(tempDir, 'explain-bad-timezone');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     const monitorsDir = path.join(monitorsRoot, 'bad-tz');
@@ -4669,12 +4672,12 @@ This monitor has a typo'd timezone.
     );
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('✗ Observation:');
-    expect(result.stdout).toContain('Verdict: failure at Observation');
+    expect(result.stdout).toContain('✗ Definition:');
+    expect(result.stdout).toContain('Verdict: failure at Definition');
     // The message must name the true cause (scheduling/timezone), not imply a
     // source observation ran and errored — text output only renders `reason`,
     // so the bad value must be inline (PR #433 review, discussion_r3608549689).
-    expect(result.stdout).toContain('schedule could not be evaluated');
+    expect(result.stdout).toContain('not a valid IANA time zone name');
     expect(result.stdout).toContain('Not/AZone');
   });
 

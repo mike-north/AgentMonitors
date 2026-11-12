@@ -10,6 +10,7 @@ import {
   eq,
   gt,
   inArray,
+  isNotNull,
   isNull,
   lte,
   ne,
@@ -24,27 +25,17 @@ import { Buffer } from 'node:buffer';
 import { monotonicFactory, ulid } from 'ulid';
 
 /**
- * Monotonic ULID factory for `monitor_events` ids (G10 PR-B). Plain `ulid()` is
- * NOT ordered within a single millisecond, but the per-recipient `net` collapse
- * and the claim-time cursor advance both need a deterministic "newest event per
- * object" tiebreak when a tick materializes several events for one object in the
- * same millisecond (their `created_at` ties at the runtime tick clock). A
- * monotonic factory makes `id` strictly increasing in insertion order, so
- * ordering by `(created_at, id)` reflects materialization order exactly.
+ * Public event identities retain their ULID representation. This process-local
+ * factory supplies uniqueness, not cross-process event order; persisted
+ * observation time and SQLite's private event sequence govern delivery order.
  */
 const eventUlid = monotonicFactory();
 
 /**
- * Monotonic ULID factory for `monitor_snapshots` ids (issue #293). `created_at`
- * is stored at epoch-SECOND precision, so several snapshots for one
- * `(workspace, monitor, object)` written in the same second (an ordinary
- * same-tick burst) all tie on `created_at`. `latestSnapshot()` picks the diff
- * predecessor, so a tie that resolved to an OLDER row corrupted the shared diff
- * chain (repeating or omitting intermediate changes). A monotonic factory makes
- * `id` strictly increasing in insertion order, giving snapshots a total
- * materialization order; ordering by `(created_at, id)` then reflects it exactly
- * — the same tie-break the `monitor_events` table already uses (see
- * {@link eventUlid}).
+ * Public snapshot identities retain their ULID representation. This factory is
+ * local to one process and cannot establish insertion order across writers.
+ * SQLite's private snapshot sequence, not this ID or the wall clock, determines
+ * the committed predecessor used by shared diffs.
  */
 const snapshotUlid = monotonicFactory();
 
@@ -91,6 +82,7 @@ import type {
   RuntimeStatus,
   SessionHookState,
   SessionObjectCursorRecord,
+  UnretainedObservationLoss,
 } from './types.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
@@ -100,10 +92,12 @@ import {
 } from './types.js';
 import type { Urgency } from '../schema/types.js';
 import { buildDiff, changeDetectionStrategyOf } from './diff.js';
+import { safeDiagnosticText } from './diagnostic-text.js';
 import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
 } from './retry-envelope.js';
+import { registerStoreWriter } from './store-writer.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -163,6 +157,7 @@ function rowToEvent(
     queryScope: parseJson(row.queryScope, {}),
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
+    definitionFingerprint: row.definitionFingerprint ?? null,
   };
 }
 
@@ -219,12 +214,7 @@ function materializationRetryKey(
 
 /** Bound persisted and projected failure text without letting it control terminal layout. */
 function safeRetryError(message: string): string {
-  return (
-    message
-      // eslint-disable-next-line no-control-regex -- persisted diagnostics must remove terminal controls
-      .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
-      .slice(0, 1_024)
-  );
+  return safeDiagnosticText(message);
 }
 
 /**
@@ -348,17 +338,19 @@ export interface NetCollapseView {
   netGroupSizeByKey: Map<string, number>;
 }
 
+/**
+ * Select net endpoints without writes. Equal-time candidates must already be
+ * in canonical materialization order, as supplied by the store's event queries.
+ * Stable timestamp sorting preserves that tie order without treating opaque IDs
+ * as chronology. Filter/slice preserve the precondition; concatenated or external
+ * candidate sets must first pass the store's canonicalization boundary.
+ */
 export function computeNetCollapseView(
   candidates: MonitorEventRecord[],
 ): NetCollapseView {
-  // Order by (createdAt, id): events materialized in the same tick share a
-  // createdAt, so the monotonic `id` (see `eventUlid`) breaks the tie in
-  // insertion order — the last is the true endpoint ("where things stand now",
-  // 002 §1.1.7).
-  const ordered = [...candidates].sort((a, b) => {
-    const byTime = a.createdAt.getTime() - b.createdAt.getTime();
-    return byTime !== 0 ? byTime : a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  });
+  const ordered = [...candidates].sort(
+    (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+  );
   const newestNetByObject = new Map<string, MonitorEventRecord>();
   const netGroupSizeByKey = new Map<string, number>();
   for (const event of ordered) {
@@ -439,7 +431,12 @@ function scopeMatches(
 }
 
 export class RuntimeStore {
+  /**
+   * Share this connection's writer boundary with internal runtime edit drains
+   * and register the runtime-owned admission span runner.
+   */
   constructor(private readonly db: InboxDb) {
+    registerStoreWriter(this, db);
     // Runtime-owned spans compose store operations without adding executable
     // callbacks to the published store API. Cache visibility follows the outer
     // commit, including when nested event savepoints succeeded before rollback.
@@ -932,24 +929,13 @@ export class RuntimeStore {
         }
 
         for (const addition of additions.values()) {
-          const usage = db
-            .select({
-              count: sql<number>`count(*)`,
-              bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
-            })
-            .from(materializationRetryOutbox)
-            .where(
-              materializationRetryKey(
-                addition.monitorId,
-                addition.workspacePath,
-              ),
-            )
-            .get();
+          const remaining = this.materializationRetryCapacity(
+            addition.monitorId,
+            addition.workspacePath,
+          );
           if (
-            (usage?.count ?? 0) + addition.count >
-              MATERIALIZATION_RETRY_MAX_RECORDS ||
-            (usage?.bytes ?? 0) + addition.bytes >
-              MATERIALIZATION_RETRY_MAX_BYTES
+            addition.count > remaining.records ||
+            addition.bytes > remaining.bytes
           ) {
             throw new MaterializationRetryCapacityError(addition.monitorId);
           }
@@ -963,6 +949,7 @@ export class RuntimeStore {
           db.insert(materializationRetryOutbox)
             .values({
               id: item.id,
+              admissionSequence: this.reserveAdmissionSequence(),
               workspacePath: item.input.workspacePath,
               monitorId: item.input.monitorId,
               sourceName: item.input.sourceName,
@@ -980,6 +967,37 @@ export class RuntimeStore {
         return prepared.map((item) => this.getMaterializationRetry(item.id));
       })
       .immediate();
+  }
+
+  /**
+   * Room left in one workspace/monitor retry outbox under the bounds that
+   * {@link RuntimeStore.enqueueMaterializationRetries} enforces: 256 rows and
+   * 8 MiB of stored envelopes, terminal rows included. This is the single
+   * definition of that capacity. Runtime admission reads it inside its own
+   * transaction to decide whether a failed observation's whole ordered suffix
+   * can be retained before it asks enqueue to store that suffix.
+   *
+   * @internal
+   */
+  materializationRetryCapacity(
+    monitorId: string,
+    workspacePath: string | null,
+  ): { records: number; bytes: number } {
+    const usage = asInternalDb(this.db)
+      .select({
+        count: sql<number>`count(*)`,
+        bytes: sql<number>`coalesce(sum(${materializationRetryOutbox.envelopeBytes}), 0)`,
+      })
+      .from(materializationRetryOutbox)
+      .where(materializationRetryKey(monitorId, workspacePath))
+      .get();
+    return {
+      records: Math.max(
+        0,
+        MATERIALIZATION_RETRY_MAX_RECORDS - (usage?.count ?? 0),
+      ),
+      bytes: Math.max(0, MATERIALIZATION_RETRY_MAX_BYTES - (usage?.bytes ?? 0)),
+    };
   }
 
   /** Resolve retained work by identity; absence is a typed error, never a successful discard. */
@@ -1191,7 +1209,11 @@ export class RuntimeStore {
    * to the caller; this boundary enforces lifecycle and atomic persistence.
    *
    * Input must be the deterministic materialization of the stored envelope,
-   * with the same workspace, monitor, source and object identity. An omitted
+   * with the same workspace, monitor, source and object identity. That
+   * includes `definitionFingerprint`: the fingerprint of the envelope's own
+   * monitor snapshot, the definition the observation was made under, never
+   * the current one (002 §5.3). The event's admission position is stamped
+   * here from the outbox row, not taken from the input (002 §2). An omitted
    * observation key uses the monitor id, matching runtime materialization;
    * explicit keys (including the empty string) keep their identity. Rendering
    * remains the runtime's responsibility. This seam accepts event data, never
@@ -1240,6 +1262,20 @@ export class RuntimeStore {
             );
           }
           const result = this.insertEvent(input, baseline, options);
+          // The event commits now but its observation was admitted when the
+          // retry was queued; supersession of a drop compares admission (002 §2).
+          // A row queued before positions were reserved predates every drop.
+          const admission = db
+            .select({
+              admissionSequence: materializationRetryOutbox.admissionSequence,
+            })
+            .from(materializationRetryOutbox)
+            .where(eq(materializationRetryOutbox.id, id))
+            .get();
+          db.update(monitorEvents)
+            .set({ admissionSequence: admission?.admissionSequence ?? 0 })
+            .where(eq(monitorEvents.id, result.id))
+            .run();
           const deleted = db
             .delete(materializationRetryOutbox)
             .where(eq(materializationRetryOutbox.id, id))
@@ -1316,6 +1352,7 @@ export class RuntimeStore {
             queryScope: JSON.stringify(input.queryScope),
             tags: JSON.stringify(input.tags),
             createdAt: input.createdAt,
+            definitionFingerprint: input.definitionFingerprint,
           })
           .run();
 
@@ -1647,10 +1684,9 @@ export class RuntimeStore {
               ...conditions,
             ),
           )
-          // Second-precision `created_at` ties within a tick; the monotonic
-          // event `id` (see `eventUlid`) keeps this newest-first listing stably
-          // ordered (issue #293).
-          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
+          // Preserve persisted observation time; SQLite's sequence resolves
+          // equal-time history consistently across independent writers.
+          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
           .all()
           .map((row) => ({
             ...rowToEvent(row.event),
@@ -1682,10 +1718,9 @@ export class RuntimeStore {
               ...conditions,
             ),
           )
-          // Second-precision `created_at` ties within a tick; the monotonic
-          // event `id` (see `eventUlid`) keeps this newest-first listing stably
-          // ordered (issue #293).
-          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
+          // Preserve persisted observation time; SQLite's sequence resolves
+          // equal-time history consistently across independent writers.
+          .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
           .all()
           .map(rowToEvent);
 
@@ -1745,10 +1780,9 @@ export class RuntimeStore {
             : eq(monitorSnapshots.workspacePath, workspacePath),
         ),
       )
-      // `created_at` is second-precision, so same-second writes tie; the
-      // monotonic `id` (see `snapshotUlid`) breaks the tie in materialization
-      // order so the newest snapshot is the diff predecessor (issue #293).
-      .orderBy(desc(monitorSnapshots.createdAt), desc(monitorSnapshots.id))
+      // The predecessor is the last retained materialization, independent of
+      // observation timestamps, wall-clock reversals or process-local IDs.
+      .orderBy(desc(monitorSnapshots.sequence))
       .get();
     return row ? { content: row.content } : null;
   }
@@ -1905,6 +1939,83 @@ export class RuntimeStore {
   }
 
   /**
+   * Reserve the next position in the `monitor_events` materialization order
+   * for an observation admitted now but materialized later (a retained retry).
+   *
+   * Events take positions from that table's AUTOINCREMENT counter
+   * (`sqlite_sequence`) when they commit. A retained observation has no event
+   * yet, so admission advances the same counter by one and keeps the value: it
+   * is above every event committed and every drop recorded before it, and
+   * below every later one. SQLite documents `sqlite_sequence` as writable;
+   * raising it only makes the next event skip the reserved value. Must run
+   * inside the admitting transaction.
+   */
+  private reserveAdmissionSequence(): number {
+    const client = asInternalDb(this.db).$client;
+    const raised = client
+      .prepare<[], { seq: number }>(
+        `UPDATE sqlite_sequence SET seq = seq + 1
+         WHERE name = 'monitor_events' RETURNING seq`,
+      )
+      .get();
+    if (raised) return raised.seq;
+    // No event has ever been inserted, so the counter has no row yet.
+    const created = client
+      .prepare<[], { seq: number }>(
+        `INSERT INTO sqlite_sequence (name, seq)
+         VALUES ('monitor_events',
+           (SELECT coalesce(max(sequence), 0) FROM monitor_events) + 1)
+         RETURNING seq`,
+      )
+      .get();
+    if (!created) {
+      throw new Error('Could not reserve a materialization position.');
+    }
+    return created.seq;
+  }
+
+  /**
+   * Record that admission dropped one observation because the retry outbox
+   * could not retain its ordered suffix (002 §2). Called inside the admitting
+   * span's transaction, so the drop commits or rolls back with that span.
+   *
+   * Besides the `errored` history row, it stores what supersedes the drop
+   * later: the observation's raw `objectKey` (only a string counts) and the
+   * high-water mark of the event materialization order at this write (see
+   * {@link RuntimeStore.reserveAdmissionSequence}). Events of earlier siblings
+   * in the same span, and retries admitted before the drop, are at or below
+   * that watermark; events of later siblings and later spans, and retries
+   * admitted after the drop, are above it.
+   *
+   * @internal
+   */
+  recordUnretainedObservation(input: {
+    monitorId: string;
+    workspacePath: string | null;
+    sourceName: string;
+    objectKey: string | undefined;
+    observationData: Record<string, unknown>;
+  }): void {
+    asInternalDb(this.db)
+      .insert(observationHistory)
+      .values({
+        id: observationUlid(),
+        monitorId: input.monitorId,
+        workspacePath: input.workspacePath,
+        sourceName: input.sourceName,
+        observationData: JSON.stringify(input.observationData),
+        result: 'errored',
+        createdAt: new Date(),
+        unretainedObjectKey: input.objectKey ?? null,
+        unretainedEventWatermark: sql`(SELECT max(
+          coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'monitor_events'), 0),
+          coalesce((SELECT max(${monitorEvents.sequence}) FROM ${monitorEvents}), 0)
+        ))`,
+      })
+      .run();
+  }
+
+  /**
    * List observation-history rows, newest first. When `query.workspacePath` is
    * provided the result is scoped to that exact workspace (issue #345 / #307) —
    * an observation tick always runs for one concrete workspace, so (unlike
@@ -1956,6 +2067,181 @@ export class RuntimeStore {
     }));
   }
 
+  /**
+   * The outstanding observations admission dropped for one workspace/monitor
+   * because the retry outbox could not retain their suffix (002 §2), or
+   * `undefined` when there are none.
+   *
+   * A drop row is an `errored` history row written by
+   * {@link RuntimeStore.recordUnretainedObservation}. It stays outstanding
+   * until it is superseded, and nothing else clears it:
+   * - a drop with an object key, by a `monitor_events` row of the same
+   *   monitor, workspace and object key whose observation was admitted after
+   *   the drop: its `admission_sequence` (a completed retry) or else its
+   *   `sequence` is above the drop's watermark. A retry admitted before the
+   *   drop carries older state, so its completion never clears it;
+   * - a drop without one, by a later `triggered` history row of the same
+   *   monitor and workspace whose span dropped nothing (no positive
+   *   `notRetainedCount`), ordered by `(created_at, id)`. The dropping span's
+   *   own batch row carries its count, so it never supersedes its own drops.
+   *
+   * Quiet ticks, notify holds, observe failures, a span whose only failure was
+   * retained, and events for other keys therefore leave a keyed drop reported.
+   * The partial and outcome indexes on `observation_history` and the
+   * object-key index on `monitor_events` keep this cheap enough for every
+   * doctor/explain call.
+   *
+   * @internal
+   */
+  outstandingUnretainedObservationLoss(
+    monitorId: string,
+    workspacePath: string,
+  ): UnretainedObservationLoss | undefined {
+    const db = asInternalDb(this.db);
+    const drop = observationHistory;
+    // json_extract raises on malformed JSON; every row is written with
+    // JSON.stringify, but guard so one bad legacy row cannot fail diagnosis.
+    const laterNotRetained = sql`CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, '$.notRetainedCount') END`;
+    const drops = and(
+      eq(drop.monitorId, monitorId),
+      eq(drop.workspacePath, workspacePath),
+      isNotNull(drop.unretainedEventWatermark),
+      or(
+        and(
+          isNotNull(drop.unretainedObjectKey),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${monitorEvents} AS superseding
+            WHERE superseding.monitor_id = ${drop.monitorId}
+              AND superseding.workspace_path = ${drop.workspacePath}
+              AND superseding.object_key = ${drop.unretainedObjectKey}
+              AND superseding.sequence > ${drop.unretainedEventWatermark}
+              AND coalesce(superseding.admission_sequence, superseding.sequence)
+                > ${drop.unretainedEventWatermark}
+          )`,
+        ),
+        and(
+          isNull(drop.unretainedObjectKey),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${observationHistory} AS superseding
+            WHERE superseding.monitor_id = ${drop.monitorId}
+              AND superseding.workspace_path = ${drop.workspacePath}
+              AND superseding.result = 'triggered'
+              AND (superseding.created_at, superseding.id) > (${drop.createdAt}, ${drop.id})
+              AND coalesce(${laterNotRetained}, 0) <= 0
+          )`,
+        ),
+      ),
+    );
+    const newest = db
+      .select()
+      .from(observationHistory)
+      .where(drops)
+      .orderBy(desc(observationHistory.createdAt), desc(observationHistory.id))
+      .limit(1)
+      .get();
+    if (!newest) return undefined;
+    const count =
+      db
+        .select({ n: sql<number>`count(*)` })
+        .from(observationHistory)
+        .where(drops)
+        .get()?.n ?? 1;
+    const data = parseJson<Record<string, unknown>>(newest.observationData, {});
+    const text = (key: string): string | undefined => {
+      const value = data[key];
+      return typeof value === 'string' ? safeDiagnosticText(value) : undefined;
+    };
+    const integer = (key: string): number | undefined => {
+      const value = data[key];
+      return typeof value === 'number' && Number.isSafeInteger(value)
+        ? value
+        : undefined;
+    };
+    const position = integer('position');
+    const spanSize = integer('spanSize');
+    const objectKey = text('objectKey');
+    const title = text('title');
+    return {
+      count,
+      recordedAt: newest.createdAt,
+      error: text('error') ?? '',
+      ...(position !== undefined ? { position } : {}),
+      ...(spanSize !== undefined ? { spanSize } : {}),
+      ...(objectKey !== undefined ? { objectKey } : {}),
+      ...(title !== undefined ? { title } : {}),
+    };
+  }
+
+  /**
+   * Monitor ids with at least one drop row in this workspace, whether or not it
+   * is still outstanding, ordered by id. Doctor uses it to report the losses of
+   * monitors that have no one unambiguous parsed definition, including
+   * ephemeral monitors, which never have one (002 §2).
+   *
+   * @internal
+   */
+  unretainedObservationMonitorIds(workspacePath: string): string[] {
+    return asInternalDb(this.db)
+      .selectDistinct({ monitorId: observationHistory.monitorId })
+      .from(observationHistory)
+      .where(
+        and(
+          eq(observationHistory.workspacePath, workspacePath),
+          isNotNull(observationHistory.unretainedEventWatermark),
+        ),
+      )
+      .orderBy(asc(observationHistory.monitorId))
+      .all()
+      .map(({ monitorId }) => monitorId);
+  }
+
+  /**
+   * Ids of every pending event of a monitor, in one workspace, that was
+   * materialized under a definition other than `currentFingerprint` (issue #451).
+   *
+   * "Pending" means at least one recipient projection has not acknowledged the
+   * event AND can still be delivered: net-collapsed intermediates and
+   * Interpret-suppressed projections never deliver and ack-all never
+   * acknowledges them, so they are excluded by the same rule the unread and
+   * reminder paths use. A row with a NULL fingerprint (materialized before the column existed)
+   * never matches: SQL `<>` against NULL is not true, which is the intended
+   * "unknown, never flagged" reading. Unlike `listEvents`, this is not bounded by
+   * a display limit, so the answer is a total.
+   */
+  pendingEventIdsOutsideDefinition(
+    monitorId: string,
+    workspacePath: string | null,
+    currentFingerprint: string,
+  ): string[] {
+    const workspaceCondition =
+      workspacePath === null
+        ? isNull(monitorEvents.workspacePath)
+        : or(
+            eq(monitorEvents.workspacePath, workspacePath),
+            isNull(monitorEvents.workspacePath),
+          );
+    return asInternalDb(this.db)
+      .selectDistinct({ id: monitorEvents.id })
+      .from(monitorEvents)
+      .innerJoin(
+        sessionEventState,
+        eq(sessionEventState.eventId, monitorEvents.id),
+      )
+      .where(
+        and(
+          eq(monitorEvents.monitorId, monitorId),
+          workspaceCondition,
+          ne(monitorEvents.definitionFingerprint, currentFingerprint),
+          isNull(sessionEventState.acknowledgedAt),
+          notInterpretSuppressed(),
+          notNetSuppressed(),
+        ),
+      )
+      .orderBy(asc(monitorEvents.id))
+      .all()
+      .map((row) => row.id);
+  }
+
   listDeliveryProjectionsForMonitor(
     monitorId: string,
     workspacePath?: string,
@@ -1985,10 +2271,9 @@ export class RuntimeStore {
         eq(sessionEventState.sessionId, agentSessions.id),
       )
       .where(and(...conditions))
-      // Second-precision `created_at` ties within a tick; the monotonic event
-      // `id` (see `eventUlid`) keeps this diagnostic listing stably ordered
-      // (issue #293).
-      .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.id))
+      // Diagnostics use the same persisted time/materialization tie order as
+      // recipient delivery, including rows written by another process.
+      .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
       .all();
 
     return rows.map(({ event, state, session }) => ({
@@ -2069,7 +2354,7 @@ export class RuntimeStore {
           notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -2095,7 +2380,7 @@ export class RuntimeStore {
           notNetSuppressed(),
         ),
       )
-      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
     return rows.map((row) => rowToEvent(row.event));
   }
@@ -2357,6 +2642,66 @@ export class RuntimeStore {
   }
 
   /**
+   * Resolve a candidate identity set back to authoritative persisted records in
+   * delivery order. External callers and mixed-urgency concatenations may not
+   * preserve equal-time order; opaque IDs or supplied artifacts cannot repair
+   * it. Session-scoped views are retained only when verified against that
+   * recipient's projection. Reject missing/duplicate identities before any
+   * collapse side effects.
+   */
+  private canonicalEventCandidates(
+    sessionId: string,
+    candidates: MonitorEventRecord[],
+  ): MonitorEventRecord[] {
+    if (candidates.length === 0) return [];
+    const suppliedById = new Map(candidates.map((event) => [event.id, event]));
+    const ids = candidates.map((event) => event.id);
+    if (suppliedById.size !== ids.length) {
+      throw new Error('Duplicate event in collapse candidates');
+    }
+    const rows = asInternalDb(this.db)
+      .select({ event: monitorEvents, state: sessionEventState })
+      .from(monitorEvents)
+      .leftJoin(
+        sessionEventState,
+        and(
+          eq(sessionEventState.eventId, monitorEvents.id),
+          eq(sessionEventState.sessionId, sessionId),
+        ),
+      )
+      .where(inArray(monitorEvents.id, ids))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
+      .all();
+    if (rows.length !== ids.length) {
+      const found = new Set(rows.map((row) => row.event.id));
+      throw new Error(
+        `Event not found: ${ids.find((id) => !found.has(id)) ?? ''}`,
+      );
+    }
+    return rows.map((row) => {
+      const supplied = suppliedById.get(row.event.id);
+      const projectionDiff = row.state?.diffText;
+      const requestsRecipientDiff =
+        supplied !== undefined && supplied.diffText !== row.event.diffText;
+      // Delta representation and optional lifecycle state are independent:
+      // listEvents(session) carries deliveryState but still has a shared diff.
+      // Only a non-shared delta requests this recipient's CURRENT projection,
+      // including when a prior claim has re-anchored it since the caller's read.
+      // Supplied text is never authoritative; stale, forged or foreign overlays
+      // cannot replace persisted artifacts or the requested recipient's state.
+      return {
+        ...rowToEvent(row.event),
+        ...(projectionDiff != null && requestsRecipientDiff
+          ? { diffText: projectionDiff }
+          : {}),
+        ...(row.state && supplied?.deliveryState !== undefined
+          ? { deliveryState: deliveryStateForRow(row.state) }
+          : {}),
+      };
+    });
+  }
+
+  /**
    * Apply the per-recipient `net` collapse to a recipient's candidate delivery
    * set at claim time (G10 PR-B, 002 §1.1.7).
    *
@@ -2380,10 +2725,12 @@ export class RuntimeStore {
    * no-op (`net` ≡ `incremental` in the degenerate single-observation span).
    *
    * @param sessionId - the claiming recipient.
-   * @param candidates - the recipient's candidate events, OLDEST-FIRST.
+   * @param candidates - a unique set of persisted candidate event identities.
+   *   Stored content and canonical delivery order are authoritative. Unknown or
+   *   duplicate IDs fail before mutation.
    * @returns the events to actually deliver (suppressed intermediates removed),
-   *   preserving the input order. The caller still passes the FULL candidate set
-   *   (delivered + suppressed) to {@link markClaimed} so the cursor advances to
+   *   in persisted observation-time/materialization order. The caller still
+   *   passes the FULL candidate set (delivered + suppressed) to {@link markClaimed} so the cursor advances to
    *   the newest claimed artifact and the suppressed rows are consumed
    *   (`first_notified_at`).
    */
@@ -2395,10 +2742,11 @@ export class RuntimeStore {
     // siblings are suppressed) is the pure, side-effect-free
     // {@link computeNetCollapseView} — shared verbatim with the delivery preview
     // (issue #299) so a capped hook context claims exactly the events it renders.
-    const view = computeNetCollapseView(candidates);
+    const canonical = this.canonicalEventCandidates(sessionId, candidates);
+    const view = computeNetCollapseView(canonical);
 
-    // No `net` group present → nothing to re-anchor or suppress; pass through.
-    if (view.netGroupSizeByKey.size === 0) return candidates;
+    // No `net` group present → nothing to re-anchor or suppress.
+    if (view.netGroupSizeByKey.size === 0) return canonical;
 
     // The MUTATION half. For each surviving delivered event whose group ACTUALLY
     // collapsed (>1 net event), recompute its per-recipient diff_text against
@@ -2513,8 +2861,8 @@ export class RuntimeStore {
 
   /**
    * For a set of just-claimed events, advance the recipient's per-object cursor
-   * to the artifact of the NEWEST (latest `createdAt`, then ULID-ordered) claimed
-   * event of each `(monitorId, objectKey, workspacePath)`. Events without a
+   * to the artifact of the NEWEST claimed event (persisted `createdAt`, then
+   * SQLite sequence) of each `(monitorId, objectKey, workspacePath)`. Events without a
    * snapshot artifact are skipped (nothing to span from). (G10, 002 §1.1.2.)
    */
   private advanceCursorsForClaimedEvents(
@@ -2525,7 +2873,7 @@ export class RuntimeStore {
       .select()
       .from(monitorEvents)
       .where(inArray(monitorEvents.id, eventIds))
-      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.id))
+      .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
 
     // Iterating in ascending order and overwriting leaves the NEWEST claimed

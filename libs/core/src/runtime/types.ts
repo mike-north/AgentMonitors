@@ -1,3 +1,4 @@
+/** Shared runtime contracts for durable monitor work, session delivery, and diagnostics. */
 import type {
   MonitorDefinition,
   NotifyConfig,
@@ -152,6 +153,25 @@ export interface MonitorEventRecord {
   queryScope: Record<string, string | string[]>;
   tags: string[];
   createdAt: Date;
+  /**
+   * A short content fingerprint of the parts of the monitor's definition that
+   * decide what an event is (`urgency`, `urgencyMax`, the body, `name`, `watch`
+   * except scheduling keys such as `interval`, `shape`, `payload` and
+   * `baseline-strategy`; 002 §5.3) AS IT WAS at materialization time
+   * (issue #451), computed by {@link definitionFingerprint} over the same
+   * `StoredObservationEnvelope.monitor` snapshot `urgency`/`title`/`body` were
+   * already captured from — never recomputed from the live monitor at delivery
+   * time. Lets a diagnostic (`monitor explain`) compare a pending event's
+   * fingerprint against the CURRENT monitor's fingerprint and say "this pending
+   * event predates the current definition" without re-deriving or altering the
+   * event's own already-correct `urgency`/`title`/`body`. `null` on legacy rows
+   * materialized before this field existed — treated as "unknown", never
+   * flagged as stale (no false positive from an absent baseline). Optional on
+   * WRITE (`insertEvent` input) — a caller that doesn't compute one (tests,
+   * or a future writer that predates this field) simply omits it and the row
+   * persists NULL — but always present (possibly `null`) on READ.
+   */
+  definitionFingerprint?: string | null;
   /**
    * The requesting session's delivery state for this event (002 §7):
    * `unread` (not acknowledged), `claimed` (surfaced at least once at a
@@ -470,6 +490,38 @@ export interface DoctorDeliveryCounts {
 }
 
 /**
+ * Observations of one monitor that admission dropped for good, because the
+ * retry outbox could not retain their ordered suffix (002 §2, "Admission
+ * outcomes when the outbox cannot retain a suffix"), and that are still
+ * outstanding because nothing has superseded them. A drop with an object key
+ * is superseded only by a later event of the same monitor, workspace and
+ * object key; a drop without one, only by a later span of that monitor in that
+ * workspace that materializes an event and drops nothing. Quiet ticks, notify
+ * holds, observe failures and restarts supersede nothing.
+ *
+ * Read from the durable `observation_history` rows that record those drops, so
+ * it survives restarts and reads the same with or without a daemon. Every text
+ * field is the bounded, control-normalized metadata stored on the newest drop
+ * row; the observation's payload is never part of it.
+ */
+export interface UnretainedObservationLoss {
+  /** How many drops of this monitor in this workspace are still outstanding, across every span. */
+  count: number;
+  /** When the newest outstanding drop was recorded. */
+  recordedAt: Date;
+  /** The materialization error followed by `Not retained for retry: <reason>`, for the newest drop. */
+  error: string;
+  /** The newest dropped observation's 1-based position in its span, when recorded. */
+  position?: number;
+  /** How many observations that span dispatched, when recorded. */
+  spanSize?: number;
+  /** The newest dropped observation's source `objectKey`, when it had one. */
+  objectKey?: string;
+  /** The newest dropped observation's source `title`, when it had one. */
+  title?: string;
+}
+
+/**
  * A per-monitor health rollup produced by
  * {@link AgentMonitorRuntime.doctorReport}. Every field is derived from durable
  * state (persisted observation history, `monitor_events`, and session
@@ -519,6 +571,14 @@ export interface DoctorMonitorRollup {
    * Optional for compatibility with reports returned by older daemons.
    */
   materializationRetries?: MaterializationRetrySummary;
+  /**
+   * Present while this monitor has an outstanding observation that admission
+   * dropped because the retry outbox could not retain it; absent once every
+   * drop is superseded (see {@link UnretainedObservationLoss}), and in reports
+   * from older daemons. Duplicated ids omit it: their loss belongs to the
+   * report's orphaned groups, like their retained work.
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 /** A parse-level failure attributed to a monitor id (or file path fallback). */
@@ -566,13 +626,21 @@ export interface MonitorDoctorReport {
   /** Every discovered monitor's rollup (both valid and invalid definitions). */
   monitors: DoctorMonitorRollup[];
   /**
-   * Retained outboxes without one unambiguous parsed current definition:
-   * missing/parse-failed definitions and duplicated ids. These are recovery
-   * obligations, not synthetic monitor definitions. A represented outbox appears
-   * here or on its monitor rollup, never both. Ordered by monitor id.
+   * Recovery obligations of ids with no usable definition (removed,
+   * parse-failed or duplicated persistent definitions, and retired ephemeral
+   * monitors): retained outboxes and outstanding unretained-observation
+   * losses. These are not synthetic monitor definitions. Each id's obligations
+   * appear in exactly one place: here, on its monitor rollup, or in
+   * {@link MonitorDoctorReport.ephemeralMonitorWork}. Ordered by monitor id.
    * Optional for compatibility with older daemon reports.
    */
-  orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
+  orphanedMonitorWork?: OrphanedMonitorWork[];
+  /**
+   * Recovery obligations of live ephemeral monitors, attributed to them rather
+   * than reported as orphaned. Ordered by monitor id. Optional for
+   * compatibility with older daemon reports.
+   */
+  ephemeralMonitorWork?: EphemeralMonitorWork[];
   /** Count of discovered monitors that failed validation. */
   invalidCount: number;
   /** Monitor-id collisions across the tree (001 §4). */
@@ -738,16 +806,70 @@ export interface MaterializationRetryQuery {
 }
 
 /**
- * Safe retained-work summary for a route with no unambiguous parsed current
- * monitor definition. The containing doctor report supplies its workspace;
- * captured source/configuration metadata is deliberately not reconstructed.
+ * What kind of monitor an id with recovery obligations belongs to: a
+ * `persistent` monitor is authored as a `MONITOR.md` definition; an
+ * `ephemeral` monitor was declared by an agent session (`ephemeral:` id) and
+ * never had a definition file.
  * @public
  */
-export interface OrphanedMaterializationRetrySummary {
-  /** Durable route identity needed to inspect and repair the retained work. */
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+/**
+ * Recovery obligations of a monitor id that has no usable definition in the
+ * doctor's workspace: a persistent monitor whose `MONITOR.md` was removed, no
+ * longer parses, or is duplicated, or an ephemeral monitor that was cancelled
+ * or reaped. It holds the id's retained retry work and its outstanding
+ * unretained-observation loss; each field is present only when there is
+ * something to report, and at least one always is. The containing doctor
+ * report supplies its workspace; captured source/configuration metadata is
+ * deliberately not reconstructed.
+ * @public
+ */
+export interface OrphanedMonitorWork {
+  /** Durable route identity needed to inspect the obligations. */
   monitorId: string;
-  /** Exact route's lifecycle totals and bounded metadata, never its envelopes. */
-  summary: MaterializationRetrySummary;
+  /**
+   * `persistent` for a directory-defined id, `ephemeral` for a retired
+   * ephemeral monitor (a live one is reported in
+   * {@link MonitorDoctorReport.ephemeralMonitorWork} instead).
+   */
+  monitorKind: DoctorMonitorKind;
+  /** Retained retry work, present only while the outbox holds records; never envelopes. */
+  materializationRetries?: MaterializationRetrySummary;
+  /**
+   * Present while the id has an outstanding observation that admission
+   * dropped because the retry outbox could not retain it.
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
+}
+
+/**
+ * Recovery obligations of a live (`active`) ephemeral monitor whose rows are
+ * in the doctor's workspace. Ephemeral monitors have no `MONITOR.md`, so they
+ * have no rollup in {@link MonitorDoctorReport.monitors}; their obligations
+ * are attributed to them here rather than reported as orphaned. Each field is
+ * present only when there is something to report, and at least one always is.
+ * @public
+ */
+export interface EphemeralMonitorWork {
+  /** The ephemeral monitor's `ephemeral:<sessionId>/<ulid>` id. */
+  monitorId: string;
+  /** The AgentMon session that declared it and can cancel it. */
+  sessionId: string;
+  /** Retained retry work, present only while the outbox holds records; never envelopes. */
+  materializationRetries?: MaterializationRetrySummary;
+  /** Present while the monitor has an outstanding dropped observation. */
+  unretainedObservationLoss?: UnretainedObservationLoss;
+  /**
+   * Present only while the monitor's persisted scope fails the source's scope
+   * preflight, the same check every tick applies. The tick then skips the
+   * watch, and an ephemeral scope cannot be edited, so the work above can
+   * never be superseded. Cancelling the watch and declaring it again with a
+   * valid scope restores observation, but the new declaration gets a new id,
+   * so this id's outstanding drop and retained work stay reported under its
+   * retired id. Absent when the scope is accepted.
+   */
+  validationError?: string;
 }
 
 /** Operator-safe retry metadata that never contains an envelope or payload. @public */
@@ -830,17 +952,25 @@ export interface ErroredObservation {
 }
 
 /**
- * A monitor that was found but skipped on a tick because its interval has not
- * yet elapsed since the last observation. Surfaced so callers (e.g. daemon
- * once) can distinguish "skipped, not yet due" from "no monitors found".
+ * A monitor paused before observation: either its cadence is not due, or its
+ * source config is invalid. Validation skips have no due time: correcting the
+ * config, rather than waiting, allows observation to resume with retained state.
  *
- * @see docs/specs/002-runtime-delivery.md §2.4
+ * @see docs/specs/002-runtime-delivery.md §2.5
  */
-export interface SkippedMonitor {
-  monitorId: string;
-  /** The earliest time at which this monitor will be due for its next tick. */
-  nextDueAt: Date;
-}
+export type SkippedMonitor =
+  | {
+      monitorId: string;
+      /** The earliest time at which this valid monitor is due again. */
+      nextDueAt: Date;
+      validationError?: never;
+    }
+  | {
+      monitorId: string;
+      /** The same joined source-config diagnostics reported by `validate`. */
+      validationError: string;
+      nextDueAt?: never;
+    };
 
 /**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
@@ -852,9 +982,9 @@ export interface SkippedMonitor {
  * same path that writes an `errored` row to `observation_history`, so the tick
  * itself can report the failure rather than silently print `emitted 0`.
  *
- * Monitors found in the directory but skipped because their interval has not
- * elapsed are listed in `skippedMonitors` so callers can distinguish
- * "skipped, not yet due" from "no monitors found" (issue #152).
+ * Monitors with invalid source config or a cadence that is not yet due are
+ * listed in `skippedMonitors`, distinguishing a config requiring correction
+ * from a valid monitor waiting to run and from an empty monitor directory.
  */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];

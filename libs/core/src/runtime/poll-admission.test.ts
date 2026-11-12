@@ -29,6 +29,11 @@ import { RuntimeStore } from './store.js';
 import { registerRuntimeTransaction } from './runtime-transaction.js';
 
 /** Fixed observation time makes source cadence and notify deadlines exact. */
+/**
+ * Notify state after a clean admission: no holds or guards, only the private
+ * pacing identity every admitted span records (002 §4.6).
+ */
+const POLICY_IDENTITY_ONLY = { policyKey: expect.any(String) };
 const NOW = new Date('2026-11-01T12:00:00.000Z');
 /** Every resource belongs to this suite and is closed before its directory is removed. */
 const resources: { root: string; clients: BetterSQLiteClient[] }[] = [];
@@ -311,7 +316,7 @@ describe('whole poll span before Interpret', () => {
       });
       expect(f.reader.getMonitorState('span', f.root)).toEqual({
         sourceState: 1,
-        notifyState: {},
+        notifyState: POLICY_IDENTITY_ONLY,
         lastObservationAt: NOW,
       });
       expect(f.reader.listMaterializationRetries()).toEqual([]);
@@ -351,7 +356,7 @@ describe('whole poll span before Interpret', () => {
       ).toBe(true);
       expect(f.reader.getMonitorState('span', f.root)).toEqual({
         sourceState: 1,
-        notifyState: {},
+        notifyState: POLICY_IDENTITY_ONLY,
         lastObservationAt: NOW,
       });
       expect(f.reader.latestSnapshot('span', 'shared-object', f.root)).toEqual({
@@ -423,7 +428,7 @@ describe('whole poll span before Interpret', () => {
         expectPrefix(f, ['step-1', 'step-2', 'step-3']);
         expect(f.reader.getMonitorState('span', f.root)).toEqual({
           sourceState: 2,
-          notifyState: {},
+          notifyState: POLICY_IDENTITY_ONLY,
           lastObservationAt: new Date(NOW.getTime() + 2000),
         });
         expect(f.sourceStates).toEqual([undefined, 1, 1]);
@@ -484,7 +489,9 @@ describe('whole poll span before Interpret', () => {
           .map(({ summary }) => summary)
           .sort(),
       ).toEqual(['concurrent', 'step-1', 'step-2', 'step-3']);
-      expect(f.reader.getMonitorState('span', f.root).notifyState).toEqual({});
+      expect(f.reader.getMonitorState('span', f.root).notifyState).toEqual(
+        POLICY_IDENTITY_ONLY,
+      );
     } finally {
       f.barrier.release();
       await tick;
@@ -874,7 +881,7 @@ describe('SQLite admission fault boundaries', () => {
     expect.soft(f.sourceStates).toEqual([undefined, 1, 1]);
     expect.soft(f.reader.getMonitorState('span', f.root)).toEqual({
       sourceState: 2,
-      notifyState: {},
+      notifyState: POLICY_IDENTITY_ONLY,
       lastObservationAt: new Date(clockTime),
     });
     expect
@@ -929,7 +936,7 @@ describe('SQLite admission fault boundaries', () => {
     ).toEqual(['step-2', 'step-3']);
     expect(f.reader.getMonitorState('span', f.root)).toEqual({
       sourceState: 1,
-      notifyState: {},
+      notifyState: POLICY_IDENTITY_ONLY,
       lastObservationAt: NOW,
     });
     expect(f.barrier.calls).toHaveLength(1);
@@ -1219,7 +1226,7 @@ describe('retry admission clock after asynchronous observation', () => {
       ).toEqual(retries.map(({ id }) => id));
       expect(f.reader.getMonitorState('span', f.root)).toEqual({
         sourceState: 1,
-        notifyState: {},
+        notifyState: POLICY_IDENTITY_ONLY,
         lastObservationAt: new Date('2026-11-01T12:00:00.000Z'),
       });
       expect(f.barrier.calls).toHaveLength(1);
@@ -1249,7 +1256,7 @@ describe('retry admission clock after asynchronous observation', () => {
     expect(f.reader.listMaterializationRetries()).toEqual([]);
     expect(f.reader.getMonitorState('span', f.root)).toEqual({
       sourceState: 1,
-      notifyState: {},
+      notifyState: POLICY_IDENTITY_ONLY,
       lastObservationAt: new Date('2026-11-01T12:00:00.000Z'),
     });
     expect(f.barrier.calls).toHaveLength(3);

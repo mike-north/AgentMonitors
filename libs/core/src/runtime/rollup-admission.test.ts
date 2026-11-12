@@ -273,6 +273,19 @@ function competingRuntime(
   };
 }
 
+/**
+ * Notify state after this fixture's window fires: the minute marker plus the
+ * private pacing identity (002 §4.6) the seeding poll recorded. A window check
+ * neither drops nor rewrites that identity, so an unchanged definition is never
+ * mistaken for a policy edit on the next tick.
+ */
+function firedWindowNotify(f: Awaited<ReturnType<typeof fixture>>) {
+  // `policyKey` is private persisted metadata outside NotifyRuntimeState's type.
+  const { policyKey } = f.before.notifyState as { policyKey?: unknown };
+  expect(typeof policyKey).toBe('string');
+  return { policyKey, rollupLastFiredMinute: Math.floor(WINDOW / 60000) };
+}
+
 /** No event family or recovery obligation may survive a failed outer admission. */
 function expectNoAdmission(f: Awaited<ReturnType<typeof fixture>>) {
   expect(f.reader.listEvents({ monitorId: 'rollup' })).toEqual([]);
@@ -322,9 +335,7 @@ describe('not-due rollup admission', () => {
       expect(state.lastObservationAt?.getTime()).toBe(
         mode === 'notdue' ? BEFORE : WINDOW,
       );
-      expect(state.notifyState).toEqual({
-        rollupLastFiredMinute: Math.floor(WINDOW / 60000),
-      });
+      expect(state.notifyState).toEqual(firedWindowNotify(f));
       expect(f.observations()).toBe(1);
     });
   }
@@ -408,7 +419,7 @@ describe('not-due rollup admission', () => {
       ).toEqual([{ content: 'alpha', event_id: events[0]?.id }]);
       expect(f.reader.getMonitorState('rollup', f.root)).toEqual({
         ...f.before,
-        notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+        notifyState: firedWindowNotify(f),
       });
       expect(
         f.reader
@@ -458,7 +469,7 @@ describe('not-due rollup admission', () => {
       expect(f.interpretation.calls).toHaveLength(3);
       expect(f.reader.getMonitorState('rollup', f.root)).toEqual({
         ...f.before,
-        notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+        notifyState: firedWindowNotify(f),
       });
       const repeated = await reopened.tick(f.monitorsDir, f.root);
       expect(repeated.emittedEventIds).toEqual([]);
@@ -507,9 +518,7 @@ describe('not-due rollup admission', () => {
         emptyWindow
           ? {
               ...f.before,
-              notifyState: {
-                rollupLastFiredMinute: Math.floor(WINDOW / 60000),
-              },
+              notifyState: firedWindowNotify(f),
             }
           : f.before,
       );
@@ -696,7 +705,7 @@ describe('native rollback in held rollup flush', () => {
       ]);
     expect.soft(reopenedStore.getMonitorState('rollup', f.root)).toEqual({
       sourceState: 'original-source',
-      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+      notifyState: firedWindowNotify(f),
       lastObservationAt: new Date(WINDOW + 2000),
     });
     expect.soft(reopenedStore.listMaterializationRetries()).toEqual([]);
@@ -769,7 +778,7 @@ describe('native rollback in held rollup flush', () => {
     expect(retries[0]?.lastError).toBe('native rollup ABORT');
     expect(f.reader.getMonitorState('rollup', f.root)).toEqual({
       ...f.before,
-      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+      notifyState: firedWindowNotify(f),
     });
     expect(f.interpretation.calls).toHaveLength(1);
     expect(f.reader.latestSnapshot('rollup', 'shared', f.root)).toEqual({
@@ -787,7 +796,7 @@ describe('native rollback in held rollup flush', () => {
     expect(reopened.listMaterializationRetries()).toEqual(retries);
     expect(reopened.getMonitorState('rollup', f.root)).toEqual({
       ...f.before,
-      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+      notifyState: firedWindowNotify(f),
     });
   });
 
@@ -870,7 +879,7 @@ describe('native rollback in held rollup flush', () => {
     expect(f.interpretation.calls).toHaveLength(1);
     const expectedState = {
       sourceState: 'original-source',
-      notifyState: { rollupLastFiredMinute: Math.floor(WINDOW / 60000) },
+      notifyState: firedWindowNotify(f),
       lastObservationAt: new Date(BEFORE + 1000),
     };
     expect(f.reader.getMonitorState('rollup', f.root)).toEqual(expectedState);

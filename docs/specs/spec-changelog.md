@@ -9,6 +9,99 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Notify-policy admission gates whole watch batches; edit drains record no drops (002 §2.3/§2.4/§4.6, 004 §2.5) — Refs #497, #537
+
+Reconcile effective notify-policy edits with explicit watch batches and span admission outcomes.
+The notify admission gate now governs whole batches: while it is closed, a yielded batch waits
+unadmitted on the consumer's stack and the iterator is not pulled again; the gate, cancellation
+and ownership token are rechecked in the same synchronous turn as the batch's transaction. The
+former checkpoint-teardown rules (closing a checkpoint queue, draining accepted checkpoints) are
+restated for batches: one batch is admitted at a time, so completion or an iterator error retires
+the watcher's slot and lease only after its last admitted batch settled; abort releases a waiting
+batch unadmitted, and a superseded watcher's batch is never admitted. A watcher is released "after
+its admitted batch settles" (§2.3). An edit drain stays all-or-nothing and records no drop and
+queues no retry when a held envelope cannot materialize; blocked work records neither; a drop is
+not held work and stays outstanding across an edit unless a drained event supersedes it under §2.
+A retained poll result is later admitted against the source baseline it was observed from.
+004 restates the #537 watcher scenarios for batches and requires the edit/admission-outcome
+interaction tests.
+
+## 2026-11-11 — A rejected source config keeps its outstanding drop visible; the order rebuild carries every additive event column (002 §2/§2.0/`monitor_events`; 004 §3.4) — Refs #497, #557, #451
+
+Compose unretained admission outcomes with the source-config preflight and definition
+fingerprints. The preflight runs before admission (tick step 5), so a rejected config records no
+drop and queues no retry. A drop admitted under the earlier config stays outstanding: doctor keeps
+it on the invalid rollup, and `monitor explain` now reports it as a `failure` materialization stage
+after the definition failure, which stays the verdict (previously the definition-failure return
+omitted it). Explain reports a drop beside the stale-definition delivery note without conflict.
+The `monitor_events` order rebuild now carries `admission_sequence` as well as
+`definition_fingerprint` when a pre-`sequence` table already has them, and the object-key index is
+created after both additive columns. `definition_fingerprint` joins the `monitor_events` schema
+table. A live ephemeral monitor whose persisted scope the source now rejects carries
+`validationError` in its `ephemeralMonitorWork` group, and its doctor checks say no later event
+can clear the work. They say that cancelling and re-declaring the watch restores observation but
+leaves this id's drop and retained work reported under its retired id (002 §2; 005 doctor).
+
+## 2026-11-11 — Ephemeral retained-work remediation names `monitor explain` (005 doctor)
+
+Corrected a false statement in 005: `monitor explain <ephemeral id>` fails its definition stage
+(there is no `MONITOR.md`) but still lists the monitor's retained record IDs, in text and structured
+output. _Current:_ retained-work remediation for a live or retired ephemeral monitor names
+`monitor explain <id>` and `monitor history <id>`, not a text-only doctor heading.
+
+## 2026-11-11 — A drop is superseded by a later observation, not a later write; ephemeral attribution; orphan work renamed (002 §2/`monitor_events`/`materialization_retry_outbox`/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
+
+Correct the entry below. "Later" for a keyed drop was commit order, and 002 said a retained retry
+that materializes counts. A retry admitted before the drop and completed after it commits above
+the drop's watermark although it carries older state for the key, so it cleared the drop while the
+newest state was never delivered. _Current_ rule: an event supersedes a keyed drop only when its
+observation was **admitted** after the drop. Admission order is the `monitor_events`
+materialization order: a queued retry reserves the next position of that table's AUTOINCREMENT
+counter (`materialization_retry_outbox.admission_sequence`) and its completed event keeps it
+(`monitor_events.admission_sequence`); other events are admitted at their own `sequence`. The drop
+row's `unretained_event_watermark` is that counter's high-water mark, so retries admitted after the
+drop, including a retained later sibling of the dropping span, still supersede it. The object-key
+index covers `admission_sequence`.
+
+Doctor scanned only `MONITOR.md` definitions, so a live ephemeral monitor's drop or retained work
+was reported as an orphaned definition, and its check said to repair a definition that never
+existed. _Current:_ a live ephemeral monitor's obligations are attributed to it in
+`ephemeralMonitorWork`; once cancelled or reaped they stay visible in `orphanedMonitorWork` as a
+retired ephemeral monitor (`monitorKind: "ephemeral"`), whose checks say so and do not ask for a
+repair. The rule that nothing but supersession clears a drop is unchanged, so a retired ephemeral
+monitor's drop stays outstanding.
+
+`orphanedMaterializationRetries` (`OrphanedMaterializationRetrySummary`) is renamed
+`orphanedMonitorWork` (`OrphanedMonitorWork`). An entry carries `monitorId`, `monitorKind`, and
+`materializationRetries` / `unretainedObservationLoss` each only when present: a loss-only entry no
+longer carries an invented all-zero retry summary. A duplicated id whose entry holds only a drop
+now shows `retry-outbox=0/0` plus `dropped-observation=orphaned` on its rollups instead of
+`retry-outbox=orphaned`. The entries below keep the names they were written with. Verified by
+`libs/core/src/runtime/unretainable-suffix-admission.test.ts`,
+`libs/core/src/inbox/db.migration.test.ts` and `apps/cli/src/retry-diagnostics.test.ts`.
+
+## 2026-11-11 — A dropped observation stays outstanding until it is superseded (002 §2/§10.7/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
+
+Replace the "later clean outcome" rule from the entry below. It cleared a drop at the next
+non-`errored` history row, so a quiet `no-change` poll, a rollup or debounce hold (`suppressed`),
+or a later span whose only failure was retained made a permanent loss read healthy one interval
+later, and a loss whose definition was removed or no longer parsed vanished from doctor. Both
+contradicted 002 §2's rule that a dropped observation is never less visible than a retained one.
+
+_Current_ rule: a drop with an object key stays outstanding until a later event of the same monitor
+id, workspace and object key materializes; a drop without one, until a later span of that monitor
+in that workspace materializes an event and drops nothing. Nothing else clears it. "Later" for
+events is commit order (`monitor_events.sequence` above a watermark the drop row records), because
+an event's `created_at` is observation time. The supersession is per monitor: another monitor's
+event for the same key does not clear the drop. Without one unambiguous parsed definition, the
+loss is reported in that id's `orphanedMaterializationRetries` entry, following the per-id rule for
+retained work, and doctor fails a `dropped-observation:<id>` check; an invalid parsed definition
+keeps it on its rollup and gets the same check. Storage: two nullable `observation_history` columns
+(`unretained_object_key`, `unretained_event_watermark`), a partial drop-row index, an outcome index
+on `observation_history` and an object-key index on `monitor_events`, all additive. Verified by
+`libs/core/src/runtime/unretainable-suffix-admission.test.ts` and
+`apps/cli/src/retry-diagnostics.test.ts` (including a real `daemon run` socket after a quiet tick).
+
 ## 2026-11-10 — Record native rollback in the locked rollup flush (002 §2, §10.7; 004 §3.4) — Refs #498
 
 With the locked not-due rollup flush composed onto the native-rollback guard, a transaction-wide
@@ -19,6 +112,54 @@ trigger coverage in `rollup-admission.test.ts` adds the held-flush ROLLBACK, the
 a hold captured before a parsed source edit. Previously, without the guard, the flush reported a
 follow-on `COMMIT` error after writing a retry suffix and cleared hold outside the vanished
 transaction, and retried old-source envelopes under the edited source. No public API change.
+
+## 2026-11-10 — Keep a dropped observation visible in explain and doctor (002 §2/§10.7/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
+
+Correct 002 §2's claim that `explainMonitor` and `doctorReport` read the in-transaction `errored`
+row of an observation the outbox could not retain. Neither did in effect. The span's batch
+`triggered` row is written after commit, so it is newer than the drop row; explain read only the
+newest row and reported `ok`. Doctor read history only for `lastObservedAt`, and its retry checks
+count outbox rows, of which a drop has none. A permanently lost observation therefore looked
+healthier than a recoverable one.
+
+_Current_ rule: the batch row records the span's drop count as `notRetainedCount`, and a drop
+stays outstanding until a later clean outcome (a non-`errored` row with no drop count). While one
+is outstanding, explain's materialization stage fails and doctor fails the monitor's check, with
+`unretainedObservationLoss` in the rollup and in doctor JSON. The drop row's `observationData`
+now also names the lost observation: `notRetained: true`, its 1-based `position`, `spanSize`, and
+`objectKey`/`title` when they are strings. Every text field follows the retry-error safe-text
+rule (controls and Unicode separators become spaces, 1,024-character cap), and the reason always
+survives the cap. The payload is never copied. Adds the internal
+`RuntimeStore.outstandingUnretainedObservationLoss()` and the public `UnretainedObservationLoss`
+type. Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts` and
+`apps/cli/src/retry-diagnostics.test.ts`.
+
+## 2026-11-10 — Give every admitted observation one durable outcome when the outbox cannot retain its suffix (002 §2/§2.4/`materialization_retry_outbox`/`observation_history`; 004 §3.4) — Refs #497
+
+Fill a gap in 002: what admission does when the retry outbox rejects a failed observation's ordered
+suffix for a reason that would recur on replay. The suffix can be over the per-monitor capacity
+(256 rows / 8 MiB, terminal rows included), or an envelope can be outside the outbox's plain-data
+domain (BigInt, cycles, nested Dates, ...). Previously the rejection rolled back the whole span,
+committed prefix included, and kept the old baseline. The next tick failed identically, so the
+monitor stopped for good. The not-due rollup flush also cleared `pendingRollup` before a separate
+materialization transaction whose failure an empty catch swallowed, losing the whole held window.
+
+_Current_ rule: every dispatched observation ends in exactly one outcome committed with the
+source/notify state. That outcome is an event, a queued retry, or an in-transaction `errored`
+row whose error ends `Not retained for retry: <reason>` (capacity, or not serializable). A suffix
+is queued whole or not at all. When it cannot be queued, the failed observation is `errored` and
+later siblings keep materializing. The baseline advances once every observation has an outcome.
+The rollup flush now clears its hold in the same transaction as the flushed span; a rollback
+leaves the window held and is reported on the tick result and as an `errored` row.
+
+The 002 §2 sentence "If outbox admission or the state write fails, the outer transaction rolls back
+the batch and retains the prior source baseline" is narrowed to storage failures of the outbox or
+state write. Those, transaction-wide `RAISE(ROLLBACK)`, and a failure writing the new `errored` row
+still roll back and hold the baseline. The `observation_history` Verified lines no longer cite the
+removed `consumeWatch()` inner catch; they cite its outer catch, the in-transaction `admitSpan()`
+rows and the rollup flush catch. Adds the internal `RuntimeStore.materializationRetryCapacity()`,
+the single definition of remaining outbox room shared by enqueue and admission. Verified by
+`libs/core/src/runtime/unretainable-suffix-admission.test.ts`.
 
 ## 2026-11-10 — Start materialization retry backoff at enqueue (002 §15; 004 §3.4) — Refs #497
 
@@ -37,6 +178,140 @@ written by `finishMaterializationSpan()`.
 A transaction-wide `RAISE(ROLLBACK)` differs: the whole span rolls back, prefix included, nothing
 is queued, the source baseline does not advance, and the single `errored` row comes from `tick()`'s
 ingest-error catch (or `consumeWatch()`'s outer catch, which also ends the watcher).
+
+## 2026-11-11 — Source-config rejection closes admission only for held work (002 §2.0/§4.6, 004 §2.5) — Refs #537
+
+Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
+rejection closes the scope's admission gate only when it has durable holds or a retained poll
+result, so a running watcher cannot commit beside that work under the rejected definition. Without
+held work, the rejection never closes admission by itself, so a watcher with open admission keeps
+its startup config, while one already blocked stays blocked until valid reconciliation (002 §4.6).
+Require tick and rescan
+proofs of both cases.
+
+## 2026-11-10 — Doctor does not invent an outbox for unattributed monitor rows; scoped remediation (004, 005) — Refs #496
+
+Doctor attributes each retry outbox once. A monitor row whose id has an orphan group claims no
+count: JSON omits `materializationRetries` and the text rollup shows `retry-outbox=orphaned`. Any
+other row without a summary, including a duplicated id with no retained work and every row of an
+older daemon report that carries no orphan groups, gets the empty summary (`0/0`). Retained-work remediation names
+`monitor explain` with `--workspace`/`--dir` when doctor was given non-default values. 004 now
+describes the retry CLI suite as running the shared Nx-built bundle, not an owned package layout.
+
+## 2026-11-06 — Preserve opaque source baselines during notify edits (002 §3/§4.6, 004 §2.5) — Refs #537
+
+Clarify the existing source-state ownership rule for guard-only resets and held drains: effective
+policy adoption updates notify metadata and materialization artifacts without reserializing raw
+source state, clearing fingerprints or changing observation clocks. Require tick/startup and
+full-reopen proofs of the next actual source's previousState, clock-only scheduling in fixtures,
+real notify-write rollback and a narrow broad-setter reversion. Ordinary ingestion/checkpoint
+semantics and ordinary flush recovery remain separate.
+
+## 2026-11-06 — Learn legacy identity and reconcile factory-less owned scopes (002 §4.6, 004 §2.5) — Refs #537
+
+A successful unchanged scan learns missing private identity on an existing row without retiring
+its guards or changing source baselines. Later known edits can reset retired guards across restart;
+no pre-first-scan history is inferred. Failed validation/write does not learn identity.
+Factory capability does not exempt existing watcher/poll ownership from startup reconciliation.
+Current invalid scope or failed drain blocks live writes; unowned observe-only state remains ordinary
+polling work. Require actual public SQLite/reopen proofs and independent narrow reversions.
+
+## 2026-11-06 — Retain current location through blocked admission (002 §4.6, 004 §2.5) — Refs #537
+
+Separate current location provenance from gate permission within the existing counted owner.
+A closed gate cannot forget the admitted/blocked location and authorize unchanged fallback on a
+later scan. Revalidate current files until valid recovery or proven absence, including locations
+that never reconciled successfully. Keep only one pathname, no instructions/history, and retire
+it with the last live lease. Require repeated public tick/startup/captured-route permission proofs,
+fresh edits, genuine moveback, owner retirement/recreation and a narrow loss-of-provenance reversion.
+
+## 2026-11-06 — Proven absence before location fallback (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify that boolean nonexistence is not proof of deletion: access or I/O failures can produce the
+same result. Only metadata ENOENT/ENOTDIR permits replacing an admitted location with a valid
+earlier location. Other failures preserve the original read diagnostic, held work and blocked
+admission without starving siblings. Require actual POSIX permission/checkpoint/yield/reopen proof,
+faithful filesystem fault controls, genuine moveback controls and narrow classification reversion.
+
+## 2026-11-06 — Live held membership and same-ID location authority (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify that holds may first appear while earlier discovery work awaits: unknown-source admission
+closes immediately and classifies current workspace-scoped holds, preserving scoped failures with
+holds and existing fatal behavior without them. A filename is not monitor identity. Revalidate a
+live owner's current same-ID/workspace replacement before an obsolete discovered/captured path can
+close its gate. Validate current file/source/scope, retain fatal duplicates, and add no path history
+or execution reload. Require actual checkpoint/yield/recovery/reopen and relocation controls across
+public tick/startup, plus independent narrow reversions.
+
+## 2026-11-06 — Fresh authored admission and balanced deferred handoffs (002 §4.6, 004 §2.5) — Refs #537
+
+Directory discovery can outlive the definition it read while another monitor awaits. Clarify the
+synchronous per-file revalidation boundary immediately before reconciliation, including stale
+missing/invalid diagnostics; no generation history or live source restart is introduced. Deferred
+handoff releases its retained cache lease even when argument access fails before ingestion. Its
+error describes the already committed drain rather than claiming old holds remain. Require actual
+public tick/startup overlap, SQLite faults/reopen, live-owner controls and independent repair reversions.
+
+## 2026-11-06 — Late poll errors preserve successor admissions (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify source exclusion after a poll relinquishes its synchronous admission: its later asynchronous
+ingestion error reporting cannot remove a successor's slot or wake work through it. Require public
+overlapping ticks, a real SQLite fault, ordered durable reopen and watcher/checkpoint/scope controls.
+This does not add ordinary ingestion rollback or a durable recovery queue.
+
+## 2026-11-05 — Close checkpoint admission before scope retirement (002 §2.4, 004 §2.5) — Refs #537
+
+Clarify the existing G14/notify-boundary guarantee across natural completion and iterator error.
+Close admission immediately, retaining the monitor/workspace exclusion and cache lease until
+accepted pre-close writes settle. A recovery rescan opens their gate without letting polling or
+replacement sources overtake them; actual writes also recheck token/cancellation. Replace the
+obsolete delete-before-drain/stable-reference description. Require source/SQLite/reopen evidence
+that cursor 111 precedes a later source baseline 999, plus cancellation and scoped successor controls.
+
+## 2026-11-05 — Poll admission and live policy ownership (002 §4.6, 004 §2.5) — Refs #537
+
+Extend the existing #556 admission rule explicitly across asynchronous polling and source creation.
+A blocked returned poll result retains its original source cursor and handling, finishes the tick
+without deadlocking recovery scans, and is admitted under current pacing before later source work.
+Factory creation rechecks cancellation/current admission and pins the latest initial snapshot.
+Process-local policy caches belong to live work and retire with completion/teardown or ephemeral
+lifetime; they do not retain retired instruction history or delete durable holds. Require actual
+public-tick/source/SQLite interleavings and bounded lifecycle controls. No durable ordinary recovery
+queue or new source outcome is introduced.
+
+## 2026-11-05 — Notify admission and startup publication boundaries (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify the existing #556 rule at asynchronous watcher admission: immediate/throttle escalation
+participates in effective policy identity without resetting unchanged prior private-key clocks;
+a previously captured gate cannot authorize a mutation
+after reconciliation blocks it. Deterministic span writes precede async Interpret, and committed
+startup projections refresh hook files even without a later yield/tick. Require actual watcher-chain
+microtask, SQLite failure and hook-file regressions with positive controls. Ordinary flush recovery
+and source execution/handling reload remain outside this rule.
+
+## 2026-11-05 — Effective notify edits drain captured holds (002 §4.6, 004 §2.5) — Refs #537
+
+Record decision #556: a changed effective notify policy flushes accepted old work before new
+source observation, even before a debounce deadline or rollup window. Preserve captured semantics;
+unchanged pacing and body-only edits keep normal clocks. The whole edit drain rereads under an
+owned writer transaction and commits materialization with hold removal; failure retains all state
+and backpressures only that monitor. Specify restart, missing-definition diagnostics, independent
+writer exclusion, real SQLite faults and actual bounded-child kill acceptance. Ordinary flush
+recovery remains separate.
+
+## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
+
+States a contract the runtime already satisfied: a pending event is delivered with the urgency,
+title and body it was materialized under, whatever edits are made to the monitor afterwards. The
+reported escalation and body swap do not reproduce on current main; delivery renders the stored
+event row on every surface, and a held debounce batch carries its own definition snapshot. Adds
+real-runtime regression scenarios (004 §2.5) and a read-only `explain` diagnostic backed by a
+nullable `monitor_events.definition_fingerprint` column that counts pending events predating the
+current definition. The fingerprint covers urgency, body, name, the source's parsed configuration
+except its scheduling `interval`, `shape`, `payload` and `baseline-strategy` (so a command or `--jq`
+edit is flagged; `notify`, `tags` and cadence edits are not), and the count is a total
+rather than bounded by the event limit. The diagnostic never gates delivery; rows without a
+fingerprint read as unknown.
 
 ## 2026-11-08 — Read retry diagnosis after asynchronous discovery (002, 004) — Refs #495
 
@@ -75,6 +350,84 @@ forced-due reopen replay, and an ABORT suffix-retention control. Route retries f
 envelopes through their captured source after a source-type edit; preserve captured instructions,
 urgency, content and timestamps without transforming the source baseline. Transaction ownership
 remains package-private and the published API is unchanged.
+
+## 2026-11-07 — Preserve dependent triggers across ordering migrations (002 §5.2, 004 §3.4) — Refs #293
+
+Coordinate event and snapshot sequence rebuilds within their existing immediate
+transaction. Suspend retained main-schema triggers across the pair and restore their
+exact SQL only after both table names exist, including cross-table and third-table
+dependencies. Preserve rows, logical references, indexes, public IDs, connection pragmas
+and ordering policies. Already-current opens leave trigger definitions untouched.
+Tests first reproduce both directions, quoted names and partial migrations; controls
+and native DDL failures verify behavior, no replay, idempotence and complete rollback.
+
+## 2026-11-07 — Build core before API-source-backed tests (004 §2.9) — Refs #554
+
+The core Nx test target declares both dependency builds and its own build because its runtime
+regression suite imports the real API source, which resolves core runtime values through compiled
+package exports. Require a cold uncached first-attempt pass, an own-build-edge-only reversion that
+reproduces the package-entry module-load failure, and an exact-restored cold pass. Direct Vitest
+still requires a prior build; no build moves into tests. Production/test source, module resolution,
+public API, preflight behavior and the accepted #561/#562 boundaries remain unchanged.
+
+## 2026-11-05 — Isolate source validator exceptions (002 §2.0, 004 §2.2/§2.5) — Refs #554
+
+Validate plugin-owned schemas on a private copy so frozen valid schemas remain
+usable and validation cannot annotate the registered schema. Convert schema
+setup/evaluation exceptions into explicit per-monitor rejection diagnostics through
+the existing validation channels; never treat an exception as valid config or
+abort healthy siblings, tick cleanup, or hook refresh. Tests-first real-source and
+SQLite regressions cover malformed patterns, frozen schemas, ordinary controls,
+retained baseline/cursor/held notify state, and recovery after correction. Existing
+source-schema format, result types, cadence sizing and accepted #561/#562 deferral
+remain unchanged; no ownership/lifetime repair is implemented here.
+
+## 2026-11-05 — Preserve safely derivable cleanup cadence (002 §2.0, 004 §2.5) — Refs #554, #561
+
+Correct the whole-source-scope guard introduced by the early reaper fix: rejecting
+unrelated source config must not shorten valid runtime cadence protection. Derive
+only poll timing, catching duration parse failure narrowly, and preserve authored
+intervals and known defaults with existing settle/margin sizing. Missing definition
+or unparseable cadence retains the five-minute fallback. Real-source/SQLite tests
+reproduce the parent-head 665000ms-to-5m shortening and actual later-claim leak,
+then verify repair within the restored window, legitimate work and workspace
+isolation. The known finite-lifetime/held-only ownership gap is assigned to #562 by
+Mike's accepted #561 decision, which permits #557 after the introduced regression and
+truthful documentation are corrected. Separate M1 repair #562 follows #305/#537/#554:
+durable exact ownership without TTL and explicit retirement, with source contracts
+unchanged. Annotate current cleanup claims in 002/004/005 with the precise delayed
+recovery and held-only discovery gap; preserve the intended goal and historical records.
+#557 does not wait for that general repair.
+
+## 2026-11-05 — Validate early reaper cadence lookup (002 §2.0, 004 §2.5) — Refs #554
+
+Dormant verify-session cleanup precedes observation preflight. Validate the source
+scope before deriving a suppression lifetime from cadence; invalid or unavailable
+config uses the existing five-minute fallback. Preserve valid interval + settle +
+margin sizing and missing-definition behavior. Real-source regression reproduces
+the malformed-duration throw before cleanup, then proves scratch retraction and
+suppression, honest config skip, healthy sibling progress, and unchanged baseline
+and held legitimate work. No new TTL policy or broad scheduler exception handling. The initial whole-scope
+condition is superseded by the safely derivable cadence correction above.
+
+## 2026-11-05 — Doctor preserves rejected-config diagnostics (002 §2.0, 004 §2.5) — Refs #554
+
+Doctor must not schedule a scope already rejected by `validateWatchScope`. A malformed
+file-fingerprint interval previously threw from scheduling and aborted the report.
+Return the shared validation error, no due time, and healthy sibling results without
+mutating durable state. Add real bundled-source and built-CLI red-to-green regressions.
+Correct the core Changeset to minor under the established pre-1.0 incompatible-change
+policy; the skipped-result union and documented consumer migration remain unchanged.
+
+## 2026-11-05 — Source-config execution preflight (002 §2.0/§2.5, 004 §2.2/§2.5) — Refs #554
+
+Apply Mike's 2026-11-05 decision: schema-invalid configs stop observing, including
+existing configs previously allowed to run. Use the accepted `validateWatchScope`
+helper before tick scheduling/notify processing and continuous watcher startup.
+Report skips visibly with the same diagnostics as validate/explain/doctor; retain
+baseline and pending notify state across restart so a corrected config resumes.
+Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
+and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
 
 ## 2026-11-01 — Lock the complete rollup decision and admission (002 §4.4; 004 §3.4) — Refs #498
 
@@ -407,6 +760,46 @@ disabled; a script test guards the configuration. Product observation-boundary b
 Point the milestone citations in 008 §9–§10 and the G21 proof at the milestones in
 [docs/product/roadmap.md](../product/roadmap.md). Contract text is unchanged; only the planned
 sequencing of these targets moved.
+
+## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004) — Refs #293
+
+The event-order boundary retains raw shared input representation and refreshes explicit
+non-shared delta views from the requested session projection. Optional lifecycle state
+is refreshed independently: its presence does not change a shared diff into a recipient
+delta. Incremental and single-net results preserve
+recipient deltas/lifecycle state; stale deltas after re-anchoring no longer fall back to
+shared history. Supplied text and another recipient's state never become authoritative.
+Tests first reproduced view loss and stale-delta fallback, then verify both raw and
+recipient representations. Immutable event ordering/artifacts remain database-owned.
+
+## 2026-11-01 — Durable equal-time event ordering (002 §1.1.7/§15, 004) — Refs #293
+
+Event queries and claimed cursor advancement retain persisted observation time as their
+primary order and use a private SQLite AUTOINCREMENT sequence for equal-time ties.
+Independent process-local ULID order no longer chooses an older net endpoint. Public
+IDs and event shapes are unchanged. The pure collapse decision preserves canonical
+query tie order; the mutating boundary reloads authoritative records in that order,
+including mixed-urgency concatenations, and rejects unknown/duplicate candidate IDs
+before mutation. Legacy migration preserves event fields and logical delivery references.
+
+Tests exercise genuine two-process adverse IDs, preview/capped claim/cursor agreement,
+mixed-band candidates, unequal observed times, rollback, migration, maintenance and
+concurrent opens. Snapshot materialization order remains a separate sequence; history
+and source frontiers are unchanged.
+
+## 2026-11-01 — Durable snapshot materialization order across writers (002 §5.2/§15, 004) — Refs #293
+
+Snapshot predecessor selection now uses a private SQLite AUTOINCREMENT sequence rather
+than wall-clock timestamps and process-local monotonic ULIDs. Equal-clock independent
+writers and clock reversals can no longer select an older retained snapshot. Public
+snapshot IDs/results are unchanged; allocation remains inside materialization atomicity.
+
+Legacy tables rebuild transactionally, preserving row data and explicit indexes/triggers.
+Current hidden rowid order is the stated bootstrap policy, not a claim to reconstruct
+historical chronology or regenerate old diffs. Specs document rollback, deletion,
+VACUUM/reopen, concurrent migration, and older-reader limitations. Tests use genuine
+independent process factories and verify the adjacent diff predecessor. Event/history
+ordering is outside this snapshot repair.
 
 ## 2026-11-01 — Verify uses observation identity boundaries (005 §16) — Refs #532
 

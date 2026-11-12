@@ -2001,17 +2001,72 @@ as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check 
 exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
 explain <id>` command. Explain lists bounded safe retry metadata (record id, status, attempts,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
+
+A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
+cannot retain a suffix": its retry suffix could not be retained, and nothing has superseded it yet)
+fails its check even though `retry-outbox` shows `0/0`, since
+the drop has no retry record. This check outranks the retry checks. Its detail is
+`observation dropped, not retained for retry (<count> outstanding; newest: <which> at <iso8601>):
+<error>` followed by the rollup line. `<which>` uses explain's wording (002 §10.7). The remediation
+names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
+`monitor history <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
+when the check clears: `A dropped observation cannot be retried. This check clears once a later
+event of this monitor materializes for each dropped object key; a drop without an object key clears
+once a later observation span of this monitor materializes an event and drops nothing.` That is
+002 §2's supersession rule exactly: a quiet (`no-change`) tick, a debounce or rollup hold, an
+observe failure, a span whose only failure was retained, events for other object keys, and a
+daemon restart all leave the check failing. Doctor JSON carries the same data in
+`monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients revive
+`recordedAt`, keep only the documented fields and normalize their text like retry errors.
+
+A drop also stays a failure without one valid, unambiguous current definition. A removed,
+parse-failed or duplicated id carries the loss in its `orphanedMonitorWork` entry as
+`unretainedObservationLoss` (a duplicated id's monitor rows omit it, and their text rollup adds
+`dropped-observation=orphaned`). A parsed but invalid definition keeps it on its monitor row,
+whose check is a `skip`. Either way doctor adds a failing `dropped-observation:<id>` check, after
+the per-monitor checks and with any `retry-outbox:<id>` check for that id, whose detail is the
+`observation dropped, not retained for retry (…): <error>` text above and whose remediation names
+`monitor history <id>` (with `--workspace` as above), says to repair the definition or reported
+failure, and gives the same clearing rule.
+
+An ephemeral monitor (`agentmonitors watch`, 007 §4) has no `MONITOR.md`, so it has no monitor row
+and nothing to repair. While it is live, its drop and retained work are reported in
+`ephemeralMonitorWork` and its `dropped-observation:<id>` / `retry-outbox:<id>` checks begin
+`ephemeral monitor of session <sessionId>; ` and say it has no MONITOR.md definition; the drop
+check keeps the clearing rule above. When the group carries `validationError` (its persisted
+scope is now rejected by its source, so every tick skips it), both checks instead state that
+reason and say no later event can clear the work, in text and JSON. They say that cancelling the
+watch and declaring it again with a valid scope restores observation, but the new declaration gets
+a new id, so this id's outstanding drop and retained work stay reported under its retired id and
+the check keeps failing. After `watch cancel` or reaping it is a _retired_ ephemeral
+monitor in `orphanedMonitorWork` (`monitorKind: "ephemeral"`): its checks begin
+`retired ephemeral monitor; `, say it was cancelled or reaped, never had a definition and will not
+observe again, and that the drop check therefore keeps failing (002 §2). No command clears it.
+Retained-work remediation for either names `monitor explain <id>` (its definition stage reports no
+`MONITOR.md`, but it still lists the retained record IDs, in text and structured output) and
+`monitor history <id>`.
+
+Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
+through the built CLI, kept failing after a tick of other object keys and cleared by a later
+event for the dropped key; removed, unparseable and invalid definitions; and a real `daemon run`
+socket after a quiet scheduled tick).
+
 Otherwise the line carries an explicit `never observed` marker (the monitor has no observation
 history) / `lead-session=none` marker (the workspace has no lead session). The three delivery states
 are distinct (000 AP): claiming a delivery never acknowledges it.
 
 **Retained-work diagnostics (current):** doctor/explain expose workspace-scoped safe retry
-metadata. Outboxes without an unambiguous parsed definition appear in
-`orphanedMaterializationRetries`, including removed, parse-failed and duplicate definitions.
-Each outbox occurs once, either attached to one current monitor or in an orphan group; orphan
-entries carry only `monitorId` and `summary`, never an invented source, urgency or cadence.
+metadata. Outboxes of live ephemeral monitors appear in `ephemeralMonitorWork`; other outboxes
+without an unambiguous parsed definition appear in `orphanedMonitorWork`, including removed,
+parse-failed and duplicate definitions and retired ephemeral monitors. Each outbox occurs once:
+attached to one current monitor, under its live ephemeral monitor, or in an orphan group. Orphan
+entries carry only `monitorId`, `monitorKind` (`persistent` or `ephemeral`),
+`materializationRetries` (only while the outbox holds records) and `unretainedObservationLoss`
+(only while one is outstanding, above), never an invented empty summary, source, urgency or
+cadence. Ephemeral entries carry `monitorId`, `sessionId` and the same two optional fields.
 Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
-for both locations. An orphan or invalid-definition outbox with pending/terminal work adds a failing
+for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
+`--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
 `retry-outbox:<id>` check independently of the original definition diagnostics. Parse and duplicate
 errors remain visible even when no valid monitor row exists; doctor JSON includes `parseErrors`
 and `duplicateIds` as well as the health checks.
@@ -2020,7 +2075,12 @@ Socket clients reconstruct created/updated/non-null next-attempt Dates in all re
 terminal next-attempt stays null. Unknown retry fields are excluded, and errors are C0/C1/DEL and
 Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
 is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
-doctor JSON defaults them to empty summaries/arrays, explain preserves the omitted optional field.
+doctor JSON defaults them to empty summaries/arrays. A monitor row's summary defaults to empty unless that
+id's orphan group holds retained work (for example a duplicated id whose outbox is in an orphan group), in which
+case the row claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. When the
+group holds only a drop, the outbox is empty: the row shows `retry-outbox=0/0` and the text rollup adds
+`dropped-observation=orphaned`. For an older daemon that reports no orphan groups at all, the empty default
+applies; explain preserves the omitted optional field.
 Text explain uses an existing top-level summary, including an explicitly empty one, in preference
 to recognized materialization-stage details. If that optional field is omitted, it displays the
 available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
@@ -2115,13 +2175,33 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
         "terminal": 0,
         "bytes": 0,
         "records": []
+      },
+      "unretainedObservationLoss": {
+        "count": 1,
+        "recordedAt": "<iso8601>",
+        "error": "<string>",
+        "position": 300,
+        "spanSize": 600,
+        "objectKey": "<string, when recorded>",
+        "title": "<string, when recorded>"
       }
     }
   ],
-  "orphanedMaterializationRetries": [
+  "orphanedMonitorWork": [
     {
       "monitorId": "<string>",
-      "summary": { "pending": 0, "terminal": 0, "bytes": 0, "records": [] }
+      "monitorKind": "persistent | ephemeral",
+      "materializationRetries": "<same shape as monitors[], present only while the outbox holds records>",
+      "unretainedObservationLoss": "<same shape as monitors[], present only while outstanding>"
+    }
+  ],
+  "ephemeralMonitorWork": [
+    {
+      "monitorId": "ephemeral:<sessionId>/<ulid>",
+      "sessionId": "<string>",
+      "materializationRetries": "<present only while the outbox holds records>",
+      "unretainedObservationLoss": "<present only while outstanding>",
+      "validationError": "<present only while the persisted scope is rejected by its source>"
     }
   ],
   "parseErrors": [],
@@ -2305,7 +2385,9 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
      whole extra interval + settle cycle and ran ~2× as long as plain `verify` while still showing
      plain `verify`'s ETA — reading as a hang and overrunning default 2-minute timeouts). Instead the
      daemon's tick **sweeps** the pending `File deleted: …/agentmonitors-verify-…` on the very tick it
-     materializes — before any later session can observe it. The sweep deletes **by object key**,
+     materializes while its suppression is active, before a later session can claim it.
+     This is finite-window protection, subject to the known recovery/discovery gaps below.
+     The sweep deletes **by object key**,
      which is safe **only** because the key is synthetic, so it can never touch a real event at a
      genuine path. The tombstone's TTL is derived from the monitor's own detect budget
      (`detect + interval + settle`, min 60s).
@@ -2326,8 +2408,9 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    scoped to the sessions that actually received it (never another session's baseline for the same
    path).
 
-   **Interruption-safety (issue #414).** An interrupted `--use-workspace-daemon` run leaves **no
-   permanent stray state**: (a) on `SIGINT`/`SIGTERM` (e.g. a command/CI timeout) verify's signal
+   **Interruption cleanup (current mechanism; issue #414).** The intended goal is that
+   verification scratch events never reach a later session. The current mechanism is bounded,
+   with the recovery/discovery gaps noted below: (a) on `SIGINT`/`SIGTERM` (e.g. a command/CI timeout) verify's signal
    handler runs the same object-appropriate cleanup best-effort — reverts the file, then tombstones
    (synthetic key) or id-retracts (real created file), and ends the throwaway verify session — before
    exiting; (b) even on an uncatchable kill (`SIGKILL`/crash) that leaves an `active` verify session
@@ -2335,9 +2418,26 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    `agentmonitors-verify-*` session to dormant, tombstones and retracts its scratch objects too (only
    the synthetic scratch keys the session projected — matched by the well-known basename). That
    backstop's tombstone TTL is derived from the object's **own monitor cadence**
-   (`max(5min, interval + settle + margin)`) so a long-interval monitor's deletion still lands inside
-   the window. The only residual is a daemon **death** between materialization and the sweep; the
-   tombstone (or the reap backstop on the next tick) still reconciles it, so it is never permanent.
+   (`max(5min, interval + settle + margin)`) to cover one nominal observe/settle cycle
+   when cadence is safely derivable, even if unrelated source config is rejected.
+   A missing definition or unparseable cadence uses the existing five-minute floor (002 §2.0).
+   Tombstones survive daemon restart and can reconcile materialization/sweep interruption while
+   active; their durability does not remove their wall-clock expiry.
+
+   **Known current gap, until [#562](https://github.com/mike-north/AgentMonitors/issues/562):**
+   if observation/recovery is delayed beyond suppression expiry, a retained scratch fingerprint
+   or already-held scratch deletion may produce a durable event that a later lead claims. A
+   scratch create held without any projected event can escape the reaper's discovery entirely,
+   so no tombstone is installed. Thus the intended unconditional no-later-scratch-event goal
+   is not a current guarantee for these cases. Legitimate mixed-batch work and foreign workspaces
+   must remain intact; real watched paths retain their separate exact-ID cleanup boundary.
+
+   [Mike's accepted decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+   sequences #562 after #305/#537/#554. That separate repair will register durable exact ownership
+   before artifact creation, retain it without TTL until explicit retirement, and leave source
+   contracts unchanged. #557 proceeds after its introduced shorter-window regression and these
+   documentation corrections; it need not wait for that repair. This annotation preserves the
+   no-leak goal and records the current limit rather than claiming the repair has shipped.
 
 If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
 daemon's captured output — never an ambiguous empty result.

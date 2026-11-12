@@ -421,6 +421,38 @@ different baselines each receive their own collapsed span. A within-tick burst t
 observations for one object collapses the same way (the newest of the burst is the surviving net
 delta for an away recipient).
 
+**Event order and equal-time endpoints.** Event delivery, `net` endpoint selection,
+claimed cursor advancement and event listings order by persisted observation `created_at`
+first, then private SQLite `monitor_events.sequence`. Timestamps remain second-precision;
+this does not recover discarded millisecond observation ordering. The sequence resolves
+only equal persisted timestamps by committed materialization order across writers. A
+later insertion with an earlier observation timestamp does not displace a newer-observed
+endpoint. Public event IDs and `MonitorEventRecord` shapes are unchanged.
+
+The pure collapse decision consumes candidates already in canonical equal-time order.
+Store pending/unread queries establish this order; preview filtering and transport caps
+preserve it. The mutating `collapseNetForClaim` boundary reloads authoritative records
+by candidate ID and orders them from SQLite before choosing endpoints, including mixed
+urgency concatenations and externally supplied arrays. Unknown or duplicate IDs fail
+before mutation; caller-modified artifacts do not override persisted content. Raw shared
+candidate records retain that representation, including `listEvents(session)` records
+that carry optional delivery state with a shared diff. Only a delta different from the
+shared event requests a recipient delta view: the return value uses the **requested
+session's current persisted projection**, not supplied delta text.
+This preserves incremental/single-net views and refreshes stale re-anchored deltas without
+falling back to shared history. Optional delivery state is refreshed independently when
+requested; its presence never changes the delta representation. If the event has no
+projection for that session, existing raw-event behavior remains; this ordering boundary
+does not add a new authorization model. Preview, actual
+claim and cursor advancement use the same ordering contract.
+
+Event sequence allocation occurs within existing event/projection/cursor/snapshot
+atomicity. Its transactional migration preserves all row fields, public IDs, logical
+references and explicit indexes/triggers. As for snapshots (§5.2), current hidden rowid
+is the legacy bootstrap policy, not reconstructed lost chronology. Rollback leaves no
+committed position, deletion does not reuse committed positions, and VACUUM/reopen
+preserve them. No observation-history or source-frontier contract changes are implied.
+
 **Interaction with Pace modes.** The baseline strategy is independent of the Pace mode. A `net`
 strategy on a `debounce` monitor still settles first (Pace), then collapses the catch-up span for
 delivery (Diff). A recipient that was live for every settled observation and never missed a window
@@ -597,18 +629,150 @@ For each runtime tick, the implementation **MUST**:
 2. parse valid monitor definitions and collect parse errors separately
 3. resolve each parsed monitor's `source` name against the source registry
 4. fail the tick if a parsed monitor references an unknown source
-5. determine whether the monitor is due to run
-6. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
-7. route returned observations through notify dispatch
-8. materialize emitted observations as durable events, queue failed envelopes, and persist updated source/notify state in one immediate transaction
-9. report emitted ids and errors from the committed result
-10. refresh hook state for sessions in the affected workspace
+5. validate the source-specific `watch` config (minus `type`) with `validateWatchScope`; skip invalid config before scheduling, observation, notify processing, or admission, so a rejected config records no drop and queues no retry
+6. determine whether the monitor is due to run
+7. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
+8. route returned observations through notify dispatch
+9. materialize emitted observations as durable events, queue failed envelopes, and persist updated source/notify state in one immediate transaction
+10. report emitted ids and errors from the committed result
+11. refresh hook state for sessions in the affected workspace
 
 A materialization failure rolls back that envelope's event/projection/cursor/snapshot transaction.
 Earlier successful siblings remain events; the failed envelope and every later sibling enter the
-bounded outbox before source/notify state advances. If outbox admission or the state write fails,
-the outer transaction rolls back the batch and retains the prior source baseline. Interpret and
-audit writes run best-effort only after that durable boundary.
+bounded outbox before source/notify state advances, when the outbox can retain that whole ordered
+suffix (below). If the outbox write or the state write fails, the outer transaction rolls back the
+batch and retains the prior source baseline. Interpret and the audit rows other than an
+unretained failure's `errored` outcome run best-effort only after that durable boundary.
+
+#### Admission outcomes when the outbox cannot retain a suffix
+
+_Current._ Every observation a span dispatches **MUST** reach exactly one durable outcome,
+committed in the same transaction as the span's source/notify state:
+
+1. a materialized event (with every recipient projection, cursor seed and snapshot);
+2. a queued retry in the bounded outbox; or
+3. an `errored` `observation_history` row whose error says why the observation was not retained.
+
+The outbox can retain a failed observation only together with its whole ordered suffix: the
+failed envelope and every later sibling. The suffix is retainable when every envelope in it is
+inside the outbox's plain-data domain and all of it fits the monitor's remaining capacity
+(256 rows / 8 MiB per workspace/monitor, terminal rows included; see
+[`materialization_retry_outbox`](#materialization_retry_outbox)). The runtime decides this inside
+the admission transaction, before it writes to the outbox:
+
+- **Retainable.** The suffix is queued in order, as above.
+- **Not retainable.** Replaying the span would fail the same way, so holding the baseline would
+  stop the monitor permanently. Instead, the failed observation gets an `errored` row in the
+  admission transaction. Its error is the materialization error followed by
+  `Not retained for retry:` and the reason: either the outbox capacity is exhausted (records and
+  bytes needed vs remaining), or the envelope, or a later sibling in its suffix, is not
+  serializable for the outbox. The row also names which observation was lost (see
+  [`observation_history`](#observation_history)). Admission then continues with the next sibling. Nothing older is queued ahead of
+  it, so materializing it cannot reorder the span. A later failure in the same span is decided
+  the same way, for its own suffix.
+- **Never part of a suffix.** The runtime never queues part of a suffix: a later sibling would
+  then materialize ahead of an older queued observation.
+
+The source baseline advances once every observation has an outcome. Writing an `errored` row is
+a storage write like any other: if it fails, the span rolls back and the baseline is held. A
+transaction-wide failure (below) still rolls back the whole span. So does a storage failure of the
+outbox or state write. Neither is a refusal decided in advance, so both keep the prior baseline
+for replay. No ingest path drops an observation silently. The tick result's
+`erroredObservations` and the watcher's `onError` report the failure. `monitor history` lists the
+committed `errored` row.
+
+A dropped observation **MUST NOT** be less visible than a retained one. A drop stays
+_outstanding_ until it is _superseded_, and only these outcomes supersede it:
+
+- **A drop with an object key** (the observation's `objectKey` was a string) is superseded by a
+  later event of the same monitor id, in the same workspace, for exactly that object key. An event
+  of another monitor or another workspace for the same key does not supersede it. "Later" means
+  the event's observation was **admitted** after the drop, not merely committed after it.
+  Admission order is the `monitor_events` materialization order: an event materialized in its
+  admitting span takes its `sequence` there, and a retained observation reserves the next position
+  of the same AUTOINCREMENT counter when its retry is queued (`admission_sequence`), which its
+  event keeps when the retry completes. The drop row records that counter's high-water mark inside
+  the admission transaction, and only an event whose admission position (`admission_sequence`,
+  else `sequence`) is above it counts. So a later sibling in the dropping span, a later span and a
+  rollup or debounce flush count, and so does a retry admitted after the drop (a later sibling of
+  the dropping span that was retained, or a later span's) once it completes. A retry admitted
+  before the drop carries older state for the key and never supersedes it, even when it completes
+  after the drop. An event's `created_at` is observation time, which a flush or retry carries over
+  from the original observation, so it cannot order events against the drop.
+- **A drop without an object key** is superseded by a later span of the same monitor in the same
+  workspace that materializes at least one event and drops nothing: a later `triggered` batch row
+  whose `notRetainedCount` is absent or zero, ordered after the drop row by `(created_at, id)`. The
+  dropping span's own batch row carries its count, so it never supersedes its own drops.
+
+Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
+rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
+retained, not a later span that materializes events only for other keys, and not a daemon restart.
+Every drop is counted separately, so one superseded drop does not clear another. While a drop is
+outstanding:
+
+- `explainMonitor`'s materialization stage is `failure` (§10.7), so its verdict fails;
+- `doctorReport` attaches `unretainedObservationLoss` to that monitor's rollup: the outstanding
+  count and the newest outstanding drop's time, error, position, span size, `objectKey` and
+  `title`. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
+  per-monitor rollup).
+- When the monitor has no one unambiguous parsed definition (its definition was removed, fails to
+  parse, or its id is duplicated), the loss goes to that id's entry in `orphanedMonitorWork`
+  instead (`monitorKind: "persistent"`), beside any retained work, with the same per-id rule as
+  retained work: a duplicated id's rollups omit it and its one orphan group carries it. A parsed
+  definition that fails validation keeps the loss on its rollup. That includes a definition whose
+  source config the preflight (§2.0) now rejects: the preflight runs before admission, so the
+  rejected config records no new drop and queues no retry, and the drop it already has stays
+  outstanding until an observation made after the config is corrected supersedes it. `monitor
+explain` reports that drop as a `failure` materialization stage after the definition failure,
+  which stays the verdict.
+- An ephemeral monitor ([007 §4](./007-agent-facing-interaction.md)) has no definition file, so it
+  has no rollup. While it is `active` its loss and retained work are attributed to it in
+  `ephemeralMonitorWork` (with its declaring `sessionId`), not reported as orphaned. If its
+  persisted scope is now rejected by the source's preflight (the check every tick applies), the
+  group also carries `validationError`: the tick skips the watch, and an ephemeral scope cannot be
+  edited, so nothing it owes can clear. Cancelling the watch and declaring it again with a valid
+  scope restores observation, but the new declaration gets a new id: this id's outstanding loss
+  and retained work stay reported under its retired id, as below. The field is absent while the
+  scope is accepted. Once it is cancelled or reaped it is _retired_: its outstanding loss and
+  retained work stay visible in `orphanedMonitorWork` with `monitorKind: "ephemeral"`, as a
+  removed definition's do. A retired
+  ephemeral monitor never observes again, so nothing supersedes its drop; it stays outstanding.
+- `doctor` fails a `dropped-observation:<id>` check for each of these cases, so the loss never
+  disappears with its definition or its declaration.
+
+Both read the durable rows through `RuntimeStore.outstandingUnretainedObservationLoss()`
+(internal), so the answer is the same with or without a daemon and across restarts. The lookup
+runs on every doctor and explain call, so it is indexed: a partial index on drop rows, an
+`observation_history (monitor_id, workspace_path, result, created_at, id)` index for the later
+span, and a `monitor_events (monitor_id, workspace_path, object_key, sequence, admission_sequence)`
+index for the later event, all created by the additive schema migration.
+
+For example, 600 observations with a native `RAISE(ABORT)` on the 300th leave a 301-record suffix,
+which no empty outbox can hold. The span commits 599 events, one `errored` row naming capacity, and
+the advanced baseline. The next tick observes newer input. A BigInt payload fails event persistence
+and is outside the outbox domain: that one observation is `errored` and its siblings materialize.
+
+The same rule applies to the poll path (`ingest()`), the watch path (one yielded batch is one
+span, §2.4), and the not-due rollup window flush (`flushRollupWindow()`, §4.4). For the rollup
+flush, the notify state that clears `pendingRollup` commits in the same transaction as the
+flushed span. A flush that rolls back leaves the whole window held, records a best-effort
+`errored` row, and reports the error on the tick result. The next window check retries it.
+
+Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts`: a capacity overflow on
+the poll path, with its drop row, batch-row count, explain verdict and doctor rollup, kept
+through a later span of other keys and cleared by a later event for its key; a keyed drop kept
+through a `no-change` tick, an observe failure, a retained-only span and a span of other keys; a
+same-key event of another monitor or workspace that does not clear it; a later sibling of the
+same key that does; an unkeyed drop kept through quiet ticks and a span that drops again and
+cleared by a span that materializes and drops nothing; a rollup drop kept through the next hold
+and cleared by the flush that materializes its key; a drop kept across reopening the store; a
+drop of a removed, unparseable, duplicated or invalid definition reported in doctor; a drop kept
+outstanding across a later observe failure and accumulated with a later drop; a span whose only
+observation is dropped, kept through later quiet ticks; bounded, control-free identity text with
+no payload; explain and doctor failing for both a retained and a dropped failure; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
+outbox; a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
+fit, or roll back; and watch batches over capacity or with a BigInt payload. Each asserts the
+three-outcome invariant and that the next tick or batch makes progress.
 
 Suffix retry admission applies only while the owning SQLite transaction is still active after
 an envelope failure. A savepoint-local `RAISE(ABORT)` may retain an earlier successful prefix
@@ -646,6 +810,84 @@ claim that SQLite cancels asynchronous JavaScript effects. Watch batches use the
 
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
 `admitSpan()`, `flushRollupWindow()` and `finishMaterializationSpan()`.
+
+### 2.0 Source-config preflight (current)
+
+A tick **MUST NOT** observe a monitor whose config fails its registered source's
+schema. It **MUST** use the existing `validateWatchScope` helper, including its
+friendly collection-strategy and timezone diagnostics, and report the joined
+errors in `skippedMonitors` as `{ monitorId, validationError }` with no `nextDueAt`.
+This check applies to directory-backed and persisted ephemeral monitors, before
+due scheduling (even when not due), and before any held notify work can flush.
+The monitor is absent from `evaluatedMonitors`; a rejected config is not an
+attempted observation and creates no observation-history row.
+
+**Existing invalid configs that previously ran now stop observing. This is
+intentional.** Fix the reported config to resume. A skipped monitor's persisted
+baseline, last-observation time, and pending notify state **MUST** remain intact,
+including across restart; fixing only the source config resumes normal scheduling
+and releases held work according to its existing notify policy. For example,
+`value: 42` against a source requiring a string causes no source effect and leaves
+an overdue debounce batch untouched; changing it to `value: fixed` allows the next
+due tick to observe using the retained baseline and flush the captured batch.
+Healthy sibling monitors **MUST** continue progressing.
+
+Validation **MUST NOT** mutate the plugin's JSON Schema. The shared helper uses a
+private copy because validator setup may annotate schema nodes. Frozen valid schemas remain valid and
+must not prevent observation or watcher startup. A schema setup/evaluation exception
+(such as a malformed regular expression) **MUST** fail closed for that monitor with
+`Source schema validation failed: <cause>` through the existing joined validation
+diagnostics: tick `skippedMonitors`, watcher startup `onError`/stderr, and definition
+validation in explain/doctor/validate. It must not execute the affected source,
+consume its baseline/cursor/held notify work, or abort healthy siblings, final
+suppression cleanup, or hook-state refresh. Correcting the schema permits normal
+preflight and recovery; ordinary scope rejections retain their existing messages.
+
+Dormant verify-session cleanup runs before observation preflight. It **MUST**
+preserve safely derivable runtime cadence when sizing scratch-event suppression,
+independently of unrelated source-schema rejection. Authored parseable intervals
+and known runtime defaults retain
+`max(5 minutes, poll interval + notify settle/suppress window + 1 minute margin)`.
+Only a missing definition or unavailable/unparseable cadence uses the existing
+five-minute floor; duration parsing must not abort cleanup or sibling evaluation.
+For example, invalid globs with a valid `10m` interval and `5s` settle retain
+`665000ms` from reaping, rather than shortening to five minutes. Ordinary source
+preflight still rejects that config before observation, leaving baseline and
+legitimate notify work intact.
+
+**Known current cleanup gap:** a deleted scratch key retained in source state or
+an already-held scratch envelope can materialize after finite suppression expires;
+a held-only create may never have projected an event for the reaper to discover.
+The intended no-later-scratch-event goal remains, but the current finite mechanism
+does not establish it for arbitrary delayed recovery or held-only discovery.
+[Mike's decision in #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+accepts a separate M1 repair, [#562](https://github.com/mike-north/AgentMonitors/issues/562),
+sequenced after #305/#537/#554: durable exact ownership without TTL, explicit
+retirement, and no source-contract change. #557 may proceed after correcting its
+introduced cadence-window regression and documenting this gap; it does not wait
+for #562. No ownership/retention/filtering repair is implemented here.
+
+Continuous `watchMonitors()` startup **MUST** apply the same preflight before
+calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from
+the returned handle and reported through `onError` (or stderr when no callback is
+provided), with the same joined diagnostic. Watchers already running keep their
+startup config; live watcher reload is outside this contract. When the rejected scope
+has held work, its admission closes until valid recovery (§4.6).
+
+`monitor explain` **MUST** report a definition failure and `doctor` **MUST** report
+an invalid monitor with the same diagnostic as `validate`. A rejected monitor's outstanding
+dropped observation stays reported beside it, in explain's materialization stage and on doctor's
+rollup (§2, "Admission outcomes when the outbox cannot retain a suffix"). Doctor **MUST NOT**
+schedule a rejected scope: for example, `file-fingerprint` with valid `globs` and
+`interval: bad` returns the authoritative validation error, `due: false`, and no
+`nextDueAt`, while healthy siblings remain in the report. Diagnostic reads **MUST**
+preserve source state, pending notify work, events, and observation history.
+`daemon once` text and
+JSON output and the continuous daemon log **MUST** expose validation skips even
+when no events emit, naming the monitor and diagnostic; waiting for a next-due time
+cannot fix invalid config. Runtime and built-CLI regressions in
+`source-validation.test.ts` and `runtime-source-validation.test.ts` enforce these
+boundaries with source side effects, sibling progress, and restart recovery.
 
 ### 2.1 Due scheduling
 
@@ -701,7 +943,7 @@ as an observation-stage failure, not a crash") and `doctor-report.test.ts`.
 
 In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<ObservationResult>`, funnelling each finite batch through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
 
-While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source yields its associated restart baseline in each batch's `nextState`; the runtime commits it with the batch ([§2.4](#24-watch-mode-source-state-checkpointing)). A restarted watcher receives that persisted baseline in `context.previousState`.
+While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after its admitted batch settles, after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source yields its associated restart baseline in each batch's `nextState`; the runtime commits it with the batch ([§2.4](#24-watch-mode-source-state-checkpointing)). A restarted watcher receives that persisted baseline in `context.previousState`.
 
 > **Example:** a source that opens an OS file-system watcher yields a batch containing a `modified` observation and its next fingerprint state when a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
 >
@@ -734,7 +976,9 @@ notify state, successful event prefix (including all recipient projections/curso
 and complete ordered retry suffix in one synchronous transaction. The whole unit **MUST** commit
 before the first Interpret invocation or next iterator pull. No source/plugin callback, Interpret,
 or other external asynchronous effect runs inside that transaction. A materialization failure with
-successful durable retry admission is an admitted batch; an outbox/state/transaction failure is not.
+successful durable retry admission is an admitted batch. So is one whose failed observation the
+outbox could not retain and which was recorded `errored` in the same commit (§2). An
+outbox/state/transaction storage failure is not.
 
 `nextState` is source-owned change-detection/restart state, not a recipient baseline, delivery
 receipt or agent acknowledgement. Omitted or `undefined` preserves the prior source baseline;
@@ -789,6 +1033,30 @@ read visibility, rollback/reopen, state-only failure, missing/undefined/null sta
 refusal, workspace isolation, abort, replacement ownership and lifecycle cleanup), with existing
 end-to-end watch/poll exclusivity scenarios retained in `service.test.ts`.
 
+#### Notify admission gate and teardown
+
+While the notify admission gate ([§4.6](#46-effective-notify-policy-edits-current)) is closed — a
+failed edit drain, an unresolved source, or a rejected scope with held work — a yielded batch waits
+on the consumer's stack and the iterator is not pulled again. The waiting batch is not admitted, so
+it records no drop and queues no retry; its observations and `nextState` stay unpersisted until the
+gate opens. Admission rereads the gate, cancellation and the watcher's ownership token in the same
+synchronous turn as the batch's transaction. The watcher's source factory is likewise created only
+once the gate is open, from the latest admitted definition and the baseline persisted at that turn.
+
+`stop()`/abort releases a waiting batch unadmitted. A superseded watcher's batch is never admitted,
+and that watcher releases only its own cache lease, never its successor's slot. Because one batch is
+admitted at a time, completion or an iterator error happens only after the last admitted batch has
+settled; only then does the watcher retire its slot and lease, so polling or a replacement watcher
+reads the resulting durable baseline rather than overtaking it.
+
+**Example.** A batch carrying cursor 111 waits while an edited-policy drain is blocked. A recovery
+tick commits the old hold, then the batch is admitted with cursor 111; only after that may polling or
+a later batch advance the baseline to 999. Reopening SQLite shows 999, never a stale 111.
+
+`runtime/notify-checkpoint-teardown.test.ts` and `runtime/notify-boundaries.test.ts` verify waiting
+batches at a closed gate, completion and error after admission, abort, token supersession, polling
+and replacement exclusion, workspace/monitor isolation and independent SQLite reopen.
+
 ### 2.5 Tick result
 
 `tick()` returns a `RuntimeTickResult` summarizing the tick:
@@ -796,7 +1064,7 @@ end-to-end watch/poll exclusivity scenarios retained in `service.test.ts`.
 - `evaluatedMonitors` — the ids of every monitor whose `observe()` was attempted this tick (including monitors whose outcome was `errored`).
 - `emittedEventIds` — the ids of the durable events materialized this tick.
 - `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
-- `skippedMonitors` — one `{ monitorId, nextDueAt }` entry per monitor found in the directory but skipped because it was not yet due (interval not elapsed for interval-based monitors; cron window not open for schedule monitors). Populated from the **same** scheduling decision that gates evaluation, so it is never recomputed. A monitor with an active continuous watcher does **not** appear here (it is driven by the watcher, not by the tick).
+- `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
 
 The runtime **MUST** surface `erroredObservations` so a caller (e.g. the CLI tick output, §10.1/§10.2) can report a failed observation rather than print a clean `emitted 0` that an author cannot distinguish from a genuine no-change.
 
@@ -1080,8 +1348,8 @@ three clocks especially visible:
    batch is flushed as a unit. If materialized as individual events, each event carries its own
    effective urgency.
 
-6. **No per-change interrupts.** A monitor with `strategy: rollup` **MUST NOT** deliver anything
-   outside a window opening. Observations accumulate silently between windows. This is the defining
+6. **No per-change interrupts.** Except for the effective-policy-edit boundary in §4.6,
+   a monitor with `strategy: rollup` **MUST NOT** deliver anything outside a window opening. Observations accumulate silently between windows. This is the defining
    property: the author trades per-change interrupts for a predictable delivery schedule.
 
 **Relationship to the Pace stage (§1.1.1).** Rollup is entirely on the **shared** side of the
@@ -1113,6 +1381,195 @@ explicitly names lower token and observation cost as a first-class motivation fo
 signal become a candidate for delivery" (§1.1.1): immediately on change, after the signal settles,
 at most once per window, or on an author-defined schedule. No further Pace modes are anticipated at
 this stage.
+
+### 4.6 Effective notify-policy edits (_current_)
+
+> **Status: current.** Refs #537; decision [#556](https://github.com/mike-north/AgentMonitors/issues/556#issuecomment-6665228377).
+> An author-caused policy edit is a narrow early-flush exception to debounce settling (§4.3)
+> and rollup's window-only rule (§4.4). It does not claim or acknowledge a delivery.
+
+The runtime **MUST** reconcile effective pacing edits before source-due and active-watcher
+skips, without requiring new source input. Each held envelope's captured definition determines
+its original policy. Effective policy includes the strategy, normalized duration, rollup cron
+and timezone (default UTC), granted whole-batch escalation (§4.1), and
+urgency/salience-dependent defaults when notify is omitted.
+Equivalent duration spellings and explicit/default UTC are unchanged policies. A body/title edit
+alone does not change pacing. The effective policy is compared over absent salience and all three
+salience levels, so an urgency band edit only changes pacing when the resolved notify behavior
+changes. A scalar urgency edit with unchanged explicit debounce retains its clock; a band edit
+that changes the grant to flush a held batch early is an effective pacing change. This includes
+observations resolving to immediate or throttle: escalation is tested before either branch.
+
+On a changed policy, the runtime **MUST** flush **all** existing debounce/rollup holds before
+observing new work under the edited policy. This covers debounce → immediate/throttle/rollup,
+rollup → immediate/throttle/debounce, and effective parameter/default changes within a strategy.
+Unchanged effective policy preserves normal clocks. Omitted notify at high urgency still means
+15s debounce (§4.1), not immediate.
+
+The flush uses each envelope's original content, effective urgency, title/source policy, payload,
+observation timestamp and handling/Shape/Interpret definition. Observation body still takes
+precedence over captured monitor instructions. Missing legacy effective urgency is backfilled
+from the captured definition per §3; missing/invalid captured semantics **MUST** block recovery,
+never borrow values from the new definition. Already-materialized rows remain immutable (#451).
+Old holds retain their order; mixed legacy hold arrays use stable observation-time order, with
+array order and then debounce-before-rollup as ties. Retired throttle suppression and rollup
+minute guards **MUST** be cleared when adopting a changed policy; they cannot suppress accepted
+old work or the new policy's first observation. Private persisted policy identity permits guard
+reset across restarts; it is not an authoring field. Changes to that private encoding alone must
+not flush unchanged captured work or reset its clocks; complete captured definitions still detect
+real effective edits when older metadata omitted an escalation bit.
+
+**Legacy identity learning (current).** If successful unchanged reconciliation finds no private
+policy key on an existing scoped row, it **MUST** record the current effective identity under the
+same owned writer boundary. This is metadata learning, not an edit: preserve all guards, holds,
+observation clocks, opaque source state and materialized artifacts. It must not make observation
+due or create a synthetic previous-state baseline for a fresh scope. A later known effective edit,
+including after restart, can then retire its suppression/minute guards before new work. With no
+historical key or held definition, edits before that first successful scan are unknowable and are
+not retroactively inferred. Failed validation or identity persistence does not record a successful
+key; existing compatible key encodings retain unchanged clocks.
+
+**Source-baseline preservation (current).** Every notify-only reconciliation commit, including
+retiring guards without held work and atomically draining holds, **MUST** update only notify-owned
+metadata and its legitimate materialization artifacts. It must preserve the persisted
+`source_state`, `last_fingerprint` and `last_observation_at` columns exactly, without decoding and
+reserializing the source baseline. Source ingestion (poll results and watch batches, §2.4) retains
+its existing ownership.
+For example, a legacy raw JSON `null` baseline with a fingerprint remains `null` after a not-due
+throttle `1h` → `1s` edit and SQLite reopen; the next actual source call receives `previousState:
+null`, not `{}`. The edit neither makes observation due nor creates a fresh baseline. Failed
+notify persistence rolls back held materialization and metadata together, preserving those same
+source columns. This extends the source ownership rule in §3 and 003 §2 to effective edits;
+`runtime/notify-only-baseline.test.ts` verifies tick/startup, guard resets, drains, rollback and the
+next real source input across restart.
+
+**Discovery freshness (current).** A directory scan supplies candidate file paths, not authority
+for a later policy mutation. Tick and watcher startup **MUST** synchronously reread each authored
+definition immediately before its reconciliation transaction, without an intervening await. That
+read is the admission linearization point: a file edit after it belongs to a subsequent discovery.
+An older scan delayed on another monitor cannot restore obsolete pacing, drain newer held work,
+or reopen a gate blocked by a newer edit. Missing/invalid scan diagnostics likewise recheck the
+captured file before closing its gate. File location is not identity (001 §2): if a live owner's latest
+admitted definition for the **same monitor ID and workspace** has a different path, both locations
+are reread. A valid current replacement protects admission from an obsolete path's disappearance;
+cached contents alone never authorize it. A missing/invalid current replacement or unresolved source
+still blocks. Two valid same-ID locations remain a fatal duplicate, not a cached-path preference.
+Missing-definition diagnostics use this same scoped resolution, including current source/scope
+validation for held work. Returning to a previously used policy or moving back to a previous location
+remains legitimate. Fallback requires genuine absence evidence: a metadata query must report
+ENOENT or ENOTDIR for the admitted location. A false boolean existence probe also represents access
+or query failure and **MUST NOT** authorize replacement. Permission, other I/O or unclassified
+metadata failures keep admission blocked with the original read diagnostic and retained holds.
+Closing permission **MUST NOT** forget the current location to revalidate: repeated unchanged
+tick/startup and captured-route discoveries remain blocked until that location is valid or genuine
+absence permits moveback. A newly selected location that fails source resolution or reconciliation
+also becomes the current location while blocked; subsequent file edits there are reread, not replaced
+with cached contents. One current pathname belongs to the existing counted live ownership, separately
+from open/closed permission. It contains no instruction snapshot or historical locations and retires
+with the last watcher/poll/deferred-result lease. No retired location governs a future owner.
+Established source/handling snapshots are not restarted or reconfigured; independent scopes continue.
+
+**Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
+reread current held state under that writer boundary, and commit the entire old batch's events,
+projections, cursor seeds, snapshots and removal of corresponding holds together. No stale read
+before the writer lock can authorize removal or replay. Event materialization units may nest as
+savepoints; the edit drain must not join an externally owned transaction. This prevents two
+runtimes from duplicating or overwriting one drain. Optional Interpret runs after commit using
+each event's own projected recipients. This does not guarantee exactly-once downstream effects
+(000 NP2).
+
+Unknown-source handling **MUST** inspect current workspace-scoped operational holds at source
+resolution, not membership captured before an earlier monitor awaited. A live watcher may create
+its first hold during that await. Existing admission closes on unresolved source even without holds;
+with current held work the failure is scoped, the holds remain, and healthy siblings continue. The
+existing fatal unknown-source behavior without held work is preserved. A watch batch cannot
+advance under that invalid definition and is admitted only after valid reconciliation, or released
+unadmitted on cancellation.
+
+Any deterministic write failure **MUST** roll back every event and all original held/source/timing
+state. The runtime reports the blocked edit through existing tick errors and best-effort history,
+retains holds even if diagnostic persistence fails, and defers only that monitor's new observation
+and source-baseline advancement. Healthy siblings and other workspace scopes continue. Restart or
+another edit retries from durable captured state. Watcher acceptance is backpressured while
+blocked: the consumer retains its current unaccepted batch and does not request another (§2.4).
+Admission **MUST** re-read the current gate in the same synchronous turn as the durable mutation;
+a definition captured before an `await` cannot authorize a later write. A waiting batch whose gate
+closes before its mutation waits for recovery or cancellation. The admitted span's deterministic
+writes finish before optional async Interpret can interleave another edit.
+
+An edit drain and ordinary admission fail differently. Ordinary ingest and window flushes keep
+their span contract (§2): a dispatched observation that cannot materialize is retained with its
+ordered suffix for retry, or recorded as a drop when the outbox cannot retain it. An edit drain is
+all-or-nothing: if any held envelope cannot materialize, the whole drain rolls back, the holds stay
+held and the gate stays closed, and it records no drop and queues no retry. Work blocked at a closed
+gate (a waiting batch or a retained poll result) has not been admitted, so it records neither. A
+drop is a history outcome, never held work, so it neither keeps the gate closed nor is drained by an
+edit. An outstanding drop stays outstanding across an edit unless the drain materializes an event
+that supersedes it under the §2 rule.
+Reconciliation can resume it without reloading the live source. Its reconciled pacing and
+urgency band govern future yields; its established execution/handling snapshot remains until an
+explicit restart.
+Watcher startup **MUST** reconcile existing scoped watcher/evaluating-poll/deferred-result ownership
+even when the current registered source has no watch factory. Factory capability controls creation,
+not admission for live work. A failed drain, or an invalid scope while held work exists, blocks
+watch batch admission and baseline writes; valid recovery commits old work before they resume.
+No new watcher, source reload or polling is introduced. An observe-only scope without its own live ownership remains untouched
+by watcher startup, even if other scopes have owners.
+Successful startup drains **MUST** refresh the affected workspace's session
+hook state after commit, even if the source never yields and no tick follows; failed transactions
+must not publish an unread prefix. This rule does not introduce unrelated live-definition reload behavior.
+
+Polling shares this boundary: concurrent rescans may reconcile a monitor while its `observe()` is
+in flight. The runtime **MUST** recheck current admission before the returned result's deterministic
+writes, applying current pacing with the established execution/handling snapshot. Only one source
+observation may be in flight or awaiting admission per monitor/workspace. Once an operation
+relinquishes that admission, its later completion/error reporting **MUST NOT** remove a successor's
+slot or wake waiters as if that successor had finished. If reconciliation is
+blocked, retain that returned result locally and finish the tick with an explainable error, so the
+daemon can run a later recovery scan. A successful rescan drains the old captured holds and admits
+the retained result before another observation or watcher factory can overtake its source baseline.
+This local retention is not a durable recovery queue: before admission, the persisted source cursor
+remains unchanged, so restart reobserves from that cursor under the existing source contract.
+
+Watcher factory creation **MUST** reread the gate and cancellation in its synchronous creation
+turn. Its full initial definition is the latest admitted definition at actual creation; subsequent
+pacing changes preserve that established execution/handling snapshot. Outstanding polls precede
+factory creation, including a startup overlapping polling without a failed edit.
+
+Cached notify definitions **MUST** belong only to live watcher/poll admissions or locally retained
+results. Removing a deferred result for handoff **MUST** release exactly its retained lease on
+every invocation exit, including definition assembly or source-result argument getters failing
+before ingestion starts. Other live watcher/poll owners keep their leases. Such handoff failures
+remain visible as ordinary observation failures **after** the edit transaction committed; they
+cannot claim the drained holds were retained or restore them. Poll completion and watcher teardown
+release their ownership; cancellation/session close/dormancy also retire unadmitted ephemeral results. Reaping cannot resurrect their timing/baselines
+or keep private instruction snapshots as historical cache entries. Cleanup of this process-local
+metadata does not delete durable holds, event history or diagnostics. Missing/invalid definitions
+with operational work retain that work until valid reconciliation or its existing lifetime rules.
+
+An invalid/unreadable/missing current definition **MUST** retain its operational holds and report
+the blocking reason. Current source-scope validation at this boundary protects existing holds;
+it does not introduce general observe-time preflight for monitors without held work. When a tick
+or watcher startup rejects a scope (§2.0) that has durable holds or a retained poll result,
+admission closes and a running watcher's next batch waits for valid reconciliation. Without
+such held work, the rejection never closes admission by itself: a watcher whose admission is open
+keeps its startup config, while one already blocked (an unresolved source, a failed drain) stays
+blocked until a valid definition is reconciled, and nothing it yielded is lost.
+There is no implicit cancellation on removal, rename or invalid metadata. Draining retained retries
+(§2) and flushing unchanged policies after source errors are separate contracts, not added by this rule.
+
+**Example.** At 08:00, debounce holds A at normal urgency with instructions X. At 08:00:02 the author
+selects daily rollup and instructions Y. Reconciliation commits A immediately with normal/X and
+its original 08:00 timestamp, before any new source observation. New B uses Y and waits for rollup's
+09:00 window. If A's write fails, A remains held and B is not newly observed until the drain succeeds.
+
+**Verification:** `runtime/notify-boundaries.test.ts` covers immediate/throttle escalation identity,
+real watcher batch microtask races, synchronous acceptance before Interpret, and actual
+hook-file refresh after idle/completed startup drains. `runtime/notify-policy-edit.test.ts` covers the transition/default/parameter
+matrix, captured fields, unchanged clocks, missing/invalid definitions, SQLite trigger failures
+(including a later batch event and hold removal), sibling/workspace isolation, watcher backpressure,
+post-commit Interpret, actual owned-child SIGKILL before/after commit and independent-process stale
+read reconciliation. Child probes load the same TypeScript source without invoking a package build.
 
 ## 5. Event Materialization
 
@@ -1160,7 +1617,39 @@ If an emitted observation includes `snapshotText`, the runtime **MUST**:
 2. compute a textual diff if a previous snapshot exists
 3. store the new snapshot in the same transaction as the event, projections, and cursor seeds
 
-**Snapshot ordering (total materialization order).** `created_at` is stored at epoch-**second** precision, so several snapshots for one `(workspacePath, monitorId, objectKey)` written in the same second (an ordinary same-tick burst) tie on `created_at`. The runtime **MUST** give snapshots a total materialization order and resolve "the latest stored snapshot" to the **most recently materialized** one under identical timestamps — never an older tied row, which would corrupt the shared diff chain (repeating or omitting intermediate changes). This is satisfied by a strictly-increasing (monotonic ULID) snapshot `id` and ordering by `(created_at, id)` — the same tie-break the `monitor_events` table already uses. User-visible newest-first listings that order by second-precision `created_at` (`events list` / `monitor explain` event and observation-history audit rows) apply the same `id` tie-break so their order is stable within a second.
+**Snapshot ordering (total materialization order).** The runtime **MUST** resolve
+"the latest stored snapshot" to the most recently materialized retained row for its
+workspace/monitor/object, independently of observation timestamps, ambient clock changes,
+or process-local ULID factories. `monitor_snapshots.sequence` is a private SQLite
+`INTEGER PRIMARY KEY AUTOINCREMENT`, allocated in the snapshot insert and its enclosing
+materialization transaction. `latestSnapshot()` orders by `sequence DESC` only. Public
+snapshot `id` values remain unique ULIDs; they identify rows but do not order them.
+
+SQLite's single writer serializes allocations across connections/processes. A rollback
+leaves no committed predecessor and may reuse its uncommitted allocation. Deleting any
+committed rows, including the newest or all rows, does not reuse their sequence numbers;
+a new snapshot follows the remaining history. Explicit integer keys survive reopen and
+`VACUUM`. The sequence is private ordering metadata, not an external cursor or contiguous
+counter. Existing event/projection/snapshot atomicity is unchanged.
+
+A legacy snapshot table is rebuilt atomically under the schema migration's immediate
+transaction. All public IDs, contents, timestamps, scope and event references survive;
+explicit indexes and triggers are recreated without replaying insertion side effects.
+The event and snapshot rebuilds share one trigger-preservation scope inside that
+transaction. When either retained legacy table needs rebuilding, all persisted
+main-schema triggers are temporarily suspended, including triggers owned by other
+tables that reference either rebuilt table. Their exact stored SQL is restored only
+after both final table names exist. A copy, index or trigger-restoration failure rolls
+back the complete original schema and data. Already-current/new schemas do not churn
+triggers; connection pragmas, public identities and ordering policies remain unchanged.
+
+Retained rows receive sequence numbers in their **current hidden rowid order**. This is
+an explicit bootstrap policy: it cannot recover chronology already lost before migration
+(for example through historical `VACUUM`) or repair previously generated diffs. Reopening
+an already migrated database is idempotent; simultaneous openers serialize the migration.
+Older binaries can still insert their named columns, but their timestamp/ULID readers do
+not gain the corrected ordering behavior. Event ordering is defined separately in §1.1.7; observation-history ordering and source
+frontiers are unchanged by these sequences.
 
 The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§11.3), via `buildDiff(previous, current, strategy)`:
 
@@ -1177,7 +1666,7 @@ The renderer is chosen by the object's `change-detection.strategy` (003 §4.2/§
 > Fixing this (carrying `ignore-paths` through the persisted snapshot metadata and stripping the
 > same fields before rendering) is a follow-up, not implemented as part of issue #437.
 
-Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (monotonic `snapshotUlid`, `(created_at, id)` tie-break); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries); `libs/core/src/runtime/transactional-materialization.test.ts` (rollback after cursor and snapshot failures).
+Verified: `libs/core/src/runtime/service.ts` — `materializeObservation()`; `libs/core/src/runtime/store.ts` — `insertEvent()`, `collapseNetForClaim()`, `saveSnapshot()`/`latestSnapshot()` (private SQLite snapshot sequence); `libs/core/src/runtime/diff.ts` — `buildDiff()`, `buildTextDiff()` (cap at 20 lines), `buildJsonDiff()` (cap at 20 entries); `libs/core/src/runtime/transactional-materialization.test.ts` (rollback after cursor and snapshot failures).
 
 This makes snapshot history an object-level concern rather than a monitor-level or session-level concern (SP5).
 
@@ -1188,6 +1677,60 @@ This makes snapshot history an object-level concern rather than a monitor-level 
 > shared/per-recipient seam ([§1.1.2](#112-the-shared--per-recipient-seam)), and recorded on
 > `session_event_state.diff_text`; the shared object-level diff here is its degenerate
 > single-baseline case (a recipient at the shared baseline gets a byte-identical span).
+
+### 5.3 Pending events keep the semantics they were observed under
+
+> **Status: current.** Resolves issue [#451](https://github.com/mike-north/AgentMonitors/issues/451).
+
+Editing a monitor's `MONITOR.md` (raising `urgency`, rewriting the body, narrowing a
+`command-poll` filter) is routine, and an edit can land while events from the old definition are
+still pending or while an observation is held in a notify batch.
+
+**Contract.** A monitor event is delivered with the `urgency`, `title` and `body` it was
+materialized under. An edit changes what _future_ observations produce; it never changes an event
+already stored, and it never changes whether that event interrupts a turn. An observation held in a
+debounce/rollup batch across the edit materializes under the definition it was observed under,
+because the batch stores the whole definition snapshot with each observation.
+
+This holds because of how the runtime is built, not because of a special case:
+
+- `processObservation` writes `urgency`, `title` and `body` onto the `monitor_events` row from the
+  observation's stored definition snapshot, and no code path updates those columns afterwards.
+- Every delivery surface (the `turn-interruptible`/`turn-idle`/`post-compact` claims, the hook and
+  channel renderers, hook state, `events` output) renders the stored row, its stored digests and its
+  per-recipient diff. None re-reads the live definition. The live definition is read only to decide
+  _when_ to observe and for `explain`/`scan` display.
+- Observation, event and source timestamps stay as provenance.
+
+**Diagnostic.** Each row also stores `definition_fingerprint`, a short hash of the parts of the
+definition that decide what an event is, computed once at materialization (nullable, additive; `NULL`
+on rows from before the column existed). Objects are hashed in canonical key order, so key order and
+whitespace in the file do not matter (array order does).
+
+| Included                                  | Why it can change a stored or delivered event                                                                                    |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `urgency`, `urgencyMax`                   | the event's delivery urgency                                                                                                     |
+| the body                                  | the delivered body when the source supplies none                                                                                 |
+| `name`                                    | the delivered title ([§5.4](#54-event-title))                                                                                    |
+| `watch`, except the scheduling keys below | source and configuration (command, query, globs, …) decide the payload and `objectKey`                                           |
+| `shape`, `payload`                        | derive facts, render the snapshot and transform the payload before diffing, so they change the stored snapshot, diff and payload |
+| `baseline-strategy`                       | stored on the event; decides how each recipient's catch-up span is collapsed                                                     |
+
+| Excluded         | Why                                                                    |
+| ---------------- | ---------------------------------------------------------------------- |
+| `notify`         | decides when events materialize, not what they contain                 |
+| `tags`           | a label used only to filter `events list`                              |
+| `watch.interval` | read by the scheduling engine, not by any source; changes cadence only |
+
+The schedule source's `cron` and `timezone` stay included: the scheduler reads them, but that source
+also writes them into its payload and `objectKey`.
+
+`monitor explain`'s delivery stage compares the stored fingerprint with the current definition and
+reports the **total** number of pending events that predate it (not bounded by `--limit`), with their
+ids in `details.staleDefinitionEventIds`. `NULL` means unknown and is never reported. The diagnostic
+is read-only and never gates, delays or alters delivery.
+
+**Verified in:** `libs/core/src/runtime/definition-change.test.ts`.
 
 ### 5.4 Event title
 
@@ -1647,7 +2190,8 @@ monitor through the persisted pipeline state and returns stages for:
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
 3. Observation: recent `observation_history` rows and latest outcome
 4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
-5. Materialization: recent `monitor_events`
+5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
+   `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
    `unread`, `claimed`, or `acknowledged`. When a session's unread normal/low events are already
    claimed with no fresh work remaining, or a same-band lease exists, this stage additionally
@@ -1667,7 +2211,7 @@ Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
   expected absence of events/projections. The verdict for a genuinely idle monitor is therefore an
   affirmative `healthy` at the observation stage (e.g. "Source ran, observed 0 changes — your watched
   target genuinely hasn't changed (not a bug).").
-- `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, or a missing expected projection.
+- `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, an outstanding dropped observation, terminal retained work, or a missing expected projection.
   (An unreachable daemon is **not** itself a stage failure: the CLI falls back to an in-process read
   of the persisted store — see the no-daemon fallback below.)
 
@@ -1680,6 +2224,19 @@ This is a read-only display transformation: `details`, history JSON and stored a
 unchanged. The existing verdict severity ordering still applies; another failure may win the
 verdict without removing this observation-stage diagnostic. Verified: `source-error-state.test.ts`
 and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
+
+While the monitor has an outstanding dropped observation (§2, "Admission outcomes when the outbox
+cannot retain a suffix"), the materialization stage is `failure` with reason
+`<count> observation(s) were dropped because the retry outbox could not retain them; the newest,
+<which>, failed: <displayed error>`. `<which>` is `observation <position> of <spanSize>`, followed
+by `(<objectKey>, "<title>")` with whichever of the two were recorded; the error uses the display
+rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
+`unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
+retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
+`failure` until every drop is superseded (§2): a quiet tick, a notify hold, an observe failure or
+events for other keys leave it failing. The observation stage still describes the newest history
+row. Verified: `unretainable-suffix-admission.test.ts` and, through a real `daemon run` socket
+after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts` (Refs #497).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -1834,40 +2391,63 @@ Verified: `libs/core/src/inbox/schema.ts` (entire file); `libs/core/src/inbox/db
 
 Corresponds to the `monitorEvents` Drizzle table. One row per materialized observation. Rows are immutable after insertion.
 
-| Column              | Type             | Notes                                           |
-| ------------------- | ---------------- | ----------------------------------------------- |
-| `id`                | TEXT PK          | ULID                                            |
-| `workspace_path`    | TEXT nullable    | Path to the workspace; `NULL` for global events |
-| `monitor_id`        | TEXT NOT NULL    | Stable monitor identifier                       |
-| `source_name`       | TEXT NOT NULL    | Source plugin name                              |
-| `urgency`           | TEXT NOT NULL    | `low \| normal \| high`                         |
-| `title`             | TEXT NOT NULL    |                                                 |
-| `body`              | TEXT NOT NULL    | Defaults to `''`                                |
-| `summary`           | TEXT NOT NULL    | Defaults to `''`                                |
-| `payload`           | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `snapshot_metadata` | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `snapshot_text`     | TEXT nullable    | Full snapshot content if provided               |
-| `diff_text`         | TEXT nullable    | Line-level diff vs. previous snapshot           |
-| `object_key`        | TEXT nullable    | Snapshot and diff keying                        |
-| `query_scope`       | TEXT NOT NULL    | JSON; defaults to `{}`                          |
-| `tags`              | TEXT NOT NULL    | JSON array; defaults to `[]`                    |
-| `created_at`        | INTEGER NOT NULL | Observation timestamp                           |
+| Column                   | Type                     | Notes                                           |
+| ------------------------ | ------------------------ | ----------------------------------------------- |
+| `sequence`               | INTEGER PK AUTOINCREMENT | Private equal-time materialization tie-break    |
+| `id`                     | TEXT NOT NULL UNIQUE     | Public ULID identity                            |
+| `workspace_path`         | TEXT nullable            | Path to the workspace; `NULL` for global events |
+| `monitor_id`             | TEXT NOT NULL            | Stable monitor identifier                       |
+| `source_name`            | TEXT NOT NULL            | Source plugin name                              |
+| `urgency`                | TEXT NOT NULL            | `low \| normal \| high`                         |
+| `title`                  | TEXT NOT NULL            |                                                 |
+| `body`                   | TEXT NOT NULL            | Defaults to `''`                                |
+| `summary`                | TEXT NOT NULL            | Defaults to `''`                                |
+| `payload`                | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_metadata`      | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_text`          | TEXT nullable            | Full snapshot content if provided               |
+| `diff_text`              | TEXT nullable            | Line-level diff vs. previous snapshot           |
+| `object_key`             | TEXT nullable            | Snapshot and diff keying                        |
+| `query_scope`            | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `tags`                   | TEXT NOT NULL            | JSON array; defaults to `[]`                    |
+| `created_at`             | INTEGER NOT NULL         | Observation timestamp                           |
+| `admission_sequence`     | INTEGER nullable         | Retry admission position; see below (§2)        |
+| `definition_fingerprint` | TEXT nullable            | Observing definition's fingerprint (§5.3)       |
+
+`admission_sequence` is set only on an event completed from the retry outbox: the position its
+retry reserved in the materialization order when it was queued (`0` for a retry queued before
+positions were reserved). `NULL` means the event was admitted where it committed, at `sequence`.
+Supersession of a dropped observation compares admission positions (§2).
+
+`definition_fingerprint` is the fingerprint of the definition the observation was made under,
+computed from the envelope's monitor snapshot at materialization (§5.3). An event completed from the
+retry outbox carries its stored envelope's fingerprint, supplied by the completing caller with the
+rest of that envelope's materialization, never the current definition's. `NULL` on rows from before
+the column existed.
+
+Both columns are additive. The materialization-order rebuild of a pre-`sequence` table carries each
+of them when the old table already has it and copies `NULL` otherwise; the migration then adds any
+still missing and creates the object-key index on the rebuilt table.
 
 ### `monitor_snapshots`
 
 Stores the full text content of each snapshot for diff computation. Keyed by `(workspace_path, monitor_id, object_key)`.
 
-| Column           | Type             | Notes                                                   |
-| ---------------- | ---------------- | ------------------------------------------------------- |
-| `id`             | TEXT PK          | Monotonic ULID — strictly increasing in insertion order |
-| `workspace_path` | TEXT nullable    |                                                         |
-| `monitor_id`     | TEXT NOT NULL    |                                                         |
-| `object_key`     | TEXT NOT NULL    |                                                         |
-| `event_id`       | TEXT NOT NULL    | FK to `monitor_events.id`                               |
-| `content`        | TEXT NOT NULL    | Full snapshot text                                      |
-| `created_at`     | INTEGER NOT NULL | Epoch **seconds**; ties broken by `id` (§5.2)           |
+| Column           | Type                     | Notes                                       |
+| ---------------- | ------------------------ | ------------------------------------------- |
+| `sequence`       | INTEGER PK AUTOINCREMENT | Private durable materialization order       |
+| `id`             | TEXT NOT NULL UNIQUE     | Public ULID identity; not an ordering key   |
+| `workspace_path` | TEXT nullable            |                                             |
+| `monitor_id`     | TEXT NOT NULL            |                                             |
+| `object_key`     | TEXT NOT NULL            |                                             |
+| `event_id`       | TEXT NOT NULL            | Logical reference to `monitor_events.id`    |
+| `content`        | TEXT NOT NULL            | Full snapshot text                          |
+| `created_at`     | INTEGER NOT NULL         | Epoch seconds for diagnostics, not ordering |
 
-The draft omitted this table. It is required for snapshot diff computation (§5.2) and is populated by `RuntimeStore.saveSnapshot()`. `id` is a monotonic ULID so same-second snapshots retain a total materialization order and `latestSnapshot()` resolves to the newest via `ORDER BY created_at DESC, id DESC` (§5.2, issue #293). Verified: `libs/core/src/runtime/store.ts` — `saveSnapshot()` / `latestSnapshot()`.
+`RuntimeStore.saveSnapshot()` allocates the sequence through SQLite;
+`latestSnapshot()` selects the greatest retained sequence for the scoped object. See
+§5.2 for rollback, deletion, reopen and legacy migration semantics. The public result
+remains `{ content }`. Verified: `runtime/store.ts`, `inbox/schema.ts`, `inbox/db.ts`, and
+`runtime/snapshot-materialization-order.test.ts`.
 
 ### `materialization_retry_outbox`
 
@@ -1875,20 +2455,25 @@ Durable observations that could not complete deterministic materialization. Each
 stored observation envelope and trusted local route so a later attempt can re-enter materialization
 without invoking the source or moving a source cursor again.
 
-| Column            | Type             | Notes                                             |
-| ----------------- | ---------------- | ------------------------------------------------- |
-| `id`              | TEXT PK          | Monotonic ULID                                    |
-| `workspace_path`  | TEXT nullable    | Part of the per-monitor capacity scope            |
-| `monitor_id`      | TEXT NOT NULL    | Must match the stored envelope                    |
-| `source_name`     | TEXT NOT NULL    | Must match the envelope's monitor source          |
-| `envelope`        | TEXT NOT NULL    | JSON `StoredObservationEnvelope`                  |
-| `envelope_bytes`  | INTEGER NOT NULL | Exact persisted UTF-8 byte count                  |
-| `attempt_count`   | INTEGER NOT NULL | Automatic retry failures; starts at `0`           |
-| `status`          | TEXT NOT NULL    | `pending \| terminal`                             |
-| `next_attempt_at` | INTEGER nullable | `NULL` after terminalization                      |
-| `last_error`      | TEXT nullable    | Control-stripped, bounded safe diagnostic message |
-| `created_at`      | INTEGER NOT NULL | Preserves oldest-first drain order                |
-| `updated_at`      | INTEGER NOT NULL | Last attempt or operator re-arm                   |
+| Column               | Type             | Notes                                             |
+| -------------------- | ---------------- | ------------------------------------------------- |
+| `id`                 | TEXT PK          | Monotonic ULID                                    |
+| `workspace_path`     | TEXT nullable    | Part of the per-monitor capacity scope            |
+| `monitor_id`         | TEXT NOT NULL    | Must match the stored envelope                    |
+| `source_name`        | TEXT NOT NULL    | Must match the envelope's monitor source          |
+| `envelope`           | TEXT NOT NULL    | JSON `StoredObservationEnvelope`                  |
+| `envelope_bytes`     | INTEGER NOT NULL | Exact persisted UTF-8 byte count                  |
+| `attempt_count`      | INTEGER NOT NULL | Automatic retry failures; starts at `0`           |
+| `status`             | TEXT NOT NULL    | `pending \| terminal`                             |
+| `next_attempt_at`    | INTEGER nullable | `NULL` after terminalization                      |
+| `last_error`         | TEXT nullable    | Control-stripped, bounded safe diagnostic message |
+| `created_at`         | INTEGER NOT NULL | Preserves oldest-first drain order                |
+| `updated_at`         | INTEGER NOT NULL | Last attempt or operator re-arm                   |
+| `admission_sequence` | INTEGER nullable | Reserved admission position; see below (§2)       |
+
+`admission_sequence` is the position the row reserved in the `monitor_events` materialization
+order (that table's AUTOINCREMENT counter) when it was queued; its completed event keeps it (§2).
+It is `NULL` on rows queued before positions were reserved.
 
 Capacity is 256 rows or 8 MiB of stored envelopes per `(workspace_path, monitor_id)`, including
 terminal rows. Envelope size is the exact serialized UTF-8 byte count. Callers must supply ordinary
@@ -1925,7 +2510,10 @@ supported plain-data inputs.
 without invoking their hooks. The validated instant is serialized explicitly as ISO text and
 restored as a Date; a string timestamp is not an accepted substitute. A batch
 enqueue uses one immediate transaction: if every failed sibling cannot fit, none is stored. Another
-workspace or monitor has independent capacity.
+workspace or monitor has independent capacity. Runtime admission does not rely on that rejection:
+it checks the domain and remaining capacity (`RuntimeStore.materializationRetryCapacity()`, the
+same bound) first. It enqueues only a suffix that fits, and records an unretainable failure as
+`errored` (§2, "Admission outcomes when the outbox cannot retain a suffix").
 
 New records first become due after at least 1 second, measured from the instant the retry is
 enqueued (_current_): backoff starts after source acquisition and prefix materialization, not at the
@@ -1991,11 +2579,13 @@ retain their primary diagnosis. This ordering does not provide a cross-process t
 snapshot or change the meaning of `generatedAt` or the caller's `now`.
 
 `doctorReport` attaches retry summaries to unambiguous parsed monitor rollups, including those with
-invalid scope or schedule. Its `orphanedMaterializationRetries` groups summaries by monitor id when
-no unambiguous parsed current definition exists: removed/parse-failed definitions and duplicated
-ids. Each retained outbox appears in exactly one diagnostic location. Orphan groups contain only
-`monitorId` and `summary`; they **MUST NOT** fabricate current source, urgency or cadence from the
-captured envelope. Existing parse and duplicate diagnostics remain intact. Groups are ordered by
+invalid scope or schedule. A live ephemeral monitor's retained work is attributed to it in
+`ephemeralMonitorWork`. Its `orphanedMonitorWork` groups the remaining obligations by monitor id:
+removed/parse-failed definitions, duplicated ids and retired ephemeral monitors. Each retained
+outbox appears in exactly one diagnostic location. Orphan groups contain only `monitorId`,
+`monitorKind`, and `materializationRetries` (present only while the outbox holds records) and/or
+`unretainedObservationLoss` (§2); they **MUST NOT** fabricate a retry summary for an empty outbox,
+or current source, urgency or cadence from the captured envelope. Existing parse and duplicate diagnostics remain intact. Groups are ordered by
 monitor id; each summary orders records by `(createdAt, id)` and includes exact counts and bytes.
 Outbox discovery is not capped by the per-monitor 256-row limit: one full outbox cannot hide another.
 Every summary excludes other workspaces and NULL-scope records unless that exact scope is requested
@@ -2127,7 +2717,7 @@ This is a documented one-time transition, not a per-tick behavior.
 
 An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
-- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`.
+- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2).
 - `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`.
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
@@ -2143,14 +2733,36 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       `emittedEventIds` reflects only durably committed events. `finishMaterializationSpan()`
       writes one `errored` row for the failed envelope after the span commits; the deferred later
       siblings get none.
+    - _Savepoint-local failure the outbox cannot retain_ (its whole ordered suffix exceeds the
+      outbox's remaining capacity or is not serializable for it; §2 "Admission outcomes when the
+      outbox cannot retain a suffix"): nothing is queued for that failure. `admitSpan()` writes
+      its `errored` row **inside** the admission transaction, with an error ending in
+      `Not retained for retry: <reason>`. That row is the observation's durable outcome, not a
+      best-effort audit. Later siblings keep materializing and the source baseline advances. Its
+      `observationData` is `{ error, notRetained: true, position, spanSize, objectKey?, title? }`:
+      `position` is the observation's 1-based place among the `spanSize` observations the span
+      dispatched, and `objectKey`/`title` are copied only when they are strings. The payload is
+      never copied. Every text field gets the retry-error safe-text rule: C0, DEL, C1, U+2028 and
+      U+2029 become spaces, and each field is capped at 1,024 characters. `error` shortens the
+      materialization error, not the reason, to fit. If every observation of the span was
+      dropped, no batch row is written (as for any span that emitted nothing and failed). Two
+      internal columns, never part of `observationData`, mark the row as a drop and say what
+      supersedes it (§2): `unretained_object_key` holds the raw `objectKey` (NULL when it was not
+      a string), and `unretained_event_watermark` holds the high-water mark of the
+      `monitor_events` materialization order (its AUTOINCREMENT counter, including positions
+      reserved by queued retries) when the row was written. The row stays outstanding until
+      superseded; it is never deleted or rewritten.
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
       catch, which also ends that watcher. On the not-due flush it comes from the tick's
       monitor-local flush catch, which reports the original native error (not a follow-on
-      `COMMIT` failure) and lets healthy siblings continue.
+      `COMMIT` failure) and lets healthy siblings continue. The window stays held because its
+      `pendingRollup` clear rolled back too.
 
-  In both cases `observationData` is `{ error: "<message>" }`. The audit write itself is best-effort: a `recordObservationHistory` failure is swallowed so a failing audit row can never re-abort the tick.
+  In every other case `observationData` is `{ error: "<message>" }`. Except for the unretained-suffix
+  row, which commits with the span, the audit write is best-effort: a `recordObservationHistory`
+  failure is swallowed so a failing audit row can never re-abort the tick.
 
   An unavailable `incoming-changes` repository/ref uses this existing source-error path (003 §6.5,
   decision #555, Refs #305). Source state, notify state and `lastObservationAt` remain unchanged,
@@ -2162,7 +2774,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), and `consumeWatch()` inner catch. Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `admitSpan()` (in-transaction `errored` rows for unretained failures), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), the not-due rollup flush catch, and `consumeWatch()`'s outer catch (which also ends the watcher). Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 An observation tick always runs for one concrete workspace, so each row records
 its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and
@@ -2183,7 +2795,7 @@ re-baseline above).
 | `result`           | TEXT NOT NULL    | `triggered \| suppressed \| no-change \| no-files-matched \| errored \| rebaselined` |
 | `created_at`       | INTEGER NOT NULL |                                                                                      |
 
-Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()` inner catch block.
+Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks (including the not-due rollup flush catch), `admitSpan()` unretained-failure rows, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()`'s outer catch block.
 
 ### `inbox_items`
 

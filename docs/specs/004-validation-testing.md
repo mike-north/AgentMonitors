@@ -36,6 +36,18 @@ When parse-time validation sees the old top-level `source:` + `scope:` shape, `v
 
 The validator is `@cfworker/json-schema`, which walks the schema at runtime rather than compiling with the `Function` constructor, so validation is safe under restrictive CSP / Workers-style environments.
 
+The shared helper validates a private schema copy and does not annotate plugin-owned
+schema objects. A frozen valid schema must still validate normally. Setup/evaluation
+exceptions are nonempty `Source schema validation failed: <cause>` diagnostics,
+not successful validation and not a reason to abort the whole monitor set. Existing
+scope mismatch and collection/timezone messages remain unchanged. Tests must cover
+malformed patterns, deep-frozen valid schemas, ordinary valid/invalid scopes, and
+schema immutability, using real registered-source/SQLite tick and watcher-startup
+boundaries. Assert healthy sibling effects, per-monitor diagnostics, retained
+baseline/cursor/overdue notify work, and repair/restart recovery. Tick failures must
+not strand suppression cleanup or hook refresh. Covered by
+`schema/validate-scope.test.ts` and `runtime/validation-exceptions.test.ts` in core.
+
 > **Target extension (not yet implemented).** Validation of `shape` predicate determinism and
 > `payload.form` / `payload.transform` / `payload.encoding` is a **_target_** obligation for the
 > `validate` surface. When implemented, `validate` will additionally reject: a `shape.derive.when`
@@ -101,8 +113,15 @@ Verified by `plugins/source-incoming-changes/src/unavailable.test.ts`,
 
 Runtime tests are the primary proof surface for: state persistence across runtime restarts; due scheduling; delivery lifecycle semantics; session projection; hook state correctness; and atomic rollback of deterministic materialization writes.
 
-**Verified in:** `libs/core/src/runtime/service.test.ts` and
-`libs/core/src/runtime/transactional-materialization.test.ts`.
+Definition-change semantics ([002 §5.3](./002-runtime-delivery.md#53-pending-events-keep-the-semantics-they-were-observed-under))
+need real-runtime scenarios: an event materialized at `normal` is not delivered as a high-urgency
+interrupt after an edit to `high`; an event observed under command A renders A's body and payload
+after an edit to command B; a batch held across the edit and a daemon restart after it keep the
+observed semantics; `explain` counts pre-edit pending events and ignores rows with no fingerprint.
+
+**Verified in:** `libs/core/src/runtime/service.test.ts`,
+`libs/core/src/runtime/transactional-materialization.test.ts` and
+`libs/core/src/runtime/definition-change.test.ts`.
 
 For the current retry-diagnostic contract in [002](./002-runtime-delivery.md), a regression **MUST**
 hold the real asynchronous monitor scan at a deterministic test-only barrier, commit valid retry
@@ -113,6 +132,179 @@ parse-invalid, duplicate and invalid-schedule routes. Assert that native retry/e
 opaque source state, event and history rows remain unchanged by diagnosis, and that diagnosis does
 not invoke a source. This is a same-runtime ordering check, not a cross-process snapshot guarantee.
 The permanent scenarios are in `libs/core/src/runtime/retry-diagnostics.test.ts`.
+
+Runtime source-config preflight is **current** behavior (002 §2.0). Tests **MUST**
+prove rejection before source side effects using a real registered source, exact
+`validateWatchScope` diagnostic parity with tick/explain/doctor, healthy sibling
+progress, and invalid-to-fixed recovery across runtime restart with baseline and
+held notify work retained. Cover directory ticks, persisted ephemeral ticks after
+schema changes, and continuous watcher startup. Invalid config intentionally stops
+observation, including configs that previously ran; daemon text/JSON and continuous
+logging must make that pause visible. The built CLI must also prove the authoring
+and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
+with valid globs and a malformed interval: doctor must report the validation error
+without scheduling it or inventing a due time, retain healthy sibling results, and
+leave source/notify state, events, and observation history unchanged. A stale verify
+session with a real projected scratch event and an edited invalid interval must
+be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
+retain the source baseline and held legitimate work, report the config skip, and
+progress a healthy sibling. Assert the existing fallback expiry at five minutes
+for unparseable cadence or a missing definition, and preserve derivable timing despite
+unrelated source-schema errors. A real-source/SQLite delayed-repair case must retain
+665000ms for invalid globs + 10m interval + 5s settle, close/reopen the store, repair
+at 12:08 after a 12:02 reap, and exclude scratch from an actual later-session claim
+while delivering legitimate held work and preserving a foreign workspace. This
+bounded regression does not resolve the known current arbitrary-pause/held-only
+ownership gap: retained fingerprints or held deletions may outlive suppression,
+and held-only creates may escape discovery. The no-later-scratch-event goal remains;
+current tests must not be cited as proof of that unconditional guarantee.
+[Decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+assigns the complete delayed-repair/held-only claim acceptance to
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), sequenced after
+#305/#537/#554. This known gap does not block #557 after its window/docs correction.
+Covered by `libs/core/src/runtime/cadence-window.test.ts`,
+`libs/core/src/runtime/object-event-suppressions.test.ts`,
+`libs/core/src/runtime/source-validation.test.ts` and
+`apps/cli/src/commands/runtime-source-validation.test.ts`.
+
+#### Notify-policy-edit durability (002 §4.6)
+
+`runtime/notify-policy-edit.test.ts` MUST prove all six exits from holding strategies, effective
+same-strategy/default changes, unchanged-policy clocks, captured old/new semantics and immutable
+materialized rows. Edits reconcile before source-due/active-watcher skips without new source input.
+Invalid/missing definitions retain holds and report the reason. A blocked watcher retains its
+unadmitted batch and is not pulled again until reconciliation succeeds (002 §2.4).
+`runtime/notify-boundaries.test.ts` MUST exercise actual watcher microtask interleavings: yield a
+batch while admission is open, then fail the real SQLite edit drain before its mutation. Original holds and cursor remain unchanged, without an event prefix; recovery drains
+captured old work before the retained operation, while cancellation writes nothing. Cover a newer
+successful policy without reloading handling, and prove an accepted span's deterministic writes
+complete before Interpret can close its gate. Immediate/throttle escalation grants participate in
+policy identity; equivalent policies and prior private-key encodings retain unchanged clocks. Restart/startup drains with idle or completed
+sources MUST update actual lead hook files without tick/new observations, preserving workspace and
+session isolation and publishing no unread state before transaction commit.
+
+`runtime/notify-admission-lifetime.test.ts` MUST use concurrent public ticks and actual controlled
+source effects to fail an edit while `observe()` awaits. The completed observation must neither
+advance durable state while blocked nor prevent the tick returning for recovery; retry/startup
+admits it in order using current pacing and captured handling. Cover restart from the unchanged
+cursor, healthy sibling/workspace isolation and startup overlapping a valid poll. At the actual
+factory boundary, exercise a gate closing, cancellation and replacement with a newer initial
+definition. Repeated declare/tick/cancel, close and dormancy cycles must release cached definitions
+without deleting accepted history; live blocked watcher/poll waiters and teardown remain functional.
+
+`runtime/notify-checkpoint-teardown.test.ts` MUST block an actual yielded baseline batch with a
+failed SQLite edit drain, then let recovery admit it before the iterator completes or fails. The
+watcher keeps its scoped exclusion/cache ownership while that batch waits, and permits recovery
+rescans without a deadlocked tick. Assert that polling/replacement reads the admitted baseline
+before its own baseline advancement, not a silently discarded batch. Independent reopen must
+preserve the later baseline. Include abort/stop of a waiting batch, a superseded watcher's batch,
+healthy foreign workspace/monitor scopes and completion with no pending batch; no retired cache
+owner may delete a successor's slot.
+
+`runtime/notify-failed-poll-successor.test.ts` MUST schedule overlapping public ticks so a real
+SQLite ingestion failure resumes its error handler after a successor observation has started.
+The older handler must preserve that successor's admission: a third poll stays excluded and
+watcher factory and its baseline batch wait until the successor's writes finish. Assert correctly ordered
+baselines/events through full SQLite close/reopen, the original ingestion error, ordinary observe
+failure/success controls, valid later wakeups and healthy sibling/foreign-workspace progress.
+Failures before ingestion starts must still clean up their own admission and permit a later poll.
+Scheduling may complete a registered source at registry lookup; runtime/ingestion/admission methods
+must remain actual implementations.
+
+`runtime/notify-discovery-freshness.test.ts` MUST suspend an earlier monitor in public tick and
+startup discovery while a newer tick/startup adopts rollup and holds work in a second actual file.
+The older scan cannot drain that work or restore its obsolete policy even when the source is not
+due. Cover a newer failed gate, invalid/deleted definitions, legitimate return to an earlier policy,
+and independent SQLite reopen. No runtime/store/admission methods may be replaced.
+
+`runtime/notify-deferred-handoff.test.ts` MUST retain a real completed poll behind a failed SQLite
+edit drain, then recover with throwing observation/next-state/outcome getters and an actual ingestion
+failure. Every exit releases exactly the deferred-result lease, preserving a live watcher owner.
+Assert the original error and committed drain truthfully, normal success/recovery, cursor persistence,
+private-cache cleanup after deletion and full SQLite close/reopen. Existing cancellation/retirement,
+scope isolation, writer-lock, killed-process and successor-admission controls remain required.
+
+`runtime/notify-live-definition.test.ts` MUST create the first actual watcher hold **after** an
+older tick/startup captured held membership, then edit its source to an unknown name. The
+watcher's next batch must stay unadmitted without cursor/baseline advancement, the error remains scoped and a
+healthy sibling progresses. No-held unknown-source errors remain fatal but close existing admission.
+Exercise flat→folder and folder→flat same-ID moves with old/new tick and startup discovery; actual
+baseline batches must use the newer admitted path without a third scan, while established handling stays
+pinned. Captured-route missing diagnostics share that protection. Reread invalid/deleted/current
+unknown-source or invalid-scope replacements, retain fatal duplicates and isolate foreign workspace
+identities. Assert actual watcher effects, recovery and full SQLite close/reopen; do not replace
+runtime/store/admission methods. Independent hold-classification/path-resolution reversions must
+reproduce their own failures while the earlier freshness/handoff controls remain green.
+It MUST also deny fallback when an admitted parent is mode 000 and read fails EACCES even though
+an existence probe returns false. Use actual POSIX permissions when supported, restoring them in
+finally before fixture cleanup. Faithful targeted filesystem read/metadata faults cover permission,
+I/O and unclassified query errors elsewhere; never replace runtime/store/admission methods. Actual
+batch, original holds/baseline and healthy sibling progress must remain intact until
+permission restoration and valid reconciliation. Genuine ENOENT/ENOTDIR moveback must still succeed
+without another scan, and a narrow absence-classification reversion must fail the denial cases.
+After the first denial, one and multiple **unchanged** tick/startup/captured-route discoveries MUST
+still revalidate the same denied location: the actual batch remains unadmitted, original holds
+and baseline stay unchanged, no source factory/poll bypasses it, and healthy scopes progress.
+Require actual POSIX first/repeated tick/startup pairs and faithful synchronous/asynchronous read
+fault controls. Cover a never-admitted location first blocked by unresolved source, later invalid
+edits at that location, genuine absence after a closed gate, and last-owner stop/abort cleanup.
+Current path and cache ownership must retire together; a new owner must use fresh authored handling.
+A narrow loss-of-location-on-gate-close reversion must fail these regressions while all prior
+freshness, absence, scope, duplicate, lease and batch/successor controls remain meaningful.
+
+`runtime/notify-legacy-policy-identity.test.ts` MUST seed the exact older private-key-missing
+shape in an owned SQLite fixture, fully close/reopen and learn identity on an unchanged not-due
+scan while preserving guards, holds, clocks, opaque/raw baselines and event/cursor artifacts.
+Cover throttle guard-only and rollup-minute state, equivalent policies, a later known edit across
+restart, actual B delivery, identical legacy holds, failed identity writes/validation and owned
+writer refusal. Fresh scopes must retain absent previousState; keyed unchanged rows need no rewrite.
+Do not infer policy history before the first successful identity-learning scan.
+
+`runtime/notify-observe-only-startup.test.ts` MUST reconcile existing watcher/poll ownership
+before skipping a factory-less current source. The actual batch and cursor stay blocked on
+invalid scope or real SQLite drain failure; startup recovery commits captured old handling before
+new work under current pacing. Cover evaluating/deferred polls, no replacement factory or polling,
+healthy scoped progress, unowned ordinary state untouched and same-ID foreign ownership isolation.
+Full SQLite reopen and independent identity-learning/factory-skip reversions remain required.
+
+`runtime/notify-only-baseline.test.ts` MUST seed controlled raw legacy JSON `null` and other
+opaque source representations with a fingerprint, learn identity, then apply a not-due effective
+edit. Guard-only resets and held drains through tick/startup must preserve raw `source_state`,
+`last_fingerprint` and `last_observation_at` through full SQLite reopen. Make the next poll due
+with a clock-only SQL update, never the broad state setter, and assert the actual source receives
+the original `previousState`. Include equivalent-policy controls, real notify-update failure with
+complete materialization rollback/retry, and a narrow reversion of only the edit's notify-only
+persistence. Prior identity, startup, scoped ownership and atomic-drain controls remain required.
+
+Use real file-backed SQLite triggers for event/projection/cursor/snapshot/hold-removal faults,
+including a later batch write and failed diagnostics. Assert full rollback of original state,
+no partial event prefix, blocked new source/baseline, healthy siblings/other workspaces and restart
+recovery. A stale pre-lock read in one independent process must not duplicate or overwrite another
+process's committed drain. Interpret must run after commit against each event's projected recipients.
+
+Kill evidence MUST use bounded owned child processes, actual SIGKILL before and after commit,
+awaited exit and SQLite reopen. Before commit: original holds and no partial events. After commit:
+events and no old holds. Reconciliation after reopen adds exactly the remaining events, with no
+duplicate prefix. Runtime reconstruction alone is not killed-process evidence. Test children may
+load TypeScript source using Node 24 transformation and a narrow local resolver; tests MUST NOT
+start a package build or rely on a previously built dist tree.
+
+This acceptance concerns the effective-edit transaction, not retry draining of ordinary
+ingest/flush work or unchanged-policy flushing after source errors.
+`runtime/edit-drain-admission-outcomes.test.ts` MUST prove the edit/admission-outcome boundary:
+an edit with nothing to drain leaves an outstanding drop and records nothing, and only a drained
+event of its key supersedes it; a drain that fails while the outbox is full records no drop and no
+retry, keeps the hold and blocks the poll until recovery; and a rejected scope with held work and
+an outstanding drop leaves hold, drop and baseline untouched, while a watcher batch waiting at that
+closed gate records no drop until valid recovery admits it. No downstream exactly-once side effects are claimed.
+
+A source-config rejection (002 §2.0) found by a tick or a watcher-startup rescan MUST block a
+running watcher's next batch while the scope has held work, leaving the held work and
+cursor unchanged until valid recovery commits old and new work. Without held work, the same
+rejection MUST NOT close admission by itself: a watcher whose admission is open MUST keep admitting
+batches under its startup config. A watcher already blocked (an unresolved source,
+a failed drain) stays blocked until a valid definition is reconciled, losing nothing it yielded.
+`runtime/notify-observe-only-startup.test.ts` covers both paths for tick and rescan.
 
 ### 2.6 CLI integration tests
 
@@ -185,6 +377,16 @@ status, signal and output rather than vitest's bare timeout.
 
 Running a CLI test file directly with vitest bypasses the Nx dependency and executes whatever bundle
 already exists; build first, or use `pnpm nx test @agentmonitors/cli`.
+
+**Current, normative:** the core test target declares its own `build` alongside dependency
+builds. Its runtime regression suite imports the real API source, whose runtime package imports
+resolve to core's compiled exports. `pnpm nx test @agentmonitors/core` therefore MUST build core
+before running tests, including when core's `dist` is absent and caching is disabled. The
+`object-event-suppressions` suite must pass all 14 existing cases on its first attempt. Removing
+only the own-build prerequisite under the same cold conditions must expose the package-entry
+module-load failure; restoring it must restore the cold pass. Direct Vitest invocation bypasses
+this prerequisite and requires a prior core build. Tests MUST NOT start builds themselves; the
+source/test module graph remains unchanged.
 
 **Current, normative:** the `source-incoming-changes` test target also declares its own `build`
 alongside dependency builds. Its revision-expression tests execute both TypeScript source and
@@ -398,22 +600,22 @@ The spec set is incomplete unless each major rule has at least one concrete test
 
 ### 3.3 Runtime delivery
 
-| Scenario                                                                                                         | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Source state survives runtime restart                                                                            | Covered (`libs/core/src/runtime/service.test.ts` — "persists source state across runtime restarts and emits changes later")                                                                                                                                                                                                                                                                                                                         |
-| High urgency waits for settle window before interruptible delivery                                               | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; "emits all debounced high-urgency observations after the settle window")                                                                                                                                                                                                                                      |
-| Normal urgency coalesces — second delivery not offered until session is acknowledged                             | Covered (`libs/core/src/runtime/service.test.ts` — "coalesces normal-urgency reminders until unread events are acknowledged")                                                                                                                                                                                                                                                                                                                       |
-| Low urgency delivers only at idle lifecycle points                                                               | Covered (`libs/core/src/runtime/service.test.ts` — "defers low-urgency delivery until idle lifecycle points")                                                                                                                                                                                                                                                                                                                                       |
-| Recap emits recent unread events and command hints                                                               | Covered (`libs/core/src/runtime/service.test.ts` — "returns recap deliveries after post-compact with recap messaging")                                                                                                                                                                                                                                                                                                                              |
-| Events project only into matching workspace sessions                                                             | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters"; `apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                 |
-| Scope filters query `queryScope` correctly                                                                       | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters")                                                                                                                                                                                                                                                                                                              |
-| Hook state reflects pending and unread counts correctly                                                          | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; `libs/core/src/hook-bridge/bridge.test.ts` — `computeHookState` suite)                                                                                                                                                                                                                                        |
-| Cron timezone matching works correctly                                                                           | Covered (`libs/core/src/runtime/service.test.ts` — "matches schedule cron expressions in the configured timezone")                                                                                                                                                                                                                                                                                                                                  |
-| An invalid schedule timezone is isolated to that monitor, not the whole tick (issue #297)                        | Covered (`libs/core/src/runtime/service.test.ts` — "isolates an invalid schedule timezone so a sibling monitor still emits (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits")                                                                                                                                           |
-| `monitor.explain` renders an invalid schedule timezone as an observation-stage failure, not a crash (issue #297) | Covered (`libs/core/src/runtime/service.test.ts` — "explains an invalid schedule timezone as an observation-stage failure, not a crash (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "explains an invalid schedule timezone as an observation-stage failure instead of crashing")                                                                                                                                                |
-| `doctor` reports an invalid schedule timezone as invalid without crashing (issue #297)                           | Covered (`libs/core/src/runtime/doctor-report.test.ts` — "reports an invalid schedule timezone as invalid without crashing, isolated from a healthy sibling (issue #297)")                                                                                                                                                                                                                                                                          |
-| `validate`/`monitor test` reject an invalid IANA schedule/rollup timezone at authoring time (issue #297)         | Covered (`libs/core/src/schema/validate-scope.test.ts` — `validateWatchScope` schedule-timezone suite; `libs/core/src/schema/monitor-schema.test.ts` — "rejects a rollup monitor with an invalid IANA timezone"; `apps/cli/src/commands/cli.integration.test.ts` — "rejects a schedule monitor with an invalid IANA timezone, alongside a valid sibling" (`validate`), "rejects a schedule monitor with an invalid IANA timezone" (`monitor test`)) |
-| Subagent sessions do not receive events projected to the lead session                                            | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                                                                                                                                               |
+| Scenario                                                                                                 | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source state survives runtime restart                                                                    | Covered (`libs/core/src/runtime/service.test.ts` — "persists source state across runtime restarts and emits changes later")                                                                                                                                                                                                                                                                                                                         |
+| High urgency waits for settle window before interruptible delivery                                       | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; "emits all debounced high-urgency observations after the settle window")                                                                                                                                                                                                                                      |
+| Normal urgency coalesces — second delivery not offered until session is acknowledged                     | Covered (`libs/core/src/runtime/service.test.ts` — "coalesces normal-urgency reminders until unread events are acknowledged")                                                                                                                                                                                                                                                                                                                       |
+| Low urgency delivers only at idle lifecycle points                                                       | Covered (`libs/core/src/runtime/service.test.ts` — "defers low-urgency delivery until idle lifecycle points")                                                                                                                                                                                                                                                                                                                                       |
+| Recap emits recent unread events and command hints                                                       | Covered (`libs/core/src/runtime/service.test.ts` — "returns recap deliveries after post-compact with recap messaging")                                                                                                                                                                                                                                                                                                                              |
+| Events project only into matching workspace sessions                                                     | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters"; `apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                 |
+| Scope filters query `queryScope` correctly                                                               | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters")                                                                                                                                                                                                                                                                                                              |
+| Hook state reflects pending and unread counts correctly                                                  | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; `libs/core/src/hook-bridge/bridge.test.ts` — `computeHookState` suite)                                                                                                                                                                                                                                        |
+| Cron timezone matching works correctly                                                                   | Covered (`libs/core/src/runtime/service.test.ts` — "matches schedule cron expressions in the configured timezone")                                                                                                                                                                                                                                                                                                                                  |
+| An invalid schedule timezone is isolated to that monitor, not the whole tick (issue #297)                | Covered (`libs/core/src/runtime/service.test.ts` — "isolates an invalid schedule timezone so a sibling monitor still emits (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits")                                                                                                                                           |
+| `monitor.explain` renders an invalid schedule timezone as a diagnostic failure, not a crash (issue #297) | Covered (`libs/core/src/runtime/service.test.ts` — "explains an invalid schedule timezone as an observation-stage failure, not a crash (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "explains an invalid schedule timezone as a definition-stage failure instead of crashing")                                                                                                                                                  |
+| `doctor` reports an invalid schedule timezone as invalid without crashing (issue #297)                   | Covered (`libs/core/src/runtime/doctor-report.test.ts` — "reports an invalid schedule timezone as invalid without crashing, isolated from a healthy sibling (issue #297)")                                                                                                                                                                                                                                                                          |
+| `validate`/`monitor test` reject an invalid IANA schedule/rollup timezone at authoring time (issue #297) | Covered (`libs/core/src/schema/validate-scope.test.ts` — `validateWatchScope` schedule-timezone suite; `libs/core/src/schema/monitor-schema.test.ts` — "rejects a rollup monitor with an invalid IANA timezone"; `apps/cli/src/commands/cli.integration.test.ts` — "rejects a schedule monitor with an invalid IANA timezone, alongside a valid sibling" (`validate`), "rejects a schedule monitor with an invalid IANA timezone" (`monitor test`)) |
+| Subagent sessions do not receive events projected to the lead session                                    | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                                                                                                                                               |
 
 ### 3.4 Persistence and snapshotting
 
@@ -435,12 +637,61 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 
 Retry CLI/IPC diagnostics are covered by `apps/cli/src/retry-diagnostics.test.ts`: real socket
 roundtrips revive distinct created/updated/next-attempt Dates for explain, doctor attached summaries
-and orphan groups; older-daemon omissions work in both commands and formats. Its built CLI lives in
-an owned temporary package layout, independent of the shared `dist` cleaned by other parallel
-integration suites; the manifest/native dependency layout is preserved and output is removed after
-all fixture children exit. No retries or timing delays mask artifact ownership. Built CLI text/JSON
+and orphan groups; older-daemon omissions work in both commands and formats. Its CLI subprocesses run the shared Nx-built
+`apps/cli/dist/index.cjs` (built by `nx test`'s dependency, never rebuilt by the test, per §2.9).
+No retries or timing delays mask artifact ownership. Built CLI text/JSON
 preserve missing/invalid/duplicate definition errors and retained IDs exactly once, normalize legacy
 unsafe errors, exclude private metadata fields and other workspaces, and leave durable state unchanged.
+
+### Snapshot materialization order
+
+`runtime/snapshot-materialization-order.test.ts` verifies that the diff predecessor is
+selected by committed insertion order, not timestamp/ULID order. Two actual child
+processes prime genuine snapshot ULID factories in private databases under an identical
+clock; the parent commits the higher-ID writer first and the lower-ID writer second,
+awaiting process exit at each barrier. An already-open independent connection and a fresh
+reader process must both return the second snapshot, giving the adjacent B→C diff.
+No stored IDs are replaced. Children have bounded lifetimes and their exits are awaited.
+
+Additional cases cover wall-clock reversal, rolled-back and rejected writes, deletion of
+the newest/all rows followed by insertion, `VACUUM` and reopen, legacy rowid bootstrap
+with unchanged public data/indexes/triggers and no replayed trigger effects, migration
+idempotence, and simultaneous first-open migration. The existing transactional
+materialization suite retains event/projection/cursor/snapshot rollback coverage.
+
+`inbox/db.migration.test.ts` additionally requires the coordinated event/snapshot
+rebuild to preserve cross-table triggers in both directions, mutual dependencies,
+third-table dependencies, quoted names and only-one-legacy-table cases. Ordinary
+triggers remain controls. Assertions retain exact stored trigger/index SQL, public
+rows and logical references, compatibility metadata and pragmas, prohibit copy-time
+trigger replay, exercise explicit behavior after open/reopen, and require no schema
+churn on an already-current open. Native duplicate-table DDL faults at the second
+rebuild and trigger restoration boundaries must roll back the whole original schema,
+rows, indexes, trigger definitions and metadata; tests inject real SQLite DDL rather
+than a fabricated error or public fault-injection API.
+
+### Equal-time event order
+
+`runtime/event-materialization-order.test.ts` uses two genuine independent event ULID
+factories and controlled commit order at the same clock. Pending/unread queries, event
+listings, pure net selection, actual runtime preview, capped claim, suppression and
+claimed cursor must agree on the later commit. Private sequences must not appear in
+public event records. A high/normal coalescing case checks that concatenating bands
+cannot reverse an equal-time endpoint; the mutating boundary reloads canonical stored
+records and rejects unknown/duplicate IDs before side effects. Unequal observed times
+retain their existing primary order.
+
+Additional cases cover transaction rollback, caller-modified artifact rejection, legacy
+migration with unchanged projections/snapshots/cursors/indexes/triggers, no replayed
+trigger effects, deletion/reinsert, VACUUM/reopen and simultaneous migrating writers.
+Direct public-boundary cases also cover incremental/single-net recipient views whose
+delta differs from shared history, raw shared inputs, lifecycle preservation, forged or
+other-recipient overlays, and a legitimate stale delta after re-anchoring. These must
+resolve to the requested recipient's current persisted projection without trusting
+caller-provided delta text. Lifecycle-only session list views must retain their shared
+diff for incremental and single-net events; lifecycle presence does not select a
+recipient delta. Existing net and hook-cap suites continue to cover per-recipient
+delivery semantics.
 
 ### 3.4.1 Real daemon crash recovery
 
@@ -462,7 +713,13 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | Held retries retain their captured source after a source-type edit | Covered (`libs/core/src/runtime/poll-admission.test.ts` — actual debounce/rollup holds plus a real later-event ABORT preserve the captured route, instructions, urgency, content and timestamps, retain the opaque source baseline and reopen exact retry/state records; corresponding successful-materialization controls remain green). |
 | Retry backoff starts at enqueue, not tick start _(current)_ | Covered (`libs/core/src/runtime/poll-admission.test.ts` — an observation at `12:00:00.000` admitted at `12:00:03.850` stores first deadlines of `12:00:05.000`, not an already-due `12:00:01.000`; observation, event, envelope, source and notify timestamps stay at observation time). |
 
+| Unretainable retry suffix still reaches one outcome per observation and advances the baseline _(current)_ | Covered (`libs/core/src/runtime/unretainable-suffix-admission.test.ts` — real ticks with native `RAISE(ABORT)`: a 301-record suffix over the 256-record outbox commits 599 events (both recipients), one in-transaction `errored` row naming capacity and the advanced baseline, failing `explainMonitor`'s verdict and doctor's rollup through a later span of other keys until a later event for `object-299`; an outbox filled by earlier ticks retains an exact-fit 5-record suffix but errors a 6-record one, and once full errors a 1-record suffix; a BigInt payload and a non-serializable later sibling are `errored` while siblings materialize. Every case asserts each observation is in exactly one of event/retry/`errored`, and that the next tick progresses). |
+| A dropped (unretained) observation is never less visible than a retained one _(current)_ | Covered (`libs/core/src/runtime/unretainable-suffix-admission.test.ts` — real ticks with native faults: the drop row names the observation's position, span size, `objectKey` and `title`, with no payload and bounded control-free text; the span's batch row carries `notRetainedCount`; `explainMonitor`'s verdict fails at materialization and `doctorReport` attaches `unretainedObservationLoss`, kept across a later observe failure and accumulated by a later drop; a retained and a dropped failure both fail explain and doctor) |
+| An outstanding drop is cleared only when superseded _(current)_ | Covered (`libs/core/src/runtime/unretainable-suffix-admission.test.ts` — a keyed drop survives a `no-change` tick, an observe failure, a retained-only later span and a later span of other keys, and clears on a later event for its key, including a later sibling of its own span; the same key from another monitor or workspace does not clear it; a retry admitted before the drop that completes after it does not clear it, while a newer observation of the key, a retry admitted after the drop (with no event between them) and a retained later sibling of the dropping span do once they complete; an unkeyed drop survives quiet ticks and a later span that drops again, and clears on a later span that materializes and drops nothing; a rollup hold keeps it and the flush that materializes its key clears it; it survives reopening the store; a removed, unparseable or duplicated definition reports it in `orphanedMonitorWork` (with no invented retry summary) and an invalid one on its rollup; a live ephemeral monitor's drop and retained work are attributed to it in `ephemeralMonitorWork` and move to `orphanedMonitorWork` as `monitorKind: "ephemeral"` once it is cancelled; a monitor whose source config the preflight now rejects is skipped without observing, dropping or retaining, keeps its drop on its invalid rollup (not orphaned), reports it in explain beside the definition-failure verdict, and clears it once the corrected config observes the key; a drop beside pending events that predate an edited definition fails explain at materialization while the delivery stage notes the stale events. `libs/core/src/inbox/db.migration.test.ts` — a pre-#497 store, with and without event `sequence`, gains the drop and admission columns and the three indexes on open and reports a drop recorded afterwards; a pre-`sequence` table holding `definition_fingerprint` and `admission_sequence` keeps both values through the order rebuild and gets the object-key index; a completed pre-upgrade retry stamps admission 0 and the observing definition's fingerprint. `apps/cli/src/retry-diagnostics.test.ts` — the built CLI's `doctor` text and JSON keep failing the monitor check after a tick of other keys and pass after an event for the dropped key; removed, unparseable and invalid definitions fail a `dropped-observation:<id>` check in text and JSON; duplicated-id rows with only an orphaned drop show `retry-outbox=0/0` and `dropped-observation=orphaned`; a live ephemeral drop gets an ephemeral-monitor check and a cancelled one a retired-ephemeral check, neither telling the user to repair a definition; a real `daemon run` socket still reports the loss in doctor and explain after a quiet scheduled tick; a monitor whose bundled `schedule` config is now rejected keeps a skipped monitor check, a failing `dropped-observation:<id>` check and no orphan group in doctor, and explain JSON/text shows the drop beside the definition-failure verdict) |
+| Rollup window flush clears its hold only together with the flushed span _(current)_ | Covered (`libs/core/src/runtime/unretainable-suffix-admission.test.ts` — not-due window flush of 600 held observations with an ABORT on the 300th commits 599 events plus one capacity `errored` row and clears `pendingRollup`; a fitting suffix is retained with the hold cleared; a native `RAISE(ROLLBACK)` leaves the whole window held, records and reports the error, and the next check in the open window flushes all of it). |
+
 | Watch batches and source state admit together | Covered (`libs/core/src/runtime/watch-batch-admission.test.ts` — two-recipient full-span/suffix visibility while first Interpret is suspended; whole and empty-state failures stop before newer input, preserve old state and replay on reopen). |
+| Watch batch whose suffix the outbox cannot retain is admitted and the watcher keeps pulling _(current)_ | Covered (`libs/core/src/runtime/unretainable-suffix-admission.test.ts` — a yielded 600-observation batch with an ABORT on the 300th, and a 10-observation batch with a BigInt payload, commit their events, one `errored` row and the batch checkpoint; `onError` reports once and the next yielded batch is admitted). |
 | Watch source migration and lifecycle fencing | Covered (`libs/core/src/runtime/watch-batch-admission.test.ts` — checkpoint callback absent, legacy yields refused, omitted/undefined/null semantics, other-workspace isolation, abort before admission/during Interpret, old-handle replacement safety, normal completion and synchronous setup failure). |
 
 | Concurrent admission decisions preserve newer durable work | Covered (`poll-admission.test.ts` — independent notify writer commits immediately before BEGIN and its held envelope is materialized; mutation of observation context cannot alter the captured source token; `watch-batch-admission.test.ts` refuses a stale later batch without changing the winning source/notify state). |
@@ -499,6 +756,15 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | A global install of the packed launcher (no workspace `node_modules`) can go from `agentmonitors init` to a delivered signal over the real hook stdin/stdout contract (issue #276) | Covered (`scripts/test-e2e-fresh-install-hooks.mjs`, `pnpm test:e2e-fresh-install-hooks`, CI per-PR) — see [§2.7](#27-fresh-environment-e2e-hooks-path).                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ### 3.5.1 Verify observation boundary
+
+**Current cleanup verification limit:** the observation/claim checks below do not
+prove arbitrary delayed scratch cleanup. Finite tombstones can expire before
+retained baseline/held-envelope recovery, and projected-event discovery misses a
+held-only scratch create. Preserve the intended no-later-scratch-event requirement,
+but track those missing recovery/ownership cases under
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), per
+[decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828),
+until its exact ownership and explicit-retirement repair lands. See 005 §16 step 9.
 
 `apps/cli/src/verify-observe.test.ts` verifies distinct old/new observation identities with actual
 SQLite second-rounded timestamps, command-start versus completion evidence, repeated-row refusal,
@@ -586,7 +852,7 @@ When sources disagree, the spec process MUST NOT silently average them together.
 - The runtime/session event pipeline is the primary delivery path.
 - The inbox item lifecycle is separate from the event pipeline, not merely another view of the same data.
 - Duplicate monitor IDs are a correctness hazard: `scanMonitors()` reports collisions, and `validate` rejects duplicate IDs within the scanned tree (§2.2).
-- Source-specific validation is fully enforced by `validate` against each source's `scopeSchema` using draft-07 JSON Schema checks, including types, enums, required fields, and nested items. Both `validate` and `monitor test` use `validateWatchScope` for the same rejection details; `monitor test` rejects invalid scopes before source observation (§2.2/§2.4).
+- Source-specific validation is fully enforced by `validate` against each source's `scopeSchema` using draft-07 JSON Schema checks, including types, enums, required fields, and nested items. Both `validate` and `monitor test` use `validateWatchScope` for the same rejection details; `monitor test` rejects invalid scopes before source observation (§2.2/§2.4). Runtime execution rejects the same invalid config before source effects (002 §2.0), preserving state until corrected.
 
 ### 5.2 Evidence priority during this transition
 
