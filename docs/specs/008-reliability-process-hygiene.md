@@ -98,6 +98,34 @@ hard upper bound. Descendants that leave the original process group/session are 
 covered by this current guarantee; they enter the deferred-reconciliation state (§2.2,
 §3.2).
 
+Both escalation steps are identity-verified (§5) before they signal. A descendant still in the
+original group is confirmed through the group's continuity (§5.1), including one forked after
+the SIGTERM step: by the command's leader before it exits (the read at the leader's exit), or by
+any confirmed member that is still alive at one of the membership readings taken every 250 ms
+through the grace period. Verification therefore does not exempt such descendants from the
+bound. The SIGKILL step abstains (§2.2 state 4) only when continuity cannot be shown: the
+process table cannot be read, or the group holds none of the processes confirmed as its members.
+
+**Exception to the bound above (the hand-off residual).** Continuity is re-established only at
+a reading. After the command's leader has exited, a group member that forks a process and exits
+between two consecutive readings (within one 250 ms interval plus one read; the read time grows under load, up to the 5 s `ps` cap), while no other
+confirmed member is alive, hands the group to a process no reading saw beside a confirmed
+member. That process, and anything it forks, cannot be told apart from unrelated work that
+reused an emptied group id, so the SIGKILL step abstains and they MAY outlive the hard upper
+bound. The abstention is reported (§6.1). While the process table is readable, this is the only
+way a process that stays in the original group escapes the bound. (A group that truly empties
+and whose id is then reused also makes the step abstain, but nothing of ours is left in it; see
+§5.1's residual window.)
+
+Verification reads the process table, which adds latency to each step. The SIGKILL goes out
+after the later of the grace expiry and the end of the SIGTERM step's read, and after the
+SIGKILL step's own read, once any grace-period reading still in flight and (if the leader
+exited) the read taken at its exit have landed. Normally that adds tens of milliseconds to
+timeout + 5 s. On macOS each read is capped by a 5-second `ps` timeout, and the in-flight and
+exit reads both started before the SIGKILL step, so even a pathologically slow table delays the
+SIGKILL to at most timeout + 15 s; a read that times out is unreadable, and that step abstains.
+On Linux the reads are `/proc` file reads, which do not wait on other processes.
+
 **Current** — implemented by `@agentmonitors/source-command-poll` per
 [003 §11](./003-source-plugins.md) (escalation targeting fixed in #303). Verified: the
 no-orphan-on-timeout guards in `plugins/source-command-poll/src/index.test.ts` (direct child
@@ -180,7 +208,7 @@ a wrong kill.
 A power loss leaves the OS to reap; the commitment is that the **next start** reconciles
 (§4.2), not that orphaning through hardware failure never occurs (see §11).
 
-## 5. Identity-Verified Cleanup — "we only ever kill what is ours" (target — #479)
+## 5. Identity-Verified Cleanup — "we only ever kill what is ours" (current for live signal paths — #479; the restart sweep and `gc` remain target — #478, #426)
 
 Before sending **any** cleanup signal on **any** path — live reaping, timeout escalation
 follow-ups, the restart sweep, `gc` — the daemon MUST positively verify at signal time that
@@ -199,6 +227,120 @@ and abstain — producing a §6.1 warning that names pid 4242 and why confirmati
 rather than kill the dev server. **This example is the promise:** the worst case is a warning,
 never collateral damage.
 
+### 5.1 The verification gate (current)
+
+Every cleanup or enforcement signal goes through one shared gate,
+`sendVerifiedSignal` in `libs/core/src/process/process-identity.ts`, which verifies and then
+signals, or withholds the signal and reports an abstention. No shipped code signals a stored
+pid or pgid any other way. Identity evidence:
+
+- **Live child handle.** While Node still holds an unreaped `ChildProcess` for a pid, the OS
+  cannot reuse that pid, nor the process-group id of a group that child leads (a POSIX
+  session/group leader cannot leave its group). Signals sent while the handle is unreaped are
+  confirmed. Once Node has reaped the child, the handle proves nothing about whoever holds the
+  number now: a reaped single process is treated as gone and never signalled by pid.
+- **Recorded identity `(pid, pgid, start time)`**, read from the platform process table
+  (`libs/core/src/process/process-table.ts`). A pid paired with its start time names one
+  process for that process's whole life. A recorded single process is confirmed only if the
+  pid's current start time equals the recorded one.
+- **Group continuity.** A process-group id cannot be reused while any member of the group
+  exists, so a membership reading taken while the group is provably ours confirms every member
+  in it, and every such member is within the boundary (§2.1). A reading is taken while the group
+  is provably ours when it:
+  - **started** while the leader was still unreaped, even if the leader is reaped before it
+    completes;
+  - started in the leader's `exit` event, which Node emits in the callback that reaps it (once
+    a signal has been aimed at the group, the gate starts this read synchronously from that
+    event, which confirms processes forked after the previous step, such as work a SIGTERM
+    trap starts before exiting); or
+  - finds a member confirmed by an earlier reading still in the group.
+
+  Confirmed members accumulate across the escalation. After the leader is reaped, a step
+  signals the group if any confirmed member is still in it; an empty group needs no signal.
+  Only a group none of whose current members was ever confirmed (continuity lost) or an
+  unreadable table makes the step abstain. Lost continuity has two causes the gate cannot tell
+  apart: the group emptied and its id was reused, or a member handed the group to a process no
+  reading saw beside a confirmed member (below).
+
+- **Grace-period membership tracking.** A step may ask the gate (`trackMembership`) to keep
+  reading the group's membership after it signals, until the next step against the same group
+  starts. The command-poll SIGTERM step does. Readings run every 250 ms, one at a time (the next
+  is scheduled only after the previous one lands), and each reading that is provably ours by
+  the rule above confirms every member it lists. A member that forks a process and later exits
+  therefore passes continuity to it as long as the member is alive at some reading after the
+  process exists. Tracking stops when the next step starts (which first lets a reading still in
+  flight land), when a reading shows the group empty, when a reading shows continuity already
+  lost (no later reading can restore it), when its `untilMs` backstop elapses, or when the
+  caller's abort signal fires. A reading that fails or is unsupported confirms nothing and does
+  not stop tracking; if every reading fails, the next step decides from earlier readings alone.
+  Its timers never keep the process alive. The interval trades the hand-off window against
+  cost: on macOS each reading spawns `/bin/ps` (about 40–50 ms), so 250 ms keeps `ps` running
+  for at most about a sixth of a 5-second grace (about 20 readings); on Linux a reading is a
+  pass over `/proc`.
+
+Platform evidence comes from what the platform ships, plus Node: on **Linux**,
+`/proc/<pid>/stat` (`pgrp` and `starttime`); on **macOS**, `/bin/ps -A -o pid=,pgid=,lstart=`
+(start time to the second). Environment-variable marks were rejected because macOS hides the
+environment of platform binaries such as `/bin/sh` from other processes. On any other platform,
+including Windows, the table is reported as unsupported: signals rest on the live child handle
+alone, and anything needing recorded identity abstains.
+
+**Residual window:** the evidence is a process-table read, which takes time (tens of
+milliseconds normally; on macOS up to its 5-second `ps` timeout), and `kill(2)` follows it as a
+separate system call. A target that empties and is replaced during that read, or between the
+read and the signal, is not detected. Replacement requires the pid space to wrap within that
+window, and no portable POSIX primitive closes it for process groups. The same window applies
+to the reading that starts while the leader is unreaped, to the one started at its exit, and to
+each grace-period reading.
+
+**Hand-off residual:** continuity is re-established only at a reading. After the leader has exited
+(before then, the read at its exit confirms every member), a member that forks and exits between
+two consecutive readings (one tracking interval plus one read, which grows under load up to the 5 s `ps` cap), while no other
+confirmed member is alive, leaves the group to a process no reading confirmed; the next step
+abstains and that process escapes the bound (§3.1's stated exception). This needs no pid reuse
+and is reproducible with ordinary processes, for example `trap '' TERM; sleep 2; sleep 30 &
+exit 0` run as the only surviving member. Without tracking (a caller that does not request it),
+the window is the whole gap between steps.
+
+### 5.2 Live signal-send inventory (current)
+
+Every place shipped code (`libs/`, `apps/`, `plugins/`) sends a signal, and its disposition.
+Keep this table current when a signal site is added.
+
+| Site                                                                                                                                                                                                                                     | Signal and target                                                          | Identity evidence                                                                                                                                                                                                                                                   | Disposition                                                                                                                                                       |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                                   | the read starts while the leader is unreaped (the timeout only fires while the command runs); the members it lists are confirmed, a read at the leader's exit confirms later forks, and readings every 250 ms until the follow-up confirm hand-offs between members | verified; if the leader exits during the read, the reading's members still confirm the group; an empty group needs no signal                                      |
+| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later (after the `SIGTERM` step's read) | the leader is unreaped, or a member confirmed earlier (at the `SIGTERM` step, the leader's exit or a grace-period reading) is still in the group                                                                                                                    | verified; an empty group needs no signal; abstains (§6.1) only when continuity is lost (a reused id, or the hand-off residual of §5.1) or the table is unreadable |
+| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                                                | live child handle                                                                                                                                                                                                                                                   | verified; the follow-up is skipped once the direct child has been reaped                                                                                          |
+| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned                  | live child handle                                                                                                                                                                                                                                                   | verified; a child that has already exited is never signalled by pid                                                                                               |
+| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child                             | live child handle                                                                                                                                                                                                                                                   | verified                                                                                                                                                          |
+| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                           | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
+| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                         | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
+
+Classified as not signal sends: `process.kill(pid, 0)` liveness probes (the startup-lock check
+in `apps/cli/src/daemon-ipc.ts`; signal 0 delivers nothing), `process.on('SIGTERM' | 'SIGINT')`
+handlers (receiving, not sending), and test fixtures under `apps/cli/src/commands/fixtures/`
+(test support, not shipped behavior). The restart sweep (#478) and `gc` (#426) do not exist yet;
+when they land they MUST use the same gate, with the recorded-identity target.
+
+**Verified:** gate unit cases (match, recycled pid, missing process, continuity lost through a
+reused group id and through an unseen hand-off, unreadable/unsupported table, leader reaped during
+a read, a late fork confirmed by the read at the leader's exit, grace-period tracking: a hand-off
+confirmed by a reading, no overlapping reads, stopping on an empty reading, on lost continuity, at
+the next step after an in-flight reading lands, on abort and at `untilMs`, unreadable or failing
+readings, unref'd timers; Linux `/proc` read errors and bounded concurrency) in
+`libs/core/src/process/process-identity.test.ts`; the `command-poll` TERM-trap late-fork SIGKILL,
+the hand-off from a TERM-ignoring member during the grace period, TERM → KILL escalation and
+clean-exit cases in `plugins/source-command-poll/src/identity-verified-cleanup.test.ts`; the command
+exiting during the SIGTERM step's read in
+`plugins/source-command-poll/src/identity-verified-cleanup.read-window.test.ts`; the
+reaped-child/recycled-pid case for detach cleanup in `apps/cli/src/commands/daemon.test.ts`. A
+reused group id cannot be produced with real processes without wrapping the pid space, so that
+cause of lost continuity is proven against a fabricated process table only. The hand-off cause
+can be produced with real processes (§5.1's example) but depends on landing inside one tracking
+interval, so it too is asserted against a fabricated table, which pins the abstention
+deterministically.
+
 **Test implication (per #479's acceptance criteria):** a recycled-identifier fixture MUST
 produce abstention, not a signal; every live signal path (not only the sweep) MUST route
 through the same verification.
@@ -206,6 +348,12 @@ through the same verification.
 ## 6. The Two Leak Classes
 
 ### 6.1 Abstention — visible, warned about (target — #507)
+
+**Current interim surface (#479):** each live-path abstention is written as one warning line to
+the stderr of the process that withheld the signal — the daemon log for a background daemon —
+naming the target, the members observed, the reason and the uncertainty, in the calibrated
+wording below. It is not yet durable, deduplicated, or delivered through `doctor` or sessions;
+that remains #507.
 
 An **abstention** (a suspected-ours process left alone because identity could not be
 confirmed, §4.2/§5) MUST produce an **active, durable, user-visible warning** — not merely a
@@ -418,7 +566,7 @@ The posture holds when, scoped to the containment boundary:
 | --------------------------------------------------------------------------- | ----------- | -------------------------------------------------------- |
 | Weeks of continuous running accumulate zero unintended processes            | §3          | #470                                                     |
 | Hard kill + restart leaves a clean process list with no manual intervention | §3.3, §4    | #470, #478, #426                                         |
-| No report, ever, of signalling a process that was not ours                  | §5          | #479                                                     |
+| No report, ever, of signalling a process that was not ours                  | §5          | #479 (live paths, current), #478                         |
 | Every abstention produces a durable, honest, user-visible warning           | §6.1        | #507                                                     |
 | The tool answers accurately what guarantee is in effect on this machine     | §7          | #480                                                     |
 | The monitoring machinery is never why the machine is warm, slow, or loud    | §8          | #469                                                     |

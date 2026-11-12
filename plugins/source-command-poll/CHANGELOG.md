@@ -1,5 +1,63 @@
 # @agentmonitors/source-command-poll
 
+## 0.5.0
+
+### Minor Changes
+
+- 2380ebe: Commit each finite poll span, its ordered retry suffix, and source/notify checkpoints together before optional interpretation. Preserve committed recipient-cache state when admission rolls back.
+
+  When the retry outbox cannot hold a failed observation's whole ordered suffix, because the monitor's outbox is full or a value cannot be stored (such as a BigInt payload), that observation is recorded as `errored` with the reason. Its siblings still materialize and the source checkpoint advances, so the monitor keeps making progress. A rollup window clears its held batch only in the same commit as the flushed observations. A flush that fails leaves the window held and reports the error.
+
+  Breaking source-plugin migration (pre-1.0): `watch()` now yields finite `ObservationResult` batches,
+  not individual observations, and `ObservationContext.checkpoint` is removed. Yield
+  `{ observations: [...], nextState }` so all covered observations and the source checkpoint commit
+  together before interpretation or the next iterator pull. Empty batches support baseline-only
+  updates. Failed admission stops the iterator and preserves the old baseline; legacy bare yields
+  are rejected. Poll signatures are unchanged.
+
+  The five bundled source packages publish the same source contracts through their exported types and
+  default source values. Their minor releases carry this breaking type migration too, even though
+  their own implementations use polling and require no runtime changes.
+
+### Patch Changes
+
+- 36307ad: Verify a process's identity immediately before every cleanup signal. Core adds `sendVerifiedSignal` and `readProcessTable`: a target is signalled only while its spawned child is still unreaped, when a recorded process (pid and start time, read from `/proc` on Linux or `/bin/ps` on macOS) is still present, or, for a process group, while the group can be shown to be the same one (a member confirmed earlier is still in it). Otherwise the signal is withheld and a warning names what was left alone and why.
+
+  `sendVerifiedSignal` also accepts `trackMembership` (`GroupMembershipTracking`): after a step signals a process group, the gate keeps reading the group's membership every 250 ms, one read at a time, until the next step starts, so a member that forks a process and later exits passes the group on to it. Tracking stops on an empty group, on lost continuity, at `untilMs`, or when its abort signal fires, and its timers never keep the process alive.
+
+  `command-poll` timeouts still escalate from SIGTERM to SIGKILL across the command's process group, including processes the command forks after the SIGTERM step, processes a member that ignores SIGTERM forks during the grace period before exiting, and commands that exit while the SIGTERM step is checking the group. The SIGKILL follow-up now skips a group that has emptied, and leaves a group alone, with a warning, only when none of its current members was ever confirmed as part of it or the process table cannot be read. One case still escapes the timeout's bound: after the command itself has exited, a member that forks a process and exits between two consecutive readings (within one 250 ms interval plus one read, and the read time grows under load, up to the 5 s `ps` cap), while no other confirmed member is alive, leaves that process unconfirmed, and it is left alone with a warning. `daemon run --detach` failure cleanup and `verify` teardown signal only their own unreaped child, never a pid left behind by a child that has already exited.
+
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [71c44fa]
+- Updated dependencies [2380ebe]
+- Updated dependencies [65351d0]
+- Updated dependencies [cb92b95]
+- Updated dependencies [d30c9a1]
+- Updated dependencies [3b205ed]
+- Updated dependencies [57e2878]
+- Updated dependencies [3b205ed]
+- Updated dependencies [f194a12]
+- Updated dependencies [e9f3fdf]
+- Updated dependencies [aa5b437]
+- Updated dependencies [820c190]
+- Updated dependencies [36307ad]
+- Updated dependencies [587d0a9]
+- Updated dependencies [caa2452]
+- Updated dependencies [2380ebe]
+- Updated dependencies [7265259]
+- Updated dependencies [d6c56a3]
+- Updated dependencies [ae08f21]
+- Updated dependencies [587d0a9]
+- Updated dependencies [1cbef80]
+- Updated dependencies [2380ebe]
+- Updated dependencies [8ce3139]
+- Updated dependencies [587d0a9]
+- Updated dependencies [28e6e00]
+- Updated dependencies [7c30c92]
+- Updated dependencies [d1649cf]
+- Updated dependencies [2380ebe]
+  - @agentmonitors/core@0.14.0
+
 ## 0.4.0
 
 ### Minor Changes
