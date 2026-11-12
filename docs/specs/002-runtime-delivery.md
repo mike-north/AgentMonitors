@@ -1175,8 +1175,10 @@ samples of 100, 1,000 and 10,000 runs): about 850 bytes per run once cleanup is 
 roughly five runs per page.
 
 **Guarantee and its limits.** For a run that registered its artifact, no observation of the exact
-scratch key reaches a lead session other than the owner once cleanup authority is in effect, across
-arbitrary delay, daemon restart, held-work flushes and config repair. Before authority takes effect,
+scratch key from the verified monitor reaches a lead session other than the owner once cleanup
+authority is in effect, across arbitrary delay, daemon restart, held-work flushes and config repair.
+Sibling monitors whose globs happen to match the scratch file are not filtered, and their events
+for it are neither dropped nor retracted. Before authority takes effect,
 a run that was killed is still in its proof phase: its events stay visible until the daemon reaps
 the owner as stale (§6.2) and retracts them. A client that predates ownership, or a current client
 against a daemon that predates it, falls back to the legacy `events.suppressObject` tombstone with a
@@ -2439,7 +2441,7 @@ The daemon socket exposes the following commands (the `DaemonMethod` enum):
 | `verifyArtifacts.register`       | Registers exact ownership of a verify scratch artifact before it is created (§2.8); returns `VerifyArtifactRecord` |
 | `verifyArtifacts.requestCleanup` | The owner's cleanup request after its proof (§2.8); returns `VerifyArtifactCleanupResult`                          |
 
-Verified: `apps/cli/src/daemon-ipc.ts` — `daemonMethodSchema` (lines 26–37); `handleRequest()` (lines 150–222).
+Verified: `apps/cli/src/daemon-ipc.ts` — `daemonMethodSchema` (lines 51–78); `handleRequest()` (lines 698–916).
 
 ### 10.6 CLI commands that round-trip through the socket
 

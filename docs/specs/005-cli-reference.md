@@ -2430,8 +2430,10 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    records are retained without expiry (002 §2.8), so no restart, delay or config repair restores a
    cleaned-up artifact's events.
 
-   **Guarantee.** For a run that registered its artifact, no event for the scratch key reaches a
-   later lead session once cleanup authority is in effect (002 §2.8). Legitimate work in the same
+   **Guarantee.** For a run that registered its artifact, no event from the verified monitor for
+   the scratch key reaches a later lead session once cleanup authority is in effect (002 §2.8).
+   Sibling monitors that happen to watch the scratch path are not covered: their events for it are
+   neither filtered nor retracted. Legitimate work in the same
    held batches, a foreign workspace with the same monitor and key, and real watched paths are
    unaffected; real watched paths keep their exact-event-id cleanup. A scratch-looking path verify
    did not register (for example, one left by an older client killed mid-run) carries no cleanup
