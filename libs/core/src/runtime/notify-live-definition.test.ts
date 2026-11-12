@@ -40,12 +40,7 @@ vi.mock('node:fs', async (importActual) => {
   }
   return {
     ...actual,
-    readFileSync: (...args: Parameters<typeof actual.readFileSync>) => {
-      if (args[0] === locationFault.path && locationFault.readCode)
-        throw failure(locationFault.readCode);
-      return actual.readFileSync(...args);
-    },
-    // The bounded monitor reader opens a descriptor instead of calling readFileSync.
+    // Monitor files are read only through the bounded reader's descriptor open.
     openSync: (...args: Parameters<typeof actual.openSync>) => {
       if (args[0] === locationFault.path && locationFault.readCode)
         throw failure(locationFault.readCode);
@@ -68,18 +63,9 @@ vi.mock('node:fs/promises', async (importActual) => {
   const actual = await importActual<typeof import('node:fs/promises')>();
   return {
     ...actual,
+    // Monitor files are read only through the bounded reader's descriptor open.
     // Repeated discovery must observe the same targeted I/O failure as the
     // synchronous admission read; otherwise a valid async read would be a duplicate.
-    readFile: async (...args: Parameters<typeof actual.readFile>) => {
-      if (args[0] === locationFault.path && locationFault.readCode) {
-        throw Object.assign(
-          new Error(locationFault.readCode + ': owned filesystem fault'),
-          { code: locationFault.readCode },
-        );
-      }
-      return await actual.readFile(...args);
-    },
-    // The bounded monitor reader opens a descriptor instead of calling readFile.
     open: async (...args: Parameters<typeof actual.open>) => {
       if (args[0] === locationFault.path && locationFault.readCode) {
         throw Object.assign(
