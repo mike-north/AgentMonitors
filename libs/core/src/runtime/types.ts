@@ -494,8 +494,9 @@ export interface DoctorDeliveryCounts {
  * still outstanding because nothing has superseded them (002 §2). One rule
  * covers every kind of drop: an observation the retry outbox could not retain
  * with its ordered suffix ("Admission outcomes when the outbox cannot retain a
- * suffix"), and an observation a debounce or rollup hold refused because it
- * cannot be serialized (002 §4.7). A drop with an object key
+ * suffix"), an observation a debounce or rollup hold refused because it
+ * cannot be serialized (002 §4.7), and the observation of a terminal retry an
+ * operator skipped (002 §2.7). A drop with an object key
  * is superseded only by a later event of the same monitor, workspace and
  * object key; a drop without one, only by a later span of that monitor in that
  * workspace that materializes an event and drops nothing. Quiet ticks, notify
@@ -513,13 +514,15 @@ export interface UnretainedObservationLoss {
   recordedAt: Date;
   /**
    * The newest drop's error: the materialization error followed by
-   * `Not retained for retry: <reason>` for an outbox drop, or the refusal
-   * message for a hold refusal (002 §4.7).
+   * `Not retained for retry: <reason>` for an outbox drop, the refusal
+   * message for a hold refusal (002 §4.7), or the retry's last error followed
+   * by `Retry skipped after <n> failed attempts[: <reason>].` for a skipped
+   * terminal retry (002 §2.7).
    */
   error: string;
-  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal). */
+  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal or a skipped retry). */
   position?: number;
-  /** How many observations that span dispatched, when recorded (never for a hold refusal). */
+  /** How many observations that span dispatched, when recorded (never for a hold refusal or a skipped retry). */
   spanSize?: number;
   /** The newest dropped observation's source `objectKey`, when it had one. */
   objectKey?: string;
@@ -738,6 +741,13 @@ export const MATERIALIZATION_RETRY_DELAYS_MS = [
 ] as const;
 /** Attempts after which a retry becomes terminal and requires re-arm. @public */
 export const MATERIALIZATION_RETRY_MAX_ATTEMPTS = 5;
+/**
+ * Longest operator reason a skipped retry records, in characters after
+ * trimming. A skip with a longer reason is refused, so the recorded loss
+ * always keeps the retry's last error and the skip note in full alongside it.
+ * @public
+ */
+export const MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH = 200;
 
 /** Durable lifecycle state for one failed materialization. @public */
 export type MaterializationRetryStatus = 'pending' | 'terminal';
@@ -894,6 +904,68 @@ export interface MaterializationRetryDiagnostic {
   createdAt: Date;
   /** Time of the most recent failed attempt or operator re-arm. */
   updatedAt: Date;
+}
+
+/**
+ * Names one retained retry for an operator repair
+ * ({@link AgentMonitorRuntime.rearmMaterializationRetry},
+ * {@link AgentMonitorRuntime.skipMaterializationRetry}): the record id that
+ * retry diagnostics list, and the workspace/monitor route it belongs to. A
+ * retry of another monitor or workspace is treated as not found, so a
+ * mistyped route never repairs someone else's work. @public
+ */
+export interface MaterializationRetryRepairInput {
+  /** The monitor whose outbox holds the retry. */
+  monitorId: string;
+  /** The retry's record id, as `monitor explain` and `doctor` list it. */
+  retryId: string;
+  /** The exact workspace the retry was admitted in. */
+  workspacePath: string;
+}
+
+/** A skip names its retry like a re-arm and may say why it is given up. @public */
+export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
+  /**
+   * Optional operator note, recorded with the loss after the retry's last
+   * error. Stored as a single-line diagnostic; at most
+   * {@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH} characters after
+   * trimming, or the skip is refused.
+   */
+  reason?: string;
+}
+
+/**
+ * What an operator repair did to a terminal retry (002 §2.7, §2.8):
+ *
+ * - `rearmed`: the retry is back on automatic retry, its attempts reset;
+ * - `skipped`: the retry is removed and its observation is recorded as an
+ *   outstanding loss (002 §2);
+ * - `verify-artifact-cleanup`: the retry is removed and nothing is recorded,
+ *   because its observation is a verify artifact whose cleanup authority is in
+ *   effect (002 §2.8). Dropping it is the cleanup its owner asked for, not lost
+ *   work, so either repair removes it this way instead of re-arming it or
+ *   recording a loss.
+ *
+ * @public
+ */
+export type MaterializationRetryRepairOutcome =
+  | 'rearmed'
+  | 'skipped'
+  | 'verify-artifact-cleanup';
+
+/**
+ * The result of an operator repair of a terminal retry
+ * ({@link AgentMonitorRuntime.rearmMaterializationRetry},
+ * {@link AgentMonitorRuntime.skipMaterializationRetry}). @public
+ */
+export interface MaterializationRetryRepairResult {
+  /** What the repair did; see {@link MaterializationRetryRepairOutcome}. */
+  outcome: MaterializationRetryRepairOutcome;
+  /**
+   * The retry's safe metadata: as it is after a re-arm, or as it was when it
+   * was removed.
+   */
+  retry: MaterializationRetryDiagnostic;
 }
 
 /** Aggregate and bounded record-level diagnostics for one retry outbox. @public */
