@@ -112,6 +112,8 @@ verified per-process cleanup instead of signalling a PGID guessed from a PPID.
 Unreadable ownership marks retain their affected PIDs as discovery abstentions, without attributing
 those processes to a command. Escape silence is per process: unrelated unreadable marks can make
 the overall pass incomplete while positively confirmed work is reaped.
+Later discovery skips ownership reads for positively terminal incarnations while still inspecting
+reused PIDs whose process identities differ.
 
 ## 2026-11-12 — Spec 004 gap markers reconciled with shipped coverage; gap-drift check (004 §3.0/§3.1/§3.5/§5.1; roadmap) — Closes #287
 

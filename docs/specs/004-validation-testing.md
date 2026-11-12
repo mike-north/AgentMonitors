@@ -895,6 +895,8 @@ Unreadable-mark controls require per-PID abstentions durable before later identi
 an unrelated unreadable environment may make discovery incomplete without producing an outcome
 for a readable detached mark-erased escape. Escape coverage must still prove the parent's reap,
 the child's survival, and no diagnostic for that child.
+Confirmed terminal incarnations must not become new unreadable candidates in a later snapshot;
+a different incarnation using the same PID must still receive normal discovery.
 
 ### 3.5.2 Literal-path verify cleanup and first-attempt acceptance
 

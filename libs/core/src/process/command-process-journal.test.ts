@@ -467,3 +467,63 @@ it('identifies unrelated unreadable marks without attributing a readable detache
     false,
   );
 });
+
+it('does not reclassify a confirmed reap as unreadable discovery in a later snapshot', async () => {
+  const f = await fixture();
+  const parent = { pid: 4242, pgid: 4242, startTime: 'parent' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [parent],
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks:
+      kill.mock.calls.length === 0 && pids.includes(parent.pid)
+        ? new Map([[parent.pid, f.token]])
+        : new Map(),
+    unreadable:
+      kill.mock.calls.length > 0 && pids.includes(parent.pid)
+        ? [parent.pid]
+        : [],
+  }));
+  const result = await f.journal.sweep();
+  expect(result.status).toBe('complete');
+  expect(result.outcomes).toEqual([
+    expect.objectContaining({ pid: parent.pid, status: 'reaped' }),
+  ]);
+  expect(kill).toHaveBeenCalledExactlyOnceWith(parent.pid, 'SIGKILL');
+});
+
+it('still records unreadable discovery when a reaped PID has a different incarnation', async () => {
+  const f = await fixture();
+  const parent = { pid: 4242, pgid: 4242, startTime: 'parent' };
+  const replacement = { ...parent, startTime: 'replacement' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: [kill.mock.calls.length === 0 ? parent : replacement],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks:
+      kill.mock.calls.length === 0 && pids.includes(parent.pid)
+        ? new Map([[parent.pid, f.token]])
+        : new Map(),
+    unreadable:
+      kill.mock.calls.length > 0 && pids.includes(parent.pid)
+        ? [parent.pid]
+        : [],
+  }));
+  const result = await f.journal.sweep();
+  expect(result.status).toBe('incomplete');
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: replacement.pid,
+      status: 'abstained',
+      reason:
+        'Same-user ownership mark could not be read; command attribution is unknown',
+    }),
+  );
+  expect(kill).toHaveBeenCalledExactlyOnceWith(parent.pid, 'SIGKILL');
+});

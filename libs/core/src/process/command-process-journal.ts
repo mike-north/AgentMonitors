@@ -322,6 +322,9 @@ export class CommandProcessJournal implements CommandProcessOwner {
       // Once an identifier is considered, never retry it during this sweep.
       // In particular, start-time disagreement cannot later become permission.
       const visited = new Set<number>();
+      // Terminal incarnations may remain visible without readable environments.
+      // Retain their full identity so a recycled PID is still discovered normally.
+      const reaped = new Map<number, ProcessIdentityRecord>();
       for (let round = 0; round < MAX_DISCOVERY_PASSES; round++) {
         const markedMembers = reading.processes.filter(
           (member) =>
@@ -462,10 +465,12 @@ export class CommandProcessJournal implements CommandProcessOwner {
                   : {}),
               },
             });
-            if (terminal === 'terminated')
+            if (terminal === 'terminated') {
+              reaped.set(pid, record);
               this.sql
                 .prepare('DELETE FROM command_pids WHERE life = ? AND pid = ?')
                 .run(previous.life, pid);
+            }
             // Keep the nonce until a later empty startup can retire it: a
             // kernel-delayed exit must never erase attribution of late forks.
             retained = true;
@@ -502,7 +507,14 @@ export class CommandProcessJournal implements CommandProcessOwner {
           break;
         }
         const nextMarks = await readCommandMarks(
-          next.processes.map((p) => p.pid),
+          next.processes
+            .filter((p) => {
+              const terminal = reaped.get(p.pid);
+              return (
+                terminal?.pgid !== p.pgid || terminal.startTime !== p.startTime
+              );
+            })
+            .map((p) => p.pid),
         );
         if (!nextMarks.supported) {
           complete = false;

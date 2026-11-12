@@ -229,6 +229,8 @@ Decisions are saved incrementally, including discovery obstacles before later id
 and the most recent 20 receipts per workspace are retained. `reaped` additionally requires
 terminal evidence (absence, a different start-time incarnation, or a zombie/dead state), not just
 an accepted signal. A sent signal with unconfirmed termination is `failed` with a reason.
+Later discovery omits ownership reads for the exact PID/group/start-time incarnation already
+confirmed terminal; a reused PID with a different identity remains subject to discovery.
 Abstained lives remain for later reconciliation. This is the input for #507; no new active warning surface ships here.
 
 Discovery takes another snapshot after signalling to catch late forks. It considers each PID
