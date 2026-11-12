@@ -4,6 +4,7 @@
  * hook taps local classes before command dispatch; it preserves the actual CLI,
  * runtime, source observation and SQLite transaction implementations.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { watch } from 'node:fs';
 import { createRequire, registerHooks } from 'node:module';
 import path from 'node:path';
@@ -14,7 +15,9 @@ const Database = require('better-sqlite3');
 const RealDate = globalThis.Date;
 let now = Number(process.env.INGRESS_TEST_NOW);
 let control = {};
-let ingressDepth = 0;
+/** Async ownership prevents an idle watcher from classifying unrelated IPC writes. */
+const lifecycle = new AsyncLocalStorage();
+const admission = new AsyncLocalStorage();
 const occurrences = new Map();
 /** Freeze wall time, leaving native timers and parent timeout budgets untouched. */
 globalThis.Date = class extends RealDate {
@@ -43,6 +46,8 @@ function pointFor(sql) {
 /** A fault precedes SQLite execution; a kill parks immediately after the write. */
 function interrupt(point) {
   const mode = control.mode;
+  const span = lifecycle.getStore();
+  if (span) span.faulted = mode === 'fault';
   control = { ...control, point: undefined };
   process.send?.({ kind: 'interrupted', point, mode });
   if (mode === 'kill') {
@@ -54,18 +59,78 @@ function interrupt(point) {
   throw new Error(`Injected ingress write failure: ${point}`);
 }
 
-/** Discover from executed SQL, rather than a hand-maintained write-point list. */
+/** Capture the driver and runtime call sites even through the ORM's stack frames. */
+function callSite() {
+  const previous = Error.stackTraceLimit;
+  try {
+    Error.stackTraceLimit = 50;
+    return new Error().stack;
+  } finally {
+    Error.stackTraceLimit = previous;
+  }
+}
+
+/**
+ * All lifecycle writes require a classification. Setup/restart validation is
+ * deliberately unarmed; fault diagnostics are checked independently by the
+ * reader; the exact expired-tombstone sweep has no ingress work in these cases.
+ * No table-wide or method-wide maintenance exemption admits new SQL silently.
+ */
+function classify(sql, args, site) {
+  const span = lifecycle.getStore();
+  if (!span) return undefined;
+  if (control.stage === undefined) return 'setup-and-restart';
+  if (admission.getStore()) return 'scenario';
+  if (
+    sql ===
+      'delete from "object_event_suppressions" where "object_event_suppressions"."expires_at" <= ?' &&
+    site.includes('.purgeExpiredObjectSuppressions (')
+  )
+    return 'expired-suppression-maintenance';
+  if (
+    span.faulted &&
+    sql.startsWith('insert into "observation_history" ') &&
+    args.includes('errored') &&
+    site.includes('.recordObservationHistory (')
+  )
+    return 'injected-fault-diagnostic';
+  const message = `Unclassified ingress write: ${sql}\n${site}`;
+  process.send?.({ kind: 'unclassified-write', message, sql, site });
+  throw new Error(message);
+}
+
+/** Discover synchronous prepared writes, including RETURNING through get/all. */
 const prepare = Database.prototype.prepare;
 Database.prototype.prepare = function (sql) {
   const statement = prepare.call(this, sql);
-  if (!/^\s*(insert|update|delete|replace)\b/i.test(sql)) return statement;
+  if (statement.readonly) return statement;
+  // Iteration defers execution until next(); treating iterate() as the write
+  // would park a kill before durability. Refuse a new deferred writer explicitly.
+  const iterate = statement.iterate;
+  statement.iterate = function (...args) {
+    if (lifecycle.getStore()) {
+      const site = callSite();
+      const message = `Unclassified ingress write: ${sql}\n${site}`;
+      process.send?.({ kind: 'unclassified-write', message, sql, site });
+      throw new Error(message);
+    }
+    return iterate.apply(this, args);
+  };
   for (const method of ['run', 'get', 'all']) {
     const execute = statement[method];
     statement[method] = function (...args) {
-      const active = ingressDepth > 0;
-
-      // A single real event-write failure opens the retry-admission/drain paths.
-      // This seed is independent of the write selected for the actual scenario.
+      const normalized = sql.replace(/\s+/g, ' ').trim();
+      const site = callSite();
+      const classification = classify(normalized, args.flat(), site);
+      const active = classification === 'scenario';
+      if (classification && !active && control.trace)
+        process.send?.({
+          kind: 'excluded-write',
+          exclusion: classification,
+          sql: normalized,
+          site,
+        });
+      // A real event failure opens retry admission independently of the selected point.
       if (
         active &&
         control.seedRetry &&
@@ -75,7 +140,8 @@ Database.prototype.prepare = function (sql) {
         throw new Error('Ingress fixture opens retry recovery');
       }
       const point = active ? pointFor(sql) : '';
-      if (active && control.trace) process.send?.({ kind: 'write', point });
+      if (active && control.trace)
+        process.send?.({ kind: 'write', point, site });
       if (active && control.point === point && control.mode === 'fault')
         interrupt(point);
       const result = execute.apply(this, args);
@@ -84,6 +150,23 @@ Database.prototype.prepare = function (sql) {
     };
   }
   return statement;
+};
+
+/** Direct SQL cannot bypass classification by avoiding prepare(). */
+const exec = Database.prototype.exec;
+Database.prototype.exec = function (sql) {
+  if (
+    lifecycle.getStore() &&
+    /\b(insert|update|delete|replace|create|drop|alter)\b/i.test(sql)
+  ) {
+    // Runtime ingress uses prepared statements. A new direct writer requires
+    // deliberate inventory support rather than an uninterruptible multi-write point.
+    const site = callSite();
+    const message = `Unclassified ingress write: ${sql}\n${site}`;
+    process.send?.({ kind: 'unclassified-write', message, sql, site });
+    throw new Error(message);
+  }
+  return exec.call(this, sql);
 };
 
 /**
@@ -164,7 +247,7 @@ function fileWatcher(source, config, context) {
   })();
 }
 
-/** Tap original results and bound instrumentation to ingress, excluding delivery/maintenance. */
+/** Trace whole asynchronous tick/watch lifecycles, with nested admission classifications. */
 globalThis.__ingressTestAttach = (Registry, Runtime) => {
   const register = Registry.prototype.register;
   Registry.prototype.register = function (source) {
@@ -189,27 +272,21 @@ globalThis.__ingressTestAttach = (Registry, Runtime) => {
     if (typeof original !== 'function')
       throw new Error(`Ingress boundary disappeared: ${name}`);
     Runtime.prototype[name] = function (...args) {
-      ingressDepth++;
-      try {
-        const result = original.apply(this, args);
-        if (result?.then)
-          return result.finally(() => {
-            ingressDepth--;
-          });
-        ingressDepth--;
-        return result;
-      } catch (error) {
-        ingressDepth--;
-        throw error;
-      }
+      return admission.run(name, () => original.apply(this, args));
     };
   }
-  const tick = Runtime.prototype.tick;
-  Runtime.prototype.tick = async function (...args) {
-    const result = await tick.apply(this, args);
-    process.send?.({ kind: 'tick', result });
-    return result;
-  };
+  for (const name of ['tick', 'consumeWatch']) {
+    const original = Runtime.prototype[name];
+    if (typeof original !== 'function')
+      throw new Error(`Ingress lifecycle disappeared: ${name}`);
+    Runtime.prototype[name] = function (...args) {
+      return lifecycle.run({ name, faulted: false }, async () => {
+        const result = await original.apply(this, args);
+        if (name === 'tick') process.send?.({ kind: 'tick', result });
+        return result;
+      });
+    };
+  }
   const watchMonitors = Runtime.prototype.watchMonitors;
   Runtime.prototype.watchMonitors = function (directory, workspace, options) {
     return watchMonitors.call(this, directory, workspace, {

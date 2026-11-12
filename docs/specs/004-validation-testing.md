@@ -850,8 +850,8 @@ and refusal of detected concurrent writes (003 §3.2).
 
 For immediate, debounce and rollup pacing, tests MUST interrupt every SQL write occurrence
 observed during acceptance, held release, retry admission and retry completion. Immediate
-pacing has no held-release phase. Discovery runs the real workflows at the SQLite driver,
-including `RETURNING` statements and repeated writes for two recipients. Each discovered
+pacing has no held-release phase. Discovery traces the entire asynchronous tick and
+watch-consumption lifecycle at the SQLite driver, including `RETURNING` statements and repeated writes for two recipients. Each discovered
 occurrence receives both a fault before execution and a SIGKILL immediately after execution,
 then an independent process restart. No source data, runtime result or transaction is mocked.
 Fixed wall clocks govern deadlines/windows; IPC messages and actual filesystem notifications
@@ -866,13 +866,31 @@ in the original `erroredObservations` tick result or watch `onError` callback an
 post-commit history-write cases retain 002 §15's existing best-effort audit semantics: a failed
 audit write cannot undo a committed event and is not itself an ingestion error.
 
-Discovery automatically adds kill/fault cases for new writes on the exercised paths. It is
-executed-path discovery, not proof that every possible branch in arbitrary source/Interpret
+The independent reader MUST compare each shared snapshot's content against the expected
+source value, and its workspace/monitor/object/event identity against the corresponding
+event. Comparing only row counts or the event's separate inline snapshot is insufficient.
+Each recipient cursor MUST retain the expected baseline content and baseline event identity
+under the exact session/workspace/monitor/object key, including after restart.
+
+The four admission operations (`ingest`, held flush, retry drain and notify reconciliation)
+automatically contribute every executed prepared write to the interruption inventory. Every
+other lifecycle write MUST match an explicit named exclusion or fail with its SQL and call
+site, even if runtime error handling catches the failure. Current exclusions are unarmed
+startup/restart setup, the exact expired-object-suppression DELETE from its maintenance
+method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
+is checked separately). Delivery refresh reaches no additional durable writes in these
+fixtures; it has no blanket exclusion. Direct SQL and deferred iterator writes are refused
+with the same diagnostic until they have deliberate interruption support.
+`ingress-preload.test.ts` independently exercises asynchronous tick/watch discovery and
+classification failures. The acquisition-path extra-write, corrupted shared-snapshot-content,
+and corrupted recipient-baseline mutations MUST all fail the suite.
+
+This is executed-path discovery, not proof that every possible branch in arbitrary source/Interpret
 code was reached; invalid-envelope/loss-capacity and policy-edit branches retain their separate
 runtime regression obligations. A scratch-copy mutation removing a durable snapshot write must
 fail the invariant assertions even though that removed write no longer appears in discovery.
-Retry re-arm and skip interruption cases remain an explicit linked TODO for #584 in the test
-file, rather than skipped tests or a dependency on commands not yet on main.
+Retry re-arm and skip interruption cases remain an explicit linked TODO for #615 in the test
+file, rather than skipped tests. The repair commands themselves are already on main.
 
 Verification launched with an isolated home/data root MUST retain 002 §10.3's socket
 normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resolved socket,

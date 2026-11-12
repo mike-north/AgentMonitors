@@ -3,7 +3,7 @@
  * is captured at the real SQLite driver while real sources ingest, hold and
  * recover work. Every discovered write occurrence gets a SIGKILL and a fault
  * scenario; clocks advance by command and readiness comes only from events.
- * TODO https://github.com/mike-north/AgentMonitors/issues/584: kill during retry re-arm and skip.
+ * TODO https://github.com/mike-north/AgentMonitors/issues/615: kill during retry re-arm and skip.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
@@ -75,6 +75,14 @@ async function message(
     return await bounded(
       new Promise<Message>((resolve, reject) => {
         const check = () => {
+          // A caught runtime error must not hide a missing inventory classification.
+          const unclassified = owned.messages.find(
+            (value) => value.kind === 'unclassified-write',
+          );
+          if (unclassified) {
+            reject(new Error(String(unclassified.message)));
+            return;
+          }
           const index = owned.messages.findIndex(predicate);
           if (index >= 0) {
             const found = owned.messages.splice(index, 1)[0];
@@ -281,6 +289,9 @@ async function fixture(source: Source, policy: Policy) {
     source === 'poll' ? tick(owned, now) : observeFile(owned, now, true);
   return {
     root,
+    monitorId: source,
+    objectKey:
+      source === 'poll' ? `http://127.0.0.1:${address.port}/` : watched,
     dbPath,
     rpc,
     start,
@@ -362,8 +373,12 @@ async function exercise(
 }
 
 /** Event and projection truth is read independently after the crashed connection is gone. */
-function assertDurableTruth(dbPath: string, failedMonitor?: string): void {
-  const db = new Database(dbPath);
+function assertDurableTruth(
+  f: Fixture,
+  recipients: readonly string[],
+  failedMonitor?: string,
+): void {
+  const db = new Database(f.dbPath);
   try {
     const events = db
       .prepare('SELECT count(*) n FROM monitor_events')
@@ -380,18 +395,49 @@ function assertDurableTruth(dbPath: string, failedMonitor?: string): void {
       )
       .get() as { n: number };
     expect(partial.n).toBe(0);
-    const missingSnapshot = db
-      .prepare(
-        'SELECT count(*) n FROM monitor_events e WHERE (SELECT count(*) FROM monitor_snapshots s WHERE s.event_id = e.id) != 1',
-      )
-      .get() as { n: number };
-    expect(missingSnapshot.n).toBe(0);
-    if (events.n > 0) {
-      const cursors = db
-        .prepare('SELECT count(*) n FROM session_object_cursor')
-        .get() as { n: number };
-      expect(cursors.n).toBe(2);
-    }
+    // Compare the separate durable artifacts against source values and exact
+    // event identities; inline monitor_events.snapshot_text is not snapshot truth.
+    const committed = db
+      .prepare('SELECT id FROM monitor_events ORDER BY sequence')
+      .all() as { id: string }[];
+    expect(committed.length).toBeLessThanOrEqual(2);
+    const route = {
+      workspace_path: f.root,
+      monitor_id: f.monitorId,
+      object_key: f.objectKey,
+    };
+    expect(
+      db
+        .prepare(
+          'SELECT workspace_path, monitor_id, object_key, event_id, content FROM monitor_snapshots ORDER BY sequence',
+        )
+        .all(),
+    ).toEqual(
+      committed.map((event, index) => ({
+        ...route,
+        event_id: event.id,
+        content: ['one', 'two'][index],
+      })),
+    );
+    // Nothing is claimed in this fixture: each recipient must retain the first
+    // event's artifact as its baseline, even after later events and a restart.
+    const first = committed[0];
+    expect(
+      db
+        .prepare(
+          'SELECT session_id, workspace_path, monitor_id, object_key, baseline_snapshot_id, baseline_content FROM session_object_cursor ORDER BY session_id',
+        )
+        .all(),
+    ).toEqual(
+      first
+        ? [...recipients].sort().map((sessionId) => ({
+            ...route,
+            session_id: sessionId,
+            baseline_snapshot_id: first.id,
+            baseline_content: 'one',
+          }))
+        : [],
+    );
     expect(db.pragma('foreign_key_check')).toEqual([]);
     if (failedMonitor) {
       const errors = db
@@ -481,7 +527,8 @@ for (const source of ['poll', 'watch'] satisfies Source[])
               await stop(first);
               await attempted;
               assertDurableTruth(
-                f.dbPath,
+                f,
+                [leadA.id, leadB.id],
                 mode === 'fault' && !point.includes('observation_history')
                   ? source
                   : undefined,
@@ -511,7 +558,7 @@ for (const source of ['poll', 'watch'] satisfies Source[])
                   unreadOnly: true,
                 }),
               ).toEqual([]);
-              assertDurableTruth(f.dbPath);
+              assertDurableTruth(f, [leadA.id, leadB.id]);
             } finally {
               await f.cleanup();
             }
