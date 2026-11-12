@@ -27,6 +27,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { RuntimeStore } from '../runtime/store.js';
 import { createDb } from './db.js';
 
 const sql = String.raw;
@@ -754,4 +755,97 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
     const migrated = openWithCurrentCode(dbPath);
     expect(rowsByRowid(migrated, 'monitor_events')).toHaveLength(2);
   });
+});
+
+/**
+ * `agent_sessions` as every released version (0.0.1–0.13.0, release commits
+ * 8f7d35bd … a6445551) created it: no `registration_sequence`.
+ */
+const SESSIONS_RELEASED = sql`
+  CREATE TABLE agent_sessions (
+    id TEXT PRIMARY KEY,
+    adapter TEXT NOT NULL,
+    host_session_id TEXT NOT NULL,
+    agent_identity TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'lead',
+    workspace_path TEXT,
+    hook_state_path TEXT NOT NULL,
+    status TEXT NOT NULL,
+    baseline_at INTEGER NOT NULL,
+    last_active_at INTEGER NOT NULL,
+    last_recap_at INTEGER,
+    dormant_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )
+`;
+
+function sessionRow(index: number): Record<string, unknown> {
+  return {
+    id: `01M6BSHAPE00000000000000A${index}`,
+    adapter: `adapter-${index}`,
+    host_session_id: `host-${index}`,
+    agent_identity: `agent-${index}`,
+    role: index % 2 === 0 ? 'subagent' : 'lead',
+    workspace_path: index % 2 === 0 ? null : `/workspace-${index}`,
+    hook_state_path: `/hooks/${index}.json`,
+    status: index % 2 === 0 ? 'dormant' : 'active',
+    baseline_at: OBSERVED_AT + index,
+    last_active_at: OBSERVED_AT + index + 1,
+    last_recap_at: OBSERVED_AT + index + 2,
+    dormant_at: index % 2 === 0 ? OBSERVED_AT + index + 3 : null,
+    created_at: OBSERVED_AT + index,
+    updated_at: OBSERVED_AT + index + 4,
+  };
+}
+
+describe('opening agent_sessions written by a released version (002 §2.6)', () => {
+  it.each(SHAPES)(
+    'keeps every session of $name, without a registration position, and positions new sessions',
+    (shape) => {
+      const dbPath = tempDbPath();
+      seedReleasedShape(dbPath, shape);
+      const seeded = rawClient(dbPath);
+      seeded.exec(SESSIONS_RELEASED);
+      insertRows(seeded, 'agent_sessions', [sessionRow(1), sessionRow(2)]);
+      const before = rowsByRowid(seeded, 'agent_sessions');
+      seeded.close();
+
+      const migrated = openWithCurrentCode(dbPath);
+      const after = rowsByRowid(migrated, 'agent_sessions');
+      expect(after).toHaveLength(2);
+      after.forEach((row, index) => {
+        // Every released value survives; the position is unknown, so NULL.
+        expect(row).toEqual({
+          ...before[index],
+          registration_sequence: null,
+        });
+      });
+      migrated.close();
+
+      // The current writer registers a session with a position after every
+      // event the released version wrote (the materialization order, 002 §2).
+      const db = createDb(dbPath);
+      const client = (db as unknown as { $client: Database.Database }).$client;
+      nativeClients.add(client);
+      const session = new RuntimeStore(db).openSession({
+        adapter: 'adapter-new',
+        hostSessionId: 'host-new',
+        agentIdentity: 'agent-new',
+        hookStatePath: '/hooks/new.json',
+      });
+      const positioned = client
+        .prepare<
+          [string],
+          { position: number | null }
+        >('SELECT registration_sequence AS position FROM agent_sessions WHERE id = ?')
+        .get(session.id)?.position;
+      expect(positioned).toBeGreaterThan(shape.events.length);
+      client.close();
+
+      // Reopening is a no-op.
+      const reopened = openWithCurrentCode(dbPath);
+      expect(rowsByRowid(reopened, 'agent_sessions')).toHaveLength(3);
+    },
+  );
 });

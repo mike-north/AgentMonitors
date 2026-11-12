@@ -630,6 +630,7 @@ For each runtime tick, the implementation **MUST**:
 3. resolve each parsed monitor's `source` name against the source registry
 4. fail the tick if a parsed monitor references an unknown source
 5. validate the source-specific `watch` config (minus `type`) with `validateWatchScope`; skip invalid config before scheduling, observation, notify processing, or admission, so a rejected config records no drop and queues no retry
+   5a. drain the monitor's retained materialization work oldest admission first, and skip the rest of the monitor's evaluation while any of it remains (§2.6)
 6. determine whether the monitor is due to run
 7. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
 8. route returned observations through notify dispatch
@@ -769,8 +770,8 @@ and cleared by the flush that materializes its key; a drop kept across reopening
 drop of a removed, unparseable, duplicated or invalid definition reported in doctor; a drop kept
 outstanding across a later observe failure and accumulated with a later drop; a span whose only
 observation is dropped, kept through later quiet ticks; bounded, control-free identity text with
-no payload; explain and doctor failing for both a retained and a dropped failure; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
-outbox; a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
+no payload; explain and doctor failing for both a retained and a dropped failure; a suffix that exactly fills the outbox and one record over
+(a span is only admitted into an empty outbox, §2.6); a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
 fit, or roll back; and watch batches over capacity or with a BigInt payload. Each asserts the
 three-outcome invariant and that the next tick or batch makes progress.
 
@@ -999,8 +1000,9 @@ failure is an admission failure, not a warning-only checkpoint operation.
 Whole-admission failure **MUST** preserve the prior source/notify state and all prior committed rows,
 record/report the error best-effort, close the iterator, and stop before requesting newer input.
 A restart or one-shot fallback receives the prior baseline and can replay the unadmitted batch.
-Durable retry obligations remain distinct from completed materialization; retry draining before
-newer input and the final owned-process crash proof remain separate runtime recovery work.
+Durable retry obligations remain distinct from completed materialization. A watcher drains them
+before its next pull (§2.6); the final owned-process crash proof remains separate runtime
+recovery work.
 
 Aborted or superseded watchers **MUST NOT** admit late batches. After an abort during Interpret,
 already committed work survives and no newer iterator pull occurs. Iterator completion, setup
@@ -1036,7 +1038,8 @@ end-to-end watch/poll exclusivity scenarios retained in `service.test.ts`.
 #### Notify admission gate and teardown
 
 While the notify admission gate ([§4.6](#46-effective-notify-policy-edits-current)) is closed — a
-failed edit drain, an unresolved source, or a rejected scope with held work — a yielded batch waits
+failed edit drain, an unresolved source, a rejected scope with held work, or retained work that
+watcher startup could not drain (§2.6) — a yielded batch waits
 on the consumer's stack and the iterator is not pulled again. The waiting batch is not admitted, so
 it records no drop and queues no retry; its observations and `nextState` stay unpersisted until the
 gate opens. Admission rereads the gate, cancellation and the watcher's ownership token in the same
@@ -1061,16 +1064,89 @@ and replacement exclusion, workspace/monitor isolation and independent SQLite re
 
 `tick()` returns a `RuntimeTickResult` summarizing the tick:
 
-- `evaluatedMonitors` — the ids of every monitor whose `observe()` was attempted this tick (including monitors whose outcome was `errored`).
+- `evaluatedMonitors` — the ids of every monitor whose `observe()` or retained-work drain (§2.6) was attempted this tick (including monitors whose outcome was `errored`). A monitor that drains and then observes appears once.
 - `emittedEventIds` — the ids of the durable events materialized this tick.
-- `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed), and one per observation a debounce/rollup hold refused because it cannot be serialized (§4.7). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
-- `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
+- `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed), and one per observation a debounce/rollup hold refused because it cannot be serialized (§4.7), and one per monitor whose retained work failed a drain attempt or is paused behind a terminal retry (§2.6). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
+- `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open), or because its oldest retained retry is backing off, in which case `nextDueAt` is that retry's next attempt time (§2.6). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
 
 The runtime **MUST** surface `erroredObservations` so a caller (e.g. the CLI tick output, §10.1/§10.2) can report a failed observation rather than print a clean `emitted 0` that an author cannot distinguish from a genuine no-change.
 
 The runtime **MUST** surface `skippedMonitors` so a caller can distinguish "monitors exist but are not yet due" from "no monitors found" — two situations that previously produced identical CLI output (issue #152).
 
 Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObservation`, `SkippedMonitor`; `libs/core/src/runtime/service.ts` — `tick()` populates `erroredObservations` in both the `observe()` and `ingest()` error branches alongside the `recordObservationHistory({ result: 'errored' })` write; populates `skippedMonitors` in the `!schedule.due` branch from the same scheduling decision.
+
+### 2.6 Retained work drains before newer source input (current)
+
+Work the runtime has accepted but not yet materialized — the retry outbox's rows for one
+workspace/monitor (§2, [`materialization_retry_outbox`](#materialization_retry_outbox)) — **MUST**
+complete before that monitor accepts anything newer. On every tick, after the source-config
+preflight (§2.0) and before notify-edit reconciliation (§4.6), a deferred poll result, a not-due
+rollup window flush (§4.4), the due check or `observe()`, the runtime drains the monitor's outbox:
+
+1. It takes the oldest row in admission order: the materialization-order position the row
+   reserved when it was queued (`admission_sequence`, §2). Rows queued before positions were
+   reserved come first, by enqueue time. Whole-second timestamps never decide the order.
+2. A `pending` row whose next attempt is due is materialized from its stored envelope, exactly as
+   its span would have materialized it, and completed atomically with removal of the row
+   (`completeMaterializationRetry`). Interpret runs after that commit. The drain then continues
+   with the next row.
+3. A failed attempt advances the row's persisted backoff and records an `errored` history row,
+   and the drain stops: a younger row never completes ahead of an older one.
+4. A `pending` row that is not yet due, or a `terminal` row, stops the drain without an attempt.
+
+While any row remains, the monitor's source is not called, and nothing else that would put newer
+work ahead of the retained work runs: no edit reconciliation, no deferred poll result, no rollup
+window flush, and no debounce flush (that one happens only through admission of a new span). A
+hold that exists beside retained work is always newer than it, because a monitor with retained
+work admits no span, so releasing the hold first would reorder events. Held work therefore waits
+behind a failing or terminal retry; this includes a held flush on a tick whose source call fails.
+A consequence is that a span is only ever admitted into an empty outbox for its monitor.
+
+Each tick that leaves retained work in place reports it:
+
+- a failed attempt: one `erroredObservations` entry with the error, beside its `errored` row;
+- a `terminal` row: one `erroredObservations` entry and one `errored` row on every tick it keeps
+  the monitor paused, naming the retry and its last error. A terminal row is never attempted
+  automatically; it stays until an operator re-arms it, and the monitor stays paused until then;
+- a row backing off: a `skippedMonitors` entry whose `nextDueAt` is the row's next attempt time.
+
+Other monitors are unaffected: each monitor drains and pauses on its own outbox.
+
+A continuous watcher drains its monitor's outbox before its first pull and after every admitted
+batch, before pulling again. It waits for a backing-off row's next attempt, reports each failed
+attempt through `onError` (with its `errored` row), and reports a terminal row once, then rechecks
+it every minute until it is re-armed or the watcher stops. A watched monitor is drained by ticks
+as well, so an edit is not reconciled ahead of its retained work; each completion is one
+synchronous transaction, so a tick and a watcher never complete the same row. Watcher startup
+drains first too. When retained work remains at startup, the watcher's admission gate stays closed
+(§2.4) and no edit is reconciled; a later tick that drains the work reconciles and opens the gate.
+
+**Recipients.** A session registered after an observation was admitted **MUST NOT** receive that
+observation, however late its retry completes. Registering a session reserves a position in the
+same materialization order (`agent_sessions.registration_sequence`); a completed retry projects
+only into sessions whose position is below its row's `admission_sequence`. The comparison does
+not depend on timestamps, so a session opened in the same second as the admission is still
+ordered correctly. Resuming a session keeps its original position. For rows written before
+positions were reserved: a retry without a position predates every positioned session, so no
+positioned session receives it; a session without a position falls back to comparing its
+whole-second registration time (`baseline_at`) with the observation time. An event materialized
+in its admitting span needs no such check, because admission and projection share one
+transaction. Held notify work released by a later flush is outside this rule: it projects into
+the sessions that match when it is flushed.
+
+**Restart.** Retained rows and their order are durable, so after a daemon restart the first tick
+(or watcher startup) drains them before the monitor observes, in their original order. Each
+completion deletes its row in the same transaction as its event, so each produces its event
+exactly once.
+
+Verified by `libs/core/src/runtime/retry-drain.test.ts`: a retry drained before newer poll input;
+no source call while a retry fails or backs off; a retry that keeps failing, reported with an
+`errored` row every tick through terminal while a sibling keeps emitting; retained work from
+before a restart drained first in order, exactly once; a same-second session that never receives
+the retry while an earlier one does; a retained watch batch drained before the next pull; a
+restarted watcher kept closed until a tick drains its batch; and the fallbacks for rows and
+sessions without positions. `libs/core/src/inbox/db.released-shapes.test.ts` opens every released
+`agent_sessions` shape.
 
 ## 3. Persisted Monitor State
 
@@ -1337,7 +1413,8 @@ three clocks especially visible:
    prior state, reports one monitor error/best-effort error history, and allows healthy siblings to run.
    Verified by `rollup-admission.test.ts`: independently owned competing runtimes before BEGIN,
    a reader opened before admission, retained-suffix barriers, rollback/reopen, and empty/closed-window
-   error isolation. This does not add source leader election or retry draining; §2 limits still apply.
+   error isolation. This does not add source leader election; §2 limits still apply, and the window
+   check waits behind retained work (§2.6).
 
 4. **Batch representation.** The flushed batch becomes one or more `monitor_events` rows (one per
    accumulated observation) rather than a single merged row, so the full event history is
@@ -1390,7 +1467,8 @@ this stage.
 > and rollup's window-only rule (§4.4). It does not claim or acknowledge a delivery.
 
 The runtime **MUST** reconcile effective pacing edits before source-due and active-watcher
-skips, without requiring new source input. Each held envelope's captured definition determines
+skips, without requiring new source input. Reconciliation follows the monitor's retained-work
+drain and waits while retained work remains (§2.6). Each held envelope's captured definition determines
 its original policy. Effective policy includes the strategy, normalized duration, rollup cron
 and timezone (default UTC), granted whole-batch escalation (§4.1), and
 urgency/salience-dependent defaults when notify is omitted.
@@ -2712,8 +2790,9 @@ Missing identities raise `MaterializationRetryNotFoundError` with code
 Both expose `retryId`; neither includes the stored envelope. Storage failures remain distinguishable
 from these domain failures.
 
-_Current:_ storage, retry transitions and atomic completion primitives. Runtime drain-before-observe
-adoption remains target work for #295; these primitives alone do not make source checkpoints safe.
+_Current:_ storage, retry transitions and atomic completion primitives, and runtime
+drain-before-intake adoption (§2.6): ticks and watchers complete rows oldest admission first
+before the monitor accepts newer input.
 Verified by `retry-outbox.test.ts` and `retry-lifecycle.test.ts`: due boundaries, invalid transitions,
 callback non-execution, actual snapshot/deletion fault rollback, failure-text sanitization and
 failed/terminal/rearmed/completed states across on-disk reopen.
@@ -2765,7 +2844,7 @@ error controls and length at its wire boundary as well as at text display. Omitt
 fields remain supported; doctor JSON uses empty summaries/groups while explain preserves omission.
 Real owned-socket tests verify dates rather than inferring correctness from core Date objects.
 
-Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Runtime retry draining and final crash acceptance remain separate work.
+Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Retained rows drain before newer input (§2.6). Final crash acceptance remains separate work.
 
 ### `session_event_state`
 
@@ -2808,22 +2887,29 @@ Verified: `libs/core/src/inbox/schema.ts` (`sessionObjectCursor`), `libs/core/sr
 
 One row per known agent session. Upserted on open (via `hostSessionId` + `adapter` uniqueness).
 
-| Column            | Type             | Notes                                                |
-| ----------------- | ---------------- | ---------------------------------------------------- |
-| `id`              | TEXT PK          | ULID                                                 |
-| `adapter`         | TEXT NOT NULL    | e.g. `claude-code`                                   |
-| `host_session_id` | TEXT NOT NULL    | Session ID from the integrating runtime              |
-| `agent_identity`  | TEXT NOT NULL    | Human-readable agent identifier                      |
-| `role`            | TEXT NOT NULL    | `lead \| subagent`; default `lead`                   |
-| `workspace_path`  | TEXT nullable    | `NULL` = global session                              |
-| `hook_state_path` | TEXT NOT NULL    | Absolute path to the hook-state JSON file            |
-| `status`          | TEXT NOT NULL    | `active \| dormant`                                  |
-| `baseline_at`     | INTEGER NOT NULL | Session open time; used for event baseline filtering |
-| `last_active_at`  | INTEGER NOT NULL | Updated on each `touchSession()`                     |
-| `last_recap_at`   | INTEGER nullable | Set by `updateSessionRecap()`                        |
-| `dormant_at`      | INTEGER nullable | Set when session is closed                           |
-| `created_at`      | INTEGER NOT NULL |                                                      |
-| `updated_at`      | INTEGER NOT NULL |                                                      |
+| Column                  | Type             | Notes                                                                    |
+| ----------------------- | ---------------- | ------------------------------------------------------------------------ |
+| `id`                    | TEXT PK          | ULID                                                                     |
+| `adapter`               | TEXT NOT NULL    | e.g. `claude-code`                                                       |
+| `host_session_id`       | TEXT NOT NULL    | Session ID from the integrating runtime                                  |
+| `agent_identity`        | TEXT NOT NULL    | Human-readable agent identifier                                          |
+| `role`                  | TEXT NOT NULL    | `lead \| subagent`; default `lead`                                       |
+| `workspace_path`        | TEXT nullable    | `NULL` = global session                                                  |
+| `hook_state_path`       | TEXT NOT NULL    | Absolute path to the hook-state JSON file                                |
+| `status`                | TEXT NOT NULL    | `active \| dormant`                                                      |
+| `baseline_at`           | INTEGER NOT NULL | Session open time; used for event baseline filtering                     |
+| `last_active_at`        | INTEGER NOT NULL | Updated on each `touchSession()`                                         |
+| `last_recap_at`         | INTEGER nullable | Set by `updateSessionRecap()`                                            |
+| `dormant_at`            | INTEGER nullable | Set when session is closed                                               |
+| `created_at`            | INTEGER NOT NULL |                                                                          |
+| `updated_at`            | INTEGER NOT NULL |                                                                          |
+| `registration_sequence` | INTEGER nullable | Materialization-order position reserved at first registration; see below |
+
+`registration_sequence` is the position a session reserved in the `monitor_events` materialization
+order (that table's AUTOINCREMENT counter, the counter a retry's `admission_sequence` comes from)
+when it was first registered. A completed retry projects only into sessions registered before its
+admission (§2.6). Resuming a session keeps the position. It is `NULL` on sessions registered before
+positions were reserved; the additive migration adds the column to every released shape.
 
 ### `monitor_state`
 

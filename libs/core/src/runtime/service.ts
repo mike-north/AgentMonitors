@@ -964,6 +964,50 @@ function summarizeMaterializationFailures(
 }
 
 /**
+ * How often a watcher held behind a terminal retry rechecks its outbox. A
+ * terminal retry is never attempted automatically; the recheck only notices
+ * that it was re-armed (or otherwise cleared) from another connection.
+ */
+const TERMINAL_RETRY_RECHECK_MS = 60_000;
+
+/**
+ * Why retained work still blocks newer source input after a drain attempt
+ * (002 §2.6): an attempt failed this time, the oldest retry is terminal and
+ * waits for an operator re-arm, or it is backing off until `nextAttemptAt`.
+ */
+type RetryDrainBlock =
+  | { kind: 'failed'; message: string }
+  | { kind: 'terminal'; message: string }
+  | { kind: 'backoff'; nextAttemptAt: Date };
+
+/** The outcome of draining one monitor's retry outbox oldest-first. */
+interface RetryDrainResult {
+  /** At least one retry was attempted, successfully or not. */
+  attempted: boolean;
+  /** Events completed from the outbox, in admission order. */
+  emittedEventIds: string[];
+  /** Present while retained work remains; the source must not be asked for more. */
+  blocked?: RetryDrainBlock;
+}
+
+/** Resolve after `ms`, or as soon as `signal` aborts. */
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, Math.max(0, ms));
+    signal.addEventListener('abort', done, { once: true });
+  });
+}
+
+/**
  * Decides, inside one admission transaction, whether a failed observation can
  * be retained together with its whole ordered suffix (002 §2). A suffix is
  * retainable only when every envelope in it is inside the retry outbox's
@@ -4010,6 +4054,27 @@ export class AgentMonitorRuntime {
       });
       return;
     }
+    // Work this monitor already accepted completes before anything newer
+    // (002 §2.6): before held-work reconciliation, a retained poll result,
+    // a rollup window flush or a source call. A watched monitor is drained
+    // here too, so a notify edit cannot release newer held work ahead of it;
+    // its watcher also drains before each pull. Each completion is one
+    // synchronous transaction, so the two never complete the same retry.
+    // An empty outbox costs one read and no await.
+    if (this.hasRetainedWork(monitor.id, workspacePath)) {
+      const drained = await this.drainMaterializationRetries(
+        monitor.id,
+        workspacePath,
+        now,
+        ephemeralSessionId,
+      );
+      acc.emittedEventIds.push(...drained.emittedEventIds);
+      if (drained.attempted) acc.evaluated.push(monitor.id);
+      if (drained.blocked) {
+        this.reportBlockedDrain(monitor, workspacePath, drained.blocked, acc);
+        return;
+      }
+    }
     if (
       !(await this.prepareNotifyPolicy(
         monitor,
@@ -4113,7 +4178,8 @@ export class AgentMonitorRuntime {
       return;
     }
 
-    acc.evaluated.push(monitor.id);
+    // A monitor that drained retained work and then observes counts once.
+    if (!acc.evaluated.includes(monitor.id)) acc.evaluated.push(monitor.id);
 
     // Two separate try/catch blocks so observe() failures and ingest()
     // failures are handled independently (issue #46):
@@ -4262,6 +4328,217 @@ export class AgentMonitorRuntime {
       } catch {
         // best-effort audit — ignore write failures
       }
+    }
+  }
+
+  /**
+   * Complete one monitor's retained materialization work, oldest admission
+   * first, until its outbox is empty or a retry cannot complete now
+   * (002 §2.6). Each retry renders the event its stored envelope describes and
+   * commits it, its projections and the removal of the retry row together;
+   * only sessions registered before the observation was admitted receive it.
+   *
+   * A failed attempt advances the retry's persisted backoff and records an
+   * `errored` history row, and the drain stops there: a younger retry never
+   * completes ahead of an older one. A terminal or backing-off retry is
+   * reported to the caller without an attempt. The source is never invoked.
+   */
+  private async drainMaterializationRetries(
+    monitorId: string,
+    workspacePath: string,
+    now: Date,
+    restrictToSessionId?: string,
+  ): Promise<RetryDrainResult> {
+    const result: RetryDrainResult = { attempted: false, emittedEventIds: [] };
+    for (;;) {
+      const retry = this.store.oldestMaterializationRetry(
+        monitorId,
+        workspacePath,
+      );
+      if (!retry) return result;
+      if (retry.status === 'terminal') {
+        return {
+          ...result,
+          blocked: {
+            kind: 'terminal',
+            message: `Materialization retry ${retry.id} stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed. Last error: ${retry.lastError ?? 'unknown'}`,
+          },
+        };
+      }
+      if (
+        retry.nextAttemptAt !== null &&
+        retry.nextAttemptAt.getTime() > now.getTime()
+      ) {
+        return {
+          ...result,
+          blocked: { kind: 'backoff', nextAttemptAt: retry.nextAttemptAt },
+        };
+      }
+
+      result.attempted = true;
+      const { envelope } = retry;
+      let materialized: MaterializedObservation;
+      try {
+        const rendered = this.renderObservationEvent({
+          monitor: envelope.monitor,
+          sourceName: envelope.monitor.frontmatter.watch.type,
+          observation: envelope.observation,
+          observedAt: envelope.observedAt,
+          workspacePath,
+          effectiveUrgency: envelope.effectiveUrgency,
+        });
+        if (!rendered) {
+          throw new Error(
+            'The retained observation is suppressed by its payload gate and cannot materialize.',
+          );
+        }
+        const event = this.store.completeMaterializationRetry(
+          retry.id,
+          rendered.event,
+          rendered.baseline,
+          restrictToSessionId !== undefined
+            ? { restrictToSessionId }
+            : undefined,
+        );
+        materialized = {
+          monitor: envelope.monitor,
+          event,
+          diffText: rendered.diffText,
+          projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
+        };
+      } catch (retryError) {
+        const cause = errorMessage(retryError);
+        let message = `Materialization retry ${retry.id} failed: ${cause}`;
+        try {
+          // Backoff starts at this attempt, not at the tick's start.
+          this.store.markMaterializationRetryFailed(retry.id, cause);
+        } catch (stateError) {
+          message += ` Recording the failed attempt also failed: ${errorMessage(stateError)}`;
+        }
+        this.recordErroredHistory(
+          monitorId,
+          workspacePath,
+          retry.sourceName,
+          message,
+        );
+        return { ...result, blocked: { kind: 'failed', message } };
+      }
+      result.emittedEventIds.push(materialized.event.id);
+      // Interpret follows the committed completion, as it does for a span.
+      await this.interpretMaterializedObservation(materialized, workspacePath);
+    }
+  }
+
+  /** Whether this workspace/monitor's retry outbox holds any row, pending or terminal. */
+  private hasRetainedWork(monitorId: string, workspacePath: string): boolean {
+    return (
+      this.store.oldestMaterializationRetry(monitorId, workspacePath) !==
+      undefined
+    );
+  }
+
+  /**
+   * Report a tick that left retained work in place (002 §2.6). A failed
+   * attempt already has its `errored` row; a terminal retry gets one on every
+   * tick it keeps the monitor paused, alongside the tick-result entry. A retry
+   * that is backing off is a schedule wait, reported with its next attempt
+   * time like any monitor that is not yet due.
+   */
+  private reportBlockedDrain(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    blocked: RetryDrainBlock,
+    acc: TickAccumulator,
+  ): void {
+    if (blocked.kind === 'backoff') {
+      acc.skippedMonitors.push({
+        monitorId: monitor.id,
+        nextDueAt: blocked.nextAttemptAt,
+      });
+      return;
+    }
+    if (blocked.kind === 'terminal') {
+      this.recordErroredHistory(
+        monitor.id,
+        workspacePath,
+        monitor.frontmatter.watch.type,
+        blocked.message,
+      );
+    }
+    acc.erroredObservations.push({
+      monitorId: monitor.id,
+      message: blocked.message,
+    });
+  }
+
+  /**
+   * Hold a watcher's next pull until its monitor's retained work has drained
+   * (002 §2.6), retrying on the outbox's own backoff. Failed attempts are
+   * reported each time; a terminal retry is reported once and then only
+   * rechecked. Returns `false` once the watcher no longer owns its monitor.
+   */
+  private async drainBeforeWatchPull(
+    monitorId: string,
+    workspacePath: string,
+    signal: AbortSignal,
+    ownsWatch: () => boolean,
+    onError?: (monitorId: string, error: Error) => void,
+  ): Promise<boolean> {
+    let reportedTerminal: string | undefined;
+    for (;;) {
+      if (!ownsWatch()) return false;
+      const drained = await this.drainMaterializationRetries(
+        monitorId,
+        workspacePath,
+        new Date(),
+      );
+      if (drained.emittedEventIds.length > 0) {
+        this.refreshWorkspaceSessions(workspacePath);
+      }
+      const { blocked } = drained;
+      if (!blocked) return ownsWatch();
+      let waitMs = 0;
+      if (blocked.kind === 'backoff') {
+        waitMs = blocked.nextAttemptAt.getTime() - Date.now();
+      } else if (blocked.kind === 'failed') {
+        onError?.(monitorId, new Error(blocked.message));
+      } else {
+        if (blocked.message !== reportedTerminal) {
+          reportedTerminal = blocked.message;
+          const sourceName =
+            this.store.oldestMaterializationRetry(monitorId, workspacePath)
+              ?.sourceName ?? 'unknown';
+          this.recordErroredHistory(
+            monitorId,
+            workspacePath,
+            sourceName,
+            blocked.message,
+          );
+          onError?.(monitorId, new Error(blocked.message));
+        }
+        waitMs = TERMINAL_RETRY_RECHECK_MS;
+      }
+      await abortableDelay(waitMs, signal);
+    }
+  }
+
+  /** Best-effort `errored` audit row; a failed write cannot change committed work. */
+  private recordErroredHistory(
+    monitorId: string,
+    workspacePath: string,
+    sourceName: string,
+    message: string,
+  ): void {
+    try {
+      this.store.recordObservationHistory({
+        monitorId,
+        workspacePath,
+        sourceName,
+        result: 'errored',
+        observationData: { error: message },
+      });
+    } catch {
+      // Audit is best-effort.
     }
   }
 
@@ -4837,7 +5114,31 @@ export class AgentMonitorRuntime {
       try {
         const errorStart = startup.erroredObservations.length;
         const emittedStart = startup.emittedEventIds.length;
-        await this.prepareNotifyPolicy(monitor, workspacePath, startup);
+        // Work retained before startup (including before a restart) drains
+        // before held work is reconciled or the source is asked for anything
+        // (002 §2.6). If it cannot drain yet, the admission gate stays closed
+        // and no edit is reconciled; a later tick drains it and opens the gate.
+        const blocked = this.hasRetainedWork(monitor.id, workspacePath)
+          ? await this.drainMaterializationRetries(
+              monitor.id,
+              workspacePath,
+              new Date(),
+            ).then((drained) => {
+              startup.emittedEventIds.push(...drained.emittedEventIds);
+              return drained.blocked;
+            })
+          : undefined;
+        if (blocked) {
+          this.setWatchPolicy(
+            monitor.id,
+            workspacePath,
+            null,
+            monitor.filePath,
+          );
+          this.reportBlockedDrain(monitor, workspacePath, blocked, startup);
+        } else {
+          await this.prepareNotifyPolicy(monitor, workspacePath, startup);
+        }
         // Startup may never receive a yield or tick. Publish committed projections
         // to the workspace's hook files even for an idle or completed source.
         if (startup.emittedEventIds.length > emittedStart) {
@@ -4890,7 +5191,8 @@ export class AgentMonitorRuntime {
    * Admit each finite watch batch before interpretation and the next iterator
    * pull. A whole-admission failure ends this iterator so its source cannot
    * advance beyond work that is absent from durable storage. Retained retries
-   * count as successful admission; their later drain has its own lifecycle.
+   * count as successful admission, and the watcher drains them before its
+   * next pull (002 §2.6).
    */
   private async consumeWatch(
     monitor: MonitorDefinition,
@@ -4937,6 +5239,20 @@ export class AgentMonitorRuntime {
         },
       );
       if (!iterable) return;
+      // Work retained before this watcher started (including before a
+      // restart) completes before its first pull (002 §2.6).
+      if (
+        this.hasRetainedWork(monitor.id, workspacePath) &&
+        !(await this.drainBeforeWatchPull(
+          monitor.id,
+          workspacePath,
+          signal,
+          ownsWatch,
+          onError,
+        ))
+      ) {
+        return;
+      }
       for await (const batch of iterable) {
         if (!ownsWatch()) break;
         // JavaScript plugins may still use the old bare-observation interface.
@@ -4998,6 +5314,19 @@ export class AgentMonitorRuntime {
         // Abort may arrive while Interpret is suspended. Do not ask the source
         // for newer input after it has lost ownership of this watcher.
         if (!ownsWatch()) break;
+        // A retained suffix of this batch completes before the next pull.
+        if (
+          this.hasRetainedWork(monitor.id, workspacePath) &&
+          !(await this.drainBeforeWatchPull(
+            monitor.id,
+            workspacePath,
+            signal,
+            ownsWatch,
+            onError,
+          ))
+        ) {
+          break;
+        }
       }
     } catch (error) {
       if (ownsWatch()) {
@@ -5351,6 +5680,33 @@ export class AgentMonitorRuntime {
    * that commit, in `interpretMaterializedObservation`.
    */
   private materializeObservation(input: ProcessObservationInput) {
+    const rendered = this.renderObservationEvent(input);
+    if (!rendered) return null;
+    const event = this.store.insertEvent(
+      rendered.event,
+      rendered.baseline,
+      // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
+      // the declaring session so its events never reach a sibling lead session.
+      input.restrictToSessionId !== undefined
+        ? { restrictToSessionId: input.restrictToSessionId }
+        : undefined,
+    );
+    return { event, diffText: rendered.diffText };
+  }
+
+  /**
+   * Deterministically render one observation into the shared event row it
+   * becomes, without writing it. Admission writes it with
+   * {@link RuntimeStore.insertEvent}; a retained retry hands the same
+   * rendering to {@link RuntimeStore.completeMaterializationRetry}, so a
+   * drained retry produces exactly the event its span would have (002 §2.6).
+   * Returns `null` for an observation its payload gate suppresses.
+   */
+  private renderObservationEvent(input: ProcessObservationInput): {
+    event: Omit<MonitorEventRecord, 'id'>;
+    baseline: { previousContent: string | null };
+    diffText: string | null;
+  } | null {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
     // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
@@ -5390,8 +5746,8 @@ export class AgentMonitorRuntime {
         ? buildDiff(previousSnapshot.content, effectiveSnapshotText, strategy)
         : null;
 
-    const event = this.store.insertEvent(
-      {
+    return {
+      event: {
         workspacePath: input.workspacePath ?? null,
         monitorId: input.monitor.id,
         sourceName: input.sourceName,
@@ -5445,15 +5801,9 @@ export class AgentMonitorRuntime {
       // a first-time recipient's cursor so it hears only changes AFTER it
       // registered (decided semantics Q1; backward-compat with the single-baseline
       // diff above when there is one recipient at the shared baseline).
-      { previousContent: previousSnapshot?.content ?? null },
-      // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
-      // the declaring session so its events never reach a sibling lead session.
-      input.restrictToSessionId !== undefined
-        ? { restrictToSessionId: input.restrictToSessionId }
-        : undefined,
-    );
-
-    return { event, diffText };
+      baseline: { previousContent: previousSnapshot?.content ?? null },
+      diffText,
+    };
   }
 
   /**

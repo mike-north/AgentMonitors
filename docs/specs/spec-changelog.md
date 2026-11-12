@@ -9,6 +9,24 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Retained work drains before newer source input; retry recipients ordered by registration position (002 §2/§2.4/§2.5/§2.6/§4.6/§15; 004 §3.4; 005) — Refs #567
+
+Add 002 §2.6. Work the runtime accepted but has not materialized now completes before its monitor
+accepts anything newer. Each tick drains the monitor's retry outbox, oldest admission first, after
+the source-config preflight and before edit reconciliation, deferred poll results, rollup window
+flushes and `observe()`. A watcher drains before its first pull and after each batch; at startup,
+retained work it cannot drain keeps its admission gate closed until a tick drains it. While any row
+remains the monitor pauses: a failed attempt is reported with an `errored` history row and a tick
+`erroredObservations` entry, a backing-off row as a `skippedMonitors` entry at its next attempt, and
+a terminal row on every tick until it is re-armed. Held notify work waits behind retained work,
+including a held flush on a tick whose source call fails, because such a hold is always newer. A
+span is therefore only admitted into an empty outbox. Sessions now reserve a position in the
+materialization order when first registered (`agent_sessions.registration_sequence`, additive
+migration), and a completed retry projects only into sessions positioned before its admission,
+so a session opened in the same second is still ordered correctly. Rows written before positions
+existed fall back as described in §2.6. Previously a retry waited on its backoff while newer input
+was admitted ahead of it, and a late retry projected into every matching session.
+
 ## 2026-11-12 — A notify-policy edit drains held rollup work in the rollup flush's owned transaction (002 §4.4/§4.6; 004 §3.4) — Refs #498
 
 Compose the locked not-due rollup flush with effective notify-policy edits. An edit that changes
