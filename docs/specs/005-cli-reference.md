@@ -1183,8 +1183,10 @@ which left them to discover `& disown` and their own log redirection. With `--de
    Every non-success `--detach` outcome — readiness timeout, spawn error, race loss, and unproven
    identity — terminates the process THIS invocation spawned and confirms it is gone (`SIGTERM`,
    escalating to `SIGKILL` if it has not exited within a short grace window) before returning. Only
-   the spawned pid is ever signalled: a daemon proven to be serving under a DIFFERENT pid belongs to
-   a concurrent lazy boot and is left untouched. Without this, "the daemon did not start" could be
+   the spawned child is ever signalled, through its own handle and only while it is still unreaped
+   ([008 §5](./008-reliability-process-hygiene.md)): a child that has already exited counts as gone
+   and its pid, which the OS may have reused, is never signalled. A daemon proven to be serving under
+   a DIFFERENT pid belongs to a concurrent lazy boot and is left untouched. Without this, "the daemon did not start" could be
    false — an unowned daemon would keep serving, indefinitely under `--reap-after-ms 0`, and the
    retry the error message suggests would collide with the process that invocation orphaned. The
    error message states whether the cleanup succeeded.

@@ -14,7 +14,9 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { Command, Option } from 'commander';
 import {
   claudeCodeAdapter,
+  isChildUnreaped,
   scanMonitors,
+  sendVerifiedSignal,
   SourceRegistry,
   type AgentSessionRecord,
   type MonitorDefinition,
@@ -459,11 +461,17 @@ async function bootIsolatedDaemon(
     exited = true;
   });
 
+  // Teardown signals go through the identity gate (008 §5): they are sent via
+  // this child's own handle, and only while Node still holds it unreaped.
+  const cleanupTarget = { kind: 'spawned-process', handle: child } as const;
+  const cleanupOptions = {
+    action: 'teardown of the isolated daemon verify started',
+  };
   const teardown = async (): Promise<void> => {
-    if (!exited && child.exitCode === null) {
-      child.kill('SIGTERM');
+    if (!exited && isChildUnreaped(child)) {
+      await sendVerifiedSignal(cleanupTarget, 'SIGTERM', cleanupOptions);
       await new Promise<void>((resolve) => {
-        if (child.exitCode !== null) {
+        if (!isChildUnreaped(child)) {
           resolve();
           return;
         }
@@ -471,8 +479,8 @@ async function bootIsolatedDaemon(
           resolve();
         });
         // Backstop: don't hang teardown if the child ignores SIGTERM.
-        void delay(3_000).then(() => {
-          child.kill('SIGKILL');
+        void delay(3_000).then(async () => {
+          await sendVerifiedSignal(cleanupTarget, 'SIGKILL', cleanupOptions);
           resolve();
         });
       });

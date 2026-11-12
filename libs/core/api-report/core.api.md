@@ -161,6 +161,17 @@ export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
+export interface ChildProcessHandle {
+    readonly exitCode: number | null;
+    // (undocumented)
+    kill(signal?: NodeJS.Signals | number): boolean;
+    once?(event: 'exit', listener: () => void): unknown;
+    // (undocumented)
+    readonly pid?: number | undefined;
+    readonly signalCode: NodeJS.Signals | null;
+}
+
+// @public
 export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number, claimedEventIds?: string[], leasedCount?: number): HookDeliveryHold | null;
 
 // @public
@@ -277,6 +288,9 @@ export interface DerivedFactRule {
     name: string;
     when: string;
 }
+
+// @public
+export function describeSignalAbstention(abstention: SignalAbstention): string;
 
 // @public
 export function diffKeyedCollection(parsedOutput: unknown, config: KeyedCollectionConfig, monitorObjectKey: string, previousSnapshot: KeyedSnapshot | undefined, observationFields?: {
@@ -450,6 +464,12 @@ export function fingerprintText(content: string): string;
 export function generateMonitorSchema(sources: ObservationSource[]): JsonSchema;
 
 // @public
+export interface GroupMembershipTracking {
+    readonly signal?: AbortSignal;
+    readonly untilMs: number;
+}
+
+// @public
 export interface HookDeliveryDiagnosis {
     // (undocumented)
     holds: HookDeliveryHold[];
@@ -505,6 +525,9 @@ export interface HookState {
     updatedAt: string;
     urgent?: UrgentItem[];
 }
+
+// @public
+export type IdentityEvidence = 'live-child-handle' | 'recorded-identity';
 
 // @public (undocumented)
 export interface InboxDb {
@@ -602,6 +625,9 @@ export type InterpretResult = {
 
 // @public
 export function invalidTimezoneError(watchConfig: Record<string, unknown>, scopeSchema: JsonSchema): string | undefined;
+
+// @public
+export function isChildUnreaped(handle: ChildProcessHandle): boolean;
 
 // @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;
@@ -1290,10 +1316,42 @@ export const PRIVATE_DIR_MODE = 448;
 export const PRIVATE_FILE_MODE = 384;
 
 // @public
+export interface ProcessIdentityRecord {
+    readonly pgid: number;
+    // (undocumented)
+    readonly pid: number;
+    // (undocumented)
+    readonly startTime: string;
+}
+
+// @public
+export type ProcessTableReader = () => Promise<ProcessTableReading>;
+
+// @public
+export type ProcessTableReading = {
+    readonly supported: true;
+    readonly processes: readonly ProcessIdentityRecord[];
+} | {
+    readonly supported: false;
+    readonly reason: string;
+};
+
+// @public
 export function readBridgeState(statePath: string): HookState | null;
 
 // @public
 export function readMonitorFileSync(filePath: string): string | undefined;
+
+// @public
+export function readProcessTable(platform?: NodeJS.Platform): Promise<ProcessTableReading>;
+
+// @public
+export interface RecordedProcessTarget {
+    // (undocumented)
+    readonly kind: 'recorded-process';
+    // (undocumented)
+    readonly record: ProcessIdentityRecord;
+}
 
 // @public
 export interface RegisterVerifyArtifactInput {
@@ -1310,6 +1368,9 @@ export function renderArtifact(snapshot: unknown, facts: readonly DerivedFact[])
 
 // @public
 export function renderShapeArtifact(snapshot: unknown, now: number, rules: readonly DerivedFactRule[]): string;
+
+// @public
+export function reportSignalAbstention(abstention: SignalAbstention): void;
 
 // @public
 export function resolveDottedPath(root: unknown, path: string): unknown;
@@ -1595,6 +1656,9 @@ export const schedulingDefaults: {
     readonly highUrgencyDefaultDebounceSettleMs: 15000;
 };
 
+// @public
+export function sendVerifiedSignal(target: SignalTarget, signal: NodeJS.Signals, options: VerifiedSignalOptions): Promise<SignalOutcome>;
+
 // @public (undocumented)
 export interface SessionEventFilter {
     // (undocumented)
@@ -1698,6 +1762,39 @@ export function shellArg(value: string): string;
 export function shellSingleQuote(value: string): string;
 
 // @public
+export interface SignalAbstention {
+    readonly action: string;
+    // (undocumented)
+    readonly observed: readonly ProcessIdentityRecord[];
+    readonly reason: string;
+    // (undocumented)
+    readonly signal: NodeJS.Signals;
+    // (undocumented)
+    readonly target: {
+        readonly kind: 'process' | 'process-group';
+        readonly id: number;
+    };
+}
+
+// @public
+export type SignalOutcome = {
+    readonly status: 'sent';
+    readonly evidence: IdentityEvidence;
+} | {
+    readonly status: 'not-needed';
+    readonly detail: string;
+} | {
+    readonly status: 'abstained';
+    readonly abstention: SignalAbstention;
+} | {
+    readonly status: 'failed';
+    readonly detail: string;
+};
+
+// @public
+export type SignalTarget = SpawnedProcessTarget | SpawnedProcessGroupTarget | RecordedProcessTarget;
+
+// @public
 export type SkippedMonitor = {
     monitorId: string;
     nextDueAt: Date;
@@ -1720,6 +1817,29 @@ export class SourceRegistry {
     names(): string[];
     // (undocumented)
     register(source: ObservationSource): void;
+}
+
+// @public
+export function spawnedProcessGroup(leader: ChildProcessHandle): SpawnedProcessGroupTarget;
+
+// @public
+export interface SpawnedProcessGroupTarget {
+    // (undocumented)
+    readonly kind: 'spawned-process-group';
+    // (undocumented)
+    readonly leader: ChildProcessHandle;
+    // (undocumented)
+    readonly pgid: number;
+    // (undocumented)
+    verifiedMembers: readonly ProcessIdentityRecord[];
+}
+
+// @public
+export interface SpawnedProcessTarget {
+    // (undocumented)
+    readonly handle: ChildProcessHandle;
+    // (undocumented)
+    readonly kind: 'spawned-process';
 }
 
 // @public (undocumented)
@@ -1785,6 +1905,15 @@ export function validateScope(scope: Record<string, unknown>, scopeSchema: JsonS
 
 // @public
 export function validateWatchScope(scope: Record<string, unknown>, scopeSchema: JsonSchema): string[];
+
+// @public
+export interface VerifiedSignalOptions {
+    readonly action: string;
+    readonly deliver?: (signal: NodeJS.Signals) => void;
+    readonly readProcessTable?: ProcessTableReader;
+    readonly reportAbstention?: (abstention: SignalAbstention) => void;
+    readonly trackMembership?: GroupMembershipTracking;
+}
 
 // @public
 export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';

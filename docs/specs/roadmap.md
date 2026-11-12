@@ -308,10 +308,12 @@ Interpret → Deliver → [React]`:
 
 - **Current:** timeout escalation of the original process group (POSIX) / `taskkill` tree
   (Windows) is enforced ([008 §3.1](./008-reliability-process-hygiene.md)) — descendants that
-  leave the original group are not yet covered; the rest of the reliability contract is
-  target — lifetime bounds die with the daemon, there is no restart sweep, cleanup signals are
-  not identity-verified, abstention warnings and the capability probe/report do not exist, and
-  the daemon has no coherent power posture.
+  leave the original group are not yet covered; every live cleanup signal is identity-verified
+  through one shared gate, abstaining with a daemon-log warning when identity cannot be
+  confirmed ([008 §5](./008-reliability-process-hygiene.md), #479); the rest of the reliability
+  contract is target — lifetime bounds die with the daemon, there is no restart sweep, durable
+  abstention warnings and the capability probe/report do not exist, and the daemon has no
+  coherent power posture.
 - **Target:** the full contract of [008](./008-reliability-process-hygiene.md): full-boundary
   bounds with the reported deferred-reconciliation state (§3.2), daemon-death-independent
   bounds (§3.3), the restart sweep and process hygiene (§4), identity-verified cleanup (§5),
