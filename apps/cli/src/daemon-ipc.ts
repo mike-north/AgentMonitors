@@ -68,6 +68,8 @@ const daemonMethodSchema = z.enum([
   'hook.diagnose',
   'history.list',
   'monitor.explain',
+  'retry.rearm',
+  'retry.skip',
   'doctor.report',
   'daemon.tick',
   'watch.declare',
@@ -178,6 +180,17 @@ const monitorExplainParamsSchema = z.object({
   workspacePath: z.string().optional(),
   historyLimit: z.number().int().positive().optional(),
   eventLimit: z.number().int().positive().optional(),
+});
+// Operator repair of one terminal materialization retry (005 `monitor retry`).
+// The route is required: a retry is only repaired through the exact
+// workspace/monitor it was admitted in, never by id alone.
+const retryRearmParamsSchema = z.object({
+  monitorId: z.string().min(1),
+  retryId: z.string().min(1),
+  workspacePath: z.string().min(1),
+});
+const retrySkipParamsSchema = retryRearmParamsSchema.extend({
+  reason: z.string().optional(),
 });
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
@@ -840,6 +853,21 @@ function handleRequest(
         ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
         ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
       });
+    }
+    case 'retry.rearm': {
+      const params = retryRearmParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.rearmMaterializationRetry(params));
+    }
+    case 'retry.skip': {
+      const params = retrySkipParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.skipMaterializationRetry({
+          monitorId: params.monitorId,
+          retryId: params.retryId,
+          workspacePath: params.workspacePath,
+          ...(params.reason !== undefined ? { reason: params.reason } : {}),
+        }),
+      );
     }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);

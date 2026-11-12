@@ -4,6 +4,7 @@
  * modifying durable work or accepting captured envelopes as diagnostic output.
  */
 import type {
+  MaterializationRetryDiagnostic,
   MaterializationRetrySummary,
   UnretainedObservationLoss,
 } from '@agentmonitors/core';
@@ -56,23 +57,35 @@ export function normalizeRetrySummary(
     pending: summary.pending,
     terminal: summary.terminal,
     bytes: summary.bytes,
-    records: summary.records.map((record) => ({
-      id: record.id,
-      status: record.status,
-      attemptCount: record.attemptCount,
-      nextAttemptAt:
-        record.nextAttemptAt === null ? null : new Date(record.nextAttemptAt),
-      createdAt: new Date(record.createdAt),
-      updatedAt: new Date(record.updatedAt),
-      lastError: retryErrorForDisplay(record.lastError),
-    })),
+    records: summary.records.map(normalizeRetryRecord),
   };
 }
 
 /**
- * Shared human-readable record details for explain and doctor. Record identity,
- * attempts and deadlines support investigation without implying an implemented
- * operator retry command. Error normalization remains defensive at display time.
+ * Reconstruct one retry record's Date contract and project only its safe
+ * metadata fields: the shape listed in summaries and returned by the
+ * `monitor retry` repairs, whether it came over the socket or in-process.
+ * @internal
+ */
+export function normalizeRetryRecord(
+  record: MaterializationRetryDiagnostic,
+): MaterializationRetryDiagnostic {
+  return {
+    id: record.id,
+    status: record.status,
+    attemptCount: record.attemptCount,
+    nextAttemptAt:
+      record.nextAttemptAt === null ? null : new Date(record.nextAttemptAt),
+    createdAt: new Date(record.createdAt),
+    updatedAt: new Date(record.updatedAt),
+    lastError: retryErrorForDisplay(record.lastError),
+  };
+}
+
+/**
+ * Shared human-readable record details for explain and doctor. The record id
+ * printed here is the name `monitor retry rearm|skip` takes. Error
+ * normalization remains defensive at display time.
  * @internal
  */
 export function retryRecordLines(

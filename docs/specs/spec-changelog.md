@@ -9,6 +9,23 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Re-arm or skip a terminal retry from the CLI (002 §2/§2.7/§15; 004 §3.4; 005 §6 `monitor retry`, §15) — Refs #584
+
+A terminal materialization retry pauses its monitor (§2.7), and until now the only way out was
+editing the store by hand. Add two operator repairs, `agentmonitors monitor retry rearm
+<monitorId> <retryId>` and `agentmonitors monitor retry skip <monitorId> <retryId> [--reason]`,
+backed by `AgentMonitorRuntime.rearmMaterializationRetry` / `skipMaterializationRetry` and the
+daemon methods `retry.rearm` / `retry.skip`, with an in-process fallback when no daemon is
+reachable. They name a retry as retry diagnostics list it and refuse, unchanged, a retry that is
+not terminal or does not belong to the named workspace/monitor. Re-arm returns the row to
+`pending` with its attempts reset (the existing store transition). Skip records the observation as
+an outstanding loss through the admission-drop record (§2), with the retry's last error and the
+reason, and deletes the row in the same transaction. The loss is superseded like a drop, measured
+from the retry's own admission position, so younger retained work for the same key clears it.
+A repair wakes a watcher of that monitor paused in the same process. The tick report, the explain
+materialization reason and the `doctor` remediation for a stopped monitor now name both commands;
+`doctor` previously said the CLI had no retry action. Attempt limit and backoff are unchanged.
+
 ## 2026-11-12 — Retained work drains before newer source input; retry recipients ordered by registration position (002 §2/§2.4/§2.5/§2.6/§2.7/§4.6/§15; 004 §3.4; 005) — Refs #567
 
 Add 002 §2.7. Work the runtime accepted but has not materialized now completes before its monitor

@@ -794,6 +794,89 @@ A daemon-side **application** error (the daemon answered with an error) is **not
 not running": it is surfaced verbatim as `Explain failed: <message>` with exit code 1. Malformed
 command arguments remain normal CLI errors.
 
+### `monitor retry` — Repair a terminal materialization retry (_current_)
+
+**Status:** Implemented (socket, with an in-process fallback when no daemon is reachable).
+
+A materialization retry that fails its last automatic attempt becomes _terminal_, and its monitor
+takes no newer input until the retry is repaired (002 §2.7). These two commands are the repairs.
+They name a retry exactly as `monitor explain` and `doctor` list it (`Retry <id>: status=terminal …`):
+by its monitor id and its record id.
+
+```
+agentmonitors monitor retry rearm <monitorId> <retryId> [--workspace <path>] [--socket <path>] [--format <toon|text|json>]
+agentmonitors monitor retry skip  <monitorId> <retryId> [--reason <text>] [--workspace <path>] [--socket <path>] [--format <toon|text|json>]
+```
+
+| Argument / Flag      | Default             | Description                                                                        |
+| -------------------- | ------------------- | ---------------------------------------------------------------------------------- |
+| `<monitorId>`        | —                   | Monitor whose retry outbox holds the retry                                         |
+| `<retryId>`          | —                   | The retry's record id, as `monitor explain` and `doctor` list it                   |
+| `--reason <text>`    | none                | `skip` only: why the observation is given up, recorded with the loss               |
+| `--workspace <path>` | current working dir | The workspace the retry was admitted in; also which workspace's daemon/db to reach |
+| `--socket <path>`    | resolved default    | Unix domain socket path for the daemon (resolved like `monitor explain`, §1)       |
+| `--format`           | auto (see §1)       | `toon`, `text`, or `json`                                                          |
+
+- **`rearm`** returns the retry to automatic retry: its failed attempts and last error reset and its
+  first retry delay (1 second) starts again. Its identity, stored observation and place in the
+  monitor's order are unchanged. The monitor stays paused until the retry completes; then it takes
+  newer input in order. If the retried attempt fails again, the retry backs off and can become
+  terminal again exactly as before (attempt limit and backoff are unchanged).
+- **`skip`** gives the retry up. In one transaction, its observation is recorded as an outstanding
+  loss and the retry is removed. The loss uses the same record as an observation admission could
+  not retain (002 §2), so `doctor` fails the monitor's check and `monitor explain` reports a
+  materialization failure until a later event for the same object key supersedes it, with the
+  wording and clearing rule of §15. Its error is the retry's last error followed by
+  `Not retained for retry: skipped after <n> failed attempts[: <reason>].` The monitor takes newer
+  input on its next tick, once no other retained work is ahead of it.
+
+Both commands refuse, exit 1, and change nothing when:
+
+- no retry of that monitor in that workspace has the id (a retry of another monitor or workspace is
+  treated as not found): `<Re-arm|Skip> failed for retry <id> of monitor <monitorId> in workspace
+<path>: Materialization retry record not found: <id>`;
+- the retry is not terminal. A pending retry is still attempted automatically, so neither repair
+  applies: `… Materialization retry record is pending, not terminal, so it cannot be
+<re-armed|skipped>. It is still retried automatically (<n> of 5 attempts failed; next attempt at
+<iso8601>): <id>`.
+
+The command asks the workspace's daemon (`retry.rearm` / `retry.skip`, Zod-validated params
+`{ monitorId, retryId, workspacePath, reason? }`). A daemon re-arm also wakes a watcher of that
+monitor that is paused on the retry, instead of leaving it to its one-minute recheck. When no daemon
+is reachable (a genuine connection failure), the command applies the same core transaction to the
+workspace-resolved database (§1 "Database path resolution") and prints `No daemon running — applied
+to the persisted store; it takes effect on the next tick.` first. A refusal from a live daemon is
+reported, never retried in-process.
+
+Text output, after a re-arm:
+
+```
+Re-armed retry <id> of monitor <monitorId>: its failed attempts are reset and it is next attempted at <iso8601>.
+The monitor stays paused until this retry completes, then takes newer input in order.
+```
+
+After a skip:
+
+```
+Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see `agentmonitors monitor explain <monitorId>`.
+The monitor takes newer input on its next tick unless other retained work is still ahead of it.
+```
+
+JSON/TOON output is `{ action: "rearm"|"skip", monitorId, workspacePath, via: "daemon"|"in-process",
+retry }`, where `retry` is the record's safe metadata (`id`, `status`, `attemptCount`,
+`nextAttemptAt`, `lastError`, `createdAt`, `updatedAt`): after a re-arm, its new state; after a
+skip, its state when it was skipped. The stored observation is never part of it. A refusal prints
+`{ "error": "<message above>" }`.
+
+The tick report names both commands for a terminal retry (002 §2.7), as do the `monitor explain`
+materialization reason and the `doctor` remediation (§15).
+
+Verified: `apps/cli/src/retry-repair.test.ts` (built CLI against a real `daemon run`: re-arm then
+success with later input in order, re-arm then failure, skip with the loss in `doctor` and
+`monitor explain` until superseded, each with one daemon and across a daemon restart; refusals
+through the daemon and in-process; the in-process path, running the re-arm `doctor` suggests) and
+`libs/core/src/runtime/retry-repair.test.ts`.
+
 ---
 
 ## §7 `source` — Manage observation source plugins
@@ -1999,7 +2082,12 @@ expression for `schedule` sources, else the observe interval), **last-observed**
 delivery-state counts for the workspace's lead session. It also reports materialization retry rows
 as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check fail so a paused or
 exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
-explain <id>` command. Explain lists bounded safe retry metadata (record id, status, attempts,
+explain <id>` command. While the outbox holds a terminal retry, the monitor is stopped (002 §2.7)
+and the remediation also names both repairs for its oldest terminal retry, the one that pauses it:
+``Once the cause is fixed, retry it with `agentmonitors monitor retry rearm <id> <retryId>`, or
+give it up as a recorded loss with `agentmonitors monitor retry skip <id> <retryId>`.`` (each
+carrying `--workspace` when it differs from the invoking directory; the repairs have no `--dir`).
+See `monitor retry` (§6). Explain lists bounded safe retry metadata (record id, status, attempts,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
 
 A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
@@ -2067,7 +2155,11 @@ cadence. Ephemeral entries carry `monitorId`, `sessionId` and the same two optio
 Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
 for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
 `--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
-`retry-outbox:<id>` check independently of the original definition diagnostics. Parse and duplicate
+`retry-outbox:<id>` check independently of the original definition diagnostics. Its remediation
+says retained work drains only while the monitor is ticked with a valid definition and, while the
+outbox holds a terminal retry, names `monitor retry rearm` and `monitor retry skip` for the oldest
+one, scoped as above; skipping is the way to clear terminal work whose monitor will not run again.
+Parse and duplicate
 errors remain visible even when no valid monitor row exists; doctor JSON includes `parseErrors`
 and `duplicateIds` as well as the health checks.
 
@@ -2090,7 +2182,8 @@ Explain's local fallback preserves definition/scheduling failures with their ret
 valid definition with retry-only state is a persisted report with the no-daemon notice, not a
 "no persisted state" remediation. Repeated diagnostic reads must not mutate retry state, observe,
 materialize, deliver, or re-arm work. Remediation identifies the monitor and retained record IDs;
-there is no retry action command. The runtime itself drains retained work before newer source
+the only commands that change retained work are `monitor retry rearm` and `monitor retry skip`
+(§6), and they apply only to a terminal retry. The runtime itself drains retained work before newer source
 input ([002 §2.7](./002-runtime-delivery.md#27-retained-work-drains-before-newer-source-input-current)).
 
 Verified: `apps/cli/src/retry-diagnostics.test.ts` uses a real owned JSONL socket and built CLI plus

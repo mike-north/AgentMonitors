@@ -368,6 +368,50 @@ describe('createDaemonServer — request-handling resilience', () => {
     }
   });
 
+  it('rejects a retry repair that does not name its workspace and monitor, and answers a well-formed one', async () => {
+    const socketPath = tempSocketPath('retry-repair');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    try {
+      await server.listen();
+      // A retry is only repaired through the route it was admitted in, never
+      // by id alone (005 `monitor retry`).
+      for (const [method, params] of [
+        ['retry.rearm', { retryId: 'r1', workspacePath: '/ws' }],
+        ['retry.rearm', { monitorId: 'm', retryId: 'r1' }],
+        ['retry.skip', { monitorId: 'm', retryId: '', workspacePath: '/ws' }],
+        [
+          'retry.skip',
+          { monitorId: 'm', retryId: 'r1', workspacePath: '/ws', reason: 7 },
+        ],
+      ] as const) {
+        const rejection = await callDaemon(method, params, {
+          socketPath,
+          timeoutMs: 1000,
+        }).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(Error);
+        expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+        expect(String(rejection)).not.toContain('not found');
+      }
+
+      // Well-formed requests reach the runtime, which reports the unknown id.
+      for (const method of ['retry.rearm', 'retry.skip'] as const) {
+        await expect(
+          callDaemon(
+            method,
+            { monitorId: 'm', retryId: 'r1', workspacePath: '/ws' },
+            { socketPath, timeoutMs: 1000 },
+          ),
+        ).rejects.toThrow('Materialization retry record not found: r1');
+      }
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
   // Issue #382: going forward, a schema-rejected request (e.g. an unknown
   // `method` — what a NEW client sends an OLD daemon build that predates it,
   // or vice versa) must carry a `code` a client can match on WITHOUT relying

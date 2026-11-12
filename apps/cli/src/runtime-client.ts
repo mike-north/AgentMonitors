@@ -10,6 +10,9 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
+  MaterializationRetryDiagnostic,
+  MaterializationRetryRepairInput,
+  MaterializationRetrySkipInput,
   MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
@@ -23,6 +26,7 @@ import type {
 } from '@agentmonitors/core';
 import {
   isMaterializationRetrySummary,
+  normalizeRetryRecord,
   normalizeRetrySummary,
   normalizeUnretainedObservationLoss,
 } from './retry-diagnostics.js';
@@ -357,6 +361,62 @@ export async function cancelWatchClient(
     'watch.cancel',
     { sessionId, ephemeralId },
     socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Re-arm one terminal retry on the live daemon (005 `monitor retry rearm`),
+ * so a watcher paused on it in that process wakes at once. The returned
+ * record is safe metadata with its Dates revived.
+ */
+export async function rearmRetryClient(
+  input: MaterializationRetryRepairInput,
+  socketPath?: string,
+): Promise<MaterializationRetryDiagnostic> {
+  return normalizeRetryRecord(
+    await callDaemon<MaterializationRetryDiagnostic>(
+      'retry.rearm',
+      { ...input },
+      socketPath ? { socketPath } : {},
+    ),
+  );
+}
+
+/** Skip one terminal retry on the live daemon (005 `monitor retry skip`). */
+export async function skipRetryClient(
+  input: MaterializationRetrySkipInput,
+  socketPath?: string,
+): Promise<MaterializationRetryDiagnostic> {
+  return normalizeRetryRecord(
+    await callDaemon<MaterializationRetryDiagnostic>(
+      'retry.skip',
+      { ...input },
+      socketPath ? { socketPath } : {},
+    ),
+  );
+}
+
+/**
+ * Re-arm one terminal retry directly in the workspace's persisted store, for
+ * when no daemon is reachable. The store transaction is the same one the
+ * daemon would run; a daemon started later finds the retry pending.
+ */
+export function rearmRetryInProcess(
+  input: MaterializationRetryRepairInput,
+  dbPath: string,
+): MaterializationRetryDiagnostic {
+  return normalizeRetryRecord(
+    createRuntime(dbPath).rearmMaterializationRetry(input),
+  );
+}
+
+/** Skip one terminal retry directly in the persisted store (no daemon reachable). */
+export function skipRetryInProcess(
+  input: MaterializationRetrySkipInput,
+  dbPath: string,
+): MaterializationRetryDiagnostic {
+  return normalizeRetryRecord(
+    createRuntime(dbPath).skipMaterializationRetry(input),
   );
 }
 

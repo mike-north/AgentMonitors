@@ -796,6 +796,45 @@ it('carries doctor scope flags into retained-work explain remediation', async ()
 });
 
 /**
+ * @see docs/specs/005-cli-reference.md `monitor retry`: doctor names both
+ * repairs for the oldest terminal retry, which is what pauses the monitor,
+ * scoped to the workspace it reported on.
+ */
+it('names re-arm and skip for the terminal retry that pauses each outbox, in text and JSON', async () => {
+  const fixture = reports();
+  const otherWorkspace = "/tmp/other ws's";
+  fixture.doctor.workspacePath = otherWorkspace;
+  await serve(fixture);
+  const scope = `--workspace '/tmp/other ws'\\''s'`;
+  const expected = {
+    'monitor:wire-monitor': ['wire-monitor', 'attached-terminal'],
+    'retry-outbox:removed': ['removed', 'orphan-terminal'],
+    'retry-outbox:ephemeral:session-1/01K0000000000000000000000': [
+      'ephemeral:session-1/01K0000000000000000000000',
+      'ephemeral-terminal',
+    ],
+  };
+
+  const text = await run('doctor', 'text');
+  expect(text.code).toBe(1);
+  expect(text.stdout).not.toContain('does not yet provide a retry action');
+  const json = JSON.parse((await run('doctor', 'json')).stdout) as {
+    checks: { name: string; remediation?: string | null }[];
+  };
+  for (const [name, [monitorId, retryId]] of Object.entries(expected)) {
+    const remediation =
+      json.checks.find((check) => check.name === name)?.remediation ?? '';
+    for (const verb of ['rearm', 'skip']) {
+      const command = `\`agentmonitors monitor retry ${verb} ${monitorId} ${retryId} ${scope}\``;
+      expect(remediation).toContain(command);
+      expect(text.stdout).toContain(command);
+    }
+  }
+  // Pending work is attempted automatically; only terminal work is named.
+  expect(text.stdout).not.toContain('attached-pending --workspace');
+});
+
+/**
  * The child's cwd is the real path (`/private/tmp/…` on macOS), so the
  * "invoking workspace" spelling is the realpath; `root` itself may be a symlink.
  */
