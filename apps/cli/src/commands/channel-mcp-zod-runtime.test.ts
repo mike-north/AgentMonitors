@@ -10,10 +10,11 @@
  * version-only audit cannot see that, because the vulnerable code ships inside
  * the patched `zod` package.
  *
- * The channel server (`commands/channel.ts`) registers its handlers with the
- * SDK's own `ListToolsRequestSchema` and `CallToolRequestSchema`. These tests
- * prove that those schemas are Zod 4 schemas, and that a real
- * Client → Server round trip using them never enters the `zod/v3` parser. A
+ * The channel server registers its inbound handlers through
+ * `registerChannelToolHandlers` (`commands/channel.ts`), which binds the SDK's
+ * `ListToolsRequestSchema` and `CallToolRequestSchema`. These tests prove that
+ * those schemas are Zod 4 schemas, and that a real Client → Server round trip
+ * through that helper never enters the `zod/v3` parser. A
  * control case registers a Zod 3 schema to prove the probe detects the
  * fallback path, so the negative assertions are not vacuous.
  *
@@ -25,6 +26,7 @@ import * as z3 from 'zod/v3';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { registerChannelToolHandlers } from './channel.js';
 import {
   CallToolRequestSchema,
   EmptyResultSchema,
@@ -90,18 +92,13 @@ describe('channel MCP request validation uses Zod 4, not the zod/v3 fallback', (
       { name: 'agentmonitors-probe', version: '0.0.0' },
       { capabilities: { tools: {} } },
     );
-    server.setRequestHandler(ListToolsRequestSchema, () => ({
-      tools: [
-        {
-          name: 'agentmon_ack',
-          description: 'probe',
-          inputSchema: { type: 'object' as const, properties: {} },
-        },
-      ],
-    }));
-    server.setRequestHandler(CallToolRequestSchema, (request) => ({
-      content: [{ type: 'text' as const, text: request.params.name }],
-    }));
+    // The channel server's own registration helper, so a change to the schemas
+    // it binds is observed here. The session resolver fails fast: this probe
+    // only cares which parser validates the request, not the ack round trip.
+    registerChannelToolHandlers(server, {
+      resolveSession: () => Promise.reject(new Error('probe: no session')),
+      socketPath: '/nonexistent/agentmonitors-probe.sock',
+    });
     const client = await connectPair(server);
     const spies = spyOnZod3Parsing();
     try {
@@ -116,7 +113,9 @@ describe('channel MCP request validation uses Zod 4, not the zod/v3 fallback', (
           event_ids: Array.from({ length: 10_000 }, (_, i) => `e${i}`),
         },
       });
-      expect(result.content).toEqual([{ type: 'text', text: 'agentmon_ack' }]);
+      // The request was parsed and routed to the real handler (which reports
+      // the probe's failing session resolver as a tool error).
+      expect(result.isError).toBe(true);
 
       expect(zod3CallCount(spies)).toBe(0);
     } finally {

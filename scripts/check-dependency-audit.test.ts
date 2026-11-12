@@ -696,6 +696,8 @@ const EXPERIMENT_EXTRA_MINIMUMS: Readonly<
     ['nanoid', '3.3.18'],
     // GHSA-82fw-gwwq-j7x9, GHSA-qxg6-89mg-rqv8 (affected <=4.1.11).
     ['@vitest/mocker', '4.1.12'],
+    // GHSA-fxqj-rqcc-2cmp (affected <=8.5.22), patched >=8.5.23.
+    ['postcss', '8.5.23'],
   ],
 };
 
