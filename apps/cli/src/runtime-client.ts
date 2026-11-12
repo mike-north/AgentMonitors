@@ -483,10 +483,16 @@ function reviveDoctorReportDates(
     ...(report.orphanedMaterializationRetries
       ? {
           orphanedMaterializationRetries:
-            report.orphanedMaterializationRetries.map((group) => ({
-              monitorId: group.monitorId,
-              summary: normalizeRetrySummary(group.summary),
-            })),
+            report.orphanedMaterializationRetries.map((group) => {
+              const loss = normalizeUnretainedObservationLoss(
+                group.unretainedObservationLoss,
+              );
+              return {
+                monitorId: group.monitorId,
+                summary: normalizeRetrySummary(group.summary),
+                ...(loss ? { unretainedObservationLoss: loss } : {}),
+              };
+            }),
         }
       : {}),
     monitors: report.monitors.map((monitor) => {

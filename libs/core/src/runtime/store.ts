@@ -10,6 +10,7 @@ import {
   eq,
   gt,
   inArray,
+  isNotNull,
   isNull,
   lte,
   ne,
@@ -1911,6 +1912,42 @@ export class RuntimeStore {
   }
 
   /**
+   * Record that admission dropped one observation because the retry outbox
+   * could not retain its ordered suffix (002 §2). Called inside the admitting
+   * span's transaction, so the drop commits or rolls back with that span.
+   *
+   * Besides the `errored` history row, it stores what supersedes the drop
+   * later: the observation's raw `objectKey` (only a string counts) and the
+   * newest `monitor_events.sequence` committed before this write. Events of
+   * earlier siblings in the same span are at or below that watermark; events
+   * of later siblings and later spans are above it.
+   *
+   * @internal
+   */
+  recordUnretainedObservation(input: {
+    monitorId: string;
+    workspacePath: string | null;
+    sourceName: string;
+    objectKey: string | undefined;
+    observationData: Record<string, unknown>;
+  }): void {
+    asInternalDb(this.db)
+      .insert(observationHistory)
+      .values({
+        id: observationUlid(),
+        monitorId: input.monitorId,
+        workspacePath: input.workspacePath,
+        sourceName: input.sourceName,
+        observationData: JSON.stringify(input.observationData),
+        result: 'errored',
+        createdAt: new Date(),
+        unretainedObjectKey: input.objectKey ?? null,
+        unretainedEventWatermark: sql`(SELECT coalesce(max(${monitorEvents.sequence}), 0) FROM ${monitorEvents})`,
+      })
+      .run();
+  }
+
+  /**
    * List observation-history rows, newest first. When `query.workspacePath` is
    * provided the result is scoped to that exact workspace (issue #345 / #307) —
    * an observation tick always runs for one concrete workspace, so (unlike
@@ -1967,14 +2004,21 @@ export class RuntimeStore {
    * because the retry outbox could not retain their suffix (002 §2), or
    * `undefined` when there are none.
    *
-   * A drop row is an `errored` history row marked `notRetained: true`. It stays
-   * outstanding until a later history row records a clean outcome: any
-   * non-`errored` result whose span dropped nothing (no positive
-   * `notRetainedCount`). The span that dropped an observation writes its own
-   * batch row after the drop row, carrying that count, so it never clears its
-   * own drop. A later `errored` row (an observe failure, a retained failure's
-   * audit row) is not a clean outcome either. Ordering is the history listing's
-   * `(created_at, id)` order.
+   * A drop row is an `errored` history row written by
+   * {@link RuntimeStore.recordUnretainedObservation}. It stays outstanding
+   * until it is superseded, and nothing else clears it:
+   * - a drop with an object key, by a later `monitor_events` row of the same
+   *   monitor, workspace and object key (a sequence above the drop's watermark);
+   * - a drop without one, by a later `triggered` history row of the same
+   *   monitor and workspace whose span dropped nothing (no positive
+   *   `notRetainedCount`), ordered by `(created_at, id)`. The dropping span's
+   *   own batch row carries its count, so it never supersedes its own drops.
+   *
+   * Quiet ticks, notify holds, observe failures, a span whose only failure was
+   * retained, and events for other keys therefore leave a keyed drop reported.
+   * The partial and outcome indexes on `observation_history` and the
+   * object-key index on `monitor_events` keep this cheap enough for every
+   * doctor/explain call.
    *
    * @internal
    */
@@ -1983,43 +2027,37 @@ export class RuntimeStore {
     workspacePath: string,
   ): UnretainedObservationLoss | undefined {
     const db = asInternalDb(this.db);
+    const drop = observationHistory;
     // json_extract raises on malformed JSON; every row is written with
     // JSON.stringify, but guard so one bad legacy row cannot fail diagnosis.
-    const field = (path: string) =>
-      sql`CASE WHEN json_valid(${observationHistory.observationData}) THEN json_extract(${observationHistory.observationData}, ${path}) END`;
-    const scope = and(
-      eq(observationHistory.monitorId, monitorId),
-      eq(observationHistory.workspacePath, workspacePath),
-    );
-    const clean = db
-      .select({
-        createdAt: observationHistory.createdAt,
-        id: observationHistory.id,
-      })
-      .from(observationHistory)
-      .where(
-        and(
-          scope,
-          ne(observationHistory.result, 'errored'),
-          sql`coalesce(${field('$.notRetainedCount')}, 0) <= 0`,
-        ),
-      )
-      .orderBy(desc(observationHistory.createdAt), desc(observationHistory.id))
-      .limit(1)
-      .get();
+    const laterNotRetained = sql`CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, '$.notRetainedCount') END`;
     const drops = and(
-      scope,
-      eq(observationHistory.result, 'errored'),
-      sql`${field('$.notRetained')} = 1`,
-      clean
-        ? or(
-            gt(observationHistory.createdAt, clean.createdAt),
-            and(
-              eq(observationHistory.createdAt, clean.createdAt),
-              gt(observationHistory.id, clean.id),
-            ),
-          )
-        : undefined,
+      eq(drop.monitorId, monitorId),
+      eq(drop.workspacePath, workspacePath),
+      isNotNull(drop.unretainedEventWatermark),
+      or(
+        and(
+          isNotNull(drop.unretainedObjectKey),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${monitorEvents} AS superseding
+            WHERE superseding.monitor_id = ${drop.monitorId}
+              AND superseding.workspace_path = ${drop.workspacePath}
+              AND superseding.object_key = ${drop.unretainedObjectKey}
+              AND superseding.sequence > ${drop.unretainedEventWatermark}
+          )`,
+        ),
+        and(
+          isNull(drop.unretainedObjectKey),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${observationHistory} AS superseding
+            WHERE superseding.monitor_id = ${drop.monitorId}
+              AND superseding.workspace_path = ${drop.workspacePath}
+              AND superseding.result = 'triggered'
+              AND (superseding.created_at, superseding.id) > (${drop.createdAt}, ${drop.id})
+              AND coalesce(${laterNotRetained}, 0) <= 0
+          )`,
+        ),
+      ),
     );
     const newest = db
       .select()
@@ -2059,6 +2097,28 @@ export class RuntimeStore {
       ...(objectKey !== undefined ? { objectKey } : {}),
       ...(title !== undefined ? { title } : {}),
     };
+  }
+
+  /**
+   * Monitor ids with at least one drop row in this workspace, whether or not it
+   * is still outstanding, ordered by id. Doctor uses it to report the losses of
+   * monitors that no longer have one unambiguous parsed definition (002 §2).
+   *
+   * @internal
+   */
+  unretainedObservationMonitorIds(workspacePath: string): string[] {
+    return asInternalDb(this.db)
+      .selectDistinct({ monitorId: observationHistory.monitorId })
+      .from(observationHistory)
+      .where(
+        and(
+          eq(observationHistory.workspacePath, workspacePath),
+          isNotNull(observationHistory.unretainedEventWatermark),
+        ),
+      )
+      .orderBy(asc(observationHistory.monitorId))
+      .all()
+      .map(({ monitorId }) => monitorId);
   }
 
   listDeliveryProjectionsForMonitor(

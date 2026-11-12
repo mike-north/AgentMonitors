@@ -680,21 +680,47 @@ for replay. No ingest path drops an observation silently. The tick result's
 `erroredObservations` and the watcher's `onError` report the failure. `monitor history` lists the
 committed `errored` row.
 
-A dropped observation **MUST NOT** be less visible than a retained one. The span's `triggered` batch
-row is written after commit and is therefore newer than the drop row, so
-diagnostics cannot read only the newest row. Instead, the batch row records the span's drop count
-as `notRetainedCount`, and a drop stays _outstanding_ until a later history row of that
-workspace/monitor records a _clean_ outcome: any result other than `errored` whose
-`notRetainedCount` is absent or zero. A later `errored` row (an observe failure, or a retained
-failure's audit row) does not clear it. While a drop is outstanding:
+A dropped observation **MUST NOT** be less visible than a retained one. A drop stays
+_outstanding_ until it is _superseded_, and only these outcomes supersede it:
+
+- **A drop with an object key** (the observation's `objectKey` was a string) is superseded by a
+  later event of the same monitor id, in the same workspace, for exactly that object key. An event
+  of another monitor or another workspace for the same key does not supersede it. "Later" is
+  commit order: the drop row records the newest `monitor_events.sequence` committed before it
+  (inside the admission transaction), and only an event with a greater sequence counts. A later
+  sibling in the dropping span, a later span, a rollup or debounce flush, and a retained retry
+  that materializes all count. An event's `created_at` is observation time, which a flush or retry
+  carries over from the original observation, so it cannot order events against the drop.
+- **A drop without an object key** is superseded by a later span of the same monitor in the same
+  workspace that materializes at least one event and drops nothing: a later `triggered` batch row
+  whose `notRetainedCount` is absent or zero, ordered after the drop row by `(created_at, id)`. The
+  dropping span's own batch row carries its count, so it never supersedes its own drops.
+
+Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
+rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
+retained, not a later span that materializes events only for other keys, and not a daemon restart.
+Every drop is counted separately, so one superseded drop does not clear another. While a drop is
+outstanding:
 
 - `explainMonitor`'s materialization stage is `failure` (§10.7), so its verdict fails;
 - `doctorReport` attaches `unretainedObservationLoss` to that monitor's rollup: the outstanding
-  count and the newest drop's time, error, position, span size, `objectKey` and `title`. `doctor`
-  fails that monitor's check with the reason ([005](./005-cli-reference.md) per-monitor rollup).
+  count and the newest outstanding drop's time, error, position, span size, `objectKey` and
+  `title`. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
+  per-monitor rollup).
+- When the monitor has no one unambiguous parsed definition (its definition was removed, fails to
+  parse, or its id is duplicated), the loss goes to that id's entry in
+  `orphanedMaterializationRetries` instead, beside any retained work, with the same per-id rule
+  as retained work: a duplicated id's rollups omit it and its one orphan group carries it. A
+  parsed definition that fails validation keeps the loss on its rollup. `doctor` fails a
+  `dropped-observation:<id>` check for both cases, so the loss never disappears with its
+  definition.
 
 Both read the durable rows through `RuntimeStore.outstandingUnretainedObservationLoss()`
-(internal), so the answer is the same with or without a daemon and across restarts.
+(internal), so the answer is the same with or without a daemon and across restarts. The lookup
+runs on every doctor and explain call, so it is indexed: a partial index on drop rows, an
+`observation_history (monitor_id, workspace_path, result, created_at, id)` index for the later
+span, and a `monitor_events (monitor_id, workspace_path, object_key, sequence)` index for the later
+event, all created by the additive schema migration.
 
 For example, 600 observations with a native `RAISE(ABORT)` on the 300th leave a 301-record suffix,
 which no empty outbox can hold. The span commits 599 events, one `errored` row naming capacity, and
@@ -708,10 +734,17 @@ flushed span. A flush that rolls back leaves the whole window held, records a be
 `errored` row, and reports the error on the tick result. The next window check retries it.
 
 Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts`: a capacity overflow on
-the poll path, with its drop row, batch-row count, explain verdict and doctor rollup, cleared by
-the next clean tick; a drop kept outstanding across a later observe failure and accumulated with a
-later drop; a span whose only observation is dropped; bounded, control-free identity text with no
-payload; explain and doctor failing for both a retained and a dropped failure; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
+the poll path, with its drop row, batch-row count, explain verdict and doctor rollup, kept
+through a later span of other keys and cleared by a later event for its key; a keyed drop kept
+through a `no-change` tick, an observe failure, a retained-only span and a span of other keys; a
+same-key event of another monitor or workspace that does not clear it; a later sibling of the
+same key that does; an unkeyed drop kept through quiet ticks and a span that drops again and
+cleared by a span that materializes and drops nothing; a rollup drop kept through the next hold
+and cleared by the flush that materializes its key; a drop kept across reopening the store; a
+drop of a removed, unparseable, duplicated or invalid definition reported in doctor; a drop kept
+outstanding across a later observe failure and accumulated with a later drop; a span whose only
+observation is dropped, kept through later quiet ticks; bounded, control-free identity text with
+no payload; explain and doctor failing for both a retained and a dropped failure; an exact-fit and one-over boundary in an outbox filled by earlier ticks; a full
 outbox; a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
 fit, or roll back; and watch batches over capacity or with a BigInt payload. Each asserts the
 three-outcome invariant and that the next tick or batch makes progress.
@@ -1810,9 +1843,11 @@ cannot retain a suffix"), the materialization stage is `failure` with reason
 by `(<objectKey>, "<title>")` with whichever of the two were recorded; the error uses the display
 rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
-retained-retry branches: retained work can still be recovered and a drop cannot. The observation
-stage still describes the newest history row. Verified: `unretainable-suffix-admission.test.ts`
-(Refs #497).
+retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
+`failure` until every drop is superseded (§2): a quiet tick, a notify hold, an observe failure or
+events for other keys leave it failing. The observation stage still describes the newest history
+row. Verified: `unretainable-suffix-admission.test.ts` and, through a real `daemon run` socket
+after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts` (Refs #497).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -2297,7 +2332,12 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       never copied. Every text field gets the retry-error safe-text rule: C0, DEL, C1, U+2028 and
       U+2029 become spaces, and each field is capped at 1,024 characters. `error` shortens the
       materialization error, not the reason, to fit. If every observation of the span was
-      dropped, no batch row is written (as for any span that emitted nothing and failed).
+      dropped, no batch row is written (as for any span that emitted nothing and failed). Two
+      internal columns, never part of `observationData`, mark the row as a drop and say what
+      supersedes it (§2): `unretained_object_key` holds the raw `objectKey` (NULL when it was not
+      a string), and `unretained_event_watermark` holds the newest `monitor_events.sequence`
+      committed before the row. The row stays outstanding until superseded; it is never deleted
+      or rewritten.
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer

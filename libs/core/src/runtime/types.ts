@@ -473,8 +473,11 @@ export interface DoctorDeliveryCounts {
  * Observations of one monitor that admission dropped for good, because the
  * retry outbox could not retain their ordered suffix (002 §2, "Admission
  * outcomes when the outbox cannot retain a suffix"), and that are still
- * outstanding: no later observation outcome of that monitor in the same
- * workspace has completed without such a drop.
+ * outstanding because nothing has superseded them. A drop with an object key
+ * is superseded only by a later event of the same monitor, workspace and
+ * object key; a drop without one, only by a later span of that monitor in that
+ * workspace that materializes an event and drops nothing. Quiet ticks, notify
+ * holds, observe failures and restarts supersede nothing.
  *
  * Read from the durable `observation_history` rows that record those drops, so
  * it survives restarts and reads the same with or without a daemon. Every text
@@ -482,7 +485,7 @@ export interface DoctorDeliveryCounts {
  * row; the observation's payload is never part of it.
  */
 export interface UnretainedObservationLoss {
-  /** How many outstanding drops are recorded, across every span since the last clean outcome. */
+  /** How many drops of this monitor in this workspace are still outstanding, across every span. */
   count: number;
   /** When the newest outstanding drop was recorded. */
   recordedAt: Date;
@@ -550,9 +553,10 @@ export interface DoctorMonitorRollup {
   materializationRetries?: MaterializationRetrySummary;
   /**
    * Present while this monitor has an outstanding observation that admission
-   * dropped because the retry outbox could not retain it. Absent once a later
-   * observation outcome completes without such a drop, and in reports from
-   * older daemons.
+   * dropped because the retry outbox could not retain it; absent once every
+   * drop is superseded (see {@link UnretainedObservationLoss}), and in reports
+   * from older daemons. Duplicated ids omit it: their loss belongs to the
+   * report's orphaned groups, like their retained work.
    */
   unretainedObservationLoss?: UnretainedObservationLoss;
 }
@@ -602,11 +606,12 @@ export interface MonitorDoctorReport {
   /** Every discovered monitor's rollup (both valid and invalid definitions). */
   monitors: DoctorMonitorRollup[];
   /**
-   * Retained outboxes without one unambiguous parsed current definition:
-   * missing/parse-failed definitions and duplicated ids. These are recovery
-   * obligations, not synthetic monitor definitions. A represented outbox appears
-   * here or on its monitor rollup, never both. Ordered by monitor id.
-   * Optional for compatibility with older daemon reports.
+   * Recovery obligations without one unambiguous parsed current definition
+   * (missing/parse-failed definitions and duplicated ids): retained outboxes,
+   * and outstanding unretained-observation losses. These are not synthetic
+   * monitor definitions. Each id's obligations appear here or on its monitor
+   * rollup, never both. Ordered by monitor id. Optional for compatibility with
+   * older daemon reports.
    */
   orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
   /** Count of discovered monitors that failed validation. */
@@ -774,16 +779,24 @@ export interface MaterializationRetryQuery {
 }
 
 /**
- * Safe retained-work summary for a route with no unambiguous parsed current
- * monitor definition. The containing doctor report supplies its workspace;
- * captured source/configuration metadata is deliberately not reconstructed.
+ * Safe recovery-obligation summary for a route with no unambiguous parsed
+ * current monitor definition: its retained work and, when present, its
+ * outstanding unretained-observation loss. The containing doctor report
+ * supplies its workspace; captured source/configuration metadata is
+ * deliberately not reconstructed.
  * @public
  */
 export interface OrphanedMaterializationRetrySummary {
   /** Durable route identity needed to inspect and repair the retained work. */
   monitorId: string;
-  /** Exact route's lifecycle totals and bounded metadata, never its envelopes. */
+  /** Exact route's lifecycle totals and bounded metadata, never its envelopes (all zero when only a loss remains). */
   summary: MaterializationRetrySummary;
+  /**
+   * Present while the route has an outstanding observation that admission
+   * dropped because the retry outbox could not retain it. Absent in reports
+   * from older daemons.
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 /** Operator-safe retry metadata that never contains an envelope or payload. @public */

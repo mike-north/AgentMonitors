@@ -2003,18 +2003,35 @@ explain <id>` command. Explain lists bounded safe retry metadata (record id, sta
 next/update times, and the control-stripped error) but never the captured envelope or payload.
 
 A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
-cannot retain a suffix": its retry suffix could not be retained, and no later observation of the
-monitor has completed without a drop) fails its check even though `retry-outbox` shows `0/0`, since
+cannot retain a suffix": its retry suffix could not be retained, and nothing has superseded it yet)
+fails its check even though `retry-outbox` shows `0/0`, since
 the drop has no retry record. This check outranks the retry checks. Its detail is
 `observation dropped, not retained for retry (<count> outstanding; newest: <which> at <iso8601>):
 <error>` followed by the rollup line. `<which>` uses explain's wording (002 §10.7). The remediation
 names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
 `monitor history <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
-the check clears once a later observation completes without a drop. Doctor JSON carries the
-same data in `monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients
-revive `recordedAt`, keep only the documented fields and normalize their text like retry errors.
+when the check clears: `A dropped observation cannot be retried. This check clears once a later
+event of this monitor materializes for each dropped object key; a drop without an object key clears
+once a later observation span of this monitor materializes an event and drops nothing.` That is
+002 §2's supersession rule exactly: a quiet (`no-change`) tick, a debounce or rollup hold, an
+observe failure, a span whose only failure was retained, events for other object keys, and a
+daemon restart all leave the check failing. Doctor JSON carries the same data in
+`monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients revive
+`recordedAt`, keep only the documented fields and normalize their text like retry errors.
+
+A drop also stays a failure without one valid, unambiguous current definition. A removed,
+parse-failed or duplicated id carries the loss in its `orphanedMaterializationRetries` entry as
+`unretainedObservationLoss` (beside a `summary` that is all zero when no work is retained; a
+duplicated id's monitor rows omit it). A parsed but invalid definition keeps it on its monitor row,
+whose check is a `skip`. Either way doctor adds a failing `dropped-observation:<id>` check, after
+the per-monitor checks and with any `retry-outbox:<id>` check for that id, whose detail is the
+`observation dropped, not retained for retry (…): <error>` text above and whose remediation names
+`monitor history <id>` (with `--workspace` as above) and the same clearing rule.
+
 Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
-through the built CLI, cleared by a later clean tick).
+through the built CLI, kept failing after a tick of other object keys and cleared by a later
+event for the dropped key; removed, unparseable and invalid definitions; and a real `daemon run`
+socket after a quiet scheduled tick).
 
 Otherwise the line carries an explicit `never observed` marker (the monitor has no observation
 history) / `lead-session=none` marker (the workspace has no lead session). The three delivery states
@@ -2024,7 +2041,8 @@ are distinct (000 AP): claiming a delivery never acknowledges it.
 metadata. Outboxes without an unambiguous parsed definition appear in
 `orphanedMaterializationRetries`, including removed, parse-failed and duplicate definitions.
 Each outbox occurs once, either attached to one current monitor or in an orphan group; orphan
-entries carry only `monitorId` and `summary`, never an invented source, urgency or cadence.
+entries carry only `monitorId`, `summary` and, while one is outstanding, `unretainedObservationLoss`
+(above), never an invented source, urgency or cadence.
 Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
 for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
 `--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
@@ -2149,7 +2167,8 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
   "orphanedMaterializationRetries": [
     {
       "monitorId": "<string>",
-      "summary": { "pending": 0, "terminal": 0, "bytes": 0, "records": [] }
+      "summary": { "pending": 0, "terminal": 0, "bytes": 0, "records": [] },
+      "unretainedObservationLoss": "<same shape as monitors[], present only while outstanding>"
     }
   ],
   "parseErrors": [],

@@ -74,6 +74,7 @@ import type {
   MonitorExplainStageId,
   MonitorExplainStageStatus,
   ObservationHistoryQuery,
+  OrphanedMaterializationRetrySummary,
   ObservationHistoryRecord,
   OpenSessionInput,
   PollingDecision,
@@ -2053,11 +2054,14 @@ export class AgentMonitorRuntime {
       const materializationRetries = duplicateMonitorIds.has(monitor.id)
         ? undefined
         : this.store.materializationRetrySummary(monitor.id, workspacePath);
-      const unretainedObservationLoss =
-        this.store.outstandingUnretainedObservationLoss(
-          monitor.id,
-          workspacePath,
-        );
+      // Like retained work, a duplicated id's drops belong to its orphan group
+      // once, not to each conflicting definition.
+      const unretainedObservationLoss = duplicateMonitorIds.has(monitor.id)
+        ? undefined
+        : this.store.outstandingUnretainedObservationLoss(
+            monitor.id,
+            workspacePath,
+          );
 
       monitors.push({
         id: monitor.id,
@@ -2083,6 +2087,10 @@ export class AgentMonitorRuntime {
 
     // Discover routes from metadata, not captured envelopes or a capped row
     // listing. Capacity is per monitor, so a full outbox cannot hide another.
+    // A rollup row represents its id's recovery obligations exactly when it
+    // carries the retry summary (one parsed, non-duplicated definition); every
+    // other id with retained work or an outstanding drop gets one orphan group,
+    // so neither can disappear with its definition (002 §2).
     const representedMonitorIds = new Set(
       monitors
         .filter(
@@ -2090,16 +2098,43 @@ export class AgentMonitorRuntime {
         )
         .map(({ id }) => id),
     );
-    const orphanedMaterializationRetries = this.store
-      .materializationRetryMonitorIds(workspacePath)
-      .filter((monitorId) => !representedMonitorIds.has(monitorId))
-      .map((monitorId) => ({
-        monitorId,
-        summary: this.store.materializationRetrySummary(
-          monitorId,
-          workspacePath,
-        ),
-      }));
+    const retainedMonitorIds = new Set(
+      this.store.materializationRetryMonitorIds(workspacePath),
+    );
+    const orphanedMaterializationRetries: OrphanedMaterializationRetrySummary[] =
+      [
+        ...new Set([
+          ...retainedMonitorIds,
+          ...this.store.unretainedObservationMonitorIds(workspacePath),
+        ]),
+      ]
+        .filter((monitorId) => !representedMonitorIds.has(monitorId))
+        .sort()
+        .flatMap((monitorId) => {
+          const unretainedObservationLoss =
+            this.store.outstandingUnretainedObservationLoss(
+              monitorId,
+              workspacePath,
+            );
+          if (
+            !retainedMonitorIds.has(monitorId) &&
+            unretainedObservationLoss === undefined
+          ) {
+            return [];
+          }
+          return [
+            {
+              monitorId,
+              summary: this.store.materializationRetrySummary(
+                monitorId,
+                workspacePath,
+              ),
+              ...(unretainedObservationLoss
+                ? { unretainedObservationLoss }
+                : {}),
+            },
+          ];
+        });
 
     return {
       generatedAt: now,
@@ -3450,11 +3485,14 @@ export class AgentMonitorRuntime {
           emitted.length,
         );
         const unretained = unretainedData.error;
-        this.store.recordObservationHistory({
+        // The raw key, not the display-safe copy: a later event for exactly
+        // this key is what supersedes the drop (002 §2).
+        const { objectKey } = envelope.observation as { objectKey?: unknown };
+        this.store.recordUnretainedObservation({
           monitorId: monitor.id,
           workspacePath: options.workspacePath,
           sourceName: envelope.monitor.frontmatter.watch.type,
-          result: 'errored',
+          objectKey: typeof objectKey === 'string' ? objectKey : undefined,
           observationData: unretainedData,
         });
         failures.push({

@@ -322,7 +322,11 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     // 600 observations with a fault at index 299 leave a 301-record suffix,
     // larger than the 256-record outbox (002 materialization_retry_outbox).
     const f = fixture('poll', (cursor) =>
-      cursor === 0 ? observations(0, 600) : observations(cursor, 3),
+      cursor === 0
+        ? observations(0, 600)
+        : cursor === 1
+          ? observations(cursor, 3)
+          : observations(cursor, 300).slice(299),
     );
     abortOn(f, 'b0-299');
 
@@ -383,7 +387,16 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     expect(f.reader.getMonitorState(MONITOR_ID, f.root).sourceState).toEqual({
       cursor: 2,
     });
-    // A later clean observation clears the drop from both diagnostics.
+    // Events for other object keys do not supersede the drop (002 §2).
+    expect(stage(await explain(f), 'materialization')?.status).toBe('failure');
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 1,
+      objectKey: 'object-299',
+    });
+
+    // A later event for `object-299` clears it from both diagnostics.
+    const third = await nextPoll(f);
+    expect(third.emittedEventIds).toHaveLength(1);
     expect(stage(await explain(f), 'materialization')?.status).toBe('ok');
     expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
   });
@@ -713,14 +726,15 @@ describe('a dropped observation stays visible in explain and doctor', () => {
     });
   }
 
-  it('keeps drops outstanding across a later failure and a later drop, tells them apart, and clears on a clean tick', async () => {
+  it('keeps drops outstanding across a later failure and a later drop, and tells them apart', async () => {
     let call = 0;
     const f = fixture('poll', () => {
       const current = call++;
       if (current === 1) throw new Error('source unavailable');
       if (current === 0) return observations(0, 10, { 5: { n: 1n } });
-      if (current === 2) return observations(2, 10, { 2: { n: 1n } });
-      return observations(current, 3);
+      // A later span that drops `object-2` and stops before `object-5`.
+      if (current === 2) return observations(2, 4, { 2: { n: 1n } });
+      return [];
     });
 
     await f.runtime.tick(f.monitorsDir, f.root);
@@ -732,7 +746,7 @@ describe('a dropped observation stays visible in explain and doctor', () => {
       title: 'b0-5',
     });
 
-    // An observe() failure is not a clean outcome: the drop stays outstanding.
+    // An observe() failure does not supersede the drop.
     const failed = await nextPoll(f);
     expect(failed.erroredObservations).toEqual([
       { monitorId: MONITOR_ID, message: 'source unavailable' },
@@ -760,22 +774,14 @@ describe('a dropped observation stays visible in explain and doctor', () => {
     expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
       count: 2,
       position: 3,
-      spanSize: 10,
+      spanSize: 4,
       objectKey: 'object-2',
       title: 'b2-2',
       error: expect.stringMatching(DOMAIN),
     });
-
-    // A span that completes without a drop clears both diagnostics.
-    const clean = await nextPoll(f);
-    expect(clean.emittedEventIds).toHaveLength(3);
-    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
-    const explained = await explain(f);
-    expect(stage(explained, 'materialization')?.status).toBe('ok');
-    expect(explained.verdict.status).not.toBe('failure');
   });
 
-  it('reports a span whose only observation was dropped, which writes no batch row', async () => {
+  it('keeps a span whose only observation was dropped outstanding through later quiet ticks', async () => {
     const f = fixture('poll', (cursor) =>
       cursor === 0 ? observations(0, 1, { 0: { n: 1n } }) : [],
     );
@@ -794,10 +800,17 @@ describe('a dropped observation stays visible in explain and doctor', () => {
     });
     expect((await explain(f)).verdict.status).toBe('failure');
 
-    // A later no-change outcome is clean and clears it.
+    // Regression (#497): a later no-change outcome used to read as clean and
+    // clear the drop one poll later, although the observation was never
+    // delivered. A quiet tick supersedes nothing.
+    await nextPoll(f);
     await nextPoll(f);
     expect(latestRow(f)?.result).toBe('no-change');
-    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 1,
+      objectKey: 'object-0',
+    });
+    expect(stage(await explain(f), 'materialization')?.status).toBe('failure');
   });
 
   it('stores only safe, bounded identity text and never the payload', async () => {
@@ -853,5 +866,385 @@ ${'y'.repeat(1_500)}'); END;
     expect(
       JSON.stringify((await doctorRollup(f)).unretainedObservationLoss),
     ).not.toContain('PRIVATE');
+  });
+});
+
+/**
+ * When an outstanding drop stops being reported (002 §2, "Admission outcomes
+ * when the outbox cannot take a suffix"): a drop with an object key stays
+ * outstanding until a later event materializes for that key, monitor and
+ * workspace; a drop without one stays outstanding until a later span of that
+ * monitor in that workspace materializes an event and drops nothing. Nothing
+ * else supersedes a drop. Regression for #497, where any later non-`errored`
+ * history row (a quiet poll, a rollup hold) cleared it.
+ */
+describe('an outstanding drop is cleared only by a superseding outcome', () => {
+  /** The loss the store reports for the fixture's monitor and workspace. */
+  function loss(f: Fixture) {
+    return f.reader.outstandingUnretainedObservationLoss(MONITOR_ID, f.root);
+  }
+
+  /** One observation for an explicit object key. */
+  function keyed(name: string, objectKey: string, payload?: unknown) {
+    return {
+      title: name,
+      summary: name,
+      objectKey,
+      snapshotText: `content-${name}`,
+      ...(payload === undefined ? {} : { payload }),
+    };
+  }
+
+  /** One observation without an object key. */
+  function unkeyed(name: string, payload?: unknown): Observation {
+    return {
+      title: name,
+      summary: name,
+      ...(payload === undefined ? {} : { payload }),
+    };
+  }
+
+  /** An event of another monitor or workspace, inserted through the store. */
+  function foreignEvent(
+    f: Fixture,
+    scope: { monitorId: string; workspacePath: string },
+    objectKey: string,
+  ) {
+    new RuntimeStore(f.writer.db).insertEvent({
+      ...scope,
+      sourceName: 'suffix-source',
+      urgency: 'normal',
+      title: objectKey,
+      body: '',
+      summary: `foreign-${objectKey}`,
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey,
+      baselineStrategy: 'incremental',
+      queryScope: {},
+      tags: [],
+      createdAt: new Date(clockTime),
+    });
+  }
+
+  it('keeps a keyed drop through quiet ticks, observe failures, retained-only spans and other keys, then clears on its key', async () => {
+    let call = 0;
+    const f = fixture('poll', () => {
+      const current = call++;
+      switch (current) {
+        case 0:
+          // `object-1` is dropped; `object-0` materializes BEFORE it in the
+          // same span, which must not count as superseding it.
+          return [
+            keyed('k0-0', 'object-1'),
+            keyed('k0-1', 'object-1', { n: 1n }),
+            keyed('k0-2', 'object-2'),
+          ];
+        case 1:
+          return [];
+        case 2:
+          throw new Error('source unavailable');
+        case 3:
+          // Its only failure is retained (fault on k3-1); k3-0 materializes.
+          return [keyed('k3-0', 'object-7'), keyed('k3-1', 'object-8')];
+        case 4:
+          return [keyed('k4-0', 'object-0'), keyed('k4-1', 'object-2')];
+        default:
+          return [keyed(`k${String(current)}-0`, 'object-1')];
+      }
+    });
+    abortOn(f, 'k3-1');
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    await nextPoll(f);
+    expect(latestRow(f)?.result).toBe('no-change');
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    const failed = await nextPoll(f);
+    expect(failed.erroredObservations).toHaveLength(1);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    const retainedOnly = await nextPoll(f);
+    expect(retainedOnly.emittedEventIds).toHaveLength(1);
+    expect(
+      f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
+    ).toBe(1);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    const otherKeys = await nextPoll(f);
+    expect(otherKeys.emittedEventIds).toHaveLength(2);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+    expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
+      count: 1,
+      objectKey: 'object-1',
+    });
+    expect(stage(await explain(f), 'materialization')?.status).toBe('failure');
+
+    const superseding = await nextPoll(f);
+    expect(superseding.emittedEventIds).toHaveLength(1);
+    expect(loss(f)).toBeUndefined();
+    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
+    // The retained failure from the earlier span is still reported on its own.
+    expect(stage(await explain(f), 'materialization')?.status).toBe('pending');
+  });
+
+  it('clears a keyed drop when a later sibling in its own span materializes the same key', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0
+        ? [keyed('s0-0', 'object-1', { n: 1n }), keyed('s0-1', 'object-1')]
+        : [],
+    );
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+
+    expect(dropRows(f)).toHaveLength(1);
+    expect(loss(f)).toBeUndefined();
+  });
+
+  it('does not clear a keyed drop for an event of the same key from another monitor or another workspace', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? [keyed('x0-0', 'object-1', { n: 1n })] : [],
+    );
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    clockTime += 1_000;
+    foreignEvent(
+      f,
+      { monitorId: 'another-monitor', workspacePath: f.root },
+      'object-1',
+    );
+    foreignEvent(
+      f,
+      { monitorId: MONITOR_ID, workspacePath: `${f.root}-elsewhere` },
+      'object-1',
+    );
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    // Control: the same insert for this monitor and workspace supersedes it.
+    foreignEvent(
+      f,
+      { monitorId: MONITOR_ID, workspacePath: f.root },
+      'object-1',
+    );
+    expect(loss(f)).toBeUndefined();
+  });
+
+  it('keeps an unkeyed drop through quiet ticks and a later dropping span, then clears on a span that materializes and drops nothing', async () => {
+    let call = 0;
+    const f = fixture('poll', () => {
+      const current = call++;
+      switch (current) {
+        case 0:
+          return [unkeyed('u0-0'), unkeyed('u0-1', { n: 1n })];
+        case 1:
+        case 2:
+          return [];
+        case 3:
+          return [unkeyed('u3-0'), unkeyed('u3-1', { n: 1n })];
+        default:
+          return [unkeyed(`u${String(current)}-0`)];
+      }
+    });
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(loss(f)).toMatchObject({ count: 1, position: 2, spanSize: 2 });
+    expect(loss(f)?.objectKey).toBeUndefined();
+
+    await nextPoll(f);
+    await nextPoll(f);
+    expect(latestRow(f)?.result).toBe('no-change');
+    expect(loss(f)).toMatchObject({ count: 1 });
+
+    // Materializes an event but drops again: it supersedes neither drop.
+    const droppedAgain = await nextPoll(f);
+    expect(droppedAgain.emittedEventIds).toHaveLength(1);
+    expect(loss(f)).toMatchObject({ count: 2, position: 2, spanSize: 2 });
+
+    const clean = await nextPoll(f);
+    expect(clean.emittedEventIds).toHaveLength(1);
+    expect(loss(f)).toBeUndefined();
+  });
+
+  it('does not clear an unkeyed drop for a span of another workspace', async () => {
+    let call = 0;
+    const f = fixture('poll', () =>
+      call++ === 0 ? [unkeyed('w0-0', { n: 1n })] : [unkeyed('w1-0')],
+    );
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(loss(f)).toMatchObject({ count: 1 });
+
+    // The same monitor id observed for another workspace materializes a clean span.
+    const elsewhere = `${f.root}-elsewhere`;
+    clockTime += 2_000;
+    const other = await f.runtime.tick(f.monitorsDir, elsewhere);
+    expect(other.emittedEventIds).toHaveLength(1);
+    expect(loss(f)).toMatchObject({ count: 1 });
+  });
+
+  it('keeps a rollup drop through the next hold and clears it at the flush that materializes its key', async () => {
+    const f = fixture('rollup', (cursor) =>
+      cursor === 0
+        ? observations(0, 600)
+        : [keyed(`r${String(cursor)}-0`, 'object-299')],
+    );
+    abortOn(f, 'b0-299');
+
+    // Hold at 12:00, flush at 12:01: the capacity fault drops `object-299`.
+    await f.runtime.tick(f.monitorsDir, f.root);
+    clockTime = NOW.getTime() + 60_000;
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-299' });
+
+    // 13:00 observes `object-299` again but only holds it.
+    clockTime = NOW.getTime() + 60 * 60_000;
+    const held = await f.runtime.tick(f.monitorsDir, f.root);
+    expect(held.emittedEventIds).toEqual([]);
+    expect(latestRow(f)?.result).toBe('suppressed');
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-299' });
+
+    // 13:01 flushes it; the flushed event carries the observation's own key.
+    clockTime = NOW.getTime() + 61 * 60_000;
+    const flushed = await f.runtime.tick(f.monitorsDir, f.root);
+    expect(flushed.emittedEventIds).toHaveLength(1);
+    const [event] = f.reader.listEvents({
+      monitorId: MONITOR_ID,
+      workspacePath: f.root,
+      limit: 1,
+    });
+    expect(event?.summary).toBe('r1-0');
+    expect(event?.objectKey).toBe('object-299');
+    expect(loss(f)).toBeUndefined();
+  });
+
+  it('keeps an outstanding drop across reopening the store', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? [keyed('p0-0', 'object-1', { n: 1n })] : [],
+    );
+    await f.runtime.tick(f.monitorsDir, f.root);
+    await nextPoll(f);
+    for (const client of [f.writer.client, f.observer.client]) client.close();
+
+    const db = createDb(path.join(f.root, 'runtime.db'));
+    try {
+      expect(
+        new RuntimeStore(db).outstandingUnretainedObservationLoss(
+          MONITOR_ID,
+          f.root,
+        ),
+      ).toMatchObject({ count: 1, objectKey: 'object-1' });
+    } finally {
+      (db as unknown as { $client: BetterSQLiteClient }).$client.close();
+    }
+  });
+});
+
+/**
+ * A drop must stay visible when its monitor no longer has one unambiguous
+ * parsed definition, the way retained work does (002 §2; 005 doctor orphan
+ * groups). Regression for #497: the loss was computed only for scanned
+ * monitors, so removing or breaking the definition made it vanish.
+ */
+describe('a drop without one current definition is reported in the orphan groups', () => {
+  async function dropped() {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? observations(0, 3, { 1: { n: 1n } }) : [],
+    );
+    await f.runtime.tick(f.monitorsDir, f.root);
+    return f;
+  }
+
+  async function report(f: Fixture) {
+    return f.runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+  }
+
+  const expectedLoss = {
+    count: 1,
+    position: 2,
+    spanSize: 3,
+    objectKey: 'object-1',
+    title: 'b0-1',
+  };
+
+  it('reports the loss of a removed definition', async () => {
+    const f = await dropped();
+    rmSync(path.join(f.monitorsDir, MONITOR_ID), { recursive: true });
+
+    const doctor = await report(f);
+
+    expect(doctor.monitors).toEqual([]);
+    expect(doctor.orphanedMaterializationRetries).toEqual([
+      {
+        monitorId: MONITOR_ID,
+        summary: { pending: 0, terminal: 0, bytes: 0, records: [] },
+        unretainedObservationLoss: expect.objectContaining(expectedLoss),
+      },
+    ]);
+  });
+
+  it('reports the loss of an unparseable definition', async () => {
+    const f = await dropped();
+    writeFileSync(
+      path.join(f.monitorsDir, MONITOR_ID, 'MONITOR.md'),
+      '---\nwatch: [unterminated\n---\n',
+    );
+
+    const doctor = await report(f);
+
+    expect(doctor.parseErrors.map(({ id }) => id)).toEqual([MONITOR_ID]);
+    expect(doctor.orphanedMaterializationRetries).toEqual([
+      expect.objectContaining({
+        monitorId: MONITOR_ID,
+        unretainedObservationLoss: expect.objectContaining(expectedLoss),
+      }),
+    ]);
+  });
+
+  it('reports a duplicated id once in its orphan group, not on each definition', async () => {
+    const f = await dropped();
+    mkdirSync(path.join(f.monitorsDir, 'nested', MONITOR_ID), {
+      recursive: true,
+    });
+    writeFileSync(
+      path.join(f.monitorsDir, 'nested', MONITOR_ID, 'MONITOR.md'),
+      '---\nwatch:\n  type: suffix-source\n  interval: 1s\nurgency: normal\n---\nDuplicate.\n',
+    );
+
+    const doctor = await report(f);
+
+    expect(doctor.duplicateIds.map(({ id }) => id)).toEqual([MONITOR_ID]);
+    for (const monitor of doctor.monitors) {
+      expect(monitor.unretainedObservationLoss).toBeUndefined();
+    }
+    expect(doctor.orphanedMaterializationRetries).toEqual([
+      expect.objectContaining({
+        monitorId: MONITOR_ID,
+        unretainedObservationLoss: expect.objectContaining(expectedLoss),
+      }),
+    ]);
+  });
+
+  it('keeps the loss on the rollup of a parsed but invalid definition', async () => {
+    const f = await dropped();
+    writeFileSync(
+      path.join(f.monitorsDir, MONITOR_ID, 'MONITOR.md'),
+      '---\nwatch:\n  type: no-such-source\n  interval: 1s\nurgency: normal\n---\nInvalid.\n',
+    );
+
+    const doctor = await report(f);
+
+    expect(doctor.monitors).toHaveLength(1);
+    expect(doctor.monitors[0]?.valid).toBe(false);
+    expect(doctor.monitors[0]?.unretainedObservationLoss).toMatchObject(
+      expectedLoss,
+    );
+    expect(doctor.orphanedMaterializationRetries).toEqual([]);
   });
 });

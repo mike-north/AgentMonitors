@@ -3,8 +3,9 @@
  * owned static server supplies distinctive metadata, so SQLite fallback cannot
  * accidentally satisfy wire-date, compatibility, privacy, or rendering checks.
  */
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -28,6 +29,7 @@ import {
   SourceRegistry,
 } from '@agentmonitors/core';
 import type { Database } from 'better-sqlite3';
+import fileFingerprintSource from '@agentmonitors/source-file-fingerprint';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { normalizeUnretainedObservationLoss } from './retry-diagnostics.js';
 import { doctorReportClient, explainMonitorClient } from './runtime-client.js';
@@ -1220,7 +1222,7 @@ it.each(['absent', 'events', 'partial', 'ordinary'] as const)(
  * hid the drop. Real ticks against a real store with a native SQLite fault;
  * expected text is written from 005's doctor per-monitor rollup rule.
  */
-it('fails the doctor monitor check for a dropped observation until a later clean tick, in text and JSON', async () => {
+it('fails the doctor monitor check for a dropped observation until a later event for its object key, in text and JSON', async () => {
   // Native Date instances, not vitest's fake-timer subclass: retry envelopes
   // accept only unmodified Dates, and the fault must be decided on capacity.
   const tickAt = new Date('2026-11-01T12:00:00.000Z');
@@ -1255,16 +1257,22 @@ it('fails the doctor monitor check for a dropped observation until a later clean
     const registry = new SourceRegistry();
     let call = 0;
     // Stands in for the bundled `schedule` source so the CLI validates the
-    // same definition; it emits 600 distinct observations, then 3.
+    // same definition; it emits 600 distinct observations, then 3 other
+    // objects, then the dropped object again.
     registry.register({
       name: 'schedule',
       scopeSchema: { type: 'object' },
       stateful: true,
       observe() {
         const batch = call++;
-        const count = batch === 0 ? 600 : 3;
+        const indexes =
+          batch === 0
+            ? Array.from({ length: 600 }, (_, index) => index)
+            : batch === 1
+              ? [0, 1, 2]
+              : [299];
         return Promise.resolve({
-          observations: Array.from({ length: count }, (_, index) => ({
+          observations: indexes.map((index) => ({
             title: `b${String(batch)}-${String(index)}`,
             summary: `b${String(batch)}-${String(index)}`,
             objectKey: `object-${String(index)}`,
@@ -1297,7 +1305,7 @@ it('fails the doctor monitor check for a dropped observation until a later clean
       );
       expect(line).toContain('retry-outbox=0/0');
       expect(text.stdout).toContain(
-        'A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.',
+        'A dropped observation cannot be retried. This check clears once a later event of this monitor materializes for each dropped object key; a drop without an object key clears once a later observation span of this monitor materializes an event and drops nothing.',
       );
 
       // Bug (#496/#497 merge): the drop remediation named a bare
@@ -1377,10 +1385,24 @@ it('fails the doctor monitor check for a dropped observation until a later clean
         expect.objectContaining({ name: 'monitor:dropper', status: 'fail' }),
       );
 
-      // A later clean tick clears the check.
+      // Regression (#497): a later tick that materializes only other objects
+      // used to read as clean and clear the check. It must keep failing.
       clockTime += 120_000;
       const second = await runtime.tick(monitors, root);
       expect(second.emittedEventIds).toHaveLength(3);
+      const kept = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+      expect(kept.monitors[0].unretainedObservationLoss).toMatchObject({
+        count: 1,
+        objectKey: 'object-299',
+      });
+      expect(kept.checks).toContainEqual(
+        expect.objectContaining({ name: 'monitor:dropper', status: 'fail' }),
+      );
+
+      // A later event for `object-299` supersedes the drop and clears it.
+      clockTime += 120_000;
+      const third = await runtime.tick(monitors, root);
+      expect(third.emittedEventIds).toHaveLength(1);
       const cleared = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
       expect(cleared.monitors[0].unretainedObservationLoss).toBeNull();
       expect(cleared.checks).toContainEqual(
@@ -1392,7 +1414,7 @@ it('fails the doctor monitor check for a dropped observation until a later clean
   } finally {
     vi.unstubAllGlobals();
   }
-});
+}, 30_000);
 
 /**
  * Bug (#497 review, finding 3): a skewed daemon's loss with a missing or
@@ -1453,3 +1475,314 @@ it.each(malformedLosses)(
     expect(text.stdout).not.toContain('observation dropped');
   },
 );
+
+/** Commit one real drop of `object-1` (a BigInt payload the outbox cannot hold) for `dropper`. */
+async function seedDrop(
+  monitors: string,
+  dbPath: string,
+  source: Parameters<SourceRegistry['register']>[0],
+): Promise<void> {
+  const db = createDb(dbPath);
+  const client = (db as unknown as { $client: Database }).$client;
+  try {
+    const registry = new SourceRegistry();
+    registry.register(source);
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const tick = await runtime.tick(monitors, root);
+    expect(tick.erroredObservations).toEqual([
+      {
+        monitorId: 'dropper',
+        message: expect.stringContaining('Not retained for retry'),
+      },
+    ]);
+  } finally {
+    client.close();
+  }
+}
+
+const DROPPER_SCHEDULE =
+  '---\nwatch:\n  type: schedule\n  cron: "* * * * *"\n  timezone: UTC\nurgency: normal\nbaseline-strategy: incremental\n---\nInspect.\n';
+
+/**
+ * Regression for #497 (definition-less drops): the loss was computed only for
+ * scanned monitors, so removing or breaking a definition made an outstanding
+ * drop vanish from doctor. It must show in the orphan groups with a failing
+ * check, like retained work for a missing definition (005 doctor).
+ */
+it.each([
+  ['removed', (dir: string) => rmSync(dir, { recursive: true })],
+  [
+    'unparseable',
+    (dir: string) =>
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        '---\nwatch: [unterminated\n---\n',
+      ),
+  ],
+  [
+    'invalid',
+    (dir: string) =>
+      writeFileSync(
+        path.join(dir, 'MONITOR.md'),
+        DROPPER_SCHEDULE.replace('type: schedule', 'type: no-such-source'),
+      ),
+  ],
+] as const)(
+  'keeps failing doctor for a drop whose definition is %s, in text and JSON',
+  async (state, breakDefinition) => {
+    const monitors = path.join(root, 'monitors');
+    const dir = path.join(monitors, 'dropper');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, 'MONITOR.md'), DROPPER_SCHEDULE);
+    const dbPath = path.join(root, 'state.db');
+    await seedDrop(monitors, dbPath, {
+      name: 'schedule',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'd-0', summary: 'd-0', objectKey: 'object-0' },
+            {
+              title: 'd-1',
+              summary: 'd-1',
+              objectKey: 'object-1',
+              payload: { n: 1n },
+            },
+          ],
+          nextState: { seeded: true },
+        }),
+    });
+    breakDefinition(dir);
+
+    const json = await run('doctor', 'json', dbPath);
+    expect(json.code).toBe(1);
+    const report = JSON.parse(json.stdout);
+    expect(report.ok).toBe(false);
+    const loss = {
+      count: 1,
+      recordedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+      error: expect.stringContaining(
+        'Not retained for retry: its envelope is not serializable for the retry outbox',
+      ),
+      position: 2,
+      spanSize: 2,
+      objectKey: 'object-1',
+      title: 'd-1',
+    };
+    if (state === 'invalid') {
+      // A parsed definition keeps its own rollup; its check is a skip, so the
+      // loss needs its own failing check.
+      expect(report.monitors[0].unretainedObservationLoss).toEqual(loss);
+      expect(report.orphanedMaterializationRetries).toEqual([]);
+    } else {
+      expect(report.monitors).toEqual([]);
+      expect(report.orphanedMaterializationRetries).toEqual([
+        {
+          monitorId: 'dropper',
+          summary: { pending: 0, terminal: 0, bytes: 0, records: [] },
+          unretainedObservationLoss: loss,
+        },
+      ]);
+    }
+    expect(report.checks).toContainEqual({
+      name: 'dropped-observation:dropper',
+      status: 'fail',
+      detail: expect.stringMatching(
+        /^observation dropped, not retained for retry \(1 outstanding; newest: observation 2 of 2 \(object-1, "d-1"\) at /,
+      ),
+      remediation: expect.stringMatching(
+        /^Inspect it with `agentmonitors monitor history dropper[^`]*` and repair the definition or reported failure\. A dropped observation cannot be retried\./,
+      ),
+    });
+
+    const text = await run('doctor', 'text', dbPath);
+    expect(text.code).toBe(1);
+    const line = text.stdout
+      .split('\n')
+      .find((candidate) =>
+        candidate.startsWith('✗ dropped-observation:dropper: '),
+      );
+    expect(line).toContain(
+      'observation dropped, not retained for retry (1 outstanding; newest: observation 2 of 2 (object-1, "d-1") at ',
+    );
+  },
+);
+
+/**
+ * Regression for #497 through the built CLI and a real `daemon run`: the
+ * daemon's next quiet scheduled tick wrote a `no-change` row, which cleared
+ * the drop, so doctor and explain served by that daemon read healthy one poll
+ * interval after a permanent loss.
+ */
+it('keeps reporting a drop through a real daemon socket after a quiet scheduled tick', async () => {
+  const monitors = path.join(root, 'monitors');
+  const dir = path.join(monitors, 'dropper');
+  mkdirSync(dir, { recursive: true });
+  const watched = path.join(root, 'watched.txt');
+  writeFileSync(watched, 'unchanged');
+  writeFileSync(
+    path.join(dir, 'MONITOR.md'),
+    [
+      '---',
+      'watch:',
+      '  type: file-fingerprint',
+      '  globs:',
+      "    - 'watched.txt'",
+      `  cwd: ${JSON.stringify(root)}`,
+      "  interval: '1s'",
+      'urgency: normal',
+      '---',
+      'Inspect.',
+      '',
+    ].join('\n'),
+  );
+  const dbPath = path.join(root, 'state.db');
+  // The real source establishes its baseline; one extra observation for
+  // `object-lost` carries a payload the retry outbox cannot hold.
+  await seedDrop(monitors, dbPath, {
+    ...fileFingerprintSource,
+    async observe(config, context) {
+      const result = await fileFingerprintSource.observe(config, context);
+      return {
+        ...result,
+        observations: [
+          ...result.observations,
+          {
+            title: 'lost',
+            summary: 'lost',
+            objectKey: 'object-lost',
+            payload: { n: 1n },
+          },
+        ],
+      };
+    },
+  });
+
+  const env = {
+    ...process.env,
+    HOME: root,
+    XDG_DATA_HOME: path.join(root, 'data'),
+    AGENTMONITORS_DB: dbPath,
+    AGENTMONITORS_SOCKET: socketPath,
+  };
+  const daemon = spawn(
+    process.execPath,
+    [
+      cli,
+      'daemon',
+      'run',
+      monitors,
+      '--workspace',
+      root,
+      '--poll-ms',
+      '200',
+      '--socket',
+      socketPath,
+      '--reap-after-ms',
+      '0',
+    ],
+    { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] },
+  );
+  let output = '';
+  daemon.stdout.setEncoding('utf8');
+  daemon.stderr.setEncoding('utf8');
+  daemon.stdout.on('data', (chunk: string) => (output += chunk));
+  daemon.stderr.on('data', (chunk: string) => (output += chunk));
+  const exited = new Promise<void>((resolve) =>
+    daemon.once('exit', () => resolve()),
+  );
+  try {
+    // Wait (bounded) for the daemon's own quiet tick after the drop.
+    const reader = createDb(dbPath);
+    const readerClient = (reader as unknown as { $client: Database }).$client;
+    try {
+      const history = new RuntimeStore(reader);
+      await vi.waitFor(
+        () => {
+          if (daemon.exitCode !== null) {
+            throw new Error(`daemon exited early: ${output}`);
+          }
+          const rows = history.listObservationHistory({
+            monitorId: 'dropper',
+            workspacePath: root,
+            limit: 10,
+          });
+          expect(rows[0]?.result).toBe('no-change');
+          expect(
+            rows.some(({ observationData }) => observationData['notRetained']),
+          ).toBe(true);
+          expect(existsSync(socketPath)).toBe(true);
+        },
+        { timeout: 15_000, interval: 100 },
+      );
+    } finally {
+      readerClient.close();
+    }
+
+    const doctor = await execute(
+      process.execPath,
+      [
+        cli,
+        'doctor',
+        '--dir',
+        monitors,
+        '--workspace',
+        root,
+        '--socket',
+        socketPath,
+        '--format',
+        'json',
+      ],
+      { cwd: root, timeout: 15000, env },
+    ).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
+    const report = JSON.parse(doctor.stdout);
+    expect(report.daemon.running).toBe(true);
+    expect(report.checks).toContainEqual(
+      expect.objectContaining({ name: 'daemon-reachable', status: 'pass' }),
+    );
+    expect(report.monitors[0].unretainedObservationLoss).toMatchObject({
+      count: 1,
+      objectKey: 'object-lost',
+      title: 'lost',
+    });
+    expect(report.checks).toContainEqual(
+      expect.objectContaining({ name: 'monitor:dropper', status: 'fail' }),
+    );
+
+    const explained = await execute(
+      process.execPath,
+      [
+        cli,
+        'monitor',
+        'explain',
+        'dropper',
+        '--dir',
+        monitors,
+        '--workspace',
+        root,
+        '--socket',
+        socketPath,
+        '--format',
+        'json',
+      ],
+      { cwd: root, timeout: 15000, env },
+    ).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
+    const explain = JSON.parse(explained.stdout) as MonitorExplainReport;
+    expect(
+      explain.stages.find(({ id }) => id === 'materialization'),
+    ).toMatchObject({ status: 'failure' });
+  } finally {
+    daemon.kill('SIGTERM');
+    const stopped = await Promise.race([
+      exited.then(() => true),
+      new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5000)),
+    ]);
+    if (!stopped) {
+      daemon.kill('SIGKILL');
+      await exited;
+    }
+  }
+}, 30_000);

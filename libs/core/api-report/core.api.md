@@ -1144,6 +1144,7 @@ export const OPERATION_TIMEOUT_PATTERN: string;
 export interface OrphanedMaterializationRetrySummary {
     monitorId: string;
     summary: MaterializationRetrySummary;
+    unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 // @public
@@ -1381,6 +1382,14 @@ export class RuntimeStore {
         result: ObservationOutcome;
         observationData: Record<string, unknown>;
     }): void;
+    // @internal
+    recordUnretainedObservation(input: {
+        monitorId: string;
+        workspacePath: string | null;
+        sourceName: string;
+        objectKey: string | undefined;
+        observationData: Record<string, unknown>;
+    }): void;
     retractObjectEvents(input: {
         workspacePath?: string | null;
         monitorId: string;
@@ -1436,6 +1445,8 @@ export class RuntimeStore {
     touchSession(sessionId: string): void;
     // (undocumented)
     unreadEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
+    // @internal
+    unretainedObservationMonitorIds(workspacePath: string): string[];
     // (undocumented)
     updateSessionRecap(sessionId: string): void;
     upsertObjectSuppression(input: {

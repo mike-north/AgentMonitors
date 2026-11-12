@@ -298,7 +298,9 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       source_name TEXT NOT NULL,
       observation_data TEXT NOT NULL DEFAULT '{}',
       result TEXT NOT NULL,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      unretained_object_key TEXT,
+      unretained_event_watermark INTEGER
     )
   `);
 
@@ -325,6 +327,34 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // workspace-scoped history/explain query (a soft one-time reset of the audit
   // trail, consistent with the monitor_state re-baseline above).
   addColumnIfMissing(sqlite, 'observation_history', 'workspace_path', 'TEXT');
+  // Additive migration (002 §2, unretained admission outcomes): a drop row
+  // records the raw object key it names and the `monitor_events` sequence
+  // committed before it, so a later event for that key can supersede it.
+  // Older rows keep NULL and are not drop rows.
+  addColumnIfMissing(
+    sqlite,
+    'observation_history',
+    'unretained_object_key',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    sqlite,
+    'observation_history',
+    'unretained_event_watermark',
+    'INTEGER',
+  );
+  // Doctor and explain read a monitor's outstanding drops on every call: the
+  // partial index holds only drop rows, and the outcome index finds a later
+  // superseding span without scanning the monitor's whole history.
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_observation_history_unretained
+      ON observation_history (workspace_path, monitor_id, created_at, id)
+      WHERE unretained_event_watermark IS NOT NULL
+  `);
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_observation_history_outcome
+      ON observation_history (monitor_id, workspace_path, result, created_at, id)
+  `);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_events (
@@ -356,6 +386,12 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   addColumnIfMissing(sqlite, 'monitor_events', 'baseline_strategy', 'TEXT');
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
+  // Created after the order migration, which rebuilds `monitor_events`. Finds a
+  // later event for a dropped observation's object key (002 §2).
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_monitor_events_object_sequence
+      ON monitor_events (monitor_id, workspace_path, object_key, sequence)
+  `);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS monitor_snapshots (

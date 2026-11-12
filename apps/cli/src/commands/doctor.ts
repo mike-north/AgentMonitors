@@ -8,6 +8,7 @@ import type {
   HookDeliveryDiagnosis,
   MaterializationRetrySummary,
   MonitorDoctorReport,
+  UnretainedObservationLoss,
 } from '@agentmonitors/core';
 import {
   describeUnretainedObservation,
@@ -413,8 +414,8 @@ function buildChecks(
       checks.push({
         name,
         status: 'fail',
-        detail: `observation dropped, not retained for retry (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}  ${rollup}`,
-        remediation: `Inspect it with \`${explainCommand(report, monitor.id)}\` and \`${historyCommand(report, monitor.id)}\`, then repair the reported failure. A dropped observation cannot be retried; this check clears once a later observation of this monitor completes without a drop.`,
+        detail: `${unretainedLossDetail(loss)}  ${rollup}`,
+        remediation: `Inspect it with \`${explainCommand(report, monitor.id)}\` and \`${historyCommand(report, monitor.id)}\`, then repair the reported failure. ${UNRETAINED_CLEARS}`,
       });
     } else if ((retryOutbox?.terminal ?? 0) > 0) {
       checks.push({
@@ -451,12 +452,55 @@ function buildChecks(
         monitor.materializationRetries,
       );
     }
+    if (!monitor.valid && monitor.unretainedObservationLoss) {
+      addUnretainedLossCheck(
+        checks,
+        report,
+        monitor.id,
+        monitor.unretainedObservationLoss,
+      );
+    }
   }
   for (const group of report.orphanedMaterializationRetries ?? []) {
     addRetainedWorkCheck(checks, report, group.monitorId, group.summary);
+    if (group.unretainedObservationLoss) {
+      addUnretainedLossCheck(
+        checks,
+        report,
+        group.monitorId,
+        group.unretainedObservationLoss,
+      );
+    }
   }
 
   return checks;
+}
+
+/** When a drop stops failing doctor (002 §2): only a superseding outcome clears it. */
+const UNRETAINED_CLEARS =
+  'A dropped observation cannot be retried. This check clears once a later event of this monitor materializes for each dropped object key; a drop without an object key clears once a later observation span of this monitor materializes an event and drops nothing.';
+
+/** The shared description of an outstanding drop, for the monitor and orphan checks. */
+function unretainedLossDetail(loss: UnretainedObservationLoss): string {
+  return `observation dropped, not retained for retry (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}`;
+}
+
+/**
+ * A drop stays a failure when its monitor has no valid, unambiguous current
+ * definition, like retained work: it must never vanish with the definition.
+ */
+function addUnretainedLossCheck(
+  checks: DoctorCheck[],
+  report: MonitorDoctorReport,
+  monitorId: string,
+  loss: UnretainedObservationLoss,
+): void {
+  checks.push({
+    name: `dropped-observation:${monitorId}`,
+    status: 'fail',
+    detail: unretainedLossDetail(loss),
+    remediation: `Inspect it with \`${historyCommand(report, monitorId)}\` and repair the definition or reported failure. ${UNRETAINED_CLEARS}`,
+  });
 }
 
 /** Recovery obligations remain failures even without one valid current definition. */

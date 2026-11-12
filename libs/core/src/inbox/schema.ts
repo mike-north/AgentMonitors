@@ -334,4 +334,20 @@ export const observationHistory = sqliteTable('observation_history', {
     ],
   }).notNull(),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * Set only on an unretained-admission drop row (002 §2): the dropped
+   * observation's raw `objectKey`, matched exactly against
+   * `monitor_events.object_key`. NULL on a drop of an observation without a
+   * string object key, and on every other row.
+   */
+  unretainedObjectKey: text('unretained_object_key'),
+  /**
+   * Set only on a drop row, and what marks it as one: the newest
+   * `monitor_events.sequence` committed when the drop was recorded, read inside
+   * the admitting transaction. An event for the same monitor, workspace and
+   * object key with a greater sequence materialized after the drop and
+   * supersedes it. Event `created_at` is observation time, not commit order, so
+   * it cannot order an event against a history row.
+   */
+  unretainedEventWatermark: integer('unretained_event_watermark'),
 });
