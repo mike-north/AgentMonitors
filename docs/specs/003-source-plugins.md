@@ -1622,9 +1622,10 @@ the group, and an empty group needs no signal. Only when continuity is lost (the
 of the processes ever confirmed) or the process table cannot be read is the group left alone: the
 step abstains and writes a warning to the daemon's stderr (the daemon log) naming the group, the
 members it saw and why identity could not be confirmed. Continuity is lost when the group emptied
-and its id was reused, or when, after the direct child has exited, a member forks and exits within
-one reading interval while no other confirmed member is alive; in that second case the forked
-process escapes the bound. That residual, and the latency the reads add to each step, are stated
+and its id was reused, or when, after the direct child has exited, a member forks and exits
+between two consecutive readings (within one 250 ms interval plus one read; the read time grows
+under load, up to the 5 s `ps` cap) while no other confirmed member is alive; in that second case
+the forked process escapes the bound. That residual, and the latency the reads add to each step, are stated
 in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
 `taskkill` runs only while the direct child is still unreaped.
 

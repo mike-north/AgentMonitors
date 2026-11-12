@@ -24,7 +24,8 @@ step, so a member that forks a process and later exits passes continuity to it. 
 leader or handed off between members during the grace period. The step abstains only when
 continuity is lost or the process table cannot be read. Lost continuity has two causes the gate
 cannot tell apart: the group emptied and its id was reused, or, after the leader has exited, a
-member forked and exited within one reading interval while no other confirmed member was alive. The
+member forked and exited between two consecutive readings (within one 250 ms interval plus one
+read, which grows under load up to the 5 s `ps` cap) while no other confirmed member was alive. The
 second leaves a real descendant running, so §3.1 keeps its MUST and adds it as a stated exception
 (the hand-off residual), and §5.1 names it beside the read-duration residual. §3.1 also states the
 latency the verification reads add to each step. The Linux reader treats only ENOENT/ESRCH

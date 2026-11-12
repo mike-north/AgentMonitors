@@ -18,8 +18,9 @@
  *
  * Continuity can still be lost in two ways, and the follow-up then abstains:
  * the group empties and its id is reused, or, after the leader has exited, a
- * member forks and exits within one reading interval while no other confirmed
- * member is alive (008 §3.1's stated exception). The first needs the pid space
+ * member forks and exits between two consecutive readings (within one 250 ms
+ * interval plus one read, which grows under load up to the 5 s `ps` cap) while
+ * no other confirmed member is alive (008 §3.1's stated exception). The first needs the pid space
  * to wrap; the second is real but timing-dependent. Both abstentions are
  * pinned against fabricated process tables in
  * `libs/core/src/process/process-identity.test.ts`.

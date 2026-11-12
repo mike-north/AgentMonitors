@@ -222,9 +222,12 @@ export interface VerifiedSignalOptions {
  * or when `signal` aborts. Its timers never keep the process alive. A reading
  * that fails or is unsupported confirms nothing and does not stop tracking.
  *
- * Residual: after the leader has exited, a member that forks and exits within
- * one interval while no other confirmed member is alive still hands the group
- * to an unconfirmed process, and the next step then abstains (008 §3.1, §5.1).
+ * Residual: after the leader has exited, a member that forks and exits between
+ * two consecutive readings (within one interval plus one read) while no other
+ * confirmed member is alive still hands the group to an unconfirmed process,
+ * and the next step then abstains (008 §3.1, §5.1). A read is a `ps` run on
+ * macOS, so its duration, and with it the window, grows under load, up to the
+ * 5 s `ps` cap.
  *
  * @public
  */

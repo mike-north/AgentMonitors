@@ -108,7 +108,7 @@ process table cannot be read, or the group holds none of the processes confirmed
 
 **Exception to the bound above (the hand-off residual).** Continuity is re-established only at
 a reading. After the command's leader has exited, a group member that forks a process and exits
-between two consecutive readings (within one 250 ms interval plus one read), while no other
+between two consecutive readings (within one 250 ms interval plus one read; the read time grows under load, up to the 5 s `ps` cap), while no other
 confirmed member is alive, hands the group to a process no reading saw beside a confirmed
 member. That process, and anything it forks, cannot be told apart from unrelated work that
 reused an emptied group id, so the SIGKILL step abstains and they MAY outlive the hard upper
@@ -295,7 +295,7 @@ each grace-period reading.
 
 **Hand-off residual:** continuity is re-established only at a reading. After the leader has exited
 (before then, the read at its exit confirms every member), a member that forks and exits between
-two consecutive readings (one tracking interval plus one read), while no other
+two consecutive readings (one tracking interval plus one read, which grows under load up to the 5 s `ps` cap), while no other
 confirmed member is alive, leaves the group to a process no reading confirmed; the next step
 abstains and that process escapes the bound (§3.1's stated exception). This needs no pid reuse
 and is reproducible with ordinary processes, for example `trap '' TERM; sleep 2; sleep 30 &
