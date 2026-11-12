@@ -1278,6 +1278,29 @@ after both final table names exist. A copy, index or trigger-restoration failure
 back the complete original schema and data. Already-current/new schemas do not churn
 triggers; connection pragmas, public identities and ordering policies remain unchanged.
 
+**Columns the current schema does not define are carried, never dropped** (_current_,
+issue #569). The rebuild derives its target from the live table (`PRAGMA table_xinfo`),
+not from a fixed column list. Columns the current schema defines take their current
+definitions (§15); one the old table lacks takes its default. Every other column — one a
+released version later stopped creating (0.0.1–0.3.0's `monitor_events.event_kind`), one a
+later change adds in place, or one an operator added — is carried with its values, its
+declared type and its default. A carried column keeps `NOT NULL` only when it has a
+default, because the current writer never names it; its collation, `CHECK` and
+`REFERENCES` clauses are not reproduced. Since every column survives, every explicit
+index and trigger still resolves and is recreated from its exact stored SQL; the rebuild
+drops none. Opening any database a released version wrote therefore succeeds without
+losing an event or snapshot value.
+
+A rebuild that cannot carry a row or column stops before copying and reports a
+`SchemaMigrationError` naming the table and column, for example
+`Cannot migrate monitor_events to the current schema: column "id" has no value in a
+retained row, and the current schema requires one. The database was left unchanged.`
+This covers a generated column (its expression is not recoverable from table metadata)
+and a retained row holding `NULL` in a column the current schema requires (a released
+`id TEXT PRIMARY KEY` admits `NULL`). The schema transaction rolls back, so the database
+keeps its original schema and data; the open fails the same way until that row or column
+is repaired.
+
 Retained rows receive sequence numbers in their **current hidden rowid order**. This is
 an explicit bootstrap policy: it cannot recover chronology already lost before migration
 (for example through historical `VACUUM`) or repair previously generated diffs. Reopening
@@ -2031,6 +2054,11 @@ Corresponds to the `monitorEvents` Drizzle table. One row per materialized obser
 | `query_scope`       | TEXT NOT NULL            | JSON; defaults to `{}`                          |
 | `tags`              | TEXT NOT NULL            | JSON array; defaults to `[]`                    |
 | `created_at`        | INTEGER NOT NULL         | Observation timestamp                           |
+
+A database written before the `sequence` column existed (every released version through
+0.13.0) is rebuilt on first open. Columns the current schema does not define, such as
+0.0.1–0.3.0's `event_kind` or a column an operator added, are carried across nullable
+unless they have a default; see §5.2 for the full column, index and failure policy.
 
 ### `monitor_snapshots`
 

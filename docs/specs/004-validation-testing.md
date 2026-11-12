@@ -531,6 +531,18 @@ rebuild and trigger restoration boundaries must roll back the whole original sch
 rows, indexes, trigger definitions and metadata; tests inject real SQLite DDL rather
 than a fabricated error or public fault-injection API.
 
+`inbox/db.released-shapes.test.ts` requires opening a database in each `monitor_events` /
+`monitor_snapshots` layout a released version created (0.0.1–0.3.0 with `event_kind`,
+0.4.0–0.8.0, 0.9.0–0.13.0 with `baseline_strategy`) to succeed with every event and
+snapshot row and value intact, including an index on the legacy-only `event_kind` column
+and operator-added columns, indexes and a trigger on both tables. Each column carries a
+distinct value so a dropped or reset column fails. Indexes and triggers keep their exact
+stored SQL, the current writer can insert afterwards, and a reopen does not rebuild again.
+A carried column keeps its declared type and default and loses only a `NOT NULL` without a
+default. A rebuild that cannot complete (a generated column; a retained row with `NULL` in
+a required column) must fail with an error naming the table and column and leave the
+database's schema and rows unchanged (002 §5.2).
+
 ### Equal-time event order
 
 `runtime/event-materialization-order.test.ts` uses two genuine independent event ULID
