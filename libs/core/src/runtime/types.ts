@@ -890,6 +890,32 @@ export interface MaterializationRetryDiagnostic {
   updatedAt: Date;
 }
 
+/**
+ * Names one retained retry for an operator repair
+ * ({@link AgentMonitorRuntime.rearmMaterializationRetry},
+ * {@link AgentMonitorRuntime.skipMaterializationRetry}): the record id that
+ * retry diagnostics list, and the workspace/monitor route it belongs to. A
+ * retry of another monitor or workspace is treated as not found, so a
+ * mistyped route never repairs someone else's work. @public
+ */
+export interface MaterializationRetryRepairInput {
+  /** The monitor whose outbox holds the retry. */
+  monitorId: string;
+  /** The retry's record id, as `monitor explain` and `doctor` list it. */
+  retryId: string;
+  /** The exact workspace the retry was admitted in. */
+  workspacePath: string;
+}
+
+/** A skip names its retry like a re-arm and may say why it is given up. @public */
+export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
+  /**
+   * Optional operator note, recorded with the loss after the retry's last
+   * error. Stored as a bounded single-line diagnostic.
+   */
+  reason?: string;
+}
+
 /** Aggregate and bounded record-level diagnostics for one retry outbox. @public */
 export interface MaterializationRetrySummary {
   /** Records still eligible for automatic retry. */

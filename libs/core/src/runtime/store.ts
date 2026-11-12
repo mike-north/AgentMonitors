@@ -1249,6 +1249,77 @@ export class RuntimeStore {
   }
 
   /**
+   * Give up terminal retained work for good (002 §2.7): record its observation
+   * as an outstanding loss through {@link RuntimeStore.recordUnretainedObservation}
+   * and remove the retry row, in one immediate transaction, so the loss is
+   * never recorded without the removal or the removal without the loss.
+   *
+   * The loss is superseded like an admission drop, measured from the retry's
+   * own admission position: a later event for the same object key, including
+   * a younger retained retry that completes, clears it. A row queued before
+   * positions were reserved uses the current high-water mark instead, so only
+   * an event materialized after the skip clears it.
+   *
+   * Only a terminal row of the named workspace/monitor can be skipped; any
+   * other row, or a row that changed state after the caller read it, is
+   * rejected with nothing written.
+   *
+   * @internal
+   */
+  skipMaterializationRetry(
+    id: string,
+    route: { monitorId: string; workspacePath: string | null },
+    loss: {
+      objectKey: string | undefined;
+      observationData: Record<string, unknown>;
+    },
+  ): MaterializationRetryRecord {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const current = this.getMaterializationRetry(id);
+        if (
+          current.monitorId !== route.monitorId ||
+          current.workspacePath !== route.workspacePath
+        ) {
+          throw new MaterializationRetryNotFoundError(id);
+        }
+        if (current.status !== 'terminal') {
+          throw new MaterializationRetryTransitionError(id, 'is not terminal');
+        }
+        const admission = db
+          .select({
+            admissionSequence: materializationRetryOutbox.admissionSequence,
+          })
+          .from(materializationRetryOutbox)
+          .where(eq(materializationRetryOutbox.id, id))
+          .get();
+        this.recordUnretainedObservation({
+          monitorId: current.monitorId,
+          workspacePath: current.workspacePath,
+          sourceName: current.sourceName,
+          objectKey: loss.objectKey,
+          observationData: loss.observationData,
+          ...(admission?.admissionSequence != null
+            ? { eventWatermark: admission.admissionSequence }
+            : {}),
+        });
+        const deleted = db
+          .delete(materializationRetryOutbox)
+          .where(eq(materializationRetryOutbox.id, id))
+          .run().changes;
+        if (deleted !== 1) {
+          throw new MaterializationRetryTransitionError(
+            id,
+            'disappeared before commit',
+          );
+        }
+        return current;
+      })
+      .immediate();
+  }
+
+  /**
    * Consume pending retained work only by committing its event, projections,
    * cursor seeds and snapshot together with removal of the retry row.
    * Terminal work requires explicit re-arm. Scheduling/due selection belongs
@@ -2105,6 +2176,11 @@ export class RuntimeStore {
    * that watermark; events of later siblings and later spans, and retries
    * admitted after the drop, are above it.
    *
+   * `eventWatermark` replaces that high-water mark for an observation that
+   * was admitted earlier than this write: a skipped retry passes its own
+   * admission position, so retained work admitted after it, which carries
+   * newer state, supersedes the loss when it completes.
+   *
    * @internal
    */
   recordUnretainedObservation(input: {
@@ -2113,6 +2189,7 @@ export class RuntimeStore {
     sourceName: string;
     objectKey: string | undefined;
     observationData: Record<string, unknown>;
+    eventWatermark?: number;
   }): void {
     asInternalDb(this.db)
       .insert(observationHistory)
@@ -2125,7 +2202,9 @@ export class RuntimeStore {
         result: 'errored',
         createdAt: new Date(),
         unretainedObjectKey: input.objectKey ?? null,
-        unretainedEventWatermark: sql`(SELECT max(
+        unretainedEventWatermark:
+          input.eventWatermark ??
+          sql`(SELECT max(
           coalesce((SELECT seq FROM sqlite_sequence WHERE name = 'monitor_events'), 0),
           coalesce((SELECT max(${monitorEvents.sequence}) FROM ${monitorEvents}), 0)
         ))`,

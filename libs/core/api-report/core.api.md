@@ -41,6 +41,7 @@ export class AgentMonitorRuntime {
     openSession(input: OpenSessionInput): AgentSessionRecord;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
+    rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryDiagnostic;
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
     releaseDelivery(reservationId: string): void;
@@ -51,6 +52,7 @@ export class AgentMonitorRuntime {
         objectKey: string;
         eventIds: string[];
     }): number;
+    skipMaterializationRetry(input: MaterializationRetrySkipInput): MaterializationRetryDiagnostic;
     // (undocumented)
     status(): RuntimeStatus;
     suppressObjectEvents(input: {
@@ -686,10 +688,22 @@ export interface MaterializationRetryRecord {
 }
 
 // @public
+export interface MaterializationRetryRepairInput {
+    monitorId: string;
+    retryId: string;
+    workspacePath: string;
+}
+
+// @public
 export class MaterializationRetrySerializationError extends Error {
     constructor(path: string, reason: string);
     readonly code = "materialization_retry_serialization_failed";
     readonly path: string;
+}
+
+// @public
+export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
+    reason?: string;
 }
 
 // @public
@@ -1407,6 +1421,7 @@ export class RuntimeStore {
         sourceName: string;
         objectKey: string | undefined;
         observationData: Record<string, unknown>;
+        eventWatermark?: number;
     }): void;
     retractObjectEvents(input: {
         workspacePath?: string | null;
@@ -1456,6 +1471,14 @@ export class RuntimeStore {
         notifyState?: unknown;
         lastObservationAt?: Date | null;
     }): void;
+    // @internal
+    skipMaterializationRetry(id: string, route: {
+        monitorId: string;
+        workspacePath: string | null;
+    }, loss: {
+        objectKey: string | undefined;
+        observationData: Record<string, unknown>;
+    }): MaterializationRetryRecord;
     staleActiveSessions(workspacePath: string | null, staleBefore: Date): AgentSessionRecord[];
     // (undocumented)
     status(): RuntimeStatus;
