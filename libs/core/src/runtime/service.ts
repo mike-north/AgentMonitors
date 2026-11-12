@@ -971,6 +971,34 @@ function heldRefusalData(refusal: NotHeldObservation): {
   };
 }
 
+/**
+ * Hold refusals placed among the envelopes admission keeps (002 §2, §2.8).
+ * Dispatch counts each refusal's `emittedBefore` in the full dispatched list;
+ * once the ownership filter drops retired verify artifacts, a refusal belongs
+ * after the kept envelopes that preceded it there, and before the rest.
+ * `kept` must be `dispatched` filtered in order. The result stays
+ * non-decreasing, as `admitSpan` requires.
+ */
+function refusalsAmongKept(
+  refusals: readonly NotHeldObservation[],
+  dispatched: readonly StoredObservationEnvelope[],
+  kept: readonly StoredObservationEnvelope[],
+): readonly NotHeldObservation[] {
+  if (kept.length === dispatched.length) return refusals;
+  // keptBefore[i]: how many of dispatched[0..i) survived the filter.
+  const keptBefore = [0];
+  let next = 0;
+  for (const envelope of dispatched) {
+    if (kept[next] === envelope) next += 1;
+    keptBefore.push(next);
+  }
+  return refusals.map((refusal) => ({
+    ...refusal,
+    emittedBefore:
+      keptBefore[Math.min(refusal.emittedBefore, dispatched.length)] ?? next,
+  }));
+}
+
 /** Report how many failures were queued or recorded errored, preserving the first error. */
 function summarizeMaterializationFailures(
   failures: MaterializationFailure[],
@@ -4977,6 +5005,11 @@ export class AgentMonitorRuntime {
    * has started, later refusals are recorded after that suffix is queued: the
    * suffix's admission positions are reserved only then, and a retry of an
    * older observation must not supersede a newer loss.
+   *
+   * A refusal's `emittedBefore` counts positions in `dispatched`. Admission
+   * places it among the envelopes that survive the ownership filter instead
+   * (002 §2.8), so a dropped artifact never pushes a refusal past a newer
+   * event of its key.
    */
   private admitSpan(
     monitor: MonitorDefinition,
@@ -4994,6 +5027,7 @@ export class AgentMonitorRuntime {
       dispatched,
       (envelope) => envelope.observation.objectKey,
     );
+    const refusals = refusalsAmongKept(notHeld, dispatched, emitted);
     const materialized: MaterializedObservation[] = [];
     const failures: MaterializationFailure[] = [];
     const retention = new SuffixRetention(
@@ -5006,9 +5040,9 @@ export class AgentMonitorRuntime {
     let refusalsRecorded = 0;
     const recordRefusalsBefore = (position: number) => {
       for (
-        let refusal = notHeld[refusalsRecorded];
+        let refusal = refusals[refusalsRecorded];
         refusal !== undefined && refusal.emittedBefore <= position;
-        refusal = notHeld[++refusalsRecorded]
+        refusal = refusals[++refusalsRecorded]
       ) {
         this.recordObservationLoss(
           monitor.id,

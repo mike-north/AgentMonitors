@@ -1059,6 +1059,10 @@ export interface NotHeldObservation {
    * are the first ones of the flush, and observations held after the refusal
    * follow them. A rollup refusal is always 0: rollup refuses only when its
    * window does not fire, and then it emits nothing.
+   *
+   * The count is over the dispatched list. When admission drops retired
+   * verify artifacts from that list (002 §2.8), it re-counts the position over
+   * the envelopes it keeps.
    */
   emittedBefore: number;
 }

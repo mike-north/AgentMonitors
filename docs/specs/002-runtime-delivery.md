@@ -702,8 +702,10 @@ recorded after those held observations and before the ones held after it. It is 
 events of siblings that arrived after it. If a retained suffix began before a
 refusal's place, the refusal is recorded after that suffix is queued, so that no retry of an older
 sibling counts as later than it. A later sibling inside that suffix then does not supersede it
-either; that errs toward reporting. A drop stays _outstanding_ until it is _superseded_, and only
-these outcomes supersede it:
+either; that errs toward reporting. A refusal's place counts only the dispatched envelopes that
+survive the verify-artifact ownership filter (§2.8): a held artifact dropped at emission neither
+precedes nor follows it, so a newer event of its key still comes after it. A drop stays
+_outstanding_ until it is _superseded_, and only these outcomes supersede it:
 
 - **A drop with an object key** (the observation's `objectKey` was a string) is superseded by a
   later event of the same monitor id, in the same workspace, for exactly that object key. An event
@@ -1281,7 +1283,10 @@ registered key, for the registered monitor and workspace only, at two boundaries
    failing-source path the source's `errored` row stays the newest. A retained retry row admitted
    before authority took effect is removed from the outbox in one immediate transaction that
    re-checks authority, before the drain's terminal and backoff checks. Its removal writes no
-   event, no `errored` row and no history row: dropping it is the cleanup, not lost work.
+   event, no `errored` row and no history row: dropping it is the cleanup, not lost work. A hold
+   refusal in the same dispatch (§4.7) is placed among the envelopes that survive this filter, not
+   all dispatched ones (§2), so a dropped artifact never moves a refusal after a newer event of its
+   key.
 
 Authority has **no wall-clock expiry**, and no successful poll, empty observation or other source
 outcome retires it. Source plugins are unaware of ownership: their opaque state, baselines and
@@ -1317,7 +1322,9 @@ finite lifetime (005 §16 step 9), which does not carry this guarantee.
 Verified: `libs/core/src/runtime/verify-artifact-ownership.test.ts` (real file-fingerprint
 observations, SQLite close/reopen, an actual later-lead claim),
 `libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts` (retained retries dropped on
-the tick and watcher drains, including a terminal one, with exactness controls) and
+the tick and watcher drains, including a terminal one, with exactness controls),
+`libs/core/src/runtime/verify-artifact-ownership-refusal-position.test.ts` (a hold refusal behind a
+dropped artifact keeps its place among the kept envelopes, with an unfiltered control) and
 `libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in
 `libs/core/src/inbox/schema.ts` (`verify_artifacts`).
 
