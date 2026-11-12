@@ -557,6 +557,11 @@ const PATCHED_MINIMUMS = [
   { package: 'fast-uri', minVersion: '3.1.9' },
   // hono via MCP — GHSA-5r4p-p66f-jhc7, patched >=4.13.11
   { package: 'hono', minVersion: '4.13.11' },
+  // @hono/node-server via @modelcontextprotocol/sdk (apps/cli) — moderate
+  // GHSA-frvp-7c67-39w9 (patched >=1.19.15) and GHSA-rmxm-3fg6-px4f
+  // (patched >=2.1.3). The SDK's declared range `^1.19.9 || ^2.0.5`
+  // already admits the patched 2.x line, so external installs get it too.
+  { package: '@hono/node-server', minVersion: '2.1.3' },
   // next — GHSA-2464-fhr4-w9xw, GHSA-p3m5-59mp-jv5r,
   // GHSA-673q-mjm6-r5xr, patched >=16.4.1
   { package: 'next', minVersion: '16.4.1' },
@@ -568,7 +573,7 @@ const PATCHED_MINIMUMS = [
   { package: 'sharp', minVersion: '0.35.5' },
 ];
 
-describe('resolved dependency versions clear known high-severity advisories (lockfile regression)', () => {
+describe('resolved dependency versions clear known advisories (lockfile regression)', () => {
   for (const { package: pkg, minVersion } of PATCHED_MINIMUMS) {
     it(`${pkg} resolves to >= ${minVersion} everywhere in the workspace lockfile`, () => {
       const versions = resolvedVersions(pkg);
@@ -661,6 +666,41 @@ describe('resolved dependency versions clear known high-severity advisories on t
 // These experiments are independent npm projects. Root workspace overrides
 // cannot protect them; each committed npm lock must select the patched code.
 // Selected packages are checked throughout the lock, including development paths.
+// Minimums every experiment shares through its MCP SDK dependency.
+const EXPERIMENT_SHARED_MINIMUMS: readonly (readonly [string, string])[] = [
+  ['@modelcontextprotocol/sdk', '1.32.0'],
+  ['fast-uri', '3.1.9'],
+  ['body-parser', '2.4.0'],
+  ['proxy-addr', '2.0.8'],
+  ['hono', '4.13.11'],
+  ['ip-address', '10.7.4'],
+  // GHSA-frvp-7c67-39w9 (patched >=1.19.15) and GHSA-rmxm-3fg6-px4f
+  // (patched >=2.1.3). The SDK accepts `^1.19.9 || ^2.0.5`, so the patched
+  // 2.x line is inside its declared range.
+  ['@hono/node-server', '2.1.3'],
+];
+
+// Minimums that apply only where the experiment's own development tooling
+// resolves the package (host-probe runs its tests with vitest).
+const EXPERIMENT_EXTRA_MINIMUMS: Readonly<
+  Record<string, readonly (readonly [string, string])[]>
+> = {
+  'host-probe': [
+    // vitest's vite line: GHSA-698v-4r3x-3vcv, GHSA-r825-w8mm-5pxw,
+    // GHSA-587h-7wmj-h5pm, GHSA-9jrq-w75r-8gcw, GHSA-rq7h-c2jc-7f22
+    // (affected 8.0.0 - 8.1.5).
+    ['vite', '8.1.6'],
+    // GHSA-68fv-2mgg-jv7q, patched >=1.2.2.
+    ['source-map-js', '1.2.2'],
+    // GHSA-28wg-ghj8-5hjv, GHSA-2v37-7h3g-55p8, patched >=3.3.18.
+    ['nanoid', '3.3.18'],
+    // GHSA-82fw-gwwq-j7x9, GHSA-qxg6-89mg-rqv8 (affected <=4.1.11).
+    ['@vitest/mocker', '4.1.12'],
+    // GHSA-fxqj-rqcc-2cmp (affected <=8.5.22), patched >=8.5.23.
+    ['postcss', '8.5.23'],
+  ],
+};
+
 describe('standalone experiment security resolutions', () => {
   for (const experiment of ['channel-probe', 'channel-uat', 'host-probe']) {
     it(`${experiment} resolves patched dependencies throughout its lockfile`, () => {
@@ -693,12 +733,8 @@ describe('standalone experiment security resolutions', () => {
         `${experiment}: packages must not be an array`,
       ).toBe(false);
       for (const [pkg, minimum] of [
-        ['@modelcontextprotocol/sdk', '1.32.0'],
-        ['fast-uri', '3.1.9'],
-        ['body-parser', '2.4.0'],
-        ['proxy-addr', '2.0.8'],
-        ['hono', '4.13.11'],
-        ['ip-address', '10.7.4'],
+        ...EXPERIMENT_SHARED_MINIMUMS,
+        ...(EXPERIMENT_EXTRA_MINIMUMS[experiment] ?? []),
       ]) {
         const versions: string[] = Object.entries(lock.packages)
           .filter(([key]) => key.endsWith(`node_modules/${pkg}`))
