@@ -17,10 +17,17 @@ is the live child handle while Node holds the child unreaped, a recorded `(pid, 
 read from `/proc` on Linux or `/bin/ps` on macOS, and process-group continuity: a group id cannot be
 reused while any member exists, so a membership reading that started while the leader was unreaped,
 started at the leader's exit, or still contains an earlier-confirmed member confirms every member it
-lists. This keeps 008 §3.1's bound for group-resident descendants, including ones forked after the
-SIGTERM step; the step abstains only when continuity is lost (a possibly reused group id) or the
-process table cannot be read. §3.1 now states the latency the verification reads add to each step,
-and §5.1 states the residual as the duration of the read. The Linux reader treats only ENOENT/ESRCH
+lists. On request (`trackMembership`, used by the command-poll SIGTERM step) the gate also reads
+the group's membership every 250 ms through the grace period, one read at a time, until the next
+step, so a member that forks a process and later exits passes continuity to it. This keeps 008
+§3.1's bound for group-resident descendants, including ones forked after the SIGTERM step by the
+leader or handed off between members during the grace period. The step abstains only when
+continuity is lost or the process table cannot be read. Lost continuity has two causes the gate
+cannot tell apart: the group emptied and its id was reused, or, after the leader has exited, a
+member forked and exited within one reading interval while no other confirmed member was alive. The
+second leaves a real descendant running, so §3.1 keeps its MUST and adds it as a stated exception
+(the hand-off residual), and §5.1 names it beside the read-duration residual. §3.1 also states the
+latency the verification reads add to each step. The Linux reader treats only ENOENT/ESRCH
 as an exited process; any other read error makes the reading unsupported. Environment-variable marks
 were rejected because macOS hides the environment of platform binaries. Adds the live signal-send
 inventory (§5.2) and records the interim abstention surface: a warning line on the daemon's stderr.
