@@ -479,6 +479,14 @@ When a previously seen file's hash changes, the source emits one `Observation` p
 - `snapshot`: `{ filePath, previousHash, currentHash }`
 - `snapshotText`: file content as UTF-8 string, **only if the file contains no null bytes** (`!content.includes(0)` where `content` is a `Buffer`)
 
+The fingerprint, binary classification and textual snapshot MUST use the same byte sample.
+The source checks file identity, size and nanosecond modification/change timestamps before and
+after reading. A detected change or a byte-count mismatch fails the entire observation without
+advancing its checkpoint; the next scheduled call uses the prior baseline. There is no internal
+retry or settling timer. A stable empty or partial file is legitimate input: this check cannot
+infer a writer's future intent, and does not promise atomicity against undetectable concurrent
+writes. Verified: `plugins/source-file-fingerprint/src/read-consistency.test.ts`.
+
 ### 3.3 Change kinds
 
 After the baseline run, the source classifies every observed transition and sets the observation's

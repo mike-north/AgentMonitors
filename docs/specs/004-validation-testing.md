@@ -813,7 +813,12 @@ owned child, with an isolated on-disk SQLite database, Unix socket and loopback 
 The poll fixture uses bundled `api-poll`. The watch fixture adds a **test-only** `fs.watch`
 wrapper around bundled `file-fingerprint.observe()` and exercises the runtime's actual
 watch ingestion; this does not claim shipped file-source watch support (003 §3.8 remains
-target).
+target). Each fixture watch round waits for both a native notification and the parent's
+completed file write before sampling; repeated callbacks do not create additional rounds.
+A flush requests a state-only pull over IPC and never rewrites the input file. This isolates
+runtime interruption from concurrent input mutation without claiming shipped watch settling.
+Deterministic source-level read-race tests separately require checkpoint/snapshot consistency
+and refusal of detected concurrent writes (003 §3.2).
 
 For immediate, debounce and rollup pacing, tests MUST interrupt every SQL write occurrence
 observed during acceptance, held release, retry admission and retry completion. Immediate

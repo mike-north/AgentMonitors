@@ -90,6 +90,10 @@ Database.prototype.prepare = function (sql) {
  * Bundled file-fingerprint is observe-only today (003 §3.8). This test-only
  * wrapper adds an actual fs.watch wakeup and delegates every batch to its real
  * observe implementation, carrying the yielded checkpoint to the next pull.
+ * A fixture round is one completed input write (or a state-only flush). Native
+ * callbacks wake that round, but cannot sample its writer mid-truncate or turn
+ * duplicate notifications into additional input. File-read races have separate
+ * source-level coverage; these rounds isolate durable runtime admission.
  * It exercises runtime watch ingestion without claiming shipped source support.
  */
 function fileWatcher(source, config, context) {
@@ -97,12 +101,29 @@ function fileWatcher(source, config, context) {
     let pending = true;
     let wake;
     let previousState = context.previousState;
-    let first = true;
     let yieldedRound = -1;
     const watcher = watch(path.join(config.cwd, 'watched.txt'), () => {
       pending = true;
       wake?.();
     });
+    // A completed write is an event barrier, not a debounce timer. Flushes
+    // explicitly request a state-only pull without rewriting the source file.
+    const written = (value) => {
+      if (value.round !== undefined) pending = false;
+      if (value.writtenRound !== undefined) {
+        if (control.flush) pending = true;
+        wake?.();
+      }
+    };
+    process.on('message', written);
+    const ready = () => {
+      const round = control.round ?? 0;
+      return (
+        pending &&
+        round !== yieldedRound &&
+        round === (control.writtenRound ?? 0)
+      );
+    };
     const abort = () => {
       watcher.close();
       wake?.();
@@ -110,11 +131,12 @@ function fileWatcher(source, config, context) {
     context.signal.addEventListener('abort', abort, { once: true });
     try {
       while (!context.signal.aborted) {
-        if (!pending)
+        while (!ready() && !context.signal.aborted) {
           await new Promise((resolve) => {
             wake = resolve;
           });
-        wake = undefined;
+          wake = undefined;
+        }
         if (context.signal.aborted) return;
         pending = false;
         const batch = await source.observe(config, {
@@ -123,14 +145,7 @@ function fileWatcher(source, config, context) {
           previousState,
         });
         const round = control.round ?? 0;
-        if (
-          !first &&
-          batch.observations.length === 0 &&
-          (!control.flush || round === yieldedRound)
-        )
-          continue;
         yieldedRound = round;
-        first = false;
         yield batch;
         previousState = batch.nextState;
         process.send?.({
@@ -143,6 +158,7 @@ function fileWatcher(source, config, context) {
       }
     } finally {
       context.signal.removeEventListener('abort', abort);
+      process.off('message', written);
       watcher.close();
     }
   })();

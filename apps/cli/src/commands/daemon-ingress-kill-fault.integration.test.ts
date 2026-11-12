@@ -256,7 +256,11 @@ async function fixture(source: Source, policy: Policy) {
   ) => {
     const currentRound = ++round;
     await control(owned, { now, flush, round: currentRound });
-    writeFileSync(watched, body);
+    // Native callbacks may arrive between truncate and write on Linux. One
+    // round represents a completed input, with completion ordered by IPC;
+    // flush-only rounds never manufacture another filesystem transition.
+    if (!flush) writeFileSync(watched, body);
+    await control(owned, { writtenRound: currentRound });
     return message(
       owned,
       (value) =>

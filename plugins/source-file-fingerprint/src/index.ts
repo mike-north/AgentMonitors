@@ -1,3 +1,8 @@
+/**
+ * Polling file observations compare source-owned content fingerprints. Each
+ * accepted hash and textual snapshot describes one validated byte sample;
+ * notification pacing and recipient delivery remain runtime responsibilities.
+ */
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -78,9 +83,30 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
   return { globs, ignore, cwd };
 }
 
-async function hashFile(filePath: string): Promise<string> {
+/**
+ * Sample once so a concurrent save cannot pair one version's checkpoint with
+ * another version's snapshot. Metadata changes or replacement during the read
+ * refuse the whole observation; the runtime keeps its prior source checkpoint.
+ * This is a consistency check, not a writer-completion protocol: a stable empty
+ * or partial file is still valid input, and no settling delay or retry is added.
+ */
+async function sampleFile(
+  filePath: string,
+): Promise<{ hash: string; content: Buffer }> {
+  const before = await stat(filePath, { bigint: true });
   const content = await readFile(filePath);
-  return createHash('sha256').update(content).digest('hex');
+  const after = await stat(filePath, { bigint: true });
+  if (
+    before.dev !== after.dev ||
+    before.ino !== after.ino ||
+    before.size !== after.size ||
+    before.mtimeNs !== after.mtimeNs ||
+    before.ctimeNs !== after.ctimeNs ||
+    BigInt(content.length) !== after.size
+  ) {
+    throw new Error(`File changed while reading: ${filePath}`);
+  }
+  return { hash: createHash('sha256').update(content).digest('hex'), content };
 }
 
 /**
@@ -119,9 +145,9 @@ async function fileExists(filePath: string): Promise<boolean> {
  * `lstat`-based, so a symlink whose target is a directory still reports as a
  * symlink (not a directory) and passes the filter unfiltered. `stat` (unlike
  * `lstat`) follows the symlink to its real target, so a matched entry that is
- * really a directory is caught here before `hashFile` would `readFile` it and
+ * really a directory is caught here before `sampleFile` would `readFile` it and
  * crash with `EISDIR` (issue #377). A path that vanished between glob and
- * this check is treated as "not a directory" — `hashFile` will surface the
+ * this check is treated as "not a directory" — `sampleFile` will surface the
  * more specific error for that race.
  */
 async function isDirectory(filePath: string): Promise<boolean> {
@@ -145,15 +171,15 @@ const CHANGE_TITLES: Record<ChangeKind, string> = {
 
 /**
  * Build an observation for a file that is present now (created or modified).
- * Reads the file for a textual snapshot when it is not binary.
+ * Uses the same sampled bytes as the checkpoint; binary samples omit text.
  */
-async function buildPresentObservation(
+function buildPresentObservation(
   filePath: string,
   changeKind: 'created' | 'modified',
   currentHash: string,
+  content: Buffer,
   previousHash?: string,
-): Promise<Observation> {
-  const content = await readFile(filePath);
+): Observation {
   const summary = `${CHANGE_TITLES[changeKind]}: ${filePath}`;
   const hashes =
     previousHash !== undefined
@@ -365,25 +391,18 @@ const source: ObservationSource = {
         if (ignoredFiles.has(filePath)) continue;
         if (currentHashes.has(filePath)) continue;
         if (await isDirectory(filePath)) continue;
-        currentHashes.set(filePath, await hashFile(filePath));
-      }
-    }
-
-    // Present files: created (new since baseline) or modified (hash changed).
-    for (const [filePath, hash] of currentHashes) {
-      nextFingerprints[filePath] = hash;
-      if (isBaseline) continue;
-      const previousHash = previous.fingerprints[filePath];
-      if (previousHash === undefined) {
+        const { hash, content } = await sampleFile(filePath);
+        currentHashes.set(filePath, hash);
+        nextFingerprints[filePath] = hash;
+        if (isBaseline) continue;
+        const previousHash = previous.fingerprints[filePath];
+        if (previousHash === hash) continue;
         observations.push(
-          await buildPresentObservation(filePath, 'created', hash),
-        );
-      } else if (previousHash !== hash) {
-        observations.push(
-          await buildPresentObservation(
+          buildPresentObservation(
             filePath,
-            'modified',
+            previousHash === undefined ? 'created' : 'modified',
             hash,
+            content,
             previousHash,
           ),
         );
