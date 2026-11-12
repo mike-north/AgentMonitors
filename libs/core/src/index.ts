@@ -42,6 +42,35 @@ export type {
 export { scanMonitors } from './parser/scan-monitors.js';
 export type { ScanResult, DuplicateMonitorId } from './parser/scan-monitors.js';
 
+// Identity-verified cleanup signals (008 §5): the one gate every cleanup or
+// enforcement signal passes through, shared by the CLI and source plugins so
+// none of them signals a stored pid/pgid without re-verifying it.
+export {
+  describeSignalAbstention,
+  isChildUnreaped,
+  reportSignalAbstention,
+  sendVerifiedSignal,
+  spawnedProcessGroup,
+} from './process/process-identity.js';
+export type {
+  ChildProcessHandle,
+  GroupMembershipTracking,
+  IdentityEvidence,
+  RecordedProcessTarget,
+  SignalAbstention,
+  SignalOutcome,
+  SignalTarget,
+  SpawnedProcessGroupTarget,
+  SpawnedProcessTarget,
+  VerifiedSignalOptions,
+} from './process/process-identity.js';
+export { readProcessTable } from './process/process-table.js';
+export type {
+  ProcessIdentityRecord,
+  ProcessTableReader,
+  ProcessTableReading,
+} from './process/process-table.js';
+
 // Local-data permission model (issue #292): owner-only enforcement shared by
 // core persistence and the CLI's socket/lock/coordination artifacts, so the
 // thin CLI (AP6) does not invent its own permission logic.
