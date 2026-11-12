@@ -357,7 +357,15 @@ it('a deferred result carrying an unserializable observation is refused at hold 
           JSON.stringify(row.observationData).includes('was not held'),
       )
       .map((row) => row.observationData),
-  ).toEqual([{ error: recovery.erroredObservations[0]?.message }]);
+  ).toEqual([
+    // A refusal is a drop (002 §2, #575): its row names the lost observation.
+    {
+      error: recovery.erroredObservations[0]?.message,
+      holdRefused: true,
+      objectKey: 'bad',
+      title: 'Bad',
+    },
+  ]);
 });
 
 /**

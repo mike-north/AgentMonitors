@@ -681,8 +681,25 @@ for replay. No ingest path drops an observation silently. The tick result's
 `erroredObservations` and the watcher's `onError` report the failure. `monitor history` lists the
 committed `errored` row.
 
-A dropped observation **MUST NOT** be less visible than a retained one. A drop stays
-_outstanding_ until it is _superseded_, and only these outcomes supersede it:
+A dropped observation **MUST NOT** be less visible than a retained one. One rule covers every
+observation the runtime could not keep, so every kind of loss is a _drop_ with the same identity:
+
+- an observation the outbox could not retain (above), whose row's error ends in
+  `Not retained for retry: <reason>`; and
+- an observation a debounce or rollup hold refused because it cannot be serialized (§4.7), whose
+  row's error is the refusal's own message.
+
+Both rows are written by one recording function (`RuntimeStore.recordObservationLoss()`,
+internal), inside the admitting span's transaction, with the same drop identity (see
+[`observation_history`](#observation_history)). Each row is written at the lost observation's
+place in the span's order. An outbox drop is recorded where its materialization failed. A refusal
+is recorded after the dispatched events of observations older than it: held work flushed in the
+same dispatch and siblings that arrived before it and went straight to materialization. It is
+recorded before the events of siblings that arrived after it. If a retained suffix began before a
+refusal's place, the refusal is recorded after that suffix is queued, so that no retry of an older
+sibling counts as later than it. A later sibling inside that suffix then does not supersede it
+either; that errs toward reporting. A drop stays _outstanding_ until it is _superseded_, and only
+these outcomes supersede it:
 
 - **A drop with an object key** (the observation's `objectKey` was a string) is superseded by a
   later event of the same monitor id, in the same workspace, for exactly that object key. An event
@@ -701,8 +718,13 @@ _outstanding_ until it is _superseded_, and only these outcomes supersede it:
   from the original observation, so it cannot order events against the drop.
 - **A drop without an object key** is superseded by a later span of the same monitor in the same
   workspace that materializes at least one event and drops nothing: a later `triggered` batch row
-  whose `notRetainedCount` is absent or zero, ordered after the drop row by `(created_at, id)`. The
-  dropping span's own batch row carries its count, so it never supersedes its own drops.
+  whose `notRetainedCount` and `notHeld` are both absent or zero, ordered after the drop row by
+  `(created_at, id)`. The dropping span's own batch row carries its counts, so it never supersedes
+  its own drops.
+
+Held work counts when it is flushed, because a hold does not reserve a materialization position.
+An observation held before a drop and flushed after it therefore supersedes a drop of the same
+key.
 
 Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
 rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
@@ -712,8 +734,8 @@ outstanding:
 
 - `explainMonitor`'s materialization stage is `failure` (§10.7), so its verdict fails;
 - `doctorReport` attaches `unretainedObservationLoss` to that monitor's rollup: the outstanding
-  count and the newest outstanding drop's time, error, position, span size, `objectKey` and
-  `title`. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
+  count, across both kinds, and the newest outstanding drop's time, error, position, span size,
+  `objectKey` and `title`. A refusal records no position or span size. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
   per-monitor rollup).
 - When the monitor has no one unambiguous parsed definition (its definition was removed, fails to
   parse, or its id is duplicated), the loss goes to that id's entry in `orphanedMonitorWork`
@@ -1551,8 +1573,8 @@ ordered suffix for retry, or recorded as a drop when the outbox cannot retain it
 all-or-nothing: if any held envelope cannot materialize, the whole drain rolls back, the holds stay
 held and the gate stays closed, and it records no drop and queues no retry. Work blocked at a closed
 gate (a waiting batch or a retained poll result) has not been admitted, so it records neither. A
-drop is a history outcome, never held work, so it neither keeps the gate closed nor is drained by an
-edit. An outstanding drop stays outstanding across an edit unless the drain materializes an event
+drop, including a hold refusal (§4.7), is a history outcome, never held work, so it neither keeps
+the gate closed nor is drained by an edit. An outstanding drop stays outstanding across an edit unless the drain materializes an event
 that supersedes it under the §2 rule.
 Reconciliation can resume it without reloading the live source. Its reconciled pacing and
 urgency band govern future yields; its established execution/handling snapshot remains until an
@@ -1621,7 +1643,7 @@ read reconciliation. Child probes load the same TypeScript source without invoki
 
 ### 4.7 Held-work serializability (_current_)
 
-> **Status: current.** Refs #570.
+> **Status: current.** Refs #570, #575.
 
 Debounce (§4.3) and rollup (§4.4) holds persist their observation envelopes as JSON in
 `monitor_state.notify_state`. An envelope that JSON cannot encode, such as a payload holding a
@@ -1650,10 +1672,10 @@ An observation that fails the check is **not held**:
 2. The span's admission transaction (§2) proceeds. Its state write advances the source baseline
    past the batch, so the observation is not observed again, including after a restart, and later
    observations are accepted on following ticks.
-3. It gets one `errored` `observation_history` row, written inside that same admission
-   transaction, before the span's batch row. If the transaction rolls back, the row, the state and
-   every sibling's outcome roll back together, and the batch is decided again from the prior
-   baseline. The row's `observationData.error` is
+3. It is a drop (§2): it gets one `errored` `observation_history` row with the drop identity,
+   written inside that same admission transaction, before the span's batch row. If the
+   transaction rolls back, the row, the state and every sibling's outcome roll back together, and
+   the batch is decided again from the prior baseline. The row's `observationData.error` is
    `Observation "<title>" was not held for <debounce|rollup>: it cannot be serialized (<reason>).`
    The title and reason are each reduced to one terminal-safe line. The title is capped at 200 code
    points and the reason at 512. The stored row and JSON history keep the whole message; history and
@@ -1677,9 +1699,16 @@ the rest of the span: a span that also emitted carries both counts, for example
 `triggered { observed: 3, emitted: 1, notRetainedCount: 1, notHeld: 1 }`, and a span whose
 dispatched observations all failed writes no batch row.
 
-A refusal is **not** a drop (§2 "Admission outcomes when the outbox cannot retain a suffix"). It
-is decided before materialization, never reaches the retry outbox, and its row carries no drop
-identity. Doctor and explain do not count it as outstanding unretained loss.
+A refusal **is** a drop. It is decided before materialization and never reaches the retry outbox,
+but the observation is lost all the same. So it follows the one loss rule of §2: it has the same
+drop identity as an observation the outbox could not retain, and doctor and explain count it as
+outstanding until it is superseded. With an object key, that means a later event of the same key.
+Without one, it means a later span that materializes an event and drops nothing. Quiet ticks,
+holds and restarts do not clear it. The batch row keeps `notHeld` apart from `notRetainedCount`
+because the two have different causes and remedies: a payload that cannot be serialized, versus
+an outbox that cannot take the suffix. A positive value of either means the span dropped
+observations, so that row supersedes no drop. Refusals recorded before this rule existed have no
+drop identity and stay one-time reports; no migration can supply the watermark they lacked.
 
 Hold acceptance applies only where an observation would be held. An observation that goes straight
 to materialization is never checked here: immediate, throttle, an escalation that flushes a
@@ -1710,13 +1739,21 @@ row's `notHeld` count; title sanitization and the 200-code-point title cap; a re
 hold's `dueAt` unchanged; a `toJSON` that throws an unconvertible value; a watcher `onError` that
 throws while a due batch flushes; a deferred poll result admitted after a notify edit
 (`runtime/notify-deferred-handoff.test.ts`); a span that mixes a refusal, an admitted observation
-and a drop, counted once each in the batch row, with the drop alone outstanding; a span whose
+and a drop, counted once each in the batch row, with both losses outstanding; a span whose
 admission rolls back reporting and recording no refusal, then refusing once on the retry; a refusal
 row that cannot be written rolling its span back; a refusal leaving the admission gate open for a
 running watcher when a later definition is rejected
 (`runtime/edit-drain-admission-outcomes.test.ts`); the built
 CLI's `monitor history` showing the reason of a long-titled refusal; and JSON-encodable payloads
-(`undefined` members, Dates) still being held.
+(`undefined` members, Dates) still being held. `runtime/hold-refusal-loss.test.ts` covers the
+refusal as outstanding loss. For a debounce and a rollup refusal, each with and without an object
+key, doctor and explain keep reporting it through quiet ticks, a hold, newer history rows and a
+restart. The keyed refusal also survives a flush of other keys, and each is cleared only by
+supersession. It also covers: a span that materializes but refuses again, which does not clear an
+unkeyed refusal; earlier and later siblings of the same key in the refusing span; and a retry of an
+older sibling queued in that span, which does not supersede it. Through the built CLI,
+`apps/cli/src/retry-diagnostics.test.ts` covers doctor and explain reporting a refusal, in text and
+JSON.
 
 ## 5. Event Materialization
 
@@ -2426,17 +2463,20 @@ verdict without removing this observation-stage diagnostic. Verified: `source-er
 and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
 
 While the monitor has an outstanding dropped observation (§2, "Admission outcomes when the outbox
-cannot retain a suffix"), the materialization stage is `failure` with reason
-`<count> observation(s) were dropped because the retry outbox could not retain them; the newest,
-<which>, failed: <displayed error>`. `<which>` is `observation <position> of <spanSize>`, followed
-by `(<objectKey>, "<title>")` with whichever of the two were recorded; the error uses the display
-rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
+cannot retain a suffix"; an observation a hold refused, §4.7, is one too), the materialization
+stage is `failure` with reason
+`<count> observation(s) were dropped because the runtime could not keep them; the newest,
+<which>, failed: <displayed error>`. The count covers both kinds of drop, and the error says which
+kind the newest was. `<which>` is `observation <position> of <spanSize>` (or `an observation` when
+no position was recorded, as for a refusal), followed by `(<objectKey>, "<title>")` with whichever
+of the two were recorded; the error uses the display rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
 retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
 `failure` until every drop is superseded (§2): a quiet tick, a notify hold, an observe failure or
 events for other keys leave it failing. The observation stage still describes the newest history
-row. Verified: `unretainable-suffix-admission.test.ts` and, through a real `daemon run` socket
-after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts` (Refs #497).
+row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
+real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
+(Refs #497, #575).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -2923,7 +2963,7 @@ This is a documented one-time transition, not a per-tick behavior.
 An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
 - `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2), and `notHeld` (a positive integer) when a hold refused some of the span's observations (§4.7).
-- `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`, plus `notHeld: <n>` when a hold refused some of the observations (§4.7). Refused observations count in `observed`, carry their own `errored` rows, and are not what makes the span `suppressed`; a span whose only observations were refused writes no batch row. A refusal is not a drop: it never sets `notRetainedCount`.
+- `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`, plus `notHeld: <n>` when a hold refused some of the observations (§4.7). Refused observations count in `observed`, carry their own `errored` drop rows, and are not what makes the span `suppressed`; a span whose only observations were refused writes no batch row. `notHeld` stays separate from `notRetainedCount` (§4.7), but either one marks a span that dropped observations, so its row supersedes no drop (§2).
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Three sub-cases:
@@ -2966,11 +3006,15 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       `pendingRollup` clear rolled back too.
 
   - A debounce or rollup hold refused an observation because it cannot be serialized (§4.7): one
-    row per refused observation, `{ error: "<message>" }`, written **inside** the span's admission
-    transaction, before the batch row. It commits with the state that advances the baseline past
-    the observation, and a span that rolls back takes the row with it. It is not a drop: it has no
-    `unretained_object_key`/`unretained_event_watermark` and is not outstanding loss. The span's
-    other observations are held, emitted or dropped as usual.
+    row per refused observation, written **inside** the span's admission transaction, before the
+    batch row. It commits with the state that advances the baseline past the observation, and a
+    span that rolls back takes the row with it. It is a drop (§2), written by the same function as
+    an unretained one, so it carries the same `unretained_object_key` and
+    `unretained_event_watermark` columns and stays outstanding until superseded. Its
+    `observationData` is `{ error, holdRefused: true, objectKey?, title? }`: `error` is the
+    refusal's whole message, and `objectKey`/`title` follow the safe-text rule above. It has no
+    `position` or `spanSize`, since a refused observation was never dispatched. The span's other
+    observations are held, emitted or dropped as usual.
 
   In every other case `observationData` is `{ error: "<message>" }`. Except for the unretained-suffix
   and hold-refusal rows, which commit with the span, the audit write is best-effort: a `recordObservationHistory`
@@ -2984,7 +3028,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.
 
-_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `admitSpan()` (in-transaction `errored` rows for unretained failures), `ingest()`'s admission transaction (hold-refusal rows, §4.7), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), the not-due rollup flush catch, and `consumeWatch()`'s outer catch (which also ends the watcher). Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
+_current_. Per-monitor isolation and the `errored` outcome are guaranteed by the runtime for both the tick loop and the watch path (issue #46). The `rebaselined` and `no-files-matched` outcomes are supported via the optional `ObservationResult.outcome` diagnostic field (issues #56 and #193). Verified: `RuntimeStore.recordObservationHistory` / `listObservationHistory`, written from `service.ts` `tick()` (observe-error and ingest-error catches), `admitSpan()` (in-transaction `errored` rows for unretained failures), `ingest()`'s admission transaction (hold-refusal rows, §4.7, written by `admitSpan()` through the same loss-recording function as unretained rows), `finishMaterializationSpan()` (per-failure `errored` rows and `sourceOutcome` classification), the not-due rollup flush catch, and `consumeWatch()`'s outer catch (which also ends the watcher). Read via `agentmonitors monitor history` ([005 §6](./005-cli-reference.md)).
 
 An observation tick always runs for one concrete workspace, so each row records
 its `workspace_path`. Workspace-scoped readers (`monitor explain`, `doctor`, and
