@@ -9,6 +9,17 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Attribute live installation writes conservatively (004 §2.13; Refs #611)
+
+Replace the unconditional-diff failure rule with a per-file exception for the same
+pre-run foreign process holding an existing regular file at both snapshots.
+Read-only process/open-file inspection must prove identity and outside lineage;
+unknown inspection stays strict. Creation/removal/replacement and unheld changes
+still fail. Diagnostics name PID, command, and files. Document the shared-held-file
+blind spot and isolation's primary role. Acceptance now reports whole inventories
+and the comparison excluding exactly those diagnosed files, without claiming the
+whole installation stayed byte-identical while its daemon was active.
+
 ## 2026-11-12 — Test suites own their filesystem roots (004 §2.13; Refs #611)
 
 Require shared default HOME/XDG/temp isolation for all maintained package/script
@@ -18,7 +29,8 @@ installation files, including absent roots and small-file content hashes, plus
 case/file/run/exit cleanup. Fixed socket fallback tests relocate their namespace
 without changing production paths. Fake-installation subprocess regressions and
 uncached full-suite installation hashes establish the validation obligation;
-concurrent external writers must be reported rather than excluded from the guard.
+the attribution refinement above supersedes this entry's original unconditional
+concurrent-writer failure rule.
 
 ## 2026-11-12 — Bundled advisory coverage follows actual build inputs (004 §2.10)
 

@@ -655,10 +655,21 @@ and compare existence, mtime, size, permissions, symlink targets, and SHA-256 co
 hashes for regular files up to 1 MiB at teardown. Default locations MUST be watched
 even when absent. This includes the legacy HOME data root, XDG/config/state/cache/
 runtime roots, macOS Library equivalents, inherited DB/socket overrides, and the
-fixed per-uid `/tmp` socket fallback (002 §10.3). A difference MUST fail the suite;
-the guard MUST never repair or remove real installation data. Concurrent external
-writers can also trigger this conservative guard; installation-preservation proof
-requires a quiet window and MUST NOT discard their changes from the comparison.
+fixed per-uid `/tmp` socket fallback (002 §10.3). Creation, removal, replacement,
+and non-file metadata changes MUST fail. An existing regular file's content or
+metadata change MAY be reported without failure only when read-only `ps`/`lsof`
+inspection proves that the same process held that file open at both snapshots,
+started before the run, and is neither the coordinator nor its descendant at either
+snapshot. PID/start identity and file device/inode MUST agree across snapshots.
+Second-resolution process start times MUST be conservatively older than the run's
+start; ambiguous birth order grants no exception. The output MUST name each PID,
+command, and exact file. An unrelated held file grants no directory-wide exception.
+Missing, failed, partial, or unreadable inspection MUST remain strict. The guard
+MUST never signal inspected processes or repair/remove installation data.
+
+This attribution is not write tracing: a test writing a file held by such a foreign
+process cannot be distinguished by the diff. HOME/XDG/TMPDIR isolation is the first
+line of protection against that path; the guard is the second line.
 
 Fixed-path socket tests MUST relocate the OS namespace at a test-only boundary;
 they may not bind, chmod, delete, or probe an installation's real fallback sockets.
@@ -674,7 +685,11 @@ same-size edits with restored mtime, and cleanup through pass/failure/timeout/
 beforeAll failure/explicit process exit. Deliberate installation mutations run in
 subprocesses with fake real roots, never against a user's installation. An acceptance
 run MUST hash every regular installation file before and after two complete suite
-runs and demonstrate byte-identical inventories; a partial test run is insufficient.
+runs. Report both whole-installation inventories and inventories excluding only
+files explicitly attributed by that run's guard diagnostics. The latter MUST be
+byte-identical to establish preservation with foreign-write exclusions; every
+excluded file and PID MUST be named. Whole-installation byte identity remains a
+separate reported outcome. A partial test run is insufficient.
 
 ## 3. Required Test Scenarios
 

@@ -6,10 +6,13 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import {
+  assertAttributedPathsUnchanged,
+  inspectOpenFiles,
+} from './attribution.mjs';
 import { installSocketNamespace } from './socket-namespace.mjs';
 import {
   applyEnvironment,
-  assertPathsUnchanged,
   createEnvironmentDirectories,
   isolatedEnvironment,
   realUserPaths,
@@ -24,6 +27,8 @@ import {
  */
 export function createTestBoundary() {
   const roots = realUserPaths(process.env);
+  const startedAt = Date.now();
+  const first = inspectOpenFiles();
   const before = snapshotPaths(roots);
   const root = mkdtempSync(
     path.join(process.platform === 'win32' ? tmpdir() : '/tmp', 'am-'),
@@ -35,7 +40,14 @@ export function createTestBoundary() {
     finished = true;
     process.removeListener('exit', onExit);
     try {
-      assertPathsUnchanged(before, snapshotPaths(roots));
+      const after = snapshotPaths(roots);
+      assertAttributedPathsUnchanged(
+        before,
+        after,
+        first,
+        inspectOpenFiles(),
+        startedAt,
+      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

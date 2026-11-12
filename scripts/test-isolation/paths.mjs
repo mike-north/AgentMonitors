@@ -175,7 +175,12 @@ export function snapshotPaths(roots) {
       }
       throw error;
     }
+    // File identity distinguishes an edit from replacing an existing directory
+    // entry; an open old inode must never authorize its replacement.
     result[file] = JSON.stringify({
+      type: stat.isFile() ? 'file' : stat.isDirectory() ? 'directory' : 'other',
+      device: String(stat.dev),
+      inode: String(stat.ino),
       mode: String(stat.mode),
       size: String(stat.size),
       mtime: String(stat.mtimeNs),
@@ -208,21 +213,4 @@ export function snapshotPaths(roots) {
   }
   for (const root of roots) visit(root);
   return result;
-}
-
-/**
- * Report every changed entry, including roots that did not previously exist.
- * Never repair or clean up real installation paths on a failing test's behalf.
- * @param {Record<string, string>} before
- * @param {Record<string, string>} after @internal
- */
-export function assertPathsUnchanged(before, after) {
-  const changed = [
-    ...new Set([...Object.keys(before), ...Object.keys(after)]),
-  ].filter((file) => before[file] !== after[file]);
-  if (changed.length) {
-    throw new Error(
-      `Real user paths changed during tests:\n${changed.join('\n')}`,
-    );
-  }
 }

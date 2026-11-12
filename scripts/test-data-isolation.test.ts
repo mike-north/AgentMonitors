@@ -3,7 +3,7 @@
  * writes to an installation. Nested suites use a fake installation, so even
  * the negative controls cannot damage a developer's files.
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import {
   existsSync,
   globSync,
@@ -18,6 +18,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { expect, it } from 'vitest';
 import { parse } from 'yaml';
@@ -53,12 +54,25 @@ function isolationConfigPaths(): string[] {
 }
 
 /** Run the real configured boundary with only owned directories as host paths. */
-async function runFixture(body: string, linked = false) {
+async function runFixture(
+  body: string,
+  linked = false,
+  options: {
+    readonly foreign?: boolean;
+    readonly unavailable?: true | 'lsof';
+  } = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), 'isolation-proof-'));
   const home = join(dir, 'real-home');
   const installation = join(home, '.local/share/agentmonitors');
   const receipt = join(dir, 'receipt.json');
   const summaryPath = join(dir, 'summary.json');
+  const trigger = join(dir, 'foreign-trigger');
+  const written = join(dir, 'foreign-written');
+  if (options.unavailable === 'lsof') {
+    mkdirSync(join(dir, 'no-tools'));
+    symlinkSync('/bin/ps', join(dir, 'no-tools/ps'));
+  }
   if (linked) {
     const target = join(dir, 'installation-target');
     mkdirSync(target, { recursive: true });
@@ -68,6 +82,7 @@ async function runFixture(body: string, linked = false) {
     mkdirSync(installation, { recursive: true });
   }
   writeFileSync(join(installation, 'existing'), 'original');
+  writeFileSync(join(installation, 'unheld'), 'original');
   // Whole-second mtime survives the Date/utimes round trip exactly, so the
   // same-size edit's rejection must rely on the small-file content hash.
   utimesSync(join(installation, 'existing'), 946_684_800, 946_684_800);
@@ -84,9 +99,56 @@ import {writeFileSync,existsSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
 const receipt=${JSON.stringify(receipt)};
 const installation=${JSON.stringify(installation)};
+const trigger=${JSON.stringify(trigger)};
+const written=${JSON.stringify(written)};
 ${body}`,
   );
+  // This leaf is a sibling of the fixture coordinator, never its descendant.
+  // IPC disconnect and spawn's hard bound stop only this owned child; it cannot
+  // spawn descendants and its exit is awaited before removing its files.
+  const foreign = options.foreign
+    ? spawn(
+        process.execPath,
+        [
+          '-e',
+          `
+const fs=require('node:fs');
+const fd=fs.openSync(${JSON.stringify(join(installation, 'existing'))},'r+');
+process.once('disconnect',()=>{fs.closeSync(fd);process.exit(0);});
+setInterval(()=>{
+  if(fs.existsSync(${JSON.stringify(trigger)})&&!fs.existsSync(${JSON.stringify(written)})){
+    fs.writeSync(fd,'external');fs.fsyncSync(fd);
+    fs.writeFileSync(${JSON.stringify(written)},'done');
+  }
+},20);
+process.send('ready');`,
+        ],
+        {
+          stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+          timeout: 20_000,
+          killSignal: 'SIGKILL',
+        },
+      )
+    : undefined;
+  const stopped = foreign
+    ? new Promise<void>((resolve, reject) => {
+        foreign.once('exit', () => resolve());
+        foreign.once('error', reject);
+      })
+    : Promise.resolve();
   try {
+    if (foreign) {
+      await new Promise<void>((resolve, reject) => {
+        foreign.once('message', () => resolve());
+        foreign.once('error', reject);
+        foreign.once('exit', () =>
+          reject(new Error('Foreign fixture exited before readiness')),
+        );
+      });
+      // ps exposes second-resolution start identity. Age past that full second
+      // before launching the coordinator, rather than guessing at its birth order.
+      await delay(1_100);
+    }
     // A threads-only Vitest fixture owns no detached processes. Node's
     // synchronous deadline bounds its one process and all worker threads;
     // the environment probe below is also synchronous and separately bounded.
@@ -115,6 +177,7 @@ ${body}`,
           XDG_RUNTIME_DIR: join(dir, 'real-runtime'),
           AGENTMONITORS_DB: join(installation, 'existing'),
           AGENTMONITORS_SOCKET: join(dir, 'real.sock'),
+          ...(options.unavailable ? { PATH: join(dir, 'no-tools') } : {}),
         },
         timeout: 15_000,
       },
@@ -123,6 +186,7 @@ ${body}`,
     return {
       ...result,
       installation,
+      foreignPid: foreign?.pid,
       // Runner metrics prove a poison case passed before teardown rejected its mutation.
       testSummary: existsSync(summaryPath)
         ? JSON.parse(readFileSync(summaryPath, 'utf8'))
@@ -132,9 +196,79 @@ ${body}`,
         : undefined,
     };
   } finally {
+    if (foreign?.connected) foreign.disconnect();
+    await stopped;
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+/** A real peer writer must be visible without being blamed on the fixture. */
+const foreignWrite = `it('foreign write',async()=>{
+  writeFileSync(trigger,'go');
+  const deadline=Date.now()+2000;
+  while(!existsSync(written)&&Date.now()<deadline) await new Promise(r=>setTimeout(r,20));
+  expect(existsSync(written)).toBe(true);
+});`;
+
+it('reports a pre-run foreign writer without failing the suite', async () => {
+  const result = await runFixture(foreignWrite, false, { foreign: true });
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+  expect(result.stdout + result.stderr).toContain('Foreign process writes');
+  // Preserve the actual nested PID/command/file diagnostic in the green receipt.
+  console.info(
+    'Fixture attribution receipt:',
+    (result.stdout + result.stderr)
+      .split('\n')
+      .find((line) => line.startsWith('Foreign process writes:')),
+  );
+  expect(result.stdout + result.stderr).toContain(`PID ${result.foreignPid}`);
+  expect(result.stdout + result.stderr).toContain(process.execPath);
+  expect(result.stdout + result.stderr).toContain(
+    result.installation + '/existing',
+  );
+}, 20_000);
+
+it('rejects new workspace entries beside a foreign-held file', async () => {
+  const result = await runFixture(
+    `import {mkdirSync} from 'node:fs';
+${foreignWrite}
+it('poison',()=>{mkdirSync(installation+'/workspaces/new',{recursive:true});writeFileSync(installation+'/workspaces/new/inbox.db','poison');});`,
+    false,
+    { foreign: true },
+  );
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('Real user paths changed');
+  expect(result.stdout + result.stderr).toContain('workspaces/new/inbox.db');
+  expect(result.testSummary.numPassedTests).toBe(2);
+}, 20_000);
+
+it('rejects an unheld edit beside a foreign-held file', async () => {
+  const result = await runFixture(
+    `${foreignWrite}
+it('poison',()=>{writeFileSync(installation+'/unheld','poison');});`,
+    false,
+    { foreign: true },
+  );
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('unheld');
+}, 20_000);
+
+it.each([true, 'lsof'] as const)(
+  'keeps the guard strict when process inspection is unavailable (%s)',
+  async (unavailable) => {
+    const result = await runFixture(
+      `it('poison',()=>writeFileSync(installation+'/existing','modified'));`,
+      false,
+      { unavailable },
+    );
+    expect(result.status, result.stdout + result.stderr).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain(
+      'Process inspection unavailable',
+    );
+    expect(result.stdout + result.stderr).toContain('existing');
+  },
+  20_000,
+);
 
 it('fails the suite when a new file appears in the real data root', async () => {
   const result = await runFixture(
