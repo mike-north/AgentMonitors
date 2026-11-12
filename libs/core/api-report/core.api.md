@@ -23,7 +23,7 @@ export class AgentMonitorRuntime {
     cancelEphemeralMonitor(sessionId: string, ephemeralId: string): EphemeralMonitorRecord;
     claimDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryClaim | null;
     // (undocumented)
-    closeSession(sessionId: string): AgentSessionRecord;
+    closeSession(sessionId: string, now?: Date): AgentSessionRecord;
     commitDelivery(reservationId: string): DeliveryClaim | null;
     declareEphemeralMonitor(input: DeclareEphemeralMonitorInput): EphemeralMonitorRecord;
     diagnoseHookDelivery(sessionId: string, lifecycle: DeliveryLifecycle): HookDeliveryDiagnosis;
@@ -37,13 +37,19 @@ export class AgentMonitorRuntime {
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
     // (undocumented)
     listSessions(): AgentSessionRecord[];
+    listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[];
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
+    registerVerifyArtifact(input: RegisterVerifyArtifactInput): VerifyArtifactRecord;
     releaseDelivery(reservationId: string): void;
+    requestVerifyArtifactCleanup(input: {
+        runId: string;
+        now?: Date;
+    }): VerifyArtifactCleanupResult;
     reserveDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryReservation | null;
     retractObjectEvents(input: {
         workspacePath?: string | null;
@@ -1264,6 +1270,16 @@ export function readBridgeState(statePath: string): HookState | null;
 export function readMonitorFileSync(filePath: string): string | undefined;
 
 // @public
+export interface RegisterVerifyArtifactInput {
+    monitorId: string;
+    now?: Date;
+    objectKey: string;
+    ownerSessionId: string;
+    runId: string;
+    workspacePath: string;
+}
+
+// @public
 export function renderArtifact(snapshot: unknown, facts: readonly DerivedFact[]): string;
 
 // @public
@@ -1317,6 +1333,8 @@ export class RuntimeStore {
     }, options?: {
         restrictToSessionId?: string;
     }): MonitorEventRecord;
+    // @internal
+    discardRetiredVerifyArtifactRetry(id: string): boolean;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
@@ -1329,6 +1347,7 @@ export class RuntimeStore {
     // (undocumented)
     getSessionById(id: string): AgentSessionRecord;
     getSessionObjectCursor(sessionId: string, monitorId: string, objectKey: string, workspacePath?: string | null): SessionObjectCursorRecord | null;
+    getVerifyArtifact(runId: string): VerifyArtifactRecord | null;
     insertEphemeralMonitor(input: {
         id: string;
         sessionId: string;
@@ -1346,6 +1365,11 @@ export class RuntimeStore {
         restrictToSessionId?: string;
     }): MonitorEventRecord;
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
+    isVerifyArtifactCleanupEffective(input: {
+        workspacePath: string;
+        monitorId: string;
+        objectKey: string;
+    }): boolean;
     // (undocumented)
     latestSnapshot(monitorId: string, objectKey: string, workspacePath?: string | null): {
         content: string;
@@ -1360,6 +1384,7 @@ export class RuntimeStore {
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
     // (undocumented)
     listSessions(): AgentSessionRecord[];
+    listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[];
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
@@ -1408,6 +1433,18 @@ export class RuntimeStore {
         objectKey: string | undefined;
         observationData: Record<string, unknown>;
     }): void;
+    recordVerifyArtifactCleanup(runId: string, cause: VerifyArtifactCleanupCause, at: Date): {
+        artifact: VerifyArtifactRecord;
+        recorded: boolean;
+    };
+    registerVerifyArtifact(input: {
+        runId: string;
+        ownerSessionId: string;
+        workspacePath: string;
+        monitorId: string;
+        objectKey: string;
+        registeredAt: Date;
+    }): VerifyArtifactRecord;
     retractObjectEvents(input: {
         workspacePath?: string | null;
         monitorId: string;
@@ -1475,6 +1512,8 @@ export class RuntimeStore {
         createdAt: Date;
         expiresAt: Date;
     }): void;
+    verifyArtifactsAwaitingCleanup(workspacePath: string): VerifyArtifactRecord[];
+    verifyArtifactsAwaitingCleanupForOwner(ownerSessionId: string): VerifyArtifactRecord[];
 }
 
 // @public
@@ -1694,6 +1733,27 @@ export function validateScope(scope: Record<string, unknown>, scopeSchema: JsonS
 
 // @public
 export function validateWatchScope(scope: Record<string, unknown>, scopeSchema: JsonSchema): string[];
+
+// @public
+export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';
+
+// @public
+export interface VerifyArtifactCleanupResult {
+    artifact: VerifyArtifactRecord;
+    retractedEventCount: number;
+}
+
+// @public
+export interface VerifyArtifactRecord {
+    cleanupCause: VerifyArtifactCleanupCause | null;
+    cleanupRequestedAt: Date | null;
+    monitorId: string;
+    objectKey: string;
+    ownerSessionId: string;
+    registeredAt: Date;
+    runId: string;
+    workspacePath: string;
+}
 
 // @public
 export interface WatchHandle {

@@ -60,6 +60,7 @@ import {
   observationHistory,
   sessionEventState,
   sessionObjectCursor,
+  verifyArtifacts,
 } from '../inbox/schema.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import { registerRuntimeTransaction } from './runtime-transaction.js';
@@ -83,6 +84,8 @@ import type {
   SessionHookState,
   SessionObjectCursorRecord,
   UnretainedObservationLoss,
+  VerifyArtifactCleanupCause,
+  VerifyArtifactRecord,
 } from './types.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
@@ -98,6 +101,7 @@ import {
   serializeRetryEnvelope,
 } from './retry-envelope.js';
 import { registerStoreWriter } from './store-writer.js';
+import { isVerifyScratchObjectKey } from './verify-scratch-key.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -181,6 +185,21 @@ function rowToEphemeralMonitor(
   };
 }
 
+function rowToVerifyArtifact(
+  row: typeof verifyArtifacts.$inferSelect,
+): VerifyArtifactRecord {
+  return {
+    runId: row.runId,
+    ownerSessionId: row.ownerSessionId,
+    workspacePath: row.workspacePath,
+    monitorId: row.monitorId,
+    objectKey: row.objectKey,
+    registeredAt: row.registeredAt,
+    cleanupRequestedAt: row.cleanupRequestedAt ?? null,
+    cleanupCause: row.cleanupCause ?? null,
+  };
+}
+
 function rowToMaterializationRetry(
   row: typeof materializationRetryOutbox.$inferSelect,
 ): MaterializationRetryRecord {
@@ -260,6 +279,23 @@ export class MaterializationRetryTransitionError extends Error {
     super(`Materialization retry record ${reason}: ${retryId}`);
     this.name = 'MaterializationRetryTransitionError';
     this.retryId = retryId;
+  }
+}
+
+/**
+ * Retry completion refused because the retained observation is a verify
+ * artifact whose cleanup authority is in effect (002 §2.8, issue #562). The
+ * check runs inside completion's own writer lock, so authority recorded by
+ * another writer after the caller decided to complete is still honored. Like
+ * every transition rejection, nothing was written: the row stays in the
+ * outbox for the drain to discard on its next read.
+ *
+ * @internal
+ */
+export class RetiredVerifyArtifactRetryError extends MaterializationRetryTransitionError {
+  constructor(retryId: string) {
+    super(retryId, 'is a verify artifact whose cleanup authority is in effect');
+    this.name = 'RetiredVerifyArtifactRetryError';
   }
 }
 
@@ -1249,6 +1285,75 @@ export class RuntimeStore {
   }
 
   /**
+   * Remove retained work whose observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8, issue #562). Such a row was admitted before
+   * authority took effect; materializing it now would deliver the run's scratch
+   * work to a later session. Authority is re-checked inside the same immediate
+   * transaction as the delete, so the decision and the removal commit together.
+   * The row is removed whatever its status — pending, backing off or terminal —
+   * and nothing is recorded in its place: no event, no history row, no loss
+   * record. Dropping it is the cleanup the owner asked for, not lost work.
+   *
+   * Returns `true` when the row was removed. `false` means the row is gone or
+   * its observation has no cleanup authority now, and it is left untouched.
+   * Authority can lapse: an owner's inactivity is derived, not recorded, until
+   * cleanup reconciliation records it, and reopening the owner session makes
+   * it active again. So `false` tells the caller only to re-read the outbox.
+   *
+   * @internal
+   */
+  discardRetiredVerifyArtifactRetry(id: string): boolean {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const current = db
+          .select()
+          .from(materializationRetryOutbox)
+          .where(eq(materializationRetryOutbox.id, id))
+          .get();
+        if (
+          current === undefined ||
+          !this.isRetiredVerifyArtifactRetry(rowToMaterializationRetry(current))
+        ) {
+          return false;
+        }
+        return (
+          db
+            .delete(materializationRetryOutbox)
+            .where(eq(materializationRetryOutbox.id, id))
+            .run().changes === 1
+        );
+      })
+      .immediate();
+  }
+
+  /**
+   * Whether a retained row's observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8). It is the predicate the runtime's drain
+   * filter applies to the row: a row with no workspace, or an observation with
+   * no object key, has no artifact to retire, and neither does a key that is
+   * not a verify scratch key. The predicate itself excludes such keys, so a
+   * registration of one through {@link RuntimeStore.registerVerifyArtifact}
+   * has no effect on retained retries. Callers evaluate it inside their own
+   * immediate transaction, so the answer and their write commit together.
+   */
+  private isRetiredVerifyArtifactRetry(
+    retry: MaterializationRetryRecord,
+  ): boolean {
+    const { objectKey } = retry.envelope.observation;
+    return (
+      retry.workspacePath !== null &&
+      objectKey !== undefined &&
+      isVerifyScratchObjectKey(objectKey) &&
+      this.isVerifyArtifactCleanupEffective({
+        workspacePath: retry.workspacePath,
+        monitorId: retry.monitorId,
+        objectKey,
+      })
+    );
+  }
+
+  /**
    * Consume pending retained work only by committing its event, projections,
    * cursor seeds and snapshot together with removal of the retry row.
    * Terminal work requires explicit re-arm. Scheduling/due selection belongs
@@ -1265,6 +1370,11 @@ export class RuntimeStore {
    * remains the runtime's responsibility. This seam accepts event data, never
    * a callback: arbitrary asynchronous effects cannot be rolled back by SQLite.
    * Interpret and other external work belong after this method returns.
+   *
+   * Cleanup authority is re-checked under the same writer lock as the write:
+   * a retained verify artifact whose authority is in effect at commit time is
+   * refused with {@link RetiredVerifyArtifactRetryError}, even when the caller
+   * read the row before another writer recorded cleanup (002 §2.8).
    *
    * @internal
    */
@@ -1306,6 +1416,9 @@ export class RuntimeStore {
               id,
               'does not match the retained observation route',
             );
+          }
+          if (this.isRetiredVerifyArtifactRetry(current)) {
+            throw new RetiredVerifyArtifactRetryError(id);
           }
           // The event commits now but its observation was admitted when the
           // retry was queued; supersession of a drop compares admission (002 §2).
@@ -2765,6 +2878,236 @@ export class RuntimeStore {
     db.delete(objectEventSuppressions)
       .where(lte(objectEventSuppressions.expiresAt, now))
       .run();
+  }
+
+  /**
+   * Persist exact ownership of one verify artifact (002 §2.8, issue #562).
+   * Idempotent per run: re-registering the identical record returns the stored
+   * one unchanged, so a retried registration never creates a second row. A run
+   * already registered for a different artifact, or an artifact already owned
+   * by another run, is refused. A new registration requires an existing,
+   * active owner session in the same workspace. The caller validates that the
+   * key is a verify scratch path carrying `runId`.
+   */
+  registerVerifyArtifact(input: {
+    runId: string;
+    ownerSessionId: string;
+    workspacePath: string;
+    monitorId: string;
+    objectKey: string;
+    registeredAt: Date;
+  }): VerifyArtifactRecord {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const existing = this.getVerifyArtifact(input.runId);
+        if (existing) {
+          if (
+            existing.ownerSessionId === input.ownerSessionId &&
+            existing.workspacePath === input.workspacePath &&
+            existing.monitorId === input.monitorId &&
+            existing.objectKey === input.objectKey
+          ) {
+            return existing;
+          }
+          throw new Error(
+            `Verify run "${input.runId}" is already registered for a different artifact; a run owns exactly one artifact.`,
+          );
+        }
+        const owner = this.findSessionById(input.ownerSessionId);
+        if (!owner) {
+          throw new Error(
+            `Cannot register a verify artifact: owner session "${input.ownerSessionId}" was not found.`,
+          );
+        }
+        if (owner.status !== 'active') {
+          throw new Error(
+            `Cannot register a verify artifact: owner session "${input.ownerSessionId}" is not active.`,
+          );
+        }
+        if (owner.workspacePath !== input.workspacePath) {
+          throw new Error(
+            `Cannot register a verify artifact: owner session "${input.ownerSessionId}" belongs to another workspace.`,
+          );
+        }
+        const owned = db
+          .select({ runId: verifyArtifacts.runId })
+          .from(verifyArtifacts)
+          .where(
+            and(
+              eq(verifyArtifacts.workspacePath, input.workspacePath),
+              eq(verifyArtifacts.monitorId, input.monitorId),
+              eq(verifyArtifacts.objectKey, input.objectKey),
+            ),
+          )
+          .get();
+        if (owned) {
+          throw new Error(
+            `Cannot register a verify artifact: "${input.objectKey}" is already owned by another verify run.`,
+          );
+        }
+        db.insert(verifyArtifacts)
+          .values({
+            runId: input.runId,
+            ownerSessionId: input.ownerSessionId,
+            workspacePath: input.workspacePath,
+            monitorId: input.monitorId,
+            objectKey: input.objectKey,
+            registeredAt: input.registeredAt,
+          })
+          .run();
+        const stored = this.getVerifyArtifact(input.runId);
+        if (!stored) {
+          throw new Error(`Verify run "${input.runId}" was not stored.`);
+        }
+        return stored;
+      })
+      .immediate();
+  }
+
+  /** One run's verify artifact, or `null` when the run never registered one. */
+  getVerifyArtifact(runId: string): VerifyArtifactRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(verifyArtifacts)
+      .where(eq(verifyArtifacts.runId, runId))
+      .get();
+    return row ? rowToVerifyArtifact(row) : null;
+  }
+
+  /**
+   * Every retained verify artifact, oldest registration first, optionally for
+   * one workspace. Records are never removed, so this is the full history.
+   */
+  listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[] {
+    const db = asInternalDb(this.db);
+    const query = db.select().from(verifyArtifacts);
+    const rows =
+      workspacePath === undefined
+        ? query
+            .orderBy(
+              asc(verifyArtifacts.registeredAt),
+              asc(verifyArtifacts.runId),
+            )
+            .all()
+        : query
+            .where(eq(verifyArtifacts.workspacePath, workspacePath))
+            .orderBy(
+              asc(verifyArtifacts.registeredAt),
+              asc(verifyArtifacts.runId),
+            )
+            .all();
+    return rows.map(rowToVerifyArtifact);
+  }
+
+  /**
+   * Record that cleanup authority took effect for one run (002 §2.8). The
+   * first recorded time and cause are permanent: a retry, or a later owner
+   * close, leaves them unchanged and reports `recorded: false`.
+   *
+   * @throws when the run never registered an artifact.
+   */
+  recordVerifyArtifactCleanup(
+    runId: string,
+    cause: VerifyArtifactCleanupCause,
+    at: Date,
+  ): { artifact: VerifyArtifactRecord; recorded: boolean } {
+    const db = asInternalDb(this.db);
+    const changes = db
+      .update(verifyArtifacts)
+      .set({ cleanupRequestedAt: at, cleanupCause: cause })
+      .where(
+        and(
+          eq(verifyArtifacts.runId, runId),
+          isNull(verifyArtifacts.cleanupRequestedAt),
+        ),
+      )
+      .run().changes;
+    const artifact = this.getVerifyArtifact(runId);
+    if (!artifact) {
+      throw new Error(`Verify run "${runId}" has not registered an artifact.`);
+    }
+    return { artifact, recorded: changes > 0 };
+  }
+
+  /**
+   * Registered artifacts still without recorded cleanup whose owner session is
+   * missing or no longer active, for one workspace. The partial index keeps
+   * this to the few in-flight rows; retired rows are never scanned.
+   */
+  verifyArtifactsAwaitingCleanup(
+    workspacePath: string,
+  ): VerifyArtifactRecord[] {
+    const db = asInternalDb(this.db);
+    return db
+      .select({ artifact: verifyArtifacts })
+      .from(verifyArtifacts)
+      .leftJoin(
+        agentSessions,
+        eq(agentSessions.id, verifyArtifacts.ownerSessionId),
+      )
+      .where(
+        and(
+          eq(verifyArtifacts.workspacePath, workspacePath),
+          isNull(verifyArtifacts.cleanupRequestedAt),
+          or(isNull(agentSessions.id), ne(agentSessions.status, 'active')),
+        ),
+      )
+      .all()
+      .map((row) => rowToVerifyArtifact(row.artifact));
+  }
+
+  /** Registered artifacts of one owner session still without recorded cleanup. */
+  verifyArtifactsAwaitingCleanupForOwner(
+    ownerSessionId: string,
+  ): VerifyArtifactRecord[] {
+    return asInternalDb(this.db)
+      .select()
+      .from(verifyArtifacts)
+      .where(
+        and(
+          eq(verifyArtifacts.ownerSessionId, ownerSessionId),
+          isNull(verifyArtifacts.cleanupRequestedAt),
+        ),
+      )
+      .all()
+      .map(rowToVerifyArtifact);
+  }
+
+  /**
+   * Whether cleanup authority is in effect for this exact artifact: it is
+   * registered for this workspace, monitor and key, and either cleanup was
+   * recorded or its owner session is missing or no longer active. An
+   * unregistered key, even one that looks like a verify scratch path, never
+   * has authority.
+   */
+  isVerifyArtifactCleanupEffective(input: {
+    workspacePath: string;
+    monitorId: string;
+    objectKey: string;
+  }): boolean {
+    const db = asInternalDb(this.db);
+    const row = db
+      .select({ runId: verifyArtifacts.runId })
+      .from(verifyArtifacts)
+      .leftJoin(
+        agentSessions,
+        eq(agentSessions.id, verifyArtifacts.ownerSessionId),
+      )
+      .where(
+        and(
+          eq(verifyArtifacts.workspacePath, input.workspacePath),
+          eq(verifyArtifacts.monitorId, input.monitorId),
+          eq(verifyArtifacts.objectKey, input.objectKey),
+          or(
+            isNotNull(verifyArtifacts.cleanupRequestedAt),
+            isNull(agentSessions.id),
+            ne(agentSessions.status, 'active'),
+          ),
+        ),
+      )
+      .get();
+    return row !== undefined;
   }
 
   /**

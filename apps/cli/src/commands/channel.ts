@@ -497,6 +497,64 @@ export const CHANNEL_SERVER_INSTRUCTIONS =
   `arguments to acknowledge all unread, ${LEASED_ROW_EXCEPTION}).`;
 
 /**
+ * Collaborators the channel server's inbound tool handlers depend on.
+ */
+export interface ChannelToolHandlerDeps {
+  /** Resolves (opening if needed) the tracked session this channel is bound to. */
+  resolveSession: () => Promise<string>;
+  /** Daemon socket the `events.ack` round trip is sent to. */
+  socketPath: string;
+}
+
+/**
+ * Registers the channel server's inbound MCP request handlers: `tools/list`
+ * advertising `agentmon_ack`, and `tools/call` routing it through `events.ack`.
+ *
+ * This is the single place the channel server binds request schemas, shared by
+ * `runChannelServe` and the Zod-runtime guard test, so that test exercises the
+ * schemas the server really registers rather than a copy of them.
+ */
+export function registerChannelToolHandlers(
+  // eslint-disable-next-line @typescript-eslint/no-deprecated -- low-level Server is intentional, see runChannelServe
+  server: Server,
+  deps: ChannelToolHandlerDeps,
+): void {
+  server.setRequestHandler(ListToolsRequestSchema, () => ({
+    tools: [ACK_TOOL],
+  }));
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    if (request.params.name !== ACK_TOOL.name) {
+      throw new Error(`unknown tool: ${request.params.name}`);
+    }
+    const parsed = parseAckArgs(request.params.arguments);
+    if (!parsed.ok) {
+      return {
+        content: [{ type: 'text', text: `Invalid arguments: ${parsed.error}` }],
+        isError: true,
+      };
+    }
+    try {
+      const boundSession = await deps.resolveSession();
+      // events.ack only touches rows projected to this session, so passing the
+      // bound session id is the "outbound gate" that re-authorizes the ids (006 §4.3).
+      await acknowledgeEventsClient(
+        boundSession,
+        parsed.args.eventIds,
+        deps.socketPath,
+      );
+      const text = buildAckResultText(parsed.args.eventIds);
+      return { content: [{ type: 'text', text }] };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        content: [{ type: 'text', text: `Acknowledge failed: ${message}` }],
+        isError: true,
+      };
+    }
+  });
+}
+
+/**
  * Run the channel as a two-way MCP server. Outbound: poll the daemon for settled
  * `turn-interruptible` deliveries and push each into the session as a `<channel>`
  * event. Each poll RESERVES the delivery, pushes it, and COMMITS the claim only
@@ -552,37 +610,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   };
 
   // Inbound: advertise the agentmon_ack tool and route it through events.ack.
-  mcp.setRequestHandler(ListToolsRequestSchema, () => ({ tools: [ACK_TOOL] }));
-  mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
-    if (request.params.name !== ACK_TOOL.name) {
-      throw new Error(`unknown tool: ${request.params.name}`);
-    }
-    const parsed = parseAckArgs(request.params.arguments);
-    if (!parsed.ok) {
-      return {
-        content: [{ type: 'text', text: `Invalid arguments: ${parsed.error}` }],
-        isError: true,
-      };
-    }
-    try {
-      const boundSession = await resolveSession();
-      // events.ack only touches rows projected to this session, so passing the
-      // bound session id is the "outbound gate" that re-authorizes the ids (006 §4.3).
-      await acknowledgeEventsClient(
-        boundSession,
-        parsed.args.eventIds,
-        socketPath,
-      );
-      const text = buildAckResultText(parsed.args.eventIds);
-      return { content: [{ type: 'text', text }] };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      return {
-        content: [{ type: 'text', text: `Acknowledge failed: ${message}` }],
-        isError: true,
-      };
-    }
-  });
+  registerChannelToolHandlers(mcp, { resolveSession, socketPath });
 
   await mcp.connect(new StdioServerTransport());
 

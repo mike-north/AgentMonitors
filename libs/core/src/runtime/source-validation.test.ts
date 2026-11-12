@@ -308,7 +308,7 @@ describe('source config execution preflight', () => {
     expect(store.getMonitorState('aaa-invalid', f.root)).toEqual(retained);
   });
 
-  it('reaps stale verify scratch work before reporting an invalid cadence and progressing healthy siblings', async () => {
+  it('reaps a stale verify owner and retracts its registered artifact before reporting an invalid cadence and progressing healthy siblings', async () => {
     vi.useFakeTimers();
     const start = new Date('2026-11-05T12:00:00Z');
     vi.setSystemTime(start);
@@ -354,6 +354,13 @@ describe('source config execution preflight', () => {
     );
     await runtime.tick(f.monitorsDir, f.root);
     vi.advanceTimersByTime(1000);
+    runtime.registerVerifyArtifact({
+      runId: 'abcdef012345',
+      ownerSessionId: verify.id,
+      workspacePath: f.root,
+      monitorId: 'aaa-invalid',
+      objectKey: scratchKey,
+    });
     writeFileSync(scratchKey, 'owned synthetic scratch');
     await runtime.tick(f.monitorsDir, f.root);
     expect(
@@ -396,20 +403,13 @@ describe('source config execution preflight', () => {
     expect(
       runtime.listEvents({ workspacePath: f.root, objectKey: scratchKey }),
     ).toEqual([]);
-    // Invalid cadence uses exactly the pre-existing five-minute fallback;
-    // cleanup must neither throw nor infer a new lifetime from rejected config.
-    expect(
-      store.activeObjectSuppressions(
-        f.root,
-        new Date(reapAt.getTime() + 299999),
-      ),
-    ).toMatchObject([{ monitorId: 'aaa-invalid', objectKey: scratchKey }]);
-    expect(
-      store.activeObjectSuppressions(
-        f.root,
-        new Date(reapAt.getTime() + 300000),
-      ),
-    ).toEqual([]);
+    // Cleanup authority comes from the registered ownership, with no lifetime
+    // derived from (or shortened by) the rejected cadence.
+    expect(store.getVerifyArtifact('abcdef012345')).toMatchObject({
+      cleanupRequestedAt: reapAt,
+      cleanupCause: 'owner-inactive',
+    });
+    expect(store.activeObjectSuppressions(f.root, reapAt)).toEqual([]);
     expect(store.getMonitorState('aaa-invalid', f.root)).toEqual(retained);
     expect(
       runtime.listObservationHistory({

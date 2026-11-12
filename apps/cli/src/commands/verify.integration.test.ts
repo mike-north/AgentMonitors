@@ -10,6 +10,7 @@
  * @see docs/specs/005-cli-reference.md §16
  */
 import {
+  execFile,
   execFileSync,
   spawn,
   type ChildProcess,
@@ -25,12 +26,18 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import type { MonitorEventRecord } from '@agentmonitors/core';
+import {
+  createDb,
+  RuntimeStore,
+  type MonitorEventRecord,
+  type VerifyArtifactRecord,
+} from '@agentmonitors/core';
 import { assertVerifySucceeded } from '../test-support/verify-result.js';
 import { listObservationHistoryClient } from '../runtime-client.js';
 
@@ -84,6 +91,21 @@ function writeMonitor(
 }
 
 /** Files matching the auto-trigger scratch name (must be gone after cleanup). */
+/**
+ * The verify-artifact ownership records the workspace daemon's database holds
+ * (issue #562), read through a short-lived connection of our own.
+ */
+function verifyArtifactsIn(dbPath: string | undefined): VerifyArtifactRecord[] {
+  if (dbPath === undefined) throw new Error('AGENTMONITORS_DB is not set');
+  const db = createDb(dbPath);
+  try {
+    return new RuntimeStore(db).listVerifyArtifacts();
+  } finally {
+    // InboxDb hides its driver; close only the connection opened here.
+    (db as unknown as { $client: { close(): void } }).$client.close();
+  }
+}
+
 function scratchFiles(workspace: string): string[] {
   return readdirSync(workspace).filter((name) =>
     name.startsWith('agentmonitors-verify-'),
@@ -636,6 +658,29 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
     }
   }
 
+  /** {@link runWs} without blocking the event loop (for in-process relays). */
+  function runWsAsync(
+    args: string[],
+    cwd: string,
+    env: Record<string, string>,
+  ): Promise<RunResult> {
+    return new Promise((resolve) => {
+      execFile(
+        CLI[0],
+        [CLI[1], ...args],
+        { encoding: 'utf-8', env, cwd },
+        (error, stdout, stderr) => {
+          const status = (error as { code?: unknown } | null)?.code;
+          resolve({
+            stdout,
+            stderr,
+            exitCode: error ? (typeof status === 'number' ? status : 1) : 0,
+          });
+        },
+      );
+    });
+  }
+
   beforeAll(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), 'verify-ws-'));
   });
@@ -802,6 +847,19 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         await delay(400);
       }
       expect(realDelivered).toBe(true);
+
+      // The run owned its artifact durably and requested its cleanup (#562):
+      // exactly one record, keyed by the run token the scratch name carries.
+      const artifacts = verifyArtifactsIn(env['AGENTMONITORS_DB']);
+      expect(artifacts).toHaveLength(1);
+      const [artifact] = artifacts;
+      expect(artifact).toMatchObject({
+        monitorId: 'docs-watch',
+        cleanupCause: 'owner-request',
+      });
+      expect(path.basename(artifact?.objectKey ?? '')).toBe(
+        `agentmonitors-verify-${artifact?.runId ?? ''}.md`,
+      );
     } finally {
       // Tear the daemon down within the test so a retry starts clean.
       runWs(['daemon', 'stop'], ws, env);
@@ -818,6 +876,179 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
           });
         });
       }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it('falls back to the legacy cleanup against a daemon that predates artifact ownership, still leaving no scratch event', async () => {
+    // Version skew: a current CLI talking to a daemon built before durable
+    // verify-artifact ownership existed. The relay answers the ownership
+    // registration exactly as such a daemon does (`unsupported_request`) and
+    // forwards every other request to a real daemon, so the run takes the
+    // legacy cleanup path end to end.
+    const ws = mkdtempSync(path.join(tempDir, 'skew-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'ams-'));
+    const baseEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([, v]) => v !== undefined),
+    ) as Record<string, string>;
+    const daemonSocket = path.join(socketDir, 'd.sock');
+    const relaySocket = path.join(socketDir, 'r.sock');
+    const daemonEnv: Record<string, string> = {
+      ...baseEnv,
+      AGENTMONITORS_SOCKET: daemonSocket,
+      AGENTMONITORS_DB: path.join(socketDir, 'verify.db'),
+    };
+    const env: Record<string, string> = {
+      ...daemonEnv,
+      AGENTMONITORS_SOCKET: relaySocket,
+    };
+
+    // The relay runs in this test process, so every CLI call routed through it
+    // must leave the event loop free (execFileSync would deadlock the relay).
+    const refusedMethods: string[] = [];
+    const relay = net.createServer((client) => {
+      let pending = '';
+      client.on('error', () => undefined);
+      client.on('data', (chunk) => {
+        pending += chunk.toString('utf-8');
+        const newline = pending.indexOf('\n');
+        if (newline === -1) return;
+        const line = pending.slice(0, newline + 1);
+        client.removeAllListeners('data');
+        const request = JSON.parse(line) as { id: string; method: string };
+        if (request.method === 'verifyArtifacts.register') {
+          refusedMethods.push(request.method);
+          client.end(
+            `${JSON.stringify({
+              id: request.id,
+              error: `Unknown method: ${request.method}`,
+              code: 'unsupported_request',
+            })}\n`,
+          );
+          return;
+        }
+        const upstream = net.createConnection(daemonSocket);
+        upstream.on('error', () => client.destroy());
+        upstream.on('connect', () => upstream.write(line));
+        upstream.pipe(client);
+      });
+    });
+    await new Promise<void>((resolve) => relay.listen(relaySocket, resolve));
+
+    expect(
+      (await runWsAsync(['init', '--enable-only'], ws, env)).exitCode,
+    ).toBe(0);
+    writeMonitor(
+      ws,
+      'docs-watch',
+      `name: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    const daemon: ChildProcess = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        path.join(ws, '.claude', 'monitors'),
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '500',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env: daemonEnv, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    try {
+      let dstdout = '';
+      let dstderr = '';
+      daemon.stdout?.setEncoding('utf-8');
+      daemon.stderr?.setEncoding('utf-8');
+      daemon.stdout?.on('data', (c: string) => (dstdout += c));
+      daemon.stderr?.on('data', (c: string) => (dstderr += c));
+      const bootDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < bootDeadline &&
+        !dstdout.includes('AgentMon daemon listening')
+      ) {
+        if (daemon.exitCode !== null) {
+          throw new Error(
+            `daemon exited early (${String(daemon.exitCode)}).\n${dstdout}\n${dstderr}`,
+          );
+        }
+        await delay(100);
+      }
+      expect(dstdout).toContain('AgentMon daemon listening');
+
+      const sessionResult = await runWsAsync(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'user-session',
+          '--workspace',
+          ws,
+          '--format',
+          'id',
+        ],
+        ws,
+        env,
+      );
+      expect(sessionResult.exitCode, sessionResult.stderr).toBe(0);
+      const sessionId = sessionResult.stdout.trim();
+
+      const verifyResult = await runWsAsync(
+        [
+          'verify',
+          'docs-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        ws,
+        env,
+      );
+      const verifyReport = JSON.parse(verifyResult.stdout) as { ok: boolean };
+      expect(
+        verifyReport.ok,
+        `${verifyResult.stdout}\n${verifyResult.stderr}`,
+      ).toBe(true);
+      expect(verifyResult.exitCode).toBe(0);
+      // The run did ask for ownership and was refused, so it took the fallback.
+      expect(refusedMethods).toEqual(['verifyArtifacts.register']);
+      expect(scratchFiles(ws)).toHaveLength(0);
+
+      const afterVerify = await runWsAsync(
+        ['events', 'list', '--session', sessionId, '--format', 'json'],
+        ws,
+        env,
+      );
+      expect(afterVerify.exitCode).toBe(0);
+      expect(afterVerify.stdout).not.toContain('agentmonitors-verify-');
+      expect(JSON.parse(afterVerify.stdout) as unknown[]).toHaveLength(0);
+      // No ownership record exists: the refused registration wrote nothing.
+      expect(verifyArtifactsIn(daemonEnv['AGENTMONITORS_DB'])).toHaveLength(0);
+    } finally {
+      runWs(['daemon', 'stop'], ws, daemonEnv);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+            resolve();
+          }, 3_000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(t);
+            resolve();
+          });
+        });
+      }
+      await new Promise<void>((resolve) => relay.close(() => resolve()));
       rmSync(socketDir, { recursive: true, force: true });
     }
   }, 90_000);
@@ -1336,6 +1567,11 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         await delay(500);
       }
       expect(clean).toBe(true);
+      // The interrupted run's artifact was registered before creation and has
+      // cleanup authority now (#562), so its key stays out of later sessions.
+      const artifacts = verifyArtifactsIn(env['AGENTMONITORS_DB']);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0]?.cleanupRequestedAt).not.toBeNull();
     } finally {
       runWs(['daemon', 'stop'], ws, env);
       if (daemon.exitCode === null) {
