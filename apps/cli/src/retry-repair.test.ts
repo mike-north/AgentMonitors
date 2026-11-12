@@ -23,6 +23,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import {
@@ -508,6 +509,41 @@ describe('monitor retry refusals', () => {
       (await doctorJson()).monitors[0]?.unretainedObservationLoss,
     ).toBeNull();
   }, 60_000);
+
+  it("reports a reachable daemon's error and never applies the repair behind it", async () => {
+    const id = await seedRetry({});
+    // A reachable daemon that answers every request with an error, as an
+    // older or failing daemon would.
+    const server = net.createServer((socket) => {
+      socket.setEncoding('utf8');
+      let buffer = '';
+      socket.on('data', (chunk: string) => {
+        buffer += chunk;
+        if (!buffer.includes('\n')) return;
+        const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as {
+          id: string;
+        };
+        socket.end(
+          JSON.stringify({ id: request.id, error: 'daemon is busy' }) + '\n',
+        );
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    try {
+      for (const verb of ['rearm', 'skip'] as const) {
+        const refused = await run(repairArgs(verb, id, '--format', 'text'));
+        expect(refused.code).toBe(1);
+        expect(refused.stderr).toContain('daemon is busy');
+        expect(refused.stdout).not.toContain('applied to the persisted store');
+      }
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    expect(retryRow(id)?.status).toBe('terminal');
+  }, 30_000);
 
   it('reports an unknown retry id as not found, in JSON', async () => {
     await seedRetry({});

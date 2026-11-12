@@ -874,7 +874,8 @@ materialization reason and the `doctor` remediation (§15).
 Verified: `apps/cli/src/retry-repair.test.ts` (built CLI against a real `daemon run`: re-arm then
 success with later input in order, re-arm then failure, skip with the loss in `doctor` and
 `monitor explain` until superseded, each with one daemon and across a daemon restart; refusals
-through the daemon and in-process; the in-process path, running the re-arm `doctor` suggests) and
+through the daemon and in-process; a reachable daemon's error reported, never applied
+in-process; the in-process path, running the re-arm `doctor` suggests) and
 `libs/core/src/runtime/retry-repair.test.ts`.
 
 ---
