@@ -8,6 +8,7 @@ import type {
   ObservationContext,
   ObservationResult,
   ObservationSource,
+  SignalTarget,
 } from '@agentmonitors/core';
 import {
   OPERATION_TIMEOUT_PATTERN,
@@ -15,6 +16,8 @@ import {
   displayObjectKey,
   parseKeyedCollectionConfig,
   parseOperationTimeoutMs,
+  sendVerifiedSignal,
+  spawnedProcessGroup,
 } from '@agentmonitors/core';
 
 // Re-exported so API Extractor can resolve the default export's type — and
@@ -194,12 +197,29 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
 const CLOSE_FALLBACK_MS = 2_000;
 
 /**
- * Best-effort process-tree termination for one escalation step (SIGTERM or SIGKILL).
+ * Identity-verified process-tree termination for one escalation step (SIGTERM or
+ * SIGKILL). Never sends a signal to an id it cannot positively confirm is still
+ * the tree this command started (008 §5): every step goes through core's
+ * `sendVerifiedSignal`, and an unconfirmable target is left alone and reported
+ * (an abstention, 008 §6.1) instead of signalled.
  *
  * On POSIX, `child` was spawned as the leader of its own process group/session
  * (`detached: true`); signaling the *negative* PID targets that whole group, so a
  * command's own background jobs (`sh -c 'sleep 30 & wait'`) die with it instead of
- * surviving as orphans (003 §11.7, issue #303).
+ * surviving as orphans (003 §11.7, issue #303). The SIGTERM step's read starts
+ * while the leader is still unreaped (the timeout only fires for a running
+ * command), so that reading's members are confirmed as ours even if the leader
+ * exits before the read completes. The gate re-reads the group's membership the
+ * moment the leader is reaped, which confirms work forked after the SIGTERM step
+ * (a TERM trap that starts a worker and exits), and keeps re-reading it through
+ * the grace period, which confirms work one member hands to a newly forked
+ * process before exiting. The SIGKILL follow-up usually runs after the leader has
+ * been reaped; it is sent if any confirmed member is still in the group, and an
+ * emptied group needs no signal. A group none of whose current members was ever
+ * confirmed is left alone with an abstention: its continuity is lost, either
+ * because a member forked and exited between two readings with no other
+ * confirmed member alive (the residual 008 §3.1 names) or because the id was
+ * reused, and the two cannot be told apart.
  *
  * Windows has no process-group-signal equivalent, and no reliable graceful signal
  * for a non-console-attached spawned process — `taskkill` without `/F` frequently
@@ -207,26 +227,62 @@ const CLOSE_FALLBACK_MS = 2_000;
  * AC2) is to always use `taskkill /PID <pid> /T /F`: forceful and tree-wide, on both
  * the timeout expiry and the grace follow-up. There is no softer Windows phase to
  * escalate from, so both steps do the same thing — the follow-up is a defensive
- * retry, not a genuine escalation.
+ * retry, sent only while the direct child is still unreaped (its pid cannot have
+ * been reused); once it has exited there is nothing left the pid can identify.
+ *
+ * Resolves once the step has finished; never rejects.
  */
-function killProcessTree(
-  child: ChildProcess,
+async function killProcessTree(
+  target: SignalTarget,
   signal: 'SIGTERM' | 'SIGKILL',
   isWindows: boolean,
-): void {
-  const pid = child.pid;
-  if (pid === undefined) return;
-  if (isWindows) {
-    execFile('taskkill', ['/PID', String(pid), '/T', '/F'], () => {
-      // Best-effort: a "not found" failure just means the tree already exited.
-    });
-    return;
-  }
+  action: string,
+): Promise<void> {
+  const windowsPid =
+    target.kind === 'spawned-process' ? target.handle.pid : undefined;
   try {
-    process.kill(-pid, signal);
+    await sendVerifiedSignal(target, signal, {
+      action,
+      // The SIGTERM step keeps confirming the group's membership through the
+      // grace period. The SIGKILL step ends that tracking when it starts, which
+      // is at most the grace period after the SIGTERM step finishes (its timer
+      // is armed before the SIGTERM step's read, and it also waits for that
+      // step), so `untilMs` is only a backstop.
+      ...(signal === 'SIGTERM' && target.kind === 'spawned-process-group'
+        ? { trackMembership: { untilMs: SIGKILL_GRACE_MS } }
+        : {}),
+      ...(isWindows && windowsPid !== undefined
+        ? {
+            deliver: () => {
+              execFile(
+                'taskkill',
+                ['/PID', String(windowsPid), '/T', '/F'],
+                () => {
+                  // Best-effort: a "not found" failure just means the tree already exited.
+                },
+              );
+            },
+          }
+        : {}),
+    });
   } catch {
-    // Process group already gone — nothing left to signal.
+    // Verification reports its own outcomes; nothing here may break the timer chain.
   }
+}
+
+/**
+ * The cleanup target for a spawned command: its whole process group on POSIX,
+ * the direct child (tree-killed by `taskkill /T`) on Windows. `undefined` when
+ * the OS never assigned a pid — nothing was started, so nothing can be signalled.
+ */
+function cleanupTargetFor(
+  child: ChildProcess,
+  isWindows: boolean,
+): SignalTarget | undefined {
+  if (child.pid === undefined) return undefined;
+  return isWindows
+    ? { kind: 'spawned-process', handle: child }
+    : spawnedProcessGroup(child);
 }
 
 /**
@@ -377,9 +433,10 @@ async function runCommand(
       // has SIGTERM ignored (e.g. inherited via `exec` from a subshell that
       // trapped it) and so survives untouched. Cancelling the pending SIGKILL as
       // soon as the direct child's own `exit` resolved this promise would leave
-      // that descendant orphaned forever (003 §11.7, issue #303). Firing SIGKILL
-      // on an already-empty process group is caught and ignored in
-      // `killProcessTree`, so leaving it armed is always safe.
+      // that descendant orphaned forever (003 §11.7, issue #303). Leaving it armed
+      // is always safe: the follow-up re-verifies the group's identity first, so
+      // an emptied group is a no-op and a reused group id is never signalled
+      // (008 §5).
     }
 
     function finish(outcome: ExecOutcome): void {
@@ -481,19 +538,32 @@ async function runCommand(
 
     // Wall-clock timeout: SIGTERM the whole process group, then SIGKILL after a 5s
     // grace (003 §11.2). Targeting the group — not just the direct child — is what
-    // guarantees no orphaned descendant survives (003 §11.7, issue #303).
+    // guarantees no orphaned descendant survives (003 §11.7, issue #303). Both steps
+    // re-verify the group's identity at signal time (008 §5).
+    const cleanupTarget = cleanupTargetFor(child, isWindows);
+    const cleanupAction = `command-poll timeout escalation for ${displayObjectKey(scope.objectKey)}`;
     const wallClockTimer = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child, 'SIGTERM', isWindows);
+      if (cleanupTarget === undefined) return;
+      const termStep = killProcessTree(
+        cleanupTarget,
+        'SIGTERM',
+        isWindows,
+        cleanupAction,
+      );
       // Unconditional: this must run to completion and SIGKILL the process group
       // even if the direct child has already exited and `finish()` has already
       // settled the promise (see the comment in `clearTimers` above) — a
       // descendant that ignores SIGTERM while the direct child dies from it is
-      // otherwise never reaped (003 §11.7, issue #303). Signaling an
-      // already-empty process group throws ESRCH, which `killProcessTree` catches
-      // and ignores.
+      // otherwise never reaped (003 §11.7, issue #303). It waits for the SIGTERM
+      // step to finish so it can rely on the group membership confirmed so far
+      // (by that step, at the leader's exit and through the grace period); an
+      // emptied group is a no-op, and one whose continuity was lost is an
+      // abstention, never a signal (008 §5).
       sigkillTimer = setTimeout(() => {
-        killProcessTree(child, 'SIGKILL', isWindows);
+        void termStep.then(() =>
+          killProcessTree(cleanupTarget, 'SIGKILL', isWindows, cleanupAction),
+        );
       }, SIGKILL_GRACE_MS);
       // sigkillTimer must not keep the event loop alive on its own.
       sigkillTimer.unref();

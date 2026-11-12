@@ -1599,6 +1599,28 @@ no orphan). Platform-specific mechanism:
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
   from on this platform.
 
+**Every escalation step is identity-verified at signal time** (issue #479,
+[008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step's process-table read starts while
+the direct child is still unreaped, so the members that read lists (pid and start time) are
+confirmed as the command's group even if the command exits before the read completes; the step then
+signals the group (or, if that read found the group already empty, needs no signal). The gate reads the group's membership again the moment the direct child is
+reaped, which confirms processes forked after the SIGTERM step (for example a worker started by a
+TERM trap just before the command exits). Through the grace period the gate keeps reading the
+group's membership every 250 ms, one read at a time, until the SIGKILL follow-up starts; each
+reading that still holds a confirmed member confirms every member it lists, so a TERM-ignoring
+member that forks a process and later exits passes the group on to it. The SIGKILL follow-up
+usually runs after the direct child has been reaped; it is sent if any confirmed member is still in
+the group, and an empty group needs no signal. Only when continuity is lost (the group holds none
+of the processes ever confirmed) or the process table cannot be read is the group left alone: the
+step abstains and writes a warning to the daemon's stderr (the daemon log) naming the group, the
+members it saw and why identity could not be confirmed. Continuity is lost when the group emptied
+and its id was reused, or when, after the direct child has exited, a member forks and exits
+between two consecutive readings (within one 250 ms interval plus one read; the read time grows
+under load, up to the 5 s `ps` cap) while no other confirmed member is alive; in that second case
+the forked process escapes the bound. That residual, and the latency the reads add to each step, are stated
+in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
+`taskkill` runs only while the direct child is still unreaped.
+
 Resolution on timeout is driven by the direct child's own `exit` event, never by waiting for its
 stdio streams to `close`. A descendant that inherited stdout/stderr (the `sleep` in the example
 above) can hold those pipes open indefinitely even after the whole process group has been signaled;
