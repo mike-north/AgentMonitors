@@ -3,6 +3,7 @@
  * and session projection. Source config must pass the authoring contract before
  * execution; rejected config pauses work without consuming its durable baseline.
  */
+import { createHash } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
@@ -374,6 +375,88 @@ function effectiveObservationUrgency(
   );
   // rank is clamped into [lo, hi] ⊆ [0, 2], so this lookup is always defined.
   return URGENCY_BY_RANK[rank] ?? lo;
+}
+
+/**
+ * Sorts object keys recursively so equal values serialize identically whatever
+ * order, or whitespace, the author wrote them in.
+ */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * `watch` keys the scheduling engine reads to decide WHEN to observe, which no
+ * source reads to decide WHAT it observes. Each bundled poll source declares
+ * `interval` as "used by the scheduling engine, not by this plugin directly"
+ * (`source-api-poll`, `source-command-poll`, `source-incoming-changes`;
+ * `source-file-fingerprint` documents it as the observe interval), and
+ * `scheduleForMonitor` is the only reader. The `schedule` source's `cron` and
+ * `timezone` are NOT listed: the scheduler reads them too, but that source also
+ * writes them into its observation's payload and `objectKey`, so they shape what
+ * an event is.
+ */
+const SCHEDULING_ONLY_WATCH_KEYS: readonly string[] = ['interval'];
+
+/**
+ * A short content fingerprint of the parts of a monitor's definition that decide
+ * what an event IS: how it was observed, what it carries, and how it is
+ * presented (issue #451).
+ *
+ * Included, with the reason each can change a stored or delivered event:
+ * - `urgency`, `urgencyMax`: the event's delivery urgency.
+ * - the body (`instructions`): the delivered body when the source supplies none.
+ * - `name`: the delivered title (`name` wins over the source's title, 002 §5.4).
+ * - `watch` minus {@link SCHEDULING_ONLY_WATCH_KEYS}: the source and its
+ *   configuration (command, query, globs, ...) decide the payload and `objectKey`.
+ * - `shape` and `payload`: derive facts, render the snapshot, and transform the
+ *   delivered payload before diffing, so they change the stored snapshot, diff
+ *   and payload.
+ * - `baselineStrategy`: stored on the event and decides how each recipient's
+ *   catch-up span is collapsed at delivery.
+ *
+ * Excluded because they change neither the observation nor the delivered text:
+ * `notify` (when events materialize, not what they contain), `tags` (a label
+ * used only to filter `events list`), and the scheduling keys above.
+ *
+ * Objects are hashed in canonical key order, so key order and whitespace in the
+ * source file do not matter; array order does.
+ *
+ * Persisted on each materialized event and recomputed from the CURRENT monitor in
+ * `explainMonitor`, so the two can be compared without touching the event's own
+ * stored fields. A read-only diagnostic aid, never a second source of truth for
+ * delivery content.
+ *
+ * @see docs/specs/002-runtime-delivery.md §5.3
+ */
+function definitionFingerprint(monitor: MonitorDefinition): string {
+  const frontmatter = monitor.frontmatter;
+  const watch = Object.fromEntries(
+    Object.entries(frontmatter.watch).filter(
+      ([key]) => !SCHEDULING_ONLY_WATCH_KEYS.includes(key),
+    ),
+  );
+  const material = JSON.stringify(
+    canonicalize({
+      urgency: frontmatter.urgency,
+      urgencyMax: frontmatter.urgencyMax,
+      instructions: monitor.instructions,
+      name: frontmatter.name,
+      watch,
+      shape: frontmatter.shape,
+      payload: frontmatter.payload,
+      baselineStrategy: frontmatter.baselineStrategy,
+    }),
+  );
+  return createHash('sha256').update(material).digest('hex').slice(0, 16);
 }
 
 function serializeObservation(
@@ -1569,6 +1652,30 @@ export class AgentMonitorRuntime {
         reminderSuppression.length > 0
           ? ` ${reminderSuppression.map((finding) => finding.message).join(' ')}`
           : '';
+
+      // Definition-drift diagnostic (issue #451): a pending event whose OWN
+      // stored `definitionFingerprint` differs from the monitor's CURRENT
+      // fingerprint was observed under a since-edited definition (anything
+      // `definitionFingerprint` covers: urgency, body, name, source and its
+      // configuration, shape, payload, baseline strategy). "Pending" means
+      // unacknowledged AND still deliverable: a projection already
+      // net-collapsed or Interpret-suppressed never delivers and is excluded.
+      // Not itself a bug — the event still delivers with what was in force when
+      // it was observed — but an author debugging an unexpected delivery needs
+      // to see that the definition has changed. A `null` fingerprint (a row from
+      // before the field existed) is "unknown", never flagged. Counted over ALL
+      // pending events for the monitor, not the `eventLimit`-bounded list above,
+      // with a single synchronous query.
+      const staleEventIds = this.store.pendingEventIdsOutsideDefinition(
+        input.monitorId,
+        workspacePath,
+        definitionFingerprint(monitor),
+      );
+      const staleSuffix =
+        staleEventIds.length > 0
+          ? ` ${String(staleEventIds.length)} pending event(s) in total predate the monitor's current definition (its urgency, body, name, source configuration, shape, payload or baseline strategy changed since they were observed) — they will still deliver with the urgency/body in force when THEY were observed, not the current one, unless a newer change to the same object supersedes them.`
+          : '';
+
       const deliveryDetails: Record<string, unknown> = { ...counts };
       if (interpretVerdicts.length > 0) {
         deliveryDetails['interpret'] = interpretVerdicts;
@@ -1576,13 +1683,16 @@ export class AgentMonitorRuntime {
       if (reminderSuppression.length > 0) {
         deliveryDetails['reminderSuppression'] = reminderSuppression;
       }
+      if (staleEventIds.length > 0) {
+        deliveryDetails['staleDefinitionEventIds'] = staleEventIds;
+      }
       stages.push(
         explainStage(
           'delivery',
           'ok',
           `Events are projected to lead sessions (${Object.entries(counts)
             .map(([state, count]) => `${state}: ${String(count)}`)
-            .join(', ')}).${interpretSuffix}${reminderSuffix}`,
+            .join(', ')}).${interpretSuffix}${reminderSuffix}${staleSuffix}`,
           deliveryDetails,
         ),
       );
@@ -3798,6 +3908,10 @@ export class AgentMonitorRuntime {
         // re-scanning monitor definitions (G10 PR-B, 002 §1.1.7). Defaults to
         // `incremental` when the monitor omits the field.
         baselineStrategy: input.monitor.frontmatter.baselineStrategy,
+        // The definition-content fingerprint (issue #451) — computed from
+        // `input.monitor`, the SAME per-observation snapshot `urgency`/`title`/
+        // `body` above were captured from, never a live re-scan.
+        definitionFingerprint: definitionFingerprint(input.monitor),
         // Make the source-agnostic changeKind queryable without each source having
         // to duplicate it into its own queryScope.
         queryScope: {

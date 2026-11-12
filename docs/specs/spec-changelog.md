@@ -9,6 +9,30 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
+
+States a contract the runtime already satisfied: a pending event is delivered with the urgency,
+title and body it was materialized under, whatever edits are made to the monitor afterwards. The
+reported escalation and body swap do not reproduce on current main; delivery renders the stored
+event row on every surface, and a held debounce batch carries its own definition snapshot. Adds
+real-runtime regression scenarios (004 §2.5) and a read-only `explain` diagnostic backed by a
+nullable `monitor_events.definition_fingerprint` column that counts pending events predating the
+current definition. The fingerprint covers urgency, body, name, the source's parsed configuration
+except its scheduling `interval`, `shape`, `payload` and `baseline-strategy` (so a command or `--jq`
+edit is flagged; `notify`, `tags` and cadence edits are not), and the count is a total
+rather than bounded by the event limit. The diagnostic never gates delivery; rows without a
+fingerprint read as unknown.
+
+## 2026-11-07 — Preserve dependent triggers across ordering migrations (002 §5.2, 004 §3.4) — Refs #293
+
+Coordinate event and snapshot sequence rebuilds within their existing immediate
+transaction. Suspend retained main-schema triggers across the pair and restore their
+exact SQL only after both table names exist, including cross-table and third-table
+dependencies. Preserve rows, logical references, indexes, public IDs, connection pragmas
+and ordering policies. Already-current opens leave trigger definitions untouched.
+Tests first reproduce both directions, quoted names and partial migrations; controls
+and native DDL failures verify behavior, no replay, idempotence and complete rollback.
+
 ## 2026-11-07 — Build core before API-source-backed tests (004 §2.9) — Refs #554
 
 The core Nx test target declares both dependency builds and its own build because its runtime
@@ -378,6 +402,46 @@ Point the milestone citations in 008 §9–§10 and the G21 proof at the milesto
 [docs/product/roadmap.md](../product/roadmap.md). Contract text is unchanged; only the planned
 sequencing of these targets moved.
 
+## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004) — Refs #293
+
+The event-order boundary retains raw shared input representation and refreshes explicit
+non-shared delta views from the requested session projection. Optional lifecycle state
+is refreshed independently: its presence does not change a shared diff into a recipient
+delta. Incremental and single-net results preserve
+recipient deltas/lifecycle state; stale deltas after re-anchoring no longer fall back to
+shared history. Supplied text and another recipient's state never become authoritative.
+Tests first reproduced view loss and stale-delta fallback, then verify both raw and
+recipient representations. Immutable event ordering/artifacts remain database-owned.
+
+## 2026-11-01 — Durable equal-time event ordering (002 §1.1.7/§15, 004) — Refs #293
+
+Event queries and claimed cursor advancement retain persisted observation time as their
+primary order and use a private SQLite AUTOINCREMENT sequence for equal-time ties.
+Independent process-local ULID order no longer chooses an older net endpoint. Public
+IDs and event shapes are unchanged. The pure collapse decision preserves canonical
+query tie order; the mutating boundary reloads authoritative records in that order,
+including mixed-urgency concatenations, and rejects unknown/duplicate candidate IDs
+before mutation. Legacy migration preserves event fields and logical delivery references.
+
+Tests exercise genuine two-process adverse IDs, preview/capped claim/cursor agreement,
+mixed-band candidates, unequal observed times, rollback, migration, maintenance and
+concurrent opens. Snapshot materialization order remains a separate sequence; history
+and source frontiers are unchanged.
+
+## 2026-11-01 — Durable snapshot materialization order across writers (002 §5.2/§15, 004) — Refs #293
+
+Snapshot predecessor selection now uses a private SQLite AUTOINCREMENT sequence rather
+than wall-clock timestamps and process-local monotonic ULIDs. Equal-clock independent
+writers and clock reversals can no longer select an older retained snapshot. Public
+snapshot IDs/results are unchanged; allocation remains inside materialization atomicity.
+
+Legacy tables rebuild transactionally, preserving row data and explicit indexes/triggers.
+Current hidden rowid order is the stated bootstrap policy, not a claim to reconstruct
+historical chronology or regenerate old diffs. Specs document rollback, deletion,
+VACUUM/reopen, concurrent migration, and older-reader limitations. Tests use genuine
+independent process factories and verify the adjacent diff predecessor. Event/history
+ordering is outside this snapshot repair.
+
 ## 2026-11-01 — Verify uses observation identity boundaries (005 §16) — Refs #532
 
 Replace millisecond-versus-second history timestamp comparison with a pre-trigger recording frontier
@@ -386,6 +450,17 @@ long commands, exclude earlier same-second rows and intermediate command idle ti
 evidence across window rotation, and refuse negative verdicts when history gaps could hide success.
 Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
 equal-second rows; a real daemon regression waits for durable triggered history before command exit.
+
+## 2026-10-31 — Retry completion owns synchronous materialization (002 persistence, 004 §3.4) — Refs #494
+
+Replace the generic completion callback with concrete event data so asynchronous caller work cannot
+escape the transaction. Require pending state and matching observation route before writes; atomically
+commit event/projections/cursors/snapshot plus retry removal and preserve the projection cache on rollback.
+Document typed missing-identity/invalid-transition errors, single-line failure updates, and upward-rounded
+second-resolution deadlines. Tests reproduce terminal bypass, callback escape, early due admission and
+unsafe Unicode separators, then verify real database faults and on-disk lifecycle recovery. A runtime-backed
+regression also requires completion to honor the normal monitor-ID fallback for omitted object keys
+while preserving explicit keys, including the empty string.
 
 ## 2026-10-31 — Preserve SQLite locks during permission migration (002 §3.1) — Refs #529
 
@@ -516,8 +591,10 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
 Core now persists failed stored-observation envelopes in a workspace-scoped, per-monitor outbox
 before a later runtime change adopts it for source ticks. Batch enqueue is capacity-atomic at 256
 records or 8 MiB. Envelopes must round-trip through JSON without conversion, trusted routes are
-checked before mutation, and safe errors are control-stripped and bounded. Retry lifecycle and
-operator diagnostics are delivered in the next two stack layers.
+checked before mutation, and safe errors are control-stripped and bounded. The lifecycle layer adds
+fixed retry delays, terminal state after five failures, explicit re-arm, and transaction-coupled
+completion so a thrown materialization cannot delete its durable retry. Operator diagnostics follow
+in the next stack layer.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 

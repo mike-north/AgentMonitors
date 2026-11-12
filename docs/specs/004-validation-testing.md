@@ -113,8 +113,15 @@ Verified by `plugins/source-incoming-changes/src/unavailable.test.ts`,
 
 Runtime tests are the primary proof surface for: state persistence across runtime restarts; due scheduling; delivery lifecycle semantics; session projection; hook state correctness; and atomic rollback of deterministic materialization writes.
 
-**Verified in:** `libs/core/src/runtime/service.test.ts` and
-`libs/core/src/runtime/transactional-materialization.test.ts`.
+Definition-change semantics ([002 §5.3](./002-runtime-delivery.md#53-pending-events-keep-the-semantics-they-were-observed-under))
+need real-runtime scenarios: an event materialized at `normal` is not delivered as a high-urgency
+interrupt after an edit to `high`; an event observed under command A renders A's body and payload
+after an edit to command B; a batch held across the edit and a daemon restart after it keep the
+observed semantics; `explain` counts pre-edit pending events and ignores rows with no fingerprint.
+
+**Verified in:** `libs/core/src/runtime/service.test.ts`,
+`libs/core/src/runtime/transactional-materialization.test.ts` and
+`libs/core/src/runtime/definition-change.test.ts`.
 
 Runtime source-config preflight is **current** behavior (002 §2.0). Tests **MUST**
 prove rejection before source side effects using a real registered source, exact
@@ -465,16 +472,67 @@ The spec set is incomplete unless each major rule has at least one concrete test
 
 The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (in `libs/core/src/runtime/store.ts`) implement snapshot storage keyed by `(workspacePath, monitorId, objectKey)`. The `materializeObservation` method in `libs/core/src/runtime/service.ts` uses these to retrieve the prior snapshot and compute a `diffText` before atomically saving the event, projections/cursor seeds, and snapshot.
 
-| Scenario                                                         | Coverage                                                                                                                                                                                                                                                                                                                    |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `snapshotText` stores a later-retrievable snapshot               | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key"; "computes a diff against the prior snapshot when an object changes").                                                                                                                   |
-| A prior snapshot produces diff text on later change              | Covered (`libs/core/src/runtime/service.test.ts` — "computes a diff against the prior snapshot when an object changes"; "renders a structural json-diff diffText for a real observation routed through processObservation").                                                                                                |
-| Snapshots are isolated by workspace, monitor, and object key     | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key").                                                                                                                                                                                        |
-| Event, projection/cursor, and snapshot writes roll back together | Covered (`libs/core/src/runtime/transactional-materialization.test.ts` — injected cursor and snapshot failures leave no event, projection, cursor, or snapshot).                                                                                                                                                            |
-| Retry outbox survives reopen with route and envelope intact      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — ordered envelopes and timestamps round-trip through an on-disk database reopen).                                                                                                                                                                                    |
-| Retry outbox capacity is batch-atomic and workspace-scoped       | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — exact 256-row and 8 MiB UTF-8 boundaries, competing connections, two-sibling count/aggregate-byte overflow with no partial batch, and independent monitor/workspace scopes).                                                                                        |
-| Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, negative zero, nested/customized Date, non-Date observedAt, and accessor/proxy values fail with a domain error before any sibling is written; altered-prototype built-in brands are rejected; route getters and direct or inherited proxy traps never run). |
-| Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                                                                                                                  |
+| Scenario                                                         | Coverage                                                                                                                                                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `snapshotText` stores a later-retrievable snapshot               | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key"; "computes a diff against the prior snapshot when an object changes").                                                                                                                                                                                   |
+| A prior snapshot produces diff text on later change              | Covered (`libs/core/src/runtime/service.test.ts` — "computes a diff against the prior snapshot when an object changes"; "renders a structural json-diff diffText for a real observation routed through processObservation").                                                                                                                                                                |
+| Snapshots are isolated by workspace, monitor, and object key     | Covered (`libs/core/src/runtime/service.test.ts` — "stores and retrieves snapshots isolated by workspace, monitor, and object key").                                                                                                                                                                                                                                                        |
+| Event, projection/cursor, and snapshot writes roll back together | Covered (`libs/core/src/runtime/transactional-materialization.test.ts` — injected cursor and snapshot failures leave no event, projection, cursor, or snapshot).                                                                                                                                                                                                                            |
+| Retry outbox survives reopen with route and envelope intact      | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — ordered envelopes and timestamps round-trip through an on-disk database reopen).                                                                                                                                                                                                                                                    |
+| Retry outbox capacity is batch-atomic and workspace-scoped       | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — exact 256-row and 8 MiB UTF-8 boundaries, competing connections, two-sibling count/aggregate-byte overflow with no partial batch, and independent monitor/workspace scopes).                                                                                                                                                        |
+| Retry envelopes round-trip without silent data conversion        | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — BigInt, negative zero, nested/customized Date, non-Date observedAt, and accessor/proxy values fail with a domain error before any sibling is written; altered-prototype built-in brands are rejected; route getters and direct or inherited proxy traps never run).                                                                 |
+| Retry errors are safe and bounded                                | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — C0/DEL controls are stripped and persisted errors are capped at 1,024 characters).                                                                                                                                                                                                                                                  |
+| Retry backoff terminalizes and requires explicit re-arm          | Covered (`libs/core/src/runtime/retry-outbox.test.ts` — due filtering, fixed delays, five-attempt terminal state and re-arm; `retry-lifecycle.test.ts` — subsecond deadlines never shorten delays, typed lifecycle failures, callback non-execution, real snapshot/deletion fault rollback, failed-update sanitization and failed/terminal/rearmed/completed states across on-disk reopen). |
+
+### Snapshot materialization order
+
+`runtime/snapshot-materialization-order.test.ts` verifies that the diff predecessor is
+selected by committed insertion order, not timestamp/ULID order. Two actual child
+processes prime genuine snapshot ULID factories in private databases under an identical
+clock; the parent commits the higher-ID writer first and the lower-ID writer second,
+awaiting process exit at each barrier. An already-open independent connection and a fresh
+reader process must both return the second snapshot, giving the adjacent B→C diff.
+No stored IDs are replaced. Children have bounded lifetimes and their exits are awaited.
+
+Additional cases cover wall-clock reversal, rolled-back and rejected writes, deletion of
+the newest/all rows followed by insertion, `VACUUM` and reopen, legacy rowid bootstrap
+with unchanged public data/indexes/triggers and no replayed trigger effects, migration
+idempotence, and simultaneous first-open migration. The existing transactional
+materialization suite retains event/projection/cursor/snapshot rollback coverage.
+
+`inbox/db.migration.test.ts` additionally requires the coordinated event/snapshot
+rebuild to preserve cross-table triggers in both directions, mutual dependencies,
+third-table dependencies, quoted names and only-one-legacy-table cases. Ordinary
+triggers remain controls. Assertions retain exact stored trigger/index SQL, public
+rows and logical references, compatibility metadata and pragmas, prohibit copy-time
+trigger replay, exercise explicit behavior after open/reopen, and require no schema
+churn on an already-current open. Native duplicate-table DDL faults at the second
+rebuild and trigger restoration boundaries must roll back the whole original schema,
+rows, indexes, trigger definitions and metadata; tests inject real SQLite DDL rather
+than a fabricated error or public fault-injection API.
+
+### Equal-time event order
+
+`runtime/event-materialization-order.test.ts` uses two genuine independent event ULID
+factories and controlled commit order at the same clock. Pending/unread queries, event
+listings, pure net selection, actual runtime preview, capped claim, suppression and
+claimed cursor must agree on the later commit. Private sequences must not appear in
+public event records. A high/normal coalescing case checks that concatenating bands
+cannot reverse an equal-time endpoint; the mutating boundary reloads canonical stored
+records and rejects unknown/duplicate IDs before side effects. Unequal observed times
+retain their existing primary order.
+
+Additional cases cover transaction rollback, caller-modified artifact rejection, legacy
+migration with unchanged projections/snapshots/cursors/indexes/triggers, no replayed
+trigger effects, deletion/reinsert, VACUUM/reopen and simultaneous migrating writers.
+Direct public-boundary cases also cover incremental/single-net recipient views whose
+delta differs from shared history, raw shared inputs, lifecycle preservation, forged or
+other-recipient overlays, and a legitimate stale delta after re-anchoring. These must
+resolve to the requested recipient's current persisted projection without trusting
+caller-provided delta text. Lifecycle-only session list views must retain their shared
+diff for incremental and single-net events; lifecycle presence does not select a
+recipient delta. Existing net and hook-cap suites continue to cover per-recipient
+delivery semantics.
 
 ### 3.4.1 Real daemon crash recovery
 
