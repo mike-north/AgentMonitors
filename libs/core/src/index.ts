@@ -1,5 +1,9 @@
-// Shell arguments shared by runtime diagnostics and CLI suggestions.
-export { shellArg, shellSingleQuote } from './commands/shell-arguments.js';
+// Shell arguments and command boundaries shared by runtime diagnostics and CLI suggestions.
+export {
+  _monitorCommandLine,
+  shellArg,
+  shellSingleQuote,
+} from './commands/shell-arguments.js';
 
 // Schema
 export {

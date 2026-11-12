@@ -771,6 +771,9 @@ export class MaterializationRetryTransitionError extends Error {
 // @public
 export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
 
+// @internal
+export function _monitorCommandLine(command: readonly string[], flags: readonly string[], ids: readonly string[]): string;
+
 // @public (undocumented)
 export interface MonitorDefinition {
     displayName: string;

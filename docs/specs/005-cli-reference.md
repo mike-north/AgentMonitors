@@ -886,7 +886,7 @@ The monitor stays paused until this retry completes, then takes newer input in o
 After a skip:
 
 ```
-Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see `agentmonitors monitor explain <monitorId> [--workspace <path> --dir <path>]`.
+Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see `agentmonitors monitor explain [--workspace <path> --dir <path>] -- <monitorId>`.
 The monitor takes newer input on its next tick unless other retained work is still ahead of it.
 ```
 
@@ -912,18 +912,25 @@ state; after a removal, its state when it was removed. The stored observation is
 `{ "error": "<message above>" }`.
 
 The tick report names both commands for a terminal retry (002 §2.7), as do the `monitor explain`
-materialization reason and the `doctor` remediation (§15). These suggestions **MUST** place all
-flags before an option terminator `--`, followed by the monitor and retry IDs, so IDs such as
-`-watcher` remain positional. For example:
+materialization reason and the `doctor` remediation (§15). These repairs and every suggested
+`monitor explain`/`monitor history` command **MUST** place all flags before an option terminator
+`--`, followed by the monitor and retry IDs, so IDs such as `-watcher` remain positional.
+This is the current behavior. For example:
 
 ```sh
 agentmonitors monitor retry rearm --workspace /work/project -- -watcher 01K000000000000000000000000
+agentmonitors monitor explain --workspace /work/project --dir /work/project/.claude/monitors -- -watcher
+agentmonitors monitor history --workspace /work/project -- -watcher
 ```
 
 Shell quoting and workspace scoping remain unchanged. Any additional flags (including `--format`
 and `--reason`) belong before `--`. Verified by the explain/doctor × rearm/skip leading-hyphen
 regressions in `apps/cli/src/retry-repair.test.ts`, which execute the suggestions verbatim through
-`/bin/sh` from another directory and check the persisted repair.
+`/bin/sh` from another directory and check the persisted repair. Follow-up regressions in the same
+suite execute skip-success and both unknown-outcome explain hints, plus doctor explain/history
+hints for dropped observations, pending retries, terminal retries, orphan drops and orphan retained
+work. They use `-watcher` and verify that inspection reads the intended retry or loss without
+changing it.
 
 Verified: `apps/cli/src/retry-repair.test.ts` (built CLI against a real `daemon run`: re-arm then
 success with later input in order, re-arm then failure, skip with the loss in `doctor` and
@@ -2161,8 +2168,8 @@ outranks the retry checks. Its detail is
 rollup line. `<count>` covers every kind of drop; `<error>` is the newest drop's own error, which
 ends in `Not retained for retry: <reason>` for an outbox drop, is the refusal message for a refused
 one, and ends in `Retry skipped after <n> failed attempts[: <reason>].` for a skipped retry. `<which>` uses explain's wording (002 §10.7). The remediation
-names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
-`monitor history <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
+names `monitor explain [flags…] -- <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
+`monitor history [flags…] -- <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
 when the check clears: `A dropped observation cannot be retried. This check clears once a later
 event of this monitor materializes for each dropped object key; a drop without an object key clears
 once a later observation span of this monitor materializes an event and drops nothing.` That is
@@ -2179,7 +2186,7 @@ parse-failed or duplicated id carries the loss in its `orphanedMonitorWork` entr
 whose check is a `skip`. Either way doctor adds a failing `dropped-observation:<id>` check, after
 the per-monitor checks and with any `retry-outbox:<id>` check for that id, whose detail is the
 `observation dropped (…): <error>` text above and whose remediation names
-`monitor history <id>` (with `--workspace` as above), says to repair the definition or reported
+`monitor history [--workspace <path>] -- <id>` (with `--workspace` as above), says to repair the definition or reported
 failure, and gives the same clearing rule.
 
 An ephemeral monitor (`agentmonitors watch`, 007 §4) has no `MONITOR.md`, so it has no monitor row
@@ -2195,9 +2202,9 @@ the check keeps failing. After `watch cancel` or reaping it is a _retired_ ephem
 monitor in `orphanedMonitorWork` (`monitorKind: "ephemeral"`): its checks begin
 `retired ephemeral monitor; `, say it was cancelled or reaped, never had a definition and will not
 observe again, and that the drop check therefore keeps failing (002 §2). No command clears it.
-Retained-work remediation for either names `monitor explain <id>` (its definition stage reports no
+Retained-work remediation for either names `monitor explain [flags…] -- <id>` (its definition stage reports no
 `MONITOR.md`, but it still lists the retained record IDs, in text and structured output) and
-`monitor history <id>`.
+`monitor history [--workspace <path>] -- <id>`.
 
 Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
 through the built CLI, kept failing after a tick of other object keys and cleared by a later

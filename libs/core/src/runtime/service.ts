@@ -11,7 +11,7 @@ import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { ulid } from 'ulid';
-import { shellArg } from '../commands/shell-arguments.js';
+import { _monitorCommandLine } from '../commands/shell-arguments.js';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import {
@@ -1032,17 +1032,11 @@ function retryRepairCommands(
 ): { rearm: string; skip: string } {
   // Always pin a known route: diagnostics can be consumed outside the
   // process/workspace that produced them, including a daemon response.
-  // End option parsing before IDs: shell quoting alone cannot make a legal
-  // leading-hyphen monitor ID positional. Every flag must precede `--`.
-  const target = [
-    ...(workspacePath === null ? [] : ['--workspace', shellArg(workspacePath)]),
-    '--',
-    shellArg(monitorId),
-    shellArg(retryId),
-  ].join(' ');
+  const flags = workspacePath === null ? [] : ['--workspace', workspacePath];
+  const ids = [monitorId, retryId];
   return {
-    rearm: `agentmonitors monitor retry rearm ${target}`,
-    skip: `agentmonitors monitor retry skip ${target}`,
+    rearm: _monitorCommandLine(['retry', 'rearm'], flags, ids),
+    skip: _monitorCommandLine(['retry', 'skip'], flags, ids),
   };
 }
 

@@ -20,6 +20,7 @@ import {
   mkdirSync,
   mkdtempSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -637,7 +638,7 @@ describe('monitor retry behind a daemon that received the request but did not an
       `Error: ${label} outcome unknown for retry ${id} of monitor ${MONITOR} in workspace ${root}: the daemon received the request but no reply arrived (`,
     );
     expect(result.stderr).toContain(
-      'may already have been applied, or may still be applied; nothing was written to the store from here. Check with `agentmonitors monitor explain watcher` or `agentmonitors doctor` before running it again.',
+      'may already have been applied, or may still be applied; nothing was written to the store from here. Check with `agentmonitors monitor explain -- watcher` or `agentmonitors doctor` before running it again.',
     );
   }
 
@@ -854,7 +855,7 @@ describe('monitor retry without a daemon', () => {
       elsewhere,
     );
     expect(skipped.code).toBe(0);
-    const hint = `agentmonitors monitor explain 'it'\\''s mine' --workspace '${workspace}' --dir '${workspaceMonitors}'`;
+    const hint = `agentmonitors monitor explain --workspace '${workspace}' --dir '${workspaceMonitors}' -- 'it'\\''s mine'`;
     expect(skipped.stdout).toContain(`; see \`${hint}\`.`);
 
     // Run it through `sh` exactly as printed, from the same directory.
@@ -868,7 +869,10 @@ describe('monitor retry without a daemon', () => {
     const printed = /; see `([^`]+)`\./u.exec(skipped.stdout)?.[1] ?? '';
     const explained = await execute(
       '/bin/sh',
-      ['-c', `${printed} --format json`],
+      [
+        '-c',
+        printed.replace('monitor explain ', 'monitor explain --format json '),
+      ],
       {
         cwd: elsewhere,
         env: { ...env, PATH: `${bin}:${env['PATH'] ?? ''}` },
@@ -1277,6 +1281,169 @@ it.each([
         expect(
           store.outstandingUnretainedObservationLoss(monitorId, workspace),
         ).toBeDefined();
+      }
+    } finally {
+      client.close();
+    }
+  },
+);
+
+/**
+ * 005 §6/§15: every follow-up addresses the same monitor when pasted verbatim,
+ * even when its legal ID looks like an option. Real persisted retries/losses
+ * distinguish the intended workspace from a command that merely parses.
+ */
+it.each([
+  ['skip success', 'skip', 'explain'],
+  ['unknown rearm', 'unknown-rearm', 'explain'],
+  ['unknown skip', 'unknown-skip', 'explain'],
+  ['doctor dropped explain', 'dropped', 'explain'],
+  ['doctor dropped history', 'dropped', 'history'],
+  ['doctor pending retry', 'pending', 'explain'],
+  ['doctor terminal retry', 'terminal', 'explain'],
+  ['doctor orphan dropped observation', 'orphan-dropped', 'history'],
+  ['doctor orphan retained work', 'orphan-retained', 'explain'],
+] as const)(
+  'follow-up regression: %s for a leading-hyphen monitor through a POSIX shell',
+  async (_label, scenario, followUp) => {
+    const monitorId = '-watcher';
+    const workspace = path.join(root, "Mike's workspace; $literal");
+    const definitions = path.join(workspace, '.claude', 'monitors');
+    writeMonitor(definitions, monitorId);
+    const id = await seedRetry({
+      exhaust: scenario !== 'pending',
+      target: { monitorId, monitorsDir: definitions, workspace },
+    });
+    const caller = path.join(root, 'caller');
+    const bin = path.join(root, 'bin');
+    mkdirSync(caller);
+    mkdirSync(bin);
+    writeFileSync(
+      path.join(bin, 'agentmonitors'),
+      `#!/bin/sh\nexec '${process.execPath}' '${cli}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    const repair = (verb: string) =>
+      run(
+        [
+          'monitor',
+          'retry',
+          verb,
+          '--workspace',
+          workspace,
+          '--socket',
+          socketPath,
+          '--format',
+          'text',
+          '--',
+          monitorId,
+          id,
+        ],
+        caller,
+      );
+    let prose: string;
+    if (scenario.startsWith('unknown-')) {
+      // A real accepted socket request with a lost reply must produce the
+      // inspection hint without performing an in-process repair.
+      const methods: string[] = [];
+      const close = await fakeDaemon((socket, request) => {
+        methods.push(request.method);
+        socket.end();
+      });
+      try {
+        const verb = scenario === 'unknown-rearm' ? 'rearm' : 'skip';
+        const result = await repair(verb);
+        expect(result.code).toBe(1);
+        expect(methods).toEqual([`retry.${verb}`]);
+        expect(result.stderr).toContain('outcome unknown');
+        prose = result.stderr;
+      } finally {
+        await close();
+      }
+    } else {
+      if (scenario === 'skip' || scenario.includes('dropped')) {
+        const result = await repair('skip');
+        expect(result.code).toBe(0);
+        prose = result.stdout;
+      } else {
+        prose = '';
+      }
+      if (scenario.startsWith('orphan-')) {
+        // Preserve the file while removing it from definition discovery.
+        renameSync(
+          path.join(definitions, monitorId, 'MONITOR.md'),
+          path.join(root, 'retired-monitor.md'),
+        );
+      }
+      if (scenario !== 'skip') {
+        const diagnostic = await run(
+          [
+            'doctor',
+            '--workspace',
+            workspace,
+            '--dir',
+            definitions,
+            '--socket',
+            socketPath,
+            '--format',
+            'json',
+          ],
+          caller,
+        );
+        expect(diagnostic.code).toBe(1);
+        const report = JSON.parse(diagnostic.stdout) as {
+          checks: { name: string; remediation?: string }[];
+        };
+        const prefix =
+          scenario === 'orphan-dropped'
+            ? 'dropped-observation'
+            : scenario === 'orphan-retained'
+              ? 'retry-outbox'
+              : 'monitor';
+        prose =
+          report.checks.find(({ name }) => name === `${prefix}:${monitorId}`)
+            ?.remediation ?? '';
+      }
+    }
+    const command = [
+      ...prose.matchAll(
+        /`(agentmonitors monitor (?:explain|history) [^`]+)`/gu,
+      ),
+    ]
+      .map((match) => match[1])
+      .find((value) => value?.startsWith(`agentmonitors monitor ${followUp} `));
+    expect(command).toBeDefined();
+    const result = await execute('/bin/sh', ['-c', command ?? 'exit 99'], {
+      cwd: caller,
+      // Same allowlist as the repair regressions: no inherited format or
+      // executable lookup can conceal an argument parsing failure.
+      env: {
+        HOME: root,
+        XDG_DATA_HOME: env['XDG_DATA_HOME'],
+        AGENTMONITORS_DB: dbPath,
+        AGENTMONITORS_SOCKET: socketPath,
+        PATH: bin,
+      },
+      timeout: 30_000,
+    });
+    if (scenario === 'skip' || scenario.includes('dropped')) {
+      expect(result.stdout).toContain('Retry skipped after 5 failed attempts.');
+    } else {
+      expect(result.stdout).toContain(id);
+    }
+    // Inspection must leave the retained work or outstanding loss intact.
+    const { store, client } = openStore();
+    try {
+      if (scenario === 'skip' || scenario.includes('dropped')) {
+        expect(
+          store.outstandingUnretainedObservationLoss(monitorId, workspace),
+        ).toBeDefined();
+      } else {
+        expect(store.getMaterializationRetry(id)).toMatchObject({
+          monitorId,
+          workspacePath: workspace,
+          status: scenario === 'pending' ? 'pending' : 'terminal',
+        });
       }
     } finally {
       client.close();

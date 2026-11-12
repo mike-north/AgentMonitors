@@ -5532,8 +5532,10 @@ Handle it.
     expect(doctorText.stdout).toMatch(
       /monitor:terminal-retry.*terminal materialization retry.*retry-outbox=0\/1/u,
     );
-    expect(doctorText.stdout).toContain(
-      'agentmonitors monitor explain terminal-retry',
+    // A symlinked temp root may need an explicit workspace spelling even
+    // when the subprocess starts there; the monitor ID stays positional.
+    expect(doctorText.stdout).toMatch(
+      /`agentmonitors monitor explain(?: --workspace [^`]+)? -- terminal-retry`/u,
     );
 
     const doctorJson = runWithEnv(

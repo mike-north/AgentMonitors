@@ -7,12 +7,14 @@
  * own default would resolve to a different workspace or directory than the one
  * the printing command was given.
  *
- * One module owns this so every suggestion quotes and scopes the same way.
+ * Scope stays here; the shared core builder quotes arguments and keeps
+ * monitor/retry IDs after an option terminator so option-looking IDs stay positional.
  */
-import { shellArg } from '@agentmonitors/core';
-export { shellArg, shellSingleQuote } from '@agentmonitors/core';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
+import { _monitorCommandLine, shellArg } from '@agentmonitors/core';
+
+export { _monitorCommandLine, shellSingleQuote } from '@agentmonitors/core';
 
 /**
  * The workspace and monitor definitions a suggestion should read: the same
@@ -44,8 +46,9 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * `--workspace <path>` when the workspace is not the current directory, which
- * every workspace-scoped command defaults to.
+ * Raw `--workspace <path>` arguments when the workspace is not the current
+ * directory, which every workspace-scoped command defaults to. Quoting belongs
+ * to the command builder so every value is escaped exactly once.
  *
  * Workspace keys are the `path.resolve()` spelling and commands default to
  * `process.cwd()` (already a real path), so a symlinked spelling is a
@@ -54,7 +57,7 @@ function samePath(a: string, b: string): boolean {
 export function workspaceFlags(workspacePath: string): string[] {
   return path.resolve(workspacePath) === path.resolve(process.cwd())
     ? []
-    : ['--workspace', shellArg(workspacePath)];
+    : ['--workspace', workspacePath];
 }
 
 /**
@@ -66,18 +69,14 @@ export function workspaceFlags(workspacePath: string): string[] {
 function scopeFlags(scope: SuggestionScope): string[] {
   const flags = workspaceFlags(scope.workspacePath);
   if (!samePath(scope.monitorsDir, '.claude/monitors')) {
-    flags.push('--dir', shellArg(scope.monitorsDir));
+    flags.push('--dir', scope.monitorsDir);
   }
   return flags;
 }
 
 /** `monitor explain <id>` reading the same workspace and definitions. */
 export function explainCommand(scope: SuggestionScope, id: string): string {
-  return [
-    'agentmonitors monitor explain',
-    shellArg(id),
-    ...scopeFlags(scope),
-  ].join(' ');
+  return _monitorCommandLine(['explain'], scopeFlags(scope), [id]);
 }
 
 /**
@@ -88,11 +87,9 @@ export function historyCommand(
   scope: Pick<SuggestionScope, 'workspacePath'>,
   id: string,
 ): string {
-  return [
-    'agentmonitors monitor history',
-    shellArg(id),
-    ...workspaceFlags(scope.workspacePath),
-  ].join(' ');
+  return _monitorCommandLine(['history'], workspaceFlags(scope.workspacePath), [
+    id,
+  ]);
 }
 
 /**
@@ -104,9 +101,9 @@ export function historyCommand(
 export function doctorCommandLine(scope: SuggestionScope): string {
   const flags = workspaceFlags(scope.workspacePath);
   if (!samePath(scope.monitorsDir, workspaceMonitorsDir(scope.workspacePath))) {
-    flags.push('--dir', shellArg(scope.monitorsDir));
+    flags.push('--dir', scope.monitorsDir);
   }
-  return ['agentmonitors doctor', ...flags].join(' ');
+  return ['agentmonitors', 'doctor', ...flags].map(shellArg).join(' ');
 }
 
 /**

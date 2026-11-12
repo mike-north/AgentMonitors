@@ -788,10 +788,10 @@ it('carries doctor scope flags into retained-work explain remediation', async ()
   await serve(fixture);
   const result = await run('doctor', 'text');
   expect(result.code).toBe(1);
-  const scoped = `agentmonitors monitor explain wire-monitor --workspace '/tmp/other ws'\\''s' --dir '/tmp/other ws'\\''s/custom-monitors'`;
+  const scoped = `agentmonitors monitor explain --workspace '/tmp/other ws'\\''s' --dir '/tmp/other ws'\\''s/custom-monitors' -- wire-monitor`;
   expect(result.stdout).toContain(scoped);
   expect(result.stdout).toContain(
-    `agentmonitors monitor explain removed --workspace '/tmp/other ws'\\''s'`,
+    `agentmonitors monitor explain --workspace '/tmp/other ws'\\''s' --dir '/tmp/other ws'\\''s/custom-monitors' -- removed`,
   );
 });
 
@@ -847,9 +847,9 @@ it('keeps the explain remediation bare when doctor uses the invoking workspace d
   await serve(fixture);
   const result = await run('doctor', 'text');
   expect(result.stdout).toContain(
-    '`agentmonitors monitor explain wire-monitor`',
+    '`agentmonitors monitor explain -- wire-monitor`',
   );
-  expect(result.stdout).not.toContain('monitor explain wire-monitor --');
+  expect(result.stdout).not.toContain('--workspace');
 });
 
 /**
@@ -936,14 +936,21 @@ it('carries a symlinked --workspace into the explain remediation and the command
   ).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
   expect(doctor.stdout).toContain(pending.id);
   expect(doctor.stdout).not.toContain(terminal.id);
-  const suggested = /`agentmonitors (monitor explain alpha[^`]*)`/.exec(
+  const suggested = /`agentmonitors (monitor explain [^`]*-- alpha)`/.exec(
     doctor.stdout,
   )?.[1];
   expect(suggested).toBeDefined();
   expect(suggested).toContain(`--workspace ${link}`);
   const explain = await execute(
     process.execPath,
-    [cli, ...(suggested ?? '').split(' '), '--format', 'text'],
+    [
+      cli,
+      'monitor',
+      'explain',
+      '--format',
+      'text',
+      ...(suggested ?? '').split(' ').slice(2),
+    ],
     { cwd, env, timeout: 15000 },
   );
   expect(explain.stdout).toContain(pending.id);
@@ -1448,18 +1455,18 @@ it('fails the doctor monitor check for a dropped observation until a later event
         },
       ).catch((error: { stdout?: string }) => ({ stdout: error.stdout ?? '' }));
       expect(scoped.stdout).toContain(
-        `\`agentmonitors monitor explain dropper --workspace ${root}`,
+        `\`agentmonitors monitor explain --workspace ${root} --dir ${monitors} -- dropper\``,
       );
 
       // Bug (#497 review, finding 4): the history suggestion was bare, so from
       // another directory it read the wrong workspace's rows. It must carry
       // `--workspace`, and running it must show this workspace's drop row.
       const suggestedHistory =
-        /`agentmonitors (monitor history dropper[^`]*)`/.exec(
+        /`agentmonitors (monitor history [^`]*-- dropper)`/.exec(
           scoped.stdout,
         )?.[1];
       expect(suggestedHistory).toBe(
-        `monitor history dropper --workspace ${root}`,
+        `monitor history --workspace ${root} -- dropper`,
       );
       const historyEnv = {
         ...process.env,
@@ -1470,7 +1477,14 @@ it('fails the doctor monitor check for a dropped observation until a later event
       };
       const history = await execute(
         process.execPath,
-        [cli, ...(suggestedHistory ?? '').split(' '), '--format', 'json'],
+        [
+          cli,
+          'monitor',
+          'history',
+          '--format',
+          'json',
+          ...(suggestedHistory ?? '').split(' ').slice(2),
+        ],
         { cwd: realpathSync(elsewhere), timeout: 15000, env: historyEnv },
       );
       expect(history.stdout).toContain(`"workspacePath": "${root}"`);
@@ -1687,7 +1701,7 @@ it.each([
         /^observation dropped \(1 outstanding; newest: observation 2 of 2 \(object-1, "d-1"\) at /,
       ),
       remediation: expect.stringMatching(
-        /^Inspect it with `agentmonitors monitor history dropper[^`]*` and repair the definition or reported failure\. A dropped observation cannot be retried\./,
+        /^Inspect it with `agentmonitors monitor history [^`]*-- dropper` and repair the definition or reported failure\. A dropped observation cannot be retried\./,
       ),
     });
 
@@ -2147,18 +2161,22 @@ async function doctorThenSuggestedExplain(
   expect(check.status).toBe('fail');
   expect(check.remediation).not.toContain('Retry outbox');
   const suggested = suggestedExplainArgs(check.remediation);
-  expect(suggested.slice(0, 3)).toEqual(['monitor', 'explain', monitorId]);
-  // Verbatim: only the output format is appended.
+  expect(suggested.slice(0, 2)).toEqual(['monitor', 'explain']);
+  expect(suggested.slice(-2)).toEqual(['--', monitorId]);
+  // Preserve every printed argument; extra format flags precede the option
+  // terminator so they cannot be interpreted as positional monitor IDs.
   const jsonRun = await runFrom(
-    [...suggested, '--format', 'json'],
+    [...suggested.slice(0, 2), '--format', 'json', ...suggested.slice(2)],
     cwd,
     dbPath,
   );
   const textRun = await runFrom(
-    [...suggested, '--format', 'text'],
+    [...suggested.slice(0, 2), '--format', 'text', ...suggested.slice(2)],
     cwd,
     dbPath,
   );
+  expect(jsonRun.code).toBe(0);
+  expect(textRun.code).toBe(0);
   return {
     remediation: check.remediation,
     recordIds:
