@@ -45,9 +45,10 @@ const START = new Date('2026-03-20T08:00:00.000Z');
  * What the controlled source does for one monitor in one workspace. A `change`
  * reports one captured observation and advances the baseline to `ref: B`; a
  * `fail` rejects without touching anything, exactly like a source that cannot
- * reach its repository.
+ * reach its repository. A `stall` call stays pending until the test rejects it
+ * with that same error, so the test can act while observe() is in flight.
  */
-type Mode = 'quiet' | 'change' | 'fail';
+type Mode = 'quiet' | 'change' | 'fail' | 'stall';
 
 interface MonitorSpec {
   id: string;
@@ -77,6 +78,8 @@ function fixture(workspaces: Record<string, MonitorSpec[]>) {
   const dbPath = path.join(root, 'state.sqlite');
   const modes = new Map<string, Mode>();
   const calls = new Map<string, number>();
+  const stalled: ((error: Error) => void)[] = [];
+  let announceStall: (() => void) | undefined;
   const modeKey = (workspace: string, id: string) =>
     JSON.stringify([workspace, id]);
   const paths: Record<string, { workspace: string; monitors: string }> = {};
@@ -102,6 +105,12 @@ function fixture(workspaces: Record<string, MonitorSpec[]>) {
       return Promise.reject(
         new Error(`repository unavailable for ${String(config['label'])}`),
       );
+    if (mode === 'stall') {
+      return new Promise((_resolve, reject) => {
+        stalled.push(reject);
+        announceStall?.();
+      });
+    }
     const previous = context.previousState as { ref?: string } | undefined;
     return Promise.resolve({
       observations:
@@ -174,6 +183,16 @@ function fixture(workspaces: Record<string, MonitorSpec[]>) {
     paths,
     set(name: string, id: string, mode: Mode) {
       modes.set(modeKey(ws(name).workspace, id), mode);
+    },
+    /** Resolves once an observe() call in `stall` mode is pending. */
+    nextStall: () =>
+      new Promise<void>((resolve) => {
+        announceStall = resolve;
+      }),
+    /** Reject every pending `stall` call as an unavailable repository. */
+    failStalled(label: string) {
+      for (const reject of stalled.splice(0))
+        reject(new Error(`repository unavailable for ${label}`));
     },
     calls: (name: string, id: string) =>
       calls.get(modeKey(ws(name).workspace, id)) ?? 0,
@@ -303,7 +322,10 @@ describe('held notify work despite source observation failures (#558)', () => {
       expect(events).toHaveLength(1);
       expect(events[0]).toMatchObject({
         id: flushed.emittedEventIds[0],
-        title: 'Captured held',
+        // The named monitor's title, with the captured source title as the
+        // summary (002 §5.4).
+        title: 'held',
+        summary: 'Captured held',
         snapshotText: 'content of held',
         urgency: 'low',
         objectKey: 'ref',
@@ -581,6 +603,35 @@ describe('held notify work despite source observation failures (#558)', () => {
       expect(f.events('a', 'held')).toEqual([]);
     });
 
+    it('a definition rejected while observe() is in flight closes the gate, so the failure flushes nothing', async () => {
+      const spec = { id: 'held', notify: DEBOUNCE };
+      const f = fixture({ a: [spec] });
+      const held = await holdThenFail(f);
+      f.set('a', 'held', 'stall');
+      f.at('2026-03-20T08:00:11.000Z');
+      const stalled = f.nextStall();
+      const inFlight = f.tick('a');
+      await stalled;
+      // A concurrent rescan finds the edited, schema-invalid definition and
+      // closes the admission gate to protect the held work (002 §2.0, §4.6).
+      f.rewrite('a', spec, 5);
+      const rescan = await f.tick('a');
+      expect(rescan.skippedMonitors).toEqual([
+        expect.objectContaining({
+          monitorId: 'held',
+          validationError: expect.any(String),
+        }),
+      ]);
+      f.failStalled('held');
+      const failed = await inFlight;
+      expect(failed.emittedEventIds).toEqual([]);
+      expect(failed.erroredObservations).toEqual([
+        { monitorId: 'held', message: 'repository unavailable for held' },
+      ]);
+      expect(f.state('a', 'held')).toEqual(held);
+      expect(f.events('a', 'held')).toEqual([]);
+    });
+
     it('a missing definition never flushes held work, even past its deadline', async () => {
       const f = fixture({ a: [{ id: 'held', notify: DEBOUNCE }] });
       const held = await holdThenFail(f);
@@ -663,7 +714,7 @@ describe('held notify work despite source observation failures (#558)', () => {
     expect(after.lastObservationAt).toEqual(held.lastObservationAt);
     const events = f.events('a', 'held');
     expect(events).toHaveLength(1);
-    expect(events[0]?.title).toBe('Captured held');
+    expect(events[0]?.summary).toBe('Captured held');
 
     // The scheduling timestamp did not advance, so the next tick asks the
     // source again: the failure is recorded again and nothing is re-delivered.
