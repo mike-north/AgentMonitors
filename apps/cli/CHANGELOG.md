@@ -1,5 +1,97 @@
 # @agentmonitors/cli
 
+## 0.12.0
+
+### Minor Changes
+
+- ffe8e8e: Render safe retained retry records in monitor explain and doctor, including missing or invalid definitions. Reconstruct socket timestamps, normalize legacy errors, and preserve old-daemon compatibility without mutating retained work. Keep available nested-only retry details visible once in text explain while preserving top-level summary precedence and structured omission. Doctor never reports an invented empty outbox for duplicate-id monitors and its explain remediation carries the workspace and directory it was given.
+- 2380ebe: Keep an observation that was dropped because the retry outbox could not retain it visible until it is superseded. A drop with an object key stays reported until an event of the same monitor and workspace materializes for that key from an observation admitted after the drop (a retained retry admitted before the drop does not count, even when it completes later); a drop without one stays reported until a later observation span of that monitor materializes an event and drops nothing. Quiet ticks, notify holds, observe failures, events for other keys and daemon restarts no longer clear it. While it is outstanding, `monitor explain` fails at the materialization stage and `doctor` fails the monitor's check, naming the error. The doctor report and its JSON add `unretainedObservationLoss`. A drop whose definition was removed, fails to parse or is duplicated is reported in that id's `orphanedMonitorWork` entry, and doctor fails a `dropped-observation:<id>` check for it (also for a definition that fails validation). The doctor report's orphan groups are now `orphanedMonitorWork` (`OrphanedMonitorWork`): each carries `monitorId`, `monitorKind`, and `materializationRetries` or `unretainedObservationLoss` only when present. A live ephemeral monitor's drop and retained work are reported under that monitor in `ephemeralMonitorWork`; once it is cancelled or reaped they stay visible in `orphanedMonitorWork` as a retired ephemeral monitor, and doctor's checks name it as such instead of asking for a definition repair. While a live ephemeral monitor's persisted scope is rejected by its source, its `EphemeralMonitorWork` group (and its doctor JSON entry) carries `validationError` with the same reason the tick reports when it skips the watch, and its checks say that cancelling and re-declaring the watch restores observation but leaves this id's work reported under its retired id. The history row for a dropped observation records its position in the span, its `objectKey` and its `title`, as bounded, control-free text, and never its payload. The runtime database gains two nullable `observation_history` columns, a nullable admission column on `monitor_events` and on `materialization_retry_outbox`, and three indexes through the additive schema migration.
+
+### Patch Changes
+
+- 65351d0: Bound monitor files to 1 MiB through shared bounded reads in direct parsing and production scans, tags to 256 entries, and derive rules to 128 before element validation. Exported collection schemas now preprocess admission, and parse errors optionally carry INPUT_LIMIT_EXCEEDED. Bound daemon requests to 1 MiB, 1000 entries per collection, 10000 values, and depth 32 before schema validation or runtime mutation. Rejected requests return a structured wire error without affecting existing sessions.
+
+  Integrate with Zod 4 while retaining native Shape rejection. Admission errors use only own envelope IDs, decoded traversal avoids copying container values, and raw-frame diagnostics describe bytes before decoding.
+
+  Keep validation hints within the monitor read budget, including files that grow or are replaced after discovery, and expose the existing bounded synchronous reader for diagnostic consumers. Reject Promise and other non-array collection declarations before async preprocessing can unwrap them; preserve raw-array admission and ordinary type diagnostics.
+
+- f194a12: Allow fresh normal and low reminder batches while older events remain claimed and unacknowledged.
+  Preserve same-band in-flight reservation holds and high-urgency settle coalescing, and update
+  suppression diagnostics to distinguish no new work from a temporary reservation.
+
+  Use the explicit `no-new-work` diagnostic for healthy claimed-only backlogs. Retain conservative
+  health warnings for legacy daemon reasons whose policy can still block future batches.
+
+- 820c190: An observation a debounce or rollup hold refuses because its payload can't be serialized is now
+  tracked as outstanding loss, like an observation the retry outbox couldn't retain. `doctor` counts
+  it and `monitor explain` keeps a failing materialization stage until it is superseded: by a later
+  event for the same object key, or, with no object key, by a later span that materializes an event
+  and drops nothing. Quiet ticks, holds and restarts no longer hide it. The refusal is still reported
+  once on the tick result or through the watcher's `onError`, with the same message. Doctor's loss
+  detail now reads `observation dropped (<count> outstanding; …)` and explain's reason
+  `<count> observation(s) were dropped because the runtime could not keep them; …`, since the loss may
+  come from either cause.
+- 36307ad: Verify a process's identity immediately before every cleanup signal. Core adds `sendVerifiedSignal` and `readProcessTable`: a target is signalled only while its spawned child is still unreaped, when a recorded process (pid and start time, read from `/proc` on Linux or `/bin/ps` on macOS) is still present, or, for a process group, while the group can be shown to be the same one (a member confirmed earlier is still in it). Otherwise the signal is withheld and a warning names what was left alone and why.
+
+  `sendVerifiedSignal` also accepts `trackMembership` (`GroupMembershipTracking`): after a step signals a process group, the gate keeps reading the group's membership every 250 ms, one read at a time, until the next step starts, so a member that forks a process and later exits passes the group on to it. Tracking stops on an empty group, on lost continuity, at `untilMs`, or when its abort signal fires, and its timers never keep the process alive.
+
+  `command-poll` timeouts still escalate from SIGTERM to SIGKILL across the command's process group, including processes the command forks after the SIGTERM step, processes a member that ignores SIGTERM forks during the grace period before exiting, and commands that exit while the SIGTERM step is checking the group. The SIGKILL follow-up now skips a group that has emptied, and leaves a group alone, with a warning, only when none of its current members was ever confirmed as part of it or the process table cannot be read. One case still escapes the timeout's bound: after the command itself has exited, a member that forks a process and exits between two consecutive readings (within one 250 ms interval plus one read, and the read time grows under load, up to the 5 s `ps` cap), while no other confirmed member is alive, leaves that process unconfirmed, and it is left alone with a warning. `daemon run --detach` failure cleanup and `verify` teardown signal only their own unreaped child, never a pid left behind by a child that has already exited.
+
+- d6c56a3: Report unavailable incoming-changes repositories and refs as recoverable source errors instead of successful empty baselines. Resolve authored revision expressions unchanged, then verify the resolved object ID peels to a commit; reject blob paths without changing valid commit-search semantics in SHA-1 or SHA-256 repositories. Capture Git stderr and retain the last-good source state for recovery. Source consumers must now handle observation rejection for unavailable inputs through the existing error contract.
+
+  Require initial state before monitor test claims a baseline. Include source errors in history text and explain using bounded single-line display, without rewriting stored audit data. Existing source-error retry cadence and held-notification deferral remain unchanged.
+
+- ae08f21: Upgrade direct validation to patched Zod 4 and raise MCP SDK and TOON dependency floors. Exported schema objects now use Zod 4 schema types; parsed monitor fields and authored validation messages retain their contracts. Preserve historical Shape admission by rejecting Date (including YAML timestamps), Map, Set, and objects with callable then/catch before normalization or promise assimilation; synchronous and asynchronous validation return failures for these inputs while retaining other object controls; the exported Shape validator uses a preprocessing pipe with unchanged authored input and parsed output types. The MCP SDK v3 compatibility path and external cel-js lodash dependency remain separately documented security limitations.
+- 1cbef80: Existing monitors with config rejected by their source schema now stop observing intentionally. Runtime ticks and continuous watcher startup validate before source effects; daemon output, monitor explain and doctor show the same diagnostic as validate. Correct the reported config to resume using the retained source baseline and pending notify work, including after restart.
+
+  Tick `skippedMonitors` entries now include either `validationError` for invalid config or `nextDueAt` for a valid monitor that is not yet due. Consumers must check which field is present before reading a due time.
+
+  Source-config validation uses a private schema copy so valid frozen source schemas work without mutation. Validator setup/evaluation exceptions now reject only the affected monitor with an explicit diagnostic, allowing healthy siblings, tick cleanup and watcher startup to proceed. Baselines, cursors and pending notify work are retained until the schema is corrected.
+
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+- d1649cf: Keep `verify --use-workspace-daemon` scratch files out of later sessions after any delay, restart or config repair.
+
+  The run now registers exact ownership of its scratch file with the workspace daemon before creating it. Once the run finishes, or its session ends or is reaped, the daemon retracts the verified monitor's events for that file and drops that monitor's later observations of it, including held work and retained retries, with no expiry. A dropped retry never pauses the monitor, and a dropped scratch file never makes `doctor` keep reporting an observation a hold refused after a newer change to the same object has superseded it. Legitimate changes, other workspaces and real watched paths are unaffected, and sibling monitors that happen to watch the scratch path are not covered. Against an older daemon, verify falls back to the previous time-limited cleanup.
+
+  Core adds `AgentMonitorRuntime.registerVerifyArtifact`, `requestVerifyArtifactCleanup` and `listVerifyArtifacts`, the `VerifyArtifactRecord`, `RegisterVerifyArtifactInput`, `VerifyArtifactCleanupResult` and `VerifyArtifactCleanupCause` types, and an additive `verify_artifacts` table. The session reaper no longer installs a time-limited suppression for scratch-named paths it did not see registered.
+
+- 16a8c53: Use observation record identities to recognize verification changes within the same persisted second and during long trigger commands. Preserve conservative negative verdicts when history is incomplete or a change is still settling.
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [71c44fa]
+- Updated dependencies [2380ebe]
+- Updated dependencies [65351d0]
+- Updated dependencies [cb92b95]
+- Updated dependencies [d30c9a1]
+- Updated dependencies [3b205ed]
+- Updated dependencies [57e2878]
+- Updated dependencies [3b205ed]
+- Updated dependencies [f194a12]
+- Updated dependencies [e9f3fdf]
+- Updated dependencies [aa5b437]
+- Updated dependencies [820c190]
+- Updated dependencies [36307ad]
+- Updated dependencies [587d0a9]
+- Updated dependencies [caa2452]
+- Updated dependencies [2380ebe]
+- Updated dependencies [7265259]
+- Updated dependencies [d6c56a3]
+- Updated dependencies [ae08f21]
+- Updated dependencies [587d0a9]
+- Updated dependencies [1cbef80]
+- Updated dependencies [2380ebe]
+- Updated dependencies [8ce3139]
+- Updated dependencies [587d0a9]
+- Updated dependencies [28e6e00]
+- Updated dependencies [7c30c92]
+- Updated dependencies [d1649cf]
+- Updated dependencies [2380ebe]
+  - @agentmonitors/core@0.14.0
+  - @agentmonitors/source-api-poll@0.6.0
+  - @agentmonitors/source-command-poll@0.5.0
+  - @agentmonitors/source-file-fingerprint@0.5.0
+  - @agentmonitors/source-incoming-changes@0.4.0
+  - @agentmonitors/source-schedule@0.3.0
+
 ## 0.11.0
 
 ### Minor Changes
