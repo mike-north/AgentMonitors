@@ -1607,6 +1607,16 @@ no orphan). Platform-specific mechanism:
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
   from on this platform.
 
+**Every escalation step is identity-verified at signal time** (issue #479,
+[008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step runs while the direct child is
+still unreaped, so the live child handle confirms the group, and the group's members (pid and start
+time) are recorded. The SIGKILL follow-up usually runs after the direct child has been reaped; it
+is sent only if a process recorded at the SIGTERM step is still in the group. An empty group needs
+no signal. A group none of whose current members was recorded is left alone: its id may have been
+reused, so the step abstains and writes a warning to the daemon's stderr (the daemon log) naming
+the group, the members it saw and why identity could not be confirmed. On Windows the follow-up
+`taskkill` runs only while the direct child is still unreaped.
+
 Resolution on timeout is driven by the direct child's own `exit` event, never by waiting for its
 stdio streams to `close`. A descendant that inherited stdout/stderr (the `sleep` in the example
 above) can hold those pipes open indefinitely even after the whole process group has been signaled;

@@ -9,6 +9,19 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-11 — Identity-verified live cleanup signals (008 §3.1, §5, §6.1; 003 §11.2; 004 §3.2, §3.5) — Refs #479
+
+Moves 008 §5 to _current_ for live signal paths. Every cleanup or enforcement signal goes through
+one shared gate in core that verifies the target at signal time, then signals or abstains. Evidence
+is the live child handle while Node holds the child unreaped, or a recorded `(pid, pgid, start
+time)` read from `/proc` on Linux or `/bin/ps` on macOS. A process group whose leader has been
+reaped is confirmed only through a surviving member recorded when the group was last confirmed;
+otherwise the `command-poll` SIGKILL follow-up abstains instead of signalling a possibly reused
+group id. Environment-variable marks were rejected because macOS hides the environment of platform
+binaries. Adds the live signal-send inventory (§5.2), narrows §3.1 to name the abstention case, and
+records the interim abstention surface: a warning line on the daemon's stderr. The durable,
+deduplicated warning surface stays target under #507, and the restart sweep under #478.
+
 ## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
 
 States a contract the runtime already satisfied: a pending event is delivered with the urgency,
