@@ -8,8 +8,8 @@ import type {
   ObservationContext,
   ObservationResult,
   ObservationSource,
+  SignalTarget,
 } from '@agentmonitors/core';
-import type { SignalTarget } from '@agentmonitors/core';
 import {
   OPERATION_TIMEOUT_PATTERN,
   diffKeyedCollection,
