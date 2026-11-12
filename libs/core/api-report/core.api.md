@@ -1370,6 +1370,8 @@ export class RuntimeStore {
     };
     materializationRetryMonitorIds(workspacePath: string | null): string[];
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
+    // @internal
+    oldestMaterializationRetry(monitorId: string, workspacePath: string | null): MaterializationRetryRecord | undefined;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
     // @internal

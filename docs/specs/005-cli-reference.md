@@ -2093,7 +2093,8 @@ Explain's local fallback preserves definition/scheduling failures with their ret
 valid definition with retry-only state is a persisted report with the no-daemon notice, not a
 "no persisted state" remediation. Repeated diagnostic reads must not mutate retry state, observe,
 materialize, deliver, or re-arm work. Remediation identifies the monitor and retained record IDs;
-this slice provides no retry action command or automatic drain-before-observe adoption.
+there is no retry action command. The runtime itself drains retained work before newer source
+input ([002 §2.7](./002-runtime-delivery.md#27-retained-work-drains-before-newer-source-input-current)).
 
 Verified: `apps/cli/src/retry-diagnostics.test.ts` uses a real owned JSONL socket and built CLI plus
 legacy SQLite rows, including same-ID other-workspace exclusion, missing/invalid/duplicate

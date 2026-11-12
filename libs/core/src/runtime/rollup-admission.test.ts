@@ -450,12 +450,19 @@ describe('not-due rollup admission', () => {
       await f
         .makeRuntime(new RuntimeStore(f.connect().db))
         .tick(f.monitorsDir, f.root);
-      expect(f.reader.listMaterializationRetries().map(({ id }) => id)).toEqual(
-        retries.map(({ id }) => id),
-      );
-      expect(f.reader.listEvents().map(({ id }) => id)).toEqual(
-        events.map(({ id }) => id),
-      );
+      // The window does not flush again. Its retained suffix, now due, drains
+      // on the reopened runtime in its original order, each exactly once
+      // (002 §2.7).
+      expect(f.reader.listMaterializationRetries()).toEqual([]);
+      expect(
+        f.observer.client
+          .prepare('SELECT id, summary FROM monitor_events ORDER BY sequence')
+          .all(),
+      ).toEqual([
+        { id: events[0]?.id, summary: 'step-1' },
+        { id: expect.any(String), summary: 'step-2' },
+        { id: expect.any(String), summary: 'step-3' },
+      ]);
     } finally {
       f.interpretation.release();
       await tick;

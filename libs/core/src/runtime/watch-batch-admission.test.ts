@@ -178,12 +178,16 @@ describe('watch batch admission', () => {
     it(`commits the complete batch and checkpoint before Interpret and next pull (retained suffix: ${String(retainedSuffix)})`, async () => {
       const interpretation = barrier();
       let resumed = false;
+      let retainedAtResume: string[] | undefined;
       let checkpointProperty: boolean | undefined;
       const f = fixture(
         source(async function* (_config, context) {
           checkpointProperty = Object.hasOwn(context, 'checkpoint');
           yield batch();
           resumed = true;
+          retainedAtResume = f.reader
+            .listMaterializationRetries()
+            .map(({ envelope }) => envelope.observation.summary);
           await idle(context);
         }),
         interpretation.adapter,
@@ -240,7 +244,20 @@ describe('watch batch admission', () => {
           })),
         );
         interpretation.release();
-        await vi.waitFor(() => expect(resumed).toBe(true));
+        // A retained suffix drains, after its first backoff, before the next
+        // pull (002 §2.7).
+        await vi.waitFor(() => expect(resumed).toBe(true), {
+          timeout: 5_000,
+          interval: 50,
+        });
+        expect(retainedAtResume).toEqual([]);
+        expect(
+          f.observer.client
+            .prepare('SELECT summary FROM monitor_events ORDER BY sequence')
+            .all(),
+        ).toEqual(
+          ['step-1', 'step-2', 'step-3'].map((summary) => ({ summary })),
+        );
         expect(errors).toHaveLength(retainedSuffix ? 1 : 0);
       } finally {
         interpretation.release();

@@ -212,6 +212,16 @@ function materializationRetryKey(
   );
 }
 
+/**
+ * When a retained observation entered the runtime: its reserved position in
+ * the materialization order (NULL for rows queued before positions existed)
+ * and its observation time, the fallback for sessions without a position.
+ */
+interface RetryAdmission {
+  admissionSequence: number | null;
+  observedAt: Date;
+}
+
 /** Bound persisted and projected failure text without letting it control terminal layout. */
 function safeRetryError(message: string): string {
   return safeDiagnosticText(message);
@@ -491,22 +501,29 @@ export class RuntimeStore {
     }
 
     const id = ulid();
-    db.insert(agentSessions)
-      .values({
-        id,
-        adapter: input.adapter,
-        hostSessionId: input.hostSessionId,
-        agentIdentity: input.agentIdentity,
-        role: input.role ?? 'lead',
-        workspacePath: input.workspacePath ?? null,
-        hookStatePath: input.hookStatePath,
-        status: 'active',
-        baselineAt: now,
-        lastActiveAt: now,
-        createdAt: now,
-        updatedAt: now,
+    db.$client
+      .transaction(() => {
+        db.insert(agentSessions)
+          .values({
+            id,
+            adapter: input.adapter,
+            hostSessionId: input.hostSessionId,
+            agentIdentity: input.agentIdentity,
+            role: input.role ?? 'lead',
+            workspacePath: input.workspacePath ?? null,
+            hookStatePath: input.hookStatePath,
+            status: 'active',
+            baselineAt: now,
+            lastActiveAt: now,
+            createdAt: now,
+            updatedAt: now,
+            // Ordered against retry admissions without relying on whole-second
+            // timestamps (002 §2.7); a resumed session keeps this position.
+            registrationSequence: this.reserveAdmissionSequence(),
+          })
+          .run();
       })
-      .run();
+      .immediate();
 
     return this.getSessionById(id);
   }
@@ -1051,6 +1068,35 @@ export class RuntimeStore {
   }
 
   /**
+   * The retry that must complete next for one workspace/monitor, pending or
+   * terminal, or `undefined` when its outbox is empty. Order is admission
+   * order: the position each row reserved in the materialization order when
+   * it was queued (002 §2). Rows queued before positions were reserved
+   * predate every positioned row and keep their enqueue order. Timestamps are
+   * whole seconds, so they cannot order rows admitted in the same second.
+   *
+   * @internal
+   */
+  oldestMaterializationRetry(
+    monitorId: string,
+    workspacePath: string | null,
+  ): MaterializationRetryRecord | undefined {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(materializationRetryOutbox)
+      .where(materializationRetryKey(monitorId, workspacePath))
+      .orderBy(
+        sql`${materializationRetryOutbox.admissionSequence} IS NOT NULL`,
+        asc(materializationRetryOutbox.admissionSequence),
+        asc(materializationRetryOutbox.createdAt),
+        asc(materializationRetryOutbox.id),
+      )
+      .limit(1)
+      .get();
+    return row ? rowToMaterializationRetry(row) : undefined;
+  }
+
+  /**
    * Discover every retained outbox in one exact workspace without loading
    * private envelopes. A row-list limit cannot serve this purpose: capacity is
    * per monitor, so the first full outbox must not hide other monitor routes.
@@ -1261,7 +1307,6 @@ export class RuntimeStore {
               'does not match the retained observation route',
             );
           }
-          const result = this.insertEvent(input, baseline, options);
           // The event commits now but its observation was admitted when the
           // retry was queued; supersession of a drop compares admission (002 §2).
           // A row queued before positions were reserved predates every drop.
@@ -1272,6 +1317,12 @@ export class RuntimeStore {
             .from(materializationRetryOutbox)
             .where(eq(materializationRetryOutbox.id, id))
             .get();
+          // Only sessions that existed when the observation was admitted
+          // receive it, however long the retry took (002 §2.7).
+          const result = this.writeEvent(input, baseline, options, {
+            admissionSequence: admission?.admissionSequence ?? null,
+            observedAt: current.envelope.observedAt,
+          });
           db.update(monitorEvents)
             .set({ admissionSequence: admission?.admissionSequence ?? 0 })
             .where(eq(monitorEvents.id, result.id))
@@ -1329,6 +1380,22 @@ export class RuntimeStore {
     baseline?: { previousContent: string | null },
     options?: { restrictToSessionId?: string },
   ): MonitorEventRecord {
+    return this.writeEvent(input, baseline, options);
+  }
+
+  /**
+   * {@link RuntimeStore.insertEvent}, optionally limited to recipients that
+   * were registered before the event's observation was admitted. Retry
+   * completion supplies that admission; events materialized in their
+   * admitting span need no limit, because admission and projection share one
+   * transaction.
+   */
+  private writeEvent(
+    input: Omit<MonitorEventRecord, 'id'>,
+    baseline?: { previousContent: string | null },
+    options?: { restrictToSessionId?: string },
+    admittedAt?: RetryAdmission,
+  ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const materialized = db.$client
       .transaction(() => {
@@ -1381,7 +1448,7 @@ export class RuntimeStore {
         // leaking. The declaring session must also still be `active`: a session reaped
         // mid-tick (its close raced this observation) must not receive a projection
         // (007 §4.4). The event row itself is still retained for durability.
-        const projectionTargets = ephemeralStillActive
+        const candidates = ephemeralStillActive
           ? this.sessionsForWorkspace(event.workspacePath).filter(
               (candidate) =>
                 candidate.role === 'lead' &&
@@ -1390,6 +1457,10 @@ export class RuntimeStore {
                     candidate.status === 'active')),
             )
           : [];
+        const projectionTargets =
+          admittedAt === undefined
+            ? candidates
+            : this.sessionsRegisteredBefore(candidates, admittedAt);
         for (const session of projectionTargets) {
           // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
           // Compute this session's delta against ITS OWN baseline cursor, and seed
@@ -1939,6 +2010,49 @@ export class RuntimeStore {
   }
 
   /**
+   * Keep the sessions that were registered before a retained observation was
+   * admitted (002 §2.7). Both positions come from the materialization-order
+   * counter, so a session registered in the same second as the admission is
+   * still ordered correctly. Data written before positions were reserved
+   * falls back as follows: a retry without a position predates every
+   * positioned session, so such a session is excluded; a session without a
+   * position is compared by its whole-second registration time against the
+   * observation time, the only order an earlier version recorded.
+   */
+  private sessionsRegisteredBefore(
+    candidates: AgentSessionRecord[],
+    admittedAt: RetryAdmission,
+  ): AgentSessionRecord[] {
+    if (candidates.length === 0) return candidates;
+    const positions = new Map(
+      asInternalDb(this.db)
+        .select({
+          id: agentSessions.id,
+          registrationSequence: agentSessions.registrationSequence,
+        })
+        .from(agentSessions)
+        .where(
+          inArray(
+            agentSessions.id,
+            candidates.map(({ id }) => id),
+          ),
+        )
+        .all()
+        .map((row) => [row.id, row.registrationSequence] as const),
+    );
+    return candidates.filter((session) => {
+      const registered = positions.get(session.id) ?? null;
+      if (registered === null) {
+        return session.baselineAt.getTime() <= admittedAt.observedAt.getTime();
+      }
+      return (
+        admittedAt.admissionSequence !== null &&
+        registered < admittedAt.admissionSequence
+      );
+    });
+  }
+
+  /**
    * Reserve the next position in the `monitor_events` materialization order
    * for an observation admitted now but materialized later (a retained retry).
    *
@@ -1949,6 +2063,10 @@ export class RuntimeStore {
    * below every later one. SQLite documents `sqlite_sequence` as writable;
    * raising it only makes the next event skip the reserved value. Must run
    * inside the admitting transaction.
+   *
+   * Registering a session reserves a position the same way, so a retry can
+   * be ordered against the sessions that existed when it was admitted
+   * (002 §2.7). A registration position never belongs to an event.
    */
   private reserveAdmissionSequence(): number {
     const client = asInternalDb(this.db).$client;

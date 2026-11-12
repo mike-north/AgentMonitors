@@ -257,9 +257,21 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       last_recap_at INTEGER,
       dormant_at INTEGER,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      registration_sequence INTEGER
     )
   `);
+  // Additive migration (002 §2.7): a session reserves its registration
+  // position in the event materialization order, so a delayed retry can tell
+  // whether the session existed when its observation was admitted. Sessions
+  // registered by an earlier version keep NULL and fall back to their
+  // registration time.
+  addColumnIfMissing(
+    sqlite,
+    'agent_sessions',
+    'registration_sequence',
+    'INTEGER',
+  );
 
   // Workspace-namespacing migration for `monitor_state` (issue #345 / #307).
   // Rebuilds the table under the `(monitor_id, workspace_path)` key while

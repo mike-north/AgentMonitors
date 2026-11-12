@@ -1,0 +1,5 @@
+---
+'@agentmonitors/core': minor
+---
+
+Complete retained work before taking newer source input. A monitor whose observations are waiting in the retry outbox now retries them, oldest first, before its source is called again or a watcher pulls its next batch, so events are never materialized out of order. While a retry fails or backs off the monitor pauses and says so: each failed attempt is reported as an errored observation with an `errored` history row, a backing-off retry shows up as a skipped monitor with its next attempt time, and a retry that has stopped after its last attempt is reported on every tick until it is re-armed. Retained work left from before a restart drains first, in its original order, exactly once. Held notify work also waits behind retained work. Sessions now record their position in the event order when they are first registered (a new nullable `agent_sessions.registration_sequence` column, added on open), and a retry that completes late is delivered only to sessions that existed when its observation was accepted, even when a session was opened in the same second.
