@@ -11,6 +11,10 @@ on:
     paths:
       - '**/package.json'
       - '**/tsup.config.ts'
+      # Existing dev imports can become bundled without a manifest change.
+      - 'libs/core/**'
+      - 'plugins/source-*/**'
+      - 'apps/cli/**'
       - 'scripts/publish-release-packages.mjs'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
@@ -23,6 +27,10 @@ on:
     paths:
       - '**/package.json'
       - '**/tsup.config.ts'
+      # Existing dev imports can become bundled without a manifest change.
+      - 'libs/core/**'
+      - 'plugins/source-*/**'
+      - 'apps/cli/**'
       - 'scripts/publish-release-packages.mjs'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
@@ -56,5 +64,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # The gate refreshes workspace exports with an uncached serial build,
+      # then builds temporary metafiles. No separate build step is required.
       - name: Audit production and bundled dependencies (fails on unresolved high/critical advisories)
         run: pnpm check:dependency-audit

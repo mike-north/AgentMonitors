@@ -195,13 +195,21 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   `lodash-es`, `ramda`) into its build (`noExternal` in `libs/core/tsup.config.ts`) and lists them
   as `devDependencies`, so consumers receive the patched versions this workspace resolves; their
   licenses ship in `libs/core/THIRD_PARTY_NOTICES.md`. Adding a bundled dependency means adding its
-  notice there. The live gate derives bundled roots from every published package's
-  `tsup.config.ts` `noExternal` selectors (strings and regular expressions) and follows
-  their resolved runtime/optional closure in `pnpm-lock.yaml`. It combines the production
-  audit with exact bundled-version findings from a full audit, using the same scoped,
-  expiring allowlist for both. Unrelated development tooling remains outside the gate;
-  unknown config/lock shapes or an unreachable audit endpoint fail closed. Adding a
-  `noExternal` package therefore adds advisory coverage without a second package list.
+  notice there. The live gate rebuilds every published tsup package sequentially into fresh temporary
+  output with `--metafile`, then audits the third-party inputs that contribute bytes to
+  those outputs. This includes default-inlined development imports and injected tool
+  code such as tsup's shims, even without a matching `noExternal` selector. Installed
+  package identities must match exact versions in `pnpm-lock.yaml`. `noExternal` remains
+  declared build intent; selectors absent from the bundle are reported without failing.
+  Fresh audit builds require installed dependencies, not existing `dist` output, so CI
+  runs the gate after its frozen install. The gate first runs a serialized workspace
+  build with Nx caching disabled so the CLI sees fresh internal package exports. It
+  then builds temporary metafiles without changing release artifacts. Build failure
+  or missing metadata fails closed; stale output is never reused. The extra build
+  cost avoids timestamp-based freshness assumptions. The production audit and exact bundled
+  findings from a full audit share the scoped, expiring allowlist. Unbundled development
+  tooling stays excluded; unsupported build/lock shapes or unreachable endpoints fail
+  closed.
   `pnpm test:standalone-consumer` installs the packed packages outside the workspace
   and fails on any high/critical `npm audit --omit=dev` advisory (or if the audit cannot run).
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation

@@ -544,14 +544,23 @@ The explicit CI-only responsibilities are:
 The independent `.github/workflows/dependency-audit.yml` is a separately guarded
 exclusion from `pnpm verify`. Its daily security cadence, path-filtered PR/main triggers,
 and advisory guarantee remain unchanged. Run `pnpm check:dependency-audit` separately
-for the live production and bundled-code advisory gate. Bundled roots come from the
-published packages' `tsup.config.ts` `noExternal` selectors, with their runtime/optional
-closure and exact versions derived from lockfile v9 snapshots. Production advisories
-and exact bundled-version findings from a full audit share the scoped, expiring
-allowlist. Unrelated development advisories remain excluded. Unsupported build/lockfile
-shapes and audit endpoint failures fail closed. Loopback-only script regressions prove
-that a synthetic high advisory against bundled code fails, and that adding only a
-`noExternal` entry extends that coverage to the new dependency closure.
+for the live production and bundled-code advisory gate. **Current, normative:** the
+gate builds each published tsup package sequentially into a new temporary directory
+with `--metafile` and derives bundled packages from inputs contributing bytes to
+outputs. This covers default-inlined development imports, explicit `noExternal`
+imports and injected third-party code (for example tsup's `cjs_shims`). Package
+identities must match exact locked versions. `noExternal` remains declared intent;
+absent selectors are reported without failing. Build failure, missing output or
+metadata, unsupported build/lockfile shapes and audit endpoint failures fail closed.
+CI installs first; the gate performs a serialized workspace build with Nx caching
+disabled to refresh internal package exports before producing temporary metafiles.
+For example, CLI bundling must consume fresh core output, even on a clean checkout.
+It never relies on pre-existing `dist` and does not need a separate CI build step. Production
+advisories and exact bundled-version findings from a full audit share the scoped,
+expiring allowlist; unbundled development advisories remain excluded. Loopback-only
+script regressions build real default imports, injected shims and plugin inputs,
+reject their synthetic high advisories, preserve explicit-selector/alias coverage,
+and prove failed current builds cannot fall back to stale metadata.
 `test:scripts` exercises audit fixtures and
 version-floor regressions; it does **not** substitute for a live advisory query. The
 parity guard pins the excluded workflow's known `pnpm check:dependency-audit` command

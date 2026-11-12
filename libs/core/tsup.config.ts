@@ -12,11 +12,13 @@ import { defineConfig } from 'tsup';
  * does not travel with a published package. Bundling ships the patched version
  * this workspace resolves. These packages are therefore `devDependencies`, and
  * their license notices are shipped in `THIRD_PARTY_NOTICES.md`. The live
- * `check:dependency-audit` gate reads these noExternal selectors and the lockfile
- * to audit the exact bundled dependency closure alongside production code; a
- * devDependency move therefore cannot remove shipped code from advisory coverage.
+ * `check:dependency-audit` gate builds fresh metafiles and checks actual bundled
+ * inputs against exact locked versions, including default-inlined imports and
+ * injected tool code. These selectors declare intent; they do not define audit
+ * scope. Unused selectors are reported without failing the advisory gate.
  *
- * Everything else stays external and is installed by the consumer. Core's
+ * Production dependencies outside these selectors stay external and are
+ * installed by the consumer. Core's
  * public types never mention these packages, so declarations are unaffected.
  */
 export default defineConfig({

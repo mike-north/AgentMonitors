@@ -9,8 +9,15 @@
 // names, and it stops working (fails the gate) once its `expires` date
 // passes, forcing someone to look at it again rather than letting it rot.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join, posix, resolve } from 'node:path';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { parse } from 'yaml';
@@ -199,16 +206,15 @@ export function runPnpmAudit({ cwd = REPO_ROOT, productionOnly = true } = {}) {
 }
 
 /**
- * Resolve the packages that published tsup builds may inline. The release
- * inventory supplies build locations; their real noExternal strings/regexps
- * select roots from each importer's locked graph, including development-only
- * roots. Their entire runtime/optional closure is conservatively covered, even
- * if tree shaking omits some files. Workspace links follow production edges;
- * each linked package's own build config also contributes its bundled roots.
+ * Audit actual third-party inputs from fresh published-package bundles. Tsup's
+ * noExternal is declared intent, not an inventory: development imports and
+ * injected shims can also ship. Rebuilding with metafiles captures all three.
  *
- * This reads lockfile v9 snapshots, including peer-qualified instances, rather
- * than node_modules or declared ranges. Unknown config/lock shapes fail closed
- * so future build changes cannot silently reduce security coverage.
+ * Each package builds sequentially into a new directory, so neither missing
+ * nor stale dist output can become a false clean result. A fresh workspace
+ * build first supplies internal package exports (the CLI bundles core's dist).
+ * Audit builds then add metafiles without changing the release artifacts. CI
+ * needs installed dependencies but no pre-existing build artifacts.
  *
  * @param {{ cwd?: string }} [options]
  * @returns {Promise<Map<string, Set<string>>>}
@@ -226,89 +232,90 @@ export async function bundledDependencyVersions({ cwd = REPO_ROOT } = {}) {
       'Unsupported bundled audit lockfile: expected v9 importers, packages and snapshots',
     );
   }
-  // Audit identity is registry package name plus exact locked version.
   const inventory = new Map();
+  let workspaceBuilt = false;
 
-  // A single visitor understands aliases, peer contexts and workspace links.
-  // Separate traversal sets let a node first discovered as unbundled later
-  // become a selected root without losing any of its dependency closure.
-  function walk(name, reference, importer, seen, visit) {
-    if (typeof reference !== 'string')
-      throw new Error(`Invalid locked reference for ${name}`);
-    if (reference.startsWith('link:')) {
-      const linked = posix.normalize(posix.join(importer, reference.slice(5)));
-      const key = `importer:${linked}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      const target = lock.importers[linked];
-      if (!target) throw new Error(`Missing bundled audit importer: ${linked}`);
-      for (const [child, ref] of Object.entries({
-        ...target.dependencies,
-        ...target.optionalDependencies,
-      })) {
-        walk(child, ref.version, linked, seen, visit);
-      }
-      return;
+  /**
+   * Resolve the physical package owning an input, including scoped packages,
+   * aliases and pnpm peer contexts. The installed identity must also exist in
+   * the frozen lockfile; a range, inferred version or unknown virtual input is
+   * never accepted as evidence of which third-party code shipped.
+   */
+  function inputPackage(input, packageRoot) {
+    if (!input.replaceAll('\\', '/').includes('node_modules/'))
+      return undefined;
+    const physical = realpathSync(resolve(packageRoot, input)).replaceAll(
+      '\\',
+      '/',
+    );
+    const marker = physical.lastIndexOf('/node_modules/');
+    if (marker < 0) throw new Error(`Unresolved bundled audit input: ${input}`);
+    const tail = physical.slice(marker + '/node_modules/'.length).split('/');
+    const name = tail.slice(0, tail[0].startsWith('@') ? 2 : 1).join('/');
+    const root = physical.slice(0, marker + '/node_modules/'.length) + name;
+    const manifest = JSON.parse(
+      readFileSync(join(root, 'package.json'), 'utf8'),
+    );
+    const key = `${manifest.name}@${manifest.version}`;
+    if (
+      typeof manifest.name !== 'string' ||
+      typeof manifest.version !== 'string' ||
+      !lock.packages[key]
+    ) {
+      throw new Error(`Unresolved bundled audit package: ${key} (${input})`);
     }
-    const key = lock.snapshots[`${name}@${reference}`]
-      ? `${name}@${reference}`
-      : reference;
-    const snapshot = lock.snapshots[key];
-    const base = key.split('(')[0];
-    const metadata = lock.packages[base];
-    const split = base.lastIndexOf('@');
-    if (!snapshot || !metadata || split <= 0)
-      throw new Error(`Unresolved bundled audit package: ${name}@${reference}`);
-    const packageName = base.slice(0, split);
-    const version = base.slice(split + 1);
-    // Aliases can reach an already-seen snapshot under a different import
-    // name. Evaluate selectors on that edge before deduplicating its children.
-    visit(packageName, version, key, name);
-    if (seen.has(key)) return;
-    seen.add(key);
-    for (const [child, ref] of Object.entries({
-      ...snapshot.dependencies,
-      ...snapshot.optionalDependencies,
-    })) {
-      walk(child, ref, importer, seen, visit);
-    }
-  }
-
-  /** Peer contexts share an audit identity, while distinct versions stay distinct. */
-  function include(name, version) {
-    if (!inventory.has(name)) inventory.set(name, new Set());
-    inventory.get(name).add(version);
+    return { name: manifest.name, version: manifest.version };
   }
 
   for (const packageDir of PACKAGE_DIRS) {
-    const configPath = join(cwd, packageDir, 'tsup.config.ts');
-    if (!existsSync(configPath)) {
-      const manifest = JSON.parse(
-        readFileSync(join(cwd, packageDir, 'package.json'), 'utf8'),
-      );
-      if (manifest.scripts?.build?.includes('tsup'))
-        throw new Error(`Missing bundled audit build config: ${configPath}`);
-      continue;
+    const packageRoot = join(cwd, packageDir);
+    const manifest = JSON.parse(
+      readFileSync(join(packageRoot, 'package.json'), 'utf8'),
+    );
+    // The launcher has no build. Every package with a build must be understood,
+    // so a future build tool cannot silently escape the published inventory.
+    if (!manifest.scripts?.build) continue;
+    const configPath = join(packageRoot, 'tsup.config.ts');
+    if (
+      manifest.scripts.build.split('&&')[0].trim() !== 'tsup' ||
+      !existsSync(configPath)
+    ) {
+      throw new Error(`Unsupported bundled audit build config: ${configPath}`);
     }
-    // Native TypeScript loading is available on the project's required Node 24.
-    // Importing evaluates the same configuration the build uses, preserving
-    // regular expressions instead of approximating them with source-text parsing.
     const loaded = (await import(pathToFileURL(configPath).href)).default;
     const configs = Array.isArray(loaded) ? loaded : [loaded];
-    const importer = lock.importers[packageDir];
-    if (!importer)
-      throw new Error(`Missing bundled audit importer: ${packageDir}`);
+    if (configs.length === 0)
+      throw new Error(`Empty bundled audit build config: ${configPath}`);
+    const formats = new Set();
     for (const config of configs) {
-      // Tsup can resolve deferred options, but this reader supports evaluated
-      // objects only. A thenable must fail closed instead of looking empty.
       if (
         !config ||
         typeof config !== 'object' ||
         typeof config.then === 'function'
-      )
+      ) {
         throw new Error(
           `Unsupported bundled audit build config: ${configPath}`,
         );
+      }
+      const configuredFormats = config.format ?? ['cjs'];
+      if (
+        !Array.isArray(configuredFormats) ||
+        configuredFormats.length === 0 ||
+        configuredFormats.some(
+          (format) => !['esm', 'cjs', 'iife'].includes(format),
+        )
+      ) {
+        throw new Error(`Unsupported bundled audit formats: ${configPath}`);
+      }
+      for (const format of configuredFormats) {
+        // Tsup names metafiles by format. Two configurations sharing a format
+        // would overwrite evidence and could hide the earlier bundle's inputs.
+        if (formats.has(format))
+          throw new Error(
+            `Overlapping bundled audit formats: ${configPath} (${format})`,
+          );
+        formats.add(format);
+      }
       const selectors = config.noExternal ?? [];
       if (
         !Array.isArray(selectors) ||
@@ -319,31 +326,119 @@ export async function bundledDependencyVersions({ cwd = REPO_ROOT } = {}) {
       ) {
         throw new Error(`Unsupported noExternal in ${configPath}`);
       }
-      const included = new Set();
-      const discovered = new Set();
-      for (const [name, ref] of Object.entries({
-        ...importer.dependencies,
-        ...importer.devDependencies,
-        ...importer.optionalDependencies,
-      })) {
-        walk(
-          name,
-          ref.version,
-          packageDir,
-          discovered,
-          (resolvedName, _version, key, importName) => {
-            const matches = selectors.some((selector) => {
-              return [resolvedName, importName].some((candidate) => {
-                if (typeof selector === 'string') {
-                  return candidate === selector;
-                }
-                selector.lastIndex = 0;
-                return selector.test(candidate);
-              });
-            });
-            if (matches) walk(resolvedName, key, packageDir, included, include);
-          },
+    }
+    if (!workspaceBuilt) {
+      // Rebuild internal exports before bundling dependents. Cache reuse could
+      // otherwise embed an old core bundle whose third-party inputs are hidden
+      // inside compiled workspace code. One serial root build owns declarations
+      // and dependency ordering; separate temporary builds own audit metadata.
+      console.log(
+        'Building published packages before the bundled-input audit...',
+      );
+      execFileSync('pnpm', ['build'], {
+        cwd,
+        env: {
+          ...process.env,
+          NX_PARALLEL: '1',
+          NX_SKIP_NX_CACHE: 'true',
+          NX_DAEMON: 'false',
+          NX_ISOLATE_PLUGINS: 'false',
+          NX_TUI: 'false',
+        },
+        encoding: 'utf8',
+        timeout: 600_000,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      workspaceBuilt = true;
+    }
+    const outputDir = mkdtempSync(
+      join(tmpdir(), 'agentmonitors-bundle-audit-'),
+    );
+    const packageNames = new Set();
+    try {
+      // A fresh destination and required metafiles make build failure or missing
+      // output fatal. Existing release artifacts are never read or overwritten.
+      execFileSync(
+        process.execPath,
+        [
+          join(cwd, 'node_modules/tsup/dist/cli-default.js'),
+          '--metafile',
+          '--out-dir',
+          outputDir,
+        ],
+        {
+          cwd: packageRoot,
+          encoding: 'utf8',
+          timeout: 120_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      for (const format of formats) {
+        const metafile = JSON.parse(
+          readFileSync(join(outputDir, `metafile-${format}.json`), 'utf8'),
         );
+        if (
+          !metafile.inputs ||
+          !metafile.outputs ||
+          Object.keys(metafile.outputs).length === 0
+        ) {
+          throw new Error(
+            `Missing bundled audit output: ${packageDir} (${format})`,
+          );
+        }
+        // esbuild reports parsed inputs even if fully tree-shaken. Output
+        // contributions identify code actually shipped in this build.
+        const inputs = new Set(
+          Object.values(metafile.outputs).flatMap((output) =>
+            Object.entries(output.inputs ?? {})
+              .filter(([, contribution]) => contribution.bytesInOutput > 0)
+              .map(([input]) => input),
+          ),
+        );
+        if (inputs.size === 0)
+          throw new Error(
+            `Missing bundled audit inputs: ${packageDir} (${format})`,
+          );
+        for (const input of inputs) {
+          const dependency = inputPackage(input, packageRoot);
+          if (!dependency) continue;
+          packageNames.add(dependency.name);
+          // Alias selectors express importer names, while audit identities use
+          // canonical names. Recognize a shipped alias when reporting intent.
+          const importer = lock.importers[packageDir];
+          for (const [name, reference] of Object.entries({
+            ...importer?.dependencies,
+            ...importer?.devDependencies,
+            ...importer?.optionalDependencies,
+          })) {
+            if (
+              reference.version?.split('(')[0] ===
+              `${dependency.name}@${dependency.version}`
+            )
+              packageNames.add(name);
+          }
+          if (!inventory.has(dependency.name))
+            inventory.set(dependency.name, new Set());
+          inventory.get(dependency.name).add(dependency.version);
+        }
+      }
+    } finally {
+      // This directory is exclusively owned by this invocation, never dist or
+      // another build's output. Cleanup does not affect release artifacts.
+      rmSync(outputDir, { recursive: true, force: true });
+    }
+    for (const config of configs) {
+      for (const selector of config.noExternal ?? []) {
+        const matched = [...packageNames].some((name) => {
+          if (typeof selector === 'string') return name === selector;
+          selector.lastIndex = 0;
+          return selector.test(name);
+        });
+        if (!matched)
+          console.warn(
+            `Declared noExternal selector absent from ${packageDir} bundle: ${selector}`,
+          );
       }
     }
   }
