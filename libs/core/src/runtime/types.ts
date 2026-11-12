@@ -741,6 +741,13 @@ export const MATERIALIZATION_RETRY_DELAYS_MS = [
 ] as const;
 /** Attempts after which a retry becomes terminal and requires re-arm. @public */
 export const MATERIALIZATION_RETRY_MAX_ATTEMPTS = 5;
+/**
+ * Longest operator reason a skipped retry records, in characters after
+ * trimming. A skip with a longer reason is refused, so the recorded loss
+ * always keeps the retry's last error and the skip note in full alongside it.
+ * @public
+ */
+export const MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH = 200;
 
 /** Durable lifecycle state for one failed materialization. @public */
 export type MaterializationRetryStatus = 'pending' | 'terminal';
@@ -920,7 +927,9 @@ export interface MaterializationRetryRepairInput {
 export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
   /**
    * Optional operator note, recorded with the loss after the retry's last
-   * error. Stored as a bounded single-line diagnostic.
+   * error. Stored as a single-line diagnostic; at most
+   * {@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH} characters after
+   * trimming, or the skip is refused.
    */
   reason?: string;
 }

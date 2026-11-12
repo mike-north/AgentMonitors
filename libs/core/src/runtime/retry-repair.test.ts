@@ -31,11 +31,17 @@ import {
   MaterializationRetryTransitionError,
   RuntimeStore,
 } from './store.js';
-import { MATERIALIZATION_RETRY_MAX_ATTEMPTS } from './types.js';
+import {
+  MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+  MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
+} from './types.js';
 
 const md = String.raw;
 
 const T0 = new Date('2026-08-13T18:00:00.100Z');
+
+/** 005 `monitor retry skip`: the longest `--reason`, in trimmed characters. */
+const SKIP_REASON_MAX = 200;
 
 const tempRoots: string[] = [];
 const clients: BetterSQLiteClient[] = [];
@@ -169,10 +175,14 @@ function retryCount(client: BetterSQLiteClient): number {
   );
 }
 
-function failSummary(client: BetterSQLiteClient, summary: string): void {
+function failSummary(
+  client: BetterSQLiteClient,
+  summary: string,
+  message = `${summary} write failed`,
+): void {
   client.exec(`CREATE TRIGGER fail_${summary}
     BEFORE INSERT ON monitor_events WHEN NEW.summary = '${summary}' BEGIN
-    SELECT RAISE(ABORT, '${summary} write failed'); END;`);
+    SELECT RAISE(ABORT, '${message}'); END;`);
 }
 
 function repair(client: BetterSQLiteClient, summary: string): void {
@@ -190,8 +200,9 @@ async function retainTerminal(
   f: ReturnType<typeof setup>,
   opened: Opened,
   clock: Clock,
+  lastError?: string,
 ): Promise<string> {
-  failSummary(opened.client, 'A');
+  failSummary(opened.client, 'A', lastError);
   await opened.runtime.tick(f.monitorsDir, f.root);
   for (let tick = 0; tick < MATERIALIZATION_RETRY_MAX_ATTEMPTS; tick += 1) {
     clock.advance(600_000);
@@ -409,6 +420,67 @@ describe('skipping a terminal retry', () => {
     expect(superseded.monitors[0]?.unretainedObservationLoss).toBeUndefined();
   });
 
+  it('refuses a reason longer than 200 characters and changes nothing', async () => {
+    const f = setup([['A'], ['B']]);
+    const opened = f.open();
+    const id = await retainTerminal(f, opened, clock);
+    const before = opened.store.getMaterializationRetry(id);
+
+    // A 1,100-character reason used to crowd the last error out of the loss.
+    for (const reason of ['r'.repeat(1_100), 'r'.repeat(SKIP_REASON_MAX + 1)]) {
+      expect(() =>
+        opened.runtime.skipMaterializationRetry({
+          monitorId: 'm',
+          retryId: id,
+          workspacePath: f.root,
+          reason,
+        }),
+      ).toThrow(
+        new RangeError(
+          `Skip reason is ${String(reason.length)} characters; at most 200 are allowed.`,
+        ),
+      );
+    }
+    expect(opened.store.getMaterializationRetry(id)).toEqual(before);
+    const doctor = await opened.runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+    expect(doctor.monitors[0]?.unretainedObservationLoss).toBeUndefined();
+    expect(MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH).toBe(SKIP_REASON_MAX);
+  });
+
+  it('keeps the skip note and a full-length reason, shortening only a long last error', async () => {
+    const f = setup([['A'], ['B']]);
+    const opened = f.open();
+    const lastError = 'E'.repeat(1_000);
+    const id = await retainTerminal(f, opened, clock, lastError);
+    expect(opened.store.getMaterializationRetry(id).lastError).toBe(lastError);
+
+    // The bound counts trimmed characters, so surrounding space is free.
+    const reason = 'r'.repeat(SKIP_REASON_MAX);
+    opened.runtime.skipMaterializationRetry({
+      monitorId: 'm',
+      retryId: id,
+      workspacePath: f.root,
+      reason: `  ${reason}  `,
+    });
+
+    // 005 `monitor retry skip`: `<last error> Retry skipped after <n> failed
+    // attempts: <reason>.`, within the 1,024-character diagnostic cap (002
+    // `materialization_retry_outbox`); the last error gives way, ending in `…`.
+    const note = ` Retry skipped after ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} failed attempts: ${reason}.`;
+    const expectedError = `${'E'.repeat(1_024 - note.length - 1)}…${note}`;
+    expect(expectedError).toHaveLength(1_024);
+    const doctor = await opened.runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+    expect(doctor.monitors[0]?.unretainedObservationLoss?.error).toBe(
+      expectedError,
+    );
+  });
+
   it('lets younger retained work drain next, and lets it supersede the loss of its object key', async () => {
     // A fails, so A and its younger sibling A3 (same object) and C stay retained.
     const f = setup([['A', 'A3@A', 'C'], ['D']]);
@@ -563,7 +635,12 @@ describe('repairs refuse anything but a terminal retry of the named monitor', ()
 });
 
 describe('a watcher paused on a terminal retry', () => {
-  it('wakes when the retry is re-armed instead of waiting for its periodic recheck', async () => {
+  /**
+   * Start a watcher whose first item `A` is retained, exhaust that retry and
+   * wait until the watcher reports it terminal and pauses. Its periodic
+   * recheck is a minute away, so anything sooner was a wake.
+   */
+  async function pausedWatcher() {
     const root = mkdtempSync(path.join(tmpdir(), 'agentmon-retry-repair-'));
     tempRoots.push(root);
     const monitorsDir = path.join(root, 'monitors');
@@ -635,7 +712,16 @@ describe('a watcher paused on a terminal retry', () => {
         { timeout: 5_000, interval: 20 },
       );
       expect(eventSummaries(client)).toEqual([]);
+      return { root, client, runtime, handle, id };
+    } catch (error) {
+      await handle.stop();
+      throw error;
+    }
+  }
 
+  it('wakes when the retry is re-armed instead of waiting for its periodic recheck', async () => {
+    const { root, client, runtime, handle, id } = await pausedWatcher();
+    try {
       runtime.rearmMaterializationRetry({
         monitorId: 'w',
         retryId: id,
@@ -647,6 +733,25 @@ describe('a watcher paused on a terminal retry', () => {
         () => expect(eventSummaries(client)).toEqual(['A', 'B']),
         { timeout: 10_000, interval: 50 },
       );
+    } finally {
+      await handle.stop();
+    }
+  }, 30_000);
+
+  it('wakes when the retry is skipped instead of waiting for its periodic recheck', async () => {
+    const { root, client, runtime, handle, id } = await pausedWatcher();
+    try {
+      runtime.skipMaterializationRetry({
+        monitorId: 'w',
+        retryId: id,
+        workspacePath: root,
+      });
+      // Its periodic recheck is a minute away; with A given up and nothing
+      // else retained, the woken watcher pulls B at once.
+      await vi.waitFor(() => expect(eventSummaries(client)).toEqual(['B']), {
+        timeout: 10_000,
+        interval: 50,
+      });
     } finally {
       await handle.stop();
     }

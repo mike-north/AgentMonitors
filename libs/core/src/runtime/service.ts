@@ -116,6 +116,7 @@ import {
   EPHEMERAL_MONITOR_ID_PREFIX,
   MATERIALIZATION_RETRY_DELAYS_MS,
   MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+  MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
   type NotifyDispatchResult,
   type NotHeldObservation,
   type NotifyRuntimeState,
@@ -994,8 +995,11 @@ function heldRefusalData(refusal: NotHeldObservation): {
  * `Retry skipped after <n> failed attempts.`, with the operator's reason when
  * one was given; `skipped` marks the row for diagnostics, `retryId` names the
  * removed retry, and the identity names which observation was lost. It has no
- * span position, since the retry outlived the span that admitted it. The
- * last error is shortened, if needed, so the skip note always fits the cap.
+ * span position, since the retry outlived the span that admitted it.
+ *
+ * The reason is already bounded ({@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH}),
+ * so the skip note always fits the diagnostic cap in full; the last error
+ * takes the rest and, when it does not fit, is shortened and ends in `…`.
  */
 function skippedRetryObservationData(
   retry: MaterializationRetryRecord,
@@ -1011,12 +1015,14 @@ function skippedRetryObservationData(
   const suffix = safeDiagnosticText(
     ` Retry skipped after ${String(retry.attemptCount)} failed attempts${note}.`,
   );
-  const error = safeDiagnosticText(
-    safeDiagnosticText(retry.lastError ?? 'Materialization failed.').slice(
-      0,
-      Math.max(0, SAFE_DIAGNOSTIC_TEXT_MAX - suffix.length),
-    ) + suffix,
+  const lastError = safeDiagnosticText(
+    retry.lastError ?? 'Materialization failed.',
   );
+  const budget = SAFE_DIAGNOSTIC_TEXT_MAX - suffix.length;
+  const error =
+    (lastError.length <= budget
+      ? lastError
+      : `${lastError.slice(0, Math.max(0, budget - 1))}…`) + suffix;
   return {
     error,
     skipped: true,
@@ -1780,10 +1786,18 @@ export class AgentMonitorRuntime {
    *   monitor in this workspace has the id.
    * @throws {@link MaterializationRetryTransitionError} when the retry is not
    *   terminal; a pending retry is still attempted automatically.
+   * @throws `RangeError` when the trimmed reason is longer than
+   *   {@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH} characters.
    */
   skipMaterializationRetry(
     input: MaterializationRetrySkipInput,
   ): MaterializationRetryDiagnostic {
+    const reasonLength = input.reason?.trim().length ?? 0;
+    if (reasonLength > MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH) {
+      throw new RangeError(
+        `Skip reason is ${String(reasonLength)} characters; at most ${String(MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH)} are allowed.`,
+      );
+    }
     const current = this.terminalRetryFor(input, 'skipped');
     // The same loss record every other drop gets (002 §2); the store writes it
     // inside the skip's own transaction, at the retry's admission position.

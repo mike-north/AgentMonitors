@@ -638,6 +638,9 @@ export const MATERIALIZATION_RETRY_MAX_BYTES: number;
 export const MATERIALIZATION_RETRY_MAX_RECORDS = 256;
 
 // @public
+export const MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH = 200;
+
+// @public
 export class MaterializationRetryCapacityError extends Error {
     constructor(monitorId: string);
     readonly code = "materialization_retry_capacity_exceeded";
