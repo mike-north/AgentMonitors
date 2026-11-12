@@ -13,7 +13,9 @@
  * ships plus Node — no native dependencies, and on macOS no third-party tools:
  *
  * - **Linux:** `/proc/<pid>/stat` — `pgrp` (field 5) and `starttime`
- *   (field 22, clock ticks since boot). No external binary is executed.
+ *   (field 22, clock ticks since boot). No external binary is executed. A
+ *   process that exits mid-read is left out; any other read error makes the
+ *   reading unsupported rather than incomplete.
  * - **macOS:** the system `/bin/ps -A -o pid=,pgid=,lstart=` under `LC_ALL=C`.
  *   `lstart` has one-second resolution, which is enough for equality matching:
  *   a recycled pid would need the pid space to wrap within the same second.
@@ -126,31 +128,90 @@ export function parseProcStat(
   return { pid, pgid, startTime };
 }
 
-async function readLinuxProcessTable(): Promise<ProcessTableReading> {
+/**
+ * The filesystem calls the Linux reader makes. Injectable so error handling
+ * (descriptor exhaustion, permission errors) can be unit-tested without a real
+ * `/proc`.
+ *
+ * @internal
+ */
+export interface ProcFs {
+  readdir(path: string): Promise<string[]>;
+  readFile(path: string, encoding: 'utf8'): Promise<string>;
+}
+
+const nodeProcFs: ProcFs = { readdir, readFile };
+
+/**
+ * Most `/proc/<pid>/stat` files read at once. Opening every entry together can
+ * exhaust file descriptors on a busy machine; a bounded pool keeps the read
+ * fast without that.
+ */
+const PROC_READ_CONCURRENCY = 32;
+
+/**
+ * Errors meaning the process exited between listing `/proc` and reading its
+ * `stat` file. Only these may drop a process from a reading; any other error
+ * means the reading is incomplete.
+ */
+const EXITED_ERROR_CODES: ReadonlySet<string> = new Set(['ENOENT', 'ESRCH']);
+
+/**
+ * Read identity evidence from Linux `/proc`.
+ *
+ * A process that exits mid-read (ENOENT/ESRCH) is simply not part of the
+ * reading. Any other failure (EMFILE, EACCES, …) makes the whole reading
+ * `supported: false`: silently dropping a live process would let a caller
+ * mistake a missing member for an exited one.
+ *
+ * @internal
+ */
+export async function readLinuxProcessTable(
+  fs: ProcFs = nodeProcFs,
+): Promise<ProcessTableReading> {
   let entries: string[];
   try {
-    entries = await readdir('/proc');
+    entries = await fs.readdir('/proc');
   } catch (error) {
     return {
       supported: false,
       reason: `could not list /proc (${errorMessage(error)})`,
     };
   }
-  const reads = entries
-    .filter((entry) => /^\d+$/.test(entry))
-    .map(async (entry) => {
+  const pids = entries.filter((entry) => /^\d+$/.test(entry));
+  const processes: ProcessIdentityRecord[] = [];
+  let failure: string | undefined;
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (failure === undefined && next < pids.length) {
+      const pid = pids[next++];
+      if (pid === undefined) return;
+      const path = `/proc/${pid}/stat`;
       try {
-        return parseProcStat(await readFile(`/proc/${entry}/stat`, 'utf8'));
-      } catch {
-        // The process exited between listing and reading: it is simply not
-        // part of this reading.
-        return undefined;
+        const record = parseProcStat(await fs.readFile(path, 'utf8'));
+        if (record !== undefined) processes.push(record);
+      } catch (error) {
+        if (isExitedError(error)) continue;
+        failure ??= `could not read ${path} (${errorMessage(error)})`;
       }
-    });
-  const processes = (await Promise.all(reads)).filter(
-    (record): record is ProcessIdentityRecord => record !== undefined,
+    }
+  };
+  await Promise.all(
+    Array.from(
+      { length: Math.min(PROC_READ_CONCURRENCY, pids.length) },
+      worker,
+    ),
   );
+  if (failure !== undefined) return { supported: false, reason: failure };
   return { supported: true, processes };
+}
+
+function isExitedError(error: unknown): boolean {
+  if (typeof error !== 'object' || error === null || !('code' in error)) {
+    return false;
+  }
+  const { code } = error;
+  return typeof code === 'string' && EXITED_ERROR_CODES.has(code);
 }
 
 function readDarwinProcessTable(): Promise<ProcessTableReading> {

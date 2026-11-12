@@ -11,6 +11,7 @@
  * @see https://man7.org/linux/man-pages/man2/kill.2.html (negative pid = group)
  * @see https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
  */
+import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import {
   describeSignalAbstention,
@@ -22,7 +23,9 @@ import {
 import {
   parseProcStat,
   parsePsIdentityOutput,
+  readLinuxProcessTable,
   readProcessTable,
+  type ProcFs,
   type ProcessIdentityRecord,
   type ProcessTableReading,
 } from './process-table.js';
@@ -45,6 +48,57 @@ function fakeChild(
 function table(...processes: ProcessIdentityRecord[]) {
   return (): Promise<ProcessTableReading> =>
     Promise.resolve({ supported: true, processes });
+}
+
+/**
+ * A fake leader that can be reaped the way Node reaps a real child: `exitCode`
+ * is set and `exit` is emitted in the same synchronous step.
+ */
+class ReapableChild extends EventEmitter implements ChildProcessHandle {
+  exitCode: number | null = null;
+  signalCode: NodeJS.Signals | null = null;
+  readonly kill = vi.fn(() => true);
+  constructor(readonly pid: number) {
+    super();
+  }
+  reap(): void {
+    this.exitCode = 0;
+    this.emit('exit', 0, null);
+  }
+}
+
+/**
+ * A process table whose content the test changes over time, recording when
+ * each read starts. `hold` makes reads wait until the test releases them, to
+ * simulate a slow read during which the leader is reaped.
+ */
+function liveTable(initial: ProcessIdentityRecord[]) {
+  let current = initial;
+  let gate: Promise<void> | undefined;
+  let release: (() => void) | undefined;
+  const reads: ProcessIdentityRecord[][] = [];
+  return {
+    set(next: ProcessIdentityRecord[]) {
+      current = next;
+    },
+    hold() {
+      gate = new Promise((resolve) => {
+        release = resolve;
+      });
+    },
+    release() {
+      release?.();
+      gate = undefined;
+    },
+    reads,
+    read: async (): Promise<ProcessTableReading> => {
+      // The snapshot is taken when the read starts, as `ps` or `/proc` would.
+      const snapshot = current;
+      reads.push(snapshot);
+      if (gate !== undefined) await gate;
+      return { supported: true, processes: snapshot };
+    },
+  };
 }
 
 const unsupportedTable = (): Promise<ProcessTableReading> =>
@@ -227,6 +281,154 @@ describe('sendVerifiedSignal: process group', () => {
   });
 });
 
+describe('sendVerifiedSignal: process group continuity across the leader exiting', () => {
+  const leaderRecord = { pid: 100, pgid: 100, startTime: T1 };
+  const sibling = { pid: 101, pgid: 100, startTime: T1 };
+
+  // Regression (#479): the SIGTERM step read the table first and
+  // checked the leader afterwards, so a command that exited on its own during
+  // the read made the step abstain, and its surviving group member was never
+  // bounded.
+  it('the SIGTERM step still signals when the leader exits during its own read', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    const t = liveTable([leaderRecord, sibling]);
+    t.hold();
+    const pending = sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+    // The leader exits on its own while the read is in flight.
+    leader.reap();
+    t.set([sibling]);
+    t.release();
+    const outcome = await pending;
+    expect(outcome).toEqual({ status: 'sent', evidence: 'recorded-identity' });
+    expect(h.delivered).toEqual(['SIGTERM']);
+    expect(h.abstentions).toEqual([]);
+    expect(group.verifiedMembers).toEqual(
+      expect.arrayContaining([leaderRecord, sibling]),
+    );
+  });
+
+  it('needs no signal when a read started before the leader exited shows an empty group', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    const t = liveTable([{ pid: 5, pgid: 5, startTime: T1 }]);
+    t.hold();
+    const pending = sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+    leader.reap();
+    t.release();
+    expect((await pending).status).toBe('not-needed');
+    expect(h.delivered).toEqual([]);
+    expect(h.abstentions).toEqual([]);
+  });
+
+  it('abstains when the leader exits during an unreadable read: there is no evidence to act on', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    // The leader's exit starts a second read, so release every pending one.
+    const releases: (() => void)[] = [];
+    const slowUnsupported = async (): Promise<ProcessTableReading> => {
+      await new Promise<void>((resolve) => {
+        releases.push(resolve);
+      });
+      return { supported: false, reason: 'the reader failed' };
+    };
+    const pending = sendVerifiedSignal(
+      group,
+      'SIGTERM',
+      h.options(slowUnsupported),
+    );
+    leader.reap();
+    for (const release of releases) release();
+    expect((await pending).status).toBe('abstained');
+    expect(h.delivered).toEqual([]);
+    expect(h.abstentions[0]?.reason).toMatch(/exited while the process table/);
+  });
+
+  // Regression (#479): a process forked after the SIGTERM step
+  // (e.g. by the command's TERM trap just before it exits) is a member of our
+  // group, but was absent from the SIGTERM read, so the SIGKILL follow-up
+  // abstained and left it running past the hard bound (008 §3.1).
+  it('confirms a process forked after the SIGTERM step through the read taken as the leader is reaped', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    const t = liveTable([leaderRecord, sibling]);
+    await sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+
+    // The trap forks a worker into the group, then the leader exits; the
+    // sibling died on SIGTERM.
+    const worker = { pid: 102, pgid: 100, startTime: T2 };
+    t.set([leaderRecord, worker]);
+    leader.reap();
+    t.set([worker]);
+
+    const outcome = await sendVerifiedSignal(
+      group,
+      'SIGKILL',
+      h.options(t.read),
+    );
+    expect(outcome).toEqual({ status: 'sent', evidence: 'recorded-identity' });
+    expect(h.delivered).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(h.abstentions).toEqual([]);
+    expect(group.verifiedMembers).toContainEqual(worker);
+  });
+
+  it('the read at the leader’s exit starts synchronously, before anything else can run', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    const t = liveTable([leaderRecord]);
+    await sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+    const before = t.reads.length;
+    leader.reap();
+    expect(t.reads.length).toBe(before + 1);
+  });
+
+  it('a later step confirms the group through a member recorded by any earlier read', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    const t = liveTable([leaderRecord, sibling]);
+    await sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+    leader.reap();
+    // Only the sibling recorded at SIGTERM remains, plus a newer process
+    // that it forked after the leader's exit read.
+    const grandchild = { pid: 103, pgid: 100, startTime: T2 };
+    t.set([sibling, grandchild]);
+    const outcome = await sendVerifiedSignal(
+      group,
+      'SIGKILL',
+      h.options(t.read),
+    );
+    expect(outcome.status).toBe('sent');
+    // Continuity through the sibling confirms the grandchild as well.
+    expect(group.verifiedMembers).toContainEqual(grandchild);
+  });
+
+  it('still abstains when continuity is lost: every confirmed member is gone and a stranger holds the id', async () => {
+    const h = harness();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    const t = liveTable([leaderRecord, sibling]);
+    await sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+    leader.reap();
+    // The group emptied after the exit read, and the id was reused.
+    const stranger = { pid: 100, pgid: 100, startTime: T2 };
+    t.set([stranger]);
+    const outcome = await sendVerifiedSignal(
+      group,
+      'SIGKILL',
+      h.options(t.read),
+    );
+    expect(outcome.status).toBe('abstained');
+    expect(h.delivered).toEqual(['SIGTERM']);
+    expect(h.abstentions[0]).toMatchObject({ observed: [stranger] });
+  });
+});
+
 describe('sendVerifiedSignal: recorded process (no handle)', () => {
   const record = { pid: 4242, pgid: 4242, startTime: T1 };
 
@@ -299,6 +501,82 @@ describe('describeSignalAbstention (008 §6.1 calibrated wording)', () => {
     expect(text).toContain('Nothing was signalled');
     // An abstention must never be phrased as a certainty.
     expect(text).not.toMatch(/\bis ours\b|\bkilled\b/);
+  });
+});
+
+describe('readLinuxProcessTable error handling', () => {
+  const stat = (pid: number, pgid: number) =>
+    `${String(pid)} (sh) S 1 ${String(pgid)} ${String(pgid)} 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0`;
+
+  function errnoError(code: string): NodeJS.ErrnoException {
+    const error: NodeJS.ErrnoException = new Error(`${code}: simulated`);
+    error.code = code;
+    return error;
+  }
+
+  function fakeProc(
+    pids: number[],
+    failures: Record<number, string> = {},
+  ): ProcFs & { maxInFlight: number } {
+    let inFlight = 0;
+    const fs = {
+      maxInFlight: 0,
+      readdir: () =>
+        Promise.resolve(['self', 'net', ...pids.map((p) => String(p))]),
+      readFile: async (path: string) => {
+        inFlight++;
+        fs.maxInFlight = Math.max(fs.maxInFlight, inFlight);
+        await new Promise((r) => setTimeout(r, 1));
+        inFlight--;
+        const pid = Number(/^\/proc\/(\d+)\/stat$/.exec(path)?.[1]);
+        const code = failures[pid];
+        if (code !== undefined) throw errnoError(code);
+        return stat(pid, 100);
+      },
+    };
+    return fs;
+  }
+
+  it('leaves out a process that exited mid-read (ENOENT / ESRCH)', async () => {
+    const reading = await readLinuxProcessTable(
+      fakeProc([100, 101, 102], { 101: 'ENOENT', 102: 'ESRCH' }),
+    );
+    expect(reading).toEqual({
+      supported: true,
+      processes: [{ pid: 100, pgid: 100, startTime: '5000' }],
+    });
+  });
+
+  // Regression (#479): any read error used to drop the process
+  // silently, so descriptor exhaustion could make a live group look empty.
+  it.each(['EMFILE', 'ENFILE', 'EACCES', 'EIO'])(
+    'reports the reading as unsupported on %s instead of dropping the process',
+    async (code) => {
+      const reading = await readLinuxProcessTable(
+        fakeProc([100, 101, 102], { 101: code }),
+      );
+      expect(reading.supported).toBe(false);
+      if (reading.supported) return;
+      expect(reading.reason).toContain('/proc/101/stat');
+      expect(reading.reason).toContain(code);
+    },
+  );
+
+  it('bounds how many stat files are open at once', async () => {
+    const pids = Array.from({ length: 500 }, (_, i) => i + 1);
+    const fs = fakeProc(pids);
+    const reading = await readLinuxProcessTable(fs);
+    expect(reading.supported && reading.processes.length).toBe(500);
+    expect(fs.maxInFlight).toBeGreaterThan(1);
+    expect(fs.maxInFlight).toBeLessThanOrEqual(32);
+  });
+
+  it('reports an unlistable /proc as unsupported', async () => {
+    const reading = await readLinuxProcessTable({
+      readdir: () => Promise.reject(errnoError('EACCES')),
+      readFile: () => Promise.reject(errnoError('ENOENT')),
+    });
+    expect(reading.supported).toBe(false);
   });
 });
 

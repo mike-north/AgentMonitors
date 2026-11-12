@@ -157,6 +157,7 @@ export interface ChildProcessHandle {
     readonly exitCode: number | null;
     // (undocumented)
     kill(signal?: NodeJS.Signals | number): boolean;
+    once?(event: 'exit', listener: () => void): unknown;
     // (undocumented)
     readonly pid?: number | undefined;
     readonly signalCode: NodeJS.Signals | null;

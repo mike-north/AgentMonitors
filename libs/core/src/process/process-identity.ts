@@ -16,25 +16,32 @@
  *   about whoever holds the number now.
  * - **Recorded identity.** A `(pid, pgid, startTime)` record read from the
  *   platform process table ({@link readProcessTable}) names one process for its
- *   whole life. For a group whose leader has been reaped, the group is
- *   confirmed only if at least one current member is a process that was a
- *   member when the group was last confirmed. A group id can be reused only
- *   after every member is gone, so one surviving known member proves the group
- *   is still the one Agent Monitors started — and then every current member is
- *   inside the containment boundary (008 §2.1).
+ *   whole life.
+ * - **Group continuity.** A process-group id cannot be reused while any member
+ *   of the group exists. So a membership reading taken while the group is
+ *   provably ours confirms every member in it: a reading that *started* while
+ *   the leader was still unreaped, one started in the leader's own `exit`
+ *   event (the moment Node reaps it), or one in which a member confirmed
+ *   earlier is still present. Confirmed members accumulate on the target, and
+ *   each later step confirms the group through any of them that remains. Every
+ *   current member of a confirmed group is inside the containment boundary
+ *   (008 §2.1), including processes forked after an earlier step.
  *
  * When identity cannot be confirmed the signal is **withheld** and the
  * abstention is reported with its reason (008 §5, §6.1): leak once rather than
  * kill the wrong thing. Verification failure never escalates to force.
  *
- * Residual: the check and the `kill(2)` are separate system calls, so a target
- * that vanishes and is replaced in between is not detected. Replacement needs
- * the whole pid space to wrap inside that window; no portable POSIX primitive
- * closes it for process groups.
+ * Residual (008 §5.1): evidence comes from a process-table read that takes time
+ * (tens of milliseconds, bounded by the reader's own timeout), and the signal
+ * is sent after it completes. A target that empties and is replaced during
+ * that read, or between the read and `kill(2)`, is not detected. Replacement
+ * needs the whole pid space to wrap inside that window; no portable POSIX
+ * primitive closes it for process groups.
  */
 import type {
   ProcessIdentityRecord,
   ProcessTableReader,
+  ProcessTableReading,
 } from './process-table.js';
 import { readProcessTable } from './process-table.js';
 import { isErrnoException } from '../security/local-permissions.js';
@@ -52,6 +59,15 @@ export interface ChildProcessHandle {
   /** Set by Node once the child has been reaped (killed by a signal). */
   readonly signalCode: NodeJS.Signals | null;
   kill(signal?: NodeJS.Signals | number): boolean;
+  /**
+   * Subscribes to the child's `exit` event, which Node emits in the same
+   * callback that reaps it. When present, a process-group target re-reads the
+   * group's membership at that moment, so processes forked after an earlier
+   * escalation step are still confirmed as ours (008 §3.1, §5.1). Without it,
+   * only members seen by an earlier read can carry the group's identity past
+   * the leader's exit.
+   */
+  once?(event: 'exit', listener: () => void): unknown;
 }
 
 /**
@@ -68,11 +84,12 @@ export interface SpawnedProcessTarget {
  * The process group led by a child Agent Monitors spawned as a group leader
  * (POSIX `detached: true`).
  *
- * `verifiedMembers` is the group's membership at the most recent moment its
- * identity was confirmed. {@link sendVerifiedSignal} maintains it: it is the
- * evidence that lets a later signal confirm the group after its leader has
- * been reaped. Create one with {@link spawnedProcessGroup} and reuse the same
- * object for every escalation step against that group.
+ * `verifiedMembers` holds every process confirmed as a member of the group so
+ * far, from each reading taken while the group was provably ours.
+ * {@link sendVerifiedSignal} maintains it: it is the evidence that lets a later
+ * signal confirm the group after its leader has been reaped. Create one with
+ * {@link spawnedProcessGroup} and reuse the same object for every escalation
+ * step against that group.
  *
  * @public
  */
@@ -269,32 +286,62 @@ export async function sendVerifiedSignal(
     }
 
     case 'spawned-process-group': {
-      // Read the table BEFORE checking the leader: if the leader is still
-      // unreaped afterwards, it was unreaped for the whole read, so every
-      // member read is genuinely part of the group Agent Monitors started.
+      // Note the leader's state when the read STARTS. While it is unreaped the
+      // group id cannot have been reused, so every member of a reading that
+      // began then is ours, even if the leader is reaped before the reading
+      // completes (residual: the group emptying and its id being reused during
+      // the read itself, 008 §5.1).
+      const leaderUnreapedAtReadStart = isChildUnreaped(target.leader);
+      if (leaderUnreapedAtReadStart) {
+        watchLeaderExit(target, readTable);
+      } else {
+        // Let the membership read started at the leader's exit land first, so
+        // processes forked after the previous step count as confirmed.
+        await groupExitReads.get(target)?.settled;
+      }
       const reading = await readTable();
-      if (isChildUnreaped(target.leader)) {
+      if (leaderUnreapedAtReadStart) {
         if (reading.supported) {
-          target.verifiedMembers = reading.processes.filter(
-            (p) => p.pgid === target.pgid,
+          recordConfirmedMembers(target, groupMembers(reading, target.pgid));
+        }
+        if (isChildUnreaped(target.leader)) {
+          return deliverToGroup(
+            target.pgid,
+            signal,
+            options,
+            'live-child-handle',
           );
+        }
+        if (!reading.supported) {
+          return abstain(
+            'process-group',
+            target.pgid,
+            `the group's leader exited while the process table was being read and ${reading.reason}, so the group's membership could not be confirmed`,
+            [],
+          );
+        }
+        if (groupMembers(reading, target.pgid).length === 0) {
+          return {
+            status: 'not-needed',
+            detail: `process group ${String(target.pgid)} has no remaining members`,
+          };
         }
         return deliverToGroup(
           target.pgid,
           signal,
           options,
-          'live-child-handle',
+          'recorded-identity',
         );
       }
       if (!reading.supported) {
         return abstain(
           'process-group',
           target.pgid,
-          `the group's leader has exited and ${reading.reason}, so the group's current members cannot be compared with the ones last confirmed as ours`,
+          `the group's leader has exited and ${reading.reason}, so the group's current members cannot be compared with the ones confirmed as ours`,
           [],
         );
       }
-      const members = reading.processes.filter((p) => p.pgid === target.pgid);
+      const members = groupMembers(reading, target.pgid);
       if (members.length === 0) {
         return {
           status: 'not-needed',
@@ -308,11 +355,11 @@ export async function sendVerifiedSignal(
         return abstain(
           'process-group',
           target.pgid,
-          `the group's leader has exited and none of its ${String(members.length)} current member(s) was a member when the group was last confirmed as ours, so the group id may have been reused by unrelated work`,
+          `the group's leader has exited and none of its ${String(members.length)} current member(s) was ever confirmed as a member, so the group id may have been reused by unrelated work`,
           members,
         );
       }
-      target.verifiedMembers = members;
+      recordConfirmedMembers(target, members);
       return deliverToGroup(target.pgid, signal, options, 'recorded-identity');
     }
 
@@ -348,6 +395,82 @@ export async function sendVerifiedSignal(
       return killNumericTarget(record.pid, signal, 'recorded-identity');
     }
   }
+}
+
+function groupMembers(
+  reading: { readonly processes: readonly ProcessIdentityRecord[] },
+  pgid: number,
+): ProcessIdentityRecord[] {
+  return reading.processes.filter((p) => p.pgid === pgid);
+}
+
+/**
+ * Add `members` to the group's confirmed membership. Earlier confirmations are
+ * kept: a `(pid, startTime)` pair names one process for its whole life, so a
+ * record for a process that has since exited can never match anything else.
+ */
+function recordConfirmedMembers(
+  target: SpawnedProcessGroupTarget,
+  members: readonly ProcessIdentityRecord[],
+): void {
+  const added = members.filter(
+    (member) => !target.verifiedMembers.some((k) => sameProcess(k, member)),
+  );
+  if (added.length > 0) {
+    target.verifiedMembers = [...target.verifiedMembers, ...added];
+  }
+}
+
+/** The membership read started when a group's leader was reaped. */
+interface GroupExitRead {
+  /** Resolves once that read has been recorded (or has failed). */
+  settled?: Promise<void>;
+}
+
+/**
+ * Per-target exit watches. Kept off the public target type: it is the gate's
+ * own bookkeeping, not evidence a caller supplies.
+ */
+const groupExitReads = new WeakMap<SpawnedProcessGroupTarget, GroupExitRead>();
+
+/**
+ * Arrange for the group's membership to be read the moment its leader is
+ * reaped. Called only while the leader is unreaped, so the `exit` event has not
+ * fired yet. Node emits `exit` in the callback that reaps the child, and the
+ * read is started synchronously from it, so the group cannot have emptied and
+ * been reused before the read began: every member it lists is ours (residual:
+ * reuse during the read, 008 §5.1). This is what captures a process forked
+ * after an earlier step, such as work a SIGTERM trap starts before exiting.
+ */
+function watchLeaderExit(
+  target: SpawnedProcessGroupTarget,
+  readTable: ProcessTableReader,
+): void {
+  if (typeof target.leader.once !== 'function') return;
+  if (groupExitReads.has(target)) return;
+  const watch: GroupExitRead = {};
+  groupExitReads.set(target, watch);
+  target.leader.once('exit', () => {
+    let reading: Promise<ProcessTableReading>;
+    try {
+      reading = readTable();
+    } catch (error) {
+      reading = Promise.resolve({
+        supported: false,
+        reason: errorMessage(error),
+      });
+    }
+    watch.settled = reading.then(
+      (result) => {
+        if (result.supported) {
+          recordConfirmedMembers(target, groupMembers(result, target.pgid));
+        }
+      },
+      () => {
+        // A failed read confirms nothing; the next step re-reads and decides.
+      },
+    );
+  });
 }
 
 function deliverToGroup(
