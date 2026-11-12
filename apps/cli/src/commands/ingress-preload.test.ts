@@ -123,3 +123,45 @@ it('refuses deferred iterator writes rather than claiming a pre-execution kill p
   expect(output).toContain('INSERT INTO probe VALUES (?) RETURNING value');
   expect(output).toContain('AgentMonitorRuntime.ingest');
 });
+
+// PRAGMAs have both direct-SQL and native-driver entrypoints; neither may hide
+// a durable write from the inventory, including checkpoints without assignments.
+for (const boundary of ['tick', 'consumeWatch'] as const) {
+  for (const operation of [
+    {
+      body: "db.exec('PRAGMA user_version = 610');",
+      sql: 'PRAGMA user_version = 610',
+    },
+    {
+      body: "db.pragma('user_version = 610');",
+      sql: 'PRAGMA user_version = 610',
+    },
+    {
+      body: "db.pragma('wal_checkpoint(TRUNCATE)');",
+      sql: 'PRAGMA wal_checkpoint(TRUNCATE)',
+    },
+  ]) {
+    it(`refuses ${operation.body} in ${boundary} with its exact SQL`, () => {
+      const output = probe(boundary, operation.body);
+      expect(output).toContain('Unclassified ingress write');
+      expect(output).toContain(operation.sql);
+      expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+    });
+  }
+
+  it(`allows read-only PRAGMA queries in ${boundary}`, () => {
+    const output = probe(
+      boundary,
+      `
+      db.exec('PRAGMA table_info(probe)');
+      console.log(JSON.stringify({
+        version: db.pragma('user_version', { simple: true }),
+        columns: db.pragma('table_info(probe)').length,
+      }));
+    `,
+    );
+    // Machine-readable output keeps Node's forced numeric colors out of receipts.
+    expect(output).toContain(JSON.stringify({ version: 0, columns: 1 }));
+    expect(output).not.toContain('Unclassified ingress write');
+  });
+}

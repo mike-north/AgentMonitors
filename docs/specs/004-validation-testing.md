@@ -880,7 +880,11 @@ startup/restart setup, the exact expired-object-suppression DELETE from its main
 method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
 is checked separately). Delivery refresh reaches no additional durable writes in these
 fixtures; it has no blanket exclusion. Direct SQL and deferred iterator writes are refused
-with the same diagnostic until they have deliberate interruption support.
+with the same diagnostic until they have deliberate interruption support. Both `exec()`
+and the native `pragma()` entrypoint MUST consult SQLite statement `readonly` metadata
+and reject writable PRAGMAs with their exact SQL. Read-only PRAGMA queries remain
+allowed. Direct SQL that cannot be prepared as one statement MUST fail closed, so
+a readable prefix cannot conceal another statement.
 `ingress-preload.test.ts` independently exercises asynchronous tick/watch discovery and
 classification failures. The acquisition-path extra-write, corrupted shared-snapshot-content,
 and corrupted recipient-baseline mutations MUST all fail the suite.

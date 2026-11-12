@@ -152,21 +152,39 @@ Database.prototype.prepare = function (sql) {
   return statement;
 };
 
-/** Direct SQL cannot bypass classification by avoiding prepare(). */
+/**
+ * Direct execution has no per-write interruption boundary. Ask SQLite rather
+ * than guessing SQL verbs: PRAGMA, WITH and RETURNING can all perform writes.
+ * Unpreparable SQL (including multiple statements) is refused conservatively;
+ * allowing a readable prefix would hide a later write in the same exec call.
+ */
+function guardDirectSql(db, sql) {
+  if (!lifecycle.getStore()) return;
+  let readonly = false;
+  try {
+    readonly = prepare.call(db, sql).readonly;
+  } catch {
+    // No statement means no proof of read-only execution. Fail closed below.
+  }
+  if (readonly) return;
+  const site = callSite();
+  const message = `Unclassified ingress write: ${sql}\n${site}`;
+  process.send?.({ kind: 'unclassified-write', message, sql, site });
+  throw new Error(message);
+}
+
+/** exec accepts whole SQL programs, so only a proven read-only statement passes. */
 const exec = Database.prototype.exec;
 Database.prototype.exec = function (sql) {
-  if (
-    lifecycle.getStore() &&
-    /\b(insert|update|delete|replace|create|drop|alter)\b/i.test(sql)
-  ) {
-    // Runtime ingress uses prepared statements. A new direct writer requires
-    // deliberate inventory support rather than an uninterruptible multi-write point.
-    const site = callSite();
-    const message = `Unclassified ingress write: ${sql}\n${site}`;
-    process.send?.({ kind: 'unclassified-write', message, sql, site });
-    throw new Error(message);
-  }
+  guardDirectSql(this, sql);
   return exec.call(this, sql);
+};
+
+/** pragma prepares through the native handle, bypassing the public prepare hook. */
+const pragma = Database.prototype.pragma;
+Database.prototype.pragma = function (source, options) {
+  guardDirectSql(this, `PRAGMA ${source}`);
+  return pragma.call(this, source, options);
 };
 
 /**
