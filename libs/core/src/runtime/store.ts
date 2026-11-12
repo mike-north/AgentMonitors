@@ -1250,7 +1250,7 @@ export class RuntimeStore {
 
   /**
    * Give up terminal retained work for good (002 §2.7): record its observation
-   * as an outstanding loss through {@link RuntimeStore.recordUnretainedObservation}
+   * as an outstanding loss through {@link RuntimeStore.recordObservationLoss}
    * and remove the retry row, in one immediate transaction, so the loss is
    * never recorded without the removal or the removal without the loss.
    *
@@ -1294,7 +1294,7 @@ export class RuntimeStore {
           .from(materializationRetryOutbox)
           .where(eq(materializationRetryOutbox.id, id))
           .get();
-        this.recordUnretainedObservation({
+        this.recordObservationLoss({
           monitorId: current.monitorId,
           workspacePath: current.workspacePath,
           sourceName: current.sourceName,
@@ -2164,17 +2164,22 @@ export class RuntimeStore {
   }
 
   /**
-   * Record that admission dropped one observation because the retry outbox
-   * could not retain its ordered suffix (002 §2). Called inside the admitting
-   * span's transaction, so the drop commits or rolls back with that span.
+   * Record that the runtime lost one observation it could not keep (002 §2):
+   * admission dropped it because the retry outbox could not retain its ordered
+   * suffix, or a debounce/rollup hold refused it because its envelope cannot
+   * be serialized (002 §4.7). This is the one place a loss gets its drop
+   * identity, so every kind of loss is tracked as outstanding the same way.
+   * Called inside the admitting span's transaction, so the loss commits or
+   * rolls back with that span.
    *
-   * Besides the `errored` history row, it stores what supersedes the drop
+   * Besides the `errored` history row, it stores what supersedes the loss
    * later: the observation's raw `objectKey` (only a string counts) and the
    * high-water mark of the event materialization order at this write (see
-   * {@link RuntimeStore.reserveAdmissionSequence}). Events of earlier siblings
-   * in the same span, and retries admitted before the drop, are at or below
-   * that watermark; events of later siblings and later spans, and retries
-   * admitted after the drop, are above it.
+   * {@link RuntimeStore.reserveAdmissionSequence}). The caller writes it at the
+   * lost observation's place in the span's dispatched order: events of earlier
+   * siblings, and retries admitted before the loss, are at or below that
+   * watermark; events of later siblings and later spans, and retries admitted
+   * after the loss, are above it.
    *
    * `eventWatermark` replaces that high-water mark for an observation that
    * was admitted earlier than this write: a skipped retry passes its own
@@ -2183,7 +2188,7 @@ export class RuntimeStore {
    *
    * @internal
    */
-  recordUnretainedObservation(input: {
+  recordObservationLoss(input: {
     monitorId: string;
     workspacePath: string | null;
     sourceName: string;
@@ -2265,12 +2270,12 @@ export class RuntimeStore {
   }
 
   /**
-   * The outstanding observations admission dropped for one workspace/monitor
-   * because the retry outbox could not retain their suffix (002 §2), or
-   * `undefined` when there are none.
+   * The outstanding observations of one workspace/monitor that the runtime
+   * could not keep (002 §2): drops the retry outbox could not retain and
+   * observations a hold refused (002 §4.7). `undefined` when there are none.
    *
    * A drop row is an `errored` history row written by
-   * {@link RuntimeStore.recordUnretainedObservation}. It stays outstanding
+   * {@link RuntimeStore.recordObservationLoss}. It stays outstanding
    * until it is superseded, and nothing else clears it:
    * - a drop with an object key, by a `monitor_events` row of the same
    *   monitor, workspace and object key whose observation was admitted after
@@ -2278,9 +2283,10 @@ export class RuntimeStore {
    *   `sequence` is above the drop's watermark. A retry admitted before the
    *   drop carries older state, so its completion never clears it;
    * - a drop without one, by a later `triggered` history row of the same
-   *   monitor and workspace whose span dropped nothing (no positive
-   *   `notRetainedCount`), ordered by `(created_at, id)`. The dropping span's
-   *   own batch row carries its count, so it never supersedes its own drops.
+   *   monitor and workspace whose span lost nothing (no positive
+   *   `notRetainedCount` or `notHeld`), ordered by `(created_at, id)`. The
+   *   losing span's own batch row carries its counts, so it never supersedes
+   *   its own losses.
    *
    * Quiet ticks, notify holds, observe failures, a span whose only failure was
    * retained, and events for other keys therefore leave a keyed drop reported.
@@ -2298,7 +2304,8 @@ export class RuntimeStore {
     const drop = observationHistory;
     // json_extract raises on malformed JSON; every row is written with
     // JSON.stringify, but guard so one bad legacy row cannot fail diagnosis.
-    const laterNotRetained = sql`CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, '$.notRetainedCount') END`;
+    const laterLost = (field: 'notRetainedCount' | 'notHeld') =>
+      sql`coalesce(CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, ${`$.${field}`}) END, 0)`;
     const drops = and(
       eq(drop.monitorId, monitorId),
       eq(drop.workspacePath, workspacePath),
@@ -2324,7 +2331,8 @@ export class RuntimeStore {
               AND superseding.workspace_path = ${drop.workspacePath}
               AND superseding.result = 'triggered'
               AND (superseding.created_at, superseding.id) > (${drop.createdAt}, ${drop.id})
-              AND coalesce(${laterNotRetained}, 0) <= 0
+              AND ${laterLost('notRetainedCount')} <= 0
+              AND ${laterLost('notHeld')} <= 0
           )`,
         ),
       ),

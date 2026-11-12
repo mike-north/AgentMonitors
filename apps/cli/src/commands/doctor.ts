@@ -607,9 +607,14 @@ function rejectedScopeRemediation(validationError: string): string {
 const UNRETAINED_CLEARS =
   'A dropped observation cannot be retried. This check clears once a later event of this monitor materializes for each dropped object key; a drop without an object key clears once a later observation span of this monitor materializes an event and drops nothing.';
 
-/** The shared description of an outstanding drop, for the monitor and orphan checks. */
+/**
+ * The shared description of outstanding loss, for the monitor and orphan
+ * checks. One wording for every kind of loss (002 §2): the newest loss's own
+ * error says why it was dropped, an outbox that could not retain it or a hold
+ * that refused it (002 §4.7).
+ */
 function unretainedLossDetail(loss: UnretainedObservationLoss): string {
-  return `observation dropped, not retained for retry (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}`;
+  return `observation dropped (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}`;
 }
 
 /**

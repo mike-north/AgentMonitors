@@ -2092,11 +2092,14 @@ See `monitor retry` (§6). Explain lists bounded safe retry metadata (record id,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
 
 A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
-cannot retain a suffix": its retry suffix could not be retained, and nothing has superseded it yet)
-fails its check even though `retry-outbox` shows `0/0`, since
-the drop has no retry record. This check outranks the retry checks. Its detail is
-`observation dropped, not retained for retry (<count> outstanding; newest: <which> at <iso8601>):
-<error>` followed by the rollup line. `<which>` uses explain's wording (002 §10.7). The remediation
+cannot retain a suffix": its retry suffix could not be retained, or a debounce or rollup hold
+refused it because it cannot be serialized (002 §4.7), and nothing has superseded it yet) fails its
+check even though `retry-outbox` shows `0/0`, since the drop has no retry record. This check
+outranks the retry checks. Its detail is
+`observation dropped (<count> outstanding; newest: <which> at <iso8601>): <error>` followed by the
+rollup line. `<count>` covers both kinds of drop; `<error>` is the newest drop's own error, which
+ends in `Not retained for retry: <reason>` for an outbox drop and is the refusal message for a
+refused one. `<which>` uses explain's wording (002 §10.7). The remediation
 names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
 `monitor history <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
 when the check clears: `A dropped observation cannot be retried. This check clears once a later
@@ -2114,7 +2117,7 @@ parse-failed or duplicated id carries the loss in its `orphanedMonitorWork` entr
 `dropped-observation=orphaned`). A parsed but invalid definition keeps it on its monitor row,
 whose check is a `skip`. Either way doctor adds a failing `dropped-observation:<id>` check, after
 the per-monitor checks and with any `retry-outbox:<id>` check for that id, whose detail is the
-`observation dropped, not retained for retry (…): <error>` text above and whose remediation names
+`observation dropped (…): <error>` text above and whose remediation names
 `monitor history <id>` (with `--workspace` as above), says to repair the definition or reported
 failure, and gives the same clearing rule.
 

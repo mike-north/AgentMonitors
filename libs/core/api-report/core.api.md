@@ -1415,7 +1415,7 @@ export class RuntimeStore {
         observationData: Record<string, unknown>;
     }): void;
     // @internal
-    recordUnretainedObservation(input: {
+    recordObservationLoss(input: {
         monitorId: string;
         workspacePath: string | null;
         sourceName: string;

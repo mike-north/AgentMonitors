@@ -1407,7 +1407,7 @@ it('fails the doctor monitor check for a dropped observation until a later event
         .find((candidate) => candidate.startsWith('✗ monitor:dropper: '));
       expect(line).toBeDefined();
       expect(line).toContain(
-        `observation dropped, not retained for retry (1 outstanding; newest: observation 300 of 600 (object-299, "b0-299") at ${tickAt.toISOString()}): native fault on b0-299 Not retained for retry: the retry outbox capacity is exhausted`,
+        `observation dropped (1 outstanding; newest: observation 300 of 600 (object-299, "b0-299") at ${tickAt.toISOString()}): native fault on b0-299 Not retained for retry: the retry outbox capacity is exhausted`,
       );
       expect(line).toContain('retry-outbox=0/0');
       expect(text.stdout).toContain(
@@ -1587,6 +1587,7 @@ async function seedDrop(
   monitors: string,
   dbPath: string,
   source: Parameters<SourceRegistry['register']>[0],
+  reported = 'Not retained for retry',
 ): Promise<void> {
   const db = createDb(dbPath);
   const client = (db as unknown as { $client: Database }).$client;
@@ -1600,7 +1601,7 @@ async function seedDrop(
     expect(tick.erroredObservations).toEqual([
       {
         monitorId: 'dropper',
-        message: expect.stringContaining('Not retained for retry'),
+        message: expect.stringContaining(reported),
       },
     ]);
   } finally {
@@ -1681,7 +1682,7 @@ it.each([
       name: 'dropped-observation:dropper',
       status: 'fail',
       detail: expect.stringMatching(
-        /^observation dropped, not retained for retry \(1 outstanding; newest: observation 2 of 2 \(object-1, "d-1"\) at /,
+        /^observation dropped \(1 outstanding; newest: observation 2 of 2 \(object-1, "d-1"\) at /,
       ),
       remediation: expect.stringMatching(
         /^Inspect it with `agentmonitors monitor history dropper[^`]*` and repair the definition or reported failure\. A dropped observation cannot be retried\./,
@@ -1696,7 +1697,7 @@ it.each([
         candidate.startsWith('✗ dropped-observation:dropper: '),
       );
     expect(line).toContain(
-      'observation dropped, not retained for retry (1 outstanding; newest: observation 2 of 2 (object-1, "d-1") at ',
+      'observation dropped (1 outstanding; newest: observation 2 of 2 (object-1, "d-1") at ',
     );
   },
 );
@@ -1761,7 +1762,7 @@ it('reports a drop of a monitor whose source config is now rejected in doctor an
       id: 'materialization',
       status: 'failure',
       reason: expect.stringContaining(
-        '1 observation(s) were dropped because the retry outbox could not retain them; the newest, observation 2 of 2 (object-1, "d-1")',
+        '1 observation(s) were dropped because the runtime could not keep them; the newest, observation 2 of 2 (object-1, "d-1")',
       ),
     }),
   );
@@ -1769,7 +1770,7 @@ it('reports a drop of a monitor whose source config is now rejected in doctor an
   const text = await run('explain', 'text', dbPath, 'dropper');
   expect(text.code).toBe(0);
   expect(text.stdout).toContain(
-    '1 observation(s) were dropped because the retry outbox could not retain them',
+    '1 observation(s) were dropped because the runtime could not keep them',
   );
 });
 
@@ -1792,6 +1793,80 @@ const droppingSource = {
       nextState: { seeded: true },
     }),
 } satisfies Parameters<SourceRegistry['register']>[0];
+
+/**
+ * Regression for #575 through the built CLI: an observation a debounce hold
+ * refused (002 §4.7) is loss like an outbox drop (002 §2). Doctor fails the
+ * monitor with the same loss wording and explain keeps a failing
+ * materialization stage, naming the refusal's own reason, after newer history.
+ */
+it('reports a hold refusal as an outstanding dropped observation in doctor and explain, in text and JSON', async () => {
+  const monitors = path.join(root, 'monitors');
+  const dir = path.join(monitors, 'dropper');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, 'MONITOR.md'),
+    DROPPER_SCHEDULE.replace(
+      'baseline-strategy: incremental\n',
+      'baseline-strategy: incremental\nnotify:\n  strategy: debounce\n  settle-for: 1h\n',
+    ),
+  );
+  const dbPath = path.join(root, 'state.db');
+  await seedDrop(
+    monitors,
+    dbPath,
+    {
+      ...droppingSource,
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'h-0', summary: 'h-0', objectKey: 'object-0' },
+            {
+              title: 'refused',
+              summary: 'refused',
+              objectKey: 'object-r',
+              payload: { n: 1n },
+            },
+          ],
+          nextState: { seeded: true },
+        }),
+    },
+    'was not held for debounce',
+  );
+
+  const json = await run('doctor', 'json', dbPath);
+  expect(json.code).toBe(1);
+  const report = JSON.parse(json.stdout);
+  expect(report.monitors[0].unretainedObservationLoss).toEqual({
+    count: 1,
+    recordedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT/),
+    error: expect.stringMatching(
+      /^Observation "refused" was not held for debounce: it cannot be serialized \(.*BigInt.*\)\.$/,
+    ),
+    objectKey: 'object-r',
+    title: 'refused',
+  });
+  expect(report.checks).toContainEqual(
+    expect.objectContaining({
+      name: 'monitor:dropper',
+      status: 'fail',
+      detail: expect.stringMatching(
+        /^observation dropped \(1 outstanding; newest: an observation \(object-r, "refused"\) at .*\): Observation "refused" was not held for debounce/,
+      ),
+    }),
+  );
+  const text = await run('doctor', 'text', dbPath);
+  expect(text.code).toBe(1);
+  expect(text.stdout).toContain(
+    '✗ monitor:dropper: observation dropped (1 outstanding; newest: an observation (object-r, "refused") at ',
+  );
+
+  const explained = await run('explain', 'text', dbPath, 'dropper');
+  expect(explained.code).toBe(0);
+  expect(explained.stdout).toContain(
+    '1 observation(s) were dropped because the runtime could not keep them; the newest, an observation (object-r, "refused"), failed: Observation "refused" was not held for debounce',
+  );
+});
 
 /**
  * Bug (#497): a duplicated id whose orphan group held only a drop
@@ -1914,7 +1989,7 @@ it('attributes a live ephemeral drop to its monitor and reports a cancelled one 
     status: 'fail',
     detail: expect.stringMatching(
       new RegExp(
-        `^ephemeral monitor of session ${sessionId}; observation dropped, not retained for retry \\(1 outstanding;`,
+        `^ephemeral monitor of session ${sessionId}; observation dropped \\(1 outstanding;`,
       ),
     ),
   });
@@ -1960,7 +2035,7 @@ it('attributes a live ephemeral drop to its monitor and reports a cancelled one 
   expect(retiredCheck).toMatchObject({
     status: 'fail',
     detail: expect.stringMatching(
-      /^retired ephemeral monitor; observation dropped, not retained for retry/,
+      /^retired ephemeral monitor; observation dropped/,
     ),
     remediation: expect.stringContaining(
       'has since been cancelled or reaped: it never had a MONITOR.md definition, so there is nothing to repair',
