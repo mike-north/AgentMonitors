@@ -411,12 +411,19 @@ export async function cancelWatchClient(
 /**
  * Client timeout for the two retry repairs. The daemon runs each repair as one
  * immediate SQLite transaction, which waits up to the store's 5-second busy
- * timeout for another writer's lock before it fails. The default 2-second
- * client timeout would give up on a daemon that is still waiting and about to
- * apply the repair; this one outlasts that wait, so a daemon that is merely
- * busy still gets to answer.
+ * timeout for another writer's lock before it fails. That wait can come twice:
+ * the store's busy wait is synchronous, so while another process holds the
+ * lock the daemon's own tick can block its event loop for up to 5 seconds
+ * before it even reads the request, and the repair's transaction may then wait
+ * up to 5 seconds more. This covers both waits with a margin, where the
+ * default 2-second client timeout would give up on a daemon about to apply the
+ * repair.
+ *
+ * It is not a bound on the daemon: a daemon blocked on a lock for longer still
+ * answers too late, the CLI reports the outcome as unknown, and the daemon may
+ * apply the repair after the CLI has given up.
  */
-export const RETRY_REPAIR_TIMEOUT_MS = 10_000;
+export const RETRY_REPAIR_TIMEOUT_MS = 15_000;
 
 /**
  * A repair result with its retry's Dates revived and its last error

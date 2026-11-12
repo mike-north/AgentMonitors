@@ -66,8 +66,9 @@ function suggestionScope(workspacePath: string): SuggestionScope {
 /**
  * The report for a request a daemon accepted but never answered (a timeout,
  * or the connection dropping after the request was written). The daemon may
- * have applied the repair, so the CLI neither claims an outcome nor applies it
- * itself; it points at the read-only commands that show which it was.
+ * have applied the repair, or may still apply it once it reads the request, so
+ * the CLI neither claims an outcome nor applies it itself; it points at the
+ * read-only commands that show which it was.
  */
 function outcomeUnknownMessage(
   repair: RetryRepair,
@@ -79,7 +80,7 @@ function outcomeUnknownMessage(
   const label = repair === 'rearm' ? 'Re-arm' : 'Skip';
   const noun = repair === 'rearm' ? 're-arm' : 'skip';
   const scope = suggestionScope(workspacePath);
-  return `${label} outcome unknown for retry ${retryId} of monitor ${monitorId} in workspace ${workspacePath}: the daemon received the request but no reply arrived (${error.message}). The ${noun} may already have been applied; nothing was written to the store from here. Check with \`${explainCommand(scope, monitorId)}\` or \`${doctorCommandLine(scope)}\` before running it again.`;
+  return `${label} outcome unknown for retry ${retryId} of monitor ${monitorId} in workspace ${workspacePath}: the daemon received the request but no reply arrived (${error.message}). The ${noun} may already have been applied, or may still be applied; nothing was written to the store from here. Check with \`${explainCommand(scope, monitorId)}\` or \`${doctorCommandLine(scope)}\` before running it again.`;
 }
 
 /** Shown once a removed retry no longer holds its monitor back. */

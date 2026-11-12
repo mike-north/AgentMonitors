@@ -279,7 +279,8 @@ async function run(
   try {
     const result = await execute(process.execPath, [cli, ...args], {
       cwd,
-      timeout: 15_000,
+      // Longer than the repairs' own 15-second wait for a daemon's reply.
+      timeout: 30_000,
       env,
     });
     return { stdout: result.stdout, stderr: result.stderr, code: 0 };
@@ -636,16 +637,16 @@ describe('monitor retry behind a daemon that received the request but did not an
       `Error: ${label} outcome unknown for retry ${id} of monitor ${MONITOR} in workspace ${root}: the daemon received the request but no reply arrived (`,
     );
     expect(result.stderr).toContain(
-      'may already have been applied; nothing was written to the store from here. Check with `agentmonitors monitor explain watcher` or `agentmonitors doctor` before running it again.',
+      'may already have been applied, or may still be applied; nothing was written to the store from here. Check with `agentmonitors monitor explain watcher` or `agentmonitors doctor` before running it again.',
     );
   }
 
   it('reports a skip whose reply comes after the client timeout as unknown, and writes nothing', async () => {
     const id = await seedRetry({});
     const lossesBefore = erroredMessages().length;
-    // Past the repairs' 10-second client timeout (RETRY_REPAIR_TIMEOUT_MS),
-    // as a daemon still waiting on another writer's lock would answer.
-    const LATE_REPLY_MS = 11_000;
+    // Past the repairs' 15-second client timeout (RETRY_REPAIR_TIMEOUT_MS),
+    // as a daemon blocked on another writer's lock for longer would answer.
+    const LATE_REPLY_MS = 16_000;
     const methods: string[] = [];
     const close = await fakeDaemon((socket, request) => {
       methods.push(request.method);
@@ -669,8 +670,11 @@ describe('monitor retry behind a daemon that received the request but did not an
     // The CLI did not skip it behind the daemon.
     expect(retryRow(id)?.status).toBe('terminal');
     expect(erroredMessages()).toHaveLength(lossesBefore);
+    // 005 `monitor retry`: two 5-second store lock waits (the daemon's own
+    // tick, then the repair) plus a margin.
+    expect(RETRY_REPAIR_TIMEOUT_MS).toBe(15_000);
     expect(RETRY_REPAIR_TIMEOUT_MS).toBeLessThan(LATE_REPLY_MS);
-  }, 30_000);
+  }, 45_000);
 
   it('reports a repair whose connection drops after the request as unknown, and writes nothing', async () => {
     const id = await seedRetry({});

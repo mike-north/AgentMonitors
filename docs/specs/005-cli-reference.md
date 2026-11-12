@@ -853,8 +853,12 @@ Both commands refuse, exit 1, and change nothing when:
 monitor <monitorId> in workspace <path>: Skip reason is <n> characters; at most 200 are allowed.`
 
 The command asks the workspace's daemon (`retry.rearm` / `retry.skip`, Zod-validated params
-`{ monitorId, retryId, workspacePath, reason? }`), waiting up to 10 seconds for its reply: longer
-than the 5 seconds the daemon's store write may wait for another writer's lock. A daemon repair
+`{ monitorId, retryId, workspacePath, reason? }`), waiting up to 15 seconds for its reply. While
+another process holds the store's write lock, the daemon's own tick can wait up to 5 seconds for it
+before the daemon reads the request, and the repair's write may then wait up to 5 seconds more; the
+15 seconds cover both waits with a margin. A daemon blocked on a lock for longer than that can still
+answer too late: the command then reports the outcome as unknown (below), and the daemon may apply
+the repair after the command has given up. A daemon repair
 (re-arm or skip) also wakes a watcher of that monitor that is paused on the retry, instead of
 leaving it to its one-minute recheck. Which path applies depends on how far the request got:
 
@@ -863,11 +867,11 @@ leaving it to its one-minute recheck. Which path applies depends on how far the 
   (§1 "Database path resolution") and prints `No daemon running — applied to the persisted store;
 it takes effect on the next tick.` first.
 - **A daemon accepted the request but no reply arrived** (the wait above ran out, or the
-  connection closed first): the daemon may already have applied the repair, so the outcome is
-  unknown. The command writes nothing, exits 1 and prints
+  connection closed first): the daemon may already have applied the repair, or may still apply it
+  once it reads the request, so the outcome is unknown. The command writes nothing, exits 1 and prints
   ``<Re-arm|Skip> outcome unknown for retry <id> of monitor <monitorId> in workspace <path>: the
 daemon received the request but no reply arrived (<cause>). The <re-arm|skip> may already have
-been applied; nothing was written to the store from here. Check with `<explain command>` or
+been applied, or may still be applied; nothing was written to the store from here. Check with `<explain command>` or
 `<doctor command>` before running it again.`` (the commands are quoted and scoped as below).
 - **The daemon answered with an error** (a refusal, or a daemon too old to know the method): the
   error is reported, never retried in-process.
