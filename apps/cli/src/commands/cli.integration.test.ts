@@ -23,6 +23,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeLocalState } from '../local-state.js';
+import { workspacePaths } from '../workspace-paths.js';
 import {
   daemonAvailable,
   callDaemon,
@@ -45,6 +46,22 @@ import {
   SourceRegistry,
   type StoredObservationEnvelope,
 } from '@agentmonitors/core';
+
+/**
+ * Default-lookup cases must bind inside their own data root, rather than the
+ * production fixed /tmp fallback. That fallback's IPC contract is exercised
+ * separately in daemon-ipc.test.ts through its relocated OS namespace.
+ */
+function expectOwnedDefaultSocket(workspace: string, dataHome: string): void {
+  const previous = process.env['XDG_DATA_HOME'];
+  try {
+    process.env['XDG_DATA_HOME'] = dataHome;
+    expect(workspacePaths(workspace).socket.length).toBeLessThanOrEqual(100);
+  } finally {
+    if (previous === undefined) delete process.env['XDG_DATA_HOME'];
+    else process.env['XDG_DATA_HOME'] = previous;
+  }
+}
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -3198,8 +3215,13 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
       expect(substitutedSocketPath).not.toBe(requestedSocketPath);
       // The substituted socket lives inside an owner-only per-uid directory,
       // never a predictable /tmp/*.sock a peer could connect to (issue #292).
-      expect(substitutedSocketPath).toMatch(
-        /^\/tmp\/agentmonitors-\d+\/agentmonitors-[0-9a-f]{16}\.sock$/,
+      // NODE_OPTIONS carries the shared namespace into the built child; its
+      // actual bind must be inside this test's root even for a forced fallback.
+      expect(path.dirname(substitutedSocketPath)).toBe(
+        path.join(tmpdir(), `agentmonitors-${String(process.getuid?.() ?? 0)}`),
+      );
+      expect(path.basename(substitutedSocketPath)).toMatch(
+        /^agentmonitors-[0-9a-f]{16}\.sock$/,
       );
 
       // Criterion 1 (regression): pre-fix, `resolveSocketPath` had no concept
@@ -3250,8 +3272,11 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
     const parsed = JSON.parse(result.stdout) as { socketPath: string };
     expect(parsed.socketPath).not.toBe(overLimitSocketPath);
     // Owner-only per-uid fallback directory, not a shared /tmp/*.sock (issue #292).
-    expect(parsed.socketPath).toMatch(
-      /^\/tmp\/agentmonitors-\d+\/agentmonitors-[0-9a-f]{16}\.sock$/,
+    expect(path.dirname(parsed.socketPath)).toBe(
+      path.join(tmpdir(), `agentmonitors-${String(process.getuid?.() ?? 0)}`),
+    );
+    expect(path.basename(parsed.socketPath)).toMatch(
+      /^agentmonitors-[0-9a-f]{16}\.sock$/,
     );
   });
 });
@@ -3761,7 +3786,7 @@ When files change, review them.
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -3961,7 +3986,7 @@ When files change, review them.
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -4125,7 +4150,7 @@ describe('session list and close', () => {
     mkdirSync(monitorsDir, { recursive: true });
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-sess-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -4202,7 +4227,7 @@ describe('session open --format id (issue #338 item 4)', () => {
     mkdirSync(monitorsDir, { recursive: true });
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-fmtid-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -4439,7 +4464,7 @@ describe('manual daemon socket commands', () => {
   it('manual socket commands report an actionable no-daemon message without a stack trace', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-manual-down-'));
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-down-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'manual-down.db');
@@ -4502,7 +4527,7 @@ When files change, review them.
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hist-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
@@ -4567,7 +4592,7 @@ This monitor fires on a schedule.
 
   function deadSocketPath(label: string): string {
     return path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
   }
@@ -5102,10 +5127,9 @@ This monitor has a typo'd timezone.
     // Isolated fake HOME + pinned XDG_DATA_HOME (workspacePaths() prefers it
     // over HOME) so the derived per-workspace db lands under a directory this
     // test controls and cleans up, never the developer's real data dir.
-    const fakeHome = mkdtempSync(
-      path.join(tmpdir(), 'agentmon-374-fallback-home-'),
-    );
-    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
+    const xdgDataHome = path.join(fakeHome, 'd');
+    expectOwnedDefaultSocket(dir, xdgDataHome);
     // Enabled, but deliberately NO `db:` value — resolveWorkspaceDbPath must
     // fall to the DERIVED per-workspace db (workspacePaths(dir).db), the exact
     // path this test proves the fallback actually reads.
@@ -5213,7 +5237,7 @@ When source files change, review them.
       {
         AGENTMONITORS_DB: ':memory:',
         AGENTMONITORS_SOCKET: path.join(
-          '/tmp',
+          tmpdir(),
           `agentmon-doctor-banner-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
         ),
       },
@@ -5263,7 +5287,7 @@ Handle it.
 
   function doctorSocket(label: string): string {
     return path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-doctor-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
   }
@@ -6435,14 +6459,15 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-335-home-'));
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET anywhere below —
     // that is the exact condition that reproduces the study's finding. Pinning
     // XDG_DATA_HOME under fakeHome (rather than leaving it to whatever the
     // ambient shell has set, which `workspacePaths()` prefers over HOME) keeps
     // every derived path — and this cleanup — confined to fakeHome regardless
     // of the developer's real environment.
-    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const xdgDataHome = path.join(fakeHome, 'd');
+    expectOwnedDefaultSocket(dir, xdgDataHome);
     const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
 
     let daemonChild: ReturnType<typeof spawn> | undefined;
@@ -6557,7 +6582,7 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-374-home-'));
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET / --socket
     // anywhere below — that is the exact condition the issue reports. Pinning
     // XDG_DATA_HOME under fakeHome (which `workspacePaths()` prefers over
@@ -6568,7 +6593,8 @@ This monitor fires on a schedule.
     // alike, making the socket cross-check below pass via that shared
     // override without ever exercising per-workspace auto-discovery, and
     // could leak real daemon state outside fakeHome.
-    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const xdgDataHome = path.join(fakeHome, 'd');
+    expectOwnedDefaultSocket(dir, xdgDataHome);
     const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
 
     let daemonChild: ReturnType<typeof spawn> | undefined;
@@ -6677,16 +6703,14 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(
-      path.join(tmpdir(), 'agentmon-335-once-home-'),
-    );
+    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
     // Pin XDG_DATA_HOME under fakeHome (it takes priority over HOME in
     // `workspacePaths()`) and use `runWithCleanEnv` so an ambient
     // AGENTMONITORS_DB/AGENTMONITORS_SOCKET/XDG_DATA_HOME in the developer's
     // own shell can't be inherited by either subprocess below.
     const env = {
       HOME: fakeHome,
-      XDG_DATA_HOME: path.join(fakeHome, '.local', 'share'),
+      XDG_DATA_HOME: path.join(fakeHome, 'd'),
     };
 
     try {
@@ -6745,7 +6769,7 @@ When files change, review them.
     );
 
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-explain-apperr-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
 
@@ -6938,7 +6962,7 @@ describe('monitor test', () => {
     run(['init', 'fp-empty', '--dir', monitorsDir], dir);
 
     const monitorFile = path.join(monitorsDir, 'fp-empty', 'MONITOR.md');
-    const result = run(['monitor', 'test', monitorFile], '/tmp');
+    const result = run(['monitor', 'test', monitorFile], tmpdir());
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('No files matched');
@@ -7004,7 +7028,7 @@ This monitor has a typo'd timezone.
     const monitorFile = path.join(monitorsDir, 'fp-empty-json', 'MONITOR.md');
     const result = run(
       ['monitor', 'test', monitorFile, '--format', 'json'],
-      '/tmp',
+      tmpdir(),
     );
 
     expect(result.exitCode).toBe(1);
@@ -7361,7 +7385,7 @@ Summarize what changed in the spec/standard docs and whether it affects current 
     // -----------------------------------------------------------------------
     const dbPath = path.join(repo, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-ic-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -7689,7 +7713,7 @@ When files change, review them.
       // factor into this proof either way.
       const dbPath = path.join(tempDir, 'gitignore-proof.db');
       const socketPath = path.join(
-        '/tmp',
+        tmpdir(),
         `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const env = {
@@ -7854,7 +7878,7 @@ function bootLazyWorkspace(reapAfterMs: number): {
   );
 
   const socket = path.join(
-    '/tmp',
+    tmpdir(),
     `agentmon-lazy-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
   );
   const db = path.join(ws, 'lazy.db');
@@ -8262,7 +8286,7 @@ describe('lazy daemon lifecycle', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-ssrecap-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'ssrecap.db');
@@ -8391,7 +8415,7 @@ describe('lazy daemon lifecycle', () => {
 
     // Per-workspace socket + db; enable monitoring via .claude/agentmonitors.local.md.
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-steel-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'steel-thread.db');
@@ -8962,7 +8986,7 @@ describe('plugin hooks.json config-drift UAT', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hooksjson.db');
@@ -9211,7 +9235,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hook-deliver.db');
@@ -9377,7 +9401,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hdn-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-normal.db');
@@ -9525,7 +9549,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hdj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-json.db');
@@ -9664,7 +9688,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hdt-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-text.db');
@@ -9787,7 +9811,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd2-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-empty.db');
@@ -9914,7 +9938,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-pt-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-pretool.db');
@@ -10020,7 +10044,7 @@ describe('hook deliver', () => {
     }
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-tr-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-trunc.db');
@@ -10215,7 +10239,7 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-333-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'issue-333.db');
@@ -10414,7 +10438,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-unk-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'unknown.db');
@@ -10489,7 +10513,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-cwd-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'cwd.db');
@@ -10563,7 +10587,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-idle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'idle.db');
@@ -10666,7 +10690,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-settle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'settle.db');
@@ -10800,7 +10824,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-ident-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'identical.db');
@@ -10990,7 +11014,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-329-unk-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'unknown.db');
@@ -11095,7 +11119,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-329-settle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'settle.db');
@@ -11222,7 +11246,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-329-claim-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'claim.db');
@@ -11355,7 +11379,7 @@ describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr 
       JSON.stringify({
         session_id: 'some-host',
         hook_event_name: 'PreToolUse',
-        cwd: '/tmp',
+        cwd: tmpdir(),
       }),
     );
     expect(result.exitCode).toBe(0);
@@ -11371,7 +11395,7 @@ describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr 
     const result = runWithStdinCapture(
       ['hook', 'deliver'],
       {},
-      JSON.stringify({ session_id: 'some-host', cwd: '/tmp' }),
+      JSON.stringify({ session_id: 'some-host', cwd: tmpdir() }),
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe('');
@@ -11412,7 +11436,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-ho-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hooks-only.db');
@@ -11629,7 +11653,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-mo-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'multi-object.db');
@@ -11800,7 +11824,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-inj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'inject.db');
@@ -11986,7 +12010,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-cc-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'channel-cycle.db');
@@ -12378,7 +12402,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     // shell-round-trip-safe end to end against a real daemon, not just at the
     // unit level.
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon chcycle [huge] ${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'channel-cycle-huge.db');
@@ -12526,7 +12550,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       // assertion above already confirmed byte-for-byte.
       const advertisedCommand = `${extractedCommand ?? ''} --format json`;
       const staleSocket = path.join(
-        '/tmp',
+        tmpdir(),
         `agentmon-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const shimDir = makeAgentmonitorsShimDir();
@@ -12614,7 +12638,7 @@ describe('hook deliver: oversized single-event marker socket scoping (issue #358
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-huge-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-huge.db');
@@ -12725,7 +12749,7 @@ describe('hook deliver: oversized single-event marker socket scoping (issue #358
       // own advertised command, already confirmed above.
       const advertisedCommand = `${extractedCommand ?? ''} --format json`;
       const staleSocket = path.join(
-        '/tmp',
+        tmpdir(),
         `agentmon-hd-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const shimDir = makeAgentmonitorsShimDir();
@@ -12854,7 +12878,7 @@ describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)',
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `am-watch-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -13085,7 +13109,7 @@ Bad schedule scope.
     // diagnosis.
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `am-parity-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {

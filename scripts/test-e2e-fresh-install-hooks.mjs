@@ -55,6 +55,7 @@
  * @see ../docs/specs/002-runtime-delivery.md §10.4 (daemon IPC wire protocol)
  * @see ../docs/specs/002-runtime-delivery.md §10.5 (the `daemon.tick` method used to force a deterministic baseline)
  */
+import { withIsolatedTestEnvironment } from './test-isolation/boundary.mjs';
 import { Buffer } from 'node:buffer';
 import { spawn, spawnSync } from 'node:child_process';
 import {
@@ -884,7 +885,7 @@ const isMainModule =
 
 if (isMainModule) {
   try {
-    await main();
+    await withIsolatedTestEnvironment(main);
   } catch (error) {
     console.error(
       `\n✖ FAILED: ${error instanceof Error ? error.message : String(error)}`,

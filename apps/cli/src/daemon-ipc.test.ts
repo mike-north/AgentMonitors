@@ -26,6 +26,8 @@ import {
 } from './daemon-ipc.js';
 import { createRuntime } from './runtime.js';
 
+// Shared test setup relocates the fixed fallback namespace, so these real IPC
+// cases never probe, bind, chmod or remove an installed daemon's artifacts.
 const tempRoots: string[] = [];
 
 function tempDir(): string {
@@ -948,8 +950,8 @@ describe.skipIf(process.platform === 'win32')(
         expect(mode(fallbackSocket)).toBe(0o600);
       } finally {
         await server.close().catch(() => undefined);
-        // Clean only the socket we created; the per-uid dir is shared and
-        // stays (owner-only) for any real daemon on this machine.
+        // Only the fixture socket is removed here; the shared setup owns
+        // the relocated per-uid directory and its complete case lifetime.
         rmSync(fallbackSocket, { force: true });
       }
     });

@@ -84,9 +84,7 @@ function git(repo: string, args: string[]): string {
 
 function fixture(format = 'sha1') {
   // Keep macOS Unix socket paths below sockaddr_un's length limit.
-  const root = mkdtempSync(
-    path.join(process.platform === 'win32' ? tmpdir() : '/tmp', 'am305-'),
-  );
+  const root = mkdtempSync(path.join(tmpdir(), 'am305-'));
   roots.push(root);
   const repo = path.join(root, 'repo');
   mkdirSync(repo);

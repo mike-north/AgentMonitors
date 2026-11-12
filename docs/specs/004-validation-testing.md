@@ -625,6 +625,57 @@ Verified in `apps/cli/src/commands/validate-admission.test.ts` and
 `libs/core/src/schema/input-limits.test.ts`. Tests consume prebuilt artifacts under
 §2.9; narrow repair reversions must reproduce each admission failure independently.
 
+### 2.13 Test filesystem isolation (current)
+
+Every maintained package suite (core, CLI fast and serial, launcher, sources, and
+`scripts/`) MUST load the shared `scripts/test-isolation` boundary through Vitest
+`globalSetup` and `setupFiles`. Standalone consumer, fresh-install hook, and Windows
+install checks MUST enter the same boundary at their direct entrypoint. Importing
+their definitions MUST NOT change the caller's environment. Nx test inputs include
+the shared boundary, so cached results cannot hide changes to it.
+
+Before test modules load, the boundary MUST replace HOME and platform home/config
+inputs, all XDG data/config/state/cache/runtime inputs, and TMPDIR/TMP/TEMP with
+owned OS temporary paths. Inherited `AGENTMONITORS_DB`, `AGENTMONITORS_SOCKET`, and
+`CLAUDE_PROJECT_DIR` MUST be removed: ordinary production fallback resolution then
+uses the isolated roots without masking workspace-specific defaults. A test MAY
+supply its own explicit overrides only within directories it owns. Child processes
+MUST inherit the isolated environment; a custom allowlist MUST retain the path
+boundary. Product storage and path precedence do not change for this rule.
+
+Ordinary case roots MUST be removed in `afterEach`, including failures/timeouts.
+Package-manager caches MAY share a run-owned root to avoid repeated downloads;
+they MUST NOT point at host caches. Module/beforeAll fixtures have file lifetimes and MUST be removed in `afterAll`.
+Coordinator teardown and process-exit hooks MUST remove remaining run roots.
+Test subprocesses still require their existing owned-process teardown: removing a
+filesystem root does not terminate its processes.
+
+The coordinator MUST capture real installation locations before overriding paths
+and compare existence, mtime, size, permissions, symlink targets, and SHA-256 content
+hashes for regular files up to 1 MiB at teardown. Default locations MUST be watched
+even when absent. This includes the legacy HOME data root, XDG/config/state/cache/
+runtime roots, macOS Library equivalents, inherited DB/socket overrides, and the
+fixed per-uid `/tmp` socket fallback (002 §10.3). A difference MUST fail the suite;
+the guard MUST never repair or remove real installation data. Concurrent external
+writers can also trigger this conservative guard; installation-preservation proof
+requires a quiet window and MUST NOT discard their changes from the comparison.
+
+Fixed-path socket tests MUST relocate the OS namespace at a test-only boundary;
+they may not bind, chmod, delete, or probe an installation's real fallback sockets.
+Shared setup installs that narrow path boundary in workers and carries it through
+`NODE_OPTIONS --import` into built CLI children. Guard snapshots MUST still observe
+the actual unrelocated per-user namespace.
+For example, a test of legacy-socket migration runs real IPC in an owned temp root
+while preserving the resolver's original fixed-base/per-uid/hash path arguments.
+
+**Verified by:** `scripts/test-data-isolation.test.ts` checks every maintained
+config, child inheritance, cache invalidation, initially absent XDG roots,
+same-size edits with restored mtime, and cleanup through pass/failure/timeout/
+beforeAll failure/explicit process exit. Deliberate installation mutations run in
+subprocesses with fake real roots, never against a user's installation. An acceptance
+run MUST hash every regular installation file before and after two complete suite
+runs and demonstrate byte-identical inventories; a partial test run is insufficient.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.

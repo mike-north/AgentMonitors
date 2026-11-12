@@ -9,6 +9,17 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Test suites own their filesystem roots (004 §2.13; Refs #611)
+
+Require shared default HOME/XDG/temp isolation for all maintained package/script
+suites and standalone install checks, with inherited storage/session overrides
+removed and child environments preserved. Add a coordinator guard for changed real
+installation files, including absent roots and small-file content hashes, plus
+case/file/run/exit cleanup. Fixed socket fallback tests relocate their namespace
+without changing production paths. Fake-installation subprocess regressions and
+uncached full-suite installation hashes establish the validation obligation;
+concurrent external writers must be reported rather than excluded from the guard.
+
 ## 2026-11-12 — Bundled advisory coverage follows actual build inputs (004 §2.10)
 
 Replace selector/closure inventory with fresh esbuild metafiles for every published
