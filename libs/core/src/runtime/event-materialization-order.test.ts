@@ -386,14 +386,24 @@ describe('durable equal-time event order', () => {
     const migratedRows = migrated.client
       .prepare('SELECT * FROM monitor_events ORDER BY sequence')
       .all() as Record<string, unknown>[];
-    // The additive admission column (002 §2) is NULL on every copied event:
-    // each was admitted where it committed.
+    // Both additive columns post-date the legacy shape and are NULL on every
+    // copied event: `admission_sequence` (002 §2) because each was admitted where
+    // it committed, `definition_fingerprint` (#451) because legacy rows read as
+    // unknown.
+    expect(migratedRows.map((row) => row['admission_sequence'])).toEqual(
+      migratedRows.map(() => null),
+    );
+    expect(migratedRows.map((row) => row['definition_fingerprint'])).toEqual(
+      migratedRows.map(() => null),
+    );
     expect(
       migratedRows.map(
-        ({ sequence: _sequence, admission_sequence: admission, ...row }) => {
-          expect(admission).toBeNull();
-          return row;
-        },
+        ({
+          sequence: _sequence,
+          admission_sequence: _admission,
+          definition_fingerprint: _f,
+          ...row
+        }) => row,
       ),
     ).toEqual(originalRows);
     expect(

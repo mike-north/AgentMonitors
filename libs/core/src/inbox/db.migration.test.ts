@@ -751,14 +751,17 @@ describe('materialization migration preserves dependent legacy triggers (#534)',
           actual?.map((row) => {
             if (table !== 'monitor_events' && table !== 'monitor_snapshots')
               return row;
-            // The additive admission column is NULL on every copied event:
-            // each was admitted where it committed (002 §2).
+            // The additive columns are NULL on every copied event: each was
+            // admitted where it committed (002 §2), and a legacy row's
+            // definition fingerprint is unknown (#451).
             const {
               sequence: _sequence,
               admission_sequence: admissionSequence,
+              definition_fingerprint: fingerprint,
               ...publicRow
             } = row;
             expect(admissionSequence ?? null).toBeNull();
+            expect(fingerprint ?? null).toBeNull();
             return publicRow;
           }),
         ).toEqual(
@@ -768,6 +771,7 @@ describe('materialization migration preserves dependent legacy triggers (#534)',
             const {
               sequence: _sequence,
               admission_sequence: _admissionSequence,
+              definition_fingerprint: _fingerprint,
               ...publicRow
             } = row;
             return publicRow;
@@ -979,7 +983,11 @@ describe('unretained admission migration (#497)', () => {
         ]),
       );
       expect(columnNames(dbPath, 'monitor_events')).toEqual(
-        expect.arrayContaining(['sequence', 'admission_sequence']),
+        expect.arrayContaining([
+          'sequence',
+          'admission_sequence',
+          'definition_fingerprint',
+        ]),
       );
       expect(columnNames(dbPath, 'materialization_retry_outbox')).toContain(
         'admission_sequence',
@@ -1122,18 +1130,160 @@ describe('unretained admission migration (#497)', () => {
       queryScope: {},
       tags: [],
       createdAt: observedAt,
+      // The observing definition's fingerprint, carried by the caller's
+      // materialization of the stored envelope (002 §5.3).
+      definitionFingerprint: 'observing-def-fp',
     });
 
+    // Completion stamps both additive columns: the admission position (0 for a
+    // pre-upgrade row) and the observing definition's fingerprint.
     expect(
       client
         .prepare<
           [string],
-          { admission_sequence: number | null }
-        >('SELECT admission_sequence FROM monitor_events WHERE id = ?')
-        .get(completed.id)?.admission_sequence,
-    ).toBe(0);
+          {
+            admission_sequence: number | null;
+            definition_fingerprint: string | null;
+          }
+        >(
+          'SELECT admission_sequence, definition_fingerprint FROM monitor_events WHERE id = ?',
+        )
+        .get(completed.id),
+    ).toEqual({
+      admission_sequence: 0,
+      definition_fingerprint: 'observing-def-fp',
+    });
     expect(
       store.outstandingUnretainedObservationLoss('upgraded', WORKSPACE),
     ).toMatchObject({ count: 1, objectKey: 'object-1' });
+  });
+});
+
+/**
+ * Regression (#451 composed with #534): a database written by the definition
+ * fingerprint change before materialization ordering existed has
+ * `definition_fingerprint` populated but no `sequence`. The ordering rebuild
+ * must carry the column and its values forward; dropping them would silently
+ * turn every pending event's fingerprint back to "unknown" (002 §5.3: rows
+ * without a fingerprint read as unknown, so staleness detection is lost).
+ */
+describe('ordering migration keeps definition_fingerprint (#451 + #534)', () => {
+  const fingerprintedId = '01M6BFP5G00000000000000010';
+  const unfingerprintedId = '01M6BFP5G00000000000000011';
+
+  function seed(filename: string): void {
+    const raw = new Database(filename);
+    migrationClients.add(raw);
+    raw.exec(
+      legacyEventsDDL.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, definition_fingerprint TEXT',
+      ),
+    );
+    const insert = raw.prepare(
+      `INSERT INTO monitor_events
+         (id, monitor_id, source_name, urgency, title, created_at, definition_fingerprint)
+       VALUES (?, 'm', 's', 'normal', 't', 1, ?)`,
+    );
+    insert.run(fingerprintedId, 'abc123def4567890');
+    insert.run(unfingerprintedId, null);
+    raw.close();
+  }
+
+  it('preserves stored fingerprint values and NULLs when rebuilding for sequence', () => {
+    const filename = tempDbPath();
+    seed(filename);
+    const client = migrationClient(filename);
+    const columns = client
+      .prepare<[], { name: string }>('PRAGMA table_info(monitor_events)')
+      .all()
+      .map((c) => c.name);
+    expect(columns).toContain('sequence');
+    expect(columns.filter((c) => c === 'definition_fingerprint')).toHaveLength(
+      1,
+    );
+    const rows = client
+      .prepare<
+        [],
+        { id: string; definition_fingerprint: string | null }
+      >('SELECT id, definition_fingerprint FROM monitor_events ORDER BY sequence')
+      .all();
+    expect(rows).toEqual([
+      { id: fingerprintedId, definition_fingerprint: 'abc123def4567890' },
+      { id: unfingerprintedId, definition_fingerprint: null },
+    ]);
+  });
+
+  // Regression (#451 + #534 + #497): the ordering rebuild must carry every
+  // additive `monitor_events` column it finds, not only the fingerprint. A
+  // pre-sequence table holding an admission position (002 §2) must keep it,
+  // or a completed retry would read as admitted where it committed and could
+  // supersede a newer drop. The object-key index must exist on the rebuilt
+  // table.
+  it('carries admission_sequence and definition_fingerprint through the rebuild and indexes the rebuilt table', () => {
+    const filename = tempDbPath();
+    const raw = new Database(filename);
+    migrationClients.add(raw);
+    raw.exec(
+      legacyEventsDDL.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, definition_fingerprint TEXT, admission_sequence INTEGER',
+      ),
+    );
+    const insert = raw.prepare(
+      `INSERT INTO monitor_events
+         (id, monitor_id, source_name, urgency, title, object_key, created_at,
+          definition_fingerprint, admission_sequence)
+       VALUES (?, 'm', 's', 'normal', 't', 'k', 1, ?, ?)`,
+    );
+    insert.run(fingerprintedId, 'abc123def4567890', 7);
+    insert.run(unfingerprintedId, null, null);
+    raw.close();
+
+    const client = migrationClient(filename);
+    const columns = client
+      .prepare<[], { name: string }>('PRAGMA table_info(monitor_events)')
+      .all()
+      .map((c) => c.name);
+    for (const column of [
+      'sequence',
+      'definition_fingerprint',
+      'admission_sequence',
+    ]) {
+      expect(columns.filter((c) => c === column)).toHaveLength(1);
+    }
+    expect(
+      client
+        .prepare<
+          [],
+          {
+            id: string;
+            definition_fingerprint: string | null;
+            admission_sequence: number | null;
+          }
+        >(
+          'SELECT id, definition_fingerprint, admission_sequence FROM monitor_events ORDER BY sequence',
+        )
+        .all(),
+    ).toEqual([
+      {
+        id: fingerprintedId,
+        definition_fingerprint: 'abc123def4567890',
+        admission_sequence: 7,
+      },
+      {
+        id: unfingerprintedId,
+        definition_fingerprint: null,
+        admission_sequence: null,
+      },
+    ]);
+    expect(
+      client
+        .prepare<[], { name: string }>(
+          "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'monitor_events'",
+        )
+        .all()
+        .map(({ name }) => name),
+    ).toContain('idx_monitor_events_object_sequence');
   });
 });

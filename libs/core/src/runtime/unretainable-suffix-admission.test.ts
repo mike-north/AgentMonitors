@@ -107,6 +107,7 @@ function fixture(
   mode: Mode,
   plan: (cursor: number) => Observation[],
   watch?: ObservationSource['watch'],
+  scopeSchema: ObservationSource['scopeSchema'] = { type: 'object' },
 ) {
   const root = mkdtempSync(path.join(tmpdir(), 'agentmon-unretainable-'));
   const owned = { root, clients: [] as BetterSQLiteClient[] };
@@ -128,7 +129,7 @@ Inspect the changes.
   );
   const source: ObservationSource = {
     name: 'suffix-source',
-    scopeSchema: { type: 'object' },
+    scopeSchema,
     stateful: true,
     observe(_config, context) {
       const cursor =
@@ -1461,5 +1462,221 @@ describe('a drop without one current definition is reported in the orphan groups
       expectedLoss,
     );
     expect(doctor.orphanedMonitorWork).toEqual([]);
+  });
+});
+
+/**
+ * A monitor whose source config is rejected by the execution preflight
+ * (002 §2 step 5, #557) after admission dropped one of its observations. The
+ * preflight runs before admission, so a rejected config adds no drop and no
+ * retry; the drop it already has stays outstanding and visible, as for any
+ * definition that fails validation, until a later observation supersedes it
+ * once the config is corrected.
+ */
+describe('a drop on a monitor whose source config is now rejected', () => {
+  /** Accepts the fixture's config; rejects `mode: broken`. */
+  const STRICT_SCOPE = {
+    type: 'object',
+    properties: { mode: { enum: ['ok'] } },
+  };
+
+  function rewrite(
+    f: Fixture,
+    extraWatch: string,
+    body = 'Inspect the changes.',
+  ) {
+    writeFileSync(
+      path.join(f.monitorsDir, MONITOR_ID, 'MONITOR.md'),
+      `---\nname: Suffix\nwatch:\n  type: suffix-source\n  interval: 1s\n${extraWatch}urgency: normal\nbaseline-strategy: incremental\n---\n${body}\n`,
+    );
+  }
+
+  async function droppedThenRejected() {
+    let observed = 0;
+    const control = { poison: true };
+    const f = fixture(
+      'poll',
+      (cursor) => {
+        observed += 1;
+        // While poisoned, every span drops `object-1`, so a span that ran
+        // under the rejected config would add a drop.
+        return observations(cursor, 3, control.poison ? { 1: { n: 1n } } : {});
+      },
+      undefined,
+      STRICT_SCOPE,
+    );
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(dropRows(f)).toHaveLength(1);
+    rewrite(f, '  mode: broken\n');
+    return { f, observed: () => observed, control };
+  }
+
+  it('skips the rejected config without observing, dropping or retaining, and keeps the outstanding drop', async () => {
+    const { f, observed } = await droppedThenRejected();
+    const before = observed();
+
+    const result = await nextPoll(f);
+
+    expect(result.skippedMonitors).toEqual([
+      {
+        monitorId: MONITOR_ID,
+        validationError: expect.stringContaining('mode'),
+      },
+    ]);
+    expect(observed()).toBe(before);
+    expect(dropRows(f)).toHaveLength(1);
+    expect(
+      f.reader.listMaterializationRetries({
+        monitorId: MONITOR_ID,
+        workspacePath: f.root,
+      }),
+    ).toEqual([]);
+    expect(
+      f.reader.outstandingUnretainedObservationLoss(MONITOR_ID, f.root),
+    ).toMatchObject({ count: 1, objectKey: 'object-1' });
+  });
+
+  it('explains the validation failure as the verdict and still reports the outstanding drop', async () => {
+    const { f } = await droppedThenRejected();
+    await nextPoll(f);
+
+    const report = await explain(f);
+
+    expect(report.verdict).toMatchObject({
+      status: 'failure',
+      stage: 'definition',
+    });
+    expect(report.verdict.reason).toContain('mode');
+    const materialization = stage(report, 'materialization');
+    expect(materialization?.status).toBe('failure');
+    expect(materialization?.reason).toContain(
+      '1 observation(s) were dropped because the retry outbox could not retain them',
+    );
+    expect(materialization?.details).toMatchObject({
+      unretainedObservationLoss: { count: 1, objectKey: 'object-1' },
+    });
+  });
+
+  it('keeps the drop on the invalid rollup in doctor, not in an orphan or ephemeral group', async () => {
+    const { f } = await droppedThenRejected();
+    await nextPoll(f);
+
+    const doctor = await f.runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+
+    expect(doctor.monitors).toHaveLength(1);
+    expect(doctor.monitors[0]).toMatchObject({
+      valid: false,
+      validationError: expect.stringContaining('mode'),
+      due: false,
+      unretainedObservationLoss: { count: 1, objectKey: 'object-1' },
+      materializationRetries: { pending: 0, terminal: 0 },
+    });
+    expect(doctor.monitors[0]?.nextDueAt).toBeUndefined();
+    expect(doctor.orphanedMonitorWork).toEqual([]);
+    expect(doctor.ephemeralMonitorWork).toEqual([]);
+  });
+
+  it('keeps a live ephemeral monitor drop attributed to it after its persisted scope is rejected', async () => {
+    // A schema the test can tighten after the drop, as a source upgrade would.
+    const mode = { enum: ['ok'] };
+    const f = fixture(
+      'poll',
+      (cursor) => (cursor === 0 ? observations(0, 3, { 1: { n: 1n } }) : []),
+      undefined,
+      { type: 'object', properties: { mode } },
+    );
+    // Only the ephemeral monitor observes in this workspace.
+    rmSync(path.join(f.monitorsDir, MONITOR_ID), { recursive: true });
+    const [session] = f.reader.sessionsForWorkspace(f.root);
+    if (!session) throw new Error('fixture opened no lead session');
+    const watch = f.runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'suffix-source',
+      scope: { mode: 'ok' },
+      instruction: 'Watch the suffix.',
+    });
+    await f.runtime.tick(f.monitorsDir, f.root);
+    const loss = { count: 1, objectKey: 'object-1' };
+    expect(
+      f.reader.outstandingUnretainedObservationLoss(watch.id, f.root),
+    ).toMatchObject(loss);
+
+    mode.enum = ['upgraded'];
+    const result = await nextPoll(f);
+    expect(result.skippedMonitors).toEqual([
+      { monitorId: watch.id, validationError: expect.stringContaining('mode') },
+    ]);
+
+    const doctor = await f.runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+    expect(doctor.orphanedMonitorWork).toEqual([]);
+    expect(doctor.ephemeralMonitorWork).toEqual([
+      {
+        monitorId: watch.id,
+        sessionId: session.id,
+        unretainedObservationLoss: expect.objectContaining(loss),
+      },
+    ]);
+  });
+
+  it('clears the drop once the corrected config observes its key again', async () => {
+    const { f, control } = await droppedThenRejected();
+    await nextPoll(f);
+    expect(
+      f.reader.outstandingUnretainedObservationLoss(MONITOR_ID, f.root),
+    ).toBeDefined();
+
+    rewrite(f, '  mode: ok\n');
+    control.poison = false;
+    await nextPoll(f);
+
+    expect(
+      f.reader.outstandingUnretainedObservationLoss(MONITOR_ID, f.root),
+    ).toBeUndefined();
+    expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
+  });
+});
+
+/**
+ * A drop beside #566's stale-definition note: the monitor's definition changed
+ * after the dropping span materialized its siblings. Explain must report both
+ * without contradiction: the drop fails materialization (the verdict), and the
+ * delivery stage notes that the pending siblings predate the current
+ * definition.
+ */
+describe('a drop beside pending events that predate the current definition', () => {
+  it('explains the drop as the verdict and notes the stale pending events in delivery', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? observations(0, 3, { 1: { n: 1n } }) : [],
+    );
+    await f.runtime.tick(f.monitorsDir, f.root);
+    // A valid edit to the body changes the definition fingerprint.
+    const file = path.join(f.monitorsDir, MONITOR_ID, 'MONITOR.md');
+    writeFileSync(
+      file,
+      `---\nname: Suffix\nwatch:\n  type: suffix-source\n  interval: 1s\nurgency: normal\nbaseline-strategy: incremental\n---\nA different body.\n`,
+    );
+
+    const report = await explain(f);
+
+    expect(report.stages.find(({ id }) => id === 'definition')?.status).toBe(
+      'ok',
+    );
+    expect(report.verdict).toMatchObject({
+      status: 'failure',
+      stage: 'materialization',
+    });
+    expect(report.verdict.reason).toContain('were dropped');
+    const delivery = report.stages.find(({ id }) => id === 'delivery');
+    expect(delivery?.status).toBe('ok');
+    expect(delivery?.reason).toContain(
+      "2 pending event(s) in total predate the monitor's current definition",
+    );
+    expect(delivery?.details?.['staleDefinitionEventIds']).toHaveLength(2);
   });
 });

@@ -1,3 +1,4 @@
+/** Shared runtime contracts for durable monitor work, session delivery, and diagnostics. */
 import type {
   MonitorDefinition,
   NotifyConfig,
@@ -152,6 +153,25 @@ export interface MonitorEventRecord {
   queryScope: Record<string, string | string[]>;
   tags: string[];
   createdAt: Date;
+  /**
+   * A short content fingerprint of the parts of the monitor's definition that
+   * decide what an event is (`urgency`, `urgencyMax`, the body, `name`, `watch`
+   * except scheduling keys such as `interval`, `shape`, `payload` and
+   * `baseline-strategy`; 002 §5.3) AS IT WAS at materialization time
+   * (issue #451), computed by {@link definitionFingerprint} over the same
+   * `StoredObservationEnvelope.monitor` snapshot `urgency`/`title`/`body` were
+   * already captured from — never recomputed from the live monitor at delivery
+   * time. Lets a diagnostic (`monitor explain`) compare a pending event's
+   * fingerprint against the CURRENT monitor's fingerprint and say "this pending
+   * event predates the current definition" without re-deriving or altering the
+   * event's own already-correct `urgency`/`title`/`body`. `null` on legacy rows
+   * materialized before this field existed — treated as "unknown", never
+   * flagged as stale (no false positive from an absent baseline). Optional on
+   * WRITE (`insertEvent` input) — a caller that doesn't compute one (tests,
+   * or a future writer that predates this field) simply omits it and the row
+   * persists NULL — but always present (possibly `null`) on READ.
+   */
+  definitionFingerprint?: string | null;
   /**
    * The requesting session's delivery state for this event (002 §7):
    * `unread` (not acknowledged), `claimed` (surfaced at least once at a
@@ -922,17 +942,25 @@ export interface ErroredObservation {
 }
 
 /**
- * A monitor that was found but skipped on a tick because its interval has not
- * yet elapsed since the last observation. Surfaced so callers (e.g. daemon
- * once) can distinguish "skipped, not yet due" from "no monitors found".
+ * A monitor paused before observation: either its cadence is not due, or its
+ * source config is invalid. Validation skips have no due time: correcting the
+ * config, rather than waiting, allows observation to resume with retained state.
  *
- * @see docs/specs/002-runtime-delivery.md §2.4
+ * @see docs/specs/002-runtime-delivery.md §2.5
  */
-export interface SkippedMonitor {
-  monitorId: string;
-  /** The earliest time at which this monitor will be due for its next tick. */
-  nextDueAt: Date;
-}
+export type SkippedMonitor =
+  | {
+      monitorId: string;
+      /** The earliest time at which this valid monitor is due again. */
+      nextDueAt: Date;
+      validationError?: never;
+    }
+  | {
+      monitorId: string;
+      /** The same joined source-config diagnostics reported by `validate`. */
+      validationError: string;
+      nextDueAt?: never;
+    };
 
 /**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
@@ -944,9 +972,9 @@ export interface SkippedMonitor {
  * same path that writes an `errored` row to `observation_history`, so the tick
  * itself can report the failure rather than silently print `emitted 0`.
  *
- * Monitors found in the directory but skipped because their interval has not
- * elapsed are listed in `skippedMonitors` so callers can distinguish
- * "skipped, not yet due" from "no monitors found" (issue #152).
+ * Monitors with invalid source config or a cadence that is not yet due are
+ * listed in `skippedMonitors`, distinguishing a config requiring correction
+ * from a valid monitor waiting to run and from an empty monitor directory.
  */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];

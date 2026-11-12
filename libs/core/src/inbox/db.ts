@@ -389,10 +389,21 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
   // Additive migration (002 §2, unretained admission outcomes), after the order
-  // migration, whose rebuild copies only the columns it knows: an event
-  // completed from the retry outbox records where its observation was admitted.
-  // Older rows keep NULL (admitted where they committed).
+  // migration, whose rebuild carries this column only when it already exists:
+  // an event completed from the retry outbox records where its observation was
+  // admitted. Older rows keep NULL (admitted where they committed).
   addColumnIfMissing(sqlite, 'monitor_events', 'admission_sequence', 'INTEGER');
+  // Additive migration (issue #451): a `monitor_events` table created before
+  // this column existed lacks `definition_fingerprint`. Add it if missing so
+  // `monitor explain` can detect pending events that predate the monitor's
+  // current definition; legacy rows keep NULL (treated as "unknown", never
+  // flagged as stale).
+  addColumnIfMissing(
+    sqlite,
+    'monitor_events',
+    'definition_fingerprint',
+    'TEXT',
+  );
   // Created after the order migration, which rebuilds `monitor_events`. Finds a
   // later event for a dropped observation's object key (002 §2), covering the
   // admission position the supersession check compares.
@@ -597,6 +608,15 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
          AND sql IS NOT NULL ORDER BY type, name`,
     )
     .all();
+  // Additive columns that later changes add after this rebuild runs. A table
+  // that already holds one (for example fingerprints written before ordering
+  // existed) keeps its values instead of resetting them to unknown/NULL; a
+  // table without one copies NULL. Every such column belongs here, or the
+  // rebuild silently drops it.
+  const carried = (column: string): string =>
+    tableHasColumn(sqlite, 'monitor_events', column) ? column : 'NULL';
+  const fingerprintSource = carried('definition_fingerprint');
+  const admissionSource = carried('admission_sequence');
   sqlite.exec(`
     CREATE TABLE monitor_events_ordered (
       sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -616,15 +636,19 @@ function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
       baseline_strategy TEXT,
       query_scope TEXT NOT NULL DEFAULT '{}',
       tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      definition_fingerprint TEXT,
+      admission_sequence INTEGER
     );
     INSERT INTO monitor_events_ordered
       (id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
        payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-       baseline_strategy, query_scope, tags, created_at)
+       baseline_strategy, query_scope, tags, created_at, definition_fingerprint,
+       admission_sequence)
       SELECT id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
         payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-        baseline_strategy, query_scope, tags, created_at
+        baseline_strategy, query_scope, tags, created_at, ${fingerprintSource},
+        ${admissionSource}
       FROM monitor_events ORDER BY rowid;
     DROP TABLE monitor_events;
     ALTER TABLE monitor_events_ordered RENAME TO monitor_events;

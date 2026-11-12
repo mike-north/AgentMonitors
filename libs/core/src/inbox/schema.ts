@@ -91,6 +91,15 @@ export const monitorEvents = sqliteTable('monitor_events', {
    * commit, so an older retry completed after a drop cannot clear it (002 §2).
    */
   admissionSequence: integer('admission_sequence'),
+  // A content fingerprint of the parts of the monitor's definition that decide
+  // what an event is (urgency, urgencyMax, body, name, watch minus scheduling
+  // keys, shape, payload, baseline-strategy; 002 §5.3) at materialization time
+  // (issue #451),
+  // letting `monitor explain` detect a pending event that predates the
+  // monitor's current definition without altering the event's own already-
+  // correct urgency/title/body. NULL on legacy rows materialized before this
+  // column existed.
+  definitionFingerprint: text('definition_fingerprint'),
 });
 
 /**

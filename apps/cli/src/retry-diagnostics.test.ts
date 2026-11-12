@@ -1621,6 +1621,78 @@ it.each([
   },
 );
 
+/**
+ * A drop on a monitor whose source config the execution preflight now rejects
+ * (#557, 002 §2 step 5): doctor keeps the loss on the invalid rollup with its
+ * own failing check, and explain reports it beside the definition failure,
+ * which stays the verdict.
+ */
+it('reports a drop of a monitor whose source config is now rejected in doctor and explain, in text and JSON', async () => {
+  const monitors = path.join(root, 'monitors');
+  const dir = path.join(monitors, 'dropper');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'MONITOR.md'), DROPPER_SCHEDULE);
+  const dbPath = path.join(root, 'state.db');
+  await seedDrop(monitors, dbPath, droppingSource);
+  // The bundled schedule source requires a string `cron`.
+  writeFileSync(
+    path.join(dir, 'MONITOR.md'),
+    DROPPER_SCHEDULE.replace('cron: "* * * * *"', 'cron: 5'),
+  );
+
+  const doctor = await run('doctor', 'json', dbPath);
+  expect(doctor.code).toBe(1);
+  const report = JSON.parse(doctor.stdout);
+  expect(report.monitors).toHaveLength(1);
+  expect(report.monitors[0]).toMatchObject({
+    id: 'dropper',
+    valid: false,
+    validationError: expect.stringContaining('cron'),
+    // A rejected config is not scheduled (#557): no due time.
+    nextDueAt: null,
+    unretainedObservationLoss: { count: 1, objectKey: 'object-1' },
+  });
+  expect(report.orphanedMonitorWork).toEqual([]);
+  expect(report.ephemeralMonitorWork).toEqual([]);
+  expect(report.checks).toContainEqual(
+    expect.objectContaining({ name: 'monitor:dropper', status: 'skip' }),
+  );
+  expect(report.checks).toContainEqual(
+    expect.objectContaining({
+      name: 'dropped-observation:dropper',
+      status: 'fail',
+      remediation: expect.stringContaining(
+        'repair the definition or reported failure',
+      ),
+    }),
+  );
+
+  // Explain reports a failing verdict without failing the command.
+  const explained = await run('explain', 'json', dbPath, 'dropper');
+  expect(explained.code).toBe(0);
+  const explanation = JSON.parse(explained.stdout);
+  expect(explanation.verdict).toMatchObject({
+    status: 'failure',
+    stage: 'definition',
+    reason: expect.stringContaining('cron'),
+  });
+  expect(explanation.stages).toContainEqual(
+    expect.objectContaining({
+      id: 'materialization',
+      status: 'failure',
+      reason: expect.stringContaining(
+        '1 observation(s) were dropped because the retry outbox could not retain them; the newest, observation 2 of 2 (object-1, "d-1")',
+      ),
+    }),
+  );
+
+  const text = await run('explain', 'text', dbPath, 'dropper');
+  expect(text.code).toBe(0);
+  expect(text.stdout).toContain(
+    '1 observation(s) were dropped because the retry outbox could not retain them',
+  );
+});
+
 /** A schedule-named source whose one span drops `object-1` (a BigInt payload). */
 const droppingSource = {
   name: 'schedule',
