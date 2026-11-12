@@ -167,6 +167,11 @@ far beyond any former suppression lifetime), and assert both the durable event t
   already-held deletion; a held-only create left by a killed run (no event ever projected) that is
   discovered only through stale-owner reaping; a held envelope drained by a notify-policy edit; a
   create held in a rollup window that fires after the owner is reaped.
+- **Held flush with nothing else held:** when the only held item is an artifact with cleanup
+  authority, the not-due rollup window check and the debounce and rollup flushes while
+  `observe()` fails (002 §2.6) clear the hold, keep the source baseline and `lastObservationAt`,
+  materialize nothing and write no audit row of their own; on the failing path the source's
+  `errored` row is the only new row.
 - **Incoming boundary:** a filtered observation does not consume a throttle window that a later
   legitimate change needs; a watcher batch admitted after restart, before any tick has recorded
   the owner's inactivity, is already filtered.

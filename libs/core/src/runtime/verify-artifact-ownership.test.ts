@@ -75,10 +75,16 @@ interface MonitorOptions {
   settle?: string;
   rollupWindow?: string;
   throttle?: string;
+  /** The poll interval; defaults to 1s. */
+  interval?: string;
 }
 
-/** One workspace plus a foreign workspace on a single durable database file. */
-function harness() {
+/**
+ * One workspace plus a foreign workspace on a single durable database file.
+ * `source` replaces the file-fingerprint source registered under its name, for
+ * scenarios that need the real source to fail on demand.
+ */
+function harness(source: ObservationSource = fileSource) {
   const root = mkdtempSync(path.join(tmpdir(), 'am-verify-ownership-'));
   roots.push(root);
   const workspace = path.join(root, 'a');
@@ -91,7 +97,7 @@ function harness() {
   const scratch = path.join(workspace, `agentmonitors-verify-${RUN}.md`);
   const watched = path.join(workspace, 'watched.txt');
   const registry = new SourceRegistry();
-  registry.register(fileSource);
+  registry.register(source);
 
   const open = () => {
     const db = createDb(path.join(root, 'state.db'));
@@ -128,7 +134,7 @@ function harness() {
   const writeMonitor = (options: MonitorOptions = {}) =>
     writeFileSync(
       path.join(monitorsDir, MONITOR_ID, 'MONITOR.md'),
-      `---\nname: Watched\nwatch:\n  type: file-fingerprint\n  globs: ${options.invalid ? '42' : "['watched.txt', 'agentmonitors-verify-*.md']"}\n  interval: 1s\nurgency: high\n${notifyBlock(options)}---\nKeep legitimate work.\n`,
+      `---\nname: Watched\nwatch:\n  type: file-fingerprint\n  globs: ${options.invalid ? '42' : "['watched.txt', 'agentmonitors-verify-*.md']"}\n  interval: ${options.interval ?? '1s'}\nurgency: high\n${notifyBlock(options)}---\nKeep legitimate work.\n`,
     );
 
   const writeForeignMonitor = () =>
@@ -1008,4 +1014,201 @@ describe('verify artifact ownership across crashes (#562)', () => {
     const [artifact] = current.store.listVerifyArtifacts(h.workspace);
     expect(artifact?.cleanupCause).toBe('owner-inactive');
   });
+});
+
+/**
+ * A held-work flush whose only held item is a verify artifact with cleanup
+ * authority: the not-due rollup window check (002 §4.4) and the flush while
+ * the source fails (002 §2.6). The held-emission boundary (002 §2.8) drops the
+ * artifact, so the flush has nothing to materialize. It still clears the hold,
+ * so the dropped item is never retried, and it writes no audit row of its own:
+ * an empty flush must not read as a source outcome, and on the failing path
+ * the source's `errored` row stays the newest one.
+ */
+describe('verify artifact ownership when a held flush holds only the artifact (#562)', () => {
+  /** The real file-fingerprint source, failing on demand like an unreadable workspace. */
+  function failableFileSource() {
+    const control = { failing: false };
+    const source: ObservationSource = {
+      ...fileSource,
+      observe: (config, context) =>
+        control.failing
+          ? Promise.reject(new Error('workspace unreadable'))
+          : fileSource.observe(config, context),
+    };
+    return { control, source };
+  }
+
+  /** The monitor's audit rows, newest first. */
+  const history = (store: RuntimeStore, workspacePath: string) =>
+    store
+      .listObservationHistory({ monitorId: MONITOR_ID, workspacePath })
+      .map((row) => ({ result: row.result, data: row.observationData }));
+
+  /** Object keys waiting in either hold. */
+  const heldKeys = (store: RuntimeStore, workspacePath: string) => {
+    const notify = store.getMonitorState(MONITOR_ID, workspacePath).notifyState;
+    return [
+      ...(notify.pendingDebounce?.observations ?? []),
+      ...(notify.pendingRollup?.observations ?? []),
+    ].map((envelope) => envelope.observation.objectKey);
+  };
+
+  /**
+   * Baseline, then hold only the scratch create one poll interval later, then
+   * let the run request cleanup and delete its file, as verify does after its
+   * proof.
+   */
+  async function holdOnlyTheArtifact(
+    h: ReturnType<typeof harness>,
+    current: ReturnType<ReturnType<typeof harness>['open']>,
+    intervalMs = 1_000,
+  ) {
+    writeFileSync(h.watched, 'baseline');
+    const owner = h.lead(current.runtime, `agentmonitors-verify-${RUN}`);
+    const later = h.lead(current.runtime, 'later-real-lead');
+    await current.runtime.tick(h.monitorsDir, h.workspace);
+    ownership.register(current.runtime, {
+      runId: RUN,
+      ownerSessionId: owner.id,
+      workspacePath: h.workspace,
+      objectKey: h.scratch,
+    });
+    writeFileSync(h.scratch, 'synthetic scratch');
+    const accepted = await tickAfter(
+      current.runtime,
+      intervalMs,
+      h.monitorsDir,
+      h.workspace,
+    );
+    expect(accepted.emittedEventIds).toEqual([]);
+    expect(heldKeys(current.store, h.workspace)).toEqual([h.scratch]);
+    ownership.requestCleanup(current.runtime, RUN);
+    rmSync(h.scratch);
+    return later;
+  }
+
+  /** What every case requires once the window or deadline has passed. */
+  function expectNothingReachedLaterLead(
+    h: ReturnType<typeof harness>,
+    current: ReturnType<ReturnType<typeof harness>['open']>,
+    later: AgentSessionRecord,
+  ) {
+    expect(heldKeys(current.store, h.workspace)).toEqual([]);
+    expect(current.runtime.listEvents({ workspacePath: h.workspace })).toEqual(
+      [],
+    );
+    vi.advanceTimersByTime(CLAIM_SETTLE_MS);
+    expect(
+      current.runtime.claimDelivery(later.id, 'turn-interruptible'),
+    ).toBeNull();
+  }
+
+  it('the not-due rollup window check clears the hold and writes no event or audit row', async () => {
+    // Timestamps persist at second precision, so a 30s interval leaves room
+    // for a tick inside the window that is not due. It stays inside the
+    // owner's 60s dormancy, so the create is held during the proof phase.
+    startClock('2026-11-12T12:59:10Z');
+    const h = harness();
+    h.writeMonitor({ rollupWindow: '0 * * * *', interval: '30s' });
+    const current = h.open();
+    const later = await holdOnlyTheArtifact(h, current, 30_000);
+    const before = current.store.getMonitorState(MONITOR_ID, h.workspace);
+    const auditBefore = history(current.store, h.workspace);
+
+    // The window opens 20s after the last poll: the not-due window check is
+    // the only thing that can flush.
+    vi.setSystemTime(new Date('2026-11-12T13:00:00.000Z'));
+    const result = await current.runtime.tick(h.monitorsDir, h.workspace);
+    expect(result.skippedMonitors.map(({ monitorId }) => monitorId)).toEqual([
+      MONITOR_ID,
+    ]);
+    expect(result.emittedEventIds).toEqual([]);
+    expect(result.erroredObservations).toEqual([]);
+
+    const after = current.store.getMonitorState(MONITOR_ID, h.workspace);
+    // The window fired: its minute marker is committed and the hold is gone.
+    expect(after.notifyState.rollupLastFiredMinute).toBe(
+      Math.floor(Date.parse('2026-11-12T13:00:00.000Z') / 60_000),
+    );
+    expect(after.notifyState.pendingRollup).toBeUndefined();
+    // Only the hold changed: no observation stood in for a poll.
+    expect(after.sourceState).toEqual(before.sourceState);
+    expect(after.lastObservationAt).toEqual(before.lastObservationAt);
+    expect(history(current.store, h.workspace)).toEqual(auditBefore);
+    expectNothingReachedLaterLead(h, current, later);
+
+    // The next due poll sees the deletion; the incoming boundary drops it.
+    vi.setSystemTime(new Date('2026-11-12T13:00:10.000Z'));
+    const polled = await current.runtime.tick(h.monitorsDir, h.workspace);
+    expect(polled.emittedEventIds).toEqual([]);
+    expect(heldKeys(current.store, h.workspace)).toEqual([]);
+  });
+
+  it.each([
+    {
+      strategy: 'debounce',
+      monitor: { settle: '10s' },
+      start: '2026-11-12T12:00:00Z',
+      // dueAt = 12:00:01 + 10s
+      deadline: '2026-11-12T12:00:11.000Z',
+    },
+    {
+      strategy: 'rollup',
+      monitor: { rollupWindow: '0 * * * *' },
+      start: '2026-11-12T12:59:00Z',
+      deadline: '2026-11-12T13:00:05.000Z',
+    },
+  ] satisfies {
+    strategy: string;
+    monitor: MonitorOptions;
+    start: string;
+    deadline: string;
+  }[])(
+    '$strategy: the flush while the source fails clears the hold, and the failure stays the only new audit row',
+    async ({ monitor, start, deadline }) => {
+      startClock(start);
+      const { control, source } = failableFileSource();
+      const h = harness(source);
+      h.writeMonitor(monitor);
+      const current = h.open();
+      const later = await holdOnlyTheArtifact(h, current);
+      control.failing = true;
+      const before = current.store.getMonitorState(MONITOR_ID, h.workspace);
+      const auditBefore = history(current.store, h.workspace);
+
+      vi.setSystemTime(new Date(deadline));
+      const result = await current.runtime.tick(h.monitorsDir, h.workspace);
+      expect(result.emittedEventIds).toEqual([]);
+      // The source failure alone: an empty flush adds no failure of its own.
+      expect(result.erroredObservations).toEqual([
+        { monitorId: MONITOR_ID, message: 'workspace unreadable' },
+      ]);
+
+      const after = current.store.getMonitorState(MONITOR_ID, h.workspace);
+      expect(after.notifyState.pendingDebounce).toBeUndefined();
+      expect(after.notifyState.pendingRollup).toBeUndefined();
+      // The baseline and scheduling timestamp are the last good ones.
+      expect(after.sourceState).toEqual(before.sourceState);
+      expect(after.lastObservationAt).toEqual(before.lastObservationAt);
+      // No `triggered` or `no-change` row from the flush: the failure is the
+      // single new row, so history and explain still show a failing source.
+      expect(history(current.store, h.workspace)).toEqual([
+        { result: 'errored', data: { error: 'workspace unreadable' } },
+        ...auditBefore,
+      ]);
+      expectNothingReachedLaterLead(h, current, later);
+
+      // A recovered source sees the deletion; the incoming boundary drops it.
+      control.failing = false;
+      const recovered = await tickAfter(
+        current.runtime,
+        1_000,
+        h.monitorsDir,
+        h.workspace,
+      );
+      expect(recovered.emittedEventIds).toEqual([]);
+      expect(heldKeys(current.store, h.workspace)).toEqual([]);
+    },
+  );
 });

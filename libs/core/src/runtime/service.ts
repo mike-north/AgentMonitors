@@ -4499,7 +4499,10 @@ export class AgentMonitorRuntime {
     });
     // Even an empty matching window commits its minute marker, but routine
     // window checks must not manufacture no-change history or empty deliveries.
-    // A window whose only held work was a filtered verify artifact is empty.
+    // The check counts what materialized, not what dispatch emitted: a flush
+    // whose only held work was a filtered verify artifact (002 §2.8) is empty
+    // too. It has already cleared the hold, and it writes no row, so on the
+    // failing-source path the source's `errored` row stays the newest (002 §2.6).
     if (
       admitted.durable.materialized.length === 0 &&
       admitted.durable.failures.length === 0

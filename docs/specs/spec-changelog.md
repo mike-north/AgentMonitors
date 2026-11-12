@@ -19,7 +19,10 @@ the verified monitor. Cleanup authority takes effect when the run requests clean
 recorded once, never withdrawn and has no wall-clock expiry. With authority in effect the runtime
 retracts the key's existing events and drops that exact key, for that monitor and workspace only,
 at the incoming-observation boundary (before notify dispatch) and at held emission (debounce,
-rollup, escalation flushes and the notify-edit drain). Source plugins and their state are unchanged.
+rollup, escalation flushes, the flush while the source fails of 002 §2.6, and the notify-edit
+drain). A held flush whose only items are dropped clears the hold and writes no history row of its
+own, so a failing source's `errored` row stays the newest. Source plugins and their state are
+unchanged.
 
 This restores the no-later-scratch-event guarantee for registered runs, including retained baseline
 deletions, held deletions and held-only creates after arbitrary delay, restart and config repair.

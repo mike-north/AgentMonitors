@@ -1148,8 +1148,11 @@ registered key, for the registered monitor and workspace only, at two boundaries
    a throttle window that a later legitimate change needs. Poll results and watcher batches pass
    through the same boundary.
 2. **Held emission** — when held work materializes: debounce settle, rollup window and escalation
-   flushes, and the notify-policy edit drain (§4.6). Legitimate items in the same held batch
-   materialize unchanged.
+   flushes, the flush while the source fails (§2.6), and the notify-policy edit drain (§4.6).
+   Legitimate items in the same held batch materialize unchanged. A flush whose only held items
+   are dropped still clears the hold (a rollup window also commits its minute marker), so the
+   dropped work is never retried; it materializes nothing and writes no `observation_history` row
+   of its own, so on the failing-source path the source's `errored` row stays the newest.
 
 Authority has **no wall-clock expiry**, and no successful poll, empty observation or other source
 outcome retires it. Source plugins are unaware of ownership: their opaque state, baselines and
