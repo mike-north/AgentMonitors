@@ -648,3 +648,41 @@ describe('the outbox discard re-checks authority itself', () => {
     );
   });
 });
+
+describe('a key registered at the store that is not a verify scratch key', () => {
+  // Regression: completion's authority re-check lacked the scratch-key
+  // requirement the drain filter applies, so a retained retry for a real path
+  // registered through the store's public API was silently discarded while a
+  // fresh observation of the same path still materialized.
+  it('keeps its retained retry: filter, completion and discard share one predicate', async () => {
+    const clock = stubClock(T0);
+    const f = pollSetup(() => [
+      [{ summary: 'R1', objectKey: 'real.md' }],
+      [{ summary: 'R2', objectKey: 'real.md' }],
+    ]);
+    const owner = openSession(f.runtime, f.root, 'owner');
+    // The store's public API does not validate the key; the runtime's does.
+    f.store.registerVerifyArtifact({
+      runId: RUN,
+      ownerSessionId: owner.id,
+      workspacePath: f.root,
+      monitorId: MONITOR_ID,
+      objectKey: 'real.md',
+      registeredAt: T0,
+    });
+    failSummary(f.client, 'R1');
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retryCount(f.client)).toBe(1);
+    const erroredBefore = erroredHistoryCount(f.client);
+
+    f.store.recordVerifyArtifactCleanup(RUN, 'owner-request', T0);
+    repair(f.client, 'R1');
+    clock.advance(2_000);
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+
+    expect(eventSummaries(f.client)).toEqual(['R1', 'R2']);
+    expect(retryCount(f.client)).toBe(0);
+    expect(result.erroredObservations).toEqual([]);
+    expect(erroredHistoryCount(f.client)).toBe(erroredBefore);
+  });
+});

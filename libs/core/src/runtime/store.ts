@@ -101,6 +101,7 @@ import {
   serializeRetryEnvelope,
 } from './retry-envelope.js';
 import { registerStoreWriter } from './store-writer.js';
+import { isVerifyScratchObjectKey } from './verify-scratch-key.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -1330,10 +1331,11 @@ export class RuntimeStore {
    * Whether a retained row's observation is a verify artifact with cleanup
    * authority in effect (002 §2.8). It is the predicate the runtime's drain
    * filter applies to the row: a row with no workspace, or an observation with
-   * no object key, has no artifact to retire. (The filter also skips keys that
-   * are not verify scratch paths, which registration never accepts.) Callers
-   * evaluate it inside their own immediate transaction, so the answer and
-   * their write commit together.
+   * no object key, has no artifact to retire, and neither does a key that is
+   * not a verify scratch key. The predicate itself excludes such keys, so a
+   * registration of one through {@link RuntimeStore.registerVerifyArtifact}
+   * has no effect on retained retries. Callers evaluate it inside their own
+   * immediate transaction, so the answer and their write commit together.
    */
   private isRetiredVerifyArtifactRetry(
     retry: MaterializationRetryRecord,
@@ -1342,6 +1344,7 @@ export class RuntimeStore {
     return (
       retry.workspacePath !== null &&
       objectKey !== undefined &&
+      isVerifyScratchObjectKey(objectKey) &&
       this.isVerifyArtifactCleanupEffective({
         workspacePath: retry.workspacePath,
         monitorId: retry.monitorId,

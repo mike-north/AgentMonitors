@@ -1258,17 +1258,19 @@ registration creates these records.
 observations are ordinary work: they materialize and project normally, so the run can observe its
 own proof delivery.
 
-**Cleanup authority.** Authority takes effect, and is never withdrawn, when either:
+**Cleanup authority.** Authority takes effect when either:
 
 - **`owner-request`** — the run asks for cleanup after its proof (`verifyArtifacts.requestCleanup`,
   §10); or
 - **`owner-inactive`** — the owner session is closed, reaped as stale (§6.2), or missing.
 
+Once recorded, it is never withdrawn; an owner that is inactive but not yet recorded supplies
+authority only while it stays inactive, and reconciliation records it at the start of the next tick.
 The first cause is recorded with its time (`cleanupRequestedAt`, `cleanupCause`); a later request or
 reconciliation keeps the first record. `owner-inactive` is recorded when the runtime closes or reaps
 the owner and again by reconciliation at the start of every tick, so a crash between ending the
 session and recording the cause is repaired on the next tick. Until it is recorded, an inactive owner
-already supplies authority at both filter boundaries below. When authority is recorded, the runtime
+supplies authority at both filter boundaries below. When authority is recorded, the runtime
 retracts every existing event for the exact key in that workspace and refreshes hook state, in
 one store write.
 

@@ -66,6 +66,10 @@ import {
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
+  isVerifyScratchObjectKey,
+  verifyScratchRunId,
+} from './verify-scratch-key.js';
+import {
   SAFE_DIAGNOSTIC_TEXT_MAX,
   safeDiagnosticText,
 } from './diagnostic-text.js';
@@ -129,6 +133,8 @@ const DEFAULT_HIGH_URGENCY_SETTLE_MS =
   schedulingDefaults.highUrgencyClaimSettleMs;
 const MAX_RECAP_EVENTS = 10;
 
+export { isVerifyScratchObjectKey };
+
 /**
  * Per-session dormancy threshold (002 §6.2 / 007 §4.4). A session that has not
  * advanced its `lastActiveAt` for at least this long is treated as **dormant by
@@ -141,34 +147,6 @@ const MAX_RECAP_EVENTS = 10;
  */
 const DEFAULT_SESSION_DORMANCY_MS = 30 * 60 * 1_000;
 
-/**
- * True when `objectKey`'s basename is a `verify` scratch file
- * (`agentmonitors-verify-<token>[.ext]`) — a synthetic path verify created and
- * deleted, which no real monitored object ever carries (issue #414). It is the
- * canonical predicate gating every by-KEY object-event sweep (the reap backstop
- * AND {@link AgentMonitorRuntime.suppressObjectEvents}) so a by-key deletion can
- * only ever erase verify's own artifacts, never a real event at a genuine
- * watched path. Exported so the daemon-socket boundary can reject a non-scratch
- * key before it ever reaches the runtime.
- *
- * Splits on BOTH `/` and `\` so a Windows-style absolute `objectKey` (which
- * `verify` builds with `path.join`) still resolves to its basename — otherwise
- * the guard would fail to recognize a scratch key on Windows and leave stray
- * sessions/events behind (issue #418 review).
- */
-export function isVerifyScratchObjectKey(objectKey: string): boolean {
-  return verifyScratchRunId(objectKey) !== undefined;
-}
-
-/**
- * The run token a verify scratch key carries (`agentmonitors-verify-<token>`),
- * or `undefined` for any other key. Registration (issue #562) requires this to
- * equal the registering run's id, tying each artifact key to exactly one run.
- */
-function verifyScratchRunId(objectKey: string): string | undefined {
-  const basename = objectKey.split(/[\\/]/).pop() ?? objectKey;
-  return /^agentmonitors-verify-([0-9a-f]{12})(\..*)?$/.exec(basename)?.[1];
-}
 const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
   definition: 'Definition',
   scheduling: 'Scheduling',
@@ -1624,7 +1602,7 @@ export class AgentMonitorRuntime {
    * dispatch) and the held-emission boundary (before materialization), so
    * neither a fresh nor a held observation of the artifact reaches a later
    * session. Every other item, including siblings in the same batch, is kept
-   * in order. Non-scratch keys skip the lookup: they can never be registered.
+   * in order. Non-scratch keys skip the lookup: they are never verify artifacts, whatever the store holds.
    */
   private withoutRetiredVerifyArtifacts<T>(
     monitorId: string,

@@ -16,7 +16,7 @@ Replace finite, time-limited scratch cleanup with durable exact ownership, as ac
 the file (`verifyArtifacts.register`), naming the run token, its throwaway session, the workspace and
 the verified monitor. Cleanup authority takes effect when the run requests cleanup after its proof
 (`verifyArtifacts.requestCleanup`) or when the owner session is closed, reaped or missing; it is
-recorded once, never withdrawn and has no wall-clock expiry. With authority in effect the runtime
+recorded once and then never withdrawn (an owner that is inactive but not yet recorded supplies authority only while it stays inactive) and has no wall-clock expiry. With authority in effect the runtime
 retracts the key's existing events and drops that exact key, for that monitor and workspace only,
 at the incoming-observation boundary (before notify dispatch) and at held emission (debounce,
 rollup, escalation flushes, the flush while the source fails of 002 §2.6, and the notify-edit
@@ -33,7 +33,9 @@ completion re-checks authority under its own writer lock, so cleanup recorded by
 after the drain read the row still drops it. A removal that cannot commit is a failed drain step:
 the row stays, one `errored` row and one `erroredObservations` entry are recorded, and other
 monitors in the tick are unaffected. Previously such a retry would have materialized after cleanup
-and reached a later lead session.
+and reached a later lead session. The drain filter, completion re-check and discard share one
+scratch-key predicate, so a retained retry for a key that is not a verify scratch key is never
+dropped.
 
 With 002 §2's rule that a hold refusal is outstanding loss recorded at its place in the span's
 order, that place counts only the dispatched envelopes that survive the ownership filter. A held
