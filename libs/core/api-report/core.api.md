@@ -290,6 +290,9 @@ export interface DoctorDeliveryCounts {
 }
 
 // @public
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+// @public
 export interface DoctorMonitorRollup {
     cadence: string;
     delivery: DoctorDeliveryCounts;
@@ -391,6 +394,14 @@ export interface EphemeralMonitorRecord {
 //
 // @public
 export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
+
+// @public
+export interface EphemeralMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
+    monitorId: string;
+    sessionId: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
+}
 
 // @public
 export interface ErroredObservation {
@@ -747,6 +758,7 @@ export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 // @public
 export interface MonitorDoctorReport {
     duplicateIds: DuplicateMonitorId[];
+    ephemeralMonitorWork?: EphemeralMonitorWork[];
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
@@ -756,7 +768,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     monitorsDir: string;
     monitorsDirExists: boolean;
-    orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
+    orphanedMonitorWork?: OrphanedMonitorWork[];
     parseErrors: DoctorParseError[];
     workspacePath: string;
 }
@@ -1141,9 +1153,10 @@ export interface OpenSessionInput {
 export const OPERATION_TIMEOUT_PATTERN: string;
 
 // @public
-export interface OrphanedMaterializationRetrySummary {
+export interface OrphanedMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
     monitorId: string;
-    summary: MaterializationRetrySummary;
+    monitorKind: DoctorMonitorKind;
     unretainedObservationLoss?: UnretainedObservationLoss;
 }
 

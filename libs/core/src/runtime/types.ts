@@ -606,14 +606,21 @@ export interface MonitorDoctorReport {
   /** Every discovered monitor's rollup (both valid and invalid definitions). */
   monitors: DoctorMonitorRollup[];
   /**
-   * Recovery obligations without one unambiguous parsed current definition
-   * (missing/parse-failed definitions and duplicated ids): retained outboxes,
-   * and outstanding unretained-observation losses. These are not synthetic
-   * monitor definitions. Each id's obligations appear here or on its monitor
-   * rollup, never both. Ordered by monitor id. Optional for compatibility with
-   * older daemon reports.
+   * Recovery obligations of ids with no usable definition (removed,
+   * parse-failed or duplicated persistent definitions, and retired ephemeral
+   * monitors): retained outboxes and outstanding unretained-observation
+   * losses. These are not synthetic monitor definitions. Each id's obligations
+   * appear in exactly one place: here, on its monitor rollup, or in
+   * {@link MonitorDoctorReport.ephemeralMonitorWork}. Ordered by monitor id.
+   * Optional for compatibility with older daemon reports.
    */
-  orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
+  orphanedMonitorWork?: OrphanedMonitorWork[];
+  /**
+   * Recovery obligations of live ephemeral monitors, attributed to them rather
+   * than reported as orphaned. Ordered by monitor id. Optional for
+   * compatibility with older daemon reports.
+   */
+  ephemeralMonitorWork?: EphemeralMonitorWork[];
   /** Count of discovered monitors that failed validation. */
   invalidCount: number;
   /** Monitor-id collisions across the tree (001 §4). */
@@ -779,23 +786,59 @@ export interface MaterializationRetryQuery {
 }
 
 /**
- * Safe recovery-obligation summary for a route with no unambiguous parsed
- * current monitor definition: its retained work and, when present, its
- * outstanding unretained-observation loss. The containing doctor report
- * supplies its workspace; captured source/configuration metadata is
+ * What kind of monitor an id with recovery obligations belongs to: a
+ * `persistent` monitor is authored as a `MONITOR.md` definition; an
+ * `ephemeral` monitor was declared by an agent session (`ephemeral:` id) and
+ * never had a definition file.
+ * @public
+ */
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+/**
+ * Recovery obligations of a monitor id that has no usable definition in the
+ * doctor's workspace: a persistent monitor whose `MONITOR.md` was removed, no
+ * longer parses, or is duplicated, or an ephemeral monitor that was cancelled
+ * or reaped. It holds the id's retained retry work and its outstanding
+ * unretained-observation loss; each field is present only when there is
+ * something to report, and at least one always is. The containing doctor
+ * report supplies its workspace; captured source/configuration metadata is
  * deliberately not reconstructed.
  * @public
  */
-export interface OrphanedMaterializationRetrySummary {
-  /** Durable route identity needed to inspect and repair the retained work. */
+export interface OrphanedMonitorWork {
+  /** Durable route identity needed to inspect the obligations. */
   monitorId: string;
-  /** Exact route's lifecycle totals and bounded metadata, never its envelopes (all zero when only a loss remains). */
-  summary: MaterializationRetrySummary;
   /**
-   * Present while the route has an outstanding observation that admission
-   * dropped because the retry outbox could not retain it. Absent in reports
-   * from older daemons.
+   * `persistent` for a directory-defined id, `ephemeral` for a retired
+   * ephemeral monitor (a live one is reported in
+   * {@link MonitorDoctorReport.ephemeralMonitorWork} instead).
    */
+  monitorKind: DoctorMonitorKind;
+  /** Retained retry work, present only while the outbox holds records; never envelopes. */
+  materializationRetries?: MaterializationRetrySummary;
+  /**
+   * Present while the id has an outstanding observation that admission
+   * dropped because the retry outbox could not retain it.
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
+}
+
+/**
+ * Recovery obligations of a live (`active`) ephemeral monitor whose rows are
+ * in the doctor's workspace. Ephemeral monitors have no `MONITOR.md`, so they
+ * have no rollup in {@link MonitorDoctorReport.monitors}; their obligations
+ * are attributed to them here rather than reported as orphaned. Each field is
+ * present only when there is something to report, and at least one always is.
+ * @public
+ */
+export interface EphemeralMonitorWork {
+  /** The ephemeral monitor's `ephemeral:<sessionId>/<ulid>` id. */
+  monitorId: string;
+  /** The AgentMon session that declared it and can cancel it. */
+  sessionId: string;
+  /** Retained retry work, present only while the outbox holds records; never envelopes. */
+  materializationRetries?: MaterializationRetrySummary;
+  /** Present while the monitor has an outstanding dropped observation. */
   unretainedObservationLoss?: UnretainedObservationLoss;
 }
 

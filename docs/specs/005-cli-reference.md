@@ -2020,13 +2020,25 @@ daemon restart all leave the check failing. Doctor JSON carries the same data in
 `recordedAt`, keep only the documented fields and normalize their text like retry errors.
 
 A drop also stays a failure without one valid, unambiguous current definition. A removed,
-parse-failed or duplicated id carries the loss in its `orphanedMaterializationRetries` entry as
-`unretainedObservationLoss` (beside a `summary` that is all zero when no work is retained; a
-duplicated id's monitor rows omit it). A parsed but invalid definition keeps it on its monitor row,
+parse-failed or duplicated id carries the loss in its `orphanedMonitorWork` entry as
+`unretainedObservationLoss` (a duplicated id's monitor rows omit it, and their text rollup adds
+`dropped-observation=orphaned`). A parsed but invalid definition keeps it on its monitor row,
 whose check is a `skip`. Either way doctor adds a failing `dropped-observation:<id>` check, after
 the per-monitor checks and with any `retry-outbox:<id>` check for that id, whose detail is the
 `observation dropped, not retained for retry (…): <error>` text above and whose remediation names
-`monitor history <id>` (with `--workspace` as above) and the same clearing rule.
+`monitor history <id>` (with `--workspace` as above), says to repair the definition or reported
+failure, and gives the same clearing rule.
+
+An ephemeral monitor (`agentmonitors watch`, 007 §4) has no `MONITOR.md`, so it has no monitor row
+and nothing to repair. While it is live, its drop and retained work are reported in
+`ephemeralMonitorWork` and its `dropped-observation:<id>` / `retry-outbox:<id>` checks begin
+`ephemeral monitor of session <sessionId>; ` and say it has no MONITOR.md definition; the drop
+check keeps the clearing rule above. After `watch cancel` or reaping it is a _retired_ ephemeral
+monitor in `orphanedMonitorWork` (`monitorKind: "ephemeral"`): its checks begin
+`retired ephemeral monitor; `, say it was cancelled or reaped, never had a definition and will not
+observe again, and that the drop check therefore keeps failing (002 §2). No command clears it.
+Retained-work remediation for either names doctor's own `Retry outbox <id>` listing and
+`monitor history <id>`, since `monitor explain` resolves `MONITOR.md` definitions only.
 
 Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
 through the built CLI, kept failing after a tick of other object keys and cleared by a later
@@ -2038,11 +2050,14 @@ history) / `lead-session=none` marker (the workspace has no lead session). The t
 are distinct (000 AP): claiming a delivery never acknowledges it.
 
 **Retained-work diagnostics (current):** doctor/explain expose workspace-scoped safe retry
-metadata. Outboxes without an unambiguous parsed definition appear in
-`orphanedMaterializationRetries`, including removed, parse-failed and duplicate definitions.
-Each outbox occurs once, either attached to one current monitor or in an orphan group; orphan
-entries carry only `monitorId`, `summary` and, while one is outstanding, `unretainedObservationLoss`
-(above), never an invented source, urgency or cadence.
+metadata. Outboxes of live ephemeral monitors appear in `ephemeralMonitorWork`; other outboxes
+without an unambiguous parsed definition appear in `orphanedMonitorWork`, including removed,
+parse-failed and duplicate definitions and retired ephemeral monitors. Each outbox occurs once:
+attached to one current monitor, under its live ephemeral monitor, or in an orphan group. Orphan
+entries carry only `monitorId`, `monitorKind` (`persistent` or `ephemeral`),
+`materializationRetries` (only while the outbox holds records) and `unretainedObservationLoss`
+(only while one is outstanding, above), never an invented empty summary, source, urgency or
+cadence. Ephemeral entries carry `monitorId`, `sessionId` and the same two optional fields.
 Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
 for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
 `--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
@@ -2055,9 +2070,11 @@ terminal next-attempt stays null. Unknown retry fields are excluded, and errors 
 Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
 is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
 doctor JSON defaults them to empty summaries/arrays. A monitor row's summary defaults to empty unless that
-id has an orphan group (for example a duplicated id whose outbox is in an orphan group), in which case the row
-claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. For an older daemon that
-reports no orphan groups at all, the empty default applies; explain preserves the omitted optional field.
+id's orphan group holds retained work (for example a duplicated id whose outbox is in an orphan group), in which
+case the row claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. When the
+group holds only a drop, the outbox is empty: the row shows `retry-outbox=0/0` and the text rollup adds
+`dropped-observation=orphaned`. For an older daemon that reports no orphan groups at all, the empty default
+applies; explain preserves the omitted optional field.
 Text explain uses an existing top-level summary, including an explicitly empty one, in preference
 to recognized materialization-stage details. If that optional field is omitted, it displays the
 available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
@@ -2164,11 +2181,20 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
       }
     }
   ],
-  "orphanedMaterializationRetries": [
+  "orphanedMonitorWork": [
     {
       "monitorId": "<string>",
-      "summary": { "pending": 0, "terminal": 0, "bytes": 0, "records": [] },
+      "monitorKind": "persistent | ephemeral",
+      "materializationRetries": "<same shape as monitors[], present only while the outbox holds records>",
       "unretainedObservationLoss": "<same shape as monitors[], present only while outstanding>"
+    }
+  ],
+  "ephemeralMonitorWork": [
+    {
+      "monitorId": "ephemeral:<sessionId>/<ulid>",
+      "sessionId": "<string>",
+      "materializationRetries": "<present only while the outbox holds records>",
+      "unretainedObservationLoss": "<present only while outstanding>"
     }
   ],
   "parseErrors": [],

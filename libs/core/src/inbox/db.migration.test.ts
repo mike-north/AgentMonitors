@@ -751,14 +751,25 @@ describe('materialization migration preserves dependent legacy triggers (#534)',
           actual?.map((row) => {
             if (table !== 'monitor_events' && table !== 'monitor_snapshots')
               return row;
-            const { sequence: _sequence, ...publicRow } = row;
+            // The additive admission column is NULL on every copied event:
+            // each was admitted where it committed (002 §2).
+            const {
+              sequence: _sequence,
+              admission_sequence: admissionSequence,
+              ...publicRow
+            } = row;
+            expect(admissionSequence ?? null).toBeNull();
             return publicRow;
           }),
         ).toEqual(
           rows.map((row) => {
             if (table !== 'monitor_events' && table !== 'monitor_snapshots')
               return row;
-            const { sequence: _sequence, ...publicRow } = row;
+            const {
+              sequence: _sequence,
+              admission_sequence: _admissionSequence,
+              ...publicRow
+            } = row;
             return publicRow;
           }),
         );
@@ -844,6 +855,185 @@ describe('materialization migration preserves dependent legacy triggers (#534)',
       // A later successful retry still owns the complete migration and original SQL.
       const recovered = migrationClient(filename);
       expectTriggerBehavior(recovered, []);
+    },
+  );
+});
+
+/**
+ * Upgrade of a store written before unretained admission outcomes were
+ * durable (002 §2, `observation_history`; #497): drop rows need two new
+ * `observation_history` columns, completed retries and queued retries need an
+ * admission position, and doctor/explain need three indexes. If any additive
+ * step regressed, every drop on an upgraded install would fail its insert and
+ * roll back its span, while fresh-store tests stayed green.
+ *
+ * Two starting points: the schema just before this change (events already
+ * carry `sequence`), and an older one whose `monitor_events` predates it, so
+ * the order migration rebuilds the table before the event index is created.
+ */
+describe('unretained admission migration (#497)', () => {
+  const sql = String.raw;
+  const PRE_497_OBSERVATION_HISTORY = sql`
+    CREATE TABLE observation_history (
+      id TEXT PRIMARY KEY,
+      monitor_id TEXT NOT NULL,
+      workspace_path TEXT,
+      source_name TEXT NOT NULL,
+      observation_data TEXT NOT NULL DEFAULT '{}',
+      result TEXT NOT NULL,
+      created_at INTEGER NOT NULL
+    );
+  `;
+  const PRE_497_RETRY_OUTBOX = sql`
+    CREATE TABLE materialization_retry_outbox (
+      id TEXT PRIMARY KEY,
+      workspace_path TEXT,
+      monitor_id TEXT NOT NULL,
+      source_name TEXT NOT NULL,
+      envelope TEXT NOT NULL,
+      envelope_bytes INTEGER NOT NULL,
+      attempt_count INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'pending',
+      next_attempt_at INTEGER,
+      last_error TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+  `;
+  /** `monitor_events` columns shared by both starting points, after the key. */
+  const EVENT_COLUMNS = sql`
+      id TEXT NOT NULL UNIQUE,
+      workspace_path TEXT,
+      monitor_id TEXT NOT NULL,
+      source_name TEXT NOT NULL,
+      urgency TEXT NOT NULL,
+      title TEXT NOT NULL,
+      body TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL DEFAULT '',
+      payload TEXT NOT NULL DEFAULT '{}',
+      snapshot_metadata TEXT NOT NULL DEFAULT '{}',
+      snapshot_text TEXT,
+      diff_text TEXT,
+      object_key TEXT,
+      baseline_strategy TEXT,
+      query_scope TEXT NOT NULL DEFAULT '{}',
+      tags TEXT NOT NULL DEFAULT '[]',
+      created_at INTEGER NOT NULL
+  `;
+  const LEGACY_EVENT_AT = Math.floor(LEGACY_UPDATED_AT / 1000);
+  const WORKSPACE = '/workspace/upgraded';
+
+  function seedPre497(dbPath: string, events: 'ordered' | 'pre-sequence') {
+    const sqlite = new Database(dbPath);
+    try {
+      sqlite.exec(PRE_497_OBSERVATION_HISTORY);
+      sqlite.exec(PRE_497_RETRY_OUTBOX);
+      sqlite.exec(
+        events === 'ordered'
+          ? `CREATE TABLE monitor_events (sequence INTEGER PRIMARY KEY AUTOINCREMENT, ${EVENT_COLUMNS})`
+          : `CREATE TABLE monitor_events (${EVENT_COLUMNS})`,
+      );
+      // An event for the key the upgraded store will drop: it predates the
+      // drop, so it must not supersede it.
+      sqlite
+        .prepare(
+          `INSERT INTO monitor_events
+             (id, workspace_path, monitor_id, source_name, urgency, title, object_key, created_at)
+           VALUES ('legacy-event', ?, 'upgraded', 'test-source', 'normal', 'before', 'object-1', ?)`,
+        )
+        .run(WORKSPACE, LEGACY_EVENT_AT);
+    } finally {
+      sqlite.close();
+    }
+  }
+
+  function indexNames(dbPath: string): string[] {
+    const sqlite = new Database(dbPath, { readonly: true });
+    try {
+      return sqlite
+        .prepare<[], { name: string }>(
+          `SELECT name FROM sqlite_master WHERE type = 'index' ORDER BY name`,
+        )
+        .all()
+        .map(({ name }) => name);
+    } finally {
+      sqlite.close();
+    }
+  }
+
+  it.each(['ordered', 'pre-sequence'] as const)(
+    'adds the drop columns, admission columns and indexes to a pre-#497 store (%s events) and reports a drop recorded after the upgrade',
+    (events) => {
+      const dbPath = tempDbPath();
+      seedPre497(dbPath, events);
+
+      const db = createDb(dbPath);
+      migrationClients.add(
+        (db as unknown as { $client: Database.Database }).$client,
+      );
+
+      expect(columnNames(dbPath, 'observation_history')).toEqual(
+        expect.arrayContaining([
+          'unretained_object_key',
+          'unretained_event_watermark',
+        ]),
+      );
+      expect(columnNames(dbPath, 'monitor_events')).toEqual(
+        expect.arrayContaining(['sequence', 'admission_sequence']),
+      );
+      expect(columnNames(dbPath, 'materialization_retry_outbox')).toContain(
+        'admission_sequence',
+      );
+      // The event index is created after the order migration's rebuild, so
+      // it exists on the rebuilt table too.
+      expect(indexNames(dbPath)).toEqual(
+        expect.arrayContaining([
+          'idx_observation_history_unretained',
+          'idx_observation_history_outcome',
+          'idx_monitor_events_object_sequence',
+        ]),
+      );
+
+      const store = new RuntimeStore(db);
+      store.recordUnretainedObservation({
+        monitorId: 'upgraded',
+        workspacePath: WORKSPACE,
+        sourceName: 'test-source',
+        objectKey: 'object-1',
+        observationData: {
+          error: 'Not retained for retry: capacity',
+          notRetained: true,
+          position: 1,
+          spanSize: 1,
+          objectKey: 'object-1',
+        },
+      });
+      expect(
+        store.outstandingUnretainedObservationLoss('upgraded', WORKSPACE),
+      ).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+      // A later event for the key supersedes it on the upgraded store too.
+      store.insertEvent({
+        monitorId: 'upgraded',
+        workspacePath: WORKSPACE,
+        sourceName: 'test-source',
+        urgency: 'normal',
+        title: 'after',
+        body: '',
+        summary: '',
+        payload: {},
+        snapshotMetadata: {},
+        snapshotText: null,
+        diffText: null,
+        objectKey: 'object-1',
+        baselineStrategy: 'incremental',
+        queryScope: {},
+        tags: [],
+        createdAt: new Date(LEGACY_UPDATED_AT),
+      });
+      expect(
+        store.outstandingUnretainedObservationLoss('upgraded', WORKSPACE),
+      ).toBeUndefined();
     },
   );
 });

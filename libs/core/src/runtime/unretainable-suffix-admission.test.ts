@@ -1121,6 +1121,138 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     expect(loss(f)).toBeUndefined();
   });
 
+  /**
+   * Complete the fixture's only pending retry the way a drain would: the
+   * deterministic event of its stored envelope, through the store's atomic
+   * completion seam. The native fault that retained it is removed first.
+   */
+  function completeOnlyRetry(f: Fixture, faultedSummary: string) {
+    f.writer.client.exec(
+      `DROP TRIGGER fault_${faultedSummary.replace('-', '_')}`,
+    );
+    const store = new RuntimeStore(f.writer.db);
+    const [retry] = store.listMaterializationRetries({
+      monitorId: MONITOR_ID,
+      workspacePath: f.root,
+    });
+    if (!retry) throw new Error('no retained retry to complete');
+    const { observation, observedAt } = retry.envelope;
+    clockTime += 2_000;
+    return store.completeMaterializationRetry(retry.id, {
+      monitorId: MONITOR_ID,
+      workspacePath: f.root,
+      sourceName: 'suffix-source',
+      urgency: 'normal',
+      title: observation.title,
+      body: '',
+      summary: observation.summary,
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: observation.snapshotText ?? null,
+      diffText: null,
+      objectKey: observation.objectKey ?? MONITOR_ID,
+      baselineStrategy: 'incremental',
+      queryScope: {},
+      tags: [],
+      createdAt: observedAt,
+    });
+  }
+
+  // Regression (#497): "later" is a later observation, not a later write. A
+  // retry admitted before the drop carries older state for the key, so its
+  // completion after the drop must not clear the drop, although its event
+  // commits with a sequence above the drop's watermark.
+  it('keeps a keyed drop when a retry admitted before it completes, and clears it on a newer observation of the key', async () => {
+    let call = 0;
+    const f = fixture('poll', () => {
+      const current = call++;
+      switch (current) {
+        case 0:
+          return [keyed('v1', 'object-1')];
+        case 1:
+          return [keyed('v2', 'object-1', { n: 1n })];
+        case 2:
+          return [];
+        default:
+          return [keyed('v3', 'object-1')];
+      }
+    });
+    abortOn(f, 'v1');
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(
+      f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
+    ).toBe(1);
+    await nextPoll(f);
+    expect(loss(f)).toMatchObject({
+      count: 1,
+      objectKey: 'object-1',
+      title: 'v2',
+    });
+
+    const completed = completeOnlyRetry(f, 'v1');
+    expect(completed.summary).toBe('v1');
+    expect(
+      f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
+    ).toBe(0);
+    expect(loss(f)).toMatchObject({
+      count: 1,
+      objectKey: 'object-1',
+      title: 'v2',
+    });
+    // A quiet tick after the completion changes nothing.
+    await nextPoll(f);
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
+
+    const newer = await nextPoll(f);
+    expect(newer.emittedEventIds).toHaveLength(1);
+    expect(loss(f)).toBeUndefined();
+  });
+
+  it('clears a keyed drop when a retry admitted after it completes, with no event between them', async () => {
+    let call = 0;
+    const f = fixture('poll', () =>
+      call++ === 0
+        ? [keyed('v1', 'object-1', { n: 1n })]
+        : call === 2
+          ? [keyed('v2', 'object-1')]
+          : [],
+    );
+    abortOn(f, 'v2');
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(loss(f)).toMatchObject({ count: 1, title: 'v1' });
+    // v2 is retained, so nothing materializes between the drop and its admission.
+    const retained = await nextPoll(f);
+    expect(retained.emittedEventIds).toEqual([]);
+    expect(
+      f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
+    ).toBe(1);
+    expect(loss(f)).toMatchObject({ count: 1, title: 'v1' });
+
+    completeOnlyRetry(f, 'v2');
+    expect(loss(f)).toBeUndefined();
+  });
+
+  it('clears a keyed drop when a later sibling of its own span is retained and completes', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0
+        ? [keyed('s1', 'object-1', { n: 1n }), keyed('s2', 'object-1')]
+        : [],
+    );
+    abortOn(f, 's2');
+
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(dropRows(f)).toHaveLength(1);
+    expect(
+      f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
+    ).toBe(1);
+    expect(loss(f)).toMatchObject({ count: 1, title: 's1' });
+
+    completeOnlyRetry(f, 's2');
+    expect(loss(f)).toBeUndefined();
+  });
+
   it('keeps an outstanding drop across reopening the store', async () => {
     const f = fixture('poll', (cursor) =>
       cursor === 0 ? [keyed('p0-0', 'object-1', { n: 1n })] : [],
@@ -1180,10 +1312,11 @@ describe('a drop without one current definition is reported in the orphan groups
     const doctor = await report(f);
 
     expect(doctor.monitors).toEqual([]);
-    expect(doctor.orphanedMaterializationRetries).toEqual([
+    // Only the loss: no retry summary is invented for an empty outbox.
+    expect(doctor.orphanedMonitorWork).toEqual([
       {
         monitorId: MONITOR_ID,
-        summary: { pending: 0, terminal: 0, bytes: 0, records: [] },
+        monitorKind: 'persistent',
         unretainedObservationLoss: expect.objectContaining(expectedLoss),
       },
     ]);
@@ -1199,7 +1332,7 @@ describe('a drop without one current definition is reported in the orphan groups
     const doctor = await report(f);
 
     expect(doctor.parseErrors.map(({ id }) => id)).toEqual([MONITOR_ID]);
-    expect(doctor.orphanedMaterializationRetries).toEqual([
+    expect(doctor.orphanedMonitorWork).toEqual([
       expect.objectContaining({
         monitorId: MONITOR_ID,
         unretainedObservationLoss: expect.objectContaining(expectedLoss),
@@ -1223,10 +1356,92 @@ describe('a drop without one current definition is reported in the orphan groups
     for (const monitor of doctor.monitors) {
       expect(monitor.unretainedObservationLoss).toBeUndefined();
     }
-    expect(doctor.orphanedMaterializationRetries).toEqual([
+    expect(doctor.orphanedMonitorWork).toEqual([
       expect.objectContaining({
         monitorId: MONITOR_ID,
         unretainedObservationLoss: expect.objectContaining(expectedLoss),
+      }),
+    ]);
+  });
+
+  // Regression (#497): doctor scanned only MONITOR.md definitions, so a live
+  // ephemeral monitor's drop was reported as an orphaned "removed definition".
+  it('attributes a live ephemeral monitor drop to it, and reports it as a retired ephemeral orphan once cancelled', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? observations(0, 3, { 1: { n: 1n } }) : [],
+    );
+    // Only the ephemeral monitor observes in this workspace.
+    rmSync(path.join(f.monitorsDir, MONITOR_ID), { recursive: true });
+    const [session] = f.reader.sessionsForWorkspace(f.root);
+    if (!session) throw new Error('fixture opened no lead session');
+    const watch = f.runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'suffix-source',
+      scope: {},
+      instruction: 'Watch the suffix.',
+    });
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(
+      f.reader.outstandingUnretainedObservationLoss(watch.id, f.root),
+    ).toMatchObject(expectedLoss);
+
+    const live = await report(f);
+    expect(live.orphanedMonitorWork).toEqual([]);
+    expect(live.ephemeralMonitorWork).toEqual([
+      {
+        monitorId: watch.id,
+        sessionId: session.id,
+        unretainedObservationLoss: expect.objectContaining(expectedLoss),
+      },
+    ]);
+
+    f.runtime.cancelEphemeralMonitor(session.id, watch.id);
+    const retired = await report(f);
+    expect(retired.ephemeralMonitorWork).toEqual([]);
+    expect(retired.orphanedMonitorWork).toEqual([
+      {
+        monitorId: watch.id,
+        monitorKind: 'ephemeral',
+        unretainedObservationLoss: expect.objectContaining(expectedLoss),
+      },
+    ]);
+  });
+
+  it('attributes a live ephemeral monitor retained work to it, not to an orphan group', async () => {
+    const f = fixture('poll', (cursor) =>
+      cursor === 0 ? observations(0, 2) : [],
+    );
+    abortOn(f, 'b0-1');
+    rmSync(path.join(f.monitorsDir, MONITOR_ID), { recursive: true });
+    const [session] = f.reader.sessionsForWorkspace(f.root);
+    if (!session) throw new Error('fixture opened no lead session');
+    const watch = f.runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'suffix-source',
+      scope: {},
+      instruction: 'Watch the suffix.',
+    });
+    await f.runtime.tick(f.monitorsDir, f.root);
+
+    const live = await report(f);
+    expect(live.orphanedMonitorWork).toEqual([]);
+    expect(live.ephemeralMonitorWork).toEqual([
+      {
+        monitorId: watch.id,
+        sessionId: session.id,
+        materializationRetries: expect.objectContaining({
+          pending: 1,
+          terminal: 0,
+        }),
+      },
+    ]);
+
+    f.runtime.cancelEphemeralMonitor(session.id, watch.id);
+    expect((await report(f)).orphanedMonitorWork).toEqual([
+      expect.objectContaining({
+        monitorId: watch.id,
+        monitorKind: 'ephemeral',
+        materializationRetries: expect.objectContaining({ pending: 1 }),
       }),
     ]);
   });
@@ -1245,6 +1460,6 @@ describe('a drop without one current definition is reported in the orphan groups
     expect(doctor.monitors[0]?.unretainedObservationLoss).toMatchObject(
       expectedLoss,
     );
-    expect(doctor.orphanedMaterializationRetries).toEqual([]);
+    expect(doctor.orphanedMonitorWork).toEqual([]);
   });
 });

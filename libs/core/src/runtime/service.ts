@@ -74,7 +74,8 @@ import type {
   MonitorExplainStageId,
   MonitorExplainStageStatus,
   ObservationHistoryQuery,
-  OrphanedMaterializationRetrySummary,
+  EphemeralMonitorWork,
+  OrphanedMonitorWork,
   ObservationHistoryRecord,
   OpenSessionInput,
   PollingDecision,
@@ -2088,9 +2089,10 @@ export class AgentMonitorRuntime {
     // Discover routes from metadata, not captured envelopes or a capped row
     // listing. Capacity is per monitor, so a full outbox cannot hide another.
     // A rollup row represents its id's recovery obligations exactly when it
-    // carries the retry summary (one parsed, non-duplicated definition); every
-    // other id with retained work or an outstanding drop gets one orphan group,
-    // so neither can disappear with its definition (002 §2).
+    // carries the retry summary (one parsed, non-duplicated definition). Every
+    // other id with retained work or an outstanding drop is attributed once:
+    // to its live ephemeral monitor, or else to an orphan group, so neither
+    // can disappear with its definition or its declaration (002 §2).
     const representedMonitorIds = new Set(
       monitors
         .filter(
@@ -2101,40 +2103,50 @@ export class AgentMonitorRuntime {
     const retainedMonitorIds = new Set(
       this.store.materializationRetryMonitorIds(workspacePath),
     );
-    const orphanedMaterializationRetries: OrphanedMaterializationRetrySummary[] =
-      [
-        ...new Set([
-          ...retainedMonitorIds,
-          ...this.store.unretainedObservationMonitorIds(workspacePath),
-        ]),
-      ]
-        .filter((monitorId) => !representedMonitorIds.has(monitorId))
-        .sort()
-        .flatMap((monitorId) => {
-          const unretainedObservationLoss =
-            this.store.outstandingUnretainedObservationLoss(
-              monitorId,
-              workspacePath,
-            );
-          if (
-            !retainedMonitorIds.has(monitorId) &&
-            unretainedObservationLoss === undefined
-          ) {
-            return [];
-          }
-          return [
-            {
-              monitorId,
-              summary: this.store.materializationRetrySummary(
-                monitorId,
-                workspacePath,
-              ),
-              ...(unretainedObservationLoss
-                ? { unretainedObservationLoss }
-                : {}),
-            },
-          ];
+    const orphanedMonitorWork: OrphanedMonitorWork[] = [];
+    const ephemeralMonitorWork: EphemeralMonitorWork[] = [];
+    for (const monitorId of [
+      ...new Set([
+        ...retainedMonitorIds,
+        ...this.store.unretainedObservationMonitorIds(workspacePath),
+      ]),
+    ]
+      .filter((id) => !representedMonitorIds.has(id))
+      .sort()) {
+      const unretainedObservationLoss =
+        this.store.outstandingUnretainedObservationLoss(
+          monitorId,
+          workspacePath,
+        );
+      const materializationRetries = retainedMonitorIds.has(monitorId)
+        ? this.store.materializationRetrySummary(monitorId, workspacePath)
+        : undefined;
+      if (!materializationRetries && !unretainedObservationLoss) continue;
+      const work = {
+        ...(materializationRetries ? { materializationRetries } : {}),
+        ...(unretainedObservationLoss ? { unretainedObservationLoss } : {}),
+      };
+      const ephemeral = monitorId.startsWith(EPHEMERAL_MONITOR_ID_PREFIX);
+      // A live ephemeral monitor never has a definition file; its work is its
+      // own, not orphaned. Once cancelled or reaped it is retired, and its
+      // obligations stay visible as an orphan like a removed definition's.
+      const declaration = ephemeral
+        ? this.store.findEphemeralMonitorById(monitorId)
+        : null;
+      if (declaration?.status === 'active') {
+        ephemeralMonitorWork.push({
+          monitorId,
+          sessionId: declaration.sessionId,
+          ...work,
         });
+      } else {
+        orphanedMonitorWork.push({
+          monitorId,
+          monitorKind: ephemeral ? 'ephemeral' : 'persistent',
+          ...work,
+        });
+      }
+    }
 
     return {
       generatedAt: now,
@@ -2142,7 +2154,8 @@ export class AgentMonitorRuntime {
       workspacePath,
       monitorsDirExists,
       monitors,
-      orphanedMaterializationRetries,
+      orphanedMonitorWork,
+      ephemeralMonitorWork,
       invalidCount,
       duplicateIds: scan.duplicateIds,
       parseErrors,

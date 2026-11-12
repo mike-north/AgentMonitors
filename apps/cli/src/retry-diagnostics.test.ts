@@ -165,8 +165,19 @@ function reports(): {
       duplicateIds: [],
       leadSessions: [],
       hasLeadSession: false,
-      orphanedMaterializationRetries: [
-        { monitorId: 'removed', summary: summary('orphan') },
+      orphanedMonitorWork: [
+        {
+          monitorId: 'removed',
+          monitorKind: 'persistent',
+          materializationRetries: summary('orphan'),
+        },
+      ],
+      ephemeralMonitorWork: [
+        {
+          monitorId: 'ephemeral:session-1/01K0000000000000000000000',
+          sessionId: 'session-1',
+          materializationRetries: summary('ephemeral'),
+        },
       ],
     },
   };
@@ -515,7 +526,8 @@ it('revives every attached and orphan retry date through real socket requests', 
   for (const value of [
     explain.materializationRetries,
     doctor.monitors[0]?.materializationRetries,
-    doctor.orphanedMaterializationRetries?.[0]?.summary,
+    doctor.orphanedMonitorWork?.[0]?.materializationRetries,
+    doctor.ephemeralMonitorWork?.[0]?.materializationRetries,
   ]) {
     expect(value).toBeDefined();
     expect(value?.records).toHaveLength(2);
@@ -549,7 +561,8 @@ it('bounds legacy socket errors and exposes only safe retry metadata', async () 
   for (const value of [
     explain.materializationRetries,
     doctor.monitors[0]?.materializationRetries,
-    doctor.orphanedMaterializationRetries?.[0]?.summary,
+    doctor.orphanedMonitorWork?.[0]?.materializationRetries,
+    doctor.ephemeralMonitorWork?.[0]?.materializationRetries,
   ]) {
     for (const record of value?.records ?? []) {
       expect(record.lastError).toBe(safeError);
@@ -585,6 +598,7 @@ it.each(['json', 'text'] as const)(
     }
     expect(doctor.stdout).toContain('orphan-pending');
     expect(doctor.stdout).toContain('orphan-terminal');
+    expect(doctor.stdout).toContain('ephemeral-pending');
     expect(doctor.stdout).toContain('wire parse failure');
     for (const output of [explain.stdout, doctor.stdout]) {
       expect(output).not.toContain('PRIVATE');
@@ -594,16 +608,16 @@ it.each(['json', 'text'] as const)(
     }
     if (format === 'json') {
       const value = JSON.parse(doctor.stdout);
-      expect(value.orphanedMaterializationRetries[0].monitorId).toBe('removed');
+      expect(value.orphanedMonitorWork[0].monitorId).toBe('removed');
       expect(
-        value.orphanedMaterializationRetries[0].summary.records[0],
+        value.orphanedMonitorWork[0].materializationRetries.records[0],
       ).toMatchObject({
         createdAt: created.toISOString(),
         updatedAt: updated.toISOString(),
         nextAttemptAt: next.toISOString(),
       });
       expect(
-        value.orphanedMaterializationRetries[0].summary.records.every(
+        value.orphanedMonitorWork[0].materializationRetries.records.every(
           (record: { lastError: string }) => record.lastError === safeError,
         ),
       ).toBe(true);
@@ -630,7 +644,8 @@ it.each(['all-omitted', 'orphans-omitted'] as const)(
   'supports older daemon fields: %s for both clients and CLI formats',
   async (omission) => {
     const fixture = reports();
-    delete fixture.doctor.orphanedMaterializationRetries;
+    delete fixture.doctor.orphanedMonitorWork;
+    delete fixture.doctor.ephemeralMonitorWork;
     fixture.doctor.parseErrors = [];
     if (omission === 'all-omitted') {
       delete fixture.explain.materializationRetries;
@@ -644,7 +659,8 @@ it.each(['all-omitted', 'orphans-omitted'] as const)(
     };
     const explain = await explainMonitorClient(input, socketPath);
     const doctor = await doctorReportClient(input, socketPath);
-    expect(doctor.orphanedMaterializationRetries).toBeUndefined();
+    expect(doctor.orphanedMonitorWork).toBeUndefined();
+    expect(doctor.ephemeralMonitorWork).toBeUndefined();
     if (omission === 'all-omitted')
       expect(explain.materializationRetries).toBeUndefined();
     for (const format of ['text', 'json'] as const) {
@@ -654,7 +670,8 @@ it.each(['all-omitted', 'orphans-omitted'] as const)(
       expect(result.stdout).not.toContain('orphan-pending');
       if (format === 'json') {
         const value = JSON.parse(result.stdout);
-        expect(value.orphanedMaterializationRetries).toEqual([]);
+        expect(value.orphanedMonitorWork).toEqual([]);
+        expect(value.ephemeralMonitorWork).toEqual([]);
         if (omission === 'all-omitted')
           expect(value.monitors[0].materializationRetries).toEqual({
             pending: 0,
@@ -684,8 +701,12 @@ it.each(['text', 'json'] as const)(
     row.id = 'dup';
     fixture.doctor.monitors = [row, { ...row }];
     fixture.doctor.duplicateIds = ['dup'];
-    fixture.doctor.orphanedMaterializationRetries = [
-      { monitorId: 'dup', summary: summary('dup-orphan') },
+    fixture.doctor.orphanedMonitorWork = [
+      {
+        monitorId: 'dup',
+        monitorKind: 'persistent',
+        materializationRetries: summary('dup-orphan'),
+      },
     ];
     await serve(fixture);
     const result = await run('doctor', format);
@@ -695,7 +716,7 @@ it.each(['text', 'json'] as const)(
       expect(value.monitors).toHaveLength(2);
       for (const monitor of value.monitors)
         expect(monitor).not.toHaveProperty('materializationRetries');
-      expect(value.orphanedMaterializationRetries[0].monitorId).toBe('dup');
+      expect(value.orphanedMonitorWork[0].monitorId).toBe('dup');
       expect(value.checks).toContainEqual(
         expect.objectContaining({ name: 'retry-outbox:dup', status: 'fail' }),
       );
@@ -863,8 +884,12 @@ it.each(['text', 'json'] as const)(
     row.id = 'dup2';
     fixture.doctor.monitors = [row, { ...row }];
     fixture.doctor.duplicateIds = ['dup2'];
-    fixture.doctor.orphanedMaterializationRetries = [
-      { monitorId: 'other', summary: summary('other-orphan') },
+    fixture.doctor.orphanedMonitorWork = [
+      {
+        monitorId: 'other',
+        monitorKind: 'persistent',
+        materializationRetries: summary('other-orphan'),
+      },
     ];
     await serve(fixture);
     const result = await run('doctor', format);
@@ -1008,8 +1033,9 @@ it.each([
               (m: { materializationRetries?: MaterializationRetrySummary }) =>
                 m.materializationRetries ? [m.materializationRetries] : [],
             ),
-            ...value.orphanedMaterializationRetries.map(
-              (g: { summary: MaterializationRetrySummary }) => g.summary,
+            ...value.orphanedMonitorWork.flatMap(
+              (g: { materializationRetries?: MaterializationRetrySummary }) =>
+                g.materializationRetries ? [g.materializationRetries] : [],
             ),
           ];
           expect(
@@ -1537,24 +1563,7 @@ it.each([
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'MONITOR.md'), DROPPER_SCHEDULE);
     const dbPath = path.join(root, 'state.db');
-    await seedDrop(monitors, dbPath, {
-      name: 'schedule',
-      scopeSchema: { type: 'object' },
-      stateful: true,
-      observe: () =>
-        Promise.resolve({
-          observations: [
-            { title: 'd-0', summary: 'd-0', objectKey: 'object-0' },
-            {
-              title: 'd-1',
-              summary: 'd-1',
-              objectKey: 'object-1',
-              payload: { n: 1n },
-            },
-          ],
-          nextState: { seeded: true },
-        }),
-    });
+    await seedDrop(monitors, dbPath, droppingSource);
     breakDefinition(dir);
 
     const json = await run('doctor', 'json', dbPath);
@@ -1576,13 +1585,14 @@ it.each([
       // A parsed definition keeps its own rollup; its check is a skip, so the
       // loss needs its own failing check.
       expect(report.monitors[0].unretainedObservationLoss).toEqual(loss);
-      expect(report.orphanedMaterializationRetries).toEqual([]);
+      expect(report.orphanedMonitorWork).toEqual([]);
     } else {
       expect(report.monitors).toEqual([]);
-      expect(report.orphanedMaterializationRetries).toEqual([
+      // Only the loss: no retry summary is invented for an empty outbox.
+      expect(report.orphanedMonitorWork).toEqual([
         {
           monitorId: 'dropper',
-          summary: { pending: 0, terminal: 0, bytes: 0, records: [] },
+          monitorKind: 'persistent',
           unretainedObservationLoss: loss,
         },
       ]);
@@ -1610,6 +1620,209 @@ it.each([
     );
   },
 );
+
+/** A schedule-named source whose one span drops `object-1` (a BigInt payload). */
+const droppingSource = {
+  name: 'schedule',
+  scopeSchema: { type: 'object' },
+  stateful: true,
+  observe: () =>
+    Promise.resolve({
+      observations: [
+        { title: 'd-0', summary: 'd-0', objectKey: 'object-0' },
+        {
+          title: 'd-1',
+          summary: 'd-1',
+          objectKey: 'object-1',
+          payload: { n: 1n },
+        },
+      ],
+      nextState: { seeded: true },
+    }),
+} satisfies Parameters<SourceRegistry['register']>[0];
+
+/**
+ * Bug (#497): a duplicated id whose orphan group held only a drop
+ * printed `retry-outbox=orphaned` on both rows although its outbox is empty.
+ * The rollup must say what is orphaned: the drop, not retained work.
+ */
+it('names the orphaned drop, not an orphaned outbox, on duplicated-id rows with an empty outbox', async () => {
+  const monitors = path.join(root, 'monitors');
+  const dir = path.join(monitors, 'dropper');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, 'MONITOR.md'), DROPPER_SCHEDULE);
+  const dbPath = path.join(root, 'state.db');
+  await seedDrop(monitors, dbPath, droppingSource);
+  mkdirSync(path.join(monitors, 'nested', 'dropper'), { recursive: true });
+  writeFileSync(
+    path.join(monitors, 'nested', 'dropper', 'MONITOR.md'),
+    DROPPER_SCHEDULE,
+  );
+
+  const text = await run('doctor', 'text', dbPath);
+  expect(text.code).toBe(1);
+  const rows = text.stdout
+    .split('\n')
+    .filter((line) => line.includes(' monitor:dropper: '));
+  expect(rows).toHaveLength(2);
+  for (const line of rows) {
+    expect(line).toContain('retry-outbox=0/0');
+    expect(line).toContain('dropped-observation=orphaned');
+    expect(line).not.toContain('retry-outbox=orphaned');
+  }
+  expect(text.stdout).not.toContain('retry-outbox:dropper');
+  expect(text.stdout).toContain('✗ dropped-observation:dropper: ');
+
+  const json = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+  expect(json.orphanedMonitorWork).toEqual([
+    expect.not.objectContaining({ materializationRetries: expect.anything() }),
+  ]);
+  for (const monitor of json.monitors) {
+    expect(monitor.materializationRetries).toEqual({
+      pending: 0,
+      terminal: 0,
+      bytes: 0,
+      records: [],
+    });
+  }
+});
+
+/**
+ * Seed one drop for a live ephemeral monitor declared by a lead session in
+ * `root`, with no MONITOR.md in the monitors directory. Returns the ids
+ * needed to cancel it later.
+ */
+async function seedEphemeralDrop(
+  dbPath: string,
+): Promise<{ sessionId: string; monitorId: string }> {
+  const db = createDb(dbPath);
+  const client = (db as unknown as { $client: Database }).$client;
+  try {
+    const registry = new SourceRegistry();
+    // A polling source: a `schedule`-typed declaration would need a cron.
+    registry.register({ ...droppingSource, name: 'drop-source' });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'lead-ephemeral',
+        workspacePath: root,
+      }),
+    );
+    const watch = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'drop-source',
+      scope: {},
+      instruction: 'Watch.',
+    });
+    const tick = await runtime.tick(path.join(root, 'monitors'), root);
+    expect(tick.erroredObservations).toEqual([
+      {
+        monitorId: watch.id,
+        message: expect.stringContaining('Not retained for retry'),
+      },
+    ]);
+    return { sessionId: session.id, monitorId: watch.id };
+  } finally {
+    client.close();
+  }
+}
+
+/**
+ * Regression for #497: doctor scanned only MONITOR.md definitions,
+ * so a live ephemeral monitor's drop showed as an orphaned definition and its
+ * check said to "repair the definition", which never existed. Once the watch
+ * is cancelled the drop stays visible as an orphan, named for what it is.
+ */
+it('attributes a live ephemeral drop to its monitor and reports a cancelled one as a retired ephemeral orphan, in text and JSON', async () => {
+  mkdirSync(path.join(root, 'monitors'), { recursive: true });
+  const dbPath = path.join(root, 'state.db');
+  const { sessionId, monitorId } = await seedEphemeralDrop(dbPath);
+  const checkName = `dropped-observation:${monitorId}`;
+
+  const live = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+  expect(live.ok).toBe(false);
+  expect(live.orphanedMonitorWork).toEqual([]);
+  expect(live.ephemeralMonitorWork).toEqual([
+    {
+      monitorId,
+      sessionId,
+      unretainedObservationLoss: expect.objectContaining({
+        count: 1,
+        objectKey: 'object-1',
+        title: 'd-1',
+      }),
+    },
+  ]);
+  const liveCheck = live.checks.find(
+    (check: { name: string }) => check.name === checkName,
+  );
+  expect(liveCheck).toMatchObject({
+    status: 'fail',
+    detail: expect.stringMatching(
+      new RegExp(
+        `^ephemeral monitor of session ${sessionId}; observation dropped, not retained for retry \\(1 outstanding;`,
+      ),
+    ),
+  });
+  expect(liveCheck.remediation).toContain(
+    'It is an ephemeral monitor declared by that session',
+  );
+  expect(liveCheck.remediation).toContain(
+    'This check clears once a later event of this monitor materializes',
+  );
+  expect(liveCheck.remediation).not.toContain('repair the definition');
+  const liveText = await run('doctor', 'text', dbPath);
+  expect(liveText.code).toBe(1);
+  expect(liveText.stdout).toContain(
+    `✗ ${checkName}: ephemeral monitor of session ${sessionId}; observation dropped`,
+  );
+  expect(liveText.stdout).not.toContain('repair the definition');
+
+  const db = createDb(dbPath);
+  try {
+    new AgentMonitorRuntime(new RuntimeStore(db), new SourceRegistry(), [
+      claudeCodeAdapter,
+    ]).cancelEphemeralMonitor(sessionId, monitorId);
+  } finally {
+    (db as unknown as { $client: Database }).$client.close();
+  }
+
+  const retired = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+  expect(retired.ok).toBe(false);
+  expect(retired.ephemeralMonitorWork).toEqual([]);
+  expect(retired.orphanedMonitorWork).toEqual([
+    {
+      monitorId,
+      monitorKind: 'ephemeral',
+      unretainedObservationLoss: expect.objectContaining({
+        count: 1,
+        objectKey: 'object-1',
+      }),
+    },
+  ]);
+  const retiredCheck = retired.checks.find(
+    (check: { name: string }) => check.name === checkName,
+  );
+  expect(retiredCheck).toMatchObject({
+    status: 'fail',
+    detail: expect.stringMatching(
+      /^retired ephemeral monitor; observation dropped, not retained for retry/,
+    ),
+    remediation: expect.stringContaining(
+      'has since been cancelled or reaped: it never had a MONITOR.md definition, so there is nothing to repair',
+    ),
+  });
+  expect(retiredCheck.remediation).not.toContain('repair the definition');
+  expect(retiredCheck.remediation).not.toContain('This check clears');
+  const retiredText = await run('doctor', 'text', dbPath);
+  expect(retiredText.code).toBe(1);
+  expect(retiredText.stdout).toContain(
+    `✗ ${checkName}: retired ephemeral monitor; observation dropped`,
+  );
+  expect(retiredText.stdout).toContain('there is nothing to repair');
+}, 30_000);
 
 /**
  * Regression for #497 through the built CLI and a real `daemon run`: the

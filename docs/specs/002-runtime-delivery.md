@@ -685,12 +685,19 @@ _outstanding_ until it is _superseded_, and only these outcomes supersede it:
 
 - **A drop with an object key** (the observation's `objectKey` was a string) is superseded by a
   later event of the same monitor id, in the same workspace, for exactly that object key. An event
-  of another monitor or another workspace for the same key does not supersede it. "Later" is
-  commit order: the drop row records the newest `monitor_events.sequence` committed before it
-  (inside the admission transaction), and only an event with a greater sequence counts. A later
-  sibling in the dropping span, a later span, a rollup or debounce flush, and a retained retry
-  that materializes all count. An event's `created_at` is observation time, which a flush or retry
-  carries over from the original observation, so it cannot order events against the drop.
+  of another monitor or another workspace for the same key does not supersede it. "Later" means
+  the event's observation was **admitted** after the drop, not merely committed after it.
+  Admission order is the `monitor_events` materialization order: an event materialized in its
+  admitting span takes its `sequence` there, and a retained observation reserves the next position
+  of the same AUTOINCREMENT counter when its retry is queued (`admission_sequence`), which its
+  event keeps when the retry completes. The drop row records that counter's high-water mark inside
+  the admission transaction, and only an event whose admission position (`admission_sequence`,
+  else `sequence`) is above it counts. So a later sibling in the dropping span, a later span and a
+  rollup or debounce flush count, and so does a retry admitted after the drop (a later sibling of
+  the dropping span that was retained, or a later span's) once it completes. A retry admitted
+  before the drop carries older state for the key and never supersedes it, even when it completes
+  after the drop. An event's `created_at` is observation time, which a flush or retry carries over
+  from the original observation, so it cannot order events against the drop.
 - **A drop without an object key** is superseded by a later span of the same monitor in the same
   workspace that materializes at least one event and drops nothing: a later `triggered` batch row
   whose `notRetainedCount` is absent or zero, ordered after the drop row by `(created_at, id)`. The
@@ -708,19 +715,25 @@ outstanding:
   `title`. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
   per-monitor rollup).
 - When the monitor has no one unambiguous parsed definition (its definition was removed, fails to
-  parse, or its id is duplicated), the loss goes to that id's entry in
-  `orphanedMaterializationRetries` instead, beside any retained work, with the same per-id rule
-  as retained work: a duplicated id's rollups omit it and its one orphan group carries it. A
-  parsed definition that fails validation keeps the loss on its rollup. `doctor` fails a
-  `dropped-observation:<id>` check for both cases, so the loss never disappears with its
-  definition.
+  parse, or its id is duplicated), the loss goes to that id's entry in `orphanedMonitorWork`
+  instead (`monitorKind: "persistent"`), beside any retained work, with the same per-id rule as
+  retained work: a duplicated id's rollups omit it and its one orphan group carries it. A parsed
+  definition that fails validation keeps the loss on its rollup.
+- An ephemeral monitor ([007 §4](./007-agent-facing-interaction.md)) has no definition file, so it
+  has no rollup. While it is `active` its loss and retained work are attributed to it in
+  `ephemeralMonitorWork` (with its declaring `sessionId`), not reported as orphaned. Once it is
+  cancelled or reaped it is _retired_: its outstanding loss and retained work stay visible in
+  `orphanedMonitorWork` with `monitorKind: "ephemeral"`, as a removed definition's do. A retired
+  ephemeral monitor never observes again, so nothing supersedes its drop; it stays outstanding.
+- `doctor` fails a `dropped-observation:<id>` check for each of these cases, so the loss never
+  disappears with its definition or its declaration.
 
 Both read the durable rows through `RuntimeStore.outstandingUnretainedObservationLoss()`
 (internal), so the answer is the same with or without a daemon and across restarts. The lookup
 runs on every doctor and explain call, so it is indexed: a partial index on drop rows, an
 `observation_history (monitor_id, workspace_path, result, created_at, id)` index for the later
-span, and a `monitor_events (monitor_id, workspace_path, object_key, sequence)` index for the later
-event, all created by the additive schema migration.
+span, and a `monitor_events (monitor_id, workspace_path, object_key, sequence, admission_sequence)`
+index for the later event, all created by the additive schema migration.
 
 For example, 600 observations with a native `RAISE(ABORT)` on the 300th leave a 301-record suffix,
 which no empty outbox can hold. The span commits 599 events, one `errored` row naming capacity, and
@@ -2002,25 +2015,31 @@ Verified: `libs/core/src/inbox/schema.ts` (entire file); `libs/core/src/inbox/db
 
 Corresponds to the `monitorEvents` Drizzle table. One row per materialized observation. Rows are immutable after insertion.
 
-| Column              | Type                     | Notes                                           |
-| ------------------- | ------------------------ | ----------------------------------------------- |
-| `sequence`          | INTEGER PK AUTOINCREMENT | Private equal-time materialization tie-break    |
-| `id`                | TEXT NOT NULL UNIQUE     | Public ULID identity                            |
-| `workspace_path`    | TEXT nullable            | Path to the workspace; `NULL` for global events |
-| `monitor_id`        | TEXT NOT NULL            | Stable monitor identifier                       |
-| `source_name`       | TEXT NOT NULL            | Source plugin name                              |
-| `urgency`           | TEXT NOT NULL            | `low \| normal \| high`                         |
-| `title`             | TEXT NOT NULL            |                                                 |
-| `body`              | TEXT NOT NULL            | Defaults to `''`                                |
-| `summary`           | TEXT NOT NULL            | Defaults to `''`                                |
-| `payload`           | TEXT NOT NULL            | JSON; defaults to `{}`                          |
-| `snapshot_metadata` | TEXT NOT NULL            | JSON; defaults to `{}`                          |
-| `snapshot_text`     | TEXT nullable            | Full snapshot content if provided               |
-| `diff_text`         | TEXT nullable            | Line-level diff vs. previous snapshot           |
-| `object_key`        | TEXT nullable            | Snapshot and diff keying                        |
-| `query_scope`       | TEXT NOT NULL            | JSON; defaults to `{}`                          |
-| `tags`              | TEXT NOT NULL            | JSON array; defaults to `[]`                    |
-| `created_at`        | INTEGER NOT NULL         | Observation timestamp                           |
+| Column               | Type                     | Notes                                           |
+| -------------------- | ------------------------ | ----------------------------------------------- |
+| `sequence`           | INTEGER PK AUTOINCREMENT | Private equal-time materialization tie-break    |
+| `id`                 | TEXT NOT NULL UNIQUE     | Public ULID identity                            |
+| `workspace_path`     | TEXT nullable            | Path to the workspace; `NULL` for global events |
+| `monitor_id`         | TEXT NOT NULL            | Stable monitor identifier                       |
+| `source_name`        | TEXT NOT NULL            | Source plugin name                              |
+| `urgency`            | TEXT NOT NULL            | `low \| normal \| high`                         |
+| `title`              | TEXT NOT NULL            |                                                 |
+| `body`               | TEXT NOT NULL            | Defaults to `''`                                |
+| `summary`            | TEXT NOT NULL            | Defaults to `''`                                |
+| `payload`            | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_metadata`  | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `snapshot_text`      | TEXT nullable            | Full snapshot content if provided               |
+| `diff_text`          | TEXT nullable            | Line-level diff vs. previous snapshot           |
+| `object_key`         | TEXT nullable            | Snapshot and diff keying                        |
+| `query_scope`        | TEXT NOT NULL            | JSON; defaults to `{}`                          |
+| `tags`               | TEXT NOT NULL            | JSON array; defaults to `[]`                    |
+| `created_at`         | INTEGER NOT NULL         | Observation timestamp                           |
+| `admission_sequence` | INTEGER nullable         | Retry admission position; see below (§2)        |
+
+`admission_sequence` is set only on an event completed from the retry outbox: the position its
+retry reserved in the materialization order when it was queued (`0` for a retry queued before
+positions were reserved). `NULL` means the event was admitted where it committed, at `sequence`.
+Supersession of a dropped observation compares admission positions (§2).
 
 ### `monitor_snapshots`
 
@@ -2049,20 +2068,25 @@ Durable observations that could not complete deterministic materialization. Each
 stored observation envelope and trusted local route so a later attempt can re-enter materialization
 without invoking the source or moving a source cursor again.
 
-| Column            | Type             | Notes                                             |
-| ----------------- | ---------------- | ------------------------------------------------- |
-| `id`              | TEXT PK          | Monotonic ULID                                    |
-| `workspace_path`  | TEXT nullable    | Part of the per-monitor capacity scope            |
-| `monitor_id`      | TEXT NOT NULL    | Must match the stored envelope                    |
-| `source_name`     | TEXT NOT NULL    | Must match the envelope's monitor source          |
-| `envelope`        | TEXT NOT NULL    | JSON `StoredObservationEnvelope`                  |
-| `envelope_bytes`  | INTEGER NOT NULL | Exact persisted UTF-8 byte count                  |
-| `attempt_count`   | INTEGER NOT NULL | Automatic retry failures; starts at `0`           |
-| `status`          | TEXT NOT NULL    | `pending \| terminal`                             |
-| `next_attempt_at` | INTEGER nullable | `NULL` after terminalization                      |
-| `last_error`      | TEXT nullable    | Control-stripped, bounded safe diagnostic message |
-| `created_at`      | INTEGER NOT NULL | Preserves oldest-first drain order                |
-| `updated_at`      | INTEGER NOT NULL | Last attempt or operator re-arm                   |
+| Column               | Type             | Notes                                             |
+| -------------------- | ---------------- | ------------------------------------------------- |
+| `id`                 | TEXT PK          | Monotonic ULID                                    |
+| `workspace_path`     | TEXT nullable    | Part of the per-monitor capacity scope            |
+| `monitor_id`         | TEXT NOT NULL    | Must match the stored envelope                    |
+| `source_name`        | TEXT NOT NULL    | Must match the envelope's monitor source          |
+| `envelope`           | TEXT NOT NULL    | JSON `StoredObservationEnvelope`                  |
+| `envelope_bytes`     | INTEGER NOT NULL | Exact persisted UTF-8 byte count                  |
+| `attempt_count`      | INTEGER NOT NULL | Automatic retry failures; starts at `0`           |
+| `status`             | TEXT NOT NULL    | `pending \| terminal`                             |
+| `next_attempt_at`    | INTEGER nullable | `NULL` after terminalization                      |
+| `last_error`         | TEXT nullable    | Control-stripped, bounded safe diagnostic message |
+| `created_at`         | INTEGER NOT NULL | Preserves oldest-first drain order                |
+| `updated_at`         | INTEGER NOT NULL | Last attempt or operator re-arm                   |
+| `admission_sequence` | INTEGER nullable | Reserved admission position; see below (§2)       |
+
+`admission_sequence` is the position the row reserved in the `monitor_events` materialization
+order (that table's AUTOINCREMENT counter) when it was queued; its completed event keeps it (§2).
+It is `NULL` on rows queued before positions were reserved.
 
 Capacity is 256 rows or 8 MiB of stored envelopes per `(workspace_path, monitor_id)`, including
 terminal rows. Envelope size is the exact serialized UTF-8 byte count. Callers must supply ordinary
@@ -2168,11 +2192,13 @@ retain their primary diagnosis. This ordering does not provide a cross-process t
 snapshot or change the meaning of `generatedAt` or the caller's `now`.
 
 `doctorReport` attaches retry summaries to unambiguous parsed monitor rollups, including those with
-invalid scope or schedule. Its `orphanedMaterializationRetries` groups summaries by monitor id when
-no unambiguous parsed current definition exists: removed/parse-failed definitions and duplicated
-ids. Each retained outbox appears in exactly one diagnostic location. Orphan groups contain only
-`monitorId` and `summary`; they **MUST NOT** fabricate current source, urgency or cadence from the
-captured envelope. Existing parse and duplicate diagnostics remain intact. Groups are ordered by
+invalid scope or schedule. A live ephemeral monitor's retained work is attributed to it in
+`ephemeralMonitorWork`. Its `orphanedMonitorWork` groups the remaining obligations by monitor id:
+removed/parse-failed definitions, duplicated ids and retired ephemeral monitors. Each retained
+outbox appears in exactly one diagnostic location. Orphan groups contain only `monitorId`,
+`monitorKind`, and `materializationRetries` (present only while the outbox holds records) and/or
+`unretainedObservationLoss` (§2); they **MUST NOT** fabricate a retry summary for an empty outbox,
+or current source, urgency or cadence from the captured envelope. Existing parse and duplicate diagnostics remain intact. Groups are ordered by
 monitor id; each summary orders records by `(createdAt, id)` and includes exact counts and bytes.
 Outbox discovery is not capped by the per-monitor 256-row limit: one full outbox cannot hide another.
 Every summary excludes other workspaces and NULL-scope records unless that exact scope is requested
@@ -2335,9 +2361,10 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
       dropped, no batch row is written (as for any span that emitted nothing and failed). Two
       internal columns, never part of `observationData`, mark the row as a drop and say what
       supersedes it (§2): `unretained_object_key` holds the raw `objectKey` (NULL when it was not
-      a string), and `unretained_event_watermark` holds the newest `monitor_events.sequence`
-      committed before the row. The row stays outstanding until superseded; it is never deleted
-      or rewritten.
+      a string), and `unretained_event_watermark` holds the high-water mark of the
+      `monitor_events` materialization order (its AUTOINCREMENT counter, including positions
+      reserved by queued retries) when the row was written. The row stays outstanding until
+      superseded; it is never deleted or rewritten.
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer

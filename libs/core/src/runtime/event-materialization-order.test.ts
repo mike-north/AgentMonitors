@@ -386,9 +386,16 @@ describe('durable equal-time event order', () => {
     const migratedRows = migrated.client
       .prepare('SELECT * FROM monitor_events ORDER BY sequence')
       .all() as Record<string, unknown>[];
-    expect(migratedRows.map(({ sequence: _sequence, ...row }) => row)).toEqual(
-      originalRows,
-    );
+    // The additive admission column (002 §2) is NULL on every copied event:
+    // each was admitted where it committed.
+    expect(
+      migratedRows.map(
+        ({ sequence: _sequence, admission_sequence: admission, ...row }) => {
+          expect(admission).toBeNull();
+          return row;
+        },
+      ),
+    ).toEqual(originalRows);
     expect(
       migrated.client
         .prepare('SELECT * FROM session_event_state ORDER BY id')

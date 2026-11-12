@@ -328,8 +328,9 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // trail, consistent with the monitor_state re-baseline above).
   addColumnIfMissing(sqlite, 'observation_history', 'workspace_path', 'TEXT');
   // Additive migration (002 §2, unretained admission outcomes): a drop row
-  // records the raw object key it names and the `monitor_events` sequence
-  // committed before it, so a later event for that key can supersede it.
+  // records the raw object key it names and the high-water mark of the event
+  // materialization order when it was admitted, so an event for that key
+  // admitted later can supersede it.
   // Older rows keep NULL and are not drop rows.
   addColumnIfMissing(
     sqlite,
@@ -375,7 +376,8 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       baseline_strategy TEXT,
       query_scope TEXT NOT NULL DEFAULT '{}',
       tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      admission_sequence INTEGER
     )
   `);
 
@@ -386,11 +388,19 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   addColumnIfMissing(sqlite, 'monitor_events', 'baseline_strategy', 'TEXT');
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
+  // Additive migration (002 §2, unretained admission outcomes), after the order
+  // migration, whose rebuild copies only the columns it knows: an event
+  // completed from the retry outbox records where its observation was admitted.
+  // Older rows keep NULL (admitted where they committed).
+  addColumnIfMissing(sqlite, 'monitor_events', 'admission_sequence', 'INTEGER');
   // Created after the order migration, which rebuilds `monitor_events`. Finds a
-  // later event for a dropped observation's object key (002 §2).
+  // later event for a dropped observation's object key (002 §2), covering the
+  // admission position the supersession check compares.
   db.run(sql`
     CREATE INDEX IF NOT EXISTS idx_monitor_events_object_sequence
-      ON monitor_events (monitor_id, workspace_path, object_key, sequence)
+      ON monitor_events (
+        monitor_id, workspace_path, object_key, sequence, admission_sequence
+      )
   `);
 
   db.run(sql`
@@ -422,9 +432,19 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       next_attempt_at INTEGER,
       last_error TEXT,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      admission_sequence INTEGER
     )
   `);
+  // Additive migration (002 §2): a retained observation reserves its position
+  // in the event materialization order at admission. Rows queued before this
+  // column keep NULL; their completions count as admitted before any drop.
+  addColumnIfMissing(
+    sqlite,
+    'materialization_retry_outbox',
+    'admission_sequence',
+    'INTEGER',
+  );
 
   db.run(sql`
     CREATE INDEX IF NOT EXISTS idx_materialization_retry_due
