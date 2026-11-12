@@ -805,6 +805,47 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | Native rollback in a held not-due rollup flush | Covered (`rollup-admission.test.ts` — a later-sibling trigger first proves the new prefix, snapshot and both projections exist in the same transaction, then real ROLLBACK leaves no event/snapshot/projection/cursor/retry, checkpoint or cleared hold; prior rows and a nonempty recipient cache survive, the original error is reported with one errored history row, no Interpret runs, and a forced-due reopen replays the whole held span once. Real ABORT retains prefix and ordered suffix. A hold captured before a parsed source/instructions/urgency edit keeps its captured route, content and urgency, and the opaque source baseline, through an ABORT flush and reopen). |
 | A notify-policy edit drains held rollup work through the flush's owned transaction | Covered (`rollup-admission.test.ts` — an edit that moves the rollup window drains, outside any window, the hold read under the writer lock, including an envelope another writer committed immediately before BEGIN; the source baseline and its clock are unchanged. A real ROLLBACK or ABORT on the second held envelope, at a minute the edited window matches, rolls the whole drain back: no event, snapshot, projection, cursor, retry, drop or metadata change, the prior recipient cache survives, the edit is reported blocked, and no window flush, poll or Interpret runs. After the fault clears the next tick drains every captured envelope once). |
 
+### 3.4.2 Process-level ingress interruption acceptance (Refs #568)
+
+`apps/cli/src/commands/daemon-ingress-kill-fault.integration.test.ts` is required in
+`test:serial`, shared by CI and `pnpm verify`. It starts the already-built CLI as a real
+owned child, with an isolated on-disk SQLite database, Unix socket and loopback HTTP stub.
+The poll fixture uses bundled `api-poll`. The watch fixture adds a **test-only** `fs.watch`
+wrapper around bundled `file-fingerprint.observe()` and exercises the runtime's actual
+watch ingestion; this does not claim shipped file-source watch support (003 §3.8 remains
+target).
+
+For immediate, debounce and rollup pacing, tests MUST interrupt every SQL write occurrence
+observed during acceptance, held release, retry admission and retry completion. Immediate
+pacing has no held-release phase. Discovery runs the real workflows at the SQLite driver,
+including `RETURNING` statements and repeated writes for two recipients. Each discovered
+occurrence receives both a fault before execution and a SIGKILL immediately after execution,
+then an independent process restart. No source data, runtime result or transaction is mocked.
+Fixed wall clocks govern deadlines/windows; IPC messages and actual filesystem notifications
+synchronize the test. Timeout timers only fail stalled waits. Owned children are reaped, with
+POSIX group termination confirmed by the shared helper, before fixture files are removed.
+
+Every case MUST assert exactly one event per distinct source change, persisted monitor order,
+complete snapshots/cursors/projections, unread delivery to both registered lead sessions across
+restart, and no projection to a subagent session. Failed ingest writes MUST identify the monitor
+in the original `erroredObservations` tick result or watch `onError` callback and persist an
+`errored` history row. History MUST never claim `triggered` when no event committed. The extra
+post-commit history-write cases retain 002 §15's existing best-effort audit semantics: a failed
+audit write cannot undo a committed event and is not itself an ingestion error.
+
+Discovery automatically adds kill/fault cases for new writes on the exercised paths. It is
+executed-path discovery, not proof that every possible branch in arbitrary source/Interpret
+code was reached; invalid-envelope/loss-capacity and policy-edit branches retain their separate
+runtime regression obligations. A scratch-copy mutation removing a durable snapshot write must
+fail the invariant assertions even though that removed write no longer appears in discovery.
+Retry re-arm and skip interruption cases remain an explicit linked TODO for #584 in the test
+file, rather than skipped tests or a dependency on commands not yet on main.
+
+Verification launched with an isolated home/data root MUST retain 002 §10.3's socket
+normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resolved socket,
+including an explicitly overlong derived path, rather than assuming the raw workspace path
+always fits the Unix socket limit.
+
 ### 3.5 CLI behavior
 
 | Scenario                                                                                                                                                                           | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

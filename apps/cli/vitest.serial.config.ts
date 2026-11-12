@@ -32,6 +32,7 @@ export default defineConfig({
       'src/detached-spawn.test.ts',
       'src/commands/daemon-detach.integration.test.ts',
       'src/commands/daemon-crash-recovery.integration.test.ts',
+      'src/commands/daemon-ingress-kill-fault.integration.test.ts',
       'src/commands/verify.integration.test.ts',
       'src/commands/cli.docker.test.ts',
       'src/channel-shutdown.integration.test.ts',

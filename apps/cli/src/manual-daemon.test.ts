@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { resolveSocketPath } from './daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from './manual-daemon.js';
 import { workspacePaths } from './workspace-paths.js';
 import { writeLocalState } from './local-state.js';
@@ -77,9 +78,30 @@ describe('resolveManualDaemonSocketPath (issue #335)', () => {
       // default socket instead of the one `daemon run` actually bound to).
       writeLocalState(ws, { enabled: true });
       expect(resolveManualDaemonSocketPath(undefined, ws)).toBe(
-        workspacePaths(ws).socket,
+        // Both entrypoints use 002 §10.3's normalized socket, including the
+        // owner-private fallback when an isolated data root makes it too long.
+        resolveSocketPath(workspacePaths(ws).socket),
       );
     } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it('normalizes an overlong derived socket exactly as the daemon does', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-manualsock-long-'));
+    const savedDataHome = process.env['XDG_DATA_HOME'];
+    try {
+      // Force the fallback independently of the developer's ambient home.
+      process.env['XDG_DATA_HOME'] = path.join(ws, 'nested/'.repeat(30));
+      writeLocalState(ws, { enabled: true });
+      const derived = workspacePaths(ws).socket;
+      expect(derived.length).toBeGreaterThan(100);
+      const normalized = resolveSocketPath(derived);
+      expect(normalized).not.toBe(derived);
+      expect(resolveManualDaemonSocketPath(undefined, ws)).toBe(normalized);
+    } finally {
+      if (savedDataHome === undefined) delete process.env['XDG_DATA_HOME'];
+      else process.env['XDG_DATA_HOME'] = savedDataHome;
       rmSync(ws, { recursive: true, force: true });
     }
   });
