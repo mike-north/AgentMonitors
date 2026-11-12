@@ -1415,7 +1415,10 @@ monitor would stop.
 The runtime **MUST** check serializability once per observation, at **hold acceptance**: the
 point where an observation would join `pendingDebounce` or `pendingRollup`. The check uses the
 same serializer as the state write, so an envelope that passes stays serializable in every later
-write of that hold. The same rule covers both strategies and every ingest path: the poll path, the
+write of that hold. The check serializes the envelope separately from the write, so it covers
+values that serialize identically each time. A non-deterministic accessor (a getter that returns a
+BigInt only on a later read) can still pass the check and fail the write; the runtime does not
+defend against that. The same rule covers both strategies and every ingest path: the poll path, the
 watch path, and a deferred poll result admitted after a notify edit (§4.6).
 
 An observation that fails the check is **not held**:
@@ -1427,9 +1430,16 @@ An observation that fails the check is **not held**:
    not observed again, and later observations are accepted on following ticks.
 3. It gets one `errored` `observation_history` row whose `observationData.error` is
    `Observation "<title>" was not held for <debounce|rollup>: it cannot be serialized (<reason>).`
-   The title and reason are reduced to one terminal-safe line of at most 512 code points.
+   The title and reason are each reduced to one terminal-safe line. The title is capped at 200 code
+   points and the reason at 512, so the reason stays visible when history and explain cap the whole
+   message at 512. If the serializer's reason cannot be read (it threw a value that cannot be
+   converted to text), the reason is the fixed text `unknown serialization error`; building the
+   message never throws.
 4. The same message is reported where the path reports failures: the tick result's
-   `erroredObservations` (`{ monitorId, message }`), or the watcher's `onError` callback.
+   `erroredObservations` (`{ monitorId, message }`), or the watcher's `onError` callback. The
+   report happens after the state commit, the `errored` row and the span's materialization, so a
+   callback that throws cannot lose work already committed, such as a debounce batch that flushed in
+   the same dispatch. A throwing callback is ignored.
 
 The span's batch row (§`observation_history`) counts a not-held observation in `observed`, adds
 `notHeld: <n>`, and classifies only the remaining observations: a mixed span that holds a sibling
@@ -1461,7 +1471,11 @@ a BigInt and a cyclic payload, with and without a restart between ticks. Each ca
 sibling held, the baseline advancing, the single `errored` row, and later observations
 materializing. It also covers: a span whose only observation is refused; sibling order around a
 refusal; an effective notify edit draining the accepted hold; the watch path's `onError`; the batch
-row's `notHeld` count; and JSON-encodable payloads (`undefined` members, Dates) still being held.
+row's `notHeld` count; title sanitization and the 200-code-point title cap; a refusal leaving the
+hold's `dueAt` unchanged; a `toJSON` that throws an unconvertible value; a watcher `onError` that
+throws while a due batch flushes; a deferred poll result admitted after a notify edit
+(`runtime/notify-deferred-handoff.test.ts`); the built CLI's `monitor history` showing the reason of
+a long-titled refusal; and JSON-encodable payloads (`undefined` members, Dates) still being held.
 
 ## 5. Event Materialization
 

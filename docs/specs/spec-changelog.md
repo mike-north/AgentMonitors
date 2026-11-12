@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Hold-acceptance refusals: title cap, total message, report after materialization (002 §4.7) — Refs #570
+
+Tighten §4.7. The not-held message caps the title at 200 code points (the reason keeps 512) so the
+reason survives the 512-code-point display cap in history and explain. Building the message never
+throws: an unreadable serializer reason becomes `unknown serialization error`. The refusal is
+reported (tick `erroredObservations`, watcher `onError`) only after the state commit, the `errored`
+row and the span's materialization, and a throwing callback is ignored, so a callback failure cannot
+lose a debounce batch flushed in the same dispatch. State the remaining limit: the check does not
+cover a non-deterministic accessor that serializes differently on a later read.
+
 ## 2026-11-11 — An unserializable observation is refused at hold acceptance (002 §4.3/§4.4/§4.7, §`observation_history`, 004 §3.3) — Refs #570
 
 Before this change, a debounce or rollup hold whose observation could not be encoded as JSON (a
