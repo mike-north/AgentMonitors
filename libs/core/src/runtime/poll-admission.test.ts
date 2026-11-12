@@ -446,14 +446,17 @@ describe('whole poll span before Interpret', () => {
     const first = before.notifyState.pendingDebounce?.observations[0];
     if (!first) throw new Error('Fixture requires a held observation');
     clockTime = NOW.getTime() + 2000;
-    let interposed = false;
-    // Test-only internal bridge intercepts the exact pre-BEGIN boundary. Both
-    // writes use real independent SQLite connections; no store reads are mocked.
+    let firedAt: string | undefined;
+    // Test-only internal bridge intercepts the exact pre-BEGIN boundary of
+    // ingest's admission. The notify-edit reconcile that precedes it on every
+    // tick (`withStoreWriter`) passes through untouched. Both writes use real
+    // independent SQLite connections; no store reads are mocked.
     registerRuntimeTransaction(
       f.store,
       (operation) => {
-        if (!interposed) {
-          interposed = true;
+        const stack = new Error().stack ?? '';
+        if (firedAt === undefined && !stack.includes('withStoreWriter')) {
+          firedAt = stack;
           f.reader.setMonitorState('span', f.root, {
             ...before,
             notifyState: {
@@ -482,7 +485,8 @@ describe('whole poll span before Interpret', () => {
     const tick = f.runtime.tick(f.monitorsDir, f.root);
     try {
       await atFirstInterpret(f, tick);
-      expect(interposed).toBe(true);
+      expect(firedAt, 'competing commit never fired').toBeDefined();
+      expect(firedAt).toContain('ingest');
       expect(
         f.reader
           .listEvents()

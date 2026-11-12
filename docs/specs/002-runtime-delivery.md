@@ -753,7 +753,7 @@ the advanced baseline. The next tick observes newer input. A BigInt payload fail
 and is outside the outbox domain: that one observation is `errored` and its siblings materialize.
 
 The same rule applies to the poll path (`ingest()`), the watch path (one yielded batch is one
-span, §2.4), and the not-due rollup window flush (`materializeSpan()`, §4.4). For the rollup
+span, §2.4), and the not-due rollup window flush (`flushRollupWindow()`, §4.4). For the rollup
 flush, the notify state that clears `pendingRollup` commits in the same transaction as the
 flushed span. A flush that rolls back leaves the whole window held, records a best-effort
 `errored` row, and reports the error on the tick result. The next window check retries it.
@@ -784,7 +784,8 @@ the prior source checkpoint and held notify envelopes remain available for compl
 The native liveness predicate belongs to the same private SQLite connection as the registered
 package-private transaction runner; it is not a source/plugin hook or a public transaction mode.
 Verified by the real SQLite rollback/ABORT, nonempty committed-cache and forced-due reopen cases
-in `poll-admission.test.ts`.
+in `poll-admission.test.ts`, and for a held not-due rollup flush (including an envelope captured
+before a parsed source edit) in `rollup-admission.test.ts`.
 
 The complete finite span **MUST** be committed before the first Interpret invocation: all successful
 events, every recipient projection/cursor seed, sequential object snapshots (including empty text),
@@ -800,14 +801,15 @@ If the persisted source token changed before admission, the batch is refused wit
 the winner's checkpoint or held work, including an empty batch that omits `nextState`. Notify-only
 updates committed before admission participate in the fresh dispatch decision. This guards changed
 baselines; it does not provide cross-process leader election or distinguish an ABA return to the
-same serialized source state. The separate not-due rollup decision boundary remains #498 work.
+same serialized source state. Not-due rollup checks also read and decide under their admission
+write lock (§4.4), but acquire no source observations and preserve the fresh source checkpoint/time.
 
 Transaction composition is package-private and accepts only implementation-owned synchronous work.
 The exported RuntimeStore API does not expose an executable transaction callback. This does not
 claim that SQLite cancels asynchronous JavaScript effects. Watch batches use the same admission boundary under §2.4.
 
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
-`materializeSpan()`.
+`admitSpan()`, `flushRollupWindow()` and `finishMaterializationSpan()`.
 
 ### 2.0 Source-config preflight (current)
 
@@ -1315,10 +1317,27 @@ three clocks especially visible:
    expression against the current time using the configured `timezone` (defaulting to `UTC`). The
    window fires at most once per minute (same guard as the schedule source, §2.2). If the window
    matches and the accumulated batch is non-empty, the batch is flushed as a single composite
-   emission and the accumulation state is cleared.
+   emission and the accumulation state is cleared. The window marker, pending-batch removal,
+   materialized events, and retry-outbox admission commit in one immediate transaction. A state or
+   outbox failure leaves the prior pending batch and marker available for restart recovery.
+   The authoritative read of the batch, minute marker, source checkpoint and observation time
+   **MUST** occur after acquiring that immediate writer lock. A preliminary scheduling read cannot
+   supply the persisted decision. A competing poll/watch/rollup admission that committed first
+   participates in this fresh decision; an already-fired minute cannot flush newly held work again.
+   Not-due evaluation preserves the locked current source checkpoint and `lastObservationAt` because
+   it acquires no new observations. The successful event prefix and complete retry suffix share the
+   batch clear/marker commit; retained work is successful admission, not completed materialization.
+   Any state/outbox failure also rolls back projections, cursor seeds, snapshots, and the store's
+   projected-recipient cache. Audit and Interpret run only after outer commit.
 
 3. **Empty window.** If the window opens but no observations have accumulated since the last flush,
-   the runtime produces no delivery (no empty pings — preserving C14).
+   the runtime produces no delivery (no empty pings — preserving C14), but still commits the minute
+   marker. Closed-window checks retain their pending batch. Neither case creates routine no-change
+   history. Even a non-emitting state write belongs to the transaction: failure preserves exact
+   prior state, reports one monitor error/best-effort error history, and allows healthy siblings to run.
+   Verified by `rollup-admission.test.ts`: independently owned competing runtimes before BEGIN,
+   a reader opened before admission, retained-suffix barriers, rollback/reopen, and empty/closed-window
+   error isolation. This does not add source leader election or retry draining; §2 limits still apply.
 
 4. **Batch representation.** The flushed batch becomes one or more `monitor_events` rows (one per
    accumulated observation) rather than a single merged row, so the full event history is
@@ -1456,7 +1475,10 @@ reread current held state under that writer boundary, and commit the entire old 
 projections, cursor seeds, snapshots and removal of corresponding holds together. No stale read
 before the writer lock can authorize removal or replay. Event materialization units may nest as
 savepoints; the edit drain must not join an externally owned transaction. This prevents two
-runtimes from duplicating or overwriting one drain. Optional Interpret runs after commit using
+runtimes from duplicating or overwriting one drain. A drain of held rollup work is a held rollup
+flush outside any window: it uses the same store-owned runtime transaction as the not-due window
+flush (§4.4), so a rollback also restores the store's last-projected recipient cache. Unlike the
+window flush it commits no prefix and retains no suffix; any failure rolls the whole drain back. Optional Interpret runs after commit using
 each event's own projected recipients. This does not guarantee exactly-once downstream effects
 (000 NP2).
 
@@ -2864,7 +2886,7 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
   - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
   - A dispatched observation failed to materialize. The same rows are written whether the span
     came from `ingest()` (tick or watch path) or from the not-due notify-window flush
-    (`materializeSpan()`). The outcome depends on the failure kind (ordered retry suffix and
+    (`flushRollupWindow()`). The outcome depends on the failure kind (ordered retry suffix and
     admission-unit rules: §2):
     - _Savepoint-local failure_ (e.g. `RAISE(ABORT)` on an event, projection/cursor or snapshot
       write): that envelope's own materialization rolls back, the earlier committed prefix stays,
@@ -2894,8 +2916,10 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
     - _Transaction-wide failure_ (`RAISE(ROLLBACK)`): the whole span rolls back, prefix included,
       and nothing is queued. The source baseline does not advance. The single `errored` row comes
       from `tick()`'s ingest-error catch; on the watch path it comes from `consumeWatch()`'s outer
-      catch, which also ends that watcher. On the not-due flush it comes from that flush's own
-      catch, and the window stays held because its `pendingRollup` clear rolled back too.
+      catch, which also ends that watcher. On the not-due flush it comes from the tick's
+      monitor-local flush catch, which reports the original native error (not a follow-on
+      `COMMIT` failure) and lets healthy siblings continue. The window stays held because its
+      `pendingRollup` clear rolled back too.
 
   - A debounce or rollup hold refused an observation because it cannot be serialized (§4.7): one
     row per refused observation, `{ error: "<message>" }`, written **inside** the span's admission

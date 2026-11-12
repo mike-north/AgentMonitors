@@ -9,6 +9,20 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — A notify-policy edit drains held rollup work in the rollup flush's owned transaction (002 §4.4/§4.6; 004 §3.4) — Refs #498
+
+Compose the locked not-due rollup flush with effective notify-policy edits. An edit that changes
+rollup pacing drains the held batch outside any window, which is a held rollup flush. Its writer
+boundary now runs as the store's registered runtime transaction, the same owned boundary as the
+window flush and span admission, so a failed drain also restores the last-projected recipient
+cache instead of leaving recipients of events it never committed. Previously the drain's SQLite
+writes rolled back but that in-memory cache did not. The drain stays all-or-nothing (no prefix
+commits, no suffix is retained, no drop is recorded), still refuses to join an externally owned
+transaction and still rejects an asynchronous callback. The not-due window flush runs only after
+the tick's edit reconciliation has succeeded and the admission gate is open, in the same
+synchronous turn as that gate check. It keeps the private pacing identity it reads under the lock.
+No public API change.
+
 ## 2026-11-12 — Hold-acceptance refusals under span admission (002 §4.7, §`observation_history`, 004 §3.3) — Refs #570, #497
 
 Restate §4.7 on span admission (§2). A refusal's `errored` row is written inside the span's
@@ -165,6 +179,17 @@ every index and trigger is recreated unchanged and none is dropped. A rebuild th
 row or column (a generated column; `NULL` in a required column) reports a `SchemaMigrationError`
 naming the table and column, and the database is left unchanged. 004 adds a released-layout
 suite that opens each layout released versions produced.
+
+## 2026-11-10 — Record native rollback in the locked rollup flush (002 §2, §10.7; 004 §3.4) — Refs #498
+
+With the locked not-due rollup flush composed onto the native-rollback guard, a transaction-wide
+`RAISE(ROLLBACK)` during a held window flush rethrows its original error through the tick's
+monitor-local flush catch, which writes the single `errored` history row. The 002 history text no
+longer says the not-due flush records no row or names the removed `materializeSpan()` path. Real
+trigger coverage in `rollup-admission.test.ts` adds the held-flush ROLLBACK, the ABORT control, and
+a hold captured before a parsed source edit. Previously, without the guard, the flush reported a
+follow-on `COMMIT` error after writing a retry suffix and cleared hold outside the vanished
+transaction, and retried old-source envelopes under the edited source. No public API change.
 
 ## 2026-11-10 — Keep a dropped observation visible in explain and doctor (002 §2/§10.7/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
 
@@ -481,6 +506,15 @@ Report skips visibly with the same diagnostics as validate/explain/doctor; retai
 baseline and pending notify state across restart so a corrected config resumes.
 Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
 and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
+
+## 2026-11-01 — Lock the complete rollup decision and admission (002 §4.4; 004 §3.4) — Refs #498
+
+Require not-due rollup checks to read their authoritative batch, marker, source checkpoint and
+observation time after obtaining the writer lock. Preserve fresh source/time state while committing
+successful event prefix, retained suffix, batch clear and marker together. Empty windows persist a
+marker without delivery/audit spam; non-emitting write failures roll back and remain monitor-local.
+Controlled competing runtimes cover not-due/due/watch entrypoints; independent readers verify suffix
+visibility before Interpret, rollback and restart. No public API changes or retry drain are introduced.
 
 ## 2026-11-01 — Watch batches bind observations to source checkpoints (002 §2.4; 003 §2; 004 §3.4) — Refs #497, #294, #295
 
@@ -1013,7 +1047,7 @@ Two contradiction resolutions recorded per 004 §5, both surfaced by PR #512 rev
 One immediate transaction now commits successful event materializations, ordered retry envelopes,
 and source/notify state. A state or outbox failure rolls the whole batch back to the prior source
 baseline. Tick ids, errors, and history reflect only committed work, and Interpret runs only after
-commit. Retry draining and rollup-window adoption follow in the next stack layers.
+commit. Retry draining follows in the next stack layer.
 
 ## 2026-08-13 — Failed materialization has a bounded durable retry outbox (002 schema, 004 §3.4, 005 §15) — Refs #295, #481
 
