@@ -540,6 +540,9 @@ function reviveDoctorReportDates(
                     monitorId: group.monitorId,
                     sessionId: group.sessionId,
                     ...work,
+                    ...(group.validationError !== undefined
+                      ? { validationError: group.validationError }
+                      : {}),
                   },
                 ]
               : [];

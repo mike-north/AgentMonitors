@@ -860,6 +860,14 @@ export interface EphemeralMonitorWork {
   materializationRetries?: MaterializationRetrySummary;
   /** Present while the monitor has an outstanding dropped observation. */
   unretainedObservationLoss?: UnretainedObservationLoss;
+  /**
+   * Present only while the monitor's persisted scope fails the source's scope
+   * preflight, the same check every tick applies. The tick then skips the
+   * watch, and an ephemeral scope cannot be edited, so the work above can
+   * never be superseded; the remedy is to cancel the watch and declare it
+   * again with a valid scope. Absent when the scope is accepted.
+   */
+  validationError?: string;
 }
 
 /** Operator-safe retry metadata that never contains an envelope or payload. @public */

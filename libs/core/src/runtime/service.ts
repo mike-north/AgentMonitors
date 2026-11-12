@@ -2294,10 +2294,32 @@ export class AgentMonitorRuntime {
         ? this.store.findEphemeralMonitorById(monitorId)
         : null;
       if (declaration?.status === 'active') {
+        // The tick's own preflight (`evaluateMonitorOnTick`): a persisted scope
+        // the source now rejects is skipped on every tick and cannot be edited.
+        // An unknown source or an unrebuildable record is an errored
+        // observation on the tick, not a scope rejection, so it is not
+        // reported here; doctor must not throw while diagnosing it.
+        const liveSource = this.registry.get(declaration.sourceName);
+        let scopeErrors: string[] = [];
+        if (liveSource) {
+          try {
+            scopeErrors = validateWatchScope(
+              watchConfig(
+                this.ephemeralRecordToMonitor(declaration).frontmatter.watch,
+              ),
+              liveSource.scopeSchema,
+            );
+          } catch {
+            scopeErrors = [];
+          }
+        }
         ephemeralMonitorWork.push({
           monitorId,
           sessionId: declaration.sessionId,
           ...work,
+          ...(scopeErrors.length > 0
+            ? { validationError: scopeErrors.join('; ') }
+            : {}),
         });
       } else {
         orphanedMonitorWork.push({

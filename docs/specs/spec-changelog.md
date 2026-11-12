@@ -20,7 +20,9 @@ omitted it). Explain reports a drop beside the stale-definition delivery note wi
 The `monitor_events` order rebuild now carries `admission_sequence` as well as
 `definition_fingerprint` when a pre-`sequence` table already has them, and the object-key index is
 created after both additive columns. `definition_fingerprint` joins the `monitor_events` schema
-table.
+table. A live ephemeral monitor whose persisted scope the source now rejects carries
+`validationError` in its `ephemeralMonitorWork` group, and its doctor checks say to cancel and
+re-declare the watch instead of promising a later event will clear the work (002 §2; 005 doctor).
 
 ## 2026-11-11 — Ephemeral retained-work remediation names `monitor explain` (005 doctor)
 

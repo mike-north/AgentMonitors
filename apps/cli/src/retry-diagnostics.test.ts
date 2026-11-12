@@ -1980,6 +1980,94 @@ it('points ephemeral retained-work remediation at a `monitor explain` that lists
 }, 30_000);
 
 /**
+ * Regression for #497 review: a live ephemeral watch whose persisted scope its
+ * source now rejects is skipped on every tick, and an ephemeral scope cannot
+ * be edited, so its drop and retained work can never clear. Doctor used to say
+ * "repair the reported failure" and "clears once a later event materializes".
+ * The stand-in source accepts any scope when the watch is declared; the built
+ * binary then resolves the real bundled `api-poll` source, which rejects it.
+ */
+it('says why a live ephemeral watch with a rejected scope cannot clear its drop or retained work, in text and JSON', async () => {
+  mkdirSync(path.join(root, 'monitors'), { recursive: true });
+  const dbPath = path.join(root, 'state.db');
+  const db = createDb(dbPath);
+  const client = (db as unknown as { $client: Database }).$client;
+  let monitorId: string;
+  try {
+    const registry = new SourceRegistry();
+    registry.register({
+      ...droppingSource,
+      name: 'api-poll',
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            { title: 'd-0', summary: 'd-0', objectKey: 'object-0' },
+            {
+              title: 'd-1',
+              summary: 'd-1',
+              objectKey: 'object-1',
+              payload: { n: 1n },
+            },
+            { title: 'd-2', summary: 'd-2', objectKey: 'object-2' },
+          ],
+          nextState: { seeded: true },
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'lead-ephemeral-rejected',
+        workspacePath: root,
+      }),
+    );
+    monitorId = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'api-poll',
+      scope: { bogus: true },
+      instruction: 'Watch.',
+    }).id;
+    // d-1 drops (BigInt payload); a native fault retains d-2.
+    client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
+      WHEN NEW.summary = 'd-2'
+      BEGIN SELECT RAISE(ABORT, 'native fault on d-2'); END;`);
+    await runtime.tick(path.join(root, 'monitors'), root);
+  } finally {
+    client.close();
+  }
+
+  const json = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+  expect(json.ephemeralMonitorWork).toHaveLength(1);
+  const group = json.ephemeralMonitorWork[0];
+  expect(group.monitorId).toBe(monitorId);
+  expect(group.validationError).toEqual(expect.any(String));
+  expect(group.validationError.length).toBeGreaterThan(0);
+  const text = (await run('doctor', 'text', dbPath)).stdout;
+  for (const name of [
+    `dropped-observation:${monitorId}`,
+    `retry-outbox:${monitorId}`,
+  ]) {
+    const check = json.checks.find(
+      (candidate: { name: string }) => candidate.name === name,
+    );
+    expect(check.status).toBe('fail');
+    expect(check.remediation).toContain(group.validationError);
+    expect(check.remediation).toContain(
+      'cancel the watch and declare it again with a valid scope',
+    );
+    expect(check.remediation).toContain('no later event can clear');
+    expect(check.remediation).not.toContain('repair the reported failure');
+    expect(check.remediation).not.toContain('This check clears once');
+    expect(text).toContain(`✗ ${name}: `);
+  }
+  expect(text).toContain(
+    'cancel the watch and declare it again with a valid scope',
+  );
+  expect(text).toContain(group.validationError);
+}, 30_000);
+
+/**
  * Regression for #497 through the built CLI and a real `daemon run`: the
  * daemon's next quiet scheduled tick wrote a `no-change` row, which cleared
  * the drop, so doctor and explain served by that daemon read healthy one poll

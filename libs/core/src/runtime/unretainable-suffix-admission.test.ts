@@ -1620,8 +1620,42 @@ describe('a drop on a monitor whose source config is now rejected', () => {
         monitorId: watch.id,
         sessionId: session.id,
         unretainedObservationLoss: expect.objectContaining(loss),
+        // #497 review: the group says why the watch is skipped, since an
+        // ephemeral scope cannot be edited and no later event can clear it.
+        validationError: expect.stringContaining('mode'),
       },
     ]);
+  });
+
+  it('leaves validationError absent on a live ephemeral group whose scope is still valid', async () => {
+    const f = fixture(
+      'poll',
+      (cursor) => (cursor === 0 ? observations(0, 3, { 1: { n: 1n } }) : []),
+      undefined,
+      { type: 'object', properties: { mode: { enum: ['ok'] } } },
+    );
+    rmSync(path.join(f.monitorsDir, MONITOR_ID), { recursive: true });
+    const [session] = f.reader.sessionsForWorkspace(f.root);
+    if (!session) throw new Error('fixture opened no lead session');
+    const watch = f.runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'suffix-source',
+      scope: { mode: 'ok' },
+      instruction: 'Watch the suffix.',
+    });
+    await f.runtime.tick(f.monitorsDir, f.root);
+
+    const doctor = await f.runtime.doctorReport({
+      monitorsDir: f.monitorsDir,
+      workspacePath: f.root,
+    });
+    expect(doctor.ephemeralMonitorWork).toHaveLength(1);
+    expect(doctor.ephemeralMonitorWork?.[0]).toMatchObject({
+      monitorId: watch.id,
+    });
+    expect(doctor.ephemeralMonitorWork?.[0]).not.toHaveProperty(
+      'validationError',
+    );
   });
 
   it('clears the drop once the corrected config observes its key again', async () => {

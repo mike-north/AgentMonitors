@@ -401,6 +401,7 @@ export interface EphemeralMonitorWork {
     monitorId: string;
     sessionId: string;
     unretainedObservationLoss?: UnretainedObservationLoss;
+    validationError?: string;
 }
 
 // @public

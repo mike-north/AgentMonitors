@@ -727,7 +727,11 @@ explain` reports that drop as a `failure` materialization stage after the defini
   which stays the verdict.
 - An ephemeral monitor ([007 §4](./007-agent-facing-interaction.md)) has no definition file, so it
   has no rollup. While it is `active` its loss and retained work are attributed to it in
-  `ephemeralMonitorWork` (with its declaring `sessionId`), not reported as orphaned. Once it is
+  `ephemeralMonitorWork` (with its declaring `sessionId`), not reported as orphaned. If its
+  persisted scope is now rejected by the source's preflight (the check every tick applies), the
+  group also carries `validationError`: the tick skips the watch, and an ephemeral scope cannot be
+  edited, so nothing it owes can clear until it is cancelled and declared again. The field is
+  absent while the scope is accepted. Once it is
   cancelled or reaped it is _retired_: its outstanding loss and retained work stay visible in
   `orphanedMonitorWork` with `monitorKind: "ephemeral"`, as a removed definition's do. A retired
   ephemeral monitor never observes again, so nothing supersedes its drop; it stays outstanding.

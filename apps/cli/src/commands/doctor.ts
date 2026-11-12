@@ -482,6 +482,9 @@ function buildChecks(
     const owner: WorkOwner = {
       kind: 'live-ephemeral',
       sessionId: work.sessionId,
+      ...(work.validationError !== undefined
+        ? { validationError: work.validationError }
+        : {}),
     };
     if (work.materializationRetries) {
       addRetainedWorkCheck(
@@ -540,7 +543,7 @@ function buildChecks(
  */
 type WorkOwner =
   | { kind: 'definition' }
-  | { kind: 'live-ephemeral'; sessionId: string }
+  | { kind: 'live-ephemeral'; sessionId: string; validationError?: string }
   | { kind: 'retired-ephemeral' };
 
 /** The leading clause of a check detail that names a non-definition owner. */
@@ -560,6 +563,15 @@ const LIVE_EPHEMERAL =
   'It is an ephemeral monitor declared by that session with `agentmonitors watch`, so it has no MONITOR.md definition.';
 const RETIRED_EPHEMERAL =
   'It was an ephemeral monitor declared by an agent session and has since been cancelled or reaped: it never had a MONITOR.md definition, so there is nothing to repair, and it will not observe again.';
+
+/**
+ * A live ephemeral watch whose persisted scope its source now rejects: every
+ * tick skips it and a scope cannot be edited, so nothing it owes can clear
+ * until it is cancelled and declared again.
+ */
+function rejectedScopeRemediation(validationError: string): string {
+  return `Its persisted scope is now rejected by its source (${validationError}), so every tick skips it and no later event can clear this. An ephemeral scope cannot be edited: cancel the watch and declare it again with a valid scope.`;
+}
 
 /** When a drop stops failing doctor (002 §2): only a superseding outcome clears it. */
 const UNRETAINED_CLEARS =
@@ -584,7 +596,10 @@ function addUnretainedLossCheck(
   const inspect = `\`${historyCommand(report, monitorId)}\``;
   const remediation = {
     definition: `Inspect it with ${inspect} and repair the definition or reported failure. ${UNRETAINED_CLEARS}`,
-    'live-ephemeral': `${LIVE_EPHEMERAL} Inspect it with ${inspect} and repair the reported failure. ${UNRETAINED_CLEARS}`,
+    'live-ephemeral':
+      owner.kind === 'live-ephemeral' && owner.validationError !== undefined
+        ? `${LIVE_EPHEMERAL} ${rejectedScopeRemediation(owner.validationError)} Inspect what was lost with ${inspect}. A dropped observation cannot be retried.`
+        : `${LIVE_EPHEMERAL} Inspect it with ${inspect} and repair the reported failure. ${UNRETAINED_CLEARS}`,
     'retired-ephemeral': `${RETIRED_EPHEMERAL} No later event can supersede this drop, so this check keeps failing; inspect what was lost with ${inspect}. A dropped observation cannot be retried.`,
   }[owner.kind];
   checks.push({
@@ -612,7 +627,10 @@ function addRetainedWorkCheck(
   const listed = `Inspect its retained record IDs with \`${explainCommand(report, monitorId)}\` (its definition stage reports no MONITOR.md, which is expected) and its observations with \`${historyCommand(report, monitorId)}\`.`;
   const remediation = {
     definition: `Inspect retained record IDs with \`${explainCommand(report, monitorId)}\` and repair the definition or reported failure.`,
-    'live-ephemeral': `${LIVE_EPHEMERAL} ${listed}`,
+    'live-ephemeral':
+      owner.kind === 'live-ephemeral' && owner.validationError !== undefined
+        ? `${LIVE_EPHEMERAL} ${rejectedScopeRemediation(owner.validationError)} ${listed}`
+        : `${LIVE_EPHEMERAL} ${listed}`,
     'retired-ephemeral': `${RETIRED_EPHEMERAL} ${listed}`,
   }[owner.kind];
   checks.push({
