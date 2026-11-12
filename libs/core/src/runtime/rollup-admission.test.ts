@@ -221,24 +221,40 @@ Inspect the changes.
   };
 }
 
-/** Interpose at the pre-BEGIN boundary without mocked reads or changes to production seams. */
+/**
+ * Interpose immediately before the window flush's own transaction begins, with
+ * no mocked reads or changes to production seams. Each tick first runs the
+ * notify-edit reconcile through the same registered runner (`withStoreWriter`);
+ * that call is passed through untouched, so the competing commit lands before
+ * the flush's BEGIN and can only be seen by a read made under the writer lock.
+ * `target: 'edit-drain'` instead fires before that reconcile's own transaction.
+ * The returned assertion proves the commit fired at the targeted transaction.
+ */
 function beforeAdmission(
   f: Awaited<ReturnType<typeof fixture>>,
   competingCommit: () => void,
+  target: 'flush' | 'edit-drain' = 'flush',
 ) {
-  let ran = false;
+  let firedAt: string | undefined;
   registerRuntimeTransaction(
     f.store,
     (operation) => {
-      if (!ran) {
-        ran = true;
+      const stack = new Error().stack ?? '';
+      const isEditDrain = stack.includes('withStoreWriter');
+      if (firedAt === undefined && isEditDrain === (target === 'edit-drain')) {
+        firedAt = stack;
         competingCommit();
       }
       return f.writer.client.transaction(operation).immediate();
     },
     () => f.writer.client.inTransaction,
   );
-  return () => expect(ran).toBe(true);
+  return () => {
+    expect(firedAt, 'competing commit never fired').toBeDefined();
+    expect(firedAt).toContain(
+      target === 'flush' ? 'flushRollupWindow' : 'withStoreWriter',
+    );
+  };
 }
 
 /** The child imports current source using Node 24 type transformation and a confined resolver hook. */
@@ -944,14 +960,17 @@ describe('notify-policy edit draining held rollup work', () => {
     editWindow(f);
     clockTime = BEFORE + 1000;
     // Another writer commits one more held envelope before this drain's BEGIN.
-    const interposed = beforeAdmission(f, () =>
-      f.reader.setMonitorState('rollup', f.root, {
-        ...f.before,
-        notifyState: {
-          ...f.before.notifyState,
-          pendingRollup: { observations: [...held, late] },
-        },
-      }),
+    const interposed = beforeAdmission(
+      f,
+      () =>
+        f.reader.setMonitorState('rollup', f.root, {
+          ...f.before,
+          notifyState: {
+            ...f.before.notifyState,
+            pendingRollup: { observations: [...held, late] },
+          },
+        }),
+      'edit-drain',
     );
     const result = await f.runtime.tick(f.monitorsDir, f.root);
     interposed();
