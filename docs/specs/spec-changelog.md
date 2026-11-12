@@ -23,6 +23,29 @@ the tick's edit reconciliation has succeeded and the admission gate is open, in 
 synchronous turn as that gate check. It keeps the private pacing identity it reads under the lock.
 No public API change.
 
+## 2026-11-12 — Hold-acceptance refusals under span admission (002 §4.7, §`observation_history`, 004 §3.3) — Refs #570, #497
+
+Restate §4.7 on span admission (§2). A refusal's `errored` row is written inside the span's
+admission transaction, before the batch row, together with the state write that advances the
+baseline past it; a rollback undoes both, and nothing is reported for it. The refusal is reported
+(tick `erroredObservations`, watcher `onError`) only after that transaction commits and the span
+has materialized, and a throwing callback is ignored. A refusal is not a drop: it carries no drop
+identity, is not outstanding loss, and never sets `notRetainedCount`; the batch row counts
+`notHeld` and `notRetainedCount` separately. Name the paths into a hold: poll and watch span
+admission, the deferred poll handoff and escalation. An edit drain, startup reconciliation and a
+not-due rollup window check add no envelope to a hold.
+
+## 2026-11-12 — Hold-acceptance refusals: title cap, total message, report after materialization (002 §4.7) — Refs #570
+
+Tighten §4.7. The not-held message caps the title at 200 code points (the reason keeps 512) so the
+start of the reason always survives the 512-code-point display cap in history and explain; the
+stored row and JSON history keep the whole message. Building the message never
+throws: an unreadable serializer reason becomes `unknown serialization error`. The refusal is
+reported (tick `erroredObservations`, watcher `onError`) only after the state commit, the `errored`
+row and the span's materialization, and a throwing callback is ignored, so a callback failure cannot
+lose a debounce batch flushed in the same dispatch. State the remaining limit: the check does not
+cover a non-deterministic accessor that serializes differently on a later read.
+
 ## 2026-11-12 — The ordering rebuild states what it preserves, loses and refuses (002 §5.2) — Refs #569
 
 Carried expression defaults are now written back as expressions (`PRAGMA table_xinfo` reports
@@ -34,6 +57,21 @@ constraint, or a `STRICT` table, is refused rather than silently loosened; only 
 SQL comments, and the refusal message says that SQLite cannot drop a column or table constraint in place, so the table
 must be rebuilt by hand or the database restored. A carried default that ends in a line comment is
 written back with a newline before its closing parenthesis. 002 §5.2 lists what is preserved, lost and refused.
+
+## 2026-11-11 — An unserializable observation is refused at hold acceptance (002 §4.3/§4.4/§4.7, §`observation_history`, 004 §3.3) — Refs #570
+
+Before this change, a debounce or rollup hold whose observation could not be encoded as JSON (a
+BigInt or a cyclic payload) failed every notify-state write for its monitor. The source baseline
+never advanced, the same batch was re-observed on every tick, and the observation's batch siblings
+were never held. The only trace was a raw serializer error repeated each tick.
+
+Add 002 §4.7. Serializability is checked once per observation, where it would join
+`pendingDebounce` or `pendingRollup`, using the hold's own serializer. A refused observation is not
+held. It gets one `errored` `observation_history` row naming the observation, the strategy and the
+reason, reported on the tick result's `erroredObservations` or the watcher's `onError`. Its siblings
+are held in order, and the baseline advances. The span's batch row counts refusals as `notHeld` and
+is omitted when every observation was refused. Observations that bypass a hold are outside this
+rule and keep the materialization contract (§5). Round-tripping such payloads remains out of scope.
 
 ## 2026-11-12 — Notify-policy admission gates whole watch batches; edit drains record no drops (002 §2.3/§2.4/§4.6, 004 §2.5) — Refs #497, #537
 

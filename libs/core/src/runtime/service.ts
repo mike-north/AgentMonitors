@@ -108,6 +108,7 @@ import {
   defaultNotifyConfigForUrgency,
   EPHEMERAL_MONITOR_ID_PREFIX,
   type NotifyDispatchResult,
+  type NotHeldObservation,
   type NotifyRuntimeState,
   type DeliveryLifecycle,
   type SessionHookState,
@@ -349,7 +350,10 @@ function explainVerdict(stages: MonitorExplainStage[]): {
  * including the truncation marker. CLI history mirrors this private policy
  * without expanding the core plugin API with a presentation-only helper.
  */
-function displayObservationError(value: unknown): string | undefined {
+function displayObservationError(
+  value: unknown,
+  limit = 512,
+): string | undefined {
   if (typeof value !== 'string') return undefined;
   const line = stripVTControlCharacters(value)
     // eslint-disable-next-line no-control-regex -- Remove literal terminal control bytes from legacy diagnostics.
@@ -357,8 +361,8 @@ function displayObservationError(value: unknown): string | undefined {
     .replace(/\s+/gu, ' ')
     .trim();
   const points = Array.from(line);
-  return points.length > 512
-    ? `${points.slice(0, 509).join('')}...`
+  return points.length > limit
+    ? `${points.slice(0, limit - 3).join('')}...`
     : line || undefined;
 }
 
@@ -502,6 +506,67 @@ function serializeObservation(
     observedAt,
     effectiveUrgency: effectiveObservationUrgency(monitor, observation),
   };
+}
+
+/**
+ * Longest observation title, in code points, a not-held outcome message
+ * carries. It is well below the 512-code-point display cap that history and
+ * explain apply to the whole message, so a long title can never push the
+ * start of the serializer's reason out of the human views; a long reason can
+ * still be cut there, while the stored row keeps it whole (002 §4.7).
+ */
+const NOT_HELD_TITLE_LIMIT = 200;
+
+/**
+ * Admission check for held notify work (002 §4.7). Debounce and rollup holds
+ * persist their envelopes as JSON in `monitor_state.notify_state`, so an
+ * envelope `JSON.stringify` cannot encode (a BigInt, a cyclic reference, a
+ * throwing `toJSON` or getter) would make every later state write for the
+ * monitor fail. The check runs the same serializer the hold write uses, once,
+ * where an envelope would join a hold; an envelope that passes stays
+ * serializable inside every later hold write.
+ *
+ * Limit: the hold write serializes the envelope again, so the check proves
+ * serializability only for values that serialize the same way twice. A
+ * non-deterministic accessor (one that returns a BigInt only on a later read)
+ * can still pass this check and fail the later write; that is not defended.
+ *
+ * Total by construction: building the outcome text never throws, even when
+ * the serializer threw a value whose own `toString` throws. Such a reason
+ * falls back to a fixed string.
+ *
+ * Returns `undefined` when the envelope can be held, otherwise the complete
+ * single-line `errored` outcome text naming the observation, the strategy and
+ * the serializer's reason.
+ */
+function notHeldReason(
+  envelope: StoredObservationEnvelope,
+  strategy: 'debounce' | 'rollup',
+): string | undefined {
+  try {
+    JSON.stringify(envelope);
+    return undefined;
+  } catch (error) {
+    let reason: string | undefined;
+    try {
+      reason = displayObservationError(
+        error instanceof Error ? error.message : String(error),
+      );
+    } catch {
+      // A hostile thrown value whose conversion to text throws: use the fixed
+      // reason rather than let the refusal itself escape and wedge the monitor.
+    }
+    let title: string | undefined;
+    try {
+      title = displayObservationError(
+        envelope.observation.title,
+        NOT_HELD_TITLE_LIMIT,
+      );
+    } catch {
+      // Same guard for a title that is not a plain string.
+    }
+    return `Observation "${title ?? '(untitled)'}" was not held for ${strategy}: it cannot be serialized (${reason ?? 'unknown serialization error'}).`;
+  }
 }
 
 function hydrateStoredObservationEnvelope(
@@ -732,6 +797,13 @@ interface MaterializationSpanResult {
 interface MaterializationSpanOptions {
   /** Raw source count before shaping/pacing, used only for audit classification. */
   observed: number;
+  /**
+   * How many of the `observed` observations a hold refused (002 §4.7). Each
+   * has its own `errored` row from the admission transaction, so they do not
+   * count toward `suppressed`, and a span made only of them writes no batch
+   * row. Distinct from a drop (`notRetainedCount`): a refusal is not loss.
+   */
+  notHeld?: number;
   workspacePath: string;
   nextMonitorState: {
     sourceState?: unknown;
@@ -3809,6 +3881,11 @@ export class AgentMonitorRuntime {
                 ...(pending.ephemeralSessionId !== undefined
                   ? { ephemeralSessionId: pending.ephemeralSessionId }
                   : {}),
+                onNotHeld: (message) =>
+                  acc.erroredObservations.push({
+                    monitorId: monitor.id,
+                    message,
+                  }),
               },
             );
           } finally {
@@ -4146,6 +4223,8 @@ export class AgentMonitorRuntime {
             ? { sourceOutcome: observationResult.outcome }
             : {}),
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+          onNotHeld: (message) =>
+            acc.erroredObservations.push({ monitorId: monitor.id, message }),
         },
       );
       // Deterministic admission ran synchronously in that call; relinquish the
@@ -4223,6 +4302,14 @@ export class AgentMonitorRuntime {
        * in the same workspace (007 §4.6 isolation).
        */
       ephemeralSessionId?: string;
+      /**
+       * Reports each observation a debounce/rollup hold refused (002 §4.7):
+       * the tick loop adds it to `erroredObservations`, a watcher to `onError`.
+       * Its durable `errored` history row is written inside the admission
+       * transaction either way. Called only after that transaction commits
+       * and the span has materialized; an exception it throws is ignored.
+       */
+      onNotHeld?: (message: string) => void;
     },
   ): Promise<MaterializationSpanResult> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
@@ -4261,8 +4348,23 @@ export class AgentMonitorRuntime {
         now,
         monitorState.notifyState,
       );
+      // An observation a hold refused (002 §4.7) is neither emitted nor held.
+      // Its outcome is this `errored` row, written in the same admission
+      // transaction as the state that advances past it: a rollback undoes
+      // both, so the refusal is decided again from the prior baseline. It is
+      // not a drop and is not tracked as outstanding loss.
+      for (const { message } of dispatch.notHeld) {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result: 'errored',
+          observationData: { error: message },
+        });
+      }
       const spanOptions: MaterializationSpanOptions = {
         observed: observations.length,
+        notHeld: dispatch.notHeld.length,
         workspacePath: options.workspacePath,
         nextMonitorState: {
           sourceState: options.nextSourceState
@@ -4286,13 +4388,28 @@ export class AgentMonitorRuntime {
       return {
         durable: this.admitSpan(monitor, dispatch.emitted, spanOptions),
         spanOptions,
+        notHeld: dispatch.notHeld,
       };
     });
-    return await this.finishMaterializationSpan(
-      monitor,
-      admitted.durable,
-      admitted.spanOptions,
-    );
+    // Refusals are reported only once the admission transaction has committed
+    // and the span has materialized, so a throwing report callback can never
+    // cut off committed work, and a rolled-back span reports none.
+    try {
+      return await this.finishMaterializationSpan(
+        monitor,
+        admitted.durable,
+        admitted.spanOptions,
+      );
+    } finally {
+      for (const { message } of admitted.notHeld) {
+        try {
+          options.onNotHeld?.(message);
+        } catch {
+          // Reporting is best-effort: the state, the `errored` row and any
+          // materialized events are already committed.
+        }
+      }
+    }
   }
 
   /**
@@ -4477,9 +4594,16 @@ export class AgentMonitorRuntime {
     const notRetainedCount = durable.failures.filter(
       ({ retained }) => !retained,
     ).length;
+    // Refusals at hold acceptance (002 §4.7) already have their own `errored`
+    // rows. They count in `observed` but never make a span `suppressed`.
+    const notHeld = options.notHeld ?? 0;
     // Do not write a false batch-level `triggered` row when every dispatched
-    // envelope failed. Individual failure rows below are the truthful outcome.
-    if (emittedCount > 0 || durable.failures.length === 0) {
+    // envelope failed, nor a `suppressed` row for a span whose only
+    // observations a hold refused. Individual rows are the truthful outcome.
+    if (
+      emittedCount > 0 ||
+      (durable.failures.length === 0 && (notHeld === 0 || observed > notHeld))
+    ) {
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4490,13 +4614,14 @@ export class AgentMonitorRuntime {
               ? 'triggered'
               : observed === 0 && options.sourceOutcome !== undefined
                 ? options.sourceOutcome
-                : observed > 0
+                : observed > notHeld
                   ? 'suppressed'
                   : 'no-change',
           observationData: {
             observed,
             emitted: emittedCount,
             ...(notRetainedCount > 0 ? { notRetainedCount } : {}),
+            ...(notHeld > 0 ? { notHeld } : {}),
           },
         });
       } catch {
@@ -4852,6 +4977,8 @@ export class AgentMonitorRuntime {
                       ...(batch.outcome
                         ? { sourceOutcome: batch.outcome }
                         : {}),
+                      onNotHeld: (message) =>
+                        onError?.(monitor.id, new Error(message)),
                     },
                   ),
                 }
@@ -5001,6 +5128,7 @@ export class AgentMonitorRuntime {
     state: NotifyRuntimeState,
   ): NotifyDispatchResult {
     const emitted: StoredObservationEnvelope[] = [];
+    const notHeld: NotHeldObservation[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
     // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
@@ -5090,6 +5218,15 @@ export class AgentMonitorRuntime {
         continue;
       }
 
+      // Hold acceptance (002 §4.7): an envelope that cannot be serialized never
+      // joins the batch, so the state write below cannot fail on it and the
+      // batch's other observations are unaffected.
+      const notHeldMessage = notHeldReason(envelope, 'debounce');
+      if (notHeldMessage !== undefined) {
+        notHeld.push({ observation, message: notHeldMessage });
+        continue;
+      }
+
       if (nextState.pendingDebounce) {
         nextState.pendingDebounce = {
           observations: [
@@ -5113,7 +5250,7 @@ export class AgentMonitorRuntime {
       };
     }
 
-    return { emitted, nextState };
+    return { emitted, nextState, notHeld };
   }
 
   /**
@@ -5148,21 +5285,19 @@ export class AgentMonitorRuntime {
     // Defensive: this method is only reached for rollup monitors, but narrow
     // the discriminated union so `window`/`timezone` are accessible.
     if (notify?.strategy !== 'rollup') {
-      return { emitted: [], nextState };
+      return { emitted: [], nextState, notHeld: [] };
     }
 
     // 1. Accumulate. Hydrate any restart-persisted envelopes (backfilling
     // `effectiveUrgency` per 002 §3 / issue #109) so a batch that survived a
     // daemon restart materializes with a valid urgency, then append this tick's
     // new observations.
-    const accumulated: StoredObservationEnvelope[] = [
-      ...(nextState.pendingRollup?.observations ?? []).map(
-        hydrateStoredObservationEnvelope,
-      ),
-      ...observations.map((observation) =>
-        serializeObservation(monitor, observation, observedAt),
-      ),
-    ];
+    const held = (nextState.pendingRollup?.observations ?? []).map(
+      hydrateStoredObservationEnvelope,
+    );
+    const arrived = observations.map((observation) =>
+      serializeObservation(monitor, observation, observedAt),
+    );
 
     // 2. Evaluate the delivery window with a once-per-minute deduplication
     // guard (002 §4.4 step 2): `cronMatchesDate` returns true for every
@@ -5180,22 +5315,32 @@ export class AgentMonitorRuntime {
     }
 
     // 3. Flush iff the window fires AND the batch is non-empty; an empty window
-    // produces no delivery (§4.4 step 3).
-    if (windowFires && accumulated.length > 0) {
+    // produces no delivery (§4.4 step 3). Observations arriving on the firing
+    // tick go straight to materialization and are never held.
+    if (windowFires && held.length + arrived.length > 0) {
       delete nextState.pendingRollup;
-      return { emitted: accumulated, nextState };
+      return { emitted: [...held, ...arrived], nextState, notHeld: [] };
     }
 
     // Otherwise keep accumulating silently — no per-change interrupts (§4.4
-    // step 6). Persist the batch (durable accumulation, §4.4 step 1) only when
+    // step 6). Hold acceptance (002 §4.7): an arriving envelope that cannot be
+    // serialized never joins the batch; its serializable siblings keep their
+    // order. Persist the batch (durable accumulation, §4.4 step 1) only when
     // there is something to hold; an empty window with nothing accumulated
     // leaves `pendingRollup` absent.
+    const notHeld: NotHeldObservation[] = [];
+    const accumulated = [...held];
+    for (const envelope of arrived) {
+      const message = notHeldReason(envelope, 'rollup');
+      if (message === undefined) accumulated.push(envelope);
+      else notHeld.push({ observation: envelope.observation, message });
+    }
     if (accumulated.length > 0) {
       nextState.pendingRollup = { observations: accumulated };
     } else {
       delete nextState.pendingRollup;
     }
-    return { emitted: [], nextState };
+    return { emitted: [], nextState, notHeld };
   }
 
   /**

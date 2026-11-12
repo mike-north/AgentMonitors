@@ -241,6 +241,126 @@ for (const failure of [
 }
 
 /**
+ * 002 §4.7: a deferred poll result admitted after a notify edit (§4.6) reaches
+ * hold acceptance through the handoff's own ingest call. An observation the
+ * new hold cannot serialize is refused and reported on the recovery tick's
+ * `erroredObservations`; its sibling is held and the cursor advances past the
+ * batch (#570).
+ */
+it('a deferred result carrying an unserializable observation is refused at hold acceptance and reported on the recovery tick (#570)', async () => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-03-20T08:00:00Z'));
+  const root = mkdtempSync(path.join(tmpdir(), 'notify-handoff-refuse-'));
+  const dir = path.join(root, 'monitors');
+  mkdirSync(dir);
+  const file = path.join(dir, 'held.md');
+  const db = createDb(path.join(root, 'state.sqlite'));
+  const client = (db as unknown as { $client: Database }).$client;
+  const store = new RuntimeStore(db);
+  const started = deferred<undefined>();
+  const result = deferred<ObservationResult>();
+  const tasks: Promise<unknown>[] = [];
+  let calls = 0;
+  const registry = new SourceRegistry();
+  registry.register({
+    name: 'handoff-source',
+    stateful: true,
+    scopeSchema: { type: 'object' },
+    async observe() {
+      calls++;
+      if (calls === 1)
+        return {
+          observations: [{ title: 'A', snapshotText: 'A', objectKey: 'obj' }],
+          nextState: { cursor: 1 },
+        };
+      if (calls === 2) {
+        started.resolve(undefined);
+        return result.promise;
+      }
+      return { observations: [], nextState: { cursor: 3 } };
+    },
+  });
+  const runtime = new AgentMonitorRuntime(store, registry, [claudeCodeAdapter]);
+  runtime.openSession(
+    claudeCodeAdapter.createSessionInput({
+      hostSessionId: 'owner',
+      workspacePath: root,
+    }),
+  );
+  const state = () => store.getMonitorState('held', root);
+  const tick = () => {
+    const task = runtime.tick(dir, root);
+    tasks.push(task);
+    return task;
+  };
+  const edit = (notify: string) =>
+    writeFileSync(
+      file,
+      `---\nwatch:\n  type: handoff-source\n  interval: 1h\nbaseline-strategy: incremental\n${notify}---\nInstructions\n`,
+    );
+  cleanups.push(async () => {
+    result.resolve({ observations: [] });
+    await Promise.allSettled(tasks);
+    if (client.open) client.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  edit('notify:\n  strategy: debounce\n  settle-for: 1h\n');
+  await tick();
+  store.setMonitorState('held', root, {
+    ...state(),
+    lastObservationAt: new Date('2000-01-01T00:00:00Z'),
+  });
+  const slow = tick();
+  await started.promise;
+  edit('notify:\n  strategy: debounce\n  settle-for: 2h\n');
+  client.exec(
+    "CREATE TRIGGER fault BEFORE INSERT ON monitor_events BEGIN SELECT RAISE(FAIL, 'owned edit fault'); END",
+  );
+  await tick();
+  result.resolve({
+    observations: [
+      {
+        title: 'Bad',
+        snapshotText: 'Bad',
+        objectKey: 'bad',
+        payload: { n: 1n },
+      },
+      { title: 'B', snapshotText: 'B', objectKey: 'obj' },
+    ],
+    nextState: { cursor: 2 },
+  });
+  await slow;
+  client.exec('DROP TRIGGER fault');
+
+  const recovery = await tick();
+  expect(recovery.erroredObservations).toEqual([
+    {
+      monitorId: 'held',
+      message: expect.stringMatching(
+        /^Observation "Bad" was not held for debounce: it cannot be serialized \(.*BigInt.*\)\.$/u,
+      ),
+    },
+  ]);
+  const heldTitles = (
+    state().notifyState.pendingDebounce?.observations ?? []
+  ).map((envelope) => envelope.observation.title);
+  expect(heldTitles).toContain('B');
+  expect(heldTitles).not.toContain('Bad');
+  expect(state().sourceState).toEqual({ cursor: 2 });
+  expect(
+    store
+      .listObservationHistory({ monitorId: 'held', workspacePath: root })
+      .filter(
+        (row) =>
+          row.result === 'errored' &&
+          JSON.stringify(row.observationData).includes('was not held'),
+      )
+      .map((row) => row.observationData),
+  ).toEqual([{ error: recovery.erroredObservations[0]?.message }]);
+});
+
+/**
  * 002 §4.6: a poll result retained behind a failed notify edit is admitted
  * against the source baseline it was observed from, not the baseline read when
  * it resumes. If another connection advanced the baseline meanwhile, the

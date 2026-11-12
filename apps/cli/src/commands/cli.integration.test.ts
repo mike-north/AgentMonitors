@@ -38,8 +38,11 @@ import {
 } from '../channel-render.js';
 import { escapeShellPath } from '../delivery-event-render.js';
 import {
+  AgentMonitorRuntime,
+  claudeCodeAdapter,
   createDb,
   RuntimeStore,
+  SourceRegistry,
   type StoredObservationEnvelope,
 } from '@agentmonitors/core';
 
@@ -4950,6 +4953,66 @@ This monitor has a typo'd timezone.
     const rows = JSON.parse(json.stdout) as { monitorId: string }[];
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((row) => row.monitorId === 'fires')).toBe(true);
+  });
+
+  it('history shows the serializer reason of a not-held observation even when its title is very long (002 §4.7, #570)', async () => {
+    const dir = path.join(tempDir, 'history-not-held-long-title');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(path.join(monitorsRoot, 'held'), { recursive: true });
+    writeFileSync(
+      path.join(monitorsRoot, 'held', 'MONITOR.md'),
+      '---\nname: Held\nwatch:\n  type: unserializable-source\n  interval: 1s\nurgency: normal\nnotify:\n  strategy: debounce\n  settle-for: 10s\n---\nInstructions\n',
+      'utf-8',
+    );
+    const dbPath = path.join(dir, 'agentmon.db');
+    // Seed the refusal through the real runtime: no bundled source can emit an
+    // unserializable payload, so a test-only source stands in for one.
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'unserializable-source',
+      stateful: true,
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            {
+              title: '\u001b[31mBad\u001b[0m\nsecond line ' + 'é'.repeat(600),
+              snapshotText: 'bad',
+              objectKey: 'bad',
+              payload: { count: 1n },
+            },
+          ],
+          nextState: { cursor: 1 },
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(createDb(dbPath)),
+      registry,
+      [claudeCodeAdapter],
+    );
+    const tick = await runtime.tick(monitorsRoot, dir);
+    expect(tick.erroredObservations).toHaveLength(1);
+
+    const socketPath = deadSocketPath('history-not-held');
+    const result = runWithEnv(
+      [
+        'monitor',
+        'history',
+        'held',
+        '--socket',
+        socketPath,
+        '--workspace',
+        dir,
+        '--format',
+        'text',
+      ],
+      { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath },
+      dir,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(
+      /was not held for debounce: it cannot be serialized \(Do not know how to serialize a BigInt\)\./u,
+    );
   });
 
   it('history with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT', () => {
