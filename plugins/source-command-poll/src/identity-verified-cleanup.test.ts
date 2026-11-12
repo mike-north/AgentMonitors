@@ -8,15 +8,14 @@
  * only observation hooks are spies on `process.kill` and `process.stderr.write`,
  * both left calling through to the real implementations.
  *
- * Simulating identifier recycling: a test cannot make the OS hand a specific
- * process-group id to unrelated work. What the verifier sees after a recycle is
- * a group whose leader is gone and whose current members include none of the
- * processes it recorded when it last confirmed the group. The recycling test
- * produces exactly that view: the command's leader starts a stand-in process
- * only AFTER the timeout's SIGTERM step has recorded the group's members, then
- * exits. When the SIGKILL follow-up runs, the recorded pgid is occupied solely
- * by a process the verifier never confirmed — indistinguishable, to it, from a
- * reused id — so it must withhold the signal and report the abstention.
+ * A process forked after the SIGTERM step is still ours: it is in the group the
+ * command started, and the group's id cannot have been reused while a member
+ * existed. The late-fork test drives that shape through a TERM trap that starts
+ * a worker and exits, and requires the SIGKILL follow-up to remove the worker
+ * (008 §3.1). The abstention for a group whose continuity is genuinely lost (a
+ * recycled id) cannot be produced with real processes without wrapping the pid
+ * space; it is covered against a fabricated process table in
+ * `libs/core/src/process/process-identity.test.ts`.
  *
  * Every process a test starts is killed in a `finally` that runs on failure too.
  *
@@ -87,25 +86,28 @@ describe.skipIf(process.platform === 'win32')(
       vi.restoreAllMocks();
     });
 
-    it('withholds SIGKILL from a recorded process group it can no longer identify, and reports the abstention', async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'am-479-recycled-'));
+    // Regression (#479): the worker forks after the SIGTERM step recorded the
+    // group's members, then the leader exits. It is a real member of the
+    // command's group and must not outlive the hard bound (008 §3.1), so the
+    // follow-up must SIGKILL it rather than abstain as if the group id had
+    // been reused.
+    it('SIGKILLs a descendant the command forks from its TERM trap after the SIGTERM step', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-479-late-fork-'));
       const leaderPidFile = join(dir, 'leader.pid');
-      const standInPidFile = join(dir, 'stand-in.pid');
-      const standIn = join(dir, 'stand-in.sh');
+      const workerPidFile = join(dir, 'worker.pid');
+      const worker = join(dir, 'worker.sh');
       const leader = join(dir, 'leader.sh');
-      // The stand-in ignores SIGTERM so only a SIGKILL could remove it; its
-      // survival is the proof that no SIGKILL reached the recorded group.
+      // The worker ignores SIGTERM so only a SIGKILL could remove it.
       writeFileSync(
-        standIn,
-        `trap '' TERM\necho $$ > '${standInPidFile}'\nexec sleep 30\n`,
+        worker,
+        `trap '' TERM\necho $$ > '${workerPidFile}'\nexec sleep 30\n`,
       );
-      // The leader starts the stand-in only once the SIGTERM step has run (and
-      // recorded the group's members), then exits.
+      // The leader starts the worker only once SIGTERM arrives, then exits.
       writeFileSync(
         leader,
         [
           `echo $$ > '${leaderPidFile}'`,
-          `trap 'sh "${standIn}" & exit 0' TERM`,
+          `trap 'sh "${worker}" & exit 0' TERM`,
           'sleep 30 &',
           'wait $!',
           '',
@@ -115,7 +117,7 @@ describe.skipIf(process.platform === 'win32')(
       const killSpy = vi.spyOn(process, 'kill');
       const stderrSpy = vi.spyOn(process.stderr, 'write');
       let leaderPid: number | undefined;
-      let standInPid: number | undefined;
+      let workerPid: number | undefined;
       try {
         const result = await source.observe(
           { command: ['sh', leader], timeout: '1s' },
@@ -128,38 +130,23 @@ describe.skipIf(process.platform === 'win32')(
         leaderPid = readPid(leaderPidFile);
         expect(leaderPid).toBeDefined();
         expect(
-          await pollUntil(() => readPid(standInPidFile) !== undefined, 3_000),
+          await pollUntil(() => readPid(workerPidFile) !== undefined, 3_000),
         ).toBe(true);
-        standInPid = readPid(standInPidFile);
+        workerPid = readPid(workerPidFile);
+        expect(workerPid).toBeDefined();
 
-        // Wait for the SIGKILL follow-up to run and abstain.
-        const abstained = await pollUntil(
-          () =>
-            stderrText(stderrSpy).includes(
-              `Left process group ${String(leaderPid)} alone instead of sending SIGKILL`,
-            ),
+        const dead = await pollUntil(
+          () => !isProcessAlive(workerPid ?? 0),
           KILL_STEP_DEADLINE_MS,
         );
-        expect(abstained).toBe(true);
-
-        // The abstention names why and what it saw, without claiming certainty.
-        const warning = stderrText(stderrSpy);
-        expect(warning).toContain('command-poll timeout escalation');
-        expect(warning).toMatch(
-          /may be ours, but its identity could not be confirmed/,
-        );
-        expect(warning).toContain(`pid ${String(standInPid)}`);
-
-        // No SIGKILL was sent to the group, and the stand-in survived.
-        expect(killSpy).not.toHaveBeenCalledWith(-(leaderPid ?? 0), 'SIGKILL');
-        expect(standInPid).toBeDefined();
-        expect(isProcessAlive(standInPid ?? 0)).toBe(true);
+        expect(dead).toBe(true);
+        expect(killSpy).toHaveBeenCalledWith(-(leaderPid ?? 0), 'SIGKILL');
+        expect(stderrText(stderrSpy)).not.toContain('alone instead of sending');
       } finally {
         vi.restoreAllMocks();
-        killAll([standInPid ?? readPid(standInPidFile), leaderPid]);
+        killAll([workerPid ?? readPid(workerPidFile), leaderPid]);
         rmSync(dir, { recursive: true, force: true });
       }
-      expect(isProcessAlive(standInPid ?? 0)).toBe(false);
     }, 20_000);
 
     it('still SIGKILLs a confirmed group after its leader exits: TERM → KILL escalation reaches a TERM-ignoring descendant', async () => {

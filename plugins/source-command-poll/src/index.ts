@@ -206,12 +206,16 @@ const CLOSE_FALLBACK_MS = 2_000;
  * On POSIX, `child` was spawned as the leader of its own process group/session
  * (`detached: true`); signaling the *negative* PID targets that whole group, so a
  * command's own background jobs (`sh -c 'sleep 30 & wait'`) die with it instead of
- * surviving as orphans (003 §11.7, issue #303). The SIGTERM step runs while the
- * leader is still unreaped (the timeout only fires for a running command), so the
- * live handle confirms the group and the group's members are recorded. The
- * SIGKILL follow-up usually runs after the leader has been reaped; it is sent only
- * if a process recorded at the SIGTERM step is still in the group — otherwise the
- * group id may have been reused, and the follow-up abstains.
+ * surviving as orphans (003 §11.7, issue #303). The SIGTERM step's read starts
+ * while the leader is still unreaped (the timeout only fires for a running
+ * command), so that reading's members are confirmed as ours even if the leader
+ * exits before the read completes. The gate re-reads the group's membership the
+ * moment the leader is reaped, which confirms work forked after the SIGTERM step
+ * (a TERM trap that starts a worker and exits). The SIGKILL follow-up usually runs
+ * after the leader has been reaped; it is sent if any confirmed member is still in
+ * the group, and an emptied group needs no signal. Only a group none of whose
+ * members was ever confirmed — continuity lost, so the id may have been reused —
+ * is left alone with an abstention.
  *
  * Windows has no process-group-signal equivalent, and no reliable graceful signal
  * for a non-console-attached spawned process — `taskkill` without `/F` frequently
@@ -540,9 +544,9 @@ async function runCommand(
       // settled the promise (see the comment in `clearTimers` above) — a
       // descendant that ignores SIGTERM while the direct child dies from it is
       // otherwise never reaped (003 §11.7, issue #303). It waits for the SIGTERM
-      // step to finish so it can rely on the group membership that step
-      // confirmed; an emptied group is a no-op, and an unconfirmable one is an
-      // abstention, never a signal (008 §5).
+      // step to finish so it can rely on the group membership confirmed so far
+      // (by that step and at the leader's exit); an emptied group is a no-op, and
+      // one whose continuity was lost is an abstention, never a signal (008 §5).
       sigkillTimer = setTimeout(() => {
         void termStep.then(() =>
           killProcessTree(cleanupTarget, 'SIGKILL', isWindows, cleanupAction),
