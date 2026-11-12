@@ -26,6 +26,10 @@
  *   each later step confirms the group through any of them that remains. Every
  *   current member of a confirmed group is inside the containment boundary
  *   (008 §2.1), including processes forked after an earlier step.
+ * - **Grace-period tracking.** On request, a step that signals a group keeps
+ *   re-reading its membership on a fixed interval until the next step, so a
+ *   member that forks a child and then exits during the grace period hands
+ *   continuity on through a reading that saw both ({@link GroupMembershipTracking}).
  *
  * When identity cannot be confirmed the signal is **withheld** and the
  * abstention is reported with its reason (008 §5, §6.1): leak once rather than
@@ -36,7 +40,10 @@
  * is sent after it completes. A target that empties and is replaced during
  * that read, or between the read and `kill(2)`, is not detected. Replacement
  * needs the whole pid space to wrap inside that window; no portable POSIX
- * primitive closes it for process groups.
+ * primitive closes it for process groups. Separately, continuity is only
+ * re-established at a reading: a member that forks and exits between two
+ * readings, while no other confirmed member is alive, leaves the group to a
+ * process no reading confirmed, and the next step abstains.
  */
 import type {
   ProcessIdentityRecord,
@@ -185,6 +192,51 @@ export interface VerifiedSignalOptions {
    * still runs first; this only changes how a confirmed signal is sent.
    */
   readonly deliver?: (signal: NodeJS.Signals) => void;
+  /**
+   * Process-group targets only. When this step signals the group, keep
+   * re-reading the group's membership on a fixed interval until the next step
+   * against the same target starts (see {@link GroupMembershipTracking}). Use it
+   * on a step that is followed by another after a grace period, so work handed
+   * from one member to a newly forked process during that period is still
+   * confirmed as ours (008 §3.1, §5.1).
+   */
+  readonly trackMembership?: GroupMembershipTracking;
+}
+
+/**
+ * Grace-period membership tracking for a process-group target, requested
+ * through {@link VerifiedSignalOptions.trackMembership}.
+ *
+ * Group continuity is only re-established when the group's membership is read.
+ * A member that forks a child and then exits between two readings hands the
+ * group to a process no reading ever saw beside a confirmed member, and the
+ * next step must then leave the group alone. Tracking reads the membership
+ * every 250 milliseconds, starting each read only after the previous one has
+ * finished, and each reading that is provably ours (008 §5.1) confirms every
+ * member it lists. A hand-off is therefore confirmed whenever the parent is still alive
+ * at some reading after the child exists.
+ *
+ * Tracking stops when the next step against the target starts (which first
+ * waits for a reading in flight), when a reading shows the group empty, when a
+ * reading shows that continuity is already lost, when `untilMs` has elapsed,
+ * or when `signal` aborts. Its timers never keep the process alive. A reading
+ * that fails or is unsupported confirms nothing and does not stop tracking.
+ *
+ * Residual: after the leader has exited, a member that forks and exits within
+ * one interval while no other confirmed member is alive still hands the group
+ * to an unconfirmed process, and the next step then abstains (008 §3.1, §5.1).
+ *
+ * @public
+ */
+export interface GroupMembershipTracking {
+  /**
+   * How long tracking may continue if no further step arrives, measured from
+   * the end of the step that started it. No reading starts after this. Set it
+   * to cover the gap until the next step.
+   */
+  readonly untilMs: number;
+  /** Aborting it stops tracking, for an owner that is torn down early. */
+  readonly signal?: AbortSignal;
 }
 
 /**
@@ -286,81 +338,24 @@ export async function sendVerifiedSignal(
     }
 
     case 'spawned-process-group': {
-      // Note the leader's state when the read STARTS. While it is unreaped the
-      // group id cannot have been reused, so every member of a reading that
-      // began then is ours, even if the leader is reaped before the reading
-      // completes (residual: the group emptying and its id being reused during
-      // the read itself, 008 §5.1).
-      const leaderUnreapedAtReadStart = isChildUnreaped(target.leader);
-      if (leaderUnreapedAtReadStart) {
-        watchLeaderExit(target, readTable);
-      } else {
-        // Let the membership read started at the leader's exit land first, so
-        // processes forked after the previous step count as confirmed.
-        await groupExitReads.get(target)?.settled;
-      }
-      const reading = await readTable();
-      if (leaderUnreapedAtReadStart) {
-        if (reading.supported) {
-          recordConfirmedMembers(target, groupMembers(reading, target.pgid));
-        }
-        if (isChildUnreaped(target.leader)) {
-          return deliverToGroup(
-            target.pgid,
-            signal,
-            options,
-            'live-child-handle',
-          );
-        }
-        if (!reading.supported) {
-          return abstain(
-            'process-group',
-            target.pgid,
-            `the group's leader exited while the process table was being read and ${reading.reason}, so the group's membership could not be confirmed`,
-            [],
-          );
-        }
-        if (groupMembers(reading, target.pgid).length === 0) {
-          return {
-            status: 'not-needed',
-            detail: `process group ${String(target.pgid)} has no remaining members`,
-          };
-        }
-        return deliverToGroup(
-          target.pgid,
-          signal,
-          options,
-          'recorded-identity',
-        );
-      }
-      if (!reading.supported) {
-        return abstain(
-          'process-group',
-          target.pgid,
-          `the group's leader has exited and ${reading.reason}, so the group's current members cannot be compared with the ones confirmed as ours`,
-          [],
-        );
-      }
-      const members = groupMembers(reading, target.pgid);
-      if (members.length === 0) {
-        return {
-          status: 'not-needed',
-          detail: `process group ${String(target.pgid)} has no remaining members`,
-        };
-      }
-      const continuous = members.some((member) =>
-        target.verifiedMembers.some((known) => sameProcess(known, member)),
+      // A step ends any tracking an earlier step started, and first lets a
+      // reading already in flight land, so a hand-off it saw is confirmed.
+      // Only awaited when tracking exists: the first step must reach its
+      // leader check without yielding (the leader is unreaped when it is
+      // called, and its exit listener has to be armed while that holds).
+      const tracking = endMembershipTracking(target);
+      if (tracking !== undefined) await tracking;
+      const outcome = await signalGroup(
+        target,
+        signal,
+        options,
+        readTable,
+        abstain,
       );
-      if (!continuous) {
-        return abstain(
-          'process-group',
-          target.pgid,
-          `the group's leader has exited and none of its ${String(members.length)} current member(s) was ever confirmed as a member, so the group id may have been reused by unrelated work`,
-          members,
-        );
+      if (outcome.status === 'sent' && options.trackMembership !== undefined) {
+        startMembershipTracking(target, readTable, options.trackMembership);
       }
-      recordConfirmedMembers(target, members);
-      return deliverToGroup(target.pgid, signal, options, 'recorded-identity');
+      return outcome;
     }
 
     case 'recorded-process': {
@@ -395,6 +390,86 @@ export async function sendVerifiedSignal(
       return killNumericTarget(record.pid, signal, 'recorded-identity');
     }
   }
+}
+
+/** One escalation step against a process group (see {@link sendVerifiedSignal}). */
+async function signalGroup(
+  target: SpawnedProcessGroupTarget,
+  signal: NodeJS.Signals,
+  options: VerifiedSignalOptions,
+  readTable: ProcessTableReader,
+  abstain: (
+    kind: 'process' | 'process-group',
+    id: number,
+    reason: string,
+    observed: readonly ProcessIdentityRecord[],
+  ) => SignalOutcome,
+): Promise<SignalOutcome> {
+  // Note the leader's state when the read STARTS. While it is unreaped the
+  // group id cannot have been reused, so every member of a reading that
+  // began then is ours, even if the leader is reaped before the reading
+  // completes (residual: the group emptying and its id being reused during
+  // the read itself, 008 §5.1).
+  const leaderUnreapedAtReadStart = isChildUnreaped(target.leader);
+  if (leaderUnreapedAtReadStart) {
+    watchLeaderExit(target, readTable);
+  } else {
+    // Let the membership read started at the leader's exit land first, so
+    // processes forked after the previous step count as confirmed.
+    await groupExitReads.get(target)?.settled;
+  }
+  const reading = await readTable();
+  if (leaderUnreapedAtReadStart) {
+    if (reading.supported) {
+      recordConfirmedMembers(target, groupMembers(reading, target.pgid));
+    }
+    if (isChildUnreaped(target.leader)) {
+      return deliverToGroup(target.pgid, signal, options, 'live-child-handle');
+    }
+    if (!reading.supported) {
+      return abstain(
+        'process-group',
+        target.pgid,
+        `the group's leader exited while the process table was being read and ${reading.reason}, so the group's membership could not be confirmed`,
+        [],
+      );
+    }
+    if (groupMembers(reading, target.pgid).length === 0) {
+      return {
+        status: 'not-needed',
+        detail: `process group ${String(target.pgid)} has no remaining members`,
+      };
+    }
+    return deliverToGroup(target.pgid, signal, options, 'recorded-identity');
+  }
+  if (!reading.supported) {
+    return abstain(
+      'process-group',
+      target.pgid,
+      `the group's leader has exited and ${reading.reason}, so the group's current members cannot be compared with the ones confirmed as ours`,
+      [],
+    );
+  }
+  const members = groupMembers(reading, target.pgid);
+  if (members.length === 0) {
+    return {
+      status: 'not-needed',
+      detail: `process group ${String(target.pgid)} has no remaining members`,
+    };
+  }
+  const continuous = members.some((member) =>
+    target.verifiedMembers.some((known) => sameProcess(known, member)),
+  );
+  if (!continuous) {
+    return abstain(
+      'process-group',
+      target.pgid,
+      `the group's leader has exited and none of its ${String(members.length)} current member(s) was ever confirmed as a member, so they may be unrelated work that reused the group id, or work a member handed off between two membership readings`,
+      members,
+    );
+  }
+  recordConfirmedMembers(target, members);
+  return deliverToGroup(target.pgid, signal, options, 'recorded-identity');
 }
 
 function groupMembers(
@@ -471,6 +546,139 @@ function watchLeaderExit(
       },
     );
   });
+}
+
+/**
+ * Interval between grace-period membership readings (see
+ * {@link GroupMembershipTracking}). It bounds the hand-off window that tracking
+ * cannot see. On macOS a reading is one `/bin/ps` run of about 40-50 ms, so
+ * 250 ms keeps `ps` running for at most about a sixth of the grace period and
+ * takes about 20 readings across a 5 s grace; on Linux a reading is a pass over
+ * `/proc` that is cheaper still. A shorter interval would put `ps` runs nearly
+ * back to back on macOS for little gain against a window that cannot be
+ * closed anyway.
+ *
+ * @internal
+ */
+export const MEMBERSHIP_READ_INTERVAL_MS = 250;
+
+/** Live grace-period tracking for one group target. */
+interface MembershipTracking {
+  stopped: boolean;
+  timer: ReturnType<typeof setTimeout> | undefined;
+  /** The reading in flight, which never rejects. */
+  inFlight: Promise<void> | undefined;
+  stop(): void;
+}
+
+/** Per-target tracking. Like {@link groupExitReads}, the gate's own state. */
+const membershipTracking = new WeakMap<
+  SpawnedProcessGroupTarget,
+  MembershipTracking
+>();
+
+/**
+ * Start re-reading the group's membership every
+ * {@link MEMBERSHIP_READ_INTERVAL_MS} until stopped (see
+ * {@link GroupMembershipTracking} for the stop conditions).
+ */
+function startMembershipTracking(
+  target: SpawnedProcessGroupTarget,
+  readTable: ProcessTableReader,
+  request: GroupMembershipTracking,
+): void {
+  const { signal } = request;
+  if (signal?.aborted === true) return;
+  const deadline = Date.now() + request.untilMs;
+  const tracking: MembershipTracking = {
+    stopped: false,
+    timer: undefined,
+    inFlight: undefined,
+    stop() {
+      if (tracking.stopped) return;
+      tracking.stopped = true;
+      clearTimeout(tracking.timer);
+      tracking.timer = undefined;
+      signal?.removeEventListener('abort', onAbort);
+      if (membershipTracking.get(target) === tracking) {
+        membershipTracking.delete(target);
+      }
+    },
+  };
+  const onAbort = (): void => {
+    tracking.stop();
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  membershipTracking.set(target, tracking);
+
+  const scheduleNext = (): void => {
+    if (tracking.stopped) return;
+    if (Date.now() + MEMBERSHIP_READ_INTERVAL_MS > deadline) {
+      tracking.stop();
+      return;
+    }
+    tracking.timer = setTimeout(() => {
+      tracking.timer = undefined;
+      if (tracking.stopped) return;
+      tracking.inFlight = readMembershipOnce(target, readTable).then(
+        (verdict) => {
+          tracking.inFlight = undefined;
+          if (verdict === 'stop') tracking.stop();
+          else scheduleNext();
+        },
+      );
+    }, MEMBERSHIP_READ_INTERVAL_MS);
+    tracking.timer.unref();
+  };
+  scheduleNext();
+}
+
+/**
+ * Stop any tracking on `target`. Returns the reading still in flight, if any,
+ * so the caller can let its confirmations land before it reads the group.
+ */
+function endMembershipTracking(
+  target: SpawnedProcessGroupTarget,
+): Promise<void> | undefined {
+  const tracking = membershipTracking.get(target);
+  if (tracking === undefined) return undefined;
+  tracking.stop();
+  return tracking.inFlight;
+}
+
+/**
+ * One grace-period membership reading. Confirms the reading's members when it
+ * is provably ours (started while the leader was unreaped, or still holding a
+ * confirmed member) and says whether tracking should go on. Never rejects.
+ */
+async function readMembershipOnce(
+  target: SpawnedProcessGroupTarget,
+  readTable: ProcessTableReader,
+): Promise<'continue' | 'stop'> {
+  const leaderUnreapedAtReadStart = isChildUnreaped(target.leader);
+  let reading: ProcessTableReading;
+  try {
+    const pending = readTable();
+    // A read started at the leader's exit may confirm members this reading
+    // relies on for continuity; let it land before judging.
+    if (!leaderUnreapedAtReadStart) await groupExitReads.get(target)?.settled;
+    reading = await pending;
+  } catch {
+    return 'continue';
+  }
+  if (!reading.supported) return 'continue';
+  const members = groupMembers(reading, target.pgid);
+  // An emptied group can never gain members again under this id.
+  if (members.length === 0) return 'stop';
+  const continuous =
+    leaderUnreapedAtReadStart ||
+    members.some((member) =>
+      target.verifiedMembers.some((known) => sameProcess(known, member)),
+    );
+  // Once continuity is lost, no later reading can restore it.
+  if (!continuous) return 'stop';
+  recordConfirmedMembers(target, members);
+  return 'continue';
 }
 
 function deliverToGroup(

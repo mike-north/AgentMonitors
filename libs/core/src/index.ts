@@ -54,6 +54,7 @@ export {
 } from './process/process-identity.js';
 export type {
   ChildProcessHandle,
+  GroupMembershipTracking,
   IdentityEvidence,
   RecordedProcessTarget,
   SignalAbstention,

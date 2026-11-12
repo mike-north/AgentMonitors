@@ -12,9 +12,10 @@
  * @see https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html
  */
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   describeSignalAbstention,
+  MEMBERSHIP_READ_INTERVAL_MS,
   sendVerifiedSignal,
   spawnedProcessGroup,
   type ChildProcessHandle,
@@ -215,7 +216,9 @@ describe('sendVerifiedSignal: process group', () => {
       target: { kind: 'process-group', id: 100 },
       observed: [stranger],
     });
-    expect(h.abstentions[0]?.reason).toMatch(/may have been reused/);
+    expect(h.abstentions[0]?.reason).toMatch(
+      /may be unrelated work that reused the group id, or work a member handed off/,
+    );
   });
 
   it('reports nothing to do when the group has no members left', async () => {
@@ -409,24 +412,305 @@ describe('sendVerifiedSignal: process group continuity across the leader exiting
     expect(group.verifiedMembers).toContainEqual(grandchild);
   });
 
-  it('still abstains when continuity is lost: every confirmed member is gone and a stranger holds the id', async () => {
-    const h = harness();
+  // Lost continuity has two causes the gate cannot tell apart: the id was
+  // reused after the group emptied, or a member handed the group to a process
+  // no reading saw beside a confirmed member (the residual of 008 §3.1). Both
+  // must abstain rather than guess.
+  it.each([
+    {
+      cause: 'the group emptied and its id was reused',
+      current: { pid: 100, pgid: 100, startTime: T2 },
+    },
+    {
+      cause: 'a member forked and exited between readings',
+      current: { pid: 104, pgid: 100, startTime: T2 },
+    },
+  ])(
+    'still abstains when continuity is lost ($cause): no current member was ever confirmed',
+    async ({ current }) => {
+      const h = harness();
+      const leader = new ReapableChild(100);
+      const group = spawnedProcessGroup(leader);
+      const t = liveTable([leaderRecord, sibling]);
+      await sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+      leader.reap();
+      t.set([current]);
+      const outcome = await sendVerifiedSignal(
+        group,
+        'SIGKILL',
+        h.options(t.read),
+      );
+      expect(outcome.status).toBe('abstained');
+      expect(h.delivered).toEqual(['SIGTERM']);
+      expect(h.abstentions[0]).toMatchObject({ observed: [current] });
+    },
+  );
+});
+
+describe('sendVerifiedSignal: grace-period membership tracking', () => {
+  const leaderRecord = { pid: 100, pgid: 100, startTime: T1 };
+  // A member that ignores SIGTERM, and the process it hands the group to.
+  const member = { pid: 101, pgid: 100, startTime: T1 };
+  const heir = { pid: 102, pgid: 100, startTime: T2 };
+  const track = { trackMembership: { untilMs: 5_000 } };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** SIGTERM with tracking, then the leader exits, leaving the member. */
+  async function termThenLeaderExits(
+    h: ReturnType<typeof harness>,
+    read: () => Promise<ProcessTableReading>,
+    t: ReturnType<typeof liveTable>,
+  ) {
     const leader = new ReapableChild(100);
     const group = spawnedProcessGroup(leader);
-    const t = liveTable([leaderRecord, sibling]);
-    await sendVerifiedSignal(group, 'SIGTERM', h.options(t.read));
+    const outcome = await sendVerifiedSignal(group, 'SIGTERM', {
+      ...h.options(read),
+      ...track,
+    });
+    expect(outcome.status).toBe('sent');
+    t.set([member]);
     leader.reap();
-    // The group emptied after the exit read, and the id was reused.
-    const stranger = { pid: 100, pgid: 100, startTime: T2 };
-    t.set([stranger]);
+    return group;
+  }
+
+  // Regression (#479): the member forks its heir and exits during the grace
+  // period. No step's read saw the heir beside a confirmed member, so the
+  // SIGKILL step found only the heir and abstained, leaving it alive past the
+  // hard bound (008 §3.1).
+  it('confirms a hand-off through a reading taken while parent and child coexist', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    const group = await termThenLeaderExits(h, t.read, t);
+    t.set([member, heir]);
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    t.set([heir]);
+
+    const outcome = await sendVerifiedSignal(
+      group,
+      'SIGKILL',
+      h.options(t.read),
+    );
+    expect(outcome).toEqual({ status: 'sent', evidence: 'recorded-identity' });
+    expect(h.delivered).toEqual(['SIGTERM', 'SIGKILL']);
+    expect(h.abstentions).toEqual([]);
+    expect(group.verifiedMembers).toContainEqual(heir);
+  });
+
+  it('reads on a fixed interval and never starts a read while one is in flight', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    await termThenLeaderExits(h, t.read, t);
+    const afterExit = t.reads.length;
+    t.hold();
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    expect(t.reads.length).toBe(afterExit + 1);
+    // The read is still in flight: several intervals pass without another.
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 4);
+    expect(t.reads.length).toBe(afterExit + 1);
+    t.release();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS - 1);
+    expect(t.reads.length).toBe(afterExit + 1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(t.reads.length).toBe(afterExit + 2);
+  });
+
+  it('stops once a reading shows the group empty', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    await termThenLeaderExits(h, t.read, t);
+    t.set([{ pid: 5, pgid: 5, startTime: T1 }]);
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    const afterEmpty = t.reads.length;
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 10);
+    expect(t.reads.length).toBe(afterEmpty);
+  });
+
+  it('stops once continuity is lost, and confirms nothing from that reading', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    const group = await termThenLeaderExits(h, t.read, t);
+    // The member forked and exited inside one interval: the residual.
+    t.set([heir]);
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    const afterLoss = t.reads.length;
+    // A later reading could not restore continuity, so none is taken.
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 10);
+    expect(t.reads.length).toBe(afterLoss);
+    expect(group.verifiedMembers).not.toContainEqual(heir);
+
     const outcome = await sendVerifiedSignal(
       group,
       'SIGKILL',
       h.options(t.read),
     );
     expect(outcome.status).toBe('abstained');
+  });
+
+  it('keeps reading past an unreadable reading, which confirms nothing', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    let failNext = false;
+    const read = (): Promise<ProcessTableReading> => {
+      if (failNext) {
+        failNext = false;
+        t.reads.push([]);
+        return Promise.resolve({ supported: false, reason: 'ps timed out' });
+      }
+      return t.read();
+    };
+    const group = await termThenLeaderExits(h, read, t);
+    t.set([member, heir]);
+    failNext = true;
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    expect(group.verifiedMembers).not.toContainEqual(heir);
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    expect(group.verifiedMembers).toContainEqual(heir);
+  });
+
+  it('keeps reading past a reader that throws or rejects', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    let mode: 'ok' | 'throw' | 'reject' = 'ok';
+    const read = (): Promise<ProcessTableReading> => {
+      if (mode === 'throw') throw new Error('spawn failed');
+      if (mode === 'reject') return Promise.reject(new Error('read failed'));
+      return t.read();
+    };
+    const group = await termThenLeaderExits(h, read, t);
+    t.set([member, heir]);
+    mode = 'throw';
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    mode = 'reject';
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    mode = 'ok';
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    expect(group.verifiedMembers).toContainEqual(heir);
+  });
+
+  it('when every grace-period reading fails, the next step decides from earlier readings alone', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    let failing = false;
+    const read = (): Promise<ProcessTableReading> =>
+      failing
+        ? Promise.resolve({ supported: false, reason: 'ps timed out' })
+        : t.read();
+    const group = await termThenLeaderExits(h, read, t);
+    failing = true;
+    t.set([member, heir]);
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 4);
+    t.set([heir]);
+    failing = false;
+    const outcome = await sendVerifiedSignal(group, 'SIGKILL', h.options(read));
+    expect(outcome.status).toBe('abstained');
     expect(h.delivered).toEqual(['SIGTERM']);
-    expect(h.abstentions[0]).toMatchObject({ observed: [stranger] });
+  });
+
+  it('stops when the next step starts, after letting a reading in flight land', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    const group = await termThenLeaderExits(h, t.read, t);
+    t.set([member, heir]);
+    t.hold();
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    // The hand-off completes while that reading is still in flight, and the
+    // SIGKILL step starts then.
+    t.set([heir]);
+    const pending = sendVerifiedSignal(group, 'SIGKILL', h.options(t.read));
+    t.release();
+    const outcome = await pending;
+    expect(outcome.status).toBe('sent');
+    expect(h.abstentions).toEqual([]);
+
+    const afterKill = t.reads.length;
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 10);
+    expect(t.reads.length).toBe(afterKill);
+  });
+
+  it('runs no reading after its owner aborts it', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    const controller = new AbortController();
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    await sendVerifiedSignal(group, 'SIGTERM', {
+      ...h.options(t.read),
+      trackMembership: { untilMs: 5_000, signal: controller.signal },
+    });
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS);
+    const beforeAbort = t.reads.length;
+    controller.abort();
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 10);
+    expect(t.reads.length).toBe(beforeAbort);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('starts no reading after untilMs, even if no further step arrives', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    const leader = new ReapableChild(100);
+    const group = spawnedProcessGroup(leader);
+    await sendVerifiedSignal(group, 'SIGTERM', {
+      ...h.options(t.read),
+      trackMembership: { untilMs: MEMBERSHIP_READ_INTERVAL_MS * 3 },
+    });
+    const afterStep = t.reads.length;
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 10);
+    expect(t.reads.length).toBe(afterStep + 3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not start when the step did not signal, or was not asked to track', async () => {
+    const h = harness();
+    // Not asked to track.
+    const t1 = liveTable([leaderRecord, member]);
+    await sendVerifiedSignal(
+      spawnedProcessGroup(new ReapableChild(100)),
+      'SIGTERM',
+      h.options(t1.read),
+    );
+    // Asked, but the step abstained.
+    const t2 = liveTable([member]);
+    const reaped = spawnedProcessGroup(fakeChild(100, 'reaped'));
+    const outcome = await sendVerifiedSignal(reaped, 'SIGTERM', {
+      ...h.options(t2.read),
+      ...track,
+    });
+    expect(outcome.status).toBe('abstained');
+    const before = [t1.reads.length, t2.reads.length];
+    await vi.advanceTimersByTimeAsync(MEMBERSHIP_READ_INTERVAL_MS * 4);
+    expect([t1.reads.length, t2.reads.length]).toEqual(before);
+  });
+
+  it('never keeps the process alive', async () => {
+    const h = harness();
+    const t = liveTable([leaderRecord, member]);
+    const unref = vi.fn();
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      ...args: Parameters<typeof setTimeout>
+    ) => {
+      const timer = realSetTimeout(...args);
+      const original = timer.unref.bind(timer);
+      timer.unref = () => {
+        unref();
+        return original();
+      };
+      return timer;
+    }) as typeof setTimeout);
+    try {
+      await termThenLeaderExits(h, t.read, t);
+      expect(unref).toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

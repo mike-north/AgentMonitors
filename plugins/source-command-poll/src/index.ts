@@ -211,11 +211,15 @@ const CLOSE_FALLBACK_MS = 2_000;
  * command), so that reading's members are confirmed as ours even if the leader
  * exits before the read completes. The gate re-reads the group's membership the
  * moment the leader is reaped, which confirms work forked after the SIGTERM step
- * (a TERM trap that starts a worker and exits). The SIGKILL follow-up usually runs
- * after the leader has been reaped; it is sent if any confirmed member is still in
- * the group, and an emptied group needs no signal. Only a group none of whose
- * members was ever confirmed — continuity lost, so the id may have been reused —
- * is left alone with an abstention.
+ * (a TERM trap that starts a worker and exits), and keeps re-reading it through
+ * the grace period, which confirms work one member hands to a newly forked
+ * process before exiting. The SIGKILL follow-up usually runs after the leader has
+ * been reaped; it is sent if any confirmed member is still in the group, and an
+ * emptied group needs no signal. A group none of whose current members was ever
+ * confirmed is left alone with an abstention: its continuity is lost, either
+ * because a member forked and exited between two readings with no other
+ * confirmed member alive (the residual 008 §3.1 names) or because the id was
+ * reused, and the two cannot be told apart.
  *
  * Windows has no process-group-signal equivalent, and no reliable graceful signal
  * for a non-console-attached spawned process — `taskkill` without `/F` frequently
@@ -239,6 +243,14 @@ async function killProcessTree(
   try {
     await sendVerifiedSignal(target, signal, {
       action,
+      // The SIGTERM step keeps confirming the group's membership through the
+      // grace period. The SIGKILL step ends that tracking when it starts, which
+      // is at most the grace period after the SIGTERM step finishes (its timer
+      // is armed before the SIGTERM step's read, and it also waits for that
+      // step), so `untilMs` is only a backstop.
+      ...(signal === 'SIGTERM' && target.kind === 'spawned-process-group'
+        ? { trackMembership: { untilMs: SIGKILL_GRACE_MS } }
+        : {}),
       ...(isWindows && windowsPid !== undefined
         ? {
             deliver: () => {
@@ -545,8 +557,9 @@ async function runCommand(
       // descendant that ignores SIGTERM while the direct child dies from it is
       // otherwise never reaped (003 §11.7, issue #303). It waits for the SIGTERM
       // step to finish so it can rely on the group membership confirmed so far
-      // (by that step and at the leader's exit); an emptied group is a no-op, and
-      // one whose continuity was lost is an abstention, never a signal (008 §5).
+      // (by that step, at the leader's exit and through the grace period); an
+      // emptied group is a no-op, and one whose continuity was lost is an
+      // abstention, never a signal (008 §5).
       sigkillTimer = setTimeout(() => {
         void termStep.then(() =>
           killProcessTree(cleanupTarget, 'SIGKILL', isWindows, cleanupAction),

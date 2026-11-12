@@ -443,6 +443,12 @@ export function fingerprintText(content: string): string;
 export function generateMonitorSchema(sources: ObservationSource[]): JsonSchema;
 
 // @public
+export interface GroupMembershipTracking {
+    readonly signal?: AbortSignal;
+    readonly untilMs: number;
+}
+
+// @public
 export interface HookDeliveryDiagnosis {
     // (undocumented)
     holds: HookDeliveryHold[];
@@ -1771,6 +1777,7 @@ export interface VerifiedSignalOptions {
     readonly deliver?: (signal: NodeJS.Signals) => void;
     readonly readProcessTable?: ProcessTableReader;
     readonly reportAbstention?: (abstention: SignalAbstention) => void;
+    readonly trackMembership?: GroupMembershipTracking;
 }
 
 // @public

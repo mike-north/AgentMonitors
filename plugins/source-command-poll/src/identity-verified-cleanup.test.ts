@@ -11,10 +11,17 @@
  * A process forked after the SIGTERM step is still ours: it is in the group the
  * command started, and the group's id cannot have been reused while a member
  * existed. The late-fork test drives that shape through a TERM trap that starts
- * a worker and exits, and requires the SIGKILL follow-up to remove the worker
- * (008 §3.1). The abstention for a group whose continuity is genuinely lost (a
- * recycled id) cannot be produced with real processes without wrapping the pid
- * space; it is covered against a fabricated process table in
+ * a worker and exits; the hand-off test drives it through a TERM-ignoring
+ * member that forks during the grace period and exits a second later, which
+ * only the grace-period membership readings can see. Both require the SIGKILL
+ * follow-up to remove the late process (008 §3.1).
+ *
+ * Continuity can still be lost in two ways, and the follow-up then abstains:
+ * the group empties and its id is reused, or, after the leader has exited, a
+ * member forks and exits within one reading interval while no other confirmed
+ * member is alive (008 §3.1's stated exception). The first needs the pid space
+ * to wrap; the second is real but timing-dependent. Both abstentions are
+ * pinned against fabricated process tables in
  * `libs/core/src/process/process-identity.test.ts`.
  *
  * Every process a test starts is killed in a `finally` that runs on failure too.
@@ -145,6 +152,85 @@ describe.skipIf(process.platform === 'win32')(
       } finally {
         vi.restoreAllMocks();
         killAll([workerPid ?? readPid(workerPidFile), leaderPid]);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }, 20_000);
+
+    // Regression (#479): a non-leader member that ignores SIGTERM forks a
+    // child during the grace period and then exits. Neither the SIGTERM read
+    // nor the read at the leader's exit saw the child, and by the SIGKILL step
+    // its parent was gone, so the step found only an unconfirmed process and
+    // abstained, leaving the child alive past the hard bound (008 §3.1). The
+    // readings taken during the grace period see parent and child together and
+    // confirm the child through the parent.
+    it('SIGKILLs a process a TERM-ignoring member hands off to during the grace period', async () => {
+      const dir = mkdtempSync(join(tmpdir(), 'am-479-relay-'));
+      const leaderPidFile = join(dir, 'leader.pid');
+      const memberPidFile = join(dir, 'member.pid');
+      const heirPidFile = join(dir, 'heir.pid');
+      const member = join(dir, 'member.sh');
+      // Timeline, with `timeout: 1s`: the SIGTERM step and the leader's exit
+      // happen at about 1 s. The member forks its heir at about 1.5 s, well
+      // after both of those reads, then outlives the fork by 1 s (several
+      // grace-period readings) and exits about 3.5 s before the SIGKILL step.
+      writeFileSync(
+        member,
+        [
+          `trap '' TERM`,
+          `echo $$ > '${memberPidFile}'`,
+          'sleep 1.5',
+          'sleep 30 &',
+          `echo $! > '${heirPidFile}'`,
+          'sleep 1',
+          'exit 0',
+          '',
+        ].join('\n'),
+      );
+
+      const killSpy = vi.spyOn(process, 'kill');
+      const stderrSpy = vi.spyOn(process.stderr, 'write');
+      let leaderPid: number | undefined;
+      let memberPid: number | undefined;
+      let heirPid: number | undefined;
+      try {
+        const result = await source.observe(
+          {
+            command: [
+              'sh',
+              '-c',
+              `echo $$ > '${leaderPidFile}'; sh '${member}' & wait`,
+            ],
+            timeout: '1s',
+          },
+          { now: NOW },
+        );
+        const payload = result.observations[0]?.payload as { error: string };
+        expect(payload.error).toMatch(/timed out/i);
+
+        leaderPid = readPid(leaderPidFile);
+        memberPid = readPid(memberPidFile);
+        expect(leaderPid).toBeDefined();
+        expect(memberPid).toBeDefined();
+        expect(
+          await pollUntil(() => readPid(heirPidFile) !== undefined, 3_000),
+        ).toBe(true);
+        heirPid = readPid(heirPidFile);
+        expect(heirPid).toBeDefined();
+
+        const dead = await pollUntil(
+          () => !isProcessAlive(heirPid ?? 0),
+          KILL_STEP_DEADLINE_MS,
+        );
+        expect(dead).toBe(true);
+        expect(killSpy).toHaveBeenCalledWith(-(leaderPid ?? 0), 'SIGKILL');
+        expect(stderrText(stderrSpy)).not.toContain('alone instead of sending');
+      } finally {
+        vi.restoreAllMocks();
+        killAll([
+          heirPid ?? readPid(heirPidFile),
+          memberPid ?? readPid(memberPidFile),
+          leaderPid,
+        ]);
         rmSync(dir, { recursive: true, force: true });
       }
     }, 20_000);
