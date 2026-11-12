@@ -298,7 +298,9 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       source_name TEXT NOT NULL,
       observation_data TEXT NOT NULL DEFAULT '{}',
       result TEXT NOT NULL,
-      created_at INTEGER NOT NULL
+      created_at INTEGER NOT NULL,
+      unretained_object_key TEXT,
+      unretained_event_watermark INTEGER
     )
   `);
 
@@ -325,6 +327,35 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // workspace-scoped history/explain query (a soft one-time reset of the audit
   // trail, consistent with the monitor_state re-baseline above).
   addColumnIfMissing(sqlite, 'observation_history', 'workspace_path', 'TEXT');
+  // Additive migration (002 §2, unretained admission outcomes): a drop row
+  // records the raw object key it names and the high-water mark of the event
+  // materialization order when it was admitted, so an event for that key
+  // admitted later can supersede it.
+  // Older rows keep NULL and are not drop rows.
+  addColumnIfMissing(
+    sqlite,
+    'observation_history',
+    'unretained_object_key',
+    'TEXT',
+  );
+  addColumnIfMissing(
+    sqlite,
+    'observation_history',
+    'unretained_event_watermark',
+    'INTEGER',
+  );
+  // Doctor and explain read a monitor's outstanding drops on every call: the
+  // partial index holds only drop rows, and the outcome index finds a later
+  // superseding span without scanning the monitor's whole history.
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_observation_history_unretained
+      ON observation_history (workspace_path, monitor_id, created_at, id)
+      WHERE unretained_event_watermark IS NOT NULL
+  `);
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_observation_history_outcome
+      ON observation_history (monitor_id, workspace_path, result, created_at, id)
+  `);
 
   sqlite.exec(
     createTableSql('monitor_events', MONITOR_EVENT_COLUMNS, {
@@ -339,7 +370,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   addColumnIfMissing(sqlite, 'monitor_events', 'baseline_strategy', 'TEXT');
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
-
+  // Additive migration (002 §2, unretained admission outcomes), after the order
+  // migration, whose rebuild carries this column only when it already exists:
+  // an event completed from the retry outbox records where its observation was
+  // admitted. Older rows keep NULL (admitted where they committed).
+  addColumnIfMissing(sqlite, 'monitor_events', 'admission_sequence', 'INTEGER');
   // Additive migration (issue #451): a `monitor_events` table created before
   // this column existed lacks `definition_fingerprint`. Add it if missing so
   // `monitor explain` can detect pending events that predate the monitor's
@@ -351,6 +386,15 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
     'definition_fingerprint',
     'TEXT',
   );
+  // Created after the order migration, which rebuilds `monitor_events`. Finds a
+  // later event for a dropped observation's object key (002 §2), covering the
+  // admission position the supersession check compares.
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_monitor_events_object_sequence
+      ON monitor_events (
+        monitor_id, workspace_path, object_key, sequence, admission_sequence
+      )
+  `);
 
   sqlite.exec(
     createTableSql('monitor_snapshots', MONITOR_SNAPSHOT_COLUMNS, {
@@ -374,9 +418,19 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       next_attempt_at INTEGER,
       last_error TEXT,
       created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL
+      updated_at INTEGER NOT NULL,
+      admission_sequence INTEGER
     )
   `);
+  // Additive migration (002 §2): a retained observation reserves its position
+  // in the event materialization order at admission. Rows queued before this
+  // column keep NULL; their completions count as admitted before any drop.
+  addColumnIfMissing(
+    sqlite,
+    'materialization_retry_outbox',
+    'admission_sequence',
+    'INTEGER',
+  );
 
   db.run(sql`
     CREATE INDEX IF NOT EXISTS idx_materialization_retry_due
@@ -539,6 +593,9 @@ const MONITOR_EVENT_COLUMNS: readonly ColumnDefinition[] = [
   { name: 'query_scope', definition: "TEXT NOT NULL DEFAULT '{}'" },
   { name: 'tags', definition: "TEXT NOT NULL DEFAULT '[]'" },
   { name: 'created_at', definition: 'INTEGER NOT NULL' },
+  // Where an event completed from the retry outbox was admitted in the
+  // materialization order; NULL on every other event (002 §2).
+  { name: 'admission_sequence', definition: 'INTEGER' },
 ];
 
 /** `monitor_snapshots` as a fresh database creates it (002 §15). */

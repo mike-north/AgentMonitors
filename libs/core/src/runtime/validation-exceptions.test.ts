@@ -98,10 +98,14 @@ function fixture() {
       const value = String(config['value']);
       if (context.previousState !== value) {
         yield {
-          title: value,
-          summary: value,
-          objectKey: name,
-          snapshotText: value,
+          observations: [
+            {
+              title: value,
+              summary: value,
+              objectKey: name,
+              snapshotText: value,
+            },
+          ],
         };
       }
     },

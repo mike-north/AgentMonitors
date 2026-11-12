@@ -359,7 +359,7 @@ The stored value is the trimmed body — leading and trailing whitespace are rem
 > predicates, `render: rendered`, malformed-CEL rejection); `libs/core/src/runtime/shape.ts`
 > (`computeDerivedFacts` pure over `(snapshot, now)`, `renderArtifact` byte-stable);
 > `libs/core/src/runtime/diff.ts` (`renderShapeArtifact`); wired in
-> `libs/core/src/runtime/service.ts` (`processObservation` → `shapeObservation`, diffing the rendered
+> `libs/core/src/runtime/service.ts` (`materializeObservation` → `shapeObservation`, diffing the rendered
 > artifact). Proven by `libs/core/src/runtime/shape.test.ts`,
 > `libs/core/src/runtime/shape-stage.test.ts`, and `libs/core/src/schema/monitor-schema.test.ts`.
 

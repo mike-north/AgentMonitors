@@ -455,7 +455,9 @@ describe('source config execution preflight', () => {
     const f = fixture();
     f.source.watch = async function* (config) {
       appendFileSync(f.marker, String(config['value']));
-      yield { title: 'Watch change', summary: 'Watch change' };
+      yield {
+        observations: [{ title: 'Watch change', summary: 'Watch change' }],
+      };
     };
     f.write('aaa-invalid', '  value: 42');
     f.write('zzz-healthy', '  value: healthy');

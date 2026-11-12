@@ -196,7 +196,7 @@ Interpret → Deliver → [React]`:
 > injected. It is best-effort — a tool failure falls back to the §1.1.5 `rendered` artifact and is
 > recorded — and every per-recipient verdict (`deliver` / `suppress` / `failed`) is recorded on
 > `session_event_state` and surfaced by `monitor explain` ([§10.7](./002-runtime-delivery.md#107-monitor-pipeline-diagnosis)),
-> so "why nothing fired" is inspectable (C12). Wired in `processObservation`/`runInterpret`
+> so "why nothing fired" is inspectable (C12). Wired in `interpretMaterializedObservation`/`runInterpret`
 > (`libs/core/src/runtime/service.ts`), with the per-recipient verdict persisted via
 > `recordInterpretDecision` and excluded-when-suppressed from delivery (`libs/core/src/runtime/store.ts`),
 > on new `session_event_state.interpret_*` columns (`libs/core/src/inbox/schema.ts` / `db.ts`). Proven
@@ -213,7 +213,7 @@ Interpret → Deliver → [React]`:
 > (`prose | structured | artifact | rendered`, the stable exported `PayloadForm` type) with a turnkey
 > transform for `structured` — `jq` reshapes, `cel` gates (`false` suppresses delivery) via
 > `applyPayloadTransform` (`libs/core/src/runtime/transform.ts`), C46. New `shape`/`payload`
-> frontmatter (`libs/core/src/schema/monitor-schema.ts`), wired in `processObservation`
+> frontmatter (`libs/core/src/schema/monitor-schema.ts`), wired in `materializeObservation`
 > (`libs/core/src/runtime/service.ts` → `shape-stage.ts`). Sources surface raw facts and do not
 > pre-compute them ([003 §2.7](./003-source-plugins.md)). The transform evaluators (`cel-js`,
 > `jq-in-the-browser`) are CSP/Workers-safe (no `Function`/`eval`). Proven by

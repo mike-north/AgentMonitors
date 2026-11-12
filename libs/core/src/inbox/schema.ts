@@ -81,6 +81,16 @@ export const monitorEvents = sqliteTable('monitor_events', {
   queryScope: text('query_scope').notNull().default('{}'),
   tags: text('tags').notNull().default('[]'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * Where this event's observation was admitted in the materialization order,
+   * when that differs from `sequence`: set only on an event completed from the
+   * retry outbox, to the position its retry reserved at admission (0 for a
+   * retry admitted before positions were reserved). NULL on every event
+   * materialized in its admitting span, whose admission position is its own
+   * `sequence`. Supersession of a dropped observation compares admission, not
+   * commit, so an older retry completed after a drop cannot clear it (002 §2).
+   */
+  admissionSequence: integer('admission_sequence'),
   // A content fingerprint of the parts of the monitor's definition that decide
   // what an event is (urgency, urgencyMax, body, name, watch minus scheduling
   // keys, shape, payload, baseline-strategy; 002 §5.3) at materialization time
@@ -132,6 +142,15 @@ export const materializationRetryOutbox = sqliteTable(
     lastError: text('last_error'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
     updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+    /**
+     * The position this observation took in the `monitor_events` materialization
+     * order when it was admitted: reserved from that table's AUTOINCREMENT
+     * counter in the admitting transaction, so it is strictly after every event
+     * and drop committed before it and before every later one. Its completed
+     * event carries it as `admission_sequence`. NULL on rows admitted before
+     * positions were reserved.
+     */
+    admissionSequence: integer('admission_sequence'),
   },
 );
 
@@ -343,4 +362,22 @@ export const observationHistory = sqliteTable('observation_history', {
     ],
   }).notNull(),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * Set only on an unretained-admission drop row (002 §2): the dropped
+   * observation's raw `objectKey`, matched exactly against
+   * `monitor_events.object_key`. NULL on a drop of an observation without a
+   * string object key, and on every other row.
+   */
+  unretainedObjectKey: text('unretained_object_key'),
+  /**
+   * Set only on a drop row, and what marks it as one: the high-water mark of
+   * the `monitor_events` materialization order (its AUTOINCREMENT counter,
+   * which also covers positions reserved by retained retries) when the drop
+   * was recorded, read inside the admitting transaction. An event for the same
+   * monitor, workspace and object key whose observation was admitted above it
+   * (`admission_sequence`, else `sequence`) supersedes the drop. Event
+   * `created_at` is observation time, not admission order, so it cannot order
+   * an event against a history row.
+   */
+  unretainedEventWatermark: integer('unretained_event_watermark'),
 });

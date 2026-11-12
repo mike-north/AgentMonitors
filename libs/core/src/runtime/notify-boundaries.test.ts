@@ -1,4 +1,8 @@
-/** Accepted #556 / 002 §4.6: effective edits fence actual durable watcher acceptance. */
+/**
+ * Accepted #556 / 002 §2.4 / §4.6: effective edits fence actual durable watch
+ * batch admission. A batch that meets a closed gate waits unadmitted, with no
+ * newer pull, until reconciliation reopens the gate or the watcher is stopped.
+ */
 import {
   mkdtempSync,
   mkdirSync,
@@ -17,6 +21,7 @@ import { SourceRegistry } from '../observation/registry.js';
 import type {
   Observation,
   ObservationContext,
+  ObservationResult,
   ObservationSource,
 } from '../observation/types.js';
 import type { MonitorDefinition } from '../schema/types.js';
@@ -55,8 +60,12 @@ function fixture(policy = DEBOUNCE, urgency = 'normal') {
   const queue: Observation[] = [
     { title: 'A', snapshotText: 'A', objectKey: 'obj' },
   ];
-  let context: (ObservationContext & { signal: AbortSignal }) | undefined;
-  let releaseYield: ((value: IteratorResult<Observation>) => void) | undefined;
+  let context: ObservationContext | undefined;
+  let releaseBatch:
+    | ((value: IteratorResult<ObservationResult>) => void)
+    | undefined;
+  /** Wakes callers waiting for the watcher's next pull, i.e. full admission of the prior batch. */
+  const pullWaiters: (() => void)[] = [];
   let calls = 0;
   let finishImmediately = false;
   const source: ObservationSource = {
@@ -76,12 +85,13 @@ function fixture(policy = DEBOUNCE, urgency = 'normal') {
         [Symbol.asyncIterator]() {
           return this;
         },
-        next(): Promise<IteratorResult<Observation>> {
-          if (finishImmediately || ctx.signal.aborted)
+        next(): Promise<IteratorResult<ObservationResult>> {
+          for (const wake of pullWaiters.splice(0)) wake();
+          if (finishImmediately || ctx.signal?.aborted)
             return Promise.resolve({ done: true, value: undefined });
           return new Promise((resolve) => {
-            releaseYield = resolve;
-            ctx.signal.addEventListener(
+            releaseBatch = resolve;
+            ctx.signal?.addEventListener(
               'abort',
               () => resolve({ done: true, value: undefined }),
               { once: true },
@@ -155,6 +165,7 @@ function fixture(policy = DEBOUNCE, urgency = 'normal') {
     reopen() {
       current.client.close();
       context = undefined;
+      releaseBatch = undefined;
       current = open();
     },
     hook(session = lead) {
@@ -168,16 +179,39 @@ function fixture(policy = DEBOUNCE, urgency = 'normal') {
       expect(context).toBeDefined();
       return handle;
     },
-    checkpoint() {
-      if (!context?.checkpoint)
-        throw new Error('Actual source checkpoint is not ready');
-      return context.checkpoint({ cursor: 999 });
+    /**
+     * Answer the watcher's outstanding pull with one batch. The returned promise
+     * settles once the batch is fully admitted (the watcher pulls again) or the
+     * watcher is aborted with the batch still unadmitted.
+     */
+    send(batch: ObservationResult): Promise<void> {
+      const release = releaseBatch;
+      if (!release || !context)
+        throw new Error('Actual watcher is not waiting');
+      releaseBatch = undefined;
+      const signal = context.signal;
+      const settled = new Promise<void>((resolve) => {
+        pullWaiters.push(resolve);
+        signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+      release({ done: false, value: batch });
+      return settled;
     },
-    yieldC() {
-      if (!releaseYield) throw new Error('Actual watcher is not waiting');
-      releaseYield({
-        done: false,
-        value: { title: 'C', snapshotText: 'C', objectKey: 'obj' },
+    /** A batch is parked on the closed admission gate, not merely slow to be pulled. */
+    gated() {
+      const runtime = current.runtime as unknown as {
+        watchPolicyWaiters: Map<string, unknown>;
+      };
+      return runtime.watchPolicyWaiters.has(JSON.stringify([root, 'held']));
+    },
+    /** A baseline-only batch: no observations, a new restart baseline. */
+    sendBaseline() {
+      return this.send({ observations: [], nextState: { cursor: 999 } });
+    },
+    /** An observation batch that leaves the restart baseline unchanged. */
+    sendC() {
+      return this.send({
+        observations: [{ title: 'C', snapshotText: 'C', objectKey: 'obj' }],
       });
     },
     async prepare(monitor: MonitorDefinition) {
@@ -249,30 +283,26 @@ it('policy identity includes escalation in throttle and preserves scalar/equival
   );
 });
 
-for (const operation of ['checkpoint', 'yield'] as const) {
-  for (const timing of [
-    'blocked',
-    operation === 'checkpoint' ? 0 : 1,
-  ] as const) {
+for (const operation of ['baseline', 'observation'] as const) {
+  for (const timing of ['blocked', operation === 'baseline' ? 0 : 1] as const) {
     const interleave = timing !== 'blocked';
-    it(`${operation} stays fenced by a failed edit, close-microtask=${timing}`, async () => {
+    it(`${operation} batch stays fenced by a failed edit, close-microtask=${timing}`, async () => {
       const f = fixture();
       await f.tick();
       await f.watch();
       const original = f.state();
-      // A stale yield must not enter ordinary overdue flushing while its edit is blocked.
-      if (operation === 'yield')
+      // A stale batch must not enter ordinary overdue flushing while its edit is blocked.
+      if (operation === 'observation')
         vi.setSystemTime(new Date(START.getTime() + 11_000));
       const edited = f.edit('');
       f.fault();
       let pending: Promise<void> | undefined;
       const enqueue = () => {
-        if (operation === 'checkpoint') pending = f.checkpoint();
-        else f.yieldC();
+        pending = operation === 'baseline' ? f.sendBaseline() : f.sendC();
       };
       if (interleave) {
         enqueue();
-        // The operation has entered the actual watcher chain. Reconciliation then closes its gate.
+        // The batch has entered the actual watcher chain. Reconciliation then closes its gate.
         await new Promise<void>((resolve) => {
           const close = (remaining: number) =>
             queueMicrotask(() => {
@@ -286,6 +316,7 @@ for (const operation of ['checkpoint', 'yield'] as const) {
         enqueue();
       }
       await turns();
+      expect(f.gated()).toBe(true);
       expect(f.state()).toEqual(original);
       expect(f.rows()).toEqual([]);
       expect(f.hook().unread.total).toBe(0);
@@ -293,31 +324,35 @@ for (const operation of ['checkpoint', 'yield'] as const) {
       expect((await f.prepare(edited)).accepted).toBe(true);
       await pending;
       await turns();
-      expect(f.rows()).toEqual(operation === 'yield' ? ['A', 'C'] : ['A']);
+      expect(f.rows()).toEqual(
+        operation === 'observation' ? ['A', 'C'] : ['A'],
+      );
       expect(f.state().sourceState).toEqual({
-        cursor: operation === 'checkpoint' ? 999 : 1,
+        cursor: operation === 'baseline' ? 999 : 1,
       });
       expect(
         f.current.store.latestSnapshot('held', 'obj', f.root)?.content,
-      ).toBe(operation === 'yield' ? 'C' : 'A');
+      ).toBe(operation === 'observation' ? 'C' : 'A');
+      expect(f.state().notifyState.policyKey).toEqual(expect.any(String));
     });
   }
 }
 
-it('cancellation releases a checkpoint caught by the failed-drain gate without persisting it', async () => {
+it('cancellation drops a baseline-only batch caught by the failed-drain gate without persisting it', async () => {
   const f = fixture();
   await f.tick();
   const handle = await f.watch();
   const original = f.state();
   f.fault();
   const edited = f.edit('');
-  const pending = f.checkpoint();
+  const pending = f.sendBaseline();
   await new Promise<void>((resolve) =>
     queueMicrotask(() => {
       void f.prepare(edited).then(() => resolve());
     }),
   );
   await turns();
+  expect(f.gated()).toBe(true);
   await handle.stop();
   await pending;
   expect(f.state()).toEqual(original);
@@ -325,7 +360,7 @@ it('cancellation releases a checkpoint caught by the failed-drain gate without p
 });
 
 for (const complete of [false, true]) {
-  it(`startup drain refreshes the actual lead hook without tick/yield, completes=${complete}`, async () => {
+  it(`startup drain refreshes the actual lead hook without tick/batch, completes=${complete}`, async () => {
     const f = fixture();
     await f.tick();
     const foreignBefore = readFileSync(f.foreign.hookStatePath, 'utf8');
@@ -396,9 +431,10 @@ it('an admitted watcher span finishes its synchronous writes before Interpret ca
   );
   await f.watch();
   vi.setSystemTime(new Date(START.getTime() + 11_000));
-  f.yieldC();
+  const admitted = f.sendC();
   await turns();
   await blocked;
+  await admitted;
   await turns();
   expect(interpreted).toEqual([
     ['A', 'B'],
@@ -415,13 +451,13 @@ it('an admitted watcher span finishes its synchronous writes before Interpret ca
   expect(f.state().sourceState).toEqual({ cursor: 1 });
 });
 
-it('a queued yield adopts the latest successful pacing edit while keeping its execution/handling snapshot', async () => {
+it('a queued batch adopts the latest successful pacing edit while keeping its execution/handling snapshot', async () => {
   const f = fixture();
   await f.tick();
   const watcher = await f.watch();
   const rollup = "notify:\n  strategy: rollup\n  window: '0 0 1 1 *'\n";
   const edited = f.edit(rollup, 'normal', 'Edited instructions');
-  f.yieldC();
+  const admitted = f.sendC();
   await new Promise<void>((resolve) =>
     queueMicrotask(() =>
       queueMicrotask(() => {
@@ -429,6 +465,7 @@ it('a queued yield adopts the latest successful pacing edit while keeping its ex
       }),
     ),
   );
+  await admitted;
   await turns();
   expect(f.rows()).toEqual(['A']);
   const captured = f.state().notifyState.pendingRollup?.observations;

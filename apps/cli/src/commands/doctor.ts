@@ -8,8 +8,13 @@ import type {
   HookDeliveryDiagnosis,
   MaterializationRetrySummary,
   MonitorDoctorReport,
+  OrphanedMonitorWork,
+  UnretainedObservationLoss,
 } from '@agentmonitors/core';
-import { retryRecordLines } from '../retry-diagnostics.js';
+import {
+  describeUnretainedObservation,
+  retryRecordLines,
+} from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { readLocalState } from '../local-state.js';
 import {
@@ -123,23 +128,31 @@ const NEVER_OBSERVED_REMEDIATION =
  * Older daemon reports omit retry metadata entirely (no per-monitor summaries
  * and no orphan groups); for those the empty-summary default is preserved.
  * On a current report, a monitor row without `materializationRetries` whose id
- * has an orphan group is deliberately unattributed (a duplicated id reports its
- * outbox there), so no count is claimed; without such a group it has no work.
+ * has retained work in an orphan group is deliberately unattributed (a
+ * duplicated id reports its outbox there), so no count is claimed; otherwise
+ * it has no retained work.
  */
 function retryOutboxFor(
-  report: Pick<MonitorDoctorReport, 'orphanedMaterializationRetries'>,
+  report: Pick<MonitorDoctorReport, 'orphanedMonitorWork'>,
   monitor: DoctorMonitorRollup,
 ): MaterializationRetrySummary | undefined {
   if (monitor.materializationRetries) return monitor.materializationRetries;
   // Only an id whose outbox really sits in an orphan group is "orphaned"; a
-  // duplicated id with no retained work has nothing to attribute, so 0/0 is true.
-  if (
-    report.orphanedMaterializationRetries?.some(
-      (group) => group.monitorId === monitor.id,
-    )
-  )
+  // duplicated id whose group holds only a loss has an empty outbox, so 0/0 is true.
+  if (orphanedWorkFor(report, monitor.id)?.materializationRetries) {
     return undefined;
+  }
   return { pending: 0, terminal: 0, bytes: 0, records: [] };
+}
+
+/** The orphan group holding this id's obligations, if any. */
+function orphanedWorkFor(
+  report: Pick<MonitorDoctorReport, 'orphanedMonitorWork'>,
+  monitorId: string,
+): OrphanedMonitorWork | undefined {
+  return report.orphanedMonitorWork?.find(
+    (group) => group.monitorId === monitorId,
+  );
 }
 
 /** Path equality that tolerates symlinked spellings (e.g. macOS /tmp vs /private/tmp). */
@@ -158,6 +171,18 @@ function samePath(a: string, b: string): boolean {
     }
   };
   return canonical(a) === canonical(b);
+}
+
+/**
+ * `monitor history <id>` scoped like `explainCommand`. History scopes by
+ * `--workspace` only (it has no `--dir`), so only that flag is carried.
+ */
+function historyCommand(report: MonitorDoctorReport, id: string): string {
+  const flags: string[] = [];
+  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
+    flags.push('--workspace', shellArg(report.workspacePath));
+  }
+  return ['agentmonitors monitor history', shellArg(id), ...flags].join(' ');
 }
 
 /** `monitor explain <id>` carrying the scope doctor was given, so it reads the same workspace. */
@@ -196,6 +221,11 @@ function rollupLine(
   hasLeadSession: boolean,
 ): string {
   const retryOutbox = retryOutboxFor(report, monitor);
+  // A duplicated id's drop is reported once, in its orphan group's check.
+  const orphanedLoss = orphanedWorkFor(report, monitor.id)
+    ?.unretainedObservationLoss
+    ? ['dropped-observation=orphaned']
+    : [];
   return [
     `source=${monitor.sourceName}`,
     `urgency=${monitor.urgency}`,
@@ -206,6 +236,7 @@ function rollupLine(
     retryOutbox
       ? `retry-outbox=${String(retryOutbox.pending)}/${String(retryOutbox.terminal)}`
       : 'retry-outbox=orphaned',
+    ...orphanedLoss,
     hasLeadSession
       ? `unread/claimed/acked=${String(monitor.delivery.unread)}/${String(monitor.delivery.claimed)}/${String(monitor.delivery.acknowledged)}`
       : 'lead-session=none',
@@ -391,6 +422,16 @@ function buildChecks(
         status: 'skip',
         detail: `invalid definition (see monitors-valid)  ${rollup}`,
       });
+    } else if (monitor.unretainedObservationLoss) {
+      // A drop has no retry record, so the retry counts in the rollup cannot
+      // show it; it outranks them because it cannot be recovered (002 §2).
+      const loss = monitor.unretainedObservationLoss;
+      checks.push({
+        name,
+        status: 'fail',
+        detail: `${unretainedLossDetail(loss)}  ${rollup}`,
+        remediation: `Inspect it with \`${explainCommand(report, monitor.id)}\` and \`${historyCommand(report, monitor.id)}\`, then repair the reported failure. ${UNRETAINED_CLEARS}`,
+      });
     } else if ((retryOutbox?.terminal ?? 0) > 0) {
       checks.push({
         name,
@@ -424,14 +465,150 @@ function buildChecks(
         report,
         monitor.id,
         monitor.materializationRetries,
+        { kind: 'definition' },
+      );
+    }
+    if (!monitor.valid && monitor.unretainedObservationLoss) {
+      addUnretainedLossCheck(
+        checks,
+        report,
+        monitor.id,
+        monitor.unretainedObservationLoss,
+        { kind: 'definition' },
       );
     }
   }
-  for (const group of report.orphanedMaterializationRetries ?? []) {
-    addRetainedWorkCheck(checks, report, group.monitorId, group.summary);
+  for (const work of report.ephemeralMonitorWork ?? []) {
+    const owner: WorkOwner = {
+      kind: 'live-ephemeral',
+      sessionId: work.sessionId,
+      ...(work.validationError !== undefined
+        ? { validationError: work.validationError }
+        : {}),
+    };
+    if (work.materializationRetries) {
+      addRetainedWorkCheck(
+        checks,
+        report,
+        work.monitorId,
+        work.materializationRetries,
+        owner,
+      );
+    }
+    if (work.unretainedObservationLoss) {
+      addUnretainedLossCheck(
+        checks,
+        report,
+        work.monitorId,
+        work.unretainedObservationLoss,
+        owner,
+      );
+    }
+  }
+  for (const group of report.orphanedMonitorWork ?? []) {
+    const owner: WorkOwner = {
+      kind:
+        group.monitorKind === 'ephemeral' ? 'retired-ephemeral' : 'definition',
+    };
+    if (group.materializationRetries) {
+      addRetainedWorkCheck(
+        checks,
+        report,
+        group.monitorId,
+        group.materializationRetries,
+        owner,
+      );
+    }
+    if (group.unretainedObservationLoss) {
+      addUnretainedLossCheck(
+        checks,
+        report,
+        group.monitorId,
+        group.unretainedObservationLoss,
+        owner,
+      );
+    }
   }
 
   return checks;
+}
+
+/**
+ * Who an id's retained work or drop belongs to when it has no healthy rollup,
+ * which decides what the user can do about it: a `MONITOR.md` definition that
+ * is invalid, removed, unparseable or duplicated; a live ephemeral monitor
+ * (no definition file, owned by its declaring session); or a retired
+ * (cancelled or reaped) ephemeral monitor, which has nothing to repair and
+ * will never observe again.
+ */
+type WorkOwner =
+  | { kind: 'definition' }
+  | { kind: 'live-ephemeral'; sessionId: string; validationError?: string }
+  | { kind: 'retired-ephemeral' };
+
+/** The leading clause of a check detail that names a non-definition owner. */
+function ownerPrefix(owner: WorkOwner): string {
+  switch (owner.kind) {
+    case 'definition':
+      return '';
+    case 'live-ephemeral':
+      return `ephemeral monitor of session ${owner.sessionId}; `;
+    case 'retired-ephemeral':
+      return 'retired ephemeral monitor; ';
+  }
+}
+
+/** Why there is no definition to repair, for the ephemeral owners. */
+const LIVE_EPHEMERAL =
+  'It is an ephemeral monitor declared by that session with `agentmonitors watch`, so it has no MONITOR.md definition.';
+const RETIRED_EPHEMERAL =
+  'It was an ephemeral monitor declared by an agent session and has since been cancelled or reaped: it never had a MONITOR.md definition, so there is nothing to repair, and it will not observe again.';
+
+/**
+ * A live ephemeral watch whose persisted scope its source now rejects: every
+ * tick skips it and a scope cannot be edited, so nothing it owes can clear.
+ * Cancelling and declaring it again restores observation under a new id, but
+ * the old id's outstanding drop and retained work stay reported under it.
+ */
+function rejectedScopeRemediation(validationError: string): string {
+  return `Its persisted scope is now rejected by its source (${validationError}), so every tick skips it and no later event can clear this. An ephemeral scope cannot be edited. Cancelling the watch and declaring it again with a valid scope restores observation, but the new declaration gets a new id: this id's outstanding drop and retained work stay reported under its retired id, and this check keeps failing.`;
+}
+
+/** When a drop stops failing doctor (002 §2): only a superseding outcome clears it. */
+const UNRETAINED_CLEARS =
+  'A dropped observation cannot be retried. This check clears once a later event of this monitor materializes for each dropped object key; a drop without an object key clears once a later observation span of this monitor materializes an event and drops nothing.';
+
+/** The shared description of an outstanding drop, for the monitor and orphan checks. */
+function unretainedLossDetail(loss: UnretainedObservationLoss): string {
+  return `observation dropped, not retained for retry (${String(loss.count)} outstanding; newest: ${describeUnretainedObservation(loss)} at ${loss.recordedAt.toISOString()}): ${loss.error}`;
+}
+
+/**
+ * A drop stays a failure when its monitor has no valid, unambiguous current
+ * definition, like retained work: it must never vanish with the definition.
+ */
+function addUnretainedLossCheck(
+  checks: DoctorCheck[],
+  report: MonitorDoctorReport,
+  monitorId: string,
+  loss: UnretainedObservationLoss,
+  owner: WorkOwner,
+): void {
+  const inspect = `\`${historyCommand(report, monitorId)}\``;
+  const remediation = {
+    definition: `Inspect it with ${inspect} and repair the definition or reported failure. ${UNRETAINED_CLEARS}`,
+    'live-ephemeral':
+      owner.kind === 'live-ephemeral' && owner.validationError !== undefined
+        ? `${LIVE_EPHEMERAL} ${rejectedScopeRemediation(owner.validationError)} Inspect what was lost with ${inspect}. A dropped observation cannot be retried.`
+        : `${LIVE_EPHEMERAL} Inspect it with ${inspect} and repair the reported failure. ${UNRETAINED_CLEARS}`,
+    'retired-ephemeral': `${RETIRED_EPHEMERAL} No later event can supersede this drop, so this check keeps failing; inspect what was lost with ${inspect}. A dropped observation cannot be retried.`,
+  }[owner.kind];
+  checks.push({
+    name: `dropped-observation:${monitorId}`,
+    status: 'fail',
+    detail: `${ownerPrefix(owner)}${unretainedLossDetail(loss)}`,
+    remediation,
+  });
 }
 
 /** Recovery obligations remain failures even without one valid current definition. */
@@ -440,15 +617,28 @@ function addRetainedWorkCheck(
   report: MonitorDoctorReport,
   monitorId: string,
   summary: MaterializationRetrySummary,
+  owner: WorkOwner,
 ): void {
   if (summary.pending === 0 && summary.terminal === 0) {
     return;
   }
+  // `monitor explain <id>` still lists an ephemeral monitor's retained record
+  // IDs (its definition stage fails, its retry section does not), in text and
+  // in the structured formats alike.
+  const listed = `Inspect its retained record IDs with \`${explainCommand(report, monitorId)}\` (its definition stage reports no MONITOR.md, which is expected) and its observations with \`${historyCommand(report, monitorId)}\`.`;
+  const remediation = {
+    definition: `Inspect retained record IDs with \`${explainCommand(report, monitorId)}\` and repair the definition or reported failure.`,
+    'live-ephemeral':
+      owner.kind === 'live-ephemeral' && owner.validationError !== undefined
+        ? `${LIVE_EPHEMERAL} ${rejectedScopeRemediation(owner.validationError)} ${listed}`
+        : `${LIVE_EPHEMERAL} ${listed}`,
+    'retired-ephemeral': `${RETIRED_EPHEMERAL} ${listed}`,
+  }[owner.kind];
   checks.push({
     name: `retry-outbox:${monitorId}`,
     status: 'fail',
-    detail: `retained materialization work  retry-outbox=${String(summary.pending)}/${String(summary.terminal)}  bytes=${String(summary.bytes)}`,
-    remediation: `Inspect retained record IDs with \`${explainCommand(report, monitorId)}\` and repair the definition or reported failure. This CLI does not yet provide a retry action.`,
+    detail: `${ownerPrefix(owner)}retained materialization work  retry-outbox=${String(summary.pending)}/${String(summary.terminal)}  bytes=${String(summary.bytes)}`,
+    remediation: `${remediation} This CLI does not yet provide a retry action.`,
   });
 }
 
@@ -678,7 +868,14 @@ function renderText(
         ? [{ monitorId: monitor.id, summary: monitor.materializationRetries }]
         : [],
     ),
-    ...(report.orphanedMaterializationRetries ?? []),
+    ...[
+      ...(report.ephemeralMonitorWork ?? []),
+      ...(report.orphanedMonitorWork ?? []),
+    ].flatMap((work) =>
+      work.materializationRetries
+        ? [{ monitorId: work.monitorId, summary: work.materializationRetries }]
+        : [],
+    ),
   ]) {
     if (group.summary.records.length === 0) {
       continue;
@@ -760,7 +957,8 @@ function toJson(
       detail: check.detail,
       remediation: check.remediation ?? null,
     })),
-    orphanedMaterializationRetries: report.orphanedMaterializationRetries ?? [],
+    orphanedMonitorWork: report.orphanedMonitorWork ?? [],
+    ephemeralMonitorWork: report.ephemeralMonitorWork ?? [],
     parseErrors: report.parseErrors,
     duplicateIds: report.duplicateIds,
     monitors: report.monitors.map((monitor) => ({
@@ -782,6 +980,13 @@ function toJson(
       ...(retryOutboxFor(report, monitor)
         ? { materializationRetries: retryOutboxFor(report, monitor) }
         : {}),
+      unretainedObservationLoss: monitor.unretainedObservationLoss
+        ? {
+            ...monitor.unretainedObservationLoss,
+            recordedAt:
+              monitor.unretainedObservationLoss.recordedAt.toISOString(),
+          }
+        : null,
     })),
     summary: { passed, failed, skipped, idle },
   };
