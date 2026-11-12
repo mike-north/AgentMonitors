@@ -843,29 +843,11 @@ consume its baseline/cursor/held notify work, or abort healthy siblings, final
 suppression cleanup, or hook-state refresh. Correcting the schema permits normal
 preflight and recovery; ordinary scope rejections retain their existing messages.
 
-Dormant verify-session cleanup runs before observation preflight. It **MUST**
-preserve safely derivable runtime cadence when sizing scratch-event suppression,
-independently of unrelated source-schema rejection. Authored parseable intervals
-and known runtime defaults retain
-`max(5 minutes, poll interval + notify settle/suppress window + 1 minute margin)`.
-Only a missing definition or unavailable/unparseable cadence uses the existing
-five-minute floor; duration parsing must not abort cleanup or sibling evaluation.
-For example, invalid globs with a valid `10m` interval and `5s` settle retain
-`665000ms` from reaping, rather than shortening to five minutes. Ordinary source
-preflight still rejects that config before observation, leaving baseline and
-legitimate notify work intact.
-
-**Known current cleanup gap:** a deleted scratch key retained in source state or
-an already-held scratch envelope can materialize after finite suppression expires;
-a held-only create may never have projected an event for the reaper to discover.
-The intended no-later-scratch-event goal remains, but the current finite mechanism
-does not establish it for arbitrary delayed recovery or held-only discovery.
-[Mike's decision in #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
-accepts a separate M1 repair, [#562](https://github.com/mike-north/AgentMonitors/issues/562),
-sequenced after #305/#537/#554: durable exact ownership without TTL, explicit
-retirement, and no source-contract change. #557 may proceed after correcting its
-introduced cadence-window regression and documenting this gap; it does not wait
-for #562. No ownership/retention/filtering repair is implemented here.
+Verify-artifact ownership reconciliation (§2.6) runs before observation preflight and does not
+depend on the monitor's source config or cadence: an owner reaped while its monitor's config is
+rejected supplies the same durable cleanup authority as any other inactive owner, and no lifetime is
+derived from the rejected config. Ordinary source preflight still rejects that config before
+observation, leaving baseline and legitimate notify work intact.
 
 Continuous `watchMonitors()` startup **MUST** apply the same preflight before
 calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from
@@ -1071,6 +1053,92 @@ The runtime **MUST** surface `erroredObservations` so a caller (e.g. the CLI tic
 The runtime **MUST** surface `skippedMonitors` so a caller can distinguish "monitors exist but are not yet due" from "no monitors found" — two situations that previously produced identical CLI output (issue #152).
 
 Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObservation`, `SkippedMonitor`; `libs/core/src/runtime/service.ts` — `tick()` populates `erroredObservations` in both the `observe()` and `ingest()` error branches alongside the `recordObservationHistory({ result: 'errored' })` write; populates `skippedMonitors` in the `!schedule.due` branch from the same scheduling decision.
+
+### 2.6 Verify-artifact ownership (_current_)
+
+`agentmonitors verify --use-workspace-daemon` (005 §16) proves a file-fingerprint monitor against
+the user's persistent workspace daemon by creating a synthetic scratch file,
+`agentmonitors-verify-<token><ext>`, whose 12-hex-digit `<token>` is the run's random identity. The
+runtime keeps every observation of that exact file out of every later lead session once the run is
+finished with it, through **durable exact ownership** rather than a time-limited suppression.
+
+**Registration (before the artifact exists).** Before creating the file, the run registers one
+ownership record: `runId` (the token), the owner session (the run's own throwaway lead session),
+`workspacePath`, `monitorId` (the monitor being verified) and the exact `objectKey` (the scratch
+path). Registration **MUST** be refused when:
+
+- the key is not a verify scratch path, or its token differs from `runId` (a real watched path can
+  never acquire by-key authority; a verify that edits a real file keeps the exact-event-id cleanup of
+  005 §16 step 9);
+- the owner session does not exist, is not `active`, or belongs to another workspace;
+- the same workspace, monitor and key are already owned by another run;
+- the `runId` is already registered for a different owner, workspace, monitor or key.
+
+Repeating an identical registration (a retry, including after a crash or daemon restart) is a no-op
+that returns the existing record, so one run never holds more than one record. Only verify
+registration creates these records.
+
+**Proof phase.** While the owner session is `active` and has not requested cleanup, the artifact's
+observations are ordinary work: they materialize and project normally, so the run can observe its
+own proof delivery.
+
+**Cleanup authority.** Authority takes effect, and is never withdrawn, when either:
+
+- **`owner-request`** — the run asks for cleanup after its proof (`verifyArtifacts.requestCleanup`,
+  §10); or
+- **`owner-inactive`** — the owner session is closed, reaped as stale (§6.2), or missing.
+
+The first cause is recorded with its time (`cleanupRequestedAt`, `cleanupCause`); a later request or
+reconciliation keeps the first record. `owner-inactive` is recorded when the runtime closes or reaps
+the owner and again by reconciliation at the start of every tick, so a crash between ending the
+session and recording the cause is repaired on the next tick. Until it is recorded, an inactive owner
+already supplies authority at both filter boundaries below. When authority is recorded, the runtime
+retracts every existing event for the exact key in that workspace and refreshes hook state, in
+one store write.
+
+**Filtering.** With authority in effect, the runtime drops observations whose object key equals the
+registered key, for the registered monitor and workspace only, at two boundaries:
+
+1. **Incoming observations** — after the CEL pre-filter and before notify dispatch (§4), inside the
+   same transaction. A dropped observation never enters a debounce or rollup hold and never consumes
+   a throttle window that a later legitimate change needs. Poll results and watcher batches pass
+   through the same boundary.
+2. **Held emission** — when held work materializes: debounce settle, rollup window and escalation
+   flushes, and the notify-policy edit drain (§4.6). Legitimate items in the same held batch
+   materialize unchanged.
+
+Authority has **no wall-clock expiry**, and no successful poll, empty observation or other source
+outcome retires it. Source plugins are unaware of ownership: their opaque state, baselines and
+fingerprints are never cleared or rewritten, and the source contract (003) is unchanged. A source
+that still remembers the deleted scratch file and reports its deletion after an arbitrary delay,
+restart or config repair produces an observation that the incoming boundary drops.
+
+**Exactness.** A matching basename alone confers nothing: an unregistered scratch-looking path, even
+one projected into a reaped session whose host id looks like a verify session, is ordinary work. A
+foreign workspace with the same monitor id and key keeps delivering, and sibling monitors whose
+globs happen to match the scratch file are not filtered.
+
+**Retention.** Records are retained without a TTL, one row per verify run, which also keeps a
+retained key from ever being registered again. Nothing retires a record automatically; there is no
+retirement command today, and accumulation across verify runs is accepted. The cost is dominated by
+the workspace path and scratch key, each stored in the row and in the object index. Measured after
+`VACUUM` with SQLite `dbstat` (4 KiB pages, 151-character workspace path, 188-character key,
+samples of 100, 1,000 and 10,000 runs): about 850 bytes per run once cleanup is recorded, about
+1,000 bytes while a record awaits cleanup (the partial index releases its entry on cleanup), or
+roughly five runs per page.
+
+**Guarantee and its limits.** For a run that registered its artifact, no observation of the exact
+scratch key reaches a lead session other than the owner once cleanup authority is in effect, across
+arbitrary delay, daemon restart, held-work flushes and config repair. Before authority takes effect,
+a run that was killed is still in its proof phase: its events stay visible until the daemon reaps
+the owner as stale (§6.2) and retracts them. A client that predates ownership, or a current client
+against a daemon that predates it, falls back to the legacy `events.suppressObject` tombstone with a
+finite lifetime (005 §16 step 9), which does not carry this guarantee.
+
+Verified: `libs/core/src/runtime/verify-artifact-ownership.test.ts` (real file-fingerprint
+observations, SQLite close/reopen, an actual later-lead claim) and
+`libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in
+`libs/core/src/inbox/schema.ts` (`verify_artifacts`).
 
 ## 3. Persisted Monitor State
 
@@ -2307,20 +2375,22 @@ raw sockets, exact boundaries), and `apps/cli/src/daemon-ipc.test.ts`.
 
 The daemon socket exposes the following commands (the `DaemonMethod` enum):
 
-| Method            | Description                                                                                   |
-| ----------------- | --------------------------------------------------------------------------------------------- |
-| `ping`            | Health check; returns `{ ok: true }`                                                          |
-| `status`          | Returns `RuntimeStatus` (session counts, event count)                                         |
-| `stop`            | Requests graceful daemon shutdown                                                             |
-| `session.open`    | Opens or resumes a session; returns `AgentSessionRecord`                                      |
-| `session.close`   | Marks a session dormant; returns `AgentSessionRecord`                                         |
-| `session.list`    | Returns all `AgentSessionRecord[]`                                                            |
-| `events.list`     | Lists events, with optional filters; returns `MonitorEventRecord[]`                           |
-| `events.ack`      | Acknowledges events for a session                                                             |
-| `hook.claim`      | Claims a delivery payload for a session at a lifecycle point; returns `DeliveryClaim \| null` |
-| `history.list`    | Lists recent observation-history rows, optionally filtered by monitor id                      |
-| `monitor.explain` | Returns a read-only staged diagnosis for one monitor's current pipeline state                 |
-| `daemon.tick`     | Runs one tick on the specified monitors directory                                             |
+| Method                           | Description                                                                                                        |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `ping`                           | Health check; returns `{ ok: true }`                                                                               |
+| `status`                         | Returns `RuntimeStatus` (session counts, event count)                                                              |
+| `stop`                           | Requests graceful daemon shutdown                                                                                  |
+| `session.open`                   | Opens or resumes a session; returns `AgentSessionRecord`                                                           |
+| `session.close`                  | Marks a session dormant; returns `AgentSessionRecord`                                                              |
+| `session.list`                   | Returns all `AgentSessionRecord[]`                                                                                 |
+| `events.list`                    | Lists events, with optional filters; returns `MonitorEventRecord[]`                                                |
+| `events.ack`                     | Acknowledges events for a session                                                                                  |
+| `hook.claim`                     | Claims a delivery payload for a session at a lifecycle point; returns `DeliveryClaim \| null`                      |
+| `history.list`                   | Lists recent observation-history rows, optionally filtered by monitor id                                           |
+| `monitor.explain`                | Returns a read-only staged diagnosis for one monitor's current pipeline state                                      |
+| `daemon.tick`                    | Runs one tick on the specified monitors directory                                                                  |
+| `verifyArtifacts.register`       | Registers exact ownership of a verify scratch artifact before it is created (§2.6); returns `VerifyArtifactRecord` |
+| `verifyArtifacts.requestCleanup` | The owner's cleanup request after its proof (§2.6); returns `VerifyArtifactCleanupResult`                          |
 
 Verified: `apps/cli/src/daemon-ipc.ts` — `daemonMethodSchema` (lines 26–37); `handleRequest()` (lines 150–222).
 
@@ -2964,6 +3034,28 @@ re-baseline above).
 | `created_at`       | INTEGER NOT NULL |                                                                                      |
 
 Verified: `libs/core/src/inbox/schema.ts` lines 104–113; `libs/core/src/inbox/db.ts` lines 98–107; `libs/core/src/runtime/service.ts` `tick()` catch blocks (including the not-due rollup flush catch), `admitSpan()` unretained-failure rows, `finishMaterializationSpan()` failure rows and result classification, and `consumeWatch()`'s outer catch block.
+
+### `verify_artifacts`
+
+Durable verify-artifact ownership (§2.6). One row per `verify --use-workspace-daemon` run that
+registered its scratch artifact; retained without expiry. Created by an additive migration
+(`CREATE TABLE IF NOT EXISTS`), so every released database shape opens unchanged.
+
+| Column                 | Type             | Notes                                                       |
+| ---------------------- | ---------------- | ----------------------------------------------------------- |
+| `run_id`               | TEXT PK          | The run's 12-hex-digit token, also embedded in `object_key` |
+| `owner_session_id`     | TEXT NOT NULL    | The run's throwaway lead session                            |
+| `workspace_path`       | TEXT NOT NULL    |                                                             |
+| `monitor_id`           | TEXT NOT NULL    | The verified monitor; the filter is scoped to it            |
+| `object_key`           | TEXT NOT NULL    | Exact scratch path                                          |
+| `registered_at`        | INTEGER NOT NULL |                                                             |
+| `cleanup_requested_at` | INTEGER nullable | First time cleanup authority was recorded; never cleared    |
+| `cleanup_cause`        | TEXT nullable    | `owner-request \| owner-inactive`                           |
+
+Indexes: unique `idx_verify_artifacts_object (workspace_path, monitor_id, object_key)` (the filter
+lookup, and refusal of a key owned by another run); partial
+`idx_verify_artifacts_awaiting_cleanup (workspace_path, owner_session_id) WHERE cleanup_requested_at IS NULL`
+(per-tick reconciliation reads only records still awaiting cleanup).
 
 ### `inbox_items`
 

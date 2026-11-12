@@ -9,6 +9,33 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2.0/§2.6/§10.5/§15; 004 §2.5/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418
+
+Replace finite, time-limited scratch cleanup with durable exact ownership, as accepted in #561.
+`verify --use-workspace-daemon` registers its synthetic scratch key with the daemon before creating
+the file (`verifyArtifacts.register`), naming the run token, its throwaway session, the workspace and
+the verified monitor. Cleanup authority takes effect when the run requests cleanup after its proof
+(`verifyArtifacts.requestCleanup`) or when the owner session is closed, reaped or missing; it is
+recorded once, never withdrawn and has no wall-clock expiry. With authority in effect the runtime
+retracts the key's existing events and drops that exact key, for that monitor and workspace only,
+at the incoming-observation boundary (before notify dispatch) and at held emission (debounce,
+rollup, escalation flushes and the notify-edit drain). Source plugins and their state are unchanged.
+
+This restores the no-later-scratch-event guarantee for registered runs, including retained baseline
+deletions, held deletions and held-only creates after arbitrary delay, restart and config repair.
+The guarantee does not cover a killed run before its owner is reaped (the proof phase), clients or
+daemons that predate ownership (they keep the finite `events.suppressObject` fallback), or sibling
+monitors that happen to watch the scratch path. A matching basename alone no longer confers cleanup:
+the session reaper's basename-matched tombstone and its cadence-sized lifetime are removed, so 002
+§2.0 no longer sizes a suppression from cadence.
+
+Records are retained without a TTL in the additive `verify_artifacts` table (one row per run; no
+automatic retirement and no retirement command). Measured after `VACUUM` with `dbstat` on 4 KiB
+pages, with a 151-character workspace path and a 188-character key, at 100, 1,000 and 10,000 runs:
+about 850 bytes per run with cleanup recorded and about 1,000 bytes while awaiting cleanup, roughly
+five runs per page. The table, its indexes and every released database shape are covered by
+`db.released-shapes.test.ts`.
+
 ## 2026-11-12 — A notify-policy edit drains held rollup work in the rollup flush's owned transaction (002 §4.4/§4.6; 004 §3.4) — Refs #498
 
 Compose the locked not-due rollup flush with effective notify-policy edits. An edit that changes
