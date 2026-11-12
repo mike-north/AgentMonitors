@@ -1036,4 +1036,104 @@ describe('unretained admission migration (#497)', () => {
       ).toBeUndefined();
     },
   );
+
+  // Regression (#497): a retry queued before positions were reserved has a
+  // NULL outbox `admission_sequence` and predates every drop. Completing it
+  // must stamp the event 0, not leave NULL: a NULL falls back to the commit
+  // sequence, which sits above a drop recorded in the meantime, and would
+  // clear that newer drop with older state.
+  it('completes a pre-upgrade NULL-admission retry as admitted before a later drop of the same key, which stays outstanding', () => {
+    const dbPath = tempDbPath();
+    seedPre497(dbPath, 'ordered');
+    const db = createDb(dbPath);
+    const client = (db as unknown as { $client: Database.Database }).$client;
+    migrationClients.add(client);
+    const store = new RuntimeStore(db);
+
+    const observedAt = new Date(LEGACY_UPDATED_AT);
+    const [retry] = store.enqueueMaterializationRetries(
+      [
+        {
+          workspacePath: WORKSPACE,
+          monitorId: 'upgraded',
+          sourceName: 'test-source',
+          error: 'v1 failed',
+          envelope: {
+            monitor: {
+              id: 'upgraded',
+              displayName: 'upgraded',
+              filePath: path.join(WORKSPACE, 'upgraded', 'MONITOR.md'),
+              instructions: 'Handle it.',
+              frontmatter: {
+                watch: { type: 'test-source' },
+                urgency: 'normal',
+                urgencyMax: 'normal',
+                baselineStrategy: 'incremental',
+              },
+            },
+            observation: {
+              title: 'object-1 v1',
+              summary: 'object-1 v1',
+              objectKey: 'object-1',
+            },
+            observedAt,
+            effectiveUrgency: 'normal',
+          },
+        },
+      ],
+      observedAt,
+    );
+    if (!retry) throw new Error('expected a retry record');
+    // The pre-upgrade shape: the row was queued before the column existed.
+    client
+      .prepare(
+        'UPDATE materialization_retry_outbox SET admission_sequence = NULL WHERE id = ?',
+      )
+      .run(retry.id);
+
+    store.recordUnretainedObservation({
+      monitorId: 'upgraded',
+      workspacePath: WORKSPACE,
+      sourceName: 'test-source',
+      objectKey: 'object-1',
+      observationData: {
+        error: 'Not retained for retry: capacity',
+        notRetained: true,
+        position: 1,
+        spanSize: 1,
+        objectKey: 'object-1',
+      },
+    });
+
+    const completed = store.completeMaterializationRetry(retry.id, {
+      monitorId: 'upgraded',
+      workspacePath: WORKSPACE,
+      sourceName: 'test-source',
+      urgency: 'normal',
+      title: 'object-1 v1',
+      body: '',
+      summary: 'object-1 v1',
+      payload: {},
+      snapshotMetadata: {},
+      snapshotText: null,
+      diffText: null,
+      objectKey: 'object-1',
+      baselineStrategy: 'incremental',
+      queryScope: {},
+      tags: [],
+      createdAt: observedAt,
+    });
+
+    expect(
+      client
+        .prepare<
+          [string],
+          { admission_sequence: number | null }
+        >('SELECT admission_sequence FROM monitor_events WHERE id = ?')
+        .get(completed.id)?.admission_sequence,
+    ).toBe(0);
+    expect(
+      store.outstandingUnretainedObservationLoss('upgraded', WORKSPACE),
+    ).toMatchObject({ count: 1, objectKey: 'object-1' });
+  });
 });

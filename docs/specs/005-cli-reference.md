@@ -2037,8 +2037,9 @@ check keeps the clearing rule above. After `watch cancel` or reaping it is a _re
 monitor in `orphanedMonitorWork` (`monitorKind: "ephemeral"`): its checks begin
 `retired ephemeral monitor; `, say it was cancelled or reaped, never had a definition and will not
 observe again, and that the drop check therefore keeps failing (002 §2). No command clears it.
-Retained-work remediation for either names doctor's own `Retry outbox <id>` listing and
-`monitor history <id>`, since `monitor explain` resolves `MONITOR.md` definitions only.
+Retained-work remediation for either names `monitor explain <id>` (its definition stage reports no
+`MONITOR.md`, but it still lists the retained record IDs, in text and structured output) and
+`monitor history <id>`.
 
 Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
 through the built CLI, kept failing after a tick of other object keys and cleared by a later

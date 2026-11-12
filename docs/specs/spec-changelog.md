@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-11 — Ephemeral retained-work remediation names `monitor explain` (005 doctor)
+
+Corrected a false statement in 005: `monitor explain <ephemeral id>` fails its definition stage
+(there is no `MONITOR.md`) but still lists the monitor's retained record IDs, in text and structured
+output. _Current:_ retained-work remediation for a live or retired ephemeral monitor names
+`monitor explain <id>` and `monitor history <id>`, not a text-only doctor heading.
+
 ## 2026-11-11 — A drop is superseded by a later observation, not a later write; ephemeral attribution; orphan work renamed (002 §2/`monitor_events`/`materialization_retry_outbox`/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
 
 Correct the entry below. "Later" for a keyed drop was commit order, and 002 said a retained retry

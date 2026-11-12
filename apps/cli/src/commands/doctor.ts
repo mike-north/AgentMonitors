@@ -606,9 +606,10 @@ function addRetainedWorkCheck(
   if (summary.pending === 0 && summary.terminal === 0) {
     return;
   }
-  // `monitor explain` resolves MONITOR.md definitions only; an ephemeral
-  // monitor's record IDs are listed in doctor's own retry-outbox section.
-  const listed = `Its retained record IDs are listed under "Retry outbox ${monitorId}" below; inspect its observations with \`${historyCommand(report, monitorId)}\`.`;
+  // `monitor explain <id>` still lists an ephemeral monitor's retained record
+  // IDs (its definition stage fails, its retry section does not), in text and
+  // in the structured formats alike.
+  const listed = `Inspect its retained record IDs with \`${explainCommand(report, monitorId)}\` (its definition stage reports no MONITOR.md, which is expected) and its observations with \`${historyCommand(report, monitorId)}\`.`;
   const remediation = {
     definition: `Inspect retained record IDs with \`${explainCommand(report, monitorId)}\` and repair the definition or reported failure.`,
     'live-ephemeral': `${LIVE_EPHEMERAL} ${listed}`,

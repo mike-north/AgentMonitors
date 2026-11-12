@@ -1825,6 +1825,89 @@ it('attributes a live ephemeral drop to its monitor and reports a cancelled one 
 }, 30_000);
 
 /**
+ * Regression for #497 review: the retained-work remediation of an ephemeral
+ * monitor claimed `monitor explain` cannot serve it and pointed at a heading
+ * that exists only in text output. `monitor explain <id>` fails its
+ * definition stage for an ephemeral id but still lists the retained record
+ * IDs, in text and JSON, so the remediation must name it.
+ */
+it('points ephemeral retained-work remediation at a `monitor explain` that lists the record ids, in text and JSON', async () => {
+  mkdirSync(path.join(root, 'monitors'), { recursive: true });
+  const dbPath = path.join(root, 'state.db');
+  const db = createDb(dbPath);
+  const client = (db as unknown as { $client: Database }).$client;
+  let monitorId: string;
+  try {
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'retain-source',
+      scopeSchema: { type: 'object' },
+      stateful: true,
+      observe: () =>
+        Promise.resolve({
+          observations: ['r-0', 'r-1', 'r-2'].map((title, index) => ({
+            title,
+            summary: title,
+            objectKey: `object-${String(index)}`,
+          })),
+          nextState: { seeded: true },
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(new RuntimeStore(db), registry, [
+      claudeCodeAdapter,
+    ]);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'lead-ephemeral-retained',
+        workspacePath: root,
+      }),
+    );
+    const watch = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'retain-source',
+      scope: {},
+      instruction: 'Watch.',
+    });
+    monitorId = watch.id;
+    // A native fault on the second observation retains it and its successor.
+    client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
+      WHEN NEW.summary = 'r-1'
+      BEGIN SELECT RAISE(ABORT, 'native fault on r-1'); END;`);
+    await runtime.tick(path.join(root, 'monitors'), root);
+  } finally {
+    client.close();
+  }
+
+  const checkName = `retry-outbox:${monitorId}`;
+  const doctor = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+  const check = doctor.checks.find(
+    (candidate: { name: string }) => candidate.name === checkName,
+  );
+  expect(check.status).toBe('fail');
+  expect(check.remediation).toContain(
+    `\`agentmonitors monitor explain ${monitorId} --workspace ${root} --dir ${path.join(root, 'monitors')}\``,
+  );
+  expect(check.remediation).not.toContain('Retry outbox');
+  const recordIds: string[] =
+    doctor.ephemeralMonitorWork[0].materializationRetries.records.map(
+      (record: { id: string }) => record.id,
+    );
+  expect(recordIds.length).toBeGreaterThan(0);
+
+  // The suggested command (same flags, via the run helper) shows the retained record ids.
+  const json = JSON.parse(
+    (await run('explain', 'json', dbPath, monitorId)).stdout,
+  );
+  expect(
+    json.materializationRetries.records.map(
+      (record: { id: string }) => record.id,
+    ),
+  ).toEqual(recordIds);
+  const text = (await run('explain', 'text', dbPath, monitorId)).stdout;
+  for (const id of recordIds) expect(text).toContain(id);
+}, 30_000);
+
+/**
  * Regression for #497 through the built CLI and a real `daemon run`: the
  * daemon's next quiet scheduled tick wrote a `no-change` row, which cleared
  * the drop, so doctor and explain served by that daemon read healthy one poll
