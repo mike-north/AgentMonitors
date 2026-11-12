@@ -569,3 +569,110 @@ describe('retry recipients after restart', () => {
     ).toBeNull();
   });
 });
+
+/** A reopened retry drain must interpret each committed observation once, in source order. */
+describe('retry Interpret after restart', () => {
+  type Fixture = ReturnType<typeof setup>;
+  const faults: {
+    name: string;
+    message: string;
+    emitted: string[];
+    queued: string[];
+    configure(fixture: Fixture): void;
+    cleanup?(fixture: Fixture): void;
+  }[] = [
+    {
+      name: 'first event',
+      message: 'insert failure for first',
+      emitted: [],
+      queued: ['first', 'second'],
+      configure: (f) => {
+        f.store.failedSummary = 'first';
+        f.store.eventFailures = 1;
+      },
+    },
+    {
+      name: 'later event',
+      message: 'insert failure for second',
+      emitted: ['first'],
+      queued: ['second'],
+      configure: (f) => {
+        f.store.failedSummary = 'second';
+        f.store.eventFailures = 1;
+      },
+    },
+    {
+      name: 'cursor',
+      message: 'cursor write failed',
+      emitted: [],
+      queued: ['first', 'second'],
+      configure: (f) => {
+        f.store.cursorFailures = 1;
+      },
+    },
+    {
+      name: 'projection',
+      message: 'projection write failed',
+      emitted: [],
+      queued: ['first', 'second'],
+      configure: (f) => {
+        f.client.exec(`CREATE TRIGGER fail_runtime_projection
+          BEFORE INSERT ON session_event_state BEGIN
+          SELECT RAISE(ABORT, 'projection write failed'); END;`);
+      },
+      cleanup: (f) => f.client.exec('DROP TRIGGER fail_runtime_projection'),
+    },
+    {
+      name: 'snapshot',
+      message: 'snapshot write failed',
+      emitted: [],
+      queued: ['first', 'second'],
+      configure: (f) => {
+        f.store.snapshotFailures = 1;
+      },
+    },
+  ];
+
+  for (const fault of faults) {
+    it(`drains a queued ${fault.name} fault in source order after restart`, async () => {
+      const f = setup();
+      fault.configure(f);
+      const initial = await f.runtime.tick(f.monitorsDir, f.rootDir);
+      fault.cleanup?.(f);
+      expect(history(f.runtime)).toEqual([
+        { result: 'errored', observationData: { error: fault.message } },
+        ...(fault.emitted.length === 1
+          ? [
+              {
+                result: 'triggered' as const,
+                observationData: { observed: 2, emitted: 1 },
+              },
+            ]
+          : []),
+      ]);
+
+      clockTime = NOW.getTime() + 1_000;
+      const reopenedStore = new RuntimeStore(createDb(f.dbPath));
+      const restarted = createRuntime(reopenedStore, f.source, f.interpret);
+      const drained = await restarted.tick(f.monitorsDir, f.rootDir);
+      expectTick(drained, reopenedStore, { emitted: fault.queued });
+      expect([
+        ...summaries(f.store, initial.emittedEventIds),
+        ...summaries(reopenedStore, drained.emittedEventIds),
+      ]).toEqual(['first', 'second']);
+      expect(
+        restarted
+          .listEvents({ monitorId: 'test-monitor' })
+          .map(({ summary }) => summary),
+      ).toEqual(['second', 'first']);
+      expect(reopenedStore.listMaterializationRetries()).toEqual([]);
+      expect(f.observedStates).toEqual([undefined, { cursor: 1 }]);
+      expect(interpretDeltas(f.interpret)).toEqual([
+        'first-state',
+        'second-state',
+      ]);
+      // Successful retry history is not asserted here: its audit outcome does not yet
+      // account for the observations committed while draining retained work.
+    });
+  }
+});
