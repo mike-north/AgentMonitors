@@ -1,3 +1,4 @@
+/** Shared runtime contracts for durable monitor work, session delivery, and diagnostics. */
 import type {
   MonitorDefinition,
   NotifyConfig,
@@ -796,17 +797,25 @@ export interface ErroredObservation {
 }
 
 /**
- * A monitor that was found but skipped on a tick because its interval has not
- * yet elapsed since the last observation. Surfaced so callers (e.g. daemon
- * once) can distinguish "skipped, not yet due" from "no monitors found".
+ * A monitor paused before observation: either its cadence is not due, or its
+ * source config is invalid. Validation skips have no due time: correcting the
+ * config, rather than waiting, allows observation to resume with retained state.
  *
- * @see docs/specs/002-runtime-delivery.md §2.4
+ * @see docs/specs/002-runtime-delivery.md §2.5
  */
-export interface SkippedMonitor {
-  monitorId: string;
-  /** The earliest time at which this monitor will be due for its next tick. */
-  nextDueAt: Date;
-}
+export type SkippedMonitor =
+  | {
+      monitorId: string;
+      /** The earliest time at which this valid monitor is due again. */
+      nextDueAt: Date;
+      validationError?: never;
+    }
+  | {
+      monitorId: string;
+      /** The same joined source-config diagnostics reported by `validate`. */
+      validationError: string;
+      nextDueAt?: never;
+    };
 
 /**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
@@ -818,9 +827,9 @@ export interface SkippedMonitor {
  * same path that writes an `errored` row to `observation_history`, so the tick
  * itself can report the failure rather than silently print `emitted 0`.
  *
- * Monitors found in the directory but skipped because their interval has not
- * elapsed are listed in `skippedMonitors` so callers can distinguish
- * "skipped, not yet due" from "no monitors found" (issue #152).
+ * Monitors with invalid source config or a cadence that is not yet due are
+ * listed in `skippedMonitors`, distinguishing a config requiring correction
+ * from a valid monitor waiting to run and from an empty monitor directory.
  */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];

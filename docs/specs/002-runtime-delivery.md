@@ -629,14 +629,90 @@ For each runtime tick, the implementation **MUST**:
 2. parse valid monitor definitions and collect parse errors separately
 3. resolve each parsed monitor's `source` name against the source registry
 4. fail the tick if a parsed monitor references an unknown source
-5. determine whether the monitor is due to run
-6. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
-7. route returned observations through notify dispatch
-8. persist updated source state and notify state
-9. materialize emitted observations as durable events
-10. refresh hook state for sessions in the affected workspace
+5. validate the source-specific `watch` config (minus `type`) with `validateWatchScope`; skip invalid config before scheduling, observation, or notify processing
+6. determine whether the monitor is due to run
+7. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
+8. route returned observations through notify dispatch
+9. persist updated source state and notify state
+10. materialize emitted observations as durable events
+11. refresh hook state for sessions in the affected workspace
 
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()` (lines 358–420).
+
+### 2.0 Source-config preflight (current)
+
+A tick **MUST NOT** observe a monitor whose config fails its registered source's
+schema. It **MUST** use the existing `validateWatchScope` helper, including its
+friendly collection-strategy and timezone diagnostics, and report the joined
+errors in `skippedMonitors` as `{ monitorId, validationError }` with no `nextDueAt`.
+This check applies to directory-backed and persisted ephemeral monitors, before
+due scheduling (even when not due), and before any held notify work can flush.
+The monitor is absent from `evaluatedMonitors`; a rejected config is not an
+attempted observation and creates no observation-history row.
+
+**Existing invalid configs that previously ran now stop observing. This is
+intentional.** Fix the reported config to resume. A skipped monitor's persisted
+baseline, last-observation time, and pending notify state **MUST** remain intact,
+including across restart; fixing only the source config resumes normal scheduling
+and releases held work according to its existing notify policy. For example,
+`value: 42` against a source requiring a string causes no source effect and leaves
+an overdue debounce batch untouched; changing it to `value: fixed` allows the next
+due tick to observe using the retained baseline and flush the captured batch.
+Healthy sibling monitors **MUST** continue progressing.
+
+Validation **MUST NOT** mutate the plugin's JSON Schema. The shared helper uses a
+private copy because validator setup may annotate schema nodes. Frozen valid schemas remain valid and
+must not prevent observation or watcher startup. A schema setup/evaluation exception
+(such as a malformed regular expression) **MUST** fail closed for that monitor with
+`Source schema validation failed: <cause>` through the existing joined validation
+diagnostics: tick `skippedMonitors`, watcher startup `onError`/stderr, and definition
+validation in explain/doctor/validate. It must not execute the affected source,
+consume its baseline/cursor/held notify work, or abort healthy siblings, final
+suppression cleanup, or hook-state refresh. Correcting the schema permits normal
+preflight and recovery; ordinary scope rejections retain their existing messages.
+
+Dormant verify-session cleanup runs before observation preflight. It **MUST**
+preserve safely derivable runtime cadence when sizing scratch-event suppression,
+independently of unrelated source-schema rejection. Authored parseable intervals
+and known runtime defaults retain
+`max(5 minutes, poll interval + notify settle/suppress window + 1 minute margin)`.
+Only a missing definition or unavailable/unparseable cadence uses the existing
+five-minute floor; duration parsing must not abort cleanup or sibling evaluation.
+For example, invalid globs with a valid `10m` interval and `5s` settle retain
+`665000ms` from reaping, rather than shortening to five minutes. Ordinary source
+preflight still rejects that config before observation, leaving baseline and
+legitimate notify work intact.
+
+**Known current cleanup gap:** a deleted scratch key retained in source state or
+an already-held scratch envelope can materialize after finite suppression expires;
+a held-only create may never have projected an event for the reaper to discover.
+The intended no-later-scratch-event goal remains, but the current finite mechanism
+does not establish it for arbitrary delayed recovery or held-only discovery.
+[Mike's decision in #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+accepts a separate M1 repair, [#562](https://github.com/mike-north/AgentMonitors/issues/562),
+sequenced after #305/#537/#554: durable exact ownership without TTL, explicit
+retirement, and no source-contract change. #557 may proceed after correcting its
+introduced cadence-window regression and documenting this gap; it does not wait
+for #562. No ownership/retention/filtering repair is implemented here.
+
+Continuous `watchMonitors()` startup **MUST** apply the same preflight before
+calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from
+the returned handle and reported through `onError` (or stderr when no callback is
+provided), with the same joined diagnostic. Watchers already running keep their
+startup config; live watcher reload is outside this contract.
+
+`monitor explain` **MUST** report a definition failure and `doctor` **MUST** report
+an invalid monitor with the same diagnostic as `validate`. Doctor **MUST NOT**
+schedule a rejected scope: for example, `file-fingerprint` with valid `globs` and
+`interval: bad` returns the authoritative validation error, `due: false`, and no
+`nextDueAt`, while healthy siblings remain in the report. Diagnostic reads **MUST**
+preserve source state, pending notify work, events, and observation history.
+`daemon once` text and
+JSON output and the continuous daemon log **MUST** expose validation skips even
+when no events emit, naming the monitor and diagnostic; waiting for a next-due time
+cannot fix invalid config. Runtime and built-CLI regressions in
+`source-validation.test.ts` and `runtime-source-validation.test.ts` enforce these
+boundaries with source side effects, sibling progress, and restart recovery.
 
 ### 2.1 Due scheduling
 
@@ -845,7 +921,7 @@ semantics.
 - `evaluatedMonitors` — the ids of every monitor whose `observe()` was attempted this tick (including monitors whose outcome was `errored`).
 - `emittedEventIds` — the ids of the durable events materialized this tick.
 - `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
-- `skippedMonitors` — one `{ monitorId, nextDueAt }` entry per monitor found in the directory but skipped because it was not yet due (interval not elapsed for interval-based monitors; cron window not open for schedule monitors). Populated from the **same** scheduling decision that gates evaluation, so it is never recomputed. A monitor with an active continuous watcher does **not** appear here (it is driven by the watcher, not by the tick).
+- `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
 
 The runtime **MUST** surface `erroredObservations` so a caller (e.g. the CLI tick output, §10.1/§10.2) can report a failed observation rather than print a clean `emitted 0` that an author cannot distinguish from a genuine no-change.
 

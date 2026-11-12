@@ -1,3 +1,8 @@
+/**
+ * Coordinate host-independent observation, notify timing, durable materialization,
+ * and session projection. Source config must pass the authoring contract before
+ * execution; rejected config pauses work without consuming its durable baseline.
+ */
 import { createHash } from 'node:crypto';
 import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -11,7 +16,7 @@ import {
 } from '../parser/parse-monitor.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
-import { validateScope, validateWatchScope } from '../schema/validate-scope.js';
+import { validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
 import type {
   Observation,
@@ -177,12 +182,13 @@ function watchConfig(watch: Record<string, unknown>): Record<string, unknown> {
  * Describe a monitor's observation cadence in author-facing terms for the doctor
  * rollup (issue #267): the cron expression for `schedule` sources, the authored
  * `watch.interval` for interval sources, or the resolved default poll interval
- * (`nextPollMs`) when none is authored. Intentionally generic wording so it reads
- * correctly for every bundled source.
+ * (`nextPollMs`) when none is authored. Authored cadence remains descriptive
+ * even for invalid config; without safe scheduling or an authored cadence the
+ * descriptor is unknown rather than inventing a default.
  */
 function describeCadence(
   watch: Record<string, unknown>,
-  nextPollMs: number,
+  nextPollMs: number | undefined,
 ): string {
   if (watch['type'] === 'schedule') {
     const cron = watch['cron'];
@@ -190,7 +196,9 @@ function describeCadence(
   }
   const interval = watch['interval'];
   if (typeof interval === 'string') return `every ${interval}`;
-  return `every ${String(Math.round(nextPollMs / 1000))}s`;
+  return nextPollMs === undefined
+    ? 'unknown'
+    : `every ${String(Math.round(nextPollMs / 1000))}s`;
 }
 /**
  * Semantic, transport-neutral body for a coalesced normal/low-urgency reminder
@@ -668,7 +676,7 @@ interface TickAccumulator {
   evaluated: string[];
   emittedEventIds: string[];
   erroredObservations: ErroredObservation[];
-  skippedMonitors: { monitorId: string; nextDueAt: Date }[];
+  skippedMonitors: RuntimeTickResult['skippedMonitors'];
 }
 
 /** One live poll's captured execution, returned-but-unadmitted work, and declaration lifetime. */
@@ -1022,11 +1030,10 @@ export class AgentMonitorRuntime {
           // it is still authored (issue #418): a long-interval/long-settle monitor
           // needs a window that outlasts its next poll + settle, or the scratch
           // deletion re-materializes AFTER the tombstone has expired and lingers.
-          // Falls back to the fixed floor when the monitor is gone from the scan.
+          // Source preflight is separate: unrelated invalid config must not
+          // shorten safely derivable cadence protection during cleanup.
           ttlMs: this.orphanSuppressionTtlMs(
             monitorsById.get(object.monitorId),
-            now,
-            object.workspacePath,
           ),
           now,
         });
@@ -1078,15 +1085,38 @@ export class AgentMonitorRuntime {
    * linger for a later session. When the object's monitor is still authored (its
    * definition is in this tick's scan) we derive the max of the floor and
    * (interval + settle + margin) so the window always outlasts one full
-   * observe-and-settle cycle; when it is gone we fall back to the floor.
+   * observe-and-settle cycle. Only unavailable or unparseable runtime cadence
+   * uses the floor; unrelated source-schema errors do not erase authored timing
+   * or known defaults. This is a bounded window, not proof that source/held work
+   * has drained after an arbitrary pause. Source preflight still gates execution.
    */
   private orphanSuppressionTtlMs(
     monitor: MonitorDefinition | undefined,
-    now: Date,
-    workspacePath: string | null,
   ): number {
     if (!monitor) return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-    const { nextPollMs } = this.scheduleForMonitor(monitor, now, workspacePath);
+    const watch = monitor.frontmatter.watch;
+    let nextPollMs: number;
+    if (watch.type === 'schedule') {
+      // Schedule observation cadence is fixed independently of cron validity.
+      nextPollMs = schedulingDefaults.scheduleTickMs;
+    } else if (watch['interval'] === undefined) {
+      nextPollMs =
+        watch.type === 'api-poll'
+          ? DEFAULT_API_POLL_MS
+          : DEFAULT_FILE_FINGERPRINT_POLL_MS;
+    } else {
+      const interval = watch['interval'];
+      if (typeof interval !== 'string') {
+        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+      }
+      // Catch only the pure duration parser. Cleanup must not turn storage or
+      // unrelated scheduler failures into a silently shortened lifetime.
+      try {
+        nextPollMs = parseDuration(interval);
+      } catch {
+        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
+      }
+    }
     const notify = monitor.frontmatter.notify;
     // The settle window that can delay the deletion's materialization: a debounce
     // holds the batch for `settle-for`; a throttle can defer up to `suppress-for`.
@@ -1214,7 +1244,7 @@ export class AgentMonitorRuntime {
     const sourceName = monitor.frontmatter.watch.type;
     const source = this.registry.get(sourceName);
     const scopeErrors = source
-      ? validateScope(
+      ? validateWatchScope(
           watchConfig(monitor.frontmatter.watch),
           source.scopeSchema,
         )
@@ -1776,7 +1806,7 @@ export class AgentMonitorRuntime {
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       const scopeErrors = source
-        ? validateScope(
+        ? validateWatchScope(
             watchConfig(monitor.frontmatter.watch),
             source.scopeSchema,
           )
@@ -1786,16 +1816,16 @@ export class AgentMonitorRuntime {
         monitor.id,
         workspacePath,
       );
-      const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
-      // Defensive isolation (issue #297): scheduleForMonitor() never throws — an
-      // invalid IANA timezone surfaces here as `schedule.error` instead. Doctor
-      // is a diagnostic surface (like explain) and must never crash on a single
-      // bad monitor's config; fold the scheduling failure into the same
-      // valid/validationError reporting as a scope error so it's visible in the
-      // rollup rather than silently producing a bogus `due`/`nextDueAt`.
-      const validationErrors = schedule.error
-        ? [...scopeErrors, schedule.error]
-        : scopeErrors;
+      // A rejected scope is not safe input to scheduling (for example, an
+      // invalid interval would throw from parseDuration). Preserve the shared
+      // validation diagnostic and leave its due time unknown until correction.
+      // Valid scopes retain the existing scheduler and its timezone diagnostic;
+      // unrelated scheduling failures are not swallowed by this boundary.
+      const schedule =
+        scopeErrors.length === 0
+          ? this.scheduleForMonitor(monitor, now, workspacePath)
+          : undefined;
+      const validationErrors = schedule?.error ? [schedule.error] : scopeErrors;
       const valid = validationErrors.length === 0;
       if (!valid) invalidCount += 1;
 
@@ -1817,11 +1847,15 @@ export class AgentMonitorRuntime {
       const neverObserved =
         runtimeState.lastObservationAt === undefined && history.length === 0;
 
-      const nextDueAt = schedule.due
-        ? now
-        : new Date(
-            (lastObservedAt?.getTime() ?? now.getTime()) + schedule.nextPollMs,
-          );
+      const nextDueAt =
+        !valid || schedule === undefined
+          ? undefined
+          : schedule.due
+            ? now
+            : new Date(
+                (lastObservedAt?.getTime() ?? now.getTime()) +
+                  schedule.nextPollMs,
+              );
 
       const events = this.store.listEvents({
         monitorId: monitor.id,
@@ -1861,11 +1895,11 @@ export class AgentMonitorRuntime {
         ...(valid ? {} : { validationError: validationErrors.join('; ') }),
         ...(lastObservedAt ? { lastObservedAt } : {}),
         neverObserved,
-        due: schedule.due,
-        nextDueAt,
+        due: valid && (schedule?.due ?? false),
+        ...(nextDueAt ? { nextDueAt } : {}),
         cadence: describeCadence(
           monitor.frontmatter.watch,
-          schedule.nextPollMs,
+          schedule?.nextPollMs,
         ),
         ...(lastEventAt ? { lastEventAt } : {}),
         delivery,
@@ -3403,6 +3437,22 @@ export class AgentMonitorRuntime {
     const key = JSON.stringify([workspacePath, monitor.id]);
     const resuming = this.pollAdmissions.get(key)?.result !== undefined;
     const sourceName = monitor.frontmatter.watch.type;
+    // Preflight the current author config before notify preparation, which can
+    // hydrate or flush held work: invalid config must leave that work untouched.
+    const preflightErrors = validateWatchScope(
+      watchConfig(monitor.frontmatter.watch),
+      source.scopeSchema,
+    );
+    if (preflightErrors.length > 0) {
+      // Close the scope's admission gate so an in-flight poll or watcher cannot
+      // commit under the rejected definition; accepted holds stay retained.
+      this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+      acc.skippedMonitors.push({
+        monitorId: monitor.id,
+        validationError: preflightErrors.join('; '),
+      });
+      return;
+    }
     if (
       !(await this.prepareNotifyPolicy(
         monitor,
@@ -3419,6 +3469,21 @@ export class AgentMonitorRuntime {
     const current = this.watchPolicies.get(key);
     if (!current || resuming || this.pollAdmissions.has(key)) return;
     monitor = this.applyWatchPolicy(monitor, current);
+
+    // Validate before scheduling or notify hydration: even an overdue held batch
+    // must remain untouched while author config is invalid. Rechecking here also
+    // protects persisted ephemeral scopes after a source schema upgrade.
+    const errors = validateWatchScope(
+      watchConfig(monitor.frontmatter.watch),
+      source.scopeSchema,
+    );
+    if (errors.length > 0) {
+      acc.skippedMonitors.push({
+        monitorId: monitor.id,
+        validationError: errors.join('; '),
+      });
+      return;
+    }
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
@@ -4039,6 +4104,26 @@ export class AgentMonitorRuntime {
       // the current definition's admission boundary. Unowned observe-only scopes
       // remain ordinary polling work, untouched by watcher startup.
       if (!canWatch && !this.notifyPolicyUsers.has(key)) continue;
+      // Watch startup is a source execution boundary just like a one-shot tick.
+      // Isolate bad config before reserving a watcher slot or touching its state.
+      const errors = validateWatchScope(
+        watchConfig(monitor.frontmatter.watch),
+        source.scopeSchema,
+      );
+      if (errors.length > 0) {
+        // Close the scope's admission gate so an existing watcher or in-flight
+        // poll cannot commit under the rejected definition; accepted holds stay.
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+        const error = new Error(errors.join('; '));
+        if (options.onError) {
+          options.onError(monitor.id, error);
+        } else {
+          process.stderr.write(
+            `Monitor "${monitor.id}" skipped: ${error.message}\n`,
+          );
+        }
+        continue;
+      }
       const controller = new AbortController();
       const watcherToken = Symbol(monitor.id);
       if (canWatch && !existing) {

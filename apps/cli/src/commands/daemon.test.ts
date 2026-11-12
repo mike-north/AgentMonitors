@@ -38,6 +38,37 @@ afterEach(() => {
   }
 });
 
+/** Validation skips must remain visible even when a continuous tick emits nothing. */
+it('logs the config diagnostic for an otherwise silent continuous tick', async () => {
+  const root = tempDir();
+  const monitorsDir = path.join(root, 'monitors');
+  mkdirSync(monitorsDir);
+  const socketPath = path.join(root, 'daemon.sock');
+  const diagnostic =
+    'scope/value: Instance type "number" is invalid. Expected "string".';
+  vi.spyOn(AgentMonitorRuntime.prototype, 'tick').mockResolvedValue({
+    evaluatedMonitors: [],
+    emittedEventIds: [],
+    erroredObservations: [],
+    skippedMonitors: [{ monitorId: 'invalid', validationError: diagnostic }],
+  });
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {
+    // Inspect the daemon summary without printing expected output.
+  });
+  const loop = runLoop(monitorsDir, root, 20, socketPath, 0, ':memory:');
+  try {
+    // Real IPC owns loop shutdown; poll only because server startup is asynchronous.
+    await vi.waitFor(() =>
+      expect(log).toHaveBeenCalledWith(
+        `Emitted 0 event(s) from 0 monitor(s).\n  invalid: skipped — ${diagnostic}`,
+      ),
+    );
+  } finally {
+    await callDaemon('stop', {}, { socketPath });
+    await loop;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Issue #398: the idle-reaping block ran outside the tick's error boundary,
 // so a transient error there (e.g. `runtime.listSessions()` hitting a brief

@@ -309,11 +309,11 @@ it('held-work source validation must succeed before missing identity is learned'
   const legacy = f.state();
   f.edit(undefined, 7);
   const invalid = await f.tick();
-  expect(
-    invalid.erroredObservations.some((item) =>
-      item.message.includes('Invalid monitor definition'),
-    ),
-  ).toBe(true);
+  // Source-config preflight (002 §2.0) skips the scope before notify
+  // preparation, so held work and the missing identity stay untouched.
+  expect(invalid.skippedMonitors).toEqual([
+    expect.objectContaining({ validationError: expect.any(String) }),
+  ]);
   expect(f.state()).toEqual(legacy);
   f.restart();
   expect(f.state()).toEqual(legacy);

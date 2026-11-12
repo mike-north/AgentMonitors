@@ -362,9 +362,9 @@ for (const failure of ['scope', 'sqlite'] as const) {
       expect(
         failed.errors.some((item) =>
           item.message.includes(
-            failure === 'scope'
-              ? 'Invalid monitor definition'
-              : 'owned startup drain fault',
+            // Scope failures are the source-config preflight diagnostic
+            // (002 §2.0), which names the offending `token` field.
+            failure === 'scope' ? 'token' : 'owned startup drain fault',
           ),
         ),
       ).toBe(true);
@@ -433,9 +433,7 @@ for (const blocked of [false, true]) {
         const recoveredByStartup = f.rows().length === 2;
         if (!recoveredByStartup) await f.tick();
         expect(
-          first.errors.some((item) =>
-            item.message.includes('Invalid monitor definition'),
-          ),
+          first.errors.some((item) => item.message.includes('token')),
         ).toBe(true);
         expect(afterPoll).toEqual(retained);
         expect(recovery.errors).toEqual([]);
