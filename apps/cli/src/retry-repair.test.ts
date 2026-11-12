@@ -634,6 +634,33 @@ describe('monitor retry without a daemon', () => {
       objectKey: watched,
       error: expect.stringContaining('Retry skipped after 5 failed attempts.'),
     });
-    expect((await explainMaterialization()).status).toBe('failure');
+    // 005 doctor: a skipped retry has no span position, so it is named as
+    // `an observation (<objectKey>, "<title>")`, followed by its own error.
+    const doctorText = await run([
+      'doctor',
+      '--dir',
+      monitors,
+      '--workspace',
+      root,
+      '--socket',
+      socketPath,
+      '--format',
+      'text',
+    ]);
+    expect(doctorText.stdout).toContain(
+      `monitor:${MONITOR}: observation dropped (1 outstanding; newest: an observation (${watched}, `,
+    );
+    expect(doctorText.stdout).toContain(
+      'Retry skipped after 5 failed attempts.',
+    );
+    // 002 §10.7: explain's materialization reason, with the same naming.
+    const materialization = await explainMaterialization();
+    expect(materialization.status).toBe('failure');
+    expect(materialization.reason).toContain(
+      `1 observation(s) were dropped because the runtime could not keep them; the newest, an observation (${watched}, `,
+    );
+    expect(materialization.reason).toMatch(
+      /Retry skipped after 5 failed attempts\.$/u,
+    );
   }, 30_000);
 });

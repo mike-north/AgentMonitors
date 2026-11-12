@@ -434,34 +434,51 @@ describe('skipping a terminal retry', () => {
     expect(doctor.monitors[0]?.unretainedObservationLoss).toBeUndefined();
   });
 
-  it('records the loss and removes the retry together, or neither', async () => {
-    const f = setup([['A'], ['B']]);
-    const opened = f.open();
-    const id = await retainTerminal(f, opened, clock);
-    // A native fault on the loss row's write.
-    opened.client.exec(`CREATE TRIGGER fail_loss
-      BEFORE INSERT ON observation_history
-      WHEN NEW.unretained_event_watermark IS NOT NULL BEGIN
-      SELECT RAISE(ABORT, 'loss write failed'); END;`);
+  // A native fault on either write of the skip: the loss row, or the retry
+  // row's removal. Whichever fails, the other must not commit without it.
+  it.each([
+    {
+      write: 'the loss row',
+      message: 'loss write failed',
+      trigger: `CREATE TRIGGER fail_skip
+        BEFORE INSERT ON observation_history
+        WHEN NEW.unretained_event_watermark IS NOT NULL BEGIN
+        SELECT RAISE(ABORT, 'loss write failed'); END;`,
+    },
+    {
+      write: 'the retry removal',
+      message: 'retry removal failed',
+      trigger: `CREATE TRIGGER fail_skip
+        BEFORE DELETE ON materialization_retry_outbox BEGIN
+        SELECT RAISE(ABORT, 'retry removal failed'); END;`,
+    },
+  ])(
+    'records the loss and removes the retry together, or neither, when $write fails',
+    async ({ message, trigger }) => {
+      const f = setup([['A'], ['B']]);
+      const opened = f.open();
+      const id = await retainTerminal(f, opened, clock);
+      opened.client.exec(trigger);
 
-    expect(() =>
-      opened.runtime.skipMaterializationRetry({
-        monitorId: 'm',
-        retryId: id,
+      expect(() =>
+        opened.runtime.skipMaterializationRetry({
+          monitorId: 'm',
+          retryId: id,
+          workspacePath: f.root,
+        }),
+      ).toThrow(message);
+      expect(opened.store.getMaterializationRetry(id).status).toBe('terminal');
+      const doctor = await opened.runtime.doctorReport({
+        monitorsDir: f.monitorsDir,
         workspacePath: f.root,
-      }),
-    ).toThrow('loss write failed');
-    expect(opened.store.getMaterializationRetry(id).status).toBe('terminal');
-    const doctor = await opened.runtime.doctorReport({
-      monitorsDir: f.monitorsDir,
-      workspacePath: f.root,
-    });
-    expect(doctor.monitors[0]?.unretainedObservationLoss).toBeUndefined();
-    // The monitor stays paused behind the retry it could not skip.
-    clock.advance(600_000);
-    await opened.runtime.tick(f.monitorsDir, f.root);
-    expect(eventSummaries(opened.client)).toEqual([]);
-  });
+      });
+      expect(doctor.monitors[0]?.unretainedObservationLoss).toBeUndefined();
+      // The monitor stays paused behind the retry it could not skip.
+      clock.advance(600_000);
+      await opened.runtime.tick(f.monitorsDir, f.root);
+      expect(eventSummaries(opened.client)).toEqual([]);
+    },
+  );
 
   it('keeps the loss and the resumed monitor across a restart', async () => {
     const f = setup([['A'], ['B']]);

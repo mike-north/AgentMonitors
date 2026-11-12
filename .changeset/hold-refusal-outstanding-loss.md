@@ -11,4 +11,4 @@ and drops nothing. Quiet ticks, holds and restarts no longer hide it. The refusa
 once on the tick result or through the watcher's `onError`, with the same message. Doctor's loss
 detail now reads `observation dropped (<count> outstanding; …)` and explain's reason
 `<count> observation(s) were dropped because the runtime could not keep them; …`, since the loss may
-come from either cause.
+come from more than one cause.
