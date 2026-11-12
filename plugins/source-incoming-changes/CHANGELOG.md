@@ -1,5 +1,61 @@
 # @agentmonitors/source-incoming-changes
 
+## 0.4.0
+
+### Minor Changes
+
+- 2380ebe: Commit each finite poll span, its ordered retry suffix, and source/notify checkpoints together before optional interpretation. Preserve committed recipient-cache state when admission rolls back.
+
+  When the retry outbox cannot hold a failed observation's whole ordered suffix, because the monitor's outbox is full or a value cannot be stored (such as a BigInt payload), that observation is recorded as `errored` with the reason. Its siblings still materialize and the source checkpoint advances, so the monitor keeps making progress. A rollup window clears its held batch only in the same commit as the flushed observations. A flush that fails leaves the window held and reports the error.
+
+  Breaking source-plugin migration (pre-1.0): `watch()` now yields finite `ObservationResult` batches,
+  not individual observations, and `ObservationContext.checkpoint` is removed. Yield
+  `{ observations: [...], nextState }` so all covered observations and the source checkpoint commit
+  together before interpretation or the next iterator pull. Empty batches support baseline-only
+  updates. Failed admission stops the iterator and preserves the old baseline; legacy bare yields
+  are rejected. Poll signatures are unchanged.
+
+  The five bundled source packages publish the same source contracts through their exported types and
+  default source values. Their minor releases carry this breaking type migration too, even though
+  their own implementations use polling and require no runtime changes.
+
+### Patch Changes
+
+- d6c56a3: Report unavailable incoming-changes repositories and refs as recoverable source errors instead of successful empty baselines. Resolve authored revision expressions unchanged, then verify the resolved object ID peels to a commit; reject blob paths without changing valid commit-search semantics in SHA-1 or SHA-256 repositories. Capture Git stderr and retain the last-good source state for recovery. Source consumers must now handle observation rejection for unavailable inputs through the existing error contract.
+
+  Require initial state before monitor test claims a baseline. Include source errors in history text and explain using bounded single-line display, without rewriting stored audit data. Existing source-error retry cadence and held-notification deferral remain unchanged.
+
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [71c44fa]
+- Updated dependencies [2380ebe]
+- Updated dependencies [65351d0]
+- Updated dependencies [cb92b95]
+- Updated dependencies [d30c9a1]
+- Updated dependencies [3b205ed]
+- Updated dependencies [57e2878]
+- Updated dependencies [3b205ed]
+- Updated dependencies [f194a12]
+- Updated dependencies [e9f3fdf]
+- Updated dependencies [aa5b437]
+- Updated dependencies [820c190]
+- Updated dependencies [36307ad]
+- Updated dependencies [587d0a9]
+- Updated dependencies [caa2452]
+- Updated dependencies [2380ebe]
+- Updated dependencies [7265259]
+- Updated dependencies [d6c56a3]
+- Updated dependencies [ae08f21]
+- Updated dependencies [587d0a9]
+- Updated dependencies [1cbef80]
+- Updated dependencies [2380ebe]
+- Updated dependencies [8ce3139]
+- Updated dependencies [587d0a9]
+- Updated dependencies [28e6e00]
+- Updated dependencies [7c30c92]
+- Updated dependencies [d1649cf]
+- Updated dependencies [2380ebe]
+  - @agentmonitors/core@0.14.0
+
 ## 0.3.2
 
 ### Patch Changes
