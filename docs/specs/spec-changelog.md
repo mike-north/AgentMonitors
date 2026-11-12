@@ -47,6 +47,12 @@ later observation of the scratch key is dropped and none could supersede it. Bot
 `MaterializationRetryRepairResult` (`outcome` plus the retry's safe metadata), and the CLI's JSON
 output carries `outcome`.
 
+The daemon client now settles when a daemon closes the connection without replying, for every
+daemon-backed command. Before, such a command was left waiting and exited 0 with no output. Now
+`monitor history`, `session list`, `events list` and `daemon stop` exit 1 with an error, `doctor`
+exits 1 and reports `daemon-unreachable`, and `monitor explain` falls back in-process as it does
+when no daemon is reachable.
+
 ## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2/§2.0/§2.7/§2.8/§10.5/§15; 004 §2.5/§3.4/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418, #575
 
 Replace finite, time-limited scratch cleanup with durable exact ownership, as accepted in #561.
