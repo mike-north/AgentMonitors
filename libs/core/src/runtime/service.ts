@@ -45,6 +45,7 @@ import {
   type HookDeliveryHold,
 } from './hook-delivery-diagnosis.js';
 import {
+  RetiredVerifyArtifactRetryError,
   RuntimeStore,
   computeNetCollapseView,
   netCollapseGroupKey,
@@ -65,6 +66,10 @@ import {
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
+  isVerifyScratchObjectKey,
+  verifyScratchRunId,
+} from './verify-scratch-key.js';
+import {
   SAFE_DIAGNOSTIC_TEXT_MAX,
   safeDiagnosticText,
 } from './diagnostic-text.js';
@@ -84,6 +89,7 @@ import type {
   DoctorParseError,
   DoctorReportInput,
   EventQuery,
+  MaterializationRetryRecord,
   MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
@@ -102,12 +108,18 @@ import type {
   UnretainedObservationLoss,
   RuntimeTickResult,
   StoredObservationEnvelope,
+  RegisterVerifyArtifactInput,
+  VerifyArtifactCleanupCause,
+  VerifyArtifactCleanupResult,
+  VerifyArtifactRecord,
   WatchHandle,
 } from './types.js';
 import {
   defaultNotifyConfigForUrgency,
   EPHEMERAL_MONITOR_ID_PREFIX,
+  MATERIALIZATION_RETRY_DELAYS_MS,
   type NotifyDispatchResult,
+  type NotHeldObservation,
   type NotifyRuntimeState,
   type DeliveryLifecycle,
   type SessionHookState,
@@ -121,6 +133,8 @@ const DEFAULT_HIGH_URGENCY_SETTLE_MS =
   schedulingDefaults.highUrgencyClaimSettleMs;
 const MAX_RECAP_EVENTS = 10;
 
+export { isVerifyScratchObjectKey };
+
 /**
  * Per-session dormancy threshold (002 §6.2 / 007 §4.4). A session that has not
  * advanced its `lastActiveAt` for at least this long is treated as **dormant by
@@ -133,47 +147,6 @@ const MAX_RECAP_EVENTS = 10;
  */
 const DEFAULT_SESSION_DORMANCY_MS = 30 * 60 * 1_000;
 
-/**
- * The `hostSessionId` prefix `verify` gives its throwaway lead session
- * (`agentmonitors-verify-<token>`). The reap backstop (issue #414) uses it to
- * recognize an orphaned verify session left by an uncatchably-killed
- * `--use-workspace-daemon` run and clean up its scratch events.
- */
-const VERIFY_SESSION_ID_PREFIX = 'agentmonitors-verify-';
-
-/**
- * TTL (issue #414) for the tombstone the reap backstop installs over an orphaned
- * verify run's scratch object — long enough for a not-yet-materialized deletion
- * to appear and be swept, short enough to leave nothing lingering.
- */
-const ORPHANED_VERIFY_SUPPRESSION_TTL_MS = 5 * 60 * 1_000;
-
-/**
- * Slack added on top of a monitor's derived poll-interval + settle when the reap
- * backstop sizes an orphan tombstone (issue #418), so a deletion materializing a
- * tick or two late still lands inside the window before it expires.
- */
-const ORPHANED_VERIFY_SUPPRESSION_MARGIN_MS = 60 * 1_000;
-
-/**
- * True when `objectKey`'s basename is a `verify` scratch file
- * (`agentmonitors-verify-<token>[.ext]`) — a synthetic path verify created and
- * deleted, which no real monitored object ever carries (issue #414). It is the
- * canonical predicate gating every by-KEY object-event sweep (the reap backstop
- * AND {@link AgentMonitorRuntime.suppressObjectEvents}) so a by-key deletion can
- * only ever erase verify's own artifacts, never a real event at a genuine
- * watched path. Exported so the daemon-socket boundary can reject a non-scratch
- * key before it ever reaches the runtime.
- *
- * Splits on BOTH `/` and `\` so a Windows-style absolute `objectKey` (which
- * `verify` builds with `path.join`) still resolves to its basename — otherwise
- * the guard would fail to recognize a scratch key on Windows and leave stray
- * sessions/events behind (issue #418 review).
- */
-export function isVerifyScratchObjectKey(objectKey: string): boolean {
-  const basename = objectKey.split(/[\\/]/).pop() ?? objectKey;
-  return /^agentmonitors-verify-[0-9a-f]{12}(\..*)?$/.test(basename);
-}
 const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
   definition: 'Definition',
   scheduling: 'Scheduling',
@@ -349,7 +322,10 @@ function explainVerdict(stages: MonitorExplainStage[]): {
  * including the truncation marker. CLI history mirrors this private policy
  * without expanding the core plugin API with a presentation-only helper.
  */
-function displayObservationError(value: unknown): string | undefined {
+function displayObservationError(
+  value: unknown,
+  limit = 512,
+): string | undefined {
   if (typeof value !== 'string') return undefined;
   const line = stripVTControlCharacters(value)
     // eslint-disable-next-line no-control-regex -- Remove literal terminal control bytes from legacy diagnostics.
@@ -357,8 +333,8 @@ function displayObservationError(value: unknown): string | undefined {
     .replace(/\s+/gu, ' ')
     .trim();
   const points = Array.from(line);
-  return points.length > 512
-    ? `${points.slice(0, 509).join('')}...`
+  return points.length > limit
+    ? `${points.slice(0, limit - 3).join('')}...`
     : line || undefined;
 }
 
@@ -502,6 +478,67 @@ function serializeObservation(
     observedAt,
     effectiveUrgency: effectiveObservationUrgency(monitor, observation),
   };
+}
+
+/**
+ * Longest observation title, in code points, a not-held outcome message
+ * carries. It is well below the 512-code-point display cap that history and
+ * explain apply to the whole message, so a long title can never push the
+ * start of the serializer's reason out of the human views; a long reason can
+ * still be cut there, while the stored row keeps it whole (002 §4.7).
+ */
+const NOT_HELD_TITLE_LIMIT = 200;
+
+/**
+ * Admission check for held notify work (002 §4.7). Debounce and rollup holds
+ * persist their envelopes as JSON in `monitor_state.notify_state`, so an
+ * envelope `JSON.stringify` cannot encode (a BigInt, a cyclic reference, a
+ * throwing `toJSON` or getter) would make every later state write for the
+ * monitor fail. The check runs the same serializer the hold write uses, once,
+ * where an envelope would join a hold; an envelope that passes stays
+ * serializable inside every later hold write.
+ *
+ * Limit: the hold write serializes the envelope again, so the check proves
+ * serializability only for values that serialize the same way twice. A
+ * non-deterministic accessor (one that returns a BigInt only on a later read)
+ * can still pass this check and fail the later write; that is not defended.
+ *
+ * Total by construction: building the outcome text never throws, even when
+ * the serializer threw a value whose own `toString` throws. Such a reason
+ * falls back to a fixed string.
+ *
+ * Returns `undefined` when the envelope can be held, otherwise the complete
+ * single-line `errored` outcome text naming the observation, the strategy and
+ * the serializer's reason.
+ */
+function notHeldReason(
+  envelope: StoredObservationEnvelope,
+  strategy: 'debounce' | 'rollup',
+): string | undefined {
+  try {
+    JSON.stringify(envelope);
+    return undefined;
+  } catch (error) {
+    let reason: string | undefined;
+    try {
+      reason = displayObservationError(
+        error instanceof Error ? error.message : String(error),
+      );
+    } catch {
+      // A hostile thrown value whose conversion to text throws: use the fixed
+      // reason rather than let the refusal itself escape and wedge the monitor.
+    }
+    let title: string | undefined;
+    try {
+      title = displayObservationError(
+        envelope.observation.title,
+        NOT_HELD_TITLE_LIMIT,
+      );
+    } catch {
+      // Same guard for a title that is not a plain string.
+    }
+    return `Observation "${title ?? '(untitled)'}" was not held for ${strategy}: it cannot be serialized (${reason ?? 'unknown serialization error'}).`;
+  }
 }
 
 function hydrateStoredObservationEnvelope(
@@ -732,8 +769,16 @@ interface MaterializationSpanResult {
 interface MaterializationSpanOptions {
   /** Raw source count before shaping/pacing, used only for audit classification. */
   observed: number;
+  /**
+   * How many of the `observed` observations a hold refused (002 §4.7). Each
+   * has its own `errored` loss row from the admission transaction, so they do
+   * not count toward `suppressed`, and a span made only of them writes no
+   * batch row. Kept apart from `notRetainedCount` because the cause differs,
+   * but both are loss: a batch row with either count supersedes no drop.
+   */
+  notHeld?: number;
   workspacePath: string;
-  nextMonitorState?: {
+  nextMonitorState: {
     sourceState?: unknown;
     notifyState: PolicyNotifyState;
     lastObservationAt?: Date | null;
@@ -801,10 +846,14 @@ function describeUnretainedObservation(
     : position;
 }
 
-/** Explain's materialization-stage reason for an outstanding drop (002 §10.7). */
+/**
+ * Explain's materialization-stage reason for outstanding loss (002 §10.7).
+ * One wording covers every kind of loss; the newest loss's own error says why
+ * it was lost (an outbox drop or a hold refusal).
+ */
 function unretainedLossReason(loss: UnretainedObservationLoss): string {
   const error = displayObservationError(loss.error);
-  return `${String(loss.count)} observation(s) were dropped because the retry outbox could not retain them; the newest, ${describeUnretainedObservation(loss)}, failed: ${error ?? 'no error was recorded'}`;
+  return `${String(loss.count)} observation(s) were dropped because the runtime could not keep them; the newest, ${describeUnretainedObservation(loss)}, failed: ${error ?? 'no error was recorded'}`;
 }
 
 /** Wire-stable details: ISO timestamps, so socket and in-process reports agree. */
@@ -850,22 +899,84 @@ function unretainedObservationData(
       Math.max(0, SAFE_DIAGNOSTIC_TEXT_MAX - reason.length),
     ) + reason,
   );
-  // Source contracts type these as strings, but a failing observation is the
-  // one most likely to break its contract; only strings are recorded.
-  const { objectKey, title } = observation as {
-    objectKey?: unknown;
-    title?: unknown;
-  };
   return {
     error,
     notRetained: true,
     position: index + 1,
     spanSize,
+    ...lostObservationIdentity(observation),
+  };
+}
+
+/**
+ * The display-safe identity a loss row stores for the observation it lost
+ * (002 `observation_history`): its `objectKey` and `title`, each only when it
+ * is a string, control-normalized and capped. Source contracts type these as
+ * strings, but a failing observation is the one most likely to break its
+ * contract. The payload is never copied.
+ */
+function lostObservationIdentity(observation: Observation): {
+  objectKey?: string;
+  title?: string;
+} {
+  const { objectKey, title } = observation as {
+    objectKey?: unknown;
+    title?: unknown;
+  };
+  return {
     ...(typeof objectKey === 'string'
       ? { objectKey: safeDiagnosticText(objectKey) }
       : {}),
     ...(typeof title === 'string' ? { title: safeDiagnosticText(title) } : {}),
   };
+}
+
+/**
+ * The durable outcome of an observation a debounce or rollup hold refused
+ * (002 §4.7), recorded as loss (002 §2). `error` is the refusal's complete
+ * outcome text, unchanged; `holdRefused` marks the row for diagnostics, and
+ * the identity names which observation was lost. A refusal has no position in
+ * a dispatched span, so none is recorded.
+ */
+function heldRefusalData(refusal: NotHeldObservation): {
+  error: string;
+  holdRefused: true;
+  objectKey?: string;
+  title?: string;
+} {
+  return {
+    error: refusal.message,
+    holdRefused: true,
+    ...lostObservationIdentity(refusal.observation),
+  };
+}
+
+/**
+ * Hold refusals placed among the envelopes admission keeps (002 §2, §2.8).
+ * Dispatch counts each refusal's `emittedBefore` in the full dispatched list;
+ * once the ownership filter drops retired verify artifacts, a refusal belongs
+ * after the kept envelopes that preceded it there, and before the rest.
+ * `kept` must be `dispatched` filtered in order. The result stays
+ * non-decreasing, as `admitSpan` requires.
+ */
+function refusalsAmongKept(
+  refusals: readonly NotHeldObservation[],
+  dispatched: readonly StoredObservationEnvelope[],
+  kept: readonly StoredObservationEnvelope[],
+): readonly NotHeldObservation[] {
+  if (kept.length === dispatched.length) return refusals;
+  // keptBefore[i]: how many of dispatched[0..i) survived the filter.
+  const keptBefore = [0];
+  let next = 0;
+  for (const envelope of dispatched) {
+    if (kept[next] === envelope) next += 1;
+    keptBefore.push(next);
+  }
+  return refusals.map((refusal) => ({
+    ...refusal,
+    emittedBefore:
+      keptBefore[Math.min(refusal.emittedBefore, dispatched.length)] ?? next,
+  }));
 }
 
 /** Report how many failures were queued or recorded errored, preserving the first error. */
@@ -889,6 +1000,50 @@ function summarizeMaterializationFailures(
       : []),
   ];
   return `${outcomes.join('; ')}. First error: ${first}`;
+}
+
+/**
+ * How often a watcher held behind a terminal retry rechecks its outbox. A
+ * terminal retry is never attempted automatically; the recheck only notices
+ * that it was re-armed (or otherwise cleared) from another connection.
+ */
+const TERMINAL_RETRY_RECHECK_MS = 60_000;
+
+/**
+ * Why retained work still blocks newer source input after a drain attempt
+ * (002 §2.7): an attempt failed this time, the oldest retry is terminal and
+ * waits for an operator re-arm, or it is backing off until `nextAttemptAt`.
+ */
+type RetryDrainBlock =
+  | { kind: 'failed'; message: string }
+  | { kind: 'terminal'; message: string }
+  | { kind: 'backoff'; nextAttemptAt: Date };
+
+/** The outcome of draining one monitor's retry outbox oldest-first. */
+interface RetryDrainResult {
+  /** At least one retry was attempted, successfully or not. */
+  attempted: boolean;
+  /** Events completed from the outbox, in admission order. */
+  emittedEventIds: string[];
+  /** Present while retained work remains; the source must not be asked for more. */
+  blocked?: RetryDrainBlock;
+}
+
+/** Resolve after `ms`, or as soon as `signal` aborts. */
+function abortableDelay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, Math.max(0, ms));
+    signal.addEventListener('abort', done, { once: true });
+  });
 }
 
 /**
@@ -1088,9 +1243,19 @@ export class AgentMonitorRuntime {
     return session;
   }
 
-  closeSession(sessionId: string): AgentSessionRecord {
+  closeSession(sessionId: string, now = new Date()): AgentSessionRecord {
     const ephemerals = this.store.listEphemeralMonitorsForSession(sessionId);
     const session = this.store.closeSession(sessionId);
+    // An ended owner no longer needs verify's proof delivery: its registered
+    // artifacts gain cleanup authority now (002 §2.8, issue #562). A crash
+    // between the close above and this record is repaired by the next tick's
+    // reconciliation, and the exact-key filter already treats a dormant owner
+    // as ended in the meantime.
+    for (const artifact of this.store.verifyArtifactsAwaitingCleanupForOwner(
+      sessionId,
+    )) {
+      this.applyVerifyArtifactCleanup(artifact.runId, 'owner-inactive', now);
+    }
     // Reap the session's ephemeral monitors (007 §4.4): a session that ends or
     // goes dormant MUST release its session-scoped watches immediately — they
     // must not outlive the session, leak into another session, or resurrect
@@ -1300,150 +1465,171 @@ export class AgentMonitorRuntime {
    * its ephemeral monitors — a backstop for a session that vanished without an
    * explicit `session close`. Distinct from the daemon-wide idle self-termination
    * (002 §10.2), which stops the whole daemon once ALL a workspace's sessions are
-   * inactive.
+   * inactive. A stale verify session is ended through the same close, which
+   * gives its registered artifacts cleanup authority (issue #562).
    */
-  private reapDormantSessions(
-    now: Date,
-    workspacePath: string,
-    monitorsById: Map<string, MonitorDefinition>,
-  ): void {
+  private reapDormantSessions(now: Date, workspacePath: string): void {
     const staleBefore = new Date(now.getTime() - this.sessionDormancyMs);
     for (const session of this.store.staleActiveSessions(
       workspacePath,
       staleBefore,
     )) {
-      // #414 backstop: a `verify --use-workspace-daemon` run killed uncatchably
-      // (SIGKILL/crash) before it could clean up leaves an `active` verify
-      // session AND its scratch file's create/delete events — the exact stray
-      // state issue #414 forbids. When we reap such a session, tombstone + retract
-      // its synthetic scratch objects too, so nothing it left reaches a later
-      // session. Captured BEFORE the close (projections persist, but read first).
-      const scratchObjects = session.hostSessionId.startsWith(
-        VERIFY_SESSION_ID_PREFIX,
-      )
-        ? this.verifyScratchObjectsForSession(session.id)
-        : [];
       // Reuse closeSession so the dormancy transition and an explicit close
-      // share ONE path (status → dormant, ephemeral monitors reaped, hook state
-      // refreshed).
-      this.closeSession(session.id);
-      for (const object of scratchObjects) {
-        this.suppressObjectEvents({
-          monitorId: object.monitorId,
-          objectKey: object.objectKey,
-          workspacePath: object.workspacePath,
-          // Derive the tombstone's life from the object's OWN monitor cadence when
-          // it is still authored (issue #418): a long-interval/long-settle monitor
-          // needs a window that outlasts its next poll + settle, or the scratch
-          // deletion re-materializes AFTER the tombstone has expired and lingers.
-          // Source preflight is separate: unrelated invalid config must not
-          // shorten safely derivable cadence protection during cleanup.
-          ttlMs: this.orphanSuppressionTtlMs(
-            monitorsById.get(object.monitorId),
-          ),
-          now,
-        });
-      }
+      // share ONE path (status → dormant, ephemeral monitors reaped, verify
+      // artifacts handed cleanup authority, hook state refreshed).
+      this.closeSession(session.id, now);
     }
   }
 
   /**
-   * The distinct synthetic scratch objects (`agentmonitors-verify-<token>…`) an
-   * orphaned verify session projected events for (issue #414). Used by the reap
-   * backstop above to tombstone+retract them. Matching is by the well-known
-   * scratch-file basename, which no real monitored object ever carries, so the
-   * subsequent by-key retraction can never touch real events.
+   * Register durable, exact ownership of a verify scratch artifact before the
+   * run creates it (002 §2.8, issue #562). While the owner session is active
+   * and has not requested cleanup, the artifact's events flow normally, which
+   * is verify's proof delivery. Cleanup authority later takes effect through
+   * {@link requestVerifyArtifactCleanup}, the owner's close, or stale-owner
+   * reaping, and then lasts without expiry.
+   *
+   * Only a verify scratch key (`…/agentmonitors-verify-<runId><ext>`) whose
+   * token equals `runId` is accepted: a real watched path can never acquire
+   * by-key cleanup authority, and each key belongs to exactly one run.
+   * Idempotent per run, including across restarts.
+   *
+   * @throws for a non-scratch key, a key carrying another run's token, a run
+   *   or key already registered differently, or an owner session that is
+   *   missing, not active, or in another workspace.
    */
-  private verifyScratchObjectsForSession(sessionId: string): {
-    monitorId: string;
-    objectKey: string;
-    workspacePath: string | null;
-  }[] {
-    const seen = new Set<string>();
-    const objects: {
-      monitorId: string;
-      objectKey: string;
-      workspacePath: string | null;
-    }[] = [];
-    for (const event of this.store.listEvents({ sessionId })) {
-      if (
-        event.objectKey === null ||
-        !isVerifyScratchObjectKey(event.objectKey)
-      )
-        continue;
-      const key = `${event.monitorId}::${event.objectKey}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      objects.push({
-        monitorId: event.monitorId,
-        objectKey: event.objectKey,
-        workspacePath: event.workspacePath ?? null,
-      });
+  registerVerifyArtifact(
+    input: RegisterVerifyArtifactInput,
+  ): VerifyArtifactRecord {
+    const keyRunId = verifyScratchRunId(input.objectKey);
+    if (keyRunId === undefined) {
+      throw new Error(
+        `registerVerifyArtifact refuses "${input.objectKey}": only a verify scratch path (agentmonitors-verify-<token>) can be owned; a real watched path keeps its exact event-id cleanup.`,
+      );
     }
-    return objects;
+    if (keyRunId !== input.runId) {
+      throw new Error(
+        `registerVerifyArtifact refuses "${input.objectKey}": the key does not carry the run identity "${input.runId}".`,
+      );
+    }
+    return this.store.registerVerifyArtifact({
+      runId: input.runId,
+      ownerSessionId: input.ownerSessionId,
+      workspacePath: input.workspacePath,
+      monitorId: input.monitorId,
+      objectKey: input.objectKey,
+      registeredAt: input.now ?? new Date(),
+    });
   }
 
   /**
-   * TTL for the tombstone the reap backstop installs over an orphaned verify run's
-   * scratch object (issue #418). The fixed {@link ORPHANED_VERIFY_SUPPRESSION_TTL_MS}
-   * floor can undershoot a monitor whose poll interval + notify settle exceeds it —
-   * the scratch deletion would then re-materialize AFTER the tombstone expired and
-   * linger for a later session. When the object's monitor is still authored (its
-   * definition is in this tick's scan) we derive the max of the floor and
-   * (interval + settle + margin) so the window always outlasts one full
-   * observe-and-settle cycle. Only unavailable or unparseable runtime cadence
-   * uses the floor; unrelated source-schema errors do not erase authored timing
-   * or known defaults. This is a bounded window, not proof that source/held work
-   * has drained after an arbitrary pause. Source preflight still gates execution.
+   * The owner's explicit cleanup request after its proof (002 §2.8, issue
+   * #562): record cleanup authority for the run's artifact and retract every
+   * event already materialized for that exact key in its monitor and
+   * workspace. From then on the key is filtered at the incoming-observation
+   * and held-emission boundaries. Idempotent: a retry keeps the first request
+   * time and cause.
+   *
+   * @throws when `runId` never registered an artifact.
    */
-  private orphanSuppressionTtlMs(
-    monitor: MonitorDefinition | undefined,
-  ): number {
-    if (!monitor) return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-    const watch = monitor.frontmatter.watch;
-    let nextPollMs: number;
-    if (watch.type === 'schedule') {
-      // Schedule observation cadence is fixed independently of cron validity.
-      nextPollMs = schedulingDefaults.scheduleTickMs;
-    } else if (watch['interval'] === undefined) {
-      nextPollMs =
-        watch.type === 'api-poll'
-          ? DEFAULT_API_POLL_MS
-          : DEFAULT_FILE_FINGERPRINT_POLL_MS;
-    } else {
-      const interval = watch['interval'];
-      if (typeof interval !== 'string') {
-        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-      }
-      // Catch only the pure duration parser. Cleanup must not turn storage or
-      // unrelated scheduler failures into a silently shortened lifetime.
-      try {
-        nextPollMs = parseDuration(interval);
-      } catch {
-        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-      }
+  requestVerifyArtifactCleanup(input: {
+    runId: string;
+    now?: Date;
+  }): VerifyArtifactCleanupResult {
+    if (!this.store.getVerifyArtifact(input.runId)) {
+      throw new Error(
+        `Verify run "${input.runId}" is not registered; only a registered artifact has cleanup authority.`,
+      );
     }
-    const notify = monitor.frontmatter.notify;
-    // The settle window that can delay the deletion's materialization: a debounce
-    // holds the batch for `settle-for`; a throttle can defer up to `suppress-for`.
-    const settleRaw =
-      notify?.strategy === 'debounce'
-        ? notify['settle-for']
-        : notify?.strategy === 'throttle'
-          ? notify['suppress-for']
-          : undefined;
-    let settleMs = 0;
-    if (typeof settleRaw === 'string') {
-      try {
-        settleMs = parseDuration(settleRaw);
-      } catch {
-        settleMs = 0;
-      }
-    }
-    return Math.max(
-      ORPHANED_VERIFY_SUPPRESSION_TTL_MS,
-      nextPollMs + settleMs + ORPHANED_VERIFY_SUPPRESSION_MARGIN_MS,
+    return this.applyVerifyArtifactCleanup(
+      input.runId,
+      'owner-request',
+      input.now ?? new Date(),
     );
+  }
+
+  /**
+   * Record cleanup authority and retract the exact key's materialized events
+   * in one owned writer transaction, then refresh the affected sessions. A
+   * crash before commit leaves neither; a retry repeats both safely.
+   */
+  private applyVerifyArtifactCleanup(
+    runId: string,
+    cause: VerifyArtifactCleanupCause,
+    now: Date,
+  ): VerifyArtifactCleanupResult {
+    const result = withStoreWriter(this.store, () => {
+      const { artifact } = this.store.recordVerifyArtifactCleanup(
+        runId,
+        cause,
+        now,
+      );
+      const retracted = this.store.retractObjectEventsByKey({
+        monitorId: artifact.monitorId,
+        objectKey: artifact.objectKey,
+        workspacePath: artifact.workspacePath,
+      });
+      return { artifact, ...retracted };
+    });
+    for (const sessionId of result.affectedSessionIds) {
+      this.refreshHookState(sessionId);
+    }
+    return {
+      artifact: result.artifact,
+      retractedEventCount: result.removedEventIds.length,
+    };
+  }
+
+  /**
+   * Give cleanup authority to registered artifacts whose owner session is
+   * missing or no longer active but has no recorded cleanup yet: a run killed
+   * before its own request, or a crash between an owner's close and this
+   * record. The exact-key filter already treats such an owner as ended; this
+   * makes that durable and retracts anything materialized during the proof.
+   */
+  private reconcileVerifyArtifacts(now: Date, workspacePath: string): void {
+    for (const artifact of this.store.verifyArtifactsAwaitingCleanup(
+      workspacePath,
+    )) {
+      this.applyVerifyArtifactCleanup(artifact.runId, 'owner-inactive', now);
+    }
+  }
+
+  /**
+   * Drop items for a verify artifact whose cleanup authority is in effect —
+   * the exact registered key in this monitor and workspace only (002 §2.8,
+   * issue #562). Applied at the incoming-observation boundary (before notify
+   * dispatch) and the held-emission boundary (before materialization), so
+   * neither a fresh nor a held observation of the artifact reaches a later
+   * session. Every other item, including siblings in the same batch, is kept
+   * in order. Non-scratch keys skip the lookup: they are never verify artifacts, whatever the store holds.
+   */
+  private withoutRetiredVerifyArtifacts<T>(
+    monitorId: string,
+    workspacePath: string,
+    items: readonly T[],
+    objectKeyOf: (item: T) => string | undefined,
+  ): T[] {
+    return items.filter((item) => {
+      const objectKey = objectKeyOf(item);
+      return (
+        objectKey === undefined ||
+        !isVerifyScratchObjectKey(objectKey) ||
+        !this.store.isVerifyArtifactCleanupEffective({
+          workspacePath,
+          monitorId,
+          objectKey,
+        })
+      );
+    });
+  }
+
+  /**
+   * Every retained verify artifact ownership record (002 §2.8, issue #562),
+   * optionally for one workspace. Records are never removed.
+   */
+  listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[] {
+    return this.store.listVerifyArtifacts(workspacePath);
   }
 
   listSessions(): AgentSessionRecord[] {
@@ -3166,12 +3352,10 @@ export class AgentMonitorRuntime {
     // transition stale active sessions to dormant and reap their ephemeral
     // monitors, so a session that vanished without an explicit close still
     // releases its session-scoped watches this tick (and they never fire below).
-    // The scanned monitors are threaded in so the reap can size an orphan verify
-    // tombstone from the object's own monitor cadence (issue #418).
-    const monitorsById = new Map<string, MonitorDefinition>(
-      result.monitors.map((parsed) => [parsed.monitor.id, parsed.monitor]),
-    );
-    this.reapDormantSessions(now, workspacePath, monitorsById);
+    this.reapDormantSessions(now, workspacePath);
+    // Verify artifacts whose owner ended without a recorded cleanup gain it
+    // before any observation or held work is admitted (002 §2.8, issue #562).
+    this.reconcileVerifyArtifacts(now, workspacePath);
 
     this.reportMissingHeldDefinitions(result, workspacePath, acc);
 
@@ -3705,7 +3889,14 @@ export class AgentMonitorRuntime {
         }
         return [];
       }
-      const drained = held
+      // Held-emission boundary (002 §2.8, issue #562): the drain materializes
+      // captured work, so a retired verify artifact is dropped here as well.
+      const drained = this.withoutRetiredVerifyArtifacts(
+        monitor.id,
+        workspacePath,
+        held,
+        (envelope) => envelope.observation.objectKey,
+      )
         .map(hydrateStoredObservationEnvelope)
         .sort((a, b) => a.observedAt.getTime() - b.observedAt.getTime())
         .map((envelope) => {
@@ -3809,6 +4000,11 @@ export class AgentMonitorRuntime {
                 ...(pending.ephemeralSessionId !== undefined
                   ? { ephemeralSessionId: pending.ephemeralSessionId }
                   : {}),
+                onNotHeld: (message) =>
+                  acc.erroredObservations.push({
+                    monitorId: monitor.id,
+                    message,
+                  }),
               },
             );
           } finally {
@@ -3933,6 +4129,27 @@ export class AgentMonitorRuntime {
       });
       return;
     }
+    // Work this monitor already accepted completes before anything newer
+    // (002 §2.7): before held-work reconciliation, a retained poll result,
+    // a rollup window flush or a source call. A watched monitor is drained
+    // here too, so a notify edit cannot release newer held work ahead of it;
+    // its watcher also drains before each pull. Each completion is one
+    // synchronous transaction, so the two never complete the same retry.
+    // An empty outbox costs one read and no await.
+    if (this.hasRetainedWork(monitor.id, workspacePath)) {
+      const drained = await this.drainMaterializationRetries(
+        monitor.id,
+        workspacePath,
+        now,
+        ephemeralSessionId,
+      );
+      acc.emittedEventIds.push(...drained.emittedEventIds);
+      if (drained.attempted) acc.evaluated.push(monitor.id);
+      if (drained.blocked) {
+        this.reportBlockedDrain(monitor, workspacePath, drained.blocked, acc);
+        return;
+      }
+    }
     if (
       !(await this.prepareNotifyPolicy(
         monitor,
@@ -3998,115 +4215,27 @@ export class AgentMonitorRuntime {
       // be evaluated on every tick regardless of the source polling interval.
       // A monitor whose interval has not yet elapsed must still flush its
       // accumulated batch when the delivery window opens, so we dispatch
-      // `dispatchRollup` with zero new observations to trigger a window check.
+      // with zero new observations to trigger a window check.
       if (monitor.frontmatter.notify?.strategy === 'rollup') {
-        // dispatchRollup mutates nextState in-place, so we pass the spread
-        // state and always persist the result — `rollupLastFiredMinute` may
-        // have been updated even when no observations were flushed.
-        const rollupNotifyState = { ...monitorStateForSkip.notifyState };
-        // dispatchRollup() evaluates `notify.timezone` via cronMatchesDate,
-        // which can throw for an invalid IANA zone exactly like the schedule
-        // watch case above (issue #297). This call sits outside the
-        // observe()/ingest() try/catches (this whole branch runs on the
-        // NOT-due path), so it needs its own isolation: a bad rollup timezone
-        // must not abort the tick for every other monitor either.
-        let rollupDispatch: NotifyDispatchResult;
-        try {
-          rollupDispatch = this.dispatchRollup(
+        await this.reportHeldNotifyFlush(
+          this.flushHeldNotifyWork(
             monitor,
-            [],
             now,
-            rollupNotifyState,
-          );
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          acc.erroredObservations.push({ monitorId: monitor.id, message });
-          try {
-            this.store.recordObservationHistory({
-              monitorId: monitor.id,
-              workspacePath,
-              sourceName,
-              result: 'errored',
-              observationData: { error: message },
-            });
-          } catch {
-            // best-effort audit — ignore write failures
-          }
-          return;
-        }
-        const nextMonitorState = {
-          sourceState: monitorStateForSkip.sourceState,
-          notifyState: rollupDispatch.nextState,
-          lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
-        };
-        // An empty window check only persists the window bookkeeping
-        // (`rollupLastFiredMinute`); it holds and flushes nothing.
-        if (rollupDispatch.emitted.length === 0) {
-          this.store.setMonitorState(
-            monitor.id,
             workspacePath,
-            nextMonitorState,
-          );
-          return;
-        }
-        // Route the flushed batch through the SAME span materialization as
-        // `ingest()` (issue #180) so the not-due path records the `triggered`
-        // observation_history row (002 §10.7) and writes every emitted
-        // observation onto the shared chain — the due path already does both.
-        // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
-        // The state that clears `pendingRollup` commits in the SAME
-        // transaction as the flushed span, so the held batch either reaches
-        // its durable outcomes (event, retained retry, or `errored` row) or
-        // stays held for the next window check. Only invoked when the window
-        // flushed something: an empty check must NOT flood the audit trail
-        // with `no-change` rows. `observed: 0` because this path dispatches
-        // no NEW observations — only the already-accumulated batch.
-        try {
-          const materialized = await this.materializeSpan(
-            monitor,
-            rollupDispatch.emitted,
-            {
-              observed: 0,
-              workspacePath,
-              nextMonitorState,
-              ...(ephemeralSessionId !== undefined
-                ? { ephemeralSessionId }
-                : {}),
-            },
-          );
-          acc.emittedEventIds.push(...materialized.emittedEventIds);
-          if (materialized.failures.length > 0) {
-            acc.erroredObservations.push({
-              monitorId: monitor.id,
-              message: summarizeMaterializationFailures(materialized.failures),
-            });
-          }
-        } catch (flushError) {
-          // The whole flush rolled back, hold included, so the batch is
-          // still held for the next window check. Reporting it is all that is
-          // left here. This dispatch decision is still read before the write
-          // lock; that separate not-due decision boundary is tracked by #498.
-          const message = errorMessage(flushError);
-          acc.erroredObservations.push({ monitorId: monitor.id, message });
-          try {
-            this.store.recordObservationHistory({
-              monitorId: monitor.id,
-              workspacePath,
-              sourceName,
-              result: 'errored',
-              observationData: { error: message },
-            });
-          } catch {
-            // best-effort audit — ignore write failures
-          }
-        }
+            ephemeralSessionId,
+          ),
+          monitor.id,
+          workspacePath,
+          sourceName,
+          acc,
+        );
       }
 
       return;
     }
 
-    acc.evaluated.push(monitor.id);
+    // A monitor that drained retained work and then observes counts once.
+    if (!acc.evaluated.includes(monitor.id)) acc.evaluated.push(monitor.id);
 
     // Two separate try/catch blocks so observe() failures and ingest()
     // failures are handled independently (issue #46):
@@ -4139,11 +4268,9 @@ export class AgentMonitorRuntime {
         },
       );
     } catch (observeError) {
-      this.pollAdmissions.delete(key);
-      this.wakeNotifyPolicy(key);
-      // observe() failed: record errored outcome (best-effort) and skip
-      // this monitor entirely for this tick. ingest() is NOT called, which
-      // preserves sourceState as described above.
+      // observe() failed: ingest() is NOT called, which preserves sourceState
+      // as described above, and the scheduling timestamp stays where the last
+      // successful observation left it.
       const message =
         observeError instanceof Error
           ? observeError.message
@@ -4152,6 +4279,28 @@ export class AgentMonitorRuntime {
       // `daemon once`/`daemon run` can report the failure instead of a bare
       // `emitted 0`.
       acc.erroredObservations.push({ monitorId: monitor.id, message });
+      // Runtime-owned timing does not wait on the source (002 §2.6): work held
+      // before the failure still flushes at its debounce deadline or rollup
+      // window. Like a successful poll, the flush is admitted synchronously
+      // while this poll still owns admission; only then is the slot released.
+      const flush = this.flushHeldWorkDespiteSourceFailure(
+        monitor,
+        admission,
+        now,
+        workspacePath,
+        ephemeralSessionId,
+      );
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
+      await this.reportHeldNotifyFlush(
+        flush,
+        monitor.id,
+        workspacePath,
+        sourceName,
+        acc,
+      );
+      // The source failure is recorded after any flush, so it stays the
+      // newest outcome: progress on held work never reads as a healthy source.
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4216,6 +4365,8 @@ export class AgentMonitorRuntime {
             ? { sourceOutcome: observationResult.outcome }
             : {}),
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+          onNotHeld: (message) =>
+            acc.erroredObservations.push({ monitorId: monitor.id, message }),
         },
       );
       // Deterministic admission ran synchronously in that call; relinquish the
@@ -4257,6 +4408,307 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Complete one monitor's retained materialization work, oldest admission
+   * first, until its outbox is empty or a retry cannot complete now
+   * (002 §2.7). Each retry renders the event its stored envelope describes and
+   * commits it, its projections and the removal of the retry row together;
+   * only sessions registered before the observation was admitted receive it.
+   *
+   * A failed attempt advances the retry's persisted backoff and records an
+   * `errored` history row, and the drain stops there: a younger retry never
+   * completes ahead of an older one. A terminal or backing-off retry is
+   * reported to the caller without an attempt. The source is never invoked.
+   */
+  private async drainMaterializationRetries(
+    monitorId: string,
+    workspacePath: string,
+    now: Date,
+    restrictToSessionId?: string,
+  ): Promise<RetryDrainResult> {
+    const result: RetryDrainResult = { attempted: false, emittedEventIds: [] };
+    for (;;) {
+      const retry = this.store.oldestMaterializationRetry(
+        monitorId,
+        workspacePath,
+      );
+      if (!retry) return result;
+      // A retained observation of a verify artifact whose cleanup authority
+      // took effect after it was queued is dropped, not drained (002 §2.8).
+      // This runs before the terminal and backoff checks, so a dropped row
+      // never holds back newer legitimate work, even when it is terminal.
+      // The discard evaluates the same predicate on the same row under its
+      // writer lock, so a refused discard means the row is gone or no longer
+      // retired (authority can lapse before it is recorded); the re-read decides.
+      if (
+        this.withoutRetiredVerifyArtifacts(
+          monitorId,
+          workspacePath,
+          [retry],
+          (r) => r.envelope.observation.objectKey,
+        ).length === 0
+      ) {
+        const blocked = this.discardRetiredRetry(
+          monitorId,
+          workspacePath,
+          retry,
+        );
+        if (blocked) return { ...result, blocked };
+        continue;
+      }
+      if (retry.status === 'terminal') {
+        return {
+          ...result,
+          blocked: {
+            kind: 'terminal',
+            message: `Materialization retry ${retry.id} stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed. Last error: ${retry.lastError ?? 'unknown'}`,
+          },
+        };
+      }
+      if (
+        retry.nextAttemptAt !== null &&
+        retry.nextAttemptAt.getTime() > now.getTime()
+      ) {
+        return {
+          ...result,
+          blocked: { kind: 'backoff', nextAttemptAt: retry.nextAttemptAt },
+        };
+      }
+
+      result.attempted = true;
+      const { envelope } = retry;
+      let materialized: MaterializedObservation;
+      try {
+        const rendered = this.renderObservationEvent({
+          monitor: envelope.monitor,
+          sourceName: envelope.monitor.frontmatter.watch.type,
+          observation: envelope.observation,
+          observedAt: envelope.observedAt,
+          workspacePath,
+          effectiveUrgency: envelope.effectiveUrgency,
+        });
+        if (!rendered) {
+          throw new Error(
+            'The retained observation is suppressed by its payload gate and cannot materialize.',
+          );
+        }
+        const event = this.store.completeMaterializationRetry(
+          retry.id,
+          rendered.event,
+          rendered.baseline,
+          restrictToSessionId !== undefined
+            ? { restrictToSessionId }
+            : undefined,
+        );
+        materialized = {
+          monitor: envelope.monitor,
+          event,
+          diffText: rendered.diffText,
+          projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
+        };
+      } catch (retryError) {
+        // Another writer recorded the artifact's cleanup after this drain
+        // read the row. Completion refused under its writer lock and wrote
+        // nothing; the row is dropped as if the read had seen the authority.
+        if (retryError instanceof RetiredVerifyArtifactRetryError) {
+          const blocked = this.discardRetiredRetry(
+            monitorId,
+            workspacePath,
+            retry,
+          );
+          if (blocked) return { ...result, blocked };
+          continue;
+        }
+        const cause = errorMessage(retryError);
+        let message = `Materialization retry ${retry.id} failed: ${cause}`;
+        try {
+          // Backoff starts at this attempt, not at the tick's start.
+          this.store.markMaterializationRetryFailed(retry.id, cause);
+        } catch (stateError) {
+          message += ` Recording the failed attempt also failed: ${errorMessage(stateError)}`;
+        }
+        this.recordErroredHistory(
+          monitorId,
+          workspacePath,
+          retry.sourceName,
+          message,
+        );
+        return { ...result, blocked: { kind: 'failed', message } };
+      }
+      result.emittedEventIds.push(materialized.event.id);
+      // Interpret follows the committed completion, as it does for a span.
+      await this.interpretMaterializedObservation(materialized, workspacePath);
+    }
+  }
+
+  /**
+   * Drop one retained row whose observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8), for {@link drainMaterializationRetries}.
+   * The store re-evaluates authority on the same row under its writer lock, so
+   * a refused discard means the row is gone or no longer retired: the caller
+   * re-reads the oldest row and that read decides. A discard that cannot
+   * commit is a failed drain step, reported like a failed completion: the row
+   * stays in place, an `errored` history row is recorded, and the returned
+   * block holds the monitor behind it.
+   */
+  private discardRetiredRetry(
+    monitorId: string,
+    workspacePath: string,
+    retry: MaterializationRetryRecord,
+  ): RetryDrainBlock | undefined {
+    try {
+      this.store.discardRetiredVerifyArtifactRetry(retry.id);
+      return undefined;
+    } catch (discardError) {
+      const message = `Materialization retry ${retry.id} could not be discarded after its verify artifact's cleanup took effect: ${errorMessage(discardError)}`;
+      this.recordErroredHistory(
+        monitorId,
+        workspacePath,
+        retry.sourceName,
+        message,
+      );
+      return { kind: 'failed', message };
+    }
+  }
+
+  /** Whether this workspace/monitor's retry outbox holds any row, pending or terminal. */
+  private hasRetainedWork(monitorId: string, workspacePath: string): boolean {
+    return (
+      this.store.oldestMaterializationRetry(monitorId, workspacePath) !==
+      undefined
+    );
+  }
+
+  /**
+   * Report a tick that left retained work in place (002 §2.7). A failed
+   * attempt already has its `errored` row; a terminal retry gets one on every
+   * tick it keeps the monitor paused, alongside the tick-result entry. A retry
+   * that is backing off is a schedule wait, reported with its next attempt
+   * time like any monitor that is not yet due.
+   */
+  private reportBlockedDrain(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    blocked: RetryDrainBlock,
+    acc: TickAccumulator,
+  ): void {
+    if (blocked.kind === 'backoff') {
+      acc.skippedMonitors.push({
+        monitorId: monitor.id,
+        nextDueAt: blocked.nextAttemptAt,
+      });
+      return;
+    }
+    if (blocked.kind === 'terminal') {
+      this.recordErroredHistory(
+        monitor.id,
+        workspacePath,
+        monitor.frontmatter.watch.type,
+        blocked.message,
+      );
+    }
+    acc.erroredObservations.push({
+      monitorId: monitor.id,
+      message: blocked.message,
+    });
+  }
+
+  /**
+   * Hold a watcher's next pull until its monitor's retained work has drained
+   * (002 §2.7), retrying on the outbox's own backoff. Failed attempts are
+   * reported each time; a terminal retry is reported once and then only
+   * rechecked. Returns `false` once the watcher no longer owns its monitor.
+   */
+  private async drainBeforeWatchPull(
+    monitorId: string,
+    workspacePath: string,
+    signal: AbortSignal,
+    ownsWatch: () => boolean,
+    onError?: (monitorId: string, error: Error) => void,
+  ): Promise<boolean> {
+    let reportedTerminal: string | undefined;
+    for (;;) {
+      if (!ownsWatch()) return false;
+      const drained = await this.drainMaterializationRetries(
+        monitorId,
+        workspacePath,
+        new Date(),
+      );
+      if (drained.emittedEventIds.length > 0) {
+        this.refreshWorkspaceSessions(workspacePath);
+      }
+      const { blocked } = drained;
+      if (!blocked) return ownsWatch();
+      let waitMs: number;
+      if (blocked.kind === 'backoff') {
+        waitMs = blocked.nextAttemptAt.getTime() - Date.now();
+      } else if (blocked.kind === 'failed') {
+        onError?.(monitorId, new Error(blocked.message));
+        waitMs = this.failedAttemptWaitMs(monitorId, workspacePath);
+      } else {
+        if (blocked.message !== reportedTerminal) {
+          reportedTerminal = blocked.message;
+          const sourceName =
+            this.store.oldestMaterializationRetry(monitorId, workspacePath)
+              ?.sourceName ?? 'unknown';
+          this.recordErroredHistory(
+            monitorId,
+            workspacePath,
+            sourceName,
+            blocked.message,
+          );
+          onError?.(monitorId, new Error(blocked.message));
+        }
+        waitMs = TERMINAL_RETRY_RECHECK_MS;
+      }
+      await abortableDelay(waitMs, signal);
+    }
+  }
+
+  /**
+   * How long a watcher waits after a failed drain attempt: until the row's
+   * persisted next attempt when that is still ahead, and otherwise the retry
+   * policy's first delay. The fallback covers a failed attempt whose backoff
+   * could not be recorded (or could not be read back), where the row is still
+   * due and an immediate retry would spin (008 §8).
+   */
+  private failedAttemptWaitMs(
+    monitorId: string,
+    workspacePath: string,
+  ): number {
+    let nextAttemptAt: Date | null | undefined;
+    try {
+      nextAttemptAt = this.store.oldestMaterializationRetry(
+        monitorId,
+        workspacePath,
+      )?.nextAttemptAt;
+    } catch {
+      // The outbox cannot be read; fall back to the floor.
+    }
+    const untilNext = nextAttemptAt ? nextAttemptAt.getTime() - Date.now() : 0;
+    return untilNext > 0 ? untilNext : MATERIALIZATION_RETRY_DELAYS_MS[0];
+  }
+
+  /** Best-effort `errored` audit row; a failed write cannot change committed work. */
+  private recordErroredHistory(
+    monitorId: string,
+    workspacePath: string,
+    sourceName: string,
+    message: string,
+  ): void {
+    try {
+      this.store.recordObservationHistory({
+        monitorId,
+        workspacePath,
+        sourceName,
+        result: 'errored',
+        observationData: { error: message },
+      });
+    } catch {
+      // Audit is best-effort.
+    }
+  }
+
+  /**
    * Funnel a batch of observations through notify dispatch, persist the updated
    * monitor state, and materialize the emitted observations into durable events.
    * Shared by the tick loop (one-shot `observe()`) and the continuous watcher
@@ -4293,6 +4745,14 @@ export class AgentMonitorRuntime {
        * in the same workspace (007 §4.6 isolation).
        */
       ephemeralSessionId?: string;
+      /**
+       * Reports each observation a debounce/rollup hold refused (002 §4.7):
+       * the tick loop adds it to `erroredObservations`, a watcher to `onError`.
+       * Its durable `errored` loss row (002 §2) is written inside the
+       * admission transaction either way. Called only after that transaction commits
+       * and the span has materialized; an exception it throws is ignored.
+       */
+      onNotHeld?: (message: string) => void;
     },
   ): Promise<MaterializationSpanResult> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
@@ -4325,14 +4785,29 @@ export class AgentMonitorRuntime {
           'Monitor source baseline changed before admission; discard this stale batch and observe again from persisted state.',
         );
       }
+      // Incoming-observation boundary (002 §2.8, issue #562): a verify
+      // artifact under cleanup authority never enters notify state or
+      // emission. Decided under the writer lock so a concurrent cleanup
+      // request is honored. The source checkpoint still advances; its opaque
+      // state is never rewritten.
+      const admittedObservations = this.withoutRetiredVerifyArtifacts(
+        monitor.id,
+        options.workspacePath,
+        passedObservations,
+        (observation) => observation.objectKey,
+      );
       const dispatch = this.dispatchNotify(
         monitor,
-        passedObservations,
+        admittedObservations,
         now,
         monitorState.notifyState,
       );
       const spanOptions: MaterializationSpanOptions = {
-        observed: observations.length,
+        // A filtered verify artifact is not an observation of the workspace.
+        observed:
+          observations.length -
+          (passedObservations.length - admittedObservations.length),
+        notHeld: dispatch.notHeld.length,
         workspacePath: options.workspacePath,
         nextMonitorState: {
           sourceState: options.nextSourceState
@@ -4354,44 +4829,233 @@ export class AgentMonitorRuntime {
           : {}),
       };
       return {
-        durable: this.admitSpan(monitor, dispatch.emitted, spanOptions),
+        // An observation a hold refused (002 §4.7) is neither emitted nor
+        // held. Admission records it as loss in this transaction, together
+        // with the state that advances past it: a rollback undoes both, so
+        // the refusal is decided again from the prior baseline.
+        durable: this.admitSpan(
+          monitor,
+          dispatch.emitted,
+          spanOptions,
+          dispatch.notHeld,
+        ),
         spanOptions,
+        notHeld: dispatch.notHeld,
       };
     });
+    // Refusals are reported only once the admission transaction has committed
+    // and the span has materialized, so a throwing report callback can never
+    // cut off committed work, and a rolled-back span reports none.
+    try {
+      return await this.finishMaterializationSpan(
+        monitor,
+        admitted.durable,
+        admitted.spanOptions,
+      );
+    } finally {
+      for (const { message } of admitted.notHeld) {
+        try {
+          options.onNotHeld?.(message);
+        } catch {
+          // Reporting is best-effort: the state, the `errored` row and any
+          // materialized events are already committed.
+        }
+      }
+    }
+  }
+
+  /**
+   * Flush held notify work whose time has come without acquiring new source
+   * observations: a rollup window check on a not-due tick (002 §4.4), or a
+   * debounce deadline or rollup window reached while the source's observe()
+   * fails (002 §2.6). Notify dispatch runs with an empty arrival set, so it
+   * decides exactly as a successful tick with no new observations would.
+   *
+   * Read the authoritative batch, minute marker, source checkpoint and
+   * observation time only after obtaining the writer lock; a schedule
+   * snapshot cannot safely supply this decision after another runtime has
+   * committed newer work. Only the notify state changes: the source baseline
+   * and scheduling timestamp are committed back as they were read, so a flush
+   * never stands in for a successful observation.
+   */
+  private async flushHeldNotifyWork(
+    monitor: MonitorDefinition,
+    now: Date,
+    workspacePath: string,
+    ephemeralSessionId?: string,
+  ): Promise<MaterializationSpanResult> {
+    const admitted = runRuntimeTransaction(this.store, () => {
+      const current = this.store.getMonitorState(monitor.id, workspacePath);
+      const dispatch = this.dispatchNotify(
+        monitor,
+        [],
+        now,
+        current.notifyState,
+      );
+      const options: MaterializationSpanOptions = {
+        observed: 0,
+        workspacePath,
+        nextMonitorState: {
+          sourceState: current.sourceState,
+          notifyState: dispatch.nextState,
+          lastObservationAt: current.lastObservationAt ?? null,
+        },
+        ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+      };
+      return {
+        durable: this.admitSpan(monitor, dispatch.emitted, options),
+        options,
+      };
+    });
+    // Even an empty matching window commits its minute marker, but routine
+    // window checks must not manufacture no-change history or empty deliveries.
+    // The check counts what materialized, not what dispatch emitted: a flush
+    // whose only held work was a filtered verify artifact (002 §2.8) is empty
+    // too. It has already cleared the hold, and it writes no row, so on the
+    // failing-source path the source's `errored` row stays the newest (002 §2.6).
+    if (
+      admitted.durable.materialized.length === 0 &&
+      admitted.durable.failures.length === 0
+    )
+      return { emittedEventIds: [], failures: [] };
     return await this.finishMaterializationSpan(
       monitor,
       admitted.durable,
-      admitted.spanOptions,
+      admitted.options,
     );
   }
 
   /**
-   * Admit an already-dispatched span, used when a notify window flushes without
-   * a new source acquisition. The caller owns dispatch decision freshness;
-   * this wrapper shares event/retry persistence and post-commit reporting with
-   * ingest, but does not recompute its supplied decision.
+   * The held-work flush for a poll whose observe() failed (002 §2.6). Runs
+   * under the admission gate current at this moment: a retired poll, or a
+   * closed gate for a rejected or missing definition (002 §2.0, §4.6), leaves
+   * held work untouched. Everything up to the flush's commit runs before this
+   * returns, so the caller can release poll admission right after the call;
+   * any failure, including a storage read, arrives as a rejection.
    */
-  private async materializeSpan(
+  private async flushHeldWorkDespiteSourceFailure(
     monitor: MonitorDefinition,
-    emitted: StoredObservationEnvelope[],
-    options: MaterializationSpanOptions,
+    admission: PollAdmission,
+    now: Date,
+    workspacePath: string,
+    ephemeralSessionId: string | undefined,
   ): Promise<MaterializationSpanResult> {
-    const durable = runRuntimeTransaction(this.store, () =>
-      this.admitSpan(monitor, emitted, options),
+    const latest = admission.retired
+      ? undefined
+      : this.watchPolicies.get(JSON.stringify([workspacePath, monitor.id]));
+    if (!latest || !this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
+      return { emittedEventIds: [], failures: [] };
+    }
+    return await this.flushHeldNotifyWork(
+      this.applyWatchPolicy(monitor, latest),
+      now,
+      workspacePath,
+      ephemeralSessionId,
     );
-    return await this.finishMaterializationSpan(monitor, durable, options);
   }
 
   /**
-   * Synchronously persist the event prefix, ordered retry suffix and state.
-   * Caller holds the outer immediate transaction; individual events use nested
-   * savepoints. No adapter or producer callback is allowed in this boundary.
+   * Put a held-work flush's outcome on the tick result. A flush that rolled
+   * back keeps its whole batch held for the next check; it is reported on the
+   * tick result and as a best-effort `errored` row, and stays local to this
+   * monitor so healthy siblings are still evaluated.
+   */
+  private async reportHeldNotifyFlush(
+    flush: Promise<MaterializationSpanResult>,
+    monitorId: string,
+    workspacePath: string,
+    sourceName: string,
+    acc: TickAccumulator,
+  ): Promise<void> {
+    try {
+      const flushed = await flush;
+      acc.emittedEventIds.push(...flushed.emittedEventIds);
+      if (flushed.failures.length > 0) {
+        acc.erroredObservations.push({
+          monitorId,
+          message: summarizeMaterializationFailures(flushed.failures),
+        });
+      }
+    } catch (error) {
+      const message = errorMessage(error);
+      acc.erroredObservations.push({ monitorId, message });
+      try {
+        this.store.recordObservationHistory({
+          monitorId,
+          workspacePath,
+          sourceName,
+          result: 'errored',
+          observationData: { error: message },
+        });
+      } catch {
+        // Audit is best-effort after the failed admission rolled back.
+      }
+    }
+  }
+
+  /**
+   * Record one observation the runtime could not keep as outstanding loss
+   * (002 §2), whatever the reason: the retry outbox could not retain it, or a
+   * hold refused it (002 §4.7). Every kind of loss goes through here, so each
+   * gets the same drop identity and the same supersession rule. Must run
+   * inside the admitting span's transaction, at the lost observation's place
+   * in the span's order (see {@link RuntimeStore.recordObservationLoss}).
+   */
+  private recordObservationLoss(
+    monitorId: string,
+    sourceName: string,
+    workspacePath: string,
+    observation: Observation,
+    observationData: Record<string, unknown> & { error: string },
+  ): void {
+    // The raw key, not the display-safe copy: a later event for exactly this
+    // key is what supersedes the loss (002 §2).
+    const { objectKey } = observation as { objectKey?: unknown };
+    this.store.recordObservationLoss({
+      monitorId,
+      workspacePath,
+      sourceName,
+      objectKey: typeof objectKey === 'string' ? objectKey : undefined,
+      observationData,
+    });
+  }
+
+  /**
+   * Synchronously persist the event prefix, ordered retry suffix, losses and
+   * state. Caller holds the outer immediate transaction; individual events use
+   * nested savepoints. No adapter or producer callback is allowed in this
+   * boundary.
+   *
+   * `notHeld` are the dispatch's hold refusals (002 §4.7). Each is recorded as
+   * loss at its place in observation order, after the `emittedBefore` events
+   * that precede it, so the drop watermark (002 §2) orders it against its
+   * siblings exactly as an unretained drop is ordered. Once a retained suffix
+   * has started, later refusals are recorded after that suffix is queued: the
+   * suffix's admission positions are reserved only then, and a retry of an
+   * older observation must not supersede a newer loss.
+   *
+   * A refusal's `emittedBefore` counts positions in `dispatched`. Admission
+   * places it among the envelopes that survive the ownership filter instead
+   * (002 §2.8), so a dropped artifact never pushes a refusal past a newer
+   * event of its key.
    */
   private admitSpan(
     monitor: MonitorDefinition,
-    emitted: StoredObservationEnvelope[],
+    dispatched: StoredObservationEnvelope[],
     options: MaterializationSpanOptions,
+    notHeld: readonly NotHeldObservation[] = [],
   ): DurableMaterializationSpan {
+    // Held-emission boundary (002 §2.8, issue #562): a held envelope for a
+    // verify artifact whose cleanup authority took effect while it waited
+    // (debounce, rollup or escalation flush) is dropped here, before
+    // materialization or retry admission. Its batch siblings keep their order.
+    const emitted = this.withoutRetiredVerifyArtifacts(
+      monitor.id,
+      options.workspacePath,
+      dispatched,
+      (envelope) => envelope.observation.objectKey,
+    );
+    const refusals = refusalsAmongKept(notHeld, dispatched, emitted);
     const materialized: MaterializedObservation[] = [];
     const failures: MaterializationFailure[] = [];
     const retention = new SuffixRetention(
@@ -4401,8 +5065,25 @@ export class AgentMonitorRuntime {
       emitted,
     );
     let deferRemaining = false;
+    let refusalsRecorded = 0;
+    const recordRefusalsBefore = (position: number) => {
+      for (
+        let refusal = refusals[refusalsRecorded];
+        refusal !== undefined && refusal.emittedBefore <= position;
+        refusal = refusals[++refusalsRecorded]
+      ) {
+        this.recordObservationLoss(
+          monitor.id,
+          monitor.frontmatter.watch.type,
+          options.workspacePath,
+          refusal.observation,
+          heldRefusalData(refusal),
+        );
+      }
+    };
 
     for (const [index, envelope] of emitted.entries()) {
+      if (!deferRemaining) recordRefusalsBefore(index);
       if (deferRemaining) {
         failures.push({
           envelope,
@@ -4460,16 +5141,13 @@ export class AgentMonitorRuntime {
           emitted.length,
         );
         const unretained = unretainedData.error;
-        // The raw key, not the display-safe copy: a later event for exactly
-        // this key is what supersedes the drop (002 §2).
-        const { objectKey } = envelope.observation as { objectKey?: unknown };
-        this.store.recordUnretainedObservation({
-          monitorId: monitor.id,
-          workspacePath: options.workspacePath,
-          sourceName: envelope.monitor.frontmatter.watch.type,
-          objectKey: typeof objectKey === 'string' ? objectKey : undefined,
-          observationData: unretainedData,
-        });
+        this.recordObservationLoss(
+          monitor.id,
+          envelope.monitor.frontmatter.watch.type,
+          options.workspacePath,
+          envelope.observation,
+          unretainedData,
+        );
         failures.push({
           envelope,
           message: unretained,
@@ -4496,17 +5174,16 @@ export class AgentMonitorRuntime {
         })),
       );
     }
+    // Refusals after every emitted envelope, or after a retained suffix began.
+    recordRefusalsBefore(Number.POSITIVE_INFINITY);
 
-    if (options.nextMonitorState) {
-      // This write deliberately follows outbox admission. If either the
-      // outbox or state write fails, the outer transaction also rolls back
-      // successful siblings, leaving the prior source baseline for replay.
-      this.store.setMonitorState(
-        monitor.id,
-        options.workspacePath,
-        options.nextMonitorState,
-      );
-    }
+    // State follows suffix admission so either failure also rolls back every
+    // successful sibling, preserving the prior source/notify replay boundary.
+    this.store.setMonitorState(
+      monitor.id,
+      options.workspacePath,
+      options.nextMonitorState,
+    );
     return { materialized, failures };
   }
 
@@ -4524,9 +5201,16 @@ export class AgentMonitorRuntime {
     const notRetainedCount = durable.failures.filter(
       ({ retained }) => !retained,
     ).length;
+    // Refusals at hold acceptance (002 §4.7) already have their own `errored`
+    // loss rows. They count in `observed` but never make a span `suppressed`.
+    const notHeld = options.notHeld ?? 0;
     // Do not write a false batch-level `triggered` row when every dispatched
-    // envelope failed. Individual failure rows below are the truthful outcome.
-    if (emittedCount > 0 || durable.failures.length === 0) {
+    // envelope failed, nor a `suppressed` row for a span whose only
+    // observations a hold refused. Individual rows are the truthful outcome.
+    if (
+      emittedCount > 0 ||
+      (durable.failures.length === 0 && (notHeld === 0 || observed > notHeld))
+    ) {
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4537,13 +5221,14 @@ export class AgentMonitorRuntime {
               ? 'triggered'
               : observed === 0 && options.sourceOutcome !== undefined
                 ? options.sourceOutcome
-                : observed > 0
+                : observed > notHeld
                   ? 'suppressed'
                   : 'no-change',
           observationData: {
             observed,
             emitted: emittedCount,
             ...(notRetainedCount > 0 ? { notRetainedCount } : {}),
+            ...(notHeld > 0 ? { notHeld } : {}),
           },
         });
       } catch {
@@ -4759,7 +5444,31 @@ export class AgentMonitorRuntime {
       try {
         const errorStart = startup.erroredObservations.length;
         const emittedStart = startup.emittedEventIds.length;
-        await this.prepareNotifyPolicy(monitor, workspacePath, startup);
+        // Work retained before startup (including before a restart) drains
+        // before held work is reconciled or the source is asked for anything
+        // (002 §2.7). If it cannot drain yet, the admission gate stays closed
+        // and no edit is reconciled; a later tick drains it and opens the gate.
+        const blocked = this.hasRetainedWork(monitor.id, workspacePath)
+          ? await this.drainMaterializationRetries(
+              monitor.id,
+              workspacePath,
+              new Date(),
+            ).then((drained) => {
+              startup.emittedEventIds.push(...drained.emittedEventIds);
+              return drained.blocked;
+            })
+          : undefined;
+        if (blocked) {
+          this.setWatchPolicy(
+            monitor.id,
+            workspacePath,
+            null,
+            monitor.filePath,
+          );
+          this.reportBlockedDrain(monitor, workspacePath, blocked, startup);
+        } else {
+          await this.prepareNotifyPolicy(monitor, workspacePath, startup);
+        }
         // Startup may never receive a yield or tick. Publish committed projections
         // to the workspace's hook files even for an idle or completed source.
         if (startup.emittedEventIds.length > emittedStart) {
@@ -4812,7 +5521,8 @@ export class AgentMonitorRuntime {
    * Admit each finite watch batch before interpretation and the next iterator
    * pull. A whole-admission failure ends this iterator so its source cannot
    * advance beyond work that is absent from durable storage. Retained retries
-   * count as successful admission; their later drain has its own lifecycle.
+   * count as successful admission, and the watcher drains them before its
+   * next pull (002 §2.7).
    */
   private async consumeWatch(
     monitor: MonitorDefinition,
@@ -4859,6 +5569,20 @@ export class AgentMonitorRuntime {
         },
       );
       if (!iterable) return;
+      // Work retained before this watcher started (including before a
+      // restart) completes before its first pull (002 §2.7).
+      if (
+        this.hasRetainedWork(monitor.id, workspacePath) &&
+        !(await this.drainBeforeWatchPull(
+          monitor.id,
+          workspacePath,
+          signal,
+          ownsWatch,
+          onError,
+        ))
+      ) {
+        return;
+      }
       for await (const batch of iterable) {
         if (!ownsWatch()) break;
         // JavaScript plugins may still use the old bare-observation interface.
@@ -4899,6 +5623,8 @@ export class AgentMonitorRuntime {
                       ...(batch.outcome
                         ? { sourceOutcome: batch.outcome }
                         : {}),
+                      onNotHeld: (message) =>
+                        onError?.(monitor.id, new Error(message)),
                     },
                   ),
                 }
@@ -4918,6 +5644,19 @@ export class AgentMonitorRuntime {
         // Abort may arrive while Interpret is suspended. Do not ask the source
         // for newer input after it has lost ownership of this watcher.
         if (!ownsWatch()) break;
+        // A retained suffix of this batch completes before the next pull.
+        if (
+          this.hasRetainedWork(monitor.id, workspacePath) &&
+          !(await this.drainBeforeWatchPull(
+            monitor.id,
+            workspacePath,
+            signal,
+            ownsWatch,
+            onError,
+          ))
+        ) {
+          break;
+        }
       }
     } catch (error) {
       if (ownsWatch()) {
@@ -5048,6 +5787,12 @@ export class AgentMonitorRuntime {
     state: NotifyRuntimeState,
   ): NotifyDispatchResult {
     const emitted: StoredObservationEnvelope[] = [];
+    const notHeld: NotHeldObservation[] = [];
+    // Refusals made while a debounce batch was held, each with how many held
+    // observations preceded it. Those held observations are older than the
+    // refusal, so if an escalation later in this dispatch flushes the batch,
+    // the refusal's place moves to just after them (002 §2).
+    let refusedBehindHeld: { refusal: NotHeldObservation; held: number }[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
     // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
@@ -5098,6 +5843,13 @@ export class AgentMonitorRuntime {
       // batch (splitting risks ordering confusion). This is the only path that
       // can short-circuit a settling debounce window before its `dueAt`.
       if (isEscalated && nextState.pendingDebounce) {
+        // The flushed batch keeps arrival order, so a refusal made while `held`
+        // observations were waiting belongs right after those `held` flushed
+        // envelopes and before the newer ones held after it.
+        for (const { refusal, held } of refusedBehindHeld) {
+          refusal.emittedBefore = emitted.length + held;
+        }
+        refusedBehindHeld = [];
         emitted.push(
           ...nextState.pendingDebounce.observations.map(
             hydrateStoredObservationEnvelope,
@@ -5137,6 +5889,22 @@ export class AgentMonitorRuntime {
         continue;
       }
 
+      // Hold acceptance (002 §4.7): an envelope that cannot be serialized never
+      // joins the batch, so the state write below cannot fail on it and the
+      // batch's other observations are unaffected.
+      const notHeldMessage = notHeldReason(envelope, 'debounce');
+      if (notHeldMessage !== undefined) {
+        const refusal: NotHeldObservation = {
+          observation,
+          message: notHeldMessage,
+          emittedBefore: emitted.length,
+        };
+        notHeld.push(refusal);
+        const held = nextState.pendingDebounce?.observations.length ?? 0;
+        if (held > 0) refusedBehindHeld.push({ refusal, held });
+        continue;
+      }
+
       if (nextState.pendingDebounce) {
         nextState.pendingDebounce = {
           observations: [
@@ -5160,7 +5928,7 @@ export class AgentMonitorRuntime {
       };
     }
 
-    return { emitted, nextState };
+    return { emitted, nextState, notHeld };
   }
 
   /**
@@ -5195,21 +5963,19 @@ export class AgentMonitorRuntime {
     // Defensive: this method is only reached for rollup monitors, but narrow
     // the discriminated union so `window`/`timezone` are accessible.
     if (notify?.strategy !== 'rollup') {
-      return { emitted: [], nextState };
+      return { emitted: [], nextState, notHeld: [] };
     }
 
     // 1. Accumulate. Hydrate any restart-persisted envelopes (backfilling
     // `effectiveUrgency` per 002 §3 / issue #109) so a batch that survived a
     // daemon restart materializes with a valid urgency, then append this tick's
     // new observations.
-    const accumulated: StoredObservationEnvelope[] = [
-      ...(nextState.pendingRollup?.observations ?? []).map(
-        hydrateStoredObservationEnvelope,
-      ),
-      ...observations.map((observation) =>
-        serializeObservation(monitor, observation, observedAt),
-      ),
-    ];
+    const held = (nextState.pendingRollup?.observations ?? []).map(
+      hydrateStoredObservationEnvelope,
+    );
+    const arrived = observations.map((observation) =>
+      serializeObservation(monitor, observation, observedAt),
+    );
 
     // 2. Evaluate the delivery window with a once-per-minute deduplication
     // guard (002 §4.4 step 2): `cronMatchesDate` returns true for every
@@ -5227,22 +5993,38 @@ export class AgentMonitorRuntime {
     }
 
     // 3. Flush iff the window fires AND the batch is non-empty; an empty window
-    // produces no delivery (§4.4 step 3).
-    if (windowFires && accumulated.length > 0) {
+    // produces no delivery (§4.4 step 3). Observations arriving on the firing
+    // tick go straight to materialization and are never held.
+    if (windowFires && held.length + arrived.length > 0) {
       delete nextState.pendingRollup;
-      return { emitted: accumulated, nextState };
+      return { emitted: [...held, ...arrived], nextState, notHeld: [] };
     }
 
     // Otherwise keep accumulating silently — no per-change interrupts (§4.4
-    // step 6). Persist the batch (durable accumulation, §4.4 step 1) only when
+    // step 6). Hold acceptance (002 §4.7): an arriving envelope that cannot be
+    // serialized never joins the batch; its serializable siblings keep their
+    // order. Persist the batch (durable accumulation, §4.4 step 1) only when
     // there is something to hold; an empty window with nothing accumulated
     // leaves `pendingRollup` absent.
+    const notHeld: NotHeldObservation[] = [];
+    const accumulated = [...held];
+    for (const envelope of arrived) {
+      const message = notHeldReason(envelope, 'rollup');
+      if (message === undefined) accumulated.push(envelope);
+      // A window that does not fire emits nothing, so nothing precedes it.
+      else
+        notHeld.push({
+          observation: envelope.observation,
+          message,
+          emittedBefore: 0,
+        });
+    }
     if (accumulated.length > 0) {
       nextState.pendingRollup = { observations: accumulated };
     } else {
       delete nextState.pendingRollup;
     }
-    return { emitted: [], nextState };
+    return { emitted: [], nextState, notHeld };
   }
 
   /**
@@ -5253,6 +6035,33 @@ export class AgentMonitorRuntime {
    * that commit, in `interpretMaterializedObservation`.
    */
   private materializeObservation(input: ProcessObservationInput) {
+    const rendered = this.renderObservationEvent(input);
+    if (!rendered) return null;
+    const event = this.store.insertEvent(
+      rendered.event,
+      rendered.baseline,
+      // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
+      // the declaring session so its events never reach a sibling lead session.
+      input.restrictToSessionId !== undefined
+        ? { restrictToSessionId: input.restrictToSessionId }
+        : undefined,
+    );
+    return { event, diffText: rendered.diffText };
+  }
+
+  /**
+   * Deterministically render one observation into the shared event row it
+   * becomes, without writing it. Admission writes it with
+   * {@link RuntimeStore.insertEvent}; a retained retry hands the same
+   * rendering to {@link RuntimeStore.completeMaterializationRetry}, so a
+   * drained retry produces exactly the event its span would have (002 §2.7).
+   * Returns `null` for an observation its payload gate suppresses.
+   */
+  private renderObservationEvent(input: ProcessObservationInput): {
+    event: Omit<MonitorEventRecord, 'id'>;
+    baseline: { previousContent: string | null };
+    diffText: string | null;
+  } | null {
     const objectKey = input.observation.objectKey ?? input.monitor.id;
 
     // ── Shape stage (G15, 002 §1.1.4–§1.1.6) ──────────────────────────────
@@ -5292,8 +6101,8 @@ export class AgentMonitorRuntime {
         ? buildDiff(previousSnapshot.content, effectiveSnapshotText, strategy)
         : null;
 
-    const event = this.store.insertEvent(
-      {
+    return {
+      event: {
         workspacePath: input.workspacePath ?? null,
         monitorId: input.monitor.id,
         sourceName: input.sourceName,
@@ -5347,15 +6156,9 @@ export class AgentMonitorRuntime {
       // a first-time recipient's cursor so it hears only changes AFTER it
       // registered (decided semantics Q1; backward-compat with the single-baseline
       // diff above when there is one recipient at the shared baseline).
-      { previousContent: previousSnapshot?.content ?? null },
-      // Ephemeral-monitor projection isolation (007 §4.6): restrict projection to
-      // the declaring session so its events never reach a sibling lead session.
-      input.restrictToSessionId !== undefined
-        ? { restrictToSessionId: input.restrictToSessionId }
-        : undefined,
-    );
-
-    return { event, diffText };
+      baseline: { previousContent: previousSnapshot?.content ?? null },
+      diffText,
+    };
   }
 
   /**

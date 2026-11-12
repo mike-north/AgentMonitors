@@ -49,6 +49,17 @@ export const agentSessions = sqliteTable('agent_sessions', {
   dormantAt: integer('dormant_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * The position this session took in the `monitor_events` materialization
+   * order when it was first registered: reserved from that table's
+   * AUTOINCREMENT counter, the same counter a retained observation reserves
+   * its `admission_sequence` from. A retry completed later projects only into
+   * sessions registered before the observation was admitted (002 §2.7), and
+   * this comparison does not depend on second-resolution timestamps. Resuming
+   * a session keeps its original position. NULL on sessions registered before
+   * positions were reserved.
+   */
+  registrationSequence: integer('registration_sequence'),
 });
 
 /**
@@ -340,6 +351,44 @@ export const objectEventSuppressions = sqliteTable(
     expiresAt: integer('expires_at', { mode: 'timestamp' }).notNull(),
   },
 );
+
+/** Why a verify artifact's cleanup authority took effect. */
+export const verifyArtifactCleanupCauses = [
+  'owner-request',
+  'owner-inactive',
+] as const;
+
+/**
+ * Durable, exact ownership of one synthetic artifact a `verify` run creates
+ * against a persistent workspace daemon (issue #562). The run registers the row
+ * **before** creating its scratch file, so the daemon knows the file is
+ * verify's own even if the run is killed before any event projects.
+ *
+ * While the owner session is active and has not asked for cleanup, events for
+ * the key flow normally: that is verify's proof delivery. Once cleanup takes
+ * effect (`cleanup_requested_at` set, or the owner session is no longer
+ * active), the runtime filters this exact `(workspace_path, monitor_id,
+ * object_key)` at the incoming-observation and held-emission boundaries, so no
+ * later session receives the artifact.
+ *
+ * Rows have no expiry and are never retired automatically: recovery can be
+ * delayed arbitrarily and no source signal proves it has finished. Only verify
+ * registration creates rows, one per run (`run_id` is the run's random token,
+ * which the scratch file name also carries), so growth is bounded by the
+ * number of `--use-workspace-daemon` runs. Retaining retired keys is also what
+ * prevents another run from reusing one.
+ */
+export const verifyArtifacts = sqliteTable('verify_artifacts', {
+  runId: text('run_id').primaryKey(),
+  ownerSessionId: text('owner_session_id').notNull(),
+  workspacePath: text('workspace_path').notNull(),
+  monitorId: text('monitor_id').notNull(),
+  objectKey: text('object_key').notNull(),
+  registeredAt: integer('registered_at', { mode: 'timestamp' }).notNull(),
+  /** First moment cleanup authority was recorded; never cleared. */
+  cleanupRequestedAt: integer('cleanup_requested_at', { mode: 'timestamp' }),
+  cleanupCause: text('cleanup_cause', { enum: verifyArtifactCleanupCauses }),
+});
 
 export const observationHistory = sqliteTable('observation_history', {
   id: text('id').primaryKey(),

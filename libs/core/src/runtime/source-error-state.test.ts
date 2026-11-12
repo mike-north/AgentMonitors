@@ -1,4 +1,7 @@
-/** Recoverable source errors preserve durable ingress state; diagnosis is a read-only view. */
+/**
+ * Recoverable source errors preserve durable ingress state while held notify
+ * work keeps its timing; diagnosis is a read-only view.
+ */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -57,7 +60,7 @@ describe('source-error state and diagnosis', () => {
     ['debounce', 'notify:\n  strategy: debounce\n  settle-for: 2s\n'],
     ['rollup', "notify:\n  strategy: rollup\n  window: '* * * * *'\n"],
   ])(
-    'retains %s work across reopen and retries without advancing scheduling',
+    'flushes %s work on time across source failures and reopen without advancing scheduling',
     async (_kind, notify) => {
       vi.useFakeTimers({ toFake: ['Date'] });
       vi.setSystemTime(new Date('2026-01-01T00:00:01Z'));
@@ -99,17 +102,26 @@ describe('source-error state and diagnosis', () => {
         expect(held.notifyState).toHaveProperty(
           _kind === 'debounce' ? 'pendingDebounce' : 'pendingRollup',
         );
+        // The debounce deadline and the next rollup window have both passed:
+        // the held work flushes although observe rejects (#558). Only the
+        // hold changes; the baseline and scheduling time stay as they were.
         mode = 'fail';
         vi.setSystemTime(new Date('2026-01-01T00:01:00Z'));
-        expect(
-          (await owned.runtime.tick(monitorsDir, root)).erroredObservations,
-        ).toEqual([{ monitorId: 'held', message: 'source unavailable' }]);
-        expect(owned.store.getMonitorState('held', root)).toEqual(held);
+        const failed = await owned.runtime.tick(monitorsDir, root);
+        expect(failed.erroredObservations).toEqual([
+          { monitorId: 'held', message: 'source unavailable' },
+        ]);
+        expect(failed.emittedEventIds).toHaveLength(1);
+        const flushed = owned.store.getMonitorState('held', root);
+        expect(flushed.sourceState).toEqual(held.sourceState);
+        expect(flushed.lastObservationAt).toEqual(held.lastObservationAt);
+        expect(flushed.notifyState).not.toHaveProperty('pendingDebounce');
+        expect(flushed.notifyState).not.toHaveProperty('pendingRollup');
         owned.close();
         owned = open(dbPath, registry);
-        expect(owned.store.getMonitorState('held', root)).toEqual(held);
-        // Current exception policy: even less than one polling interval later, retry.
-        // Held work is retained rather than flushed while observe rejects (#558/#559).
+        expect(owned.store.getMonitorState('held', root)).toEqual(flushed);
+        // Current exception policy: even less than one polling interval later,
+        // retry (#559). Nothing is held any more, so nothing is re-delivered.
         vi.setSystemTime(new Date('2026-01-01T00:01:00.100Z'));
         const retried = await owned.runtime.tick(monitorsDir, root);
         expect(observe).toHaveBeenCalledTimes(4);
@@ -117,21 +129,22 @@ describe('source-error state and diagnosis', () => {
         expect(retried.erroredObservations).toEqual([
           { monitorId: 'held', message: 'source unavailable' },
         ]);
-        expect(owned.store.getMonitorState('held', root)).toEqual(held);
+        expect(owned.store.getMonitorState('held', root)).toEqual(flushed);
         expect(
           owned.store
             .listObservationHistory({ monitorId: 'held', workspacePath: root })
-            .slice(0, 2)
+            .slice(0, 3)
             .map((row) => ({ result: row.result, data: row.observationData })),
         ).toEqual([
           { result: 'errored', data: { error: 'source unavailable' } },
           { result: 'errored', data: { error: 'source unavailable' } },
+          { result: 'triggered', data: { observed: 0, emitted: 1 } },
         ]);
         mode = 'recover';
         vi.setSystemTime(new Date('2026-01-01T00:01:00.200Z'));
         expect(
           (await owned.runtime.tick(monitorsDir, root)).emittedEventIds,
-        ).toHaveLength(1);
+        ).toEqual([]);
         expect(owned.store.getMonitorState('held', root).sourceState).toEqual({
           ref: 'B',
         });

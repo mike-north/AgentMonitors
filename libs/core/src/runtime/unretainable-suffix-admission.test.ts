@@ -77,6 +77,24 @@ function label(batch: number, index: number): string {
   return `b${String(batch)}-${String(index)}`;
 }
 
+/**
+ * Index of the observation whose materialization is made to fail in the
+ * over-capacity spans. Near the front, so the failed observation's ordered
+ * suffix is almost the whole span.
+ */
+const FAULT_INDEX = 1;
+/**
+ * The smallest span whose failed suffix (the failed observation plus every
+ * later one) is one record larger than the outbox, so it can never be retained
+ * (002 materialization_retry_outbox). A case costs one event per observation,
+ * so deriving the span from the capacity keeps cases as small as the limit
+ * allows while tracking it.
+ */
+const OVER_CAPACITY_SPAN = FAULT_INDEX + MATERIALIZATION_RETRY_MAX_RECORDS + 1;
+/** The over-capacity span's failed observation, by summary and object key. */
+const FAULT_LABEL = label(0, FAULT_INDEX);
+const FAULT_KEY = `object-${String(FAULT_INDEX)}`;
+
 /** A batch of distinct objects, so each observation is its own event and snapshot. */
 function observations(
   batch: number,
@@ -320,25 +338,27 @@ async function nextPoll(f: Fixture) {
 
 describe('poll admission when the outbox cannot take the suffix', () => {
   it('records the failed observation errored, materializes the rest and advances when its suffix exceeds outbox capacity', async () => {
-    // 600 observations with a fault at index 299 leave a 301-record suffix,
-    // larger than the 256-record outbox (002 materialization_retry_outbox).
+    const spanSize = OVER_CAPACITY_SPAN;
     const f = fixture('poll', (cursor) =>
       cursor === 0
-        ? observations(0, 600)
+        ? observations(0, spanSize)
         : cursor === 1
-          ? observations(cursor, 3)
-          : observations(cursor, 300).slice(299),
+          ? // Other object keys: they must not supersede the drop.
+            observations(cursor, 4).filter((_, index) => index !== FAULT_INDEX)
+          : observations(cursor, 2).slice(FAULT_INDEX),
     );
-    abortOn(f, 'b0-299');
+    const faulted = FAULT_LABEL;
+    const faultedKey = FAULT_KEY;
+    abortOn(f, faulted);
 
     const first = await f.runtime.tick(f.monitorsDir, f.root);
 
     expectOutcomes(f, {
-      emitted: labels(0, 600),
+      emitted: labels(0, spanSize),
       retained: [],
-      errored: [{ label: 'b0-299', reason: CAPACITY }],
+      errored: [{ label: faulted, reason: CAPACITY }],
     });
-    expect(first.emittedEventIds).toHaveLength(599);
+    expect(first.emittedEventIds).toHaveLength(spanSize - 1);
     expect(first.erroredObservations).toEqual([
       { monitorId: MONITOR_ID, message: expect.stringMatching(CAPACITY) },
     ]);
@@ -350,18 +370,24 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     const [drop] = dropRows(f);
     expect(drop).toEqual({
       error: expect.stringMatching(
-        /^native fault on b0-299 Not retained for retry: the retry outbox capacity is exhausted/,
+        new RegExp(
+          `^native fault on ${faulted} Not retained for retry: the retry outbox capacity is exhausted`,
+        ),
       ),
       notRetained: true,
-      position: 300,
-      spanSize: 600,
-      objectKey: 'object-299',
-      title: 'b0-299',
+      position: FAULT_INDEX + 1,
+      spanSize,
+      objectKey: faultedKey,
+      title: faulted,
     });
     // The span's batch row is newer than the drop row and counts the drop.
     expect(latestRow(f)).toEqual({
       result: 'triggered',
-      observationData: { observed: 600, emitted: 599, notRetainedCount: 1 },
+      observationData: {
+        observed: spanSize,
+        emitted: spanSize - 1,
+        notRetainedCount: 1,
+      },
     });
     // Explain and doctor surface the drop even though the newest history row
     // is that span's `triggered` row (002 §10.7; 005 doctor rollup).
@@ -369,16 +395,16 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     expect(explained.verdict).toEqual({
       status: 'failure',
       stage: 'materialization',
-      reason: `1 observation(s) were dropped because the retry outbox could not retain them; the newest, observation 300 of 600 (object-299, "b0-299"), failed: ${String(drop?.['error'])}`,
+      reason: `1 observation(s) were dropped because the runtime could not keep them; the newest, observation ${String(FAULT_INDEX + 1)} of ${String(spanSize)} (${faultedKey}, "${faulted}"), failed: ${String(drop?.['error'])}`,
     });
     expect((await doctorRollup(f)).unretainedObservationLoss).toEqual({
       count: 1,
       recordedAt: NOW,
       error: drop?.['error'],
-      position: 300,
-      spanSize: 600,
-      objectKey: 'object-299',
-      title: 'b0-299',
+      position: FAULT_INDEX + 1,
+      spanSize,
+      objectKey: faultedKey,
+      title: faulted,
     });
 
     // The next tick makes progress from the advanced baseline.
@@ -392,83 +418,69 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     expect(stage(await explain(f), 'materialization')?.status).toBe('failure');
     expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
       count: 1,
-      objectKey: 'object-299',
+      objectKey: faultedKey,
     });
 
-    // A later event for `object-299` clears it from both diagnostics.
+    // A later event for the dropped object key clears it from both diagnostics.
     const third = await nextPoll(f);
     expect(third.emittedEventIds).toHaveLength(1);
     expect(stage(await explain(f), 'materialization')?.status).toBe('ok');
     expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
   });
 
-  // An outbox filled by earlier partial failures: 251 rows from the first tick,
-  // so 5 records remain. A 5-record suffix fits exactly; a 6-record one does not.
+  // A monitor with retained work drains it before taking newer input
+  // (002 §2.7), so a span is only ever admitted into an empty outbox and the
+  // boundary is the whole outbox, decided within one span. A fault at index 4
+  // of a 260-observation span leaves a 256-record suffix, which fits exactly;
+  // a fault at index 3 leaves 257, one record over.
   for (const [faultIndex, fits] of [
-    [5, true],
-    [4, false],
+    [4, true],
+    [3, false],
   ] as const) {
-    it(`retains a suffix that fits the remaining capacity and errors one that does not (fault at index ${String(faultIndex)})`, async () => {
+    it(`retains a suffix that exactly fills the outbox and errors one record over (fault at index ${String(faultIndex)})`, async () => {
+      const spanSize = MATERIALIZATION_RETRY_MAX_RECORDS + 4;
       const f = fixture('poll', (cursor) =>
-        cursor === 0
-          ? observations(0, 260)
-          : cursor === 1
-            ? observations(1, 10)
-            : cursor === 2
-              ? observations(2, 3)
-              : observations(cursor, 2),
+        cursor === 0 ? observations(0, spanSize) : observations(cursor, 2),
       );
-      abortOn(f, 'b0-9');
-      abortOn(f, label(1, faultIndex));
-      abortOn(f, 'b2-1');
+      const faulted = label(0, faultIndex);
+      abortOn(f, faulted);
 
-      await f.runtime.tick(f.monitorsDir, f.root);
-      const firstRetained = labels(0, 260).slice(9);
+      const first = await f.runtime.tick(f.monitorsDir, f.root);
+      const retained = fits ? labels(0, spanSize).slice(faultIndex) : [];
       expectOutcomes(f, {
-        emitted: labels(0, 260),
-        retained: firstRetained,
-        errored: [],
+        emitted: labels(0, spanSize),
+        retained,
+        errored: fits ? [] : [{ label: faulted, reason: CAPACITY }],
       });
-      expect(firstRetained).toHaveLength(251);
-      const priorEvents = labels(0, 9);
-
-      await nextPoll(f);
-      const secondRetained = fits ? labels(1, 10).slice(faultIndex) : [];
-      expectOutcomes(f, {
-        emitted: labels(1, 10),
-        retained: secondRetained,
-        errored: fits
-          ? []
-          : [{ label: label(1, faultIndex), reason: CAPACITY }],
-        priorEvents,
-        priorRetained: firstRetained,
-      });
-      const retainedTotal = firstRetained.length + secondRetained.length;
-      expect(retainedTotal).toBe(
-        fits ? MATERIALIZATION_RETRY_MAX_RECORDS : 251,
+      expect(retained).toHaveLength(
+        fits ? MATERIALIZATION_RETRY_MAX_RECORDS : 0,
       );
+      expect(first.emittedEventIds).toHaveLength(
+        fits ? faultIndex : spanSize - 1,
+      );
+      expect(f.reader.getMonitorState(MONITOR_ID, f.root).sourceState).toEqual({
+        cursor: 1,
+      });
 
-      // Terminal and pending rows both hold capacity; with the outbox full,
-      // a later single failure cannot be retained but must not stall the span.
-      if (fits) {
-        const third = await nextPoll(f);
-        expectOutcomes(f, {
-          emitted: labels(2, 3),
-          retained: [],
-          errored: [{ label: 'b2-1', reason: CAPACITY }],
-          priorEvents: [...priorEvents, ...labels(1, faultIndex)],
-          priorRetained: [...firstRetained, ...secondRetained],
-        });
-        expect(third.emittedEventIds).toHaveLength(2);
-        expect(
-          f.reader.getMonitorState(MONITOR_ID, f.root).sourceState,
-        ).toEqual({ cursor: 3 });
-        const fourth = await nextPoll(f);
-        expect(fourth.emittedEventIds).toHaveLength(2);
-        expect(
-          f.reader.getMonitorState(MONITOR_ID, f.root).sourceState,
-        ).toEqual({ cursor: 4 });
-      }
+      // Once the fault clears, a retained suffix completes in its original
+      // order before the next span is observed; a drop leaves nothing to drain.
+      f.writer.client.exec(`DROP TRIGGER fault_${faulted.replace('-', '_')}`);
+      const second = await nextPoll(f);
+      expect(second.erroredObservations).toEqual([]);
+      expect(second.emittedEventIds).toHaveLength(retained.length + 2);
+      expect(f.reader.listMaterializationRetries()).toEqual([]);
+      expect(
+        f.writer.client
+          .prepare<[], { summary: string }>(
+            'SELECT summary FROM monitor_events ORDER BY sequence',
+          )
+          .all()
+          .map(({ summary }) => summary)
+          .slice(-(retained.length + 2)),
+      ).toEqual([...retained, ...labels(1, 2)]);
+      expect(f.reader.getMonitorState(MONITOR_ID, f.root).sourceState).toEqual({
+        cursor: 2,
+      });
     });
   }
 
@@ -539,9 +551,11 @@ describe('rollup window flush on the not-due path', () => {
 
   it('flushes a held window whose suffix exceeds capacity into events plus one errored row, clearing the hold', async () => {
     const f = fixture('rollup', (cursor) =>
-      cursor === 0 ? observations(0, 600) : observations(cursor, 3),
+      cursor === 0
+        ? observations(0, OVER_CAPACITY_SPAN)
+        : observations(cursor, 3),
     );
-    abortOn(f, 'b0-299');
+    abortOn(f, FAULT_LABEL);
 
     const flushed = await holdThenFlush(f);
 
@@ -549,11 +563,11 @@ describe('rollup window flush on the not-due path', () => {
       MONITOR_ID,
     ]);
     expectOutcomes(f, {
-      emitted: labels(0, 600),
+      emitted: labels(0, OVER_CAPACITY_SPAN),
       retained: [],
-      errored: [{ label: 'b0-299', reason: CAPACITY }],
+      errored: [{ label: FAULT_LABEL, reason: CAPACITY }],
     });
-    expect(flushed.emittedEventIds).toHaveLength(599);
+    expect(flushed.emittedEventIds).toHaveLength(OVER_CAPACITY_SPAN - 1);
     expect(flushed.erroredObservations).toEqual([
       { monitorId: MONITOR_ID, message: expect.stringMatching(CAPACITY) },
     ]);
@@ -640,7 +654,12 @@ describe('watch batch admission when the outbox cannot take the suffix', () => {
   }
 
   for (const [name, first, fault, reason] of [
-    ['over capacity', observations(0, 600), 'b0-299', CAPACITY],
+    [
+      'over capacity',
+      observations(0, OVER_CAPACITY_SPAN),
+      FAULT_LABEL,
+      CAPACITY,
+    ],
     [
       'with a BigInt payload',
       observations(0, 10, { 4: { n: 1n } }),
@@ -693,16 +712,25 @@ describe('watch batch admission when the outbox cannot take the suffix', () => {
   }
 });
 
+/** Records in the suffix of the retained case: far below capacity, so it fits. */
+const RETAINED_SUFFIX = 10;
+
 describe('a dropped observation stays visible in explain and doctor', () => {
   // A drop must never be less visible than a recoverable failure (002 §10.7,
   // 005 doctor rollup): both fail explain's verdict and doctor's monitor check.
   for (const [name, fault, dropped] of [
-    ['retained (fault at #500, 100-record suffix)', 'b0-499', false],
-    ['dropped (fault at #300, 301-record suffix)', 'b0-299', true],
+    [
+      `retained (a ${String(RETAINED_SUFFIX)}-record suffix, which fits)`,
+      label(0, OVER_CAPACITY_SPAN - RETAINED_SUFFIX),
+      false,
+    ],
+    ['dropped (a suffix one over capacity)', FAULT_LABEL, true],
   ] as const) {
     it(`fails explain and doctor for a ${name} failure`, async () => {
       const f = fixture('poll', (cursor) =>
-        cursor === 0 ? observations(0, 600) : observations(cursor, 3),
+        cursor === 0
+          ? observations(0, OVER_CAPACITY_SPAN)
+          : observations(cursor, 3),
       );
       abortOn(f, fault);
 
@@ -721,7 +749,7 @@ describe('a dropped observation stays visible in explain and doctor', () => {
           `native fault on ${fault}`,
         );
       } else {
-        expect(rollup.materializationRetries?.pending).toBe(101);
+        expect(rollup.materializationRetries?.pending).toBe(RETAINED_SUFFIX);
         expect(rollup.unretainedObservationLoss).toBeUndefined();
       }
     });
@@ -822,22 +850,22 @@ describe('a dropped observation stays visible in explain and doctor', () => {
     const f = fixture('poll', (cursor) =>
       cursor === 0
         ? [
-            ...observations(0, 299),
+            ...observations(0, FAULT_INDEX),
             {
               title: unsafe + 't'.repeat(2_000),
-              summary: 'b0-299',
+              summary: FAULT_LABEL,
               objectKey: unsafe + 'k',
-              snapshotText: 'content-b0-299',
+              snapshotText: `content-${FAULT_LABEL}`,
               payload: { secret: 'PRIVATE-PAYLOAD' },
             },
-            ...observations(0, 600).slice(300),
+            ...observations(0, OVER_CAPACITY_SPAN).slice(FAULT_INDEX + 1),
           ]
         : [],
     );
     // A long materialization error with an embedded newline.
     f.writer.client.exec(sql`
       CREATE TRIGGER fault_long BEFORE INSERT ON monitor_events
-      WHEN NEW.summary = 'b0-299'
+      WHEN NEW.summary = '${FAULT_LABEL}'
       BEGIN SELECT RAISE(ABORT, 'long fault
 ${'y'.repeat(1_500)}'); END;
     `);
@@ -976,8 +1004,11 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     ).toBe(1);
     expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
 
+    // The retained k3-1 (object-8) drains before the next span is observed
+    // (002 §2.7); an event for another key does not supersede the drop.
+    f.writer.client.exec('DROP TRIGGER fault_k3_1');
     const otherKeys = await nextPoll(f);
-    expect(otherKeys.emittedEventIds).toHaveLength(2);
+    expect(otherKeys.emittedEventIds).toHaveLength(3);
     expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
     expect((await doctorRollup(f)).unretainedObservationLoss).toMatchObject({
       count: 1,
@@ -989,8 +1020,9 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     expect(superseding.emittedEventIds).toHaveLength(1);
     expect(loss(f)).toBeUndefined();
     expect((await doctorRollup(f)).unretainedObservationLoss).toBeUndefined();
-    // The retained failure from the earlier span is still reported on its own.
-    expect(stage(await explain(f), 'materialization')?.status).toBe('pending');
+    // The retained failure from the earlier span has drained, so nothing is
+    // left to report.
+    expect(stage(await explain(f), 'materialization')?.status).toBe('ok');
   });
 
   it('clears a keyed drop when a later sibling in its own span materializes the same key', async () => {
@@ -1090,23 +1122,23 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
   it('keeps a rollup drop through the next hold and clears it at the flush that materializes its key', async () => {
     const f = fixture('rollup', (cursor) =>
       cursor === 0
-        ? observations(0, 600)
-        : [keyed(`r${String(cursor)}-0`, 'object-299')],
+        ? observations(0, OVER_CAPACITY_SPAN)
+        : [keyed(`r${String(cursor)}-0`, FAULT_KEY)],
     );
-    abortOn(f, 'b0-299');
+    abortOn(f, FAULT_LABEL);
 
-    // Hold at 12:00, flush at 12:01: the capacity fault drops `object-299`.
+    // Hold at 12:00, flush at 12:01: the capacity fault drops the failed object key.
     await f.runtime.tick(f.monitorsDir, f.root);
     clockTime = NOW.getTime() + 60_000;
     await f.runtime.tick(f.monitorsDir, f.root);
-    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-299' });
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: FAULT_KEY });
 
-    // 13:00 observes `object-299` again but only holds it.
+    // 13:00 observes the failed object key again but only holds it.
     clockTime = NOW.getTime() + 60 * 60_000;
     const held = await f.runtime.tick(f.monitorsDir, f.root);
     expect(held.emittedEventIds).toEqual([]);
     expect(latestRow(f)?.result).toBe('suppressed');
-    expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-299' });
+    expect(loss(f)).toMatchObject({ count: 1, objectKey: FAULT_KEY });
 
     // 13:01 flushes it; the flushed event carries the observation's own key.
     clockTime = NOW.getTime() + 61 * 60_000;
@@ -1118,7 +1150,7 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
       limit: 1,
     });
     expect(event?.summary).toBe('r1-0');
-    expect(event?.objectKey).toBe('object-299');
+    expect(event?.objectKey).toBe(FAULT_KEY);
     expect(loss(f)).toBeUndefined();
   });
 
@@ -1171,8 +1203,6 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
         case 0:
           return [keyed('v1', 'object-1')];
         case 1:
-          return [keyed('v2', 'object-1', { n: 1n })];
-        case 2:
           return [];
         default:
           return [keyed('v3', 'object-1')];
@@ -1184,7 +1214,24 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     expect(
       f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
     ).toBe(1);
-    await nextPoll(f);
+    // A monitor with retained work no longer admits a span (002 §2.7), so a
+    // drop recorded after a still-pending retry exists only in a database
+    // written before that rule. Record the drop directly, as admission would.
+    new RuntimeStore(f.writer.db).recordObservationLoss({
+      monitorId: MONITOR_ID,
+      workspacePath: f.root,
+      sourceName: 'suffix-source',
+      objectKey: 'object-1',
+      observationData: {
+        error:
+          'insert failed Not retained for retry: the envelope is not serializable for the retry outbox.',
+        notRetained: true,
+        position: 1,
+        spanSize: 1,
+        objectKey: 'object-1',
+        title: 'v2',
+      },
+    });
     expect(loss(f)).toMatchObject({
       count: 1,
       objectKey: 'object-1',
@@ -1550,7 +1597,7 @@ describe('a drop on a monitor whose source config is now rejected', () => {
     const materialization = stage(report, 'materialization');
     expect(materialization?.status).toBe('failure');
     expect(materialization?.reason).toContain(
-      '1 observation(s) were dropped because the retry outbox could not retain them',
+      '1 observation(s) were dropped because the runtime could not keep them',
     );
     expect(materialization?.details).toMatchObject({
       unretainedObservationLoss: { count: 1, objectKey: 'object-1' },

@@ -1,3 +1,4 @@
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import {
   mkdtempSync,
   mkdirSync,
@@ -3899,7 +3900,7 @@ Handle it.
   // A FlakyStore subclass that throws on a sentinel observation title provides
   // a clean public seam to trigger ingest() failure without private mocking.
   // https://github.com/mike-north/AgentMonitors/issues/46
-  it('isolates an ingest() failure in consumeWatch() so the watcher survives and subsequent observations still flow', async () => {
+  it('isolates an ingest() failure in consumeWatch() so the watcher survives, drains it, and subsequent observations still flow', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');
@@ -3911,16 +3912,20 @@ Handle it.
       'Handle it.',
     );
 
-    // Subclass RuntimeStore to throw on the sentinel observation so ingest()
-    // fails for that specific observation without patching private methods.
+    // Subclass RuntimeStore to throw once on the sentinel observation so
+    // ingest() fails for that specific observation without patching private
+    // methods. The failure is retained and drains from the outbox before the
+    // watcher pulls its next batch (002 §2.7).
     class FlakyStore extends RuntimeStore {
+      failures = 1;
       override insertEvent(
         input: Omit<MonitorEventRecord, 'id'>,
       ): MonitorEventRecord {
         // Keyed on `summary`: the materialized `title` is the monitor's
         // authored name since issue #449, so the source's sentinel text — which
         // this fault injection targets — now arrives as `summary`.
-        if (input.summary === 'boom') {
+        if (input.summary === 'boom' && this.failures > 0) {
+          this.failures -= 1;
           throw new Error('simulated insert failure');
         }
         return super.insertEvent(input);
@@ -3967,12 +3972,29 @@ Handle it.
     const handle = await runtime.watchMonitors(monitorsDir, rootDir);
     expect(handle.monitorIds).toEqual(['test-monitor']);
 
-    // give the watcher enough time to consume both observations
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The retained 'boom' becomes due after its first backoff (at least one
+    // second), drains, and only then is 'ok' pulled.
+    await vi.waitFor(
+      () =>
+        expect(
+          runtime.listEvents({ sessionId: session.id }).map((e) => e.summary),
+        ).toContain('ok'),
+      { timeout: 5_000, interval: 50 },
+    );
 
-    // (a) watcher survived 'boom' — handle still active and 'ok' produced an event
-    const events = runtime.listEvents({ sessionId: session.id });
-    expect(events.some((e) => e.summary === 'ok')).toBe(true);
+    // (a) watcher survived 'boom' — handle still active, 'boom' drained, and
+    // 'ok' produced an event after it
+    // Materialization order (the private AUTOINCREMENT key), not listEvents
+    // order, which follows observedAt: 'boom' must commit before 'ok'.
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    expect(
+      client
+        .prepare<[], { summary: string }>(
+          'SELECT summary FROM monitor_events ORDER BY sequence',
+        )
+        .all()
+        .map(({ summary }) => summary),
+    ).toEqual(['boom', 'ok']);
 
     // (b) 'ok' produced a triggered history row
     const history = runtime.listObservationHistory({
@@ -5052,7 +5074,9 @@ Handle it.
   // source poll interval has NOT elapsed but the delivery window opens) is the
   // *normal* operating mode for a rollup monitor whose `watch.interval` is
   // relaxed to match the window (002 §4.4), and it had drifted: it applied
-  // neither behavior. Both paths now route through the shared materializeSpan().
+  // neither behavior. Both paths now share admitSpan() for durable admission and
+  // finishMaterializationSpan() for the audit row; the not-due path reaches them
+  // through flushHeldNotifyWork(), which reads the held batch under the writer lock.
   //
   // Expected delta/history counts below are written BY HAND from the spec, not
   // captured from program output.
@@ -5410,7 +5434,9 @@ Daily digest.
     // No regression for the empty not-due tick: the window check runs on EVERY
     // not-due tick, but an empty flush (window closed, or nothing accumulated)
     // must NOT write a `no-change` audit row each tick — only a real flush is
-    // recorded. (The call site guards materializeSpan on emitted.length > 0.)
+    // recorded. (flushHeldNotifyWork() returns before finishMaterializationSpan()
+    // when the window emits nothing; an open empty window still commits its
+    // minute marker.)
     it('does not record an audit row for a not-due tick that flushes nothing', async () => {
       vi.useFakeTimers();
       vi.setSystemTime(ACCUM_BASE);

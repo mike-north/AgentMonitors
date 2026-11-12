@@ -5,6 +5,7 @@
  */
 import type { Database } from 'better-sqlite3';
 import type { InboxDb } from '../inbox/db.js';
+import { runRuntimeTransaction } from './runtime-transaction.js';
 
 /** Store lifetime owns the binding; transaction support never retains a dead store. */
 const connections = new WeakMap<object, Database>();
@@ -29,6 +30,11 @@ export function storeWriter(store: object): Database {
  * Own the outer immediate transaction, including reads that decide what to
  * remove. Nested event units use SQLite savepoints; no async work may escape
  * this callback before COMMIT. Joining someone else's transaction is refused.
+ *
+ * The transaction is the store's registered runtime transaction, the same
+ * owned boundary as span admission and the held rollup window flush: a
+ * rollback also restores the store's last-projected recipient cache, so a
+ * failed drain cannot expose recipients of events it never committed.
  * @internal
  */
 export function withStoreWriter<T>(store: object, action: () => T): T {
@@ -36,15 +42,19 @@ export function withStoreWriter<T>(store: object, action: () => T): T {
   if (client.inTransaction) {
     throw new Error('Notify edit requires an owned writer transaction.');
   }
-  return client
-    .transaction(() => {
-      const result = action();
-      if (result && typeof result === 'object' && 'then' in result) {
-        throw new Error('Notify edit writer callback must be synchronous.');
-      }
-      return result;
-    })
-    .immediate();
+  const synchronous = (): T => {
+    const result = action();
+    if (result && typeof result === 'object' && 'then' in result) {
+      throw new Error('Notify edit writer callback must be synchronous.');
+    }
+    return result;
+  };
+  // The runtime guard rejects a thenable before COMMIT; the runner's
+  // compile-time Promise exclusion cannot be proven for an unconstrained `T`.
+  return runRuntimeTransaction(
+    store,
+    synchronous as Parameters<typeof runRuntimeTransaction<T>>[1],
+  );
 }
 
 /** Enumerate only this workspace's persisted holds, including missing definitions. @internal */

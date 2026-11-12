@@ -1,7 +1,12 @@
 /**
- * Preserve the existing bounded scratch-cleanup window when unrelated source
- * config is rejected. This proves delayed repair within that window, not the
- * arbitrary-pause or held-only ownership guarantee tracked separately in #561.
+ * A stale verify owner is reaped while its monitor's source config is rejected
+ * (issue #562). Its registered artifact gains cleanup authority without any
+ * lifetime derived from the rejected cadence, so the source's retained scratch
+ * deletion never reaches a later lead after restart and arbitrary repair. Held
+ * legitimate work, a healthy sibling and a foreign workspace with the same key
+ * keep progressing.
+ *
+ * @see ../../../../docs/specs/002-runtime-delivery.md §2.0 (preflight), §2.8 (verify artifact ownership)
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,7 +20,7 @@ import { validateWatchScope } from '../schema/validate-scope.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 
-it('retains 665000ms of valid cadence protection through rejected globs, restart, repair and later claim', async () => {
+it("keeps a reaped owner's scratch deletion out of a later lead through rejected globs, restart and arbitrary repair", async () => {
   const root = mkdtempSync(path.join(tmpdir(), 'am-cadence-window-'));
   const workspace = path.join(root, 'a');
   const foreign = path.join(root, 'b');
@@ -87,6 +92,13 @@ it('retains 665000ms of valid cadence protection through rejected globs, restart
     await current.runtime.tick(monitorsDir, workspace);
     await current.runtime.tick(foreignDir, foreign);
     vi.advanceTimersByTime(1000);
+    current.runtime.registerVerifyArtifact({
+      runId: 'abcdef012345',
+      ownerSessionId: owner.id,
+      workspacePath: workspace,
+      monitorId,
+      objectKey: scratch,
+    });
     writeFileSync(scratch, 'synthetic scratch');
     writeFileSync(watched, 'legitimate emitted');
     await current.runtime.tick(monitorsDir, workspace);
@@ -151,25 +163,17 @@ it('retains 665000ms of valid cadence protection through rejected globs, restart
     expect(current.store.getMonitorState(monitorId, workspace)).toEqual(
       retained,
     );
-    expect
-      .soft(
-        current.store.activeObjectSuppressions(
-          workspace,
-          new Date(reapAt.getTime() + 664999),
-        ),
-      )
-      .toHaveLength(1);
-    expect
-      .soft(
-        current.store.activeObjectSuppressions(
-          workspace,
-          new Date(reapAt.getTime() + 665000),
-        ),
-      )
-      .toEqual([]);
+    expect(current.store.getVerifyArtifact('abcdef012345')).toMatchObject({
+      cleanupRequestedAt: reapAt,
+      cleanupCause: 'owner-inactive',
+    });
+    expect(current.store.activeObjectSuppressions(workspace, reapAt)).toEqual(
+      [],
+    );
     current.close();
     current = open();
-    vi.setSystemTime(new Date('2026-11-05T12:08:00Z'));
+    // Far beyond any cadence-derived window the rejected config could imply.
+    vi.setSystemTime(new Date('2026-11-06T12:08:00Z'));
     await current.runtime.tick(monitorsDir, workspace);
     expect(current.store.getMonitorState(monitorId, workspace)).toEqual(
       retained,
@@ -199,9 +203,8 @@ it('retains 665000ms of valid cadence protection through rejected globs, restart
       workspacePath: workspace,
       objectKey: scratch,
     });
-    // Both the durable result and the actual later claim must exclude scratch;
-    // expiry alone is insufficient evidence that the bounded repair works.
-    expect.soft(scratchEvents).toEqual([]);
+    // Both the durable result and the actual later claim must exclude scratch.
+    expect(scratchEvents).toEqual([]);
     expect(
       claim?.events.every(
         (event) =>
@@ -232,18 +235,6 @@ it('retains 665000ms of valid cadence protection through rejected globs, restart
     expect(foreignClaim?.events.map((event) => event.eventId)).toContain(
       foreignEvents[0]?.id,
     );
-    expect(
-      current.store.activeObjectSuppressions(
-        workspace,
-        new Date(reapAt.getTime() + 664999),
-      ),
-    ).toHaveLength(1);
-    expect(
-      current.store.activeObjectSuppressions(
-        workspace,
-        new Date(reapAt.getTime() + 665000),
-      ),
-    ).toEqual([]);
   } finally {
     current.close();
     vi.useRealTimers();

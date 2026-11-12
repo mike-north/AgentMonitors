@@ -332,12 +332,16 @@ Interpret → Deliver → [React]`:
 All test gaps tracked from [004 §3](./004-validation-testing.md) are now closed:
 
 - **T1** — `low` urgency acceptance: added to the schema test loop
-  (`libs/core/src/schema/monitor-schema.test.ts`).
+  (`libs/core/src/schema/monitor-schema.test.ts` › "accepts all urgency values").
 - **T2** — snapshot persistence & isolation: `RuntimeStore` save/retrieve/isolation tests plus a
   runtime diff-on-change test (SP5, [002 §5.2](./002-runtime-delivery.md)).
 - **T3** — `validate` failure paths: closed alongside G2 (unknown-source + schema-violation
   integration tests).
-- **T4** — `schema generate` / `session list|close` CLI wiring: standalone CLI integration tests.
+- **T4** — `schema generate` / `session list|close` CLI wiring: standalone CLI integration tests (`apps/cli/src/commands/cli.integration.test.ts` › `schema generate`,
+  `session list and close`).
+
+Gap ids and the marker convention are defined in [004 §3.0](./004-validation-testing.md);
+`scripts/spec-gap-drift.test.ts` fails if a gap listed here as closed still has a spec marker.
 
 ## How to retire an item
 

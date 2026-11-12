@@ -490,10 +490,12 @@ export interface DoctorDeliveryCounts {
 }
 
 /**
- * Observations of one monitor that admission dropped for good, because the
- * retry outbox could not retain their ordered suffix (002 §2, "Admission
- * outcomes when the outbox cannot retain a suffix"), and that are still
- * outstanding because nothing has superseded them. A drop with an object key
+ * Observations of one monitor that the runtime dropped for good, and that are
+ * still outstanding because nothing has superseded them (002 §2). One rule
+ * covers every kind of drop: an observation the retry outbox could not retain
+ * with its ordered suffix ("Admission outcomes when the outbox cannot retain a
+ * suffix"), and an observation a debounce or rollup hold refused because it
+ * cannot be serialized (002 §4.7). A drop with an object key
  * is superseded only by a later event of the same monitor, workspace and
  * object key; a drop without one, only by a later span of that monitor in that
  * workspace that materializes an event and drops nothing. Quiet ticks, notify
@@ -505,15 +507,19 @@ export interface DoctorDeliveryCounts {
  * row; the observation's payload is never part of it.
  */
 export interface UnretainedObservationLoss {
-  /** How many drops of this monitor in this workspace are still outstanding, across every span. */
+  /** How many drops of this monitor in this workspace are still outstanding, across every span and kind. */
   count: number;
   /** When the newest outstanding drop was recorded. */
   recordedAt: Date;
-  /** The materialization error followed by `Not retained for retry: <reason>`, for the newest drop. */
+  /**
+   * The newest drop's error: the materialization error followed by
+   * `Not retained for retry: <reason>` for an outbox drop, or the refusal
+   * message for a hold refusal (002 §4.7).
+   */
   error: string;
-  /** The newest dropped observation's 1-based position in its span, when recorded. */
+  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal). */
   position?: number;
-  /** How many observations that span dispatched, when recorded. */
+  /** How many observations that span dispatched, when recorded (never for a hold refusal). */
   spanSize?: number;
   /** The newest dropped observation's source `objectKey`, when it had one. */
   objectKey?: string;
@@ -572,8 +578,8 @@ export interface DoctorMonitorRollup {
    */
   materializationRetries?: MaterializationRetrySummary;
   /**
-   * Present while this monitor has an outstanding observation that admission
-   * dropped because the retry outbox could not retain it; absent once every
+   * Present while this monitor has an outstanding dropped observation (one the
+   * retry outbox could not retain, or one a hold refused); absent once every
    * drop is superseded (see {@link UnretainedObservationLoss}), and in reports
    * from older daemons. Duplicated ids omit it: their loss belongs to the
    * report's orphaned groups, like their retained work.
@@ -837,8 +843,8 @@ export interface OrphanedMonitorWork {
   /** Retained retry work, present only while the outbox holds records; never envelopes. */
   materializationRetries?: MaterializationRetrySummary;
   /**
-   * Present while the id has an outstanding observation that admission
-   * dropped because the retry outbox could not retain it.
+   * Present while the id has an outstanding dropped observation (one the
+   * retry outbox could not retain, or one a hold refused).
    */
   unretainedObservationLoss?: UnretainedObservationLoss;
 }
@@ -1005,9 +1011,60 @@ export interface WatchHandle {
   stop(): Promise<void>;
 }
 
+/**
+ * One notify dispatch decision over a batch of observations.
+ *
+ * `emitted` proceeds to materialization now; `nextState` is the notify state to
+ * persist, including any debounce/rollup hold. `notHeld` lists observations a
+ * hold refused because their envelope cannot be serialized into
+ * `monitor_state.notify_state` (002 §4.7): they are neither emitted nor held,
+ * and the caller records each as outstanding loss and reports it.
+ *
+ * @internal
+ */
 export interface NotifyDispatchResult {
   emitted: StoredObservationEnvelope[];
   nextState: NotifyRuntimeState;
+  notHeld: NotHeldObservation[];
+}
+
+/**
+ * An observation a debounce or rollup hold refused at acceptance because its
+ * envelope cannot be serialized (002 §4.7). `message` is the complete,
+ * single-line outcome text: it names the observation, the hold strategy and
+ * the serializer's reason.
+ *
+ * A refusal is loss (002 §2): admission records it with the same drop identity
+ * as an observation the retry outbox could not retain, at its place in the
+ * span's dispatched order.
+ *
+ * @internal
+ */
+export interface NotHeldObservation {
+  observation: Observation;
+  message: string;
+  /**
+   * The index in the same dispatch's `emitted` list at which this refusal is
+   * recorded: every envelope before it is of an observation older than the
+   * refusal, and every envelope from it on is of a newer one. Admission
+   * records the loss after the first `emittedBefore` envelopes and before the
+   * rest, so only an event of a newer observation of the same key supersedes
+   * it.
+   *
+   * The envelopes before it are held work flushed when its settle window had
+   * already elapsed, siblings that arrived before it and went straight to
+   * materialization, and, when an escalation later in the dispatch flushes the
+   * debounce batch (002 §4.1), the observations that batch held at the moment
+   * of refusal. A flushed batch keeps arrival order, so those held envelopes
+   * are the first ones of the flush, and observations held after the refusal
+   * follow them. A rollup refusal is always 0: rollup refuses only when its
+   * window does not fire, and then it emits nothing.
+   *
+   * The count is over the dispatched list. When admission drops retired
+   * verify artifacts from that list (002 §2.8), it re-counts the position over
+   * the envelopes it keeps.
+   */
+  emittedBefore: number;
 }
 
 export interface RuntimeStatus {
@@ -1112,4 +1169,72 @@ export function defaultNotifyConfigForUrgency(
     };
   }
   return undefined;
+}
+
+/**
+ * Why cleanup authority took effect for a registered verify artifact (002
+ * §2.8): the owner asked for cleanup after its proof, or the owner session was
+ * no longer active (closed, reaped as stale, or missing) when the runtime
+ * reconciled it.
+ *
+ * @public
+ */
+export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';
+
+/**
+ * Durable, exact ownership of one synthetic artifact a `verify` run created
+ * against a persistent workspace daemon (issue #562, 002 §2.8). The record
+ * names one object key in one monitor and workspace. It is retained without
+ * expiry: once cleanup has taken effect the runtime keeps that exact key out of
+ * every later session, and the retained key cannot be registered again.
+ *
+ * @public
+ */
+export interface VerifyArtifactRecord {
+  /** The verify run's random token; one record per run. */
+  runId: string;
+  /** The verify run's throwaway lead session. */
+  ownerSessionId: string;
+  /** The workspace whose daemon owns the artifact; ownership never crosses workspaces. */
+  workspacePath: string;
+  /** The monitor the run verified; the filter is scoped to it. */
+  monitorId: string;
+  /** The exact scratch path, which carries {@link VerifyArtifactRecord.runId}. */
+  objectKey: string;
+  /** When the run registered ownership, before creating the artifact. */
+  registeredAt: Date;
+  /** When cleanup authority was first recorded; never cleared once set. */
+  cleanupRequestedAt: Date | null;
+  /** Why cleanup authority took effect; `null` while the run is still in its proof phase. */
+  cleanupCause: VerifyArtifactCleanupCause | null;
+}
+
+/**
+ * Register exact ownership of a verify scratch artifact before creating it
+ * (002 §2.8). `objectKey` must be a verify scratch path whose token equals
+ * `runId`; real watched paths are refused.
+ *
+ * @public
+ */
+export interface RegisterVerifyArtifactInput {
+  /** The run's random 12-hex-digit token, embedded in `objectKey`. */
+  runId: string;
+  /** The run's own active lead session in `workspacePath`. */
+  ownerSessionId: string;
+  /** The workspace whose daemon owns the artifact. */
+  workspacePath: string;
+  /** The monitor being verified; filtering is scoped to it. */
+  monitorId: string;
+  /** The exact scratch path the run is about to create. */
+  objectKey: string;
+  /** Registration time; defaults to the current clock. */
+  now?: Date;
+}
+
+/** The outcome of a verify artifact cleanup request (002 §2.8). @public */
+export interface VerifyArtifactCleanupResult {
+  /** The record after the request; unchanged when cleanup was already recorded. */
+  artifact: VerifyArtifactRecord;
+  /** Events for the exact key that this request retracted. */
+  retractedEventCount: number;
 }

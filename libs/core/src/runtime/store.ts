@@ -60,6 +60,7 @@ import {
   observationHistory,
   sessionEventState,
   sessionObjectCursor,
+  verifyArtifacts,
 } from '../inbox/schema.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import { registerRuntimeTransaction } from './runtime-transaction.js';
@@ -83,6 +84,8 @@ import type {
   SessionHookState,
   SessionObjectCursorRecord,
   UnretainedObservationLoss,
+  VerifyArtifactCleanupCause,
+  VerifyArtifactRecord,
 } from './types.js';
 import {
   MATERIALIZATION_RETRY_DELAYS_MS,
@@ -98,6 +101,7 @@ import {
   serializeRetryEnvelope,
 } from './retry-envelope.js';
 import { registerStoreWriter } from './store-writer.js';
+import { isVerifyScratchObjectKey } from './verify-scratch-key.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -181,6 +185,21 @@ function rowToEphemeralMonitor(
   };
 }
 
+function rowToVerifyArtifact(
+  row: typeof verifyArtifacts.$inferSelect,
+): VerifyArtifactRecord {
+  return {
+    runId: row.runId,
+    ownerSessionId: row.ownerSessionId,
+    workspacePath: row.workspacePath,
+    monitorId: row.monitorId,
+    objectKey: row.objectKey,
+    registeredAt: row.registeredAt,
+    cleanupRequestedAt: row.cleanupRequestedAt ?? null,
+    cleanupCause: row.cleanupCause ?? null,
+  };
+}
+
 function rowToMaterializationRetry(
   row: typeof materializationRetryOutbox.$inferSelect,
 ): MaterializationRetryRecord {
@@ -210,6 +229,16 @@ function materializationRetryKey(
       ? isNull(materializationRetryOutbox.workspacePath)
       : eq(materializationRetryOutbox.workspacePath, workspacePath),
   );
+}
+
+/**
+ * When a retained observation entered the runtime: its reserved position in
+ * the materialization order (NULL for rows queued before positions existed)
+ * and its observation time, the fallback for sessions without a position.
+ */
+interface RetryAdmission {
+  admissionSequence: number | null;
+  observedAt: Date;
 }
 
 /** Bound persisted and projected failure text without letting it control terminal layout. */
@@ -250,6 +279,23 @@ export class MaterializationRetryTransitionError extends Error {
     super(`Materialization retry record ${reason}: ${retryId}`);
     this.name = 'MaterializationRetryTransitionError';
     this.retryId = retryId;
+  }
+}
+
+/**
+ * Retry completion refused because the retained observation is a verify
+ * artifact whose cleanup authority is in effect (002 §2.8, issue #562). The
+ * check runs inside completion's own writer lock, so authority recorded by
+ * another writer after the caller decided to complete is still honored. Like
+ * every transition rejection, nothing was written: the row stays in the
+ * outbox for the drain to discard on its next read.
+ *
+ * @internal
+ */
+export class RetiredVerifyArtifactRetryError extends MaterializationRetryTransitionError {
+  constructor(retryId: string) {
+    super(retryId, 'is a verify artifact whose cleanup authority is in effect');
+    this.name = 'RetiredVerifyArtifactRetryError';
   }
 }
 
@@ -491,22 +537,29 @@ export class RuntimeStore {
     }
 
     const id = ulid();
-    db.insert(agentSessions)
-      .values({
-        id,
-        adapter: input.adapter,
-        hostSessionId: input.hostSessionId,
-        agentIdentity: input.agentIdentity,
-        role: input.role ?? 'lead',
-        workspacePath: input.workspacePath ?? null,
-        hookStatePath: input.hookStatePath,
-        status: 'active',
-        baselineAt: now,
-        lastActiveAt: now,
-        createdAt: now,
-        updatedAt: now,
+    db.$client
+      .transaction(() => {
+        db.insert(agentSessions)
+          .values({
+            id,
+            adapter: input.adapter,
+            hostSessionId: input.hostSessionId,
+            agentIdentity: input.agentIdentity,
+            role: input.role ?? 'lead',
+            workspacePath: input.workspacePath ?? null,
+            hookStatePath: input.hookStatePath,
+            status: 'active',
+            baselineAt: now,
+            lastActiveAt: now,
+            createdAt: now,
+            updatedAt: now,
+            // Ordered against retry admissions without relying on whole-second
+            // timestamps (002 §2.7); a resumed session keeps this position.
+            registrationSequence: this.reserveAdmissionSequence(),
+          })
+          .run();
       })
-      .run();
+      .immediate();
 
     return this.getSessionById(id);
   }
@@ -1051,6 +1104,35 @@ export class RuntimeStore {
   }
 
   /**
+   * The retry that must complete next for one workspace/monitor, pending or
+   * terminal, or `undefined` when its outbox is empty. Order is admission
+   * order: the position each row reserved in the materialization order when
+   * it was queued (002 §2). Rows queued before positions were reserved
+   * predate every positioned row and keep their enqueue order. Timestamps are
+   * whole seconds, so they cannot order rows admitted in the same second.
+   *
+   * @internal
+   */
+  oldestMaterializationRetry(
+    monitorId: string,
+    workspacePath: string | null,
+  ): MaterializationRetryRecord | undefined {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(materializationRetryOutbox)
+      .where(materializationRetryKey(monitorId, workspacePath))
+      .orderBy(
+        sql`${materializationRetryOutbox.admissionSequence} IS NOT NULL`,
+        asc(materializationRetryOutbox.admissionSequence),
+        asc(materializationRetryOutbox.createdAt),
+        asc(materializationRetryOutbox.id),
+      )
+      .limit(1)
+      .get();
+    return row ? rowToMaterializationRetry(row) : undefined;
+  }
+
+  /**
    * Discover every retained outbox in one exact workspace without loading
    * private envelopes. A row-list limit cannot serve this purpose: capacity is
    * per monitor, so the first full outbox must not hide other monitor routes.
@@ -1203,6 +1285,75 @@ export class RuntimeStore {
   }
 
   /**
+   * Remove retained work whose observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8, issue #562). Such a row was admitted before
+   * authority took effect; materializing it now would deliver the run's scratch
+   * work to a later session. Authority is re-checked inside the same immediate
+   * transaction as the delete, so the decision and the removal commit together.
+   * The row is removed whatever its status — pending, backing off or terminal —
+   * and nothing is recorded in its place: no event, no history row, no loss
+   * record. Dropping it is the cleanup the owner asked for, not lost work.
+   *
+   * Returns `true` when the row was removed. `false` means the row is gone or
+   * its observation has no cleanup authority now, and it is left untouched.
+   * Authority can lapse: an owner's inactivity is derived, not recorded, until
+   * cleanup reconciliation records it, and reopening the owner session makes
+   * it active again. So `false` tells the caller only to re-read the outbox.
+   *
+   * @internal
+   */
+  discardRetiredVerifyArtifactRetry(id: string): boolean {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const current = db
+          .select()
+          .from(materializationRetryOutbox)
+          .where(eq(materializationRetryOutbox.id, id))
+          .get();
+        if (
+          current === undefined ||
+          !this.isRetiredVerifyArtifactRetry(rowToMaterializationRetry(current))
+        ) {
+          return false;
+        }
+        return (
+          db
+            .delete(materializationRetryOutbox)
+            .where(eq(materializationRetryOutbox.id, id))
+            .run().changes === 1
+        );
+      })
+      .immediate();
+  }
+
+  /**
+   * Whether a retained row's observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8). It is the predicate the runtime's drain
+   * filter applies to the row: a row with no workspace, or an observation with
+   * no object key, has no artifact to retire, and neither does a key that is
+   * not a verify scratch key. The predicate itself excludes such keys, so a
+   * registration of one through {@link RuntimeStore.registerVerifyArtifact}
+   * has no effect on retained retries. Callers evaluate it inside their own
+   * immediate transaction, so the answer and their write commit together.
+   */
+  private isRetiredVerifyArtifactRetry(
+    retry: MaterializationRetryRecord,
+  ): boolean {
+    const { objectKey } = retry.envelope.observation;
+    return (
+      retry.workspacePath !== null &&
+      objectKey !== undefined &&
+      isVerifyScratchObjectKey(objectKey) &&
+      this.isVerifyArtifactCleanupEffective({
+        workspacePath: retry.workspacePath,
+        monitorId: retry.monitorId,
+        objectKey,
+      })
+    );
+  }
+
+  /**
    * Consume pending retained work only by committing its event, projections,
    * cursor seeds and snapshot together with removal of the retry row.
    * Terminal work requires explicit re-arm. Scheduling/due selection belongs
@@ -1219,6 +1370,11 @@ export class RuntimeStore {
    * remains the runtime's responsibility. This seam accepts event data, never
    * a callback: arbitrary asynchronous effects cannot be rolled back by SQLite.
    * Interpret and other external work belong after this method returns.
+   *
+   * Cleanup authority is re-checked under the same writer lock as the write:
+   * a retained verify artifact whose authority is in effect at commit time is
+   * refused with {@link RetiredVerifyArtifactRetryError}, even when the caller
+   * read the row before another writer recorded cleanup (002 §2.8).
    *
    * @internal
    */
@@ -1261,7 +1417,9 @@ export class RuntimeStore {
               'does not match the retained observation route',
             );
           }
-          const result = this.insertEvent(input, baseline, options);
+          if (this.isRetiredVerifyArtifactRetry(current)) {
+            throw new RetiredVerifyArtifactRetryError(id);
+          }
           // The event commits now but its observation was admitted when the
           // retry was queued; supersession of a drop compares admission (002 §2).
           // A row queued before positions were reserved predates every drop.
@@ -1272,6 +1430,12 @@ export class RuntimeStore {
             .from(materializationRetryOutbox)
             .where(eq(materializationRetryOutbox.id, id))
             .get();
+          // Only sessions that existed when the observation was admitted
+          // receive it, however long the retry took (002 §2.7).
+          const result = this.writeEvent(input, baseline, options, {
+            admissionSequence: admission?.admissionSequence ?? null,
+            observedAt: current.envelope.observedAt,
+          });
           db.update(monitorEvents)
             .set({ admissionSequence: admission?.admissionSequence ?? 0 })
             .where(eq(monitorEvents.id, result.id))
@@ -1329,6 +1493,22 @@ export class RuntimeStore {
     baseline?: { previousContent: string | null },
     options?: { restrictToSessionId?: string },
   ): MonitorEventRecord {
+    return this.writeEvent(input, baseline, options);
+  }
+
+  /**
+   * {@link RuntimeStore.insertEvent}, optionally limited to recipients that
+   * were registered before the event's observation was admitted. Retry
+   * completion supplies that admission; events materialized in their
+   * admitting span need no limit, because admission and projection share one
+   * transaction.
+   */
+  private writeEvent(
+    input: Omit<MonitorEventRecord, 'id'>,
+    baseline?: { previousContent: string | null },
+    options?: { restrictToSessionId?: string },
+    admittedAt?: RetryAdmission,
+  ): MonitorEventRecord {
     const db = asInternalDb(this.db);
     const materialized = db.$client
       .transaction(() => {
@@ -1381,7 +1561,7 @@ export class RuntimeStore {
         // leaking. The declaring session must also still be `active`: a session reaped
         // mid-tick (its close raced this observation) must not receive a projection
         // (007 §4.4). The event row itself is still retained for durability.
-        const projectionTargets = ephemeralStillActive
+        const candidates = ephemeralStillActive
           ? this.sessionsForWorkspace(event.workspacePath).filter(
               (candidate) =>
                 candidate.role === 'lead' &&
@@ -1390,6 +1570,10 @@ export class RuntimeStore {
                     candidate.status === 'active')),
             )
           : [];
+        const projectionTargets =
+          admittedAt === undefined
+            ? candidates
+            : this.sessionsRegisteredBefore(candidates, admittedAt);
         for (const session of projectionTargets) {
           // ── Per-recipient Diff (G10, 002 §1.1.2) ──────────────────────────────
           // Compute this session's delta against ITS OWN baseline cursor, and seed
@@ -1939,6 +2123,49 @@ export class RuntimeStore {
   }
 
   /**
+   * Keep the sessions that were registered before a retained observation was
+   * admitted (002 §2.7). Both positions come from the materialization-order
+   * counter, so a session registered in the same second as the admission is
+   * still ordered correctly. Data written before positions were reserved
+   * falls back as follows: a retry without a position predates every
+   * positioned session, so such a session is excluded; a session without a
+   * position is compared by its whole-second registration time against the
+   * observation time, the only order an earlier version recorded.
+   */
+  private sessionsRegisteredBefore(
+    candidates: AgentSessionRecord[],
+    admittedAt: RetryAdmission,
+  ): AgentSessionRecord[] {
+    if (candidates.length === 0) return candidates;
+    const positions = new Map(
+      asInternalDb(this.db)
+        .select({
+          id: agentSessions.id,
+          registrationSequence: agentSessions.registrationSequence,
+        })
+        .from(agentSessions)
+        .where(
+          inArray(
+            agentSessions.id,
+            candidates.map(({ id }) => id),
+          ),
+        )
+        .all()
+        .map((row) => [row.id, row.registrationSequence] as const),
+    );
+    return candidates.filter((session) => {
+      const registered = positions.get(session.id) ?? null;
+      if (registered === null) {
+        return session.baselineAt.getTime() <= admittedAt.observedAt.getTime();
+      }
+      return (
+        admittedAt.admissionSequence !== null &&
+        registered < admittedAt.admissionSequence
+      );
+    });
+  }
+
+  /**
    * Reserve the next position in the `monitor_events` materialization order
    * for an observation admitted now but materialized later (a retained retry).
    *
@@ -1949,6 +2176,10 @@ export class RuntimeStore {
    * below every later one. SQLite documents `sqlite_sequence` as writable;
    * raising it only makes the next event skip the reserved value. Must run
    * inside the admitting transaction.
+   *
+   * Registering a session reserves a position the same way, so a retry can
+   * be ordered against the sessions that existed when it was admitted
+   * (002 §2.7). A registration position never belongs to an event.
    */
   private reserveAdmissionSequence(): number {
     const client = asInternalDb(this.db).$client;
@@ -1975,21 +2206,26 @@ export class RuntimeStore {
   }
 
   /**
-   * Record that admission dropped one observation because the retry outbox
-   * could not retain its ordered suffix (002 §2). Called inside the admitting
-   * span's transaction, so the drop commits or rolls back with that span.
+   * Record that the runtime lost one observation it could not keep (002 §2):
+   * admission dropped it because the retry outbox could not retain its ordered
+   * suffix, or a debounce/rollup hold refused it because its envelope cannot
+   * be serialized (002 §4.7). This is the one place a loss gets its drop
+   * identity, so every kind of loss is tracked as outstanding the same way.
+   * Called inside the admitting span's transaction, so the loss commits or
+   * rolls back with that span.
    *
-   * Besides the `errored` history row, it stores what supersedes the drop
+   * Besides the `errored` history row, it stores what supersedes the loss
    * later: the observation's raw `objectKey` (only a string counts) and the
    * high-water mark of the event materialization order at this write (see
-   * {@link RuntimeStore.reserveAdmissionSequence}). Events of earlier siblings
-   * in the same span, and retries admitted before the drop, are at or below
-   * that watermark; events of later siblings and later spans, and retries
-   * admitted after the drop, are above it.
+   * {@link RuntimeStore.reserveAdmissionSequence}). The caller writes it at the
+   * lost observation's place in the span's dispatched order: events of earlier
+   * siblings, and retries admitted before the loss, are at or below that
+   * watermark; events of later siblings and later spans, and retries admitted
+   * after the loss, are above it.
    *
    * @internal
    */
-  recordUnretainedObservation(input: {
+  recordObservationLoss(input: {
     monitorId: string;
     workspacePath: string | null;
     sourceName: string;
@@ -2068,12 +2304,12 @@ export class RuntimeStore {
   }
 
   /**
-   * The outstanding observations admission dropped for one workspace/monitor
-   * because the retry outbox could not retain their suffix (002 §2), or
-   * `undefined` when there are none.
+   * The outstanding observations of one workspace/monitor that the runtime
+   * could not keep (002 §2): drops the retry outbox could not retain and
+   * observations a hold refused (002 §4.7). `undefined` when there are none.
    *
    * A drop row is an `errored` history row written by
-   * {@link RuntimeStore.recordUnretainedObservation}. It stays outstanding
+   * {@link RuntimeStore.recordObservationLoss}. It stays outstanding
    * until it is superseded, and nothing else clears it:
    * - a drop with an object key, by a `monitor_events` row of the same
    *   monitor, workspace and object key whose observation was admitted after
@@ -2081,9 +2317,10 @@ export class RuntimeStore {
    *   `sequence` is above the drop's watermark. A retry admitted before the
    *   drop carries older state, so its completion never clears it;
    * - a drop without one, by a later `triggered` history row of the same
-   *   monitor and workspace whose span dropped nothing (no positive
-   *   `notRetainedCount`), ordered by `(created_at, id)`. The dropping span's
-   *   own batch row carries its count, so it never supersedes its own drops.
+   *   monitor and workspace whose span lost nothing (no positive
+   *   `notRetainedCount` or `notHeld`), ordered by `(created_at, id)`. The
+   *   losing span's own batch row carries its counts, so it never supersedes
+   *   its own losses.
    *
    * Quiet ticks, notify holds, observe failures, a span whose only failure was
    * retained, and events for other keys therefore leave a keyed drop reported.
@@ -2101,7 +2338,8 @@ export class RuntimeStore {
     const drop = observationHistory;
     // json_extract raises on malformed JSON; every row is written with
     // JSON.stringify, but guard so one bad legacy row cannot fail diagnosis.
-    const laterNotRetained = sql`CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, '$.notRetainedCount') END`;
+    const laterLost = (field: 'notRetainedCount' | 'notHeld') =>
+      sql`coalesce(CASE WHEN json_valid(superseding.observation_data) THEN json_extract(superseding.observation_data, ${`$.${field}`}) END, 0)`;
     const drops = and(
       eq(drop.monitorId, monitorId),
       eq(drop.workspacePath, workspacePath),
@@ -2127,7 +2365,8 @@ export class RuntimeStore {
               AND superseding.workspace_path = ${drop.workspacePath}
               AND superseding.result = 'triggered'
               AND (superseding.created_at, superseding.id) > (${drop.createdAt}, ${drop.id})
-              AND coalesce(${laterNotRetained}, 0) <= 0
+              AND ${laterLost('notRetainedCount')} <= 0
+              AND ${laterLost('notHeld')} <= 0
           )`,
         ),
       ),
@@ -2639,6 +2878,236 @@ export class RuntimeStore {
     db.delete(objectEventSuppressions)
       .where(lte(objectEventSuppressions.expiresAt, now))
       .run();
+  }
+
+  /**
+   * Persist exact ownership of one verify artifact (002 §2.8, issue #562).
+   * Idempotent per run: re-registering the identical record returns the stored
+   * one unchanged, so a retried registration never creates a second row. A run
+   * already registered for a different artifact, or an artifact already owned
+   * by another run, is refused. A new registration requires an existing,
+   * active owner session in the same workspace. The caller validates that the
+   * key is a verify scratch path carrying `runId`.
+   */
+  registerVerifyArtifact(input: {
+    runId: string;
+    ownerSessionId: string;
+    workspacePath: string;
+    monitorId: string;
+    objectKey: string;
+    registeredAt: Date;
+  }): VerifyArtifactRecord {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const existing = this.getVerifyArtifact(input.runId);
+        if (existing) {
+          if (
+            existing.ownerSessionId === input.ownerSessionId &&
+            existing.workspacePath === input.workspacePath &&
+            existing.monitorId === input.monitorId &&
+            existing.objectKey === input.objectKey
+          ) {
+            return existing;
+          }
+          throw new Error(
+            `Verify run "${input.runId}" is already registered for a different artifact; a run owns exactly one artifact.`,
+          );
+        }
+        const owner = this.findSessionById(input.ownerSessionId);
+        if (!owner) {
+          throw new Error(
+            `Cannot register a verify artifact: owner session "${input.ownerSessionId}" was not found.`,
+          );
+        }
+        if (owner.status !== 'active') {
+          throw new Error(
+            `Cannot register a verify artifact: owner session "${input.ownerSessionId}" is not active.`,
+          );
+        }
+        if (owner.workspacePath !== input.workspacePath) {
+          throw new Error(
+            `Cannot register a verify artifact: owner session "${input.ownerSessionId}" belongs to another workspace.`,
+          );
+        }
+        const owned = db
+          .select({ runId: verifyArtifacts.runId })
+          .from(verifyArtifacts)
+          .where(
+            and(
+              eq(verifyArtifacts.workspacePath, input.workspacePath),
+              eq(verifyArtifacts.monitorId, input.monitorId),
+              eq(verifyArtifacts.objectKey, input.objectKey),
+            ),
+          )
+          .get();
+        if (owned) {
+          throw new Error(
+            `Cannot register a verify artifact: "${input.objectKey}" is already owned by another verify run.`,
+          );
+        }
+        db.insert(verifyArtifacts)
+          .values({
+            runId: input.runId,
+            ownerSessionId: input.ownerSessionId,
+            workspacePath: input.workspacePath,
+            monitorId: input.monitorId,
+            objectKey: input.objectKey,
+            registeredAt: input.registeredAt,
+          })
+          .run();
+        const stored = this.getVerifyArtifact(input.runId);
+        if (!stored) {
+          throw new Error(`Verify run "${input.runId}" was not stored.`);
+        }
+        return stored;
+      })
+      .immediate();
+  }
+
+  /** One run's verify artifact, or `null` when the run never registered one. */
+  getVerifyArtifact(runId: string): VerifyArtifactRecord | null {
+    const row = asInternalDb(this.db)
+      .select()
+      .from(verifyArtifacts)
+      .where(eq(verifyArtifacts.runId, runId))
+      .get();
+    return row ? rowToVerifyArtifact(row) : null;
+  }
+
+  /**
+   * Every retained verify artifact, oldest registration first, optionally for
+   * one workspace. Records are never removed, so this is the full history.
+   */
+  listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[] {
+    const db = asInternalDb(this.db);
+    const query = db.select().from(verifyArtifacts);
+    const rows =
+      workspacePath === undefined
+        ? query
+            .orderBy(
+              asc(verifyArtifacts.registeredAt),
+              asc(verifyArtifacts.runId),
+            )
+            .all()
+        : query
+            .where(eq(verifyArtifacts.workspacePath, workspacePath))
+            .orderBy(
+              asc(verifyArtifacts.registeredAt),
+              asc(verifyArtifacts.runId),
+            )
+            .all();
+    return rows.map(rowToVerifyArtifact);
+  }
+
+  /**
+   * Record that cleanup authority took effect for one run (002 §2.8). The
+   * first recorded time and cause are permanent: a retry, or a later owner
+   * close, leaves them unchanged and reports `recorded: false`.
+   *
+   * @throws when the run never registered an artifact.
+   */
+  recordVerifyArtifactCleanup(
+    runId: string,
+    cause: VerifyArtifactCleanupCause,
+    at: Date,
+  ): { artifact: VerifyArtifactRecord; recorded: boolean } {
+    const db = asInternalDb(this.db);
+    const changes = db
+      .update(verifyArtifacts)
+      .set({ cleanupRequestedAt: at, cleanupCause: cause })
+      .where(
+        and(
+          eq(verifyArtifacts.runId, runId),
+          isNull(verifyArtifacts.cleanupRequestedAt),
+        ),
+      )
+      .run().changes;
+    const artifact = this.getVerifyArtifact(runId);
+    if (!artifact) {
+      throw new Error(`Verify run "${runId}" has not registered an artifact.`);
+    }
+    return { artifact, recorded: changes > 0 };
+  }
+
+  /**
+   * Registered artifacts still without recorded cleanup whose owner session is
+   * missing or no longer active, for one workspace. The partial index keeps
+   * this to the few in-flight rows; retired rows are never scanned.
+   */
+  verifyArtifactsAwaitingCleanup(
+    workspacePath: string,
+  ): VerifyArtifactRecord[] {
+    const db = asInternalDb(this.db);
+    return db
+      .select({ artifact: verifyArtifacts })
+      .from(verifyArtifacts)
+      .leftJoin(
+        agentSessions,
+        eq(agentSessions.id, verifyArtifacts.ownerSessionId),
+      )
+      .where(
+        and(
+          eq(verifyArtifacts.workspacePath, workspacePath),
+          isNull(verifyArtifacts.cleanupRequestedAt),
+          or(isNull(agentSessions.id), ne(agentSessions.status, 'active')),
+        ),
+      )
+      .all()
+      .map((row) => rowToVerifyArtifact(row.artifact));
+  }
+
+  /** Registered artifacts of one owner session still without recorded cleanup. */
+  verifyArtifactsAwaitingCleanupForOwner(
+    ownerSessionId: string,
+  ): VerifyArtifactRecord[] {
+    return asInternalDb(this.db)
+      .select()
+      .from(verifyArtifacts)
+      .where(
+        and(
+          eq(verifyArtifacts.ownerSessionId, ownerSessionId),
+          isNull(verifyArtifacts.cleanupRequestedAt),
+        ),
+      )
+      .all()
+      .map(rowToVerifyArtifact);
+  }
+
+  /**
+   * Whether cleanup authority is in effect for this exact artifact: it is
+   * registered for this workspace, monitor and key, and either cleanup was
+   * recorded or its owner session is missing or no longer active. An
+   * unregistered key, even one that looks like a verify scratch path, never
+   * has authority.
+   */
+  isVerifyArtifactCleanupEffective(input: {
+    workspacePath: string;
+    monitorId: string;
+    objectKey: string;
+  }): boolean {
+    const db = asInternalDb(this.db);
+    const row = db
+      .select({ runId: verifyArtifacts.runId })
+      .from(verifyArtifacts)
+      .leftJoin(
+        agentSessions,
+        eq(agentSessions.id, verifyArtifacts.ownerSessionId),
+      )
+      .where(
+        and(
+          eq(verifyArtifacts.workspacePath, input.workspacePath),
+          eq(verifyArtifacts.monitorId, input.monitorId),
+          eq(verifyArtifacts.objectKey, input.objectKey),
+          or(
+            isNotNull(verifyArtifacts.cleanupRequestedAt),
+            isNull(agentSessions.id),
+            ne(agentSessions.status, 'active'),
+          ),
+        ),
+      )
+      .get();
+    return row !== undefined;
   }
 
   /**

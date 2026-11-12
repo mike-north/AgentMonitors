@@ -1,5 +1,10 @@
 /**
- * Object-event suppression tombstones (issue #414).
+ * Object-event suppression tombstones (issue #414) and the stale-owner reap
+ * backstop for registered verify artifacts (issue #562).
+ *
+ * Current `verify` registers durable artifact ownership instead (see
+ * `verify-artifact-ownership.test.ts`); the finite tombstone below remains for
+ * older verify clients that call `events.suppressObject` on a newer daemon.
  *
  * `verify --use-workspace-daemon` must clean up the events its throwaway scratch
  * file produced against the PERSISTENT workspace daemon WITHOUT blocking a full
@@ -26,34 +31,10 @@ import apiSource from '../../../../plugins/source-api-poll/src/index.js';
 import scheduleSource from '../../../../plugins/source-schedule/src/index.js';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
-import type {
-  ObservationResult,
-  ObservationSource,
-} from '../observation/types.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
 import type { MonitorEventRecord } from './types.js';
 import { AgentMonitorRuntime, isVerifyScratchObjectKey } from './service.js';
-
-/**
- * A no-op source registered under `file-fingerprint` so `tick()` can scan and
- * evaluate an authored monitor without pulling in the real source plugin (which
- * depends on core — a circular import). It observes nothing; these tests drive
- * events into the store directly.
- */
-const noopFileFingerprintSource: ObservationSource = {
-  name: 'file-fingerprint',
-  scopeSchema: { type: 'object', properties: {} },
-  async observe(): Promise<ObservationResult> {
-    return { observations: [] };
-  },
-};
-
-function registryWithNoopSource(): SourceRegistry {
-  const registry = new SourceRegistry();
-  registry.register(noopFileFingerprintSource);
-  return registry;
-}
 
 const tempDirs: string[] = [];
 
@@ -334,7 +315,7 @@ describe('object-event suppressions (issue #414)', () => {
     ).toHaveLength(0);
   });
 
-  it('reap backstop: an orphaned verify session is reaped AND its scratch events retracted', async () => {
+  it('reap backstop: a reaped verify session gives its registered artifact permanent cleanup authority and retracts its events', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-07-16T00:00:00.000Z'));
     const { rootDir, monitorsDir } = makeWorkspace();
@@ -348,8 +329,8 @@ describe('object-event suppressions (issue #414)', () => {
       { sessionDormancyMs: 60_000 },
     );
     const store = new RuntimeStore(db);
-    // A verify run that was killed uncatchably: an active verify-tagged session
-    // plus its scratch events, never cleaned up.
+    // A verify run that was killed uncatchably: an active verify session, its
+    // registered artifact and its scratch event, never cleaned up.
     const orphan = runtime.openSession(
       claudeCodeAdapter.createSessionInput({
         hostSessionId: 'agentmonitors-verify-abcabcabcabc',
@@ -360,6 +341,13 @@ describe('object-event suppressions (issue #414)', () => {
       rootDir,
       'agentmonitors-verify-abcabcabcabc.md',
     );
+    runtime.registerVerifyArtifact({
+      runId: 'abcabcabcabc',
+      ownerSessionId: orphan.id,
+      workspacePath: rootDir,
+      monitorId: MONITOR_ID,
+      objectKey: scratchKey,
+    });
     store.insertEvent({
       ...eventBase(rootDir),
       title: `File created: ${scratchKey}`,
@@ -373,22 +361,8 @@ describe('object-event suppressions (issue #414)', () => {
     vi.setSystemTime(new Date('2026-07-16T00:05:00.000Z'));
     await runtime.tick(monitorsDir, rootDir);
 
-    // The session is no longer active AND its scratch events are gone.
     const reaped = runtime.listSessions().find((s) => s.id === orphan.id);
     expect(reaped?.status).not.toBe('active');
-    // With no authored definition, the established fallback remains exactly 5m.
-    expect(
-      store.activeObjectSuppressions(
-        rootDir,
-        new Date('2026-07-16T00:09:59.999Z'),
-      ),
-    ).toHaveLength(1);
-    expect(
-      store.activeObjectSuppressions(
-        rootDir,
-        new Date('2026-07-16T00:10:00.000Z'),
-      ),
-    ).toHaveLength(0);
     expect(
       runtime.listEvents({
         monitorId: MONITOR_ID,
@@ -396,6 +370,17 @@ describe('object-event suppressions (issue #414)', () => {
         workspacePath: rootDir,
       }),
     ).toHaveLength(0);
+    // Ownership, not a finite tombstone, carries the authority.
+    expect(store.listVerifyArtifacts(rootDir)).toEqual([
+      expect.objectContaining({
+        runId: 'abcabcabcabc',
+        cleanupRequestedAt: new Date('2026-07-16T00:05:00.000Z'),
+        cleanupCause: 'owner-inactive',
+      }),
+    ]);
+    expect(
+      store.activeObjectSuppressions(rootDir, new Date('2026-07-16T00:05:00Z')),
+    ).toEqual([]);
   });
 });
 
@@ -533,23 +518,13 @@ describe('object-event suppression safety guards (issue #418)', () => {
   });
 
   it.each([
-    { source: fileSource, config: '  globs: 42', settle: '10m', ttl: 690000 },
-    { source: apiSource, config: '  url: 42', settle: '5m', ttl: 660000 },
-    {
-      source: scheduleSource,
-      config: '  cron: 42',
-      settle: '10m',
-      ttl: 720000,
-    },
-    {
-      source: fileSource,
-      config: '  globs: 42\n  interval: bad',
-      settle: '10m',
-      ttl: 300000,
-    },
+    { source: fileSource, config: '  globs: 42' },
+    { source: apiSource, config: '  url: 42' },
+    { source: scheduleSource, config: '  cron: 42' },
+    { source: fileSource, config: '  globs: 42\n  interval: bad' },
   ])(
-    'preserves safely derivable cadence for rejected $source.name config ($ttl ms)',
-    async ({ source, config, settle, ttl }) => {
+    'stale-owner cleanup precedes $source.name preflight for rejected config and installs no finite tombstone',
+    async ({ source, config }) => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-11-05T12:00:00Z'));
       const { rootDir, monitorsDir } = makeWorkspace();
@@ -557,7 +532,7 @@ describe('object-event suppression safety guards (issue #418)', () => {
       mkdirSync(dir);
       writeFileSync(
         path.join(dir, 'MONITOR.md'),
-        `---\nwatch:\n  type: ${source.name}\n${config}\nnotify:\n  strategy: debounce\n  settle-for: ${settle}\nurgency: normal\n---\nHandle it.\n`,
+        `---\nwatch:\n  type: ${source.name}\n${config}\nnotify:\n  strategy: debounce\n  settle-for: 10m\nurgency: normal\n---\nHandle it.\n`,
       );
       const registry = new SourceRegistry();
       registry.register(source);
@@ -569,7 +544,7 @@ describe('object-event suppression safety guards (issue #418)', () => {
         undefined,
         { sessionDormancyMs: 60000 },
       );
-      runtime.openSession(
+      const owner = runtime.openSession(
         claudeCodeAdapter.createSessionInput({
           hostSessionId: 'agentmonitors-verify-abcdef012345',
           workspacePath: rootDir,
@@ -579,6 +554,13 @@ describe('object-event suppression safety guards (issue #418)', () => {
         rootDir,
         'agentmonitors-verify-abcdef012345.md',
       );
+      runtime.registerVerifyArtifact({
+        runId: 'abcdef012345',
+        ownerSessionId: owner.id,
+        workspacePath: rootDir,
+        monitorId: MONITOR_ID,
+        objectKey: scratchKey,
+      });
       store.insertEvent({
         ...eventBase(rootDir),
         sourceName: source.name,
@@ -590,84 +572,18 @@ describe('object-event suppression safety guards (issue #418)', () => {
       const reapAt = new Date('2026-11-05T12:02:00Z');
       vi.setSystemTime(reapAt);
       const tick = await runtime.tick(monitorsDir, rootDir);
+      // The rejected config is still refused before observation.
       expect(tick.evaluatedMonitors).toEqual([]);
       expect(tick.skippedMonitors).toHaveLength(1);
       expect(
-        store.activeObjectSuppressions(
-          rootDir,
-          new Date(reapAt.getTime() + ttl - 1),
-        ),
-      ).toHaveLength(1);
-      expect(
-        store.activeObjectSuppressions(
-          rootDir,
-          new Date(reapAt.getTime() + ttl),
-        ),
+        runtime.listEvents({ workspacePath: rootDir, objectKey: scratchKey }),
       ).toEqual([]);
+      expect(store.getVerifyArtifact('abcdef012345')).toMatchObject({
+        cleanupRequestedAt: reapAt,
+        cleanupCause: 'owner-inactive',
+      });
+      // No cadence-sized window exists to expire.
+      expect(store.activeObjectSuppressions(rootDir, reapAt)).toEqual([]);
     },
   );
-
-  it('the reap backstop sizes the orphan tombstone from the monitor cadence, so a long-interval monitor outlives the 5-min floor', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date('2026-07-16T00:00:00.000Z'));
-    const { rootDir, monitorsDir } = makeWorkspace();
-    // Author a long-interval + long-settle monitor so its derived tombstone TTL
-    // (max(5min, interval + settle + 1min margin) = max(5min, 10+2+1min) = 13min)
-    // exceeds the fixed 5-minute floor. Pre-fix the reap used the flat floor, so a
-    // deletion re-materializing after 5min would linger.
-    const monitorDir = path.join(monitorsDir, MONITOR_ID);
-    mkdirSync(monitorDir, { recursive: true });
-    writeFileSync(
-      path.join(monitorDir, 'MONITOR.md'),
-      `---\nname: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  interval: '10m'\nnotify:\n  strategy: debounce\n  settle-for: '2m'\nurgency: normal\n---\nReview it.\n`,
-      'utf-8',
-    );
-    const db = createDb(':memory:');
-    const runtime = new AgentMonitorRuntime(
-      new RuntimeStore(db),
-      registryWithNoopSource(),
-      [claudeCodeAdapter],
-      undefined,
-      { sessionDormancyMs: 60_000 },
-    );
-    const store = new RuntimeStore(db);
-    // Open the orphaned verify session (its presence is what the reap acts on).
-    runtime.openSession(
-      claudeCodeAdapter.createSessionInput({
-        hostSessionId: 'agentmonitors-verify-fedcba987654',
-        workspacePath: rootDir,
-      }),
-    );
-    const scratchKey = path.join(
-      rootDir,
-      'agentmonitors-verify-fedcba987654.md',
-    );
-    store.insertEvent({
-      ...eventBase(rootDir),
-      title: `File created: ${scratchKey}`,
-      summary: `File created: ${scratchKey}`,
-      objectKey: scratchKey,
-      createdAt: new Date(),
-    });
-
-    // Advance past dormancy and tick: the reap installs the tombstone now (00:02).
-    vi.setSystemTime(new Date('2026-07-16T00:02:00.000Z'));
-    await runtime.tick(monitorsDir, rootDir);
-
-    // The 13m lifetime from 00:02 lasts until exactly 00:15, preserving the
-    // valid interval + settle + margin sizing rather than shortening to the floor.
-    expect(
-      store.activeObjectSuppressions(
-        rootDir,
-        new Date('2026-07-16T00:14:59.999Z'),
-      ),
-    ).toHaveLength(1);
-    // Expiry remains exactly at the established cadence-derived boundary.
-    expect(
-      store.activeObjectSuppressions(
-        rootDir,
-        new Date('2026-07-16T00:15:00.000Z'),
-      ),
-    ).toHaveLength(0);
-  });
 });
