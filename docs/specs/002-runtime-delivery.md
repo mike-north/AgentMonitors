@@ -1624,6 +1624,59 @@ after both final table names exist. A copy, index or trigger-restoration failure
 back the complete original schema and data. Already-current/new schemas do not churn
 triggers; connection pragmas, public identities and ordering policies remain unchanged.
 
+**Columns the current schema does not define are carried, never dropped** (_current_,
+issue #569). The rebuild derives its target from the live table (`PRAGMA table_xinfo`),
+not from a fixed column list. Columns the current schema defines take their current
+definitions (§15); one the old table lacks takes its default. Every other column — one a
+released version later stopped creating (0.0.1–0.3.0's `monitor_events.event_kind`), one a
+later change adds in place, or one an operator added — is carried with its values, its
+declared type and its default; an expression default such as `(datetime('now'))` is carried
+as an expression, including one that ends in a line comment. A carried column keeps `NOT NULL` only when it has a default, because the
+current writer never names it.
+
+What the rebuild preserves, loses and refuses:
+
+- **Preserved:** every column and its values; each carried column's type and default; the
+  current definitions of current columns (including `id` uniqueness, which also covers a
+  released `id TEXT PRIMARY KEY`); every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX` and
+  every trigger, recreated from its exact stored SQL.
+- **Lost:** a carried column's collation (a `COLLATE NOCASE` column behind an explicit unique
+  index then compares case-sensitively), and its `NOT NULL` when it has no default: the
+  rebuilt column admits `NULL` where the old one did not, because the current writer never
+  names the column and would otherwise fail every insert.
+- **Refused:** any `UNIQUE` or `PRIMARY KEY` constraint other than the lone `id` key (inline on
+  a carried column, or table-level; SQLite backs each with an automatic index that is not an
+  explicit index and cannot be recreated, and a rowid-alias `INTEGER PRIMARY KEY` on another
+  column has none to detect, so it is found through the column's primary-key position); any
+  `CHECK` constraint, inline or table-level, found by scanning the stored table text with
+  string literals, quoted identifiers and SQL comments blanked; any `REFERENCES` clause
+  (found through `PRAGMA foreign_key_list`), since the connection enforces foreign keys and
+  the rebuilt table would admit orphan rows the old one rejected; and a `STRICT` table (found
+  through `PRAGMA table_list`), since the rebuilt table is not strict and would admit values
+  the old one rejected. Dropping these would
+  silently admit rows the table rejected, so the open stops with a `SchemaMigrationError`
+  instead. The message names the table, and the column when one is identifiable (a `CHECK`
+  that mentions no column is reported as "the table has a table-level CHECK constraint", and
+  a `STRICT` table likewise names no column), and ends with the remedy: SQLite
+  cannot drop a column or table constraint in place, so rebuild the table by hand without it (or
+  restore the database), and the open will then proceed.
+
+Since every column survives, every explicit index and trigger still resolves; the rebuild
+drops none of them. Opening any database a released version wrote therefore succeeds without
+losing an event or snapshot value.
+
+A rebuild that cannot carry a row or column stops before copying and reports a
+`SchemaMigrationError` naming the table, and the column when one is identifiable, for example
+`Cannot migrate monitor_events to the current schema: column "id" has no value in a
+retained row, and the current schema requires one. The database was left unchanged.`
+This covers a generated column (its expression is not recoverable from table metadata),
+a `UNIQUE`/`PRIMARY KEY`/`CHECK`/`REFERENCES` constraint it cannot recreate or a `STRICT` table (above), and a retained row
+holding `NULL` in a column the current schema requires, with or without a default (a
+released `id TEXT PRIMARY KEY` admits `NULL`). The error names the live table (and column, when one is identifiable),
+never the scratch table. The schema transaction rolls back, so the database
+keeps its original schema and data; the open fails the same way until that row or column
+is repaired.
+
 Retained rows receive sequence numbers in their **current hidden rowid order**. This is
 an explicit bootstrap policy: it cannot recover chronology already lost before migration
 (for example through historical `VACUUM`) or repair previously generated diffs. Reopening
@@ -2408,6 +2461,11 @@ the column existed.
 Both columns are additive. The materialization-order rebuild of a pre-`sequence` table carries each
 of them when the old table already has it and copies `NULL` otherwise; the migration then adds any
 still missing and creates the object-key index on the rebuilt table.
+
+A database written before the `sequence` column existed (every released version through
+0.13.0) is rebuilt on first open. Columns the current schema does not define, such as
+0.0.1–0.3.0's `event_kind` or a column an operator added, are carried across nullable
+unless they have a default; see §5.2 for the full column, index and failure policy.
 
 ### `monitor_snapshots`
 

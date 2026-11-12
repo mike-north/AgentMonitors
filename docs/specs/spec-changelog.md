@@ -9,6 +9,18 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — The ordering rebuild states what it preserves, loses and refuses (002 §5.2) — Refs #569
+
+Carried expression defaults are now written back as expressions (`PRAGMA table_xinfo` reports
+them without their parentheses, which made the rebuilt `CREATE TABLE` invalid and failed every
+open). A retained `NULL` in a `NOT NULL DEFAULT` column now raises a `SchemaMigrationError` naming
+the real table and column. A live table with a `UNIQUE` or `PRIMARY KEY` constraint other than the
+lone `id` key (including a rowid-alias primary key on another column), or any `CHECK` or `REFERENCES`
+constraint, or a `STRICT` table, is refused rather than silently loosened; only collation and the `NOT NULL` of a carried column without a default are lost. The check ignores
+SQL comments, and the refusal message says that SQLite cannot drop a column or table constraint in place, so the table
+must be rebuilt by hand or the database restored. A carried default that ends in a line comment is
+written back with a newline before its closing parenthesis. 002 §5.2 lists what is preserved, lost and refused.
+
 ## 2026-11-12 — Notify-policy admission gates whole watch batches; edit drains record no drops (002 §2.3/§2.4/§4.6, 004 §2.5) — Refs #497, #537
 
 Reconcile effective notify-policy edits with explicit watch batches and span admission outcomes.
@@ -101,6 +113,20 @@ keeps it on its rollup and gets the same check. Storage: two nullable `observati
 on `observation_history` and an object-key index on `monitor_events`, all additive. Verified by
 `libs/core/src/runtime/unretainable-suffix-admission.test.ts` and
 `apps/cli/src/retry-diagnostics.test.ts` (including a real `daemon run` socket after a quiet tick).
+
+## 2026-11-11 — The ordering rebuild carries every column it does not define (002 §5.2/§15, 004) — Refs #569
+
+The rebuild that adds the private `sequence` key to `monitor_events` and `monitor_snapshots`
+copied a fixed column list. A database whose table held another column lost that column's
+values, and if an index referenced it, recreating the index failed and rolled the open back on
+every attempt, so the daemon could not start. 0.0.1–0.3.0 created `monitor_events.event_kind`,
+which later versions stopped creating without removing it. The rebuild now derives its target
+from the live table: current columns take their current definitions, and every other column is
+carried with its values, declared type and default (keeping `NOT NULL` only with a default), so
+every index and trigger is recreated unchanged and none is dropped. A rebuild that cannot carry a
+row or column (a generated column; `NULL` in a required column) reports a `SchemaMigrationError`
+naming the table and column, and the database is left unchanged. 004 adds a released-layout
+suite that opens each layout released versions produced.
 
 ## 2026-11-10 — Keep a dropped observation visible in explain and doctor (002 §2/§10.7/`observation_history`; 004 §3.4; 005 doctor) — Refs #497
 
