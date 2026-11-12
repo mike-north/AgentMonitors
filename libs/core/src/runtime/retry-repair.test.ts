@@ -231,12 +231,12 @@ describe('a terminal retry pauses its monitor until it is repaired', () => {
       {
         monitorId: 'm',
         message: expect.stringContaining(
-          `\`agentmonitors monitor retry rearm m ${id} --workspace ${f.root}\``,
+          `\`agentmonitors monitor retry rearm --workspace ${f.root} -- m ${id}\``,
         ),
       },
     ]);
     expect(tick.erroredObservations[0]?.message).toContain(
-      `\`agentmonitors monitor retry skip m ${id} --workspace ${f.root}\``,
+      `\`agentmonitors monitor retry skip --workspace ${f.root} -- m ${id}\``,
     );
 
     const explain = await opened.runtime.explainMonitor({
@@ -247,10 +247,10 @@ describe('a terminal retry pauses its monitor until it is repaired', () => {
     const stage = explain.stages.find(({ id: s }) => s === 'materialization');
     expect(stage?.status).toBe('failure');
     expect(stage?.reason).toContain(
-      `\`agentmonitors monitor retry rearm m ${id} --workspace ${f.root}\``,
+      `\`agentmonitors monitor retry rearm --workspace ${f.root} -- m ${id}\``,
     );
     expect(stage?.reason).toContain(
-      `\`agentmonitors monitor retry skip m ${id} --workspace ${f.root}\``,
+      `\`agentmonitors monitor retry skip --workspace ${f.root} -- m ${id}\``,
     );
   });
 });
@@ -730,7 +730,10 @@ describe('a watcher paused on a terminal retry', () => {
       repair(client, 'A');
       // The watcher finds the retry terminal, reports it once and pauses.
       await vi.waitFor(
-        () => expect(errors.join('\n')).toContain('monitor retry rearm w'),
+        () =>
+          expect(errors.join('\n')).toContain(
+            `monitor retry rearm --workspace ${root} -- w`,
+          ),
         { timeout: 5_000, interval: 20 },
       );
       if (!action) expect(eventSummaries(client)).toEqual([]);

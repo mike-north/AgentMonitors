@@ -721,10 +721,10 @@ describe('monitor retry without a daemon', () => {
     );
     expect(check?.status).toBe('fail');
     expect(check?.remediation).toContain(
-      `\`agentmonitors monitor retry rearm ${MONITOR} ${id}\``,
+      `\`agentmonitors monitor retry rearm -- ${MONITOR} ${id}\``,
     );
     expect(check?.remediation).toContain(
-      `\`agentmonitors monitor retry skip ${MONITOR} ${id}\``,
+      `\`agentmonitors monitor retry skip -- ${MONITOR} ${id}\``,
     );
     // So does the tick report.
     const once = await run([
@@ -736,17 +736,25 @@ describe('monitor retry without a daemon', () => {
       '--format',
       'json',
     ]);
-    expect(once.stdout).toContain(`monitor retry rearm ${MONITOR} ${id}`);
-    expect(once.stdout).toContain(`monitor retry skip ${MONITOR} ${id}`);
+    expect(once.stdout).toContain(
+      `monitor retry rearm --workspace ${root} -- ${MONITOR} ${id}`,
+    );
+    expect(once.stdout).toContain(
+      `monitor retry skip --workspace ${root} -- ${MONITOR} ${id}`,
+    );
 
-    // Run the suggested command exactly as written, from the workspace.
+    // Run the suggested repair from the workspace, with the format option
+    // before its option terminator.
     const suggested = /`agentmonitors (monitor retry rearm [^`]+)`/.exec(
       check?.remediation ?? '',
     )?.[1];
     const rearmed = await run([
-      ...(suggested ?? '').split(' '),
+      'monitor',
+      'retry',
+      'rearm',
       '--format',
       'text',
+      ...(suggested ?? '').split(' ').slice(3),
     ]);
     expect(rearmed.code).toBe(0);
     expect(rearmed.stdout).toContain(
@@ -1170,6 +1178,104 @@ it.each(['rearm', 'skip'] as const)(
         ).toEqual([]);
         expect(
           store.outstandingUnretainedObservationLoss(MONITOR, workspace),
+        ).toBeDefined();
+      }
+    } finally {
+      client.close();
+    }
+  },
+);
+
+/** Legal leading-hyphen IDs stay positional when a printed repair is pasted into a shell. */
+it.each([
+  ['explain', 'rearm'],
+  ['explain', 'skip'],
+  ['doctor', 'rearm'],
+  ['doctor', 'skip'],
+] as const)(
+  'regression: %s %s repairs a leading-hyphen monitor through a POSIX shell',
+  async (surface, verb) => {
+    const monitorId = '-watcher';
+    writeMonitor(monitors, monitorId);
+    const workspace = path.join(root, "Mike's workspace; $literal");
+    mkdirSync(workspace);
+    const id = await seedRetry({
+      target: { monitorId, monitorsDir: monitors, workspace },
+    });
+    const caller = path.join(root, 'caller');
+    mkdirSync(caller);
+    // The shim supplies executable lookup only; every printed argument goes
+    // unchanged through the shell from outside the retry's workspace.
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      path.join(bin, 'agentmonitors'),
+      `#!/bin/sh\nexec '${process.execPath}' '${cli}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    const flags = [
+      '--workspace',
+      workspace,
+      '--dir',
+      monitors,
+      '--format',
+      'json',
+    ];
+    const diagnostic = await run(
+      surface === 'explain'
+        ? ['monitor', 'explain', ...flags, '--', monitorId]
+        : ['doctor', ...flags],
+      caller,
+    );
+    // Doctor reports the stopped monitor as unhealthy; explain still succeeds.
+    expect(diagnostic.code).toBe(surface === 'doctor' ? 1 : 0);
+    const report = JSON.parse(diagnostic.stdout) as {
+      stages?: { id: string; reason: string }[];
+      checks?: { name: string; remediation?: string }[];
+    };
+    const prose =
+      surface === 'explain'
+        ? report.stages?.find(({ id }) => id === 'materialization')?.reason
+        : report.checks?.find(({ name }) => name === `monitor:${monitorId}`)
+            ?.remediation;
+    const command = prose?.match(
+      new RegExp('`(agentmonitors monitor retry ' + verb + ' [^`]+)`'),
+    )?.[1];
+    expect(command).toBeDefined();
+    const result = await execute('/bin/sh', ['-c', command ?? 'exit 99'], {
+      cwd: caller,
+      // Match the workspace-scope regressions: format detection must not
+      // depend on the invoking terminal, and the shim uses absolute paths.
+      env: {
+        HOME: root,
+        XDG_DATA_HOME: env['XDG_DATA_HOME'],
+        AGENTMONITORS_DB: dbPath,
+        AGENTMONITORS_SOCKET: socketPath,
+        PATH: bin,
+      },
+      timeout: 30_000,
+    });
+    expect(result.stdout).toContain(
+      `${verb === 'rearm' ? 'Re-armed' : 'Skipped'} retry ${id} of monitor ${monitorId}`,
+    );
+    const { store, client } = openStore();
+    try {
+      if (verb === 'rearm') {
+        expect(store.getMaterializationRetry(id)).toMatchObject({
+          workspacePath: workspace,
+          monitorId,
+          status: 'pending',
+          attemptCount: 0,
+        });
+      } else {
+        expect(
+          store.listMaterializationRetries({
+            monitorId,
+            workspacePath: workspace,
+          }),
+        ).toEqual([]);
+        expect(
+          store.outstandingUnretainedObservationLoss(monitorId, workspace),
         ).toBeDefined();
       }
     } finally {

@@ -1200,9 +1200,11 @@ Each tick that leaves retained work in place reports it:
   entry with the error, beside its `errored` row;
 - a `terminal` row: one `erroredObservations` entry and one `errored` row on every tick it keeps
   the monitor paused, naming the retry, both repairs (`agentmonitors monitor retry rearm
-<monitorId> <retryId>` and `agentmonitors monitor retry skip <monitorId> <retryId>`) and its last
-  error. A terminal row is never attempted automatically; it stays until an operator re-arms or
-  skips it, and the monitor stays paused until then;
+[--workspace <path>] -- <monitorId> <retryId>` and `agentmonitors monitor retry skip
+[--workspace <path>] -- <monitorId> <retryId>`) and its last error. All flags precede `--` so a
+  leading-hyphen monitor ID stays positional (005 §6). A terminal row is never attempted
+  automatically; it stays until an operator re-arms or skips it, and the monitor stays paused
+  until then;
 - a row backing off: a `skippedMonitors` entry whose `nextDueAt` is the row's next attempt time.
 
 Other monitors are unaffected: each monitor drains and pauses on its own outbox.

@@ -1032,10 +1032,13 @@ function retryRepairCommands(
 ): { rearm: string; skip: string } {
   // Always pin a known route: diagnostics can be consumed outside the
   // process/workspace that produced them, including a daemon response.
+  // End option parsing before IDs: shell quoting alone cannot make a legal
+  // leading-hyphen monitor ID positional. Every flag must precede `--`.
   const target = [
+    ...(workspacePath === null ? [] : ['--workspace', shellArg(workspacePath)]),
+    '--',
     shellArg(monitorId),
     shellArg(retryId),
-    ...(workspacePath === null ? [] : ['--workspace', shellArg(workspacePath)]),
   ].join(' ');
   return {
     rearm: `agentmonitors monitor retry rearm ${target}`,

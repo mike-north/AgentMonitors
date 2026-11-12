@@ -469,7 +469,7 @@ describe('a watcher paused on a terminal retry for a retired verify artifact', (
       await vi.waitFor(
         () =>
           expect(errors.join('\n')).toContain(
-            `monitor retry rearm ${MONITOR_ID}`,
+            `monitor retry rearm --workspace ${root} -- ${MONITOR_ID}`,
           ),
         { timeout: 5_000, interval: 20 },
       );

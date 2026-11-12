@@ -825,13 +825,15 @@ it('names re-arm and skip for the terminal retry that pauses each outbox, in tex
     const remediation =
       json.checks.find((check) => check.name === name)?.remediation ?? '';
     for (const verb of ['rearm', 'skip']) {
-      const command = `\`agentmonitors monitor retry ${verb} ${monitorId} ${retryId} ${scope}\``;
+      const command = `\`agentmonitors monitor retry ${verb} ${scope} -- ${monitorId} ${retryId}\``;
       expect(remediation).toContain(command);
       expect(text.stdout).toContain(command);
     }
   }
   // Pending work is attempted automatically; only terminal work is named.
-  expect(text.stdout).not.toContain('attached-pending --workspace');
+  expect(text.stdout).not.toMatch(
+    /`agentmonitors monitor retry (?:rearm|skip) [^`]* attached-pending`/u,
+  );
 });
 
 /**

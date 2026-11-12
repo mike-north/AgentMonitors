@@ -804,8 +804,8 @@ They name a retry exactly as `monitor explain` and `doctor` list it (`Retry <id>
 by its monitor id and its record id.
 
 ```
-agentmonitors monitor retry rearm <monitorId> <retryId> [--workspace <path>] [--socket <path>] [--format <toon|text|json>]
-agentmonitors monitor retry skip  <monitorId> <retryId> [--reason <text>] [--workspace <path>] [--socket <path>] [--format <toon|text|json>]
+agentmonitors monitor retry rearm [--workspace <path>] [--socket <path>] [--format <toon|text|json>] -- <monitorId> <retryId>
+agentmonitors monitor retry skip  [--reason <text>] [--workspace <path>] [--socket <path>] [--format <toon|text|json>] -- <monitorId> <retryId>
 ```
 
 | Argument / Flag      | Default             | Description                                                                        |
@@ -912,7 +912,18 @@ state; after a removal, its state when it was removed. The stored observation is
 `{ "error": "<message above>" }`.
 
 The tick report names both commands for a terminal retry (002 §2.7), as do the `monitor explain`
-materialization reason and the `doctor` remediation (§15).
+materialization reason and the `doctor` remediation (§15). These suggestions **MUST** place all
+flags before an option terminator `--`, followed by the monitor and retry IDs, so IDs such as
+`-watcher` remain positional. For example:
+
+```sh
+agentmonitors monitor retry rearm --workspace /work/project -- -watcher 01K000000000000000000000000
+```
+
+Shell quoting and workspace scoping remain unchanged. Any additional flags (including `--format`
+and `--reason`) belong before `--`. Verified by the explain/doctor × rearm/skip leading-hyphen
+regressions in `apps/cli/src/retry-repair.test.ts`, which execute the suggestions verbatim through
+`/bin/sh` from another directory and check the persisted repair.
 
 Verified: `apps/cli/src/retry-repair.test.ts` (built CLI against a real `daemon run`: re-arm then
 success with later input in order, re-arm then failure, skip with the loss in `doctor` and
@@ -2131,9 +2142,10 @@ as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check 
 exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
 explain <id>` command. While the outbox holds a terminal retry, the monitor is stopped (002 §2.7)
 and the remediation also names both repairs for its oldest terminal retry, the one that pauses it:
-``Once the cause is fixed, retry it with `agentmonitors monitor retry rearm <id> <retryId>`, or
-give it up as a recorded loss with `agentmonitors monitor retry skip <id> <retryId>`.`` (each
-carrying `--workspace` when it differs from the invoking directory; the repairs have no `--dir`).
+``Once the cause is fixed, retry it with `agentmonitors monitor retry rearm -- <id> <retryId>`, or
+give it up as a recorded loss with `agentmonitors monitor retry skip -- <id> <retryId>`.`` (each
+carrying `--workspace` before `--` when it differs from the invoking directory; the repairs have no
+`--dir`).
 See `monitor retry` (§6). Explain lists bounded safe retry metadata (record id, status, attempts,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
 

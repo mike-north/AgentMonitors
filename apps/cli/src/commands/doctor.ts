@@ -167,10 +167,13 @@ function retryRepairCommands(
 ): { rearm: string; skip: string } | undefined {
   const oldest = summary?.records.find(({ status }) => status === 'terminal');
   if (!oldest) return undefined;
+  // Preserve workspace scoping and quoting, but end option parsing before
+  // IDs so a legal leading-hyphen monitor name cannot become a CLI option.
   const target = [
+    ...workspaceFlags(report.workspacePath),
+    '--',
     shellArg(id),
     shellArg(oldest.id),
-    ...workspaceFlags(report.workspacePath),
   ].join(' ');
   return {
     rearm: `agentmonitors monitor retry rearm ${target}`,
