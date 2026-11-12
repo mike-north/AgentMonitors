@@ -854,6 +854,23 @@ that waits for its durable `triggered` history row before returning; verificatio
 Run the daemon suite serially with retries disabled when accepting this boundary repair. This proves
 the deterministic recording-order defect and repair, not that every historical CI failure had that cause.
 
+### 3.5.1a Restart command containment (008 §4.2, issue #478)
+
+`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` belongs only to the serial
+restart-safety suite. Required outcomes: SIGKILL/restart reaps the command and child with per-PID
+identity/daemon-life diagnostics; re-sessioned mark-kept descendants are reaped; detached
+mark-erased escapes survive without warnings; simulated reused PID/PGID and previous-boot state
+abstain with reasons and the unrelated process answers a fresh IPC ping; an empty startup records
+a completed empty pass. Readiness is condition-based; every daemon and orphan has failure-safe,
+owned-process cleanup. Record five consecutive suite timings when accepting changes here.
+
+Core journal tests cover pre-spawn durability attribution without a recorded child PID, live-owner
+exclusion, signal-time mark loss, changed process start time, unavailable identity evidence,
+group-confirmed unmarked children, late forks, malformed records, bounded discovery and termination
+confirmation, zero host queries for empty-journal readiness, recycled anchor PIDs between discovery readings, an old owner PID reused by the new
+daemon, and PID reuse during the last marker read. Source tests prove optional PID bookkeeping
+failures cannot abandon live supervision.
+
 ### 3.5.2 Literal-path verify cleanup and first-attempt acceptance
 
 The literal-glob integration scenario must prove that verify removes the file it created and its

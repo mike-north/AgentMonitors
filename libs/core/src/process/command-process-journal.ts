@@ -1,0 +1,595 @@
+/**
+ * Durable command ownership and restart reconciliation (008 §4.2). The life
+ * nonce is committed before any command can spawn, so even SIGKILL inside
+ * spawn cannot leave identifiable work without a durable attribution record.
+ * Numeric PIDs are suspicions only; boot, inherited mark and fresh start-time
+ * identity must all agree before the shared signal gate can send anything.
+ */
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+import Database from 'better-sqlite3';
+import { z } from 'zod';
+import {
+  ensurePrivateDir,
+  restrictExistingPathMode,
+  withRestrictedUmask,
+} from '../security/local-permissions.js';
+import {
+  COMMAND_LIFE_ENV,
+  readBootIdentity,
+  readCommandMarks,
+  readCommandTerminal,
+} from './command-process-marks.js';
+import { sendVerifiedSignal } from './process-identity.js';
+import {
+  readProcessTable,
+  type ProcessIdentityRecord,
+} from './process-table.js';
+
+/** Source-side ownership seam, also usable by a daemon-independent command supervisor. @public */
+export interface CommandProcessOwner {
+  /** Await the committed admission mark before spawning, then apply it after authored env. */
+  environment(): Promise<Readonly<Record<string, string>>>;
+  /** Persist the directly spawned identifier as a suspicion, never proof of identity. */
+  spawned(pid: number): void;
+  /** Forget a reaped direct PID; the life mark still attributes any surviving descendants. */
+  exited(pid: number): void;
+}
+
+/** One durable decision, suitable for a future active-warning surface. @public */
+export interface RestartSweepOutcome {
+  /** Reaped requires terminal evidence; failed includes a sent signal with unconfirmed termination. */
+  readonly status: 'reaped' | 'abstained' | 'gone' | 'failed' | 'owner-alive';
+  /** The durable nonce of the daemon life that originally admitted this work. */
+  readonly life: string;
+  /** The considered identifier; absent only for discovery or record-level failures. */
+  readonly pid?: number;
+  /** Why cleanup was withheld, failed or was unnecessary. */
+  readonly reason?: string;
+  /** Evidence is deliberately limited to identity; never argv or environment contents. */
+  readonly evidence?: ProcessIdentityRecord & {
+    readonly boot: string;
+    readonly mark: string;
+    /** A same-group member may be identified through an already marked anchor. */
+    readonly via: 'inherited-mark' | 'group-continuity';
+    readonly groupAnchor?: ProcessIdentityRecord;
+  };
+}
+
+/** An empty complete pass is different from unavailable discovery or an interrupted pass. @public */
+export interface RestartSweepResult {
+  /** Complete means discovery finished; individual outcomes can still contain abstentions or failures. */
+  readonly status: 'running' | 'complete' | 'incomplete';
+  /** UTC timestamp identifying when this startup reconciliation began. */
+  readonly startedAt: string;
+  /** Incrementally committed decisions, including successful and deliberately withheld cleanup. */
+  readonly outcomes: readonly RestartSweepOutcome[];
+}
+
+/** Durable records are validated before identifiers can reach the signal gate. */
+const identitySchema = z.object({
+  pid: z.number().int().positive(),
+  pgid: z.number().int(),
+  startTime: z.string(),
+});
+const lifeSchema = z.object({
+  life: z.uuid(),
+  boot: z.string(),
+  owner: z.string().transform((value, context) => {
+    try {
+      return identitySchema.nullable().parse(JSON.parse(value));
+    } catch {
+      context.addIssue({ code: 'custom', message: 'Invalid daemon identity' });
+      return z.NEVER;
+    }
+  }),
+});
+const pidSchema = z.object({ pid: z.number().int().positive() });
+
+/**
+ * Per-workspace journal beside the runtime database. FULL synchronous SQLite
+ * commits make the pre-spawn marker crash-safe; completed old lives are retired,
+ * abstentions remain retryable, and only the most recent 20 sweep receipts remain.
+ * @public
+ */
+export class CommandProcessJournal implements CommandProcessOwner {
+  /** Identity work is deferred until real reconciliation or the first command admission. */
+  private boot: string | undefined;
+  private owner: ProcessIdentityRecord | undefined;
+  private identityReady: Promise<void> | undefined;
+  private registered = false;
+  private constructor(
+    private readonly sql: Database.Database,
+    private readonly workspace: string,
+    private readonly life: string,
+  ) {}
+
+  /** Open durable storage without scanning the host when no command life needs reconciliation. */
+  static open(dbPath: string, workspace: string): CommandProcessJournal {
+    const filename =
+      dbPath === ':memory:' ? ':memory:' : `${dbPath}.commands.sqlite`;
+    if (filename !== ':memory:') ensurePrivateDir(path.dirname(filename));
+    const sql = withRestrictedUmask(() => new Database(filename));
+    try {
+      if (filename !== ':memory:') restrictExistingPathMode(filename, 0o600);
+      sql.pragma('synchronous = FULL');
+      sql.exec(`
+        CREATE TABLE IF NOT EXISTS command_lives(life TEXT PRIMARY KEY, workspace TEXT NOT NULL, boot TEXT NOT NULL, owner TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS command_pids(life TEXT NOT NULL, pid INTEGER NOT NULL, PRIMARY KEY(life,pid));
+        CREATE TABLE IF NOT EXISTS restart_sweeps(id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, result TEXT NOT NULL);
+      `);
+      return new CommandProcessJournal(sql, workspace, randomUUID());
+    } catch (error) {
+      sql.close();
+      throw error;
+    }
+  }
+
+  /** Commit the nonce and owner identity before the source receives permission to spawn. */
+  async environment(): Promise<Readonly<Record<string, string>>> {
+    await this.initializeIdentity();
+    if (!this.registered) {
+      this.sql
+        .prepare('INSERT INTO command_lives VALUES(?,?,?,?)')
+        .run(
+          this.life,
+          this.workspace,
+          this.boot ?? '',
+          JSON.stringify(this.owner ?? null),
+        );
+      this.registered = true;
+    }
+    return { [COMMAND_LIFE_ENV]: this.life };
+  }
+
+  /** No lifecycle row is published until a real command asks for its admission mark. */
+  private initializeIdentity(): Promise<void> {
+    this.identityReady ??= (async () => {
+      this.boot = await readBootIdentity();
+      const table = await readProcessTable();
+      this.owner = table.supported
+        ? table.processes.find((p) => p.pid === process.pid)
+        : undefined;
+    })();
+    return this.identityReady;
+  }
+  /** Recording a numeric suspicion is synchronous before the spawn caller returns. */
+  spawned(pid: number): void {
+    this.sql
+      .prepare('INSERT OR IGNORE INTO command_pids VALUES(?,?)')
+      .run(this.life, pid);
+  }
+  /** A direct exit cannot retire the life: detached marked descendants may remain. */
+  exited(pid: number): void {
+    this.sql
+      .prepare('DELETE FROM command_pids WHERE life = ? AND pid = ?')
+      .run(this.life, pid);
+  }
+  /** Release persistence after the daemon has finished admitting command work. */
+  close(): void {
+    this.sql.close();
+  }
+
+  /** Reconcile only dead lives in this workspace, never a numerically matching group. */
+  async sweep(): Promise<RestartSweepResult> {
+    const outcomes: RestartSweepOutcome[] = [];
+    const startedAt = new Date().toISOString();
+    const receipt = this.sql
+      .prepare('INSERT INTO restart_sweeps(workspace,result) VALUES(?,?)')
+      .run(
+        this.workspace,
+        JSON.stringify({ status: 'running', startedAt, outcomes }),
+      );
+    /** Save after every decision so a later crash leaves an honest partial receipt. */
+    const save = (status: RestartSweepResult['status']): RestartSweepResult => {
+      const result: RestartSweepResult = { status, startedAt, outcomes };
+      this.sql
+        .prepare('UPDATE restart_sweeps SET result = ? WHERE id = ?')
+        .run(JSON.stringify(result), receipt.lastInsertRowid);
+      return result;
+    };
+    /** Keep successful empty passes and failed passes under the same receipt bound. */
+    const finish = (
+      status: RestartSweepResult['status'],
+    ): RestartSweepResult => {
+      this.sql
+        .prepare(
+          'DELETE FROM restart_sweeps WHERE workspace = ? AND id NOT IN (SELECT id FROM restart_sweeps WHERE workspace = ? ORDER BY id DESC LIMIT 20)',
+        )
+        .run(this.workspace, this.workspace);
+      return save(status);
+    };
+    const rows = this.sql
+      .prepare(
+        'SELECT life, boot, owner FROM command_lives WHERE workspace = ? AND life != ?',
+      )
+      .all(this.workspace, this.life);
+    // Without an admitted earlier command life there is no nonce to attribute.
+    // A complete empty receipt needs no ps, sysctl or /proc scan at readiness.
+    if (rows.length === 0) return finish('complete');
+    const table = await readProcessTable();
+    if (!table.supported) {
+      outcomes.push({
+        status: 'abstained',
+        life: this.life,
+        reason: table.reason,
+      });
+      return finish('incomplete');
+    }
+    this.boot = await readBootIdentity();
+    this.owner = table.processes.find((p) => p.pid === process.pid);
+    this.identityReady = Promise.resolve();
+    const marks = await readCommandMarks(table.processes.map((p) => p.pid));
+    if (!marks.supported) {
+      outcomes.push({
+        status: 'abstained',
+        life: this.life,
+        reason: marks.reason,
+      });
+      return finish('incomplete');
+    }
+    let complete = (marks.unreadable?.length ?? 0) === 0;
+    if (!complete)
+      outcomes.push({
+        status: 'abstained',
+        life: this.life,
+        reason: 'Some same-user ownership marks could not be read',
+      });
+    const lives = rows.map((raw) => lifeSchema.safeParse(raw));
+    // A daemon can itself inherit an old command mark. A currently registered
+    // live daemon owner is never cleanup work, including this very process.
+    const liveOwners = new Set(
+      lives.flatMap((parsed) => {
+        if (
+          !parsed.success ||
+          parsed.data.boot !== this.boot ||
+          parsed.data.owner === null
+        )
+          return [];
+        const owner = parsed.data.owner;
+        return table.processes.some(
+          (p) => p.pid === owner.pid && p.startTime === owner.startTime,
+        )
+          ? [owner.pid]
+          : [];
+      }),
+    );
+    for (const parsed of lives) {
+      if (!parsed.success) {
+        complete = false;
+        outcomes.push({
+          status: 'abstained',
+          life: 'invalid-record',
+          reason: 'Invalid durable ownership record',
+        });
+        save('running');
+        continue;
+      }
+      const previous = parsed.data;
+      if (previous.life === this.life) continue;
+      const sameBoot = this.boot !== undefined && previous.boot === this.boot;
+      const owner = previous.owner;
+      if (
+        sameBoot &&
+        owner !== null &&
+        table.processes.some(
+          (p) => p.pid === owner.pid && p.startTime === owner.startTime,
+        )
+      ) {
+        outcomes.push({
+          status: 'owner-alive',
+          life: previous.life,
+          pid: owner.pid,
+        });
+        save('running');
+        continue;
+      }
+      if (sameBoot && owner === null) {
+        outcomes.push({
+          status: 'abstained',
+          life: previous.life,
+          reason:
+            'Previous daemon identity was unavailable; death cannot be confirmed',
+        });
+        save('running');
+        continue;
+      }
+      const recorded = new Set<number>();
+      for (const raw of this.sql
+        .prepare('SELECT pid FROM command_pids WHERE life = ?')
+        .all(previous.life)) {
+        const pid = pidSchema.safeParse(raw);
+        if (pid.success) recorded.add(pid.data.pid);
+        else {
+          complete = false;
+          outcomes.push({
+            status: 'abstained',
+            life: previous.life,
+            reason: 'Invalid durable command PID record',
+          });
+        }
+      }
+      let reading = table;
+      let ownership = marks;
+      let retained = !complete;
+      // Once an identifier is considered, never retry it during this sweep.
+      // In particular, start-time disagreement cannot later become permission.
+      const visited = new Set<number>();
+      for (let round = 0; round < MAX_DISCOVERY_PASSES; round++) {
+        const markedMembers = reading.processes.filter(
+          (member) =>
+            ownership.marks.get(member.pid) === previous.life &&
+            !liveOwners.has(member.pid) &&
+            member.pid !== process.pid,
+        );
+        const confirmed = await confirmGroupAnchors(
+          sameBoot ? markedMembers : [],
+        );
+        if (!confirmed.supported) {
+          complete = false;
+          retained = true;
+          outcomes.push({
+            status: 'abstained',
+            life: previous.life,
+            reason: confirmed.reason,
+          });
+          break;
+        }
+        for (const pid of confirmed.changed) {
+          visited.add(pid);
+          retained = true;
+          outcomes.push({
+            status: 'abstained',
+            life: previous.life,
+            pid,
+            reason:
+              'Process identity or group changed while ownership marks were read; identifier may have been reused',
+          });
+          save('running');
+        }
+        const anchors = confirmed.anchors;
+        const candidates = new Set([
+          ...recorded,
+          ...reading.processes
+            .filter(
+              (p) =>
+                ownership.marks.get(p.pid) === previous.life ||
+                anchors.has(p.pgid) ||
+                recorded.has(p.pgid),
+            )
+            .map((p) => p.pid),
+        ]);
+        const pending = [...candidates].filter((pid) => !visited.has(pid));
+        if (pending.length === 0) break;
+        for (const pid of pending) {
+          visited.add(pid);
+          const record = reading.processes.find((p) => p.pid === pid);
+          if (record === undefined) {
+            outcomes.push({ status: 'gone', life: previous.life, pid });
+            save('running');
+            continue;
+          }
+          if (liveOwners.has(pid) || pid === process.pid) {
+            outcomes.push({
+              status: 'abstained',
+              life: previous.life,
+              pid,
+              reason:
+                'Identifier belongs to a currently registered daemon owner',
+            });
+            retained = true;
+            save('running');
+            continue;
+          }
+          const inherited = ownership.marks.get(pid) === previous.life;
+          const anchor = anchors.get(record.pgid);
+          if (!sameBoot || (!inherited && anchor === undefined)) {
+            outcomes.push({
+              status: 'abstained',
+              life: previous.life,
+              pid,
+              reason: !sameBoot
+                ? 'Boot identity differs or is unavailable'
+                : 'Inherited ownership mark differs or is unreadable; group continuity is unconfirmed',
+            });
+            retained = true;
+            save('running');
+            continue;
+          }
+          const outcome = await sendVerifiedSignal(
+            { kind: 'recorded-process', record },
+            'SIGKILL',
+            {
+              action: 'restart command cleanup',
+              // Discovery positively records group membership while a marked
+              // anchor exists. That immutable process identity remains evidence
+              // after the anchor is killed; a bare PGID never grants authority.
+              readProcessTable: async () => {
+                const freshBoot = await readBootIdentity();
+                let markConfirmed = true;
+                if (inherited) {
+                  const freshMarks = await readCommandMarks([pid]);
+                  markConfirmed =
+                    freshMarks.supported &&
+                    freshMarks.marks.get(pid) === previous.life;
+                }
+                // Identity is the LAST asynchronous query. An environment read
+                // must not leave the gate comparing a pre-recycling snapshot.
+                const fresh = await readProcessTable();
+                if (
+                  !fresh.supported ||
+                  !fresh.processes.some((p) => p.pid === pid)
+                )
+                  return fresh;
+                if (freshBoot !== this.boot || !markConfirmed)
+                  return {
+                    supported: false,
+                    reason:
+                      'Boot or inherited ownership mark could not be confirmed at signal time',
+                  };
+                return fresh;
+              },
+              reportAbstention: () => {
+                /* Durable outcomes are the future active-warning input. */
+              },
+            },
+          );
+          if (outcome.status === 'sent') {
+            const terminal = await readCommandTerminal(record);
+            outcomes.push({
+              status: terminal === 'terminated' ? 'reaped' : 'failed',
+              ...(terminal !== 'terminated'
+                ? {
+                    reason: `SIGKILL sent, but termination could not be confirmed (${terminal})`,
+                  }
+                : {}),
+              life: previous.life,
+              pid,
+              evidence: {
+                ...record,
+                boot: previous.boot,
+                mark: previous.life,
+                via: inherited ? 'inherited-mark' : 'group-continuity',
+                ...(!inherited && anchor !== undefined
+                  ? { groupAnchor: anchor }
+                  : {}),
+              },
+            });
+            if (terminal === 'terminated')
+              this.sql
+                .prepare('DELETE FROM command_pids WHERE life = ? AND pid = ?')
+                .run(previous.life, pid);
+            // Keep the nonce until a later empty startup can retire it: a
+            // kernel-delayed exit must never erase attribution of late forks.
+            retained = true;
+          } else if (outcome.status === 'abstained') {
+            retained = true;
+            outcomes.push({
+              status: 'abstained',
+              life: previous.life,
+              pid,
+              reason: outcome.abstention.reason,
+            });
+          } else {
+            retained ||= outcome.status === 'failed';
+            outcomes.push({
+              status: outcome.status === 'not-needed' ? 'gone' : 'failed',
+              life: previous.life,
+              pid,
+              reason: outcome.detail,
+            });
+          }
+          save('running');
+        }
+        // Re-read after signals to discover forks made during the first pass.
+        // This is bounded discovery, not a timer or a retry of failed kills.
+        const next = await readProcessTable();
+        if (!next.supported) {
+          complete = false;
+          retained = true;
+          outcomes.push({
+            status: 'abstained',
+            life: previous.life,
+            reason: next.reason,
+          });
+          break;
+        }
+        const nextMarks = await readCommandMarks(
+          next.processes.map((p) => p.pid),
+        );
+        if (!nextMarks.supported || (nextMarks.unreadable?.length ?? 0) > 0) {
+          complete = false;
+          retained = true;
+          outcomes.push({
+            status: 'abstained',
+            life: previous.life,
+            reason: nextMarks.supported
+              ? 'Some same-user ownership marks could not be read'
+              : nextMarks.reason,
+          });
+          break;
+        }
+        reading = next;
+        ownership = nextMarks;
+        if (round === MAX_DISCOVERY_PASSES - 1) {
+          const markedGroups = new Set(
+            reading.processes
+              .filter(
+                (p) =>
+                  ownership.marks.get(p.pid) === previous.life &&
+                  !liveOwners.has(p.pid) &&
+                  p.pid !== process.pid,
+              )
+              .map((p) => p.pgid),
+          );
+          const outstanding = reading.processes.filter(
+            (p) =>
+              !visited.has(p.pid) &&
+              (ownership.marks.get(p.pid) === previous.life ||
+                markedGroups.has(p.pgid) ||
+                recorded.has(p.pgid)),
+          );
+          if (outstanding.length > 0) {
+            complete = false;
+            retained = true;
+            for (const candidate of outstanding)
+              outcomes.push({
+                status: 'abstained',
+                life: previous.life,
+                pid: candidate.pid,
+                reason:
+                  'Bounded discovery did not reach a quiet process snapshot',
+              });
+          }
+        }
+      }
+      if (!retained)
+        this.sql.transaction(() => {
+          this.sql
+            .prepare('DELETE FROM command_pids WHERE life = ?')
+            .run(previous.life);
+          this.sql
+            .prepare('DELETE FROM command_lives WHERE life = ?')
+            .run(previous.life);
+        })();
+      save('running');
+    }
+    return finish(complete ? 'complete' : 'incomplete');
+  }
+}
+
+/** Bound startup discovery even if marked work continuously forks while being reconciled. */
+const MAX_DISCOVERY_PASSES = 8;
+
+/** A failed or changing anchor cannot lend its old group authority to unrelated work. */
+type GroupAnchorConfirmation =
+  | {
+      readonly supported: true;
+      readonly anchors: ReadonlyMap<number, ProcessIdentityRecord>;
+      readonly changed: readonly number[];
+    }
+  | { readonly supported: false; readonly reason: string };
+
+/**
+ * Sandwich marker discovery between identity readings before recording any
+ * group membership. The initial table alone is not evidence for the later
+ * marker: a recycled PID may have moved that marker onto a different group.
+ * Both incarnation and group must survive the reading, before any kill can
+ * remove the anchor whose identity is being established.
+ */
+async function confirmGroupAnchors(
+  marked: readonly ProcessIdentityRecord[],
+): Promise<GroupAnchorConfirmation> {
+  const anchors = new Map<number, ProcessIdentityRecord>();
+  if (marked.length === 0) return { supported: true, anchors, changed: [] };
+  const confirmation = await readProcessTable();
+  if (!confirmation.supported) return confirmation;
+  const changed: number[] = [];
+  for (const member of marked) {
+    const current = confirmation.processes.find((p) => p.pid === member.pid);
+    if (current?.startTime !== member.startTime || current.pgid !== member.pgid)
+      changed.push(member.pid);
+    else anchors.set(member.pgid, member);
+  }
+  return { supported: true, anchors, changed };
+}

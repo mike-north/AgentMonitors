@@ -1,6 +1,8 @@
+/** Execute finite command observations; optional ownership tracks daemon crash survivors without changing live deadlines. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
 import type {
+  CommandProcessOwner,
   JsonSchema,
   KeyedCollectionConfig,
   KeyedSnapshot,
@@ -26,6 +28,7 @@ import {
 // warnings in the checked-in API report.
 export type {
   ChangeKind,
+  CommandProcessOwner,
   JsonSchema,
   Observation,
   ObservationContext,
@@ -327,7 +330,15 @@ function resolveCwd(
 async function runCommand(
   scope: ScopeConfig,
   effectiveCwd: string | undefined,
+  owner?: CommandProcessOwner,
 ): Promise<ExecOutcome> {
+  // Admission is durable before spawn; ordinary in-process execution retains
+  // its original inherited-environment path and creates no ownership work.
+  const ownershipEnv =
+    owner === undefined ? undefined : await owner.environment();
+  const inheritedEnv = scope.env
+    ? { ...process.env, ...scope.env }
+    : process.env;
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
@@ -339,7 +350,10 @@ async function runCommand(
       {
         cwd: effectiveCwd,
         // `env` is merged over the inherited daemon environment (003 §11.1).
-        env: scope.env ? { ...process.env, ...scope.env } : process.env,
+        env:
+          ownershipEnv === undefined
+            ? inheritedEnv
+            : { ...inheritedEnv, ...ownershipEnv },
         shell: false,
         // POSIX: leader of its own process group/session, so the timeout escalation
         // can signal the whole tree at once (`killProcessTree` above) instead of only
@@ -569,7 +583,33 @@ async function runCommand(
       sigkillTimer.unref();
     }, scope.timeoutMs);
     wallClockTimer.unref();
+
+    // The mandatory life record already precedes spawn. Numeric hints are
+    // recorded before returning to the event loop, with live supervision fully
+    // installed; an optional hint failure must never abandon the running child.
+    if (child.pid !== undefined && owner !== undefined) {
+      const pid = child.pid;
+      updatePidBookkeeping(() => {
+        owner.spawned(pid);
+      });
+      child.once('exit', () => {
+        updatePidBookkeeping(() => {
+          owner.exited(pid);
+        });
+      });
+    }
   });
+}
+
+/** The precommitted life mark remains authoritative when an optional numeric hint cannot be updated. */
+function updatePidBookkeeping(update: () => void): void {
+  try {
+    update();
+  } catch {
+    process.stderr.write(
+      'Command ownership PID bookkeeping failed; the committed life mark remains available for restart cleanup.\n',
+    );
+  }
 }
 
 /** Recursively sort object keys for order-insensitive JSON comparison (mirrors api-poll). */
@@ -836,105 +876,124 @@ const scopeSchema: JsonSchema = {
   required: ['command'],
 };
 
-const source: ObservationSource = {
-  name: 'command-poll',
-  stateful: true,
-  scopeSchema,
+/**
+ * Compose crash ownership with the ordinary command source. In-process users
+ * retain their existing behavior; daemon users supply a precommitted owner.
+ * @public
+ */
+export function createCommandPollSource(
+  owner?: CommandProcessOwner,
+): ObservationSource {
+  return {
+    name: 'command-poll',
+    stateful: true,
+    scopeSchema,
+    observe(
+      config: Record<string, unknown>,
+      context: ObservationContext = { now: new Date() },
+    ): Promise<ObservationResult> {
+      return observeCommand(config, context, owner);
+    },
+  };
+}
 
-  async observe(
-    config: Record<string, unknown>,
-    context: ObservationContext = { now: new Date() },
-  ): Promise<ObservationResult> {
-    const scope = parseScopeConfig(config);
-    const prev = isCommandState(context.previousState)
-      ? context.previousState
-      : undefined;
-    const effectiveCwd = resolveCwd(scope.cwd, context.workspacePath);
+/** Acquire a command result and advance only its source-owned comparison/health baseline. */
+async function observeCommand(
+  config: Record<string, unknown>,
+  context: ObservationContext,
+  owner?: CommandProcessOwner,
+): Promise<ObservationResult> {
+  const scope = parseScopeConfig(config);
+  const prev = isCommandState(context.previousState)
+    ? context.previousState
+    : undefined;
+  const effectiveCwd = resolveCwd(scope.cwd, context.workspacePath);
 
-    const outcome = await runCommand(scope, effectiveCwd);
+  const outcome = await runCommand(scope, effectiveCwd, owner);
 
-    // ---- Execution failure path (003 §11.5) -------------------------------------
-    if (outcome.kind === 'failure') {
-      // Prior state is kept (no re-baseline, no state loss). Emit only on the
-      // ok → failing transition edge — including a failing first-ever run, which
-      // establishes no baseline but records health so the recovery edge fires.
-      const wasFailing = prev?.health === 'failing';
-      const nextState: CommandState = {
-        stdout: prev?.stdout ?? '',
-        exitCode: prev?.exitCode ?? 0,
-        truncated: prev?.truncated ?? false,
-        health: 'failing',
-        baselined: prev?.baselined ?? false,
-        // Carry the keyed baseline forward untouched so recovery diffs against it.
-        ...(prev?.keyedSnapshot ? { keyedSnapshot: prev.keyedSnapshot } : {}),
-      };
-      return {
-        observations: wasFailing ? [] : [failingObservation(scope, outcome)],
-        nextState,
-      };
-    }
+  // ---- Execution failure path (003 §11.5) -------------------------------------
+  if (outcome.kind === 'failure') {
+    // Prior state is kept (no re-baseline, no state loss). Emit only on the
+    // ok → failing transition edge — including a failing first-ever run, which
+    // establishes no baseline but records health so the recovery edge fires.
+    const wasFailing = prev?.health === 'failing';
+    const nextState: CommandState = {
+      stdout: prev?.stdout ?? '',
+      exitCode: prev?.exitCode ?? 0,
+      truncated: prev?.truncated ?? false,
+      health: 'failing',
+      baselined: prev?.baselined ?? false,
+      // Carry the keyed baseline forward untouched so recovery diffs against it.
+      ...(prev?.keyedSnapshot ? { keyedSnapshot: prev.keyedSnapshot } : {}),
+    };
+    return {
+      observations: wasFailing ? [] : [failingObservation(scope, outcome)],
+      nextState,
+    };
+  }
 
-    // ---- Successful execution path ----------------------------------------------
-    const result = outcome.result;
-    const recovered = prev?.health === 'failing';
-    const hadBaseline = prev?.baselined ?? false;
+  // ---- Successful execution path ----------------------------------------------
+  const result = outcome.result;
+  const recovered = prev?.health === 'failing';
+  const hadBaseline = prev?.baselined ?? false;
 
-    const observations: Observation[] = [];
-    // A failing → ok edge always emits the recovery health observation (003 §11.5).
-    if (recovered) {
-      observations.push(recoveredObservation(scope));
-    }
+  const observations: Observation[] = [];
+  // A failing → ok edge always emits the recovery health observation (003 §11.5).
+  if (recovered) {
+    observations.push(recoveredObservation(scope));
+  }
 
-    // ---- Keyed-collection mode (003 §12) ----------------------------------------
-    // Parse stdout as JSON and diff per keyed object. The keyed snapshot lives in the
-    // same per-monitor state slot; the baseline rule is unchanged (first successful
-    // run records the snapshot, emits nothing). A failing-first-run leaves no keyed
-    // baseline, so the first success after it baselines silently too.
-    if (scope.collection) {
-      const result2 = diffKeyedCollection(
-        JSON.parse(result.stdout),
-        scope.collection,
-        scope.objectKey,
-        hadBaseline ? prev?.keyedSnapshot : undefined,
-        {
-          payload: { command: scope.command },
-          queryScope: { command: scope.objectKey },
-        },
-      );
-      observations.push(...result2.observations);
-      const nextState: CommandState = {
-        stdout: result.stdout,
-        exitCode: result.exitCode,
-        truncated: result.truncated,
-        health: 'ok',
-        baselined: true,
-        keyedSnapshot: result2.snapshot,
-      };
-      return { observations, nextState };
-    }
-
+  // ---- Keyed-collection mode (003 §12) ----------------------------------------
+  // Parse stdout as JSON and diff per keyed object. The keyed snapshot lives in the
+  // same per-monitor state slot; the baseline rule is unchanged (first successful
+  // run records the snapshot, emits nothing). A failing-first-run leaves no keyed
+  // baseline, so the first success after it baselines silently too.
+  if (scope.collection) {
+    const result2 = diffKeyedCollection(
+      JSON.parse(result.stdout),
+      scope.collection,
+      scope.objectKey,
+      hadBaseline ? prev?.keyedSnapshot : undefined,
+      {
+        payload: { command: scope.command },
+        queryScope: { command: scope.objectKey },
+      },
+    );
+    observations.push(...result2.observations);
     const nextState: CommandState = {
       stdout: result.stdout,
       exitCode: result.exitCode,
       truncated: result.truncated,
       health: 'ok',
       baselined: true,
+      keyedSnapshot: result2.snapshot,
     };
-
-    // The output-changed observation requires a real pre-failure/prior baseline to
-    // diff against. The first-ever success — and the first success after a failing
-    // first run — baselines silently (003 §11.4/§11.5).
-    if (
-      prev !== undefined &&
-      hadBaseline &&
-      hasChanged(scope.strategy, scope.ignorePaths, prev, result)
-    ) {
-      observations.push(changedObservation(scope, result));
-    }
-
     return { observations, nextState };
-  },
-};
+  }
+
+  const nextState: CommandState = {
+    stdout: result.stdout,
+    exitCode: result.exitCode,
+    truncated: result.truncated,
+    health: 'ok',
+    baselined: true,
+  };
+
+  // The output-changed observation requires a real pre-failure/prior baseline to
+  // diff against. The first-ever success — and the first success after a failing
+  // first run — baselines silently (003 §11.4/§11.5).
+  if (
+    prev !== undefined &&
+    hadBaseline &&
+    hasChanged(scope.strategy, scope.ignorePaths, prev, result)
+  ) {
+    observations.push(changedObservation(scope, result));
+  }
+
+  return { observations, nextState };
+}
+
+const source = createCommandPollSource();
 
 /** Health observation for the `ok → failing` edge (003 §11.5). Never carries `env`. */
 function failingObservation(

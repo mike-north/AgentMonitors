@@ -1,5 +1,7 @@
+/** Compose the runtime with bundled sources and optional daemon command ownership. */
 import {
   AgentMonitorRuntime,
+  type CommandProcessOwner,
   RuntimeStore,
   claudeCodeAdapter,
   createDb,
@@ -9,10 +11,14 @@ import { resolveDbPath } from './db-path.js';
 import { resolveSocketPath } from './daemon-ipc.js';
 import { SourceRegistry } from '@agentmonitors/core';
 
-export function createRuntime(dbPath = resolveDbPath()): AgentMonitorRuntime {
+/** Compose one store and source registry, with optional daemon command ownership. @internal */
+export function createRuntime(
+  dbPath = resolveDbPath(),
+  commandOwner?: CommandProcessOwner,
+): AgentMonitorRuntime {
   const db = createDb(dbPath);
   const registry = new SourceRegistry();
-  registerCoreSources(registry);
+  registerCoreSources(registry, commandOwner);
   return new AgentMonitorRuntime(new RuntimeStore(db), registry, [
     claudeCodeAdapter,
   ]);

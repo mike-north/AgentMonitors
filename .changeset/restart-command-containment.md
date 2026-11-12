@@ -1,0 +1,7 @@
+---
+'@agentmonitors/core': minor
+'@agentmonitors/cli': patch
+'@agentmonitors/source-command-poll': minor
+---
+
+Reconcile orphaned command-poll processes when the daemon starts on macOS and Linux. Persist command ownership before spawning, verify boot and process identity before cleanup, and retain diagnostics for reaped processes and conservative abstentions, including detached descendants that keep their ownership marks.

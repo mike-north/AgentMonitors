@@ -8,6 +8,16 @@
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
+export interface CommandProcessOwner {
+    environment(): Promise<Readonly<Record<string, string>>>;
+    exited(pid: number): void;
+    spawned(pid: number): void;
+}
+
+// @public
+export function createCommandPollSource(owner?: CommandProcessOwner): ObservationSource;
+
+// @public
 export type JsonSchema = Record<string, unknown>;
 
 // @public

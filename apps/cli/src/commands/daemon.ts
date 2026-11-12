@@ -11,7 +11,11 @@ import type {
   RuntimeTickResult,
   WatchHandle,
 } from '@agentmonitors/core';
-import { isChildUnreaped, sendVerifiedSignal } from '@agentmonitors/core';
+import {
+  CommandProcessJournal,
+  isChildUnreaped,
+  sendVerifiedSignal,
+} from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
 import {
@@ -365,7 +369,34 @@ export async function runLoop(
   reapAfterMs: number,
   dbPath: string,
 ): Promise<void> {
-  const runtime = createRuntime(dbPath);
+  const journal = CommandProcessJournal.open(dbPath, workspacePath);
+  try {
+    await journal.sweep();
+    await runOwnedLoop(
+      monitorsDir,
+      workspacePath,
+      pollMs,
+      socketPath,
+      reapAfterMs,
+      dbPath,
+      journal,
+    );
+  } finally {
+    journal.close();
+  }
+}
+
+/** Admit observations and IPC only after old command lives have been reconciled. */
+async function runOwnedLoop(
+  monitorsDir: string,
+  workspacePath: string,
+  pollMs: number,
+  socketPath: string,
+  reapAfterMs: number,
+  dbPath: string,
+  journal: CommandProcessJournal,
+): Promise<void> {
+  const runtime = createRuntime(dbPath, journal);
   let stopping = false;
   let wakeLoop: (() => void) | undefined;
   const server = createDaemonServer({

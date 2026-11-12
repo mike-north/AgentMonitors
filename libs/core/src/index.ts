@@ -283,3 +283,10 @@ export type {
   InterpretResult,
   ClaudeInterpretAdapterOptions,
 } from './adapter/interpret.js';
+
+export { CommandProcessJournal } from './process/command-process-journal.js';
+export type {
+  CommandProcessOwner,
+  RestartSweepOutcome,
+  RestartSweepResult,
+} from './process/command-process-journal.js';
