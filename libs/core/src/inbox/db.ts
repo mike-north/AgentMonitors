@@ -357,29 +357,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       ON observation_history (monitor_id, workspace_path, result, created_at, id)
   `);
 
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS monitor_events (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      urgency TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL DEFAULT '',
-      payload TEXT NOT NULL DEFAULT '{}',
-      snapshot_metadata TEXT NOT NULL DEFAULT '{}',
-      snapshot_text TEXT,
-      diff_text TEXT,
-      object_key TEXT,
-      baseline_strategy TEXT,
-      query_scope TEXT NOT NULL DEFAULT '{}',
-      tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL,
-      admission_sequence INTEGER
-    )
-  `);
+  sqlite.exec(
+    createTableSql('monitor_events', MONITOR_EVENT_COLUMNS, {
+      ifNotExists: true,
+    }),
+  );
 
   // Additive migration (G10 PR-B, 002 §1.1.7): a `monitor_events` table created
   // before PR-B lacks the persisted `baseline_strategy` column. Add it if
@@ -389,9 +371,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
   // Additive migration (002 §2, unretained admission outcomes), after the order
-  // migration, whose rebuild carries this column only when it already exists:
-  // an event completed from the retry outbox records where its observation was
-  // admitted. Older rows keep NULL (admitted where they committed).
+  // migration. The rebuild target declares this column, so a rebuilt table
+  // always has it; this step serves a table that already had the order
+  // sequence before the column existed. An event completed from the retry
+  // outbox records where its observation was admitted. Older rows keep NULL
+  // (admitted where they committed).
   addColumnIfMissing(sqlite, 'monitor_events', 'admission_sequence', 'INTEGER');
   // Additive migration (issue #451): a `monitor_events` table created before
   // this column existed lacks `definition_fingerprint`. Add it if missing so
@@ -414,18 +398,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       )
   `);
 
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS monitor_snapshots (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      object_key TEXT NOT NULL,
-      event_id TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    )
-  `);
+  sqlite.exec(
+    createTableSql('monitor_snapshots', MONITOR_SNAPSHOT_COLUMNS, {
+      ifNotExists: true,
+    }),
+  );
 
   migrateSnapshotMaterializationOrder(sqlite);
   for (const trigger of retainedTriggers) sqlite.exec(trigger.sql);
@@ -586,117 +563,421 @@ function suspendMaterializationMigrationTriggers(
 }
 
 /**
- * Preserve event identities and their projection/snapshot/cursor references
- * while adding a private tie-break for equal persisted observation timestamps.
- * This runs under the schema-build immediate transaction, after older additive
- * event-column migrations. No event payload or observed time is rewritten.
- *
- * Current hidden rowid orders the retained legacy bootstrap only; lost earlier
- * chronology is not reconstructible. SQLite allocates all subsequent positions
- * atomically, preserves them across VACUUM/reopen and does not reuse committed
- * deleted positions. The coordinator suspends triggers across both rebuilds;
- * this table-local helper restores only retained indexes.
- * The repository's event relationships are logical IDs, not SQLite foreign keys.
+ * One column of a table this module creates: its name and the rest of its SQL
+ * column definition. The lists below are the single source for both the fresh
+ * `CREATE TABLE` and the materialization-order rebuild target, so the two cannot
+ * drift apart. Columns that later changes add in place (`addColumnIfMissing`)
+ * stay out of these lists: the rebuild carries them when the old table has them,
+ * and the additive step adds them when it does not. `admission_sequence` is the
+ * exception: it is part of the base `monitor_events` shape, so a fresh table and
+ * every rebuild target declare it, and its additive step only serves a table
+ * that already had the order sequence before the column existed.
  */
-function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
-  if (tableHasColumn(sqlite, 'monitor_events', 'sequence')) return;
+interface ColumnDefinition {
+  readonly name: string;
+  readonly definition: string;
+}
 
-  const indexes = sqlite
-    .prepare<[], { sql: string }>(
-      `SELECT sql FROM sqlite_master
-       WHERE tbl_name = 'monitor_events' AND type = 'index'
-         AND sql IS NOT NULL ORDER BY type, name`,
-    )
-    .all();
-  // Additive columns that later changes add after this rebuild runs. A table
-  // that already holds one (for example fingerprints written before ordering
-  // existed) keeps its values instead of resetting them to unknown/NULL; a
-  // table without one copies NULL. Every such column belongs here, or the
-  // rebuild silently drops it.
-  const carried = (column: string): string =>
-    tableHasColumn(sqlite, 'monitor_events', column) ? column : 'NULL';
-  const fingerprintSource = carried('definition_fingerprint');
-  const admissionSource = carried('admission_sequence');
-  sqlite.exec(`
-    CREATE TABLE monitor_events_ordered (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      urgency TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL DEFAULT '',
-      payload TEXT NOT NULL DEFAULT '{}',
-      snapshot_metadata TEXT NOT NULL DEFAULT '{}',
-      snapshot_text TEXT,
-      diff_text TEXT,
-      object_key TEXT,
-      baseline_strategy TEXT,
-      query_scope TEXT NOT NULL DEFAULT '{}',
-      tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL,
-      definition_fingerprint TEXT,
-      admission_sequence INTEGER
+/** `monitor_events` as a fresh database creates it (002 §15). */
+const MONITOR_EVENT_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'sequence', definition: 'INTEGER PRIMARY KEY AUTOINCREMENT' },
+  { name: 'id', definition: 'TEXT NOT NULL UNIQUE' },
+  { name: 'workspace_path', definition: 'TEXT' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'source_name', definition: 'TEXT NOT NULL' },
+  { name: 'urgency', definition: 'TEXT NOT NULL' },
+  { name: 'title', definition: 'TEXT NOT NULL' },
+  { name: 'body', definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: 'summary', definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: 'payload', definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { name: 'snapshot_metadata', definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { name: 'snapshot_text', definition: 'TEXT' },
+  { name: 'diff_text', definition: 'TEXT' },
+  { name: 'object_key', definition: 'TEXT' },
+  { name: 'baseline_strategy', definition: 'TEXT' },
+  { name: 'query_scope', definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { name: 'tags', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { name: 'created_at', definition: 'INTEGER NOT NULL' },
+  // Where an event completed from the retry outbox was admitted in the
+  // materialization order; NULL on every other event (002 §2).
+  { name: 'admission_sequence', definition: 'INTEGER' },
+];
+
+/** `monitor_snapshots` as a fresh database creates it (002 §15). */
+const MONITOR_SNAPSHOT_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'sequence', definition: 'INTEGER PRIMARY KEY AUTOINCREMENT' },
+  { name: 'id', definition: 'TEXT NOT NULL UNIQUE' },
+  { name: 'workspace_path', definition: 'TEXT' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'object_key', definition: 'TEXT NOT NULL' },
+  { name: 'event_id', definition: 'TEXT NOT NULL' },
+  { name: 'content', definition: 'TEXT NOT NULL' },
+  { name: 'created_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** Quote a SQLite identifier so any stored name, including quotes, round-trips. */
+function quoteIdentifier(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+/** Render `CREATE TABLE` for one of this module's column lists. */
+function createTableSql(
+  table: string,
+  columns: readonly ColumnDefinition[],
+  options: { ifNotExists?: boolean } = {},
+): string {
+  const body = columns
+    .map((column) => `${quoteIdentifier(column.name)} ${column.definition}`)
+    .join(',\n  ');
+  const guard = options.ifNotExists === true ? 'IF NOT EXISTS ' : '';
+  return `CREATE TABLE ${guard}${table} (\n  ${body}\n)`;
+}
+
+/**
+ * A schema migration found a row or column it cannot carry into the current
+ * layout. Thrown inside the schema-build immediate transaction, so the database
+ * is left exactly as it was; the message names the table, and the column when
+ * one is identifiable, so an operator can repair that data and reopen. Not re-exported from the package
+ * entry point: callers see it as an `Error` thrown by `createDb`.
+ *
+ * @internal
+ */
+export class SchemaMigrationError extends Error {
+  /** The table whose rebuild stopped. */
+  readonly table: string;
+  /** The column that stopped it; absent for a table-level constraint that names none. */
+  readonly column: string | undefined;
+
+  constructor(
+    table: string,
+    column: string | undefined,
+    reason: string,
+    options?: { cause?: unknown; remedy?: string },
+  ) {
+    const subject =
+      column === undefined ? '' : `column ${quoteIdentifier(column)} `;
+    super(
+      `Cannot migrate ${table} to the current schema: ${subject}${reason}. ` +
+        (options?.remedy === undefined ? '' : `${options.remedy} `) +
+        'The database was left unchanged.',
+      options?.cause === undefined ? undefined : { cause: options.cause },
     );
-    INSERT INTO monitor_events_ordered
-      (id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
-       payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-       baseline_strategy, query_scope, tags, created_at, definition_fingerprint,
-       admission_sequence)
-      SELECT id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
-        payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-        baseline_strategy, query_scope, tags, created_at, ${fingerprintSource},
-        ${admissionSource}
-      FROM monitor_events ORDER BY rowid;
-    DROP TABLE monitor_events;
-    ALTER TABLE monitor_events_ordered RENAME TO monitor_events;
+    this.name = 'SchemaMigrationError';
+    this.table = table;
+    this.column = column;
+  }
+}
+
+/**
+ * A live column as `PRAGMA table_xinfo` reports it. `hidden` is 0 for an
+ * ordinary column, 2 or 3 for a generated one (virtual or stored).
+ */
+interface LiveColumn {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  /** 1-based position within the PRIMARY KEY, or 0 when not part of it. */
+  pk: number;
+  hidden: number;
+}
+
+/**
+ * What an operator can do about a constraint the rebuild cannot recreate.
+ * SQLite has no `ALTER TABLE ... DROP CONSTRAINT`, so removal means a manual
+ * table rebuild or a restore.
+ */
+const UNREPRODUCIBLE_CONSTRAINT_REMEDY =
+  'SQLite cannot drop a column or table constraint in place; rebuild the table by hand without it ' +
+  '(or restore the database), and the open will then proceed.';
+
+/**
+ * Blank out string literals, quoted identifiers and SQL comments so keyword
+ * scans cannot match inside them. Comments are consumed in the same pass as
+ * quotes, so a quote inside a comment never pairs with a later one; SQLite keeps
+ * comments in the stored `CREATE TABLE` text. An unterminated block comment
+ * runs to the end of the text, as SQLite reads it.
+ */
+function blankQuoted(sqlText: string): string {
+  return sqlText.replace(
+    /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g,
+    (m) => ' '.repeat(m.length),
+  );
+}
+
+/**
+ * Refuse a live table whose constraints the rebuild cannot recreate, rather
+ * than silently loosen them (spec 002 §5.2). A uniqueness guarantee that
+ * quietly disappears lets duplicates in afterwards, so it is a data-integrity
+ * change, not a cosmetic one.
+ *
+ * Reproduced: the current definitions of the columns the current schema owns
+ * (including `id` uniqueness, which also covers a released `id TEXT PRIMARY
+ * KEY`), and every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX`.
+ * Refused: any other UNIQUE or PRIMARY KEY constraint (inline on a carried
+ * column or table-level, which SQLite backs with an automatic index), and any
+ * CHECK constraint, inline or table-level, a STRICT table, any REFERENCES clause (the current
+ * connection enforces foreign keys, so a carried one would reject rows the
+ * rebuilt table admits), and a rowid-alias PRIMARY KEY on any column other than
+ * `id` (it has no automatic index to detect). Tolerated losses are collation
+ * and the NOT NULL of a carried column without a default; see
+ * {@link rebuildWithMaterializationOrder}.
+ */
+function refuseUnreproducibleConstraints(
+  sqlite: BetterSQLiteClient,
+  table: string,
+  live: readonly LiveColumn[],
+  currentNames: ReadonlySet<string>,
+): void {
+  // The rebuilt table is not STRICT, so it would admit values the live one rejects.
+  const [listed] = sqlite.pragma(`table_list(${table})`) as {
+    strict: number;
+  }[];
+  if (listed?.strict === 1) {
+    throw new SchemaMigrationError(
+      table,
+      undefined,
+      'the table is STRICT, and the rebuild cannot reproduce that',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
+  const rowidAlias = live.find(
+    (column) => column.pk > 0 && column.name.toLowerCase() !== 'id',
+  );
+  if (rowidAlias) {
+    throw new SchemaMigrationError(
+      table,
+      rowidAlias.name,
+      'is covered by a UNIQUE or PRIMARY KEY constraint the rebuild cannot reproduce',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
+  const references = sqlite.pragma(`foreign_key_list(${table})`) as {
+    from: string;
+  }[];
+  if (references[0] !== undefined) {
+    throw new SchemaMigrationError(
+      table,
+      references[0].from,
+      'is covered by a REFERENCES constraint the rebuild cannot reproduce',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
+  const indexes = sqlite.pragma(`index_list(${table})`) as {
+    name: string;
+    origin: string;
+  }[];
+  for (const index of indexes) {
+    if (index.origin !== 'u' && index.origin !== 'pk') continue;
+    const members = (
+      sqlite.pragma(`index_info(${quoteIdentifier(index.name)})`) as {
+        name: string | null;
+      }[]
+    ).flatMap((member) => (member.name === null ? [] : [member.name]));
+    // The current schema declares `id` UNIQUE, so a lone `id` key is recreated.
+    if (members.length === 1 && members[0]?.toLowerCase() === 'id') continue;
+    const culprit =
+      members.find((name) => !currentNames.has(name.toLowerCase())) ??
+      members[0];
+    if (culprit !== undefined) {
+      throw new SchemaMigrationError(
+        table,
+        culprit,
+        'is covered by a UNIQUE or PRIMARY KEY constraint the rebuild cannot reproduce',
+        { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+      );
+    }
+  }
+
+  const row = sqlite
+    .prepare<
+      [string],
+      { sql: string | null }
+    >(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(table);
+  const text = blankQuoted(row?.sql ?? '');
+  const check = /\bCHECK\s*\(/i.exec(text);
+  if (check) {
+    // Read the balanced expression to name a column it mentions.
+    let depth = 0;
+    let end = check.index + check[0].length - 1;
+    for (; end < text.length; end += 1) {
+      if (text[end] === '(') depth += 1;
+      else if (text[end] === ')' && --depth === 0) break;
+    }
+    const expression = text.slice(check.index, end + 1);
+    const mentioned = live.find((column) =>
+      new RegExp(`\\b${column.name.replace(/[^\w]/g, '.')}\\b`, 'i').test(
+        expression,
+      ),
+    );
+    throw new SchemaMigrationError(
+      table,
+      mentioned?.name,
+      mentioned === undefined
+        ? 'the table has a table-level CHECK constraint the rebuild cannot reproduce'
+        : 'is covered by a CHECK constraint the rebuild cannot reproduce',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
+}
+
+/**
+ * Rebuild a table written before the private `sequence` order key existed, so
+ * it gains that key while keeping everything it holds (spec 002 §5.2).
+ *
+ * The target layout is derived from the live table, not a fixed column list:
+ *
+ * - Columns the current schema defines take their current definitions; one the
+ *   old table lacks takes its default.
+ * - Every other column is carried across with its declared type and default,
+ *   and its values. This covers columns a released version later stopped
+ *   creating (0.0.1–0.3.0's `monitor_events.event_kind`), columns later changes
+ *   add in place, and columns an operator added. A carried column keeps NOT NULL
+ *   only when it has a default: the current writer never names it, so a NOT NULL
+ *   without a default would reject every new row. So a carried column's
+ *   collation, and its NOT NULL when it has no default, are not reproduced: the
+ *   rebuilt column admits NULL where the old one did not. CHECK and REFERENCES
+ *   clauses and STRICT tables are refused rather than dropped, since dropping
+ *   any of them changes which rows the table admits.
+ * - Because every column survives, every explicit index (and every trigger the
+ *   coordinator restores) still resolves. All are recreated from their exact
+ *   stored SQL; none is dropped. Automatic indexes behind UNIQUE and PRIMARY KEY
+ *   constraints are not explicit indexes and are not recreated, so the rebuild
+ *   refuses a table that has one other than the lone `id` key (see
+ *   {@link refuseUnreproducibleConstraints}), as it does any CHECK or REFERENCES
+ *   constraint and a STRICT table.
+ *
+ * A row, column or constraint that cannot be carried stops the migration with a
+ * {@link SchemaMigrationError} naming the table, and the column when one is
+ * identifiable: a generated column (its expression is not recoverable from table
+ * metadata), a UNIQUE/PRIMARY KEY, CHECK or REFERENCES constraint the rebuild
+ * cannot recreate, a STRICT table, or a retained row holding
+ * NULL in a column the current schema requires, with or without a default (a
+ * released `id TEXT PRIMARY KEY` admits NULL). The caller's immediate transaction then
+ * rolls the database back to its original schema and data.
+ *
+ * Retained rows take positions in current hidden rowid order. That orders the
+ * retained legacy bootstrap only; chronology lost earlier is not reconstructible.
+ * SQLite allocates later positions atomically, preserves them across
+ * VACUUM/reopen and does not reuse committed deleted positions. The repository's
+ * event relationships are logical IDs, not SQLite foreign keys.
+ */
+function rebuildWithMaterializationOrder(
+  sqlite: BetterSQLiteClient,
+  table: 'monitor_events' | 'monitor_snapshots',
+  columns: readonly ColumnDefinition[],
+): void {
+  if (tableHasColumn(sqlite, table, 'sequence')) return;
+
+  const live = sqlite.pragma(`table_xinfo(${table})`) as LiveColumn[];
+  // SQLite column names compare case-insensitively.
+  const liveNames = new Set(live.map((column) => column.name.toLowerCase()));
+  const currentNames = new Set(
+    columns.map((column) => column.name.toLowerCase()),
+  );
+
+  const generated = live.find((column) => column.hidden !== 0);
+  if (generated) {
+    throw new SchemaMigrationError(
+      table,
+      generated.name,
+      'is a generated column, and its expression cannot be carried across the rebuild',
+    );
+  }
+  refuseUnreproducibleConstraints(sqlite, table, live, currentNames);
+  // A required current column must hold a value in every retained row: either
+  // the old table has it and no row holds NULL, or the old table has no rows.
+  for (const column of columns) {
+    if (column.name === 'sequence' || !/\bNOT NULL\b/.test(column.definition)) {
+      continue;
+    }
+    // An explicit NULL is rejected even by a NOT NULL column that has a default.
+    // A column the old table lacks takes its default, so it only needs a check
+    // when it has none.
+    const inLive = liveNames.has(column.name.toLowerCase());
+    if (!inLive && /\bDEFAULT\b/.test(column.definition)) continue;
+    const condition = inLive ? `${quoteIdentifier(column.name)} IS NULL` : '1';
+    const missing = sqlite
+      .prepare(`SELECT 1 FROM ${table} WHERE ${condition} LIMIT 1`)
+      .get();
+    if (missing !== undefined) {
+      throw new SchemaMigrationError(
+        table,
+        column.name,
+        'has no value in a retained row, and the current schema requires one',
+      );
+    }
+  }
+
+  const carried: ColumnDefinition[] = live
+    .filter((column) => !currentNames.has(column.name.toLowerCase()))
+    .map((column) => {
+      const constraint =
+        column.dflt_value === null
+          ? ''
+          : // table_xinfo reports the default without its outer parentheses, so
+            // restore them: that form is valid for literals and expressions alike.
+            // The newline keeps a trailing line comment from swallowing the
+            // closing parenthesis; table_xinfo drops it.
+            `${column.notnull !== 0 ? ' NOT NULL' : ''} DEFAULT (${column.dflt_value}\n)`;
+      return {
+        name: column.name,
+        definition: `${column.type}${constraint}`,
+      };
+    });
+  const copied = live.map((column) => quoteIdentifier(column.name)).join(', ');
+  const indexes = sqlite
+    .prepare<[string], { name: string; sql: string }>(
+      `SELECT name, sql FROM sqlite_master
+       WHERE tbl_name = ? AND type = 'index' AND sql IS NOT NULL
+       ORDER BY name`,
+    )
+    .all(table);
+
+  const ordered = `${table}_ordered`;
+  sqlite.exec(createTableSql(ordered, [...columns, ...carried]));
+  sqlite.exec(`
+    INSERT INTO ${ordered} (${copied})
+      SELECT ${copied} FROM ${table} ORDER BY rowid;
+    DROP TABLE ${table};
+    ALTER TABLE ${ordered} RENAME TO ${table};
   `);
   for (const index of indexes) sqlite.exec(index.sql);
 }
 
 /**
+ * Give retained events a SQLite-owned materialization order (the equal-time
+ * tie-break, 002 §1.1.7) while preserving event identities and their
+ * projection/snapshot/cursor references. Runs under the schema-build immediate
+ * transaction, after older additive event-column migrations; no event payload
+ * or observed time is rewritten. The coordinator suspends triggers across both
+ * rebuilds; see {@link rebuildWithMaterializationOrder} for the column, index
+ * and failure policy.
+ */
+function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
+  rebuildWithMaterializationOrder(
+    sqlite,
+    'monitor_events',
+    MONITOR_EVENT_COLUMNS,
+  );
+}
+
+/**
  * Give retained snapshots a SQLite-owned materialization order without changing
- * their public identities or artifacts. The schema-build immediate transaction
- * owns this rebuild, so concurrent openers cannot see a partially copied table.
- *
- * Legacy hidden rowid order is the available bootstrap policy, not a recovery
- * of historical chronology lost before migration (for example by VACUUM).
- * New explicit integer keys survive VACUUM and reopen; AUTOINCREMENT prevents
- * reuse after committed deletion. Rolled-back allocations may be reused because
- * no committed snapshot ever acquired them. This helper restores retained indexes;
- * the coordinator restores triggers only after both table names are valid.
+ * their public identities or artifacts (002 §5.2). The schema-build immediate
+ * transaction owns this rebuild, so concurrent openers cannot see a partially
+ * copied table. Rolled-back allocations may be reused because no committed
+ * snapshot ever acquired them. The coordinator restores triggers only after both
+ * table names are valid; see {@link rebuildWithMaterializationOrder} for the
+ * column, index and failure policy.
  */
 function migrateSnapshotMaterializationOrder(sqlite: BetterSQLiteClient): void {
-  if (tableHasColumn(sqlite, 'monitor_snapshots', 'sequence')) return;
-
-  const indexes = sqlite
-    .prepare<[], { sql: string }>(
-      `SELECT sql FROM sqlite_master
-       WHERE tbl_name = 'monitor_snapshots' AND type = 'index'
-         AND sql IS NOT NULL ORDER BY type, name`,
-    )
-    .all();
-  sqlite.exec(`
-    CREATE TABLE monitor_snapshots_ordered (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      object_key TEXT NOT NULL,
-      event_id TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-    INSERT INTO monitor_snapshots_ordered
-      (id, workspace_path, monitor_id, object_key, event_id, content, created_at)
-      SELECT id, workspace_path, monitor_id, object_key, event_id, content, created_at
-      FROM monitor_snapshots ORDER BY rowid;
-    DROP TABLE monitor_snapshots;
-    ALTER TABLE monitor_snapshots_ordered RENAME TO monitor_snapshots;
-  `);
-  for (const index of indexes) sqlite.exec(index.sql);
+  rebuildWithMaterializationOrder(
+    sqlite,
+    'monitor_snapshots',
+    MONITOR_SNAPSHOT_COLUMNS,
+  );
 }
 
 /**
