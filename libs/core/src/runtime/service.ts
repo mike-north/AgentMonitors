@@ -2810,6 +2810,20 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Held work that a rejected current scope must protect: durable notify holds,
+   * or a returned poll result retained until reconciliation succeeds. Without
+   * either, a running watcher keeps ingesting under its startup snapshot and
+   * the admission gate stays as it was (002 §2.0, §4.6).
+   */
+  private hasHeldNotifyWork(id: string, workspacePath: string): boolean {
+    const key = JSON.stringify([workspacePath, id]);
+    return (
+      this.hasCurrentNotifyHold(id, workspacePath) ||
+      this.pollAdmissions.get(key)?.result !== undefined
+    );
+  }
+
+  /**
    * Fallback is authorized only by positive evidence that the admitted location
    * is absent. A boolean existence probe also hides permission and I/O failures;
    * those cannot retire an unreadable current definition in favor of another.
@@ -3194,7 +3208,6 @@ export class AgentMonitorRuntime {
   private reconcileNotifyEdit(
     monitor: MonitorDefinition,
     workspacePath: string,
-    source: ObservationSource,
     restrictToSessionId?: string,
   ) {
     return withStoreWriter(this.store, () => {
@@ -3205,19 +3218,6 @@ export class AgentMonitorRuntime {
         ...(notify.pendingDebounce?.observations ?? []),
         ...(notify.pendingRollup?.observations ?? []),
       ];
-      // Definition validity is decided against the same current durable holds
-      // as the drain itself, including work committed by another runtime after
-      // this tick scanned the file. This is scoped protection, not general source
-      // preflight for ordinary observation without held work.
-      if (held.length) {
-        const errors = validateWatchScope(
-          watchConfig(monitor.frontmatter.watch),
-          source.scopeSchema,
-        );
-        if (errors.length) {
-          throw new Error(`Invalid monitor definition: ${errors.join('; ')}`);
-        }
-      }
       for (const envelope of held) {
         // Persisted envelopes are older-version data. Missing captured semantics
         // must block recovery, never borrow instructions or urgency from an edit.
@@ -3290,10 +3290,11 @@ export class AgentMonitorRuntime {
    * Publish acceptance only after the owned edit transaction succeeds. Startup
    * and tick use this same boundary; optional Interpret remains after commit.
    * A failed attempt retains durable work and leaves a cancellable blocked gate.
+   * Callers run the source-config preflight (002 §2.0) on this same definition
+   * in the same synchronous turn, so an invalid scope never reaches the drain.
    */
   private async prepareNotifyPolicy(
     monitor: MonitorDefinition,
-    source: ObservationSource,
     workspacePath: string,
     acc: TickAccumulator,
     ephemeralSessionId?: string,
@@ -3305,7 +3306,6 @@ export class AgentMonitorRuntime {
       const drained = this.reconcileNotifyEdit(
         monitor,
         workspacePath,
-        source,
         ephemeralSessionId,
       );
       acc.emittedEventIds.push(...drained.map((item) => item.event.id));
@@ -3444,9 +3444,12 @@ export class AgentMonitorRuntime {
       source.scopeSchema,
     );
     if (preflightErrors.length > 0) {
-      // Close the scope's admission gate so an in-flight poll or watcher cannot
-      // commit under the rejected definition; accepted holds stay retained.
-      this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+      // Held work is protected: close the admission gate so a running watcher or
+      // poll cannot commit beside it under the rejected definition. Without held
+      // work, running watchers keep their startup config (002 §2.0, §4.6).
+      if (this.hasHeldNotifyWork(monitor.id, workspacePath)) {
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+      }
       acc.skippedMonitors.push({
         monitorId: monitor.id,
         validationError: preflightErrors.join('; '),
@@ -3456,7 +3459,6 @@ export class AgentMonitorRuntime {
     if (
       !(await this.prepareNotifyPolicy(
         monitor,
-        source,
         workspacePath,
         acc,
         ephemeralSessionId,
@@ -3468,22 +3470,8 @@ export class AgentMonitorRuntime {
     // Preparation can await Interpret while another rescan closes/replaces the gate.
     const current = this.watchPolicies.get(key);
     if (!current || resuming || this.pollAdmissions.has(key)) return;
+    // Only pacing/urgency follow the gate, so the preflighted scope still holds.
     monitor = this.applyWatchPolicy(monitor, current);
-
-    // Validate before scheduling or notify hydration: even an overdue held batch
-    // must remain untouched while author config is invalid. Rechecking here also
-    // protects persisted ephemeral scopes after a source schema upgrade.
-    const errors = validateWatchScope(
-      watchConfig(monitor.frontmatter.watch),
-      source.scopeSchema,
-    );
-    if (errors.length > 0) {
-      acc.skippedMonitors.push({
-        monitorId: monitor.id,
-        validationError: errors.join('; '),
-      });
-      return;
-    }
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
@@ -4111,9 +4099,17 @@ export class AgentMonitorRuntime {
         source.scopeSchema,
       );
       if (errors.length > 0) {
-        // Close the scope's admission gate so an existing watcher or in-flight
-        // poll cannot commit under the rejected definition; accepted holds stay.
-        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+        // Held work is protected: close the admission gate so an existing watcher
+        // or poll cannot commit beside it under the rejected definition. Without
+        // held work, running watchers keep their startup config (002 §2.0, §4.6).
+        if (this.hasHeldNotifyWork(monitor.id, workspacePath)) {
+          this.setWatchPolicy(
+            monitor.id,
+            workspacePath,
+            null,
+            monitor.filePath,
+          );
+        }
         const error = new Error(errors.join('; '));
         if (options.onError) {
           options.onError(monitor.id, error);
@@ -4134,7 +4130,7 @@ export class AgentMonitorRuntime {
       try {
         const errorStart = startup.erroredObservations.length;
         const emittedStart = startup.emittedEventIds.length;
-        await this.prepareNotifyPolicy(monitor, source, workspacePath, startup);
+        await this.prepareNotifyPolicy(monitor, workspacePath, startup);
         // Startup may never receive a yield or tick. Publish committed projections
         // to the workspace's hook files even for an idle or completed source.
         if (startup.emittedEventIds.length > emittedStart) {

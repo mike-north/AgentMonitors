@@ -123,6 +123,40 @@ observed semantics; `explain` counts pre-edit pending events and ignores rows wi
 `libs/core/src/runtime/transactional-materialization.test.ts` and
 `libs/core/src/runtime/definition-change.test.ts`.
 
+Runtime source-config preflight is **current** behavior (002 §2.0). Tests **MUST**
+prove rejection before source side effects using a real registered source, exact
+`validateWatchScope` diagnostic parity with tick/explain/doctor, healthy sibling
+progress, and invalid-to-fixed recovery across runtime restart with baseline and
+held notify work retained. Cover directory ticks, persisted ephemeral ticks after
+schema changes, and continuous watcher startup. Invalid config intentionally stops
+observation, including configs that previously ran; daemon text/JSON and continuous
+logging must make that pause visible. The built CLI must also prove the authoring
+and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
+with valid globs and a malformed interval: doctor must report the validation error
+without scheduling it or inventing a due time, retain healthy sibling results, and
+leave source/notify state, events, and observation history unchanged. A stale verify
+session with a real projected scratch event and an edited invalid interval must
+be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
+retain the source baseline and held legitimate work, report the config skip, and
+progress a healthy sibling. Assert the existing fallback expiry at five minutes
+for unparseable cadence or a missing definition, and preserve derivable timing despite
+unrelated source-schema errors. A real-source/SQLite delayed-repair case must retain
+665000ms for invalid globs + 10m interval + 5s settle, close/reopen the store, repair
+at 12:08 after a 12:02 reap, and exclude scratch from an actual later-session claim
+while delivering legitimate held work and preserving a foreign workspace. This
+bounded regression does not resolve the known current arbitrary-pause/held-only
+ownership gap: retained fingerprints or held deletions may outlive suppression,
+and held-only creates may escape discovery. The no-later-scratch-event goal remains;
+current tests must not be cited as proof of that unconditional guarantee.
+[Decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+assigns the complete delayed-repair/held-only claim acceptance to
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), sequenced after
+#305/#537/#554. This known gap does not block #557 after its window/docs correction.
+Covered by `libs/core/src/runtime/cadence-window.test.ts`,
+`libs/core/src/runtime/object-event-suppressions.test.ts`,
+`libs/core/src/runtime/source-validation.test.ts` and
+`apps/cli/src/commands/runtime-source-validation.test.ts`.
+
 #### Notify-policy-edit durability (002 §4.6)
 
 `runtime/notify-policy-edit.test.ts` MUST prove all six exits from holding strategies, effective
@@ -249,39 +283,11 @@ start a package build or rely on a previously built dist tree.
 This acceptance concerns the effective-edit transaction, not ordinary ingest/flush retry recovery
 or unchanged-policy flushing after source errors. No downstream exactly-once side effects are claimed.
 
-Runtime source-config preflight is **current** behavior (002 §2.0). Tests **MUST**
-prove rejection before source side effects using a real registered source, exact
-`validateWatchScope` diagnostic parity with tick/explain/doctor, healthy sibling
-progress, and invalid-to-fixed recovery across runtime restart with baseline and
-held notify work retained. Cover directory ticks, persisted ephemeral ticks after
-schema changes, and continuous watcher startup. Invalid config intentionally stops
-observation, including configs that previously ran; daemon text/JSON and continuous
-logging must make that pause visible. The built CLI must also prove the authoring
-and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
-with valid globs and a malformed interval: doctor must report the validation error
-without scheduling it or inventing a due time, retain healthy sibling results, and
-leave source/notify state, events, and observation history unchanged. A stale verify
-session with a real projected scratch event and an edited invalid interval must
-be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
-retain the source baseline and held legitimate work, report the config skip, and
-progress a healthy sibling. Assert the existing fallback expiry at five minutes
-for unparseable cadence or a missing definition, and preserve derivable timing despite
-unrelated source-schema errors. A real-source/SQLite delayed-repair case must retain
-665000ms for invalid globs + 10m interval + 5s settle, close/reopen the store, repair
-at 12:08 after a 12:02 reap, and exclude scratch from an actual later-session claim
-while delivering legitimate held work and preserving a foreign workspace. This
-bounded regression does not resolve the known current arbitrary-pause/held-only
-ownership gap: retained fingerprints or held deletions may outlive suppression,
-and held-only creates may escape discovery. The no-later-scratch-event goal remains;
-current tests must not be cited as proof of that unconditional guarantee.
-[Decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
-assigns the complete delayed-repair/held-only claim acceptance to
-[#562](https://github.com/mike-north/AgentMonitors/issues/562), sequenced after
-#305/#537/#554. This known gap does not block #557 after its window/docs correction.
-Covered by `libs/core/src/runtime/cadence-window.test.ts`,
-`libs/core/src/runtime/object-event-suppressions.test.ts`,
-`libs/core/src/runtime/source-validation.test.ts` and
-`apps/cli/src/commands/runtime-source-validation.test.ts`.
+A source-config rejection (002 §2.0) found by a tick or a watcher-startup rescan MUST block a
+running watcher's yield and checkpoint while the scope has held work, leaving the held batch and
+cursor unchanged until valid recovery commits old and new work. Without held work, the same
+rejection MUST leave that watcher accepting yields and checkpoints under its startup config.
+`runtime/notify-observe-only-startup.test.ts` covers both paths for tick and rescan.
 
 ### 2.6 CLI integration tests
 

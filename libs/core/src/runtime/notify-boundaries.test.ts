@@ -191,17 +191,11 @@ function fixture(policy = DEBOUNCE, urgency = 'normal') {
       const runtime = current.runtime as unknown as {
         prepareNotifyPolicy(
           m: MonitorDefinition,
-          s: ObservationSource,
           w: string,
           a: typeof acc,
         ): Promise<boolean>;
       };
-      const accepted = await runtime.prepareNotifyPolicy(
-        monitor,
-        source,
-        root,
-        acc,
-      );
+      const accepted = await runtime.prepareNotifyPolicy(monitor, root, acc);
       return { accepted, acc };
     },
     fault() {

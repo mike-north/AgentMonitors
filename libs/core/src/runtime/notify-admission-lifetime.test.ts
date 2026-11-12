@@ -225,12 +225,11 @@ function fixture(watched = false) {
       const runtime = current.runtime as unknown as {
         prepareNotifyPolicy(
           m: MonitorDefinition,
-          s: ObservationSource,
           w: string,
           a: typeof acc,
         ): Promise<boolean>;
       };
-      return runtime.prepareNotifyPolicy(monitor, source, root, acc);
+      return runtime.prepareNotifyPolicy(monitor, root, acc);
     },
     policies() {
       return (

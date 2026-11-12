@@ -7,6 +7,8 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { SourceRegistry } from '../observation/registry.js';
+import type { JsonSchema } from '../observation/types.js';
+import { validateWatchScope } from '../schema/validate-scope.js';
 import type { PolicyNotifyState } from './notify-policy.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
@@ -15,6 +17,11 @@ import { RuntimeStore } from './store.js';
 const START = new Date('2026-03-20T09:00:00Z');
 const THROTTLE = 'notify:\n  strategy: throttle\n  suppress-for: 1h\n';
 const ROLLUP = "notify:\n  strategy: rollup\n  window: '* * * * *'\n";
+/** The fixture source's scope contract; tests derive expected diagnostics from it. */
+const SCOPE_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { token: { type: 'string' } },
+};
 const cleanups: (() => void)[] = [];
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
@@ -36,7 +43,7 @@ function fixture(policy: string) {
   registry.register({
     name: 'identity-source',
     stateful: true,
-    scopeSchema: { type: 'object', properties: { token: { type: 'string' } } },
+    scopeSchema: SCOPE_SCHEMA,
     async observe(_config, context) {
       previous.push(context.previousState);
       calls++;
@@ -310,10 +317,18 @@ it('held-work source validation must succeed before missing identity is learned'
   f.edit(undefined, 7);
   const invalid = await f.tick();
   // Source-config preflight (002 §2.0) skips the scope before notify
-  // preparation, so held work and the missing identity stay untouched.
+  // preparation with the same diagnostic as `validate`, so held work and the
+  // missing identity stay untouched and no blocked-edit error is reported.
   expect(invalid.skippedMonitors).toEqual([
-    expect.objectContaining({ validationError: expect.any(String) }),
+    {
+      monitorId: 'held',
+      validationError: validateWatchScope(
+        { interval: '1h', token: 7 },
+        SCOPE_SCHEMA,
+      ).join('; '),
+    },
   ]);
+  expect(invalid.erroredObservations).toEqual([]);
   expect(f.state()).toEqual(legacy);
   f.restart();
   expect(f.state()).toEqual(legacy);

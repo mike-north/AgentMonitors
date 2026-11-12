@@ -1,4 +1,8 @@
-/** 002 §4.6: factory capability does not exempt existing scoped ownership from startup reconciliation. */
+/**
+ * 002 §4.6: factory capability does not exempt existing scoped ownership from
+ * startup reconciliation. 002 §2.0: a rejected source config protects held work
+ * without reloading a running watcher that has none.
+ */
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -9,10 +13,12 @@ import { createDb } from '../inbox/db.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { SourceRegistry } from '../observation/registry.js';
 import type {
+  JsonSchema,
   Observation,
   ObservationContext,
   ObservationResult,
 } from '../observation/types.js';
+import { validateWatchScope } from '../schema/validate-scope.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
 
@@ -37,6 +43,17 @@ async function until(predicate: () => boolean) {
   expect(predicate()).toBe(true);
 }
 const DEBOUNCE = 'notify:\n  strategy: debounce\n  settle-for: 1h\n';
+/** The edited source requires a string token; `token: 7` is the rejected scope. */
+const OBSERVE_ONLY_SCHEMA: JsonSchema = {
+  type: 'object',
+  properties: { token: { type: 'string' } },
+  required: ['token'],
+};
+/** The diagnostic `validate` reports for the rejected edit (002 §2.0 parity). */
+const SCOPE_DIAGNOSTIC = validateWatchScope(
+  { interval: '1h', token: 7 },
+  OBSERVE_ONLY_SCHEMA,
+).join('; ');
 
 /** Public watcher/poll ownership and actual SQLite make the pre-factory reconciliation boundary observable. */
 async function fixture(mode: 'watch' | 'poll' | 'none') {
@@ -109,11 +126,7 @@ async function fixture(mode: 'watch' | 'poll' | 'none') {
   registry.register({
     name: 'observe-only',
     stateful: true,
-    scopeSchema: {
-      type: 'object',
-      properties: { token: { type: 'string' } },
-      required: ['token'],
-    },
+    scopeSchema: OBSERVE_ONLY_SCHEMA,
     async observe() {
       observeOnlyCalls++;
       return { observations: [] };
@@ -359,16 +372,20 @@ for (const failure of ['scope', 'sqlite'] as const) {
       if (!recoveredByStartup) await f.tick();
       await checkpoint;
       await until(() => f.rows().length === 2);
-      expect(
-        failed.errors.some((item) =>
-          item.message.includes(
-            // Scope failures are the source-config preflight diagnostic
-            // (002 §2.0), which names the offending `token` field.
-            failure === 'scope' ? 'token' : 'owned startup drain fault',
+      if (failure === 'scope') {
+        // The source-config preflight (002 §2.0) reports exactly the `validate`
+        // diagnostic; no blocked-edit report accompanies it.
+        const rejected = [{ monitorId: 'held', message: SCOPE_DIAGNOSTIC }];
+        expect(failed.errors).toEqual(rejected);
+        expect(repeated.errors).toEqual(rejected);
+      } else {
+        expect(
+          failed.errors.some((item) =>
+            item.message.includes('owned startup drain fault'),
           ),
-        ),
-      ).toBe(true);
-      expect(repeated.errors).not.toEqual([]);
+        ).toBe(true);
+        expect(repeated.errors).not.toEqual([]);
+      }
       expect(blocked).toEqual(retained);
       expect(afterRepeated).toEqual(retained);
       expect(acceptedWhileBlocked).toBe(false);
@@ -382,6 +399,106 @@ for (const failure of ['scope', 'sqlite'] as const) {
       expect(f.observeOnlyCalls).toBe(0);
       expect(f.oldPollCalls).toBe(0);
       expect(f.healthyFactories).toBe(1);
+      await f.reopen();
+      expect(f.owners().size).toBe(0);
+    },
+  );
+}
+
+it('tick-rejected scope blocks an existing watcher with held work and recovers before checkpoint/yield', async () => {
+  const f = await fixture('watch');
+  await f.emit('A');
+  const retained = f.state();
+  f.edit('observe-only', 7);
+  const rejected = await f.tick();
+  let settled = false;
+  const checkpoint = f.checkpoint().then(() => {
+    settled = true;
+  });
+  await f.emit('B');
+  const blocked = f.state();
+  const rowsWhileBlocked = f.rows();
+  const acceptedWhileBlocked = settled;
+  f.edit();
+  const recovery = await f.tick();
+  await checkpoint;
+  await until(() => f.rows().length === 2);
+  expect(rejected.skippedMonitors).toEqual([
+    { monitorId: 'held', validationError: SCOPE_DIAGNOSTIC },
+  ]);
+  expect(rejected.erroredObservations).toEqual([]);
+  expect(retained.notifyState.pendingDebounce?.observations).toHaveLength(1);
+  // Neither yield B nor checkpoint({ cursor: 999 }) commits beside held A.
+  expect(acceptedWhileBlocked).toBe(false);
+  expect(blocked).toEqual(retained);
+  expect(blocked.notifyState.pendingDebounce?.observations).toHaveLength(1);
+  expect(blocked.sourceState).toEqual(retained.sourceState);
+  expect(rowsWhileBlocked).toEqual([]);
+  expect(recovery.erroredObservations).toEqual([]);
+  expect(recovery.skippedMonitors).toEqual([]);
+  expect(f.rows()).toEqual(AB);
+  expect(f.state().sourceState).toEqual({ cursor: 999 });
+  expect(f.factories).toBe(1);
+  expect(f.factoryToken).toBe('initial');
+  expect(f.observeOnlyCalls).toBe(0);
+  expect(f.oldPollCalls).toBe(0);
+  await f.reopen();
+  expect(f.owners().size).toBe(0);
+});
+
+for (const via of ['tick', 'rescan'] as const) {
+  it(
+    via +
+      '-rejected scope without held work leaves a running watcher on its startup config',
+    async () => {
+      const f = await fixture('watch');
+      expect(f.state().notifyState.pendingDebounce).toBeUndefined();
+      f.edit('observe-only', 7);
+      const reject = async () => {
+        if (via === 'tick') {
+          const result = await f.tick();
+          expect(result.skippedMonitors).toEqual([
+            { monitorId: 'held', validationError: SCOPE_DIAGNOSTIC },
+          ]);
+          expect(result.erroredObservations).toEqual([]);
+        } else {
+          const result = await f.startup();
+          expect(result.errors).toEqual([
+            { monitorId: 'held', message: SCOPE_DIAGNOSTIC },
+          ]);
+          expect(result.handle.monitorIds).toEqual([]);
+        }
+      };
+      await reject();
+      // 002 §2.0: with nothing held, the watcher keeps ingesting under its
+      // startup snapshot (debounce pacing, original handling).
+      await f.emit('A');
+      let settled = false;
+      const checkpoint = f.checkpoint().then(() => {
+        settled = true;
+      });
+      await settle();
+      expect(settled).toBe(true);
+      await checkpoint;
+      const accepted = f.state();
+      expect(accepted.notifyState.pendingDebounce?.observations).toHaveLength(
+        1,
+      );
+      expect(accepted.sourceState).toEqual({ cursor: 999 });
+      expect(f.rows()).toEqual([]);
+      // Once A is held, the same rejection protects it from later yields.
+      await reject();
+      await f.emit('B');
+      expect(f.state()).toEqual(accepted);
+      f.edit();
+      await f.tick();
+      await until(() => f.rows().length === 2);
+      expect(f.rows()).toEqual(AB);
+      expect(f.state().sourceState).toEqual({ cursor: 999 });
+      expect(f.factories).toBe(1);
+      expect(f.factoryToken).toBe('initial');
+      expect(f.observeOnlyCalls).toBe(0);
+      expect(f.oldPollCalls).toBe(0);
       await f.reopen();
       expect(f.owners().size).toBe(0);
     },
@@ -432,9 +549,9 @@ for (const blocked of [false, true]) {
         const recovery = await f.startup();
         const recoveredByStartup = f.rows().length === 2;
         if (!recoveredByStartup) await f.tick();
-        expect(
-          first.errors.some((item) => item.message.includes('token')),
-        ).toBe(true);
+        expect(first.errors).toEqual([
+          { monitorId: 'held', message: SCOPE_DIAGNOSTIC },
+        ]);
         expect(afterPoll).toEqual(retained);
         expect(recovery.errors).toEqual([]);
         expect(recoveredByStartup).toBe(true);

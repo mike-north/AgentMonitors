@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-11 — Source-config rejection closes admission only for held work (002 §2.0/§4.6, 004 §2.5) — Refs #537
+
+Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
+rejection closes the scope's admission gate only when it has durable holds or a retained poll
+result, so a running watcher cannot commit beside that work under the rejected definition. Without
+held work, a running watcher keeps its startup config, as 002 §2.0 states. Require tick and rescan
+proofs of both cases.
+
 ## 2026-11-06 — Preserve opaque source baselines during notify edits (002 §3/§4.6, 004 §2.5) — Refs #537
 
 Clarify the existing source-state ownership rule for guard-only resets and held drains: effective

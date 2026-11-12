@@ -699,7 +699,8 @@ Continuous `watchMonitors()` startup **MUST** apply the same preflight before
 calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from
 the returned handle and reported through `onError` (or stderr when no callback is
 provided), with the same joined diagnostic. Watchers already running keep their
-startup config; live watcher reload is outside this contract.
+startup config; live watcher reload is outside this contract. When the rejected scope
+has held work, its admission closes until valid recovery (§4.6).
 
 `monitor explain` **MUST** report a definition failure and `doctor` **MUST** report
 an invalid monitor with the same diagnostic as `validate`. Doctor **MUST NOT**
@@ -1340,9 +1341,9 @@ urgency band govern future yields; its established execution/handling snapshot r
 explicit restart.
 Watcher startup **MUST** reconcile existing scoped watcher/evaluating-poll/deferred-result ownership
 even when the current registered source has no watch factory. Factory capability controls creation,
-not admission for live work. Invalid scope or failed drain blocks actual checkpoint/yield and
-baseline writes; valid recovery commits old work before they resume. No new watcher, source reload
-or polling is introduced. An observe-only scope without its own live ownership remains untouched
+not admission for live work. A failed drain, or an invalid scope while held work exists, blocks
+actual checkpoint/yield and baseline writes; valid recovery commits old work before they resume.
+No new watcher, source reload or polling is introduced. An observe-only scope without its own live ownership remains untouched
 by watcher startup, even if other scopes have owners.
 Successful startup drains **MUST** refresh the affected workspace's session
 hook state after commit, even if the source never yields and no tick follows; failed transactions
@@ -1378,8 +1379,11 @@ with operational work retain that work until valid reconciliation or its existin
 
 An invalid/unreadable/missing current definition **MUST** retain its operational holds and report
 the blocking reason. Current source-scope validation at this boundary protects existing holds;
-it does not introduce general observe-time preflight for monitors without held work. There is no
-implicit cancellation on removal, rename or invalid metadata. Ordinary ingest/flush retry recovery
+it does not introduce general observe-time preflight for monitors without held work. When a tick
+or watcher startup rejects a scope (§2.0) that has durable holds or a retained poll result,
+admission closes and a running watcher's checkpoint/yield waits for valid reconciliation. Without
+such held work, admission is left as it was and a running watcher keeps its startup config.
+There is no implicit cancellation on removal, rename or invalid metadata. Ordinary ingest/flush retry recovery
 and flushing unchanged policies after source errors are separate contracts, not added by this rule.
 
 **Example.** At 08:00, debounce holds A at normal urgency with instructions X. At 08:00:02 the author
