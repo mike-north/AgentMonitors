@@ -634,3 +634,67 @@ it('a refusal row that cannot be written rolls back its span instead of advancin
   expect(f.heldTitles()).toEqual(['A']);
   expect(f.state().sourceState).toEqual({ cursor: 1 });
 });
+
+/**
+ * 002 §4.7: the hold-acceptance check covers an observation joining a held
+ * batch, not one arriving on the tick the rollup window fires. That
+ * observation goes straight to materialization, where 002 §2 drops it (it is
+ * not retainable in the outbox) and records `notRetainedCount` on the batch
+ * row. So it is a drop, not a refusal: no `notHeld` count, no "was not held"
+ * row, and the unretained loss stays visible to doctor and explain.
+ */
+it('an unretainable observation arriving on a rollup firing tick is dropped at materialization, never refused by the hold check (002 §4.7, §2)', async () => {
+  const f = fixture(policies.rollup, [
+    () => [observation('A')],
+    () => [observation('Bad', { count: 10n }), observation('C')],
+  ]);
+
+  await f.tick();
+  expect(f.heldTitles()).toEqual(['A']);
+
+  f.at('2026-03-20T09:00:00Z');
+  const fired = await f.tick();
+
+  // The held batch and the retainable arrival are emitted, in order; the
+  // window is flushed.
+  expect(f.eventSummaries()).toEqual(['A', 'C']);
+  expect(fired.emittedEventIds).toHaveLength(2);
+  expect(f.state().notifyState.pendingRollup).toBeUndefined();
+
+  // The hold check did not run: the only report is the materialization drop,
+  // and no refusal is reported or recorded.
+  expect(fired.erroredObservations).toEqual([
+    {
+      monitorId: 'held',
+      message: expect.stringContaining('Not retained for retry'),
+    },
+  ]);
+  expect(
+    fired.erroredObservations.filter((e) => e.message.includes('was not held')),
+  ).toEqual([]);
+  const refusals = f
+    .errored()
+    .filter((row) => JSON.stringify(row.observationData).includes('not held'));
+  expect(refusals).toEqual([]);
+
+  // Materialization dropped Bad: one durable drop row, and the batch row
+  // counts it as not retained rather than not held.
+  const drops = f
+    .errored()
+    .filter(
+      (row) =>
+        (row.observationData as { notRetained?: boolean }).notRetained === true,
+    );
+  expect(drops.map((row) => row.observationData)).toEqual([
+    expect.objectContaining({ objectKey: 'Bad', notRetained: true }),
+  ]);
+  const batchRow = f.history().at(-1);
+  expect(batchRow).toEqual([
+    'triggered',
+    { observed: 2, emitted: 2, notRetainedCount: 1 },
+  ]);
+  expect(batchRow?.[1]).not.toHaveProperty('notHeld');
+
+  // The loss stays outstanding for doctor and explain.
+  expect(f.loss()).toMatchObject({ count: 1, objectKey: 'Bad' });
+});
