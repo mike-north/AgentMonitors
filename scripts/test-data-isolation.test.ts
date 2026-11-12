@@ -6,6 +6,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   existsSync,
+  globSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -14,10 +15,11 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { expect, it } from 'vitest';
+import { parse } from 'yaml';
 import { realUserPaths } from './test-isolation/paths.mjs';
 import {
   allGuardedVitestConfigPaths,
@@ -25,6 +27,29 @@ import {
 } from './vitest-pass-with-no-tests.mjs';
 
 const repo = resolve(import.meta.dirname, '..');
+
+/** Private workspace packages also need defaults, even outside the publisher inventory. */
+function isolationConfigPaths(): string[] {
+  const workspace: { packages: string[] } = parse(
+    readFileSync(join(repo, 'pnpm-workspace.yaml'), 'utf8'),
+  );
+  const configs = workspace.packages.flatMap((pattern) =>
+    globSync(`${pattern}/package.json`, { cwd: repo }).flatMap((file) => {
+      const manifest = JSON.parse(readFileSync(join(repo, file), 'utf8'));
+      const script = manifest.scripts?.test;
+      if (typeof script !== 'string' || !script.includes('vitest')) {
+        return [];
+      }
+      if (script !== 'vitest run') {
+        throw new Error(
+          `Audit the selected Vitest config for ${file}: ${script}`,
+        );
+      }
+      return [join(dirname(file), 'vitest.config.ts')];
+    }),
+  );
+  return [...new Set([...allGuardedVitestConfigPaths(), ...configs])];
+}
 
 /** Run the real configured boundary with only owned directories as host paths. */
 async function runFixture(body: string, linked = false) {
@@ -113,13 +138,15 @@ it('poison',()=>{const file=installation+'/existing'; const stat=statSync(file);
 
 for (const outcome of ['pass', 'fail', 'timeout']) {
   it(`isolates inherited paths and children, and cleans up after ${outcome}`, async () => {
+    // Positive/failure probes retain Vitest's normal case budget around a
+    // separately bounded Node child; only the deliberate timeout case is short.
     const result = await runFixture(`it('case',async()=>{
 const keys=['HOME','XDG_DATA_HOME','XDG_CONFIG_HOME','XDG_STATE_HOME','XDG_CACHE_HOME','XDG_RUNTIME_DIR','TMPDIR'];
 const env=Object.fromEntries(keys.map(k=>[k,process.env[k]]));
 const child=spawnSync(process.execPath,['-e','process.stdout.write(JSON.stringify(process.env))'],{encoding:'utf8',timeout:3000});
 writeFileSync(receipt,JSON.stringify({env,child:JSON.parse(child.stdout)}));
 ${outcome === 'fail' ? 'expect(1).toBe(2);' : outcome === 'timeout' ? 'await new Promise(()=>{});' : "expect(process.env.AGENTMONITORS_DB??'').not.toContain(installation);expect(process.env.AGENTMONITORS_SOCKET).toBeUndefined();"}
-},50);`);
+},${outcome === 'timeout' ? 50 : 5_000});`);
     if (outcome === 'pass') {
       expect(result.status, result.stdout + result.stderr).toBe(0);
     } else {
@@ -138,7 +165,7 @@ ${outcome === 'fail' ? 'expect(1).toBe(2);' : outcome === 'timeout' ? 'await new
   }, 20_000);
 }
 
-it.each(allGuardedVitestConfigPaths())(
+it.each(isolationConfigPaths())(
   '%s enables the shared isolation boundary',
   async (config) => {
     const resolved = await importVitestConfig(repo, config);
@@ -196,8 +223,11 @@ await withIsolatedTestEnvironment(async()=>{writeFileSync(${JSON.stringify(recei
         },
       );
       expect(result.error, result.stderr).toBeUndefined();
-      if (outcome === 'throw') expect(result.status, result.stderr).not.toBe(0);
-      else expect(result.status, result.stderr).toBe(0);
+      if (outcome === 'throw') {
+        expect(result.status, result.stderr).not.toBe(0);
+      } else {
+        expect(result.status, result.stderr).toBe(0);
+      }
       const { root } = JSON.parse(readFileSync(receipt, 'utf8'));
       expect(root).not.toBe(process.env.HOME);
       expect(existsSync(root)).toBe(false);

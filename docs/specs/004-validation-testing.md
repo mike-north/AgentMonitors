@@ -627,9 +627,9 @@ Verified in `apps/cli/src/commands/validate-admission.test.ts` and
 
 ### 2.13 Test filesystem isolation (current)
 
-Every maintained package suite (core, CLI fast and serial, launcher, sources, and
-`scripts/`) MUST load the shared `scripts/test-isolation` boundary through Vitest
-`globalSetup` and `setupFiles`. Standalone consumer, fresh-install hook, and Windows
+Every maintained package suite (core, CLI fast and serial, launcher, sources,
+website unit tests, and `scripts/`) MUST load the shared `scripts/test-isolation`
+boundary through Vitest `globalSetup` and `setupFiles`. Standalone consumer, fresh-install hook, and Windows
 install checks MUST enter the same boundary at their direct entrypoint. Importing
 their definitions MUST NOT change the caller's environment. Nx test inputs include
 the shared boundary, so cached results cannot hide changes to it.
