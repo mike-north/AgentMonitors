@@ -805,7 +805,7 @@ interface MaterializationSpanOptions {
    */
   notHeld?: number;
   workspacePath: string;
-  nextMonitorState?: {
+  nextMonitorState: {
     sourceState?: unknown;
     notifyState: PolicyNotifyState;
     lastObservationAt?: Date | null;
@@ -4077,94 +4077,24 @@ export class AgentMonitorRuntime {
       // accumulated batch when the delivery window opens, so we dispatch
       // `dispatchRollup` with zero new observations to trigger a window check.
       if (monitor.frontmatter.notify?.strategy === 'rollup') {
-        // dispatchRollup mutates nextState in-place, so we pass the spread
-        // state and always persist the result — `rollupLastFiredMinute` may
-        // have been updated even when no observations were flushed.
-        const rollupNotifyState = { ...monitorStateForSkip.notifyState };
-        // dispatchRollup() evaluates `notify.timezone` via cronMatchesDate,
-        // which can throw for an invalid IANA zone exactly like the schedule
-        // watch case above (issue #297). This call sits outside the
-        // observe()/ingest() try/catches (this whole branch runs on the
-        // NOT-due path), so it needs its own isolation: a bad rollup timezone
-        // must not abort the tick for every other monitor either.
-        let rollupDispatch: NotifyDispatchResult;
         try {
-          rollupDispatch = this.dispatchRollup(
+          const flushed = await this.flushRollupWindow(
             monitor,
-            [],
             now,
-            rollupNotifyState,
-          );
-        } catch (error) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-          acc.erroredObservations.push({ monitorId: monitor.id, message });
-          try {
-            this.store.recordObservationHistory({
-              monitorId: monitor.id,
-              workspacePath,
-              sourceName,
-              result: 'errored',
-              observationData: { error: message },
-            });
-          } catch {
-            // best-effort audit — ignore write failures
-          }
-          return;
-        }
-        const nextMonitorState = {
-          sourceState: monitorStateForSkip.sourceState,
-          notifyState: rollupDispatch.nextState,
-          lastObservationAt: monitorStateForSkip.lastObservationAt ?? null,
-        };
-        // An empty window check only persists the window bookkeeping
-        // (`rollupLastFiredMinute`); it holds and flushes nothing.
-        if (rollupDispatch.emitted.length === 0) {
-          this.store.setMonitorState(
-            monitor.id,
             workspacePath,
-            nextMonitorState,
+            ephemeralSessionId,
           );
-          return;
-        }
-        // Route the flushed batch through the SAME span materialization as
-        // `ingest()` (issue #180) so the not-due path records the `triggered`
-        // observation_history row (002 §10.7) and writes every emitted
-        // observation onto the shared chain — the due path already does both.
-        // (The `net` collapse is per-recipient at claim time; G10 PR-B.)
-        // The state that clears `pendingRollup` commits in the SAME
-        // transaction as the flushed span, so the held batch either reaches
-        // its durable outcomes (event, retained retry, or `errored` row) or
-        // stays held for the next window check. Only invoked when the window
-        // flushed something: an empty check must NOT flood the audit trail
-        // with `no-change` rows. `observed: 0` because this path dispatches
-        // no NEW observations — only the already-accumulated batch.
-        try {
-          const materialized = await this.materializeSpan(
-            monitor,
-            rollupDispatch.emitted,
-            {
-              observed: 0,
-              workspacePath,
-              nextMonitorState,
-              ...(ephemeralSessionId !== undefined
-                ? { ephemeralSessionId }
-                : {}),
-            },
-          );
-          acc.emittedEventIds.push(...materialized.emittedEventIds);
-          if (materialized.failures.length > 0) {
+          acc.emittedEventIds.push(...flushed.emittedEventIds);
+          if (flushed.failures.length > 0) {
             acc.erroredObservations.push({
               monitorId: monitor.id,
-              message: summarizeMaterializationFailures(materialized.failures),
+              message: summarizeMaterializationFailures(flushed.failures),
             });
           }
-        } catch (flushError) {
-          // The whole flush rolled back, hold included, so the batch is
-          // still held for the next window check. Reporting it is all that is
-          // left here. This dispatch decision is still read before the write
-          // lock; that separate not-due decision boundary is tracked by #498.
-          const message = errorMessage(flushError);
+        } catch (error) {
+          // Scheduling, empty-state and emitting admission failures all remain
+          // local to this monitor; healthy siblings must still be evaluated.
+          const message = errorMessage(error);
           acc.erroredObservations.push({ monitorId: monitor.id, message });
           try {
             this.store.recordObservationHistory({
@@ -4175,7 +4105,7 @@ export class AgentMonitorRuntime {
               observationData: { error: message },
             });
           } catch {
-            // best-effort audit — ignore write failures
+            // Audit is best-effort after the failed admission rolled back.
           }
         }
       }
@@ -4483,20 +4413,46 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Admit an already-dispatched span, used when a notify window flushes without
-   * a new source acquisition. The caller owns dispatch decision freshness;
-   * this wrapper shares event/retry persistence and post-commit reporting with
-   * ingest, but does not recompute its supplied decision.
+   * Check a notify window without acquiring new source observations. Read the
+   * authoritative batch, minute marker, source checkpoint and observation time
+   * only after obtaining the writer lock; a schedule snapshot cannot safely
+   * supply this decision after another runtime has committed newer work.
    */
-  private async materializeSpan(
+  private async flushRollupWindow(
     monitor: MonitorDefinition,
-    emitted: StoredObservationEnvelope[],
-    options: MaterializationSpanOptions,
+    now: Date,
+    workspacePath: string,
+    ephemeralSessionId?: string,
   ): Promise<MaterializationSpanResult> {
-    const durable = runRuntimeTransaction(this.store, () =>
-      this.admitSpan(monitor, emitted, options),
+    const admitted = runRuntimeTransaction(this.store, () => {
+      const current = this.store.getMonitorState(monitor.id, workspacePath);
+      const dispatch = this.dispatchRollup(monitor, [], now, {
+        ...current.notifyState,
+      });
+      const options: MaterializationSpanOptions = {
+        observed: 0,
+        workspacePath,
+        nextMonitorState: {
+          sourceState: current.sourceState,
+          notifyState: dispatch.nextState,
+          lastObservationAt: current.lastObservationAt ?? null,
+        },
+        ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+      };
+      return {
+        durable: this.admitSpan(monitor, dispatch.emitted, options),
+        options,
+        emitted: dispatch.emitted.length,
+      };
+    });
+    // Even an empty matching window commits its minute marker, but routine
+    // window checks must not manufacture no-change history or empty deliveries.
+    if (admitted.emitted === 0) return { emittedEventIds: [], failures: [] };
+    return await this.finishMaterializationSpan(
+      monitor,
+      admitted.durable,
+      admitted.options,
     );
-    return await this.finishMaterializationSpan(monitor, durable, options);
   }
 
   /**
@@ -4614,16 +4570,13 @@ export class AgentMonitorRuntime {
       );
     }
 
-    if (options.nextMonitorState) {
-      // This write deliberately follows outbox admission. If either the
-      // outbox or state write fails, the outer transaction also rolls back
-      // successful siblings, leaving the prior source baseline for replay.
-      this.store.setMonitorState(
-        monitor.id,
-        options.workspacePath,
-        options.nextMonitorState,
-      );
-    }
+    // State follows suffix admission so either failure also rolls back every
+    // successful sibling, preserving the prior source/notify replay boundary.
+    this.store.setMonitorState(
+      monitor.id,
+      options.workspacePath,
+      options.nextMonitorState,
+    );
     return { materialized, failures };
   }
 
