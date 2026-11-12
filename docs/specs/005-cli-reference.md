@@ -2380,7 +2380,7 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    - **Synthetic scratch key → durable exact ownership (the non-blocking path, issues #414/#562).**
      For a scratch sibling (`…/agentmonitors-verify-<token><ext>`, a path no real monitored object
      ever shares, whose `<token>` is the run's random identity), verify **registers ownership of that
-     exact key with the daemon before creating the file** (`verifyArtifacts.register`, 002 §2.6).
+     exact key with the daemon before creating the file** (`verifyArtifacts.register`, 002 §2.8).
      The registration names the run, its throwaway verify session, the workspace and the monitor
      being verified. A registration the daemon refuses aborts the run with a `setup` failure before
      any file is created. During the proof the scratch file's events flow normally. At cleanup,
@@ -2427,11 +2427,11 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    later observation of it, whether or not an event was ever projected. A crash between ending the
    session and recording that authority is repaired on the next tick. Until the owner is reaped, a
    killed run's artifact is still in its proof phase and its events remain visible. Ownership
-   records are retained without expiry (002 §2.6), so no restart, delay or config repair restores a
+   records are retained without expiry (002 §2.8), so no restart, delay or config repair restores a
    cleaned-up artifact's events.
 
    **Guarantee.** For a run that registered its artifact, no event for the scratch key reaches a
-   later lead session once cleanup authority is in effect (002 §2.6). Legitimate work in the same
+   later lead session once cleanup authority is in effect (002 §2.8). Legitimate work in the same
    held batches, a foreign workspace with the same monitor and key, and real watched paths are
    unaffected; real watched paths keep their exact-event-id cleanup. A scratch-looking path verify
    did not register (for example, one left by an older client killed mid-run) carries no cleanup

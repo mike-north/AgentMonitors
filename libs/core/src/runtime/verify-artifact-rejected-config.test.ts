@@ -6,7 +6,7 @@
  * legitimate work, a healthy sibling and a foreign workspace with the same key
  * keep progressing.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §2.0 (preflight), §2.6 (verify artifact ownership)
+ * @see ../../../../docs/specs/002-runtime-delivery.md §2.0 (preflight), §2.8 (verify artifact ownership)
  */
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

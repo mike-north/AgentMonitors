@@ -11,7 +11,7 @@
  * in the same batches, a foreign workspace with the same key and a real watched
  * path are controls that must keep delivering.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §2.6 (verify artifact ownership)
+ * @see ../../../../docs/specs/002-runtime-delivery.md §2.8 (verify artifact ownership)
  * @see ../../../../docs/specs/005-cli-reference.md §16 step 9
  * @see ../../../../docs/specs/004-validation-testing.md §2.5
  */

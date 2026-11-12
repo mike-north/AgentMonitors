@@ -252,7 +252,7 @@ function beforeAdmission(
   return () => {
     expect(firedAt, 'competing commit never fired').toBeDefined();
     expect(firedAt).toContain(
-      target === 'flush' ? 'flushRollupWindow' : 'withStoreWriter',
+      target === 'flush' ? 'flushHeldNotifyWork' : 'withStoreWriter',
     );
   };
 }

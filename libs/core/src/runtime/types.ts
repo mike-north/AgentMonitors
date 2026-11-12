@@ -1141,7 +1141,7 @@ export function defaultNotifyConfigForUrgency(
 
 /**
  * Why cleanup authority took effect for a registered verify artifact (002
- * §2.6): the owner asked for cleanup after its proof, or the owner session was
+ * §2.8): the owner asked for cleanup after its proof, or the owner session was
  * no longer active (closed, reaped as stale, or missing) when the runtime
  * reconciled it.
  *
@@ -1151,7 +1151,7 @@ export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';
 
 /**
  * Durable, exact ownership of one synthetic artifact a `verify` run created
- * against a persistent workspace daemon (issue #562, 002 §2.6). The record
+ * against a persistent workspace daemon (issue #562, 002 §2.8). The record
  * names one object key in one monitor and workspace. It is retained without
  * expiry: once cleanup has taken effect the runtime keeps that exact key out of
  * every later session, and the retained key cannot be registered again.
@@ -1179,7 +1179,7 @@ export interface VerifyArtifactRecord {
 
 /**
  * Register exact ownership of a verify scratch artifact before creating it
- * (002 §2.6). `objectKey` must be a verify scratch path whose token equals
+ * (002 §2.8). `objectKey` must be a verify scratch path whose token equals
  * `runId`; real watched paths are refused.
  *
  * @public
@@ -1199,7 +1199,7 @@ export interface RegisterVerifyArtifactInput {
   now?: Date;
 }
 
-/** The outcome of a verify artifact cleanup request (002 §2.6). @public */
+/** The outcome of a verify artifact cleanup request (002 §2.8). @public */
 export interface VerifyArtifactCleanupResult {
   /** The record after the request; unchanged when cleanup was already recorded. */
   artifact: VerifyArtifactRecord;

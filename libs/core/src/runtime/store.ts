@@ -2660,7 +2660,7 @@ export class RuntimeStore {
   }
 
   /**
-   * Persist exact ownership of one verify artifact (002 §2.6, issue #562).
+   * Persist exact ownership of one verify artifact (002 §2.8, issue #562).
    * Idempotent per run: re-registering the identical record returns the stored
    * one unchanged, so a retried registration never creates a second row. A run
    * already registered for a different artifact, or an artifact already owned
@@ -2780,7 +2780,7 @@ export class RuntimeStore {
   }
 
   /**
-   * Record that cleanup authority took effect for one run (002 §2.6). The
+   * Record that cleanup authority took effect for one run (002 §2.8). The
    * first recorded time and cause are permanent: a retry, or a later owner
    * close, leaves them unchanged and reports `recorded: false`.
    *

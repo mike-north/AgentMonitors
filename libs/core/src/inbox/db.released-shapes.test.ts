@@ -312,7 +312,7 @@ function rowsByRowid(
 }
 
 /**
- * The additive verify-artifact ownership table (002 §2.6, issue #562): its
+ * The additive verify-artifact ownership table (002 §2.8, issue #562): its
  * columns, its unique exact-key index and its partial awaiting-cleanup index.
  * Released versions never wrote it, so it must exist and be empty after open.
  */

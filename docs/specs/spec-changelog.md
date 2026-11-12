@@ -9,7 +9,7 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2.0/§2.6/§10.5/§15; 004 §2.5/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418
+## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2.0/§2.8/§10.5/§15; 004 §2.5/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418
 
 Replace finite, time-limited scratch cleanup with durable exact ownership, as accepted in #561.
 `verify --use-workspace-daemon` registers its synthetic scratch key with the daemon before creating
@@ -35,6 +35,23 @@ pages, with a 151-character workspace path and a 188-character key, at 100, 1,00
 about 850 bytes per run with cleanup recorded and about 1,000 bytes while awaiting cleanup, roughly
 five runs per page. The table, its indexes and every released database shape are covered by
 `db.released-shapes.test.ts`.
+
+## 2026-11-12 — Held notify work flushes on time while its source fails (002 §2.6, §2.5, §4.3, §`observation_history`; 003 §6.5; 004 §3.3) — Refs #558
+
+Close the gap the `incoming-changes` source-error decision left open (#555): a due monitor whose
+`observe()` keeps failing used to keep accepted debounce and rollup work held indefinitely,
+because the error path returned before notify dispatch and the unchanged scheduling timestamp
+kept the not-due rollup check from running. New 002 §2.6: after recording the failure, the
+runtime runs the held-work flush (the not-due rollup window check, now `flushHeldNotifyWork()`,
+generalized to any held strategy) with no new observations. It flushes a passed debounce
+deadline or a matching rollup window, commits only the notify state change, and keeps the
+source baseline and `lastObservationAt`, so the monitor stays due and is retried as before. The
+source failure is reported beside the flushed ids, and its `errored` row is written after the
+flush's `triggered` row so history and explain still show the failing source. A rolled-back
+flush keeps the batch held. Schema-invalid, missing and rejected-in-flight definitions still
+block. No public outcome type or API change; continuous watchers and retry cadence (#559) are
+unchanged. 003 §6.5 and the #305 scenario list in 004 drop the old "held work waits for a
+successful observe" consequence; 004 §3.3 adds the required scenario.
 
 ## 2026-11-12 — A notify-policy edit drains held rollup work in the rollup flush's owned transaction (002 §4.4/§4.6; 004 §3.4) — Refs #498
 
