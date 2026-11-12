@@ -104,6 +104,100 @@ describe('callDaemon', () => {
       },
     ).catch((error: unknown) => error);
     expect(rejection).toBeInstanceOf(DaemonConnectionError);
+    // No daemon received anything, so a writing caller may fall back.
+    expect((rejection as DaemonConnectionError).requestSent).toBe(false);
+  });
+
+  /**
+   * Once the request is written, a missing reply leaves the daemon's outcome
+   * unknown: the error still classifies as a connection failure (read-only
+   * fallbacks are unchanged) but says the request was sent, so a writing
+   * caller (`monitor retry`) does not also apply it in-process.
+   */
+  describe('after the request reached a daemon', () => {
+    async function listen(
+      name: string,
+      onRequest: (socket: net.Socket) => void,
+    ): Promise<{ socketPath: string; close: () => Promise<void> }> {
+      const socketPath = tempSocketPath(name);
+      const sockets = new Set<net.Socket>();
+      const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('error', () => undefined);
+        socket.setEncoding('utf-8');
+        let buffer = '';
+        socket.on('data', (chunk) => {
+          buffer += chunk;
+          if (buffer.includes('\n')) onRequest(socket);
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+      });
+      return {
+        socketPath,
+        close: async () => {
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    it('marks a timeout with no reply as sent', async () => {
+      const daemon = await listen('silent', () => undefined);
+      try {
+        const rejection = await callDaemon(
+          'status',
+          {},
+          { socketPath: daemon.socketPath, timeoutMs: 200 },
+        ).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(DaemonConnectionError);
+        expect((rejection as DaemonConnectionError).requestSent).toBe(true);
+        expect((rejection as Error).message).toBe(
+          `Timed out waiting for AgentMon daemon at ${daemon.socketPath}`,
+        );
+      } finally {
+        await daemon.close();
+      }
+    });
+
+    it('marks a connection dropped before the reply as sent, without waiting for the timeout', async () => {
+      const daemon = await listen('drop', (socket) => socket.destroy());
+      try {
+        const started = Date.now();
+        const rejection = await callDaemon(
+          'status',
+          {},
+          { socketPath: daemon.socketPath, timeoutMs: 5_000 },
+        ).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(DaemonConnectionError);
+        expect((rejection as DaemonConnectionError).requestSent).toBe(true);
+        expect(Date.now() - started).toBeLessThan(4_000);
+      } finally {
+        await daemon.close();
+      }
+    });
+
+    it('marks a half-written reply followed by a close as sent', async () => {
+      const daemon = await listen('partial', (socket) => {
+        socket.end('{"id":"1","res');
+      });
+      try {
+        const rejection = await callDaemon(
+          'status',
+          {},
+          { socketPath: daemon.socketPath, timeoutMs: 5_000 },
+        ).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(DaemonConnectionError);
+        expect((rejection as DaemonConnectionError).requestSent).toBe(true);
+        expect((rejection as Error).message).toBe(
+          `AgentMon daemon at ${daemon.socketPath} closed the connection without a reply`,
+        );
+      } finally {
+        await daemon.close();
+      }
+    });
   });
 
   // Issue #382: an old, still-running daemon build predates a method the
@@ -253,6 +347,45 @@ describe('callDaemon', () => {
 // createDaemonServer: one bad request must not crash the daemon (issue #292)
 // ---------------------------------------------------------------------------
 describe('createDaemonServer — request-handling resilience', () => {
+  it('uses only an own envelope id when reporting admission rejection', async () => {
+    const socketPath = tempSocketPath('own-id');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    const parse = JSON.parse;
+    // Simulate an inherited id without changing any global object prototype.
+    const decoded = {
+      method: 'ping',
+      params: { ignored: Array(1001).fill(null) },
+    };
+    Object.setPrototypeOf(decoded, { id: 'inherited' });
+    await server.listen();
+    const parser = vi.spyOn(JSON, 'parse').mockReturnValueOnce(decoded);
+    try {
+      const raw = await new Promise<string>((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let response = '';
+        socket.setEncoding('utf8');
+        socket.on('connect', () => socket.end('parent-id-probe\n'));
+        socket.on('data', (chunk: string) => {
+          response += chunk;
+        });
+        socket.on('end', () => resolve(response));
+        socket.on('error', reject);
+      });
+      parser.mockRestore();
+      expect(parse(raw)).toMatchObject({
+        id: 'invalid',
+        code: 'INPUT_LIMIT_EXCEEDED',
+      });
+      expect(await daemonAvailable(socketPath)).toBe(true);
+    } finally {
+      parser.mockRestore();
+      await server.close();
+    }
+  });
+
   it('answers an error response and stays alive when a request fails synchronous param validation', async () => {
     const socketPath = tempSocketPath('bad-params');
     const server = createDaemonServer({
@@ -326,6 +459,121 @@ describe('createDaemonServer — request-handling resilience', () => {
       await expect(daemonAvailable(socketPath)).resolves.toBe(true);
     } finally {
       await server.close().catch(() => undefined);
+    }
+  });
+
+  it('rejects a retry repair that does not name its workspace and monitor, and answers a well-formed one', async () => {
+    const socketPath = tempSocketPath('retry-repair');
+    const server = createDaemonServer({
+      runtime: createRuntime(':memory:'),
+      socketPath,
+    });
+    try {
+      await server.listen();
+      // A retry is only repaired through the route it was admitted in, never
+      // by id alone (005 `monitor retry`).
+      for (const [method, params] of [
+        ['retry.rearm', { retryId: 'r1', workspacePath: '/ws' }],
+        ['retry.rearm', { monitorId: 'm', retryId: 'r1' }],
+        ['retry.skip', { monitorId: 'm', retryId: '', workspacePath: '/ws' }],
+        [
+          'retry.skip',
+          { monitorId: 'm', retryId: 'r1', workspacePath: '/ws', reason: 7 },
+        ],
+      ] as const) {
+        const rejection = await callDaemon(method, params, {
+          socketPath,
+          timeoutMs: 1000,
+        }).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(Error);
+        expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+        expect(String(rejection)).not.toContain('not found');
+      }
+
+      // Well-formed requests reach the runtime, which reports the unknown id.
+      for (const method of ['retry.rearm', 'retry.skip'] as const) {
+        await expect(
+          callDaemon(
+            method,
+            { monitorId: 'm', retryId: 'r1', workspacePath: '/ws' },
+            { socketPath, timeoutMs: 1000 },
+          ),
+        ).rejects.toThrow('Materialization retry record not found: r1');
+      }
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+    }
+  });
+
+  // Issue #562: verify registers exact artifact ownership before creating its
+  // scratch file, then requests cleanup. The socket boundary refuses a real
+  // watched path and a malformed run token, keeps a retried registration to one
+  // record, and refuses cleanup for an unregistered run, staying alive throughout.
+  it('round-trips verify artifact registration and cleanup, refusing real paths and unregistered runs', async () => {
+    const socketPath = tempSocketPath('verify-artifacts');
+    const ws = mkdtempSync(path.join(tmpdir(), 'am-verify-artifacts-'));
+    const runtime = createRuntime(':memory:');
+    const server = createDaemonServer({ runtime, socketPath });
+    const call = <T>(method: string, params: Record<string, unknown>) =>
+      callDaemon<T>(method, params, { socketPath, timeoutMs: 1000 });
+    try {
+      await server.listen();
+      const owner = await call<{ id: string }>('session.open', {
+        adapter: 'claude-code',
+        hostSessionId: 'agentmonitors-verify-0a1b2c3d4e5f',
+        workspacePath: ws,
+        agentIdentity: 'claude-code',
+        hookStatePath: path.join(ws, '.hook-state.json'),
+      });
+      const register = {
+        runId: '0a1b2c3d4e5f',
+        ownerSessionId: owner.id,
+        workspacePath: ws,
+        monitorId: 'm',
+        objectKey: path.join(ws, 'agentmonitors-verify-0a1b2c3d4e5f.md'),
+      };
+
+      for (const params of [
+        { ...register, objectKey: path.join(ws, 'src', 'app.ts') },
+        { ...register, runId: 'not-a-token' },
+      ]) {
+        const rejection = await call('verifyArtifacts.register', params).catch(
+          (error: unknown) => error,
+        );
+        expect(rejection).toBeInstanceOf(Error);
+        expect(rejection).not.toBeInstanceOf(DaemonConnectionError);
+      }
+
+      const first = await call<{ runId: string; cleanupCause: unknown }>(
+        'verifyArtifacts.register',
+        register,
+      );
+      expect(first).toMatchObject({
+        runId: '0a1b2c3d4e5f',
+        cleanupCause: null,
+      });
+      await expect(call('verifyArtifacts.register', register)).resolves.toEqual(
+        first,
+      );
+
+      const cleanup = await call<{
+        artifact: { cleanupCause: unknown };
+        retractedEventCount: number;
+      }>('verifyArtifacts.requestCleanup', { runId: '0a1b2c3d4e5f' });
+      expect(cleanup.artifact.cleanupCause).toBe('owner-request');
+      expect(cleanup.retractedEventCount).toBe(0);
+
+      const unregistered = await call('verifyArtifacts.requestCleanup', {
+        runId: 'ffffffffffff',
+      }).catch((error: unknown) => error);
+      expect(unregistered).toBeInstanceOf(Error);
+      expect((unregistered as Error).message).toMatch(/not registered/);
+      expect(runtime.listVerifyArtifacts()).toHaveLength(1);
+      await expect(daemonAvailable(socketPath)).resolves.toBe(true);
+    } finally {
+      await server.close().catch(() => undefined);
+      rmSync(ws, { recursive: true, force: true });
     }
   });
 

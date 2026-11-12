@@ -38,13 +38,13 @@ import type {
 
 The interface definition (verified: `libs/core/src/observation/types.ts`):
 
-| Member                     | Kind                         | Required | Description                                                                                                                 |
-| -------------------------- | ---------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches `watch.type` in `MONITOR.md`.                                                        |
-| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's per-source config (the `watch:` block minus `type`).                          |
-| `stateful`                 | `readonly boolean?`          | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent.                         |
-| `observe(config, context)` | `Promise<ObservationResult>` | Yes      | One-shot observation: check for changes and return any observations.                                                        |
-| `watch?(config, context)`  | `AsyncIterable<Observation>` | No       | Optional continuous watch mode, driven by the runtime for sources that implement it (NP4). Stops on `context.signal` abort. |
+| Member                     | Kind                               | Required | Description                                                                                                                 |
+| -------------------------- | ---------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `name`                     | `readonly string`                  | Yes      | Unique kebab-case plugin name. Matches `watch.type` in `MONITOR.md`.                                                        |
+| `scopeSchema`              | `readonly JsonSchema`              | Yes      | JSON Schema fragment describing this source's per-source config (the `watch:` block minus `type`).                          |
+| `stateful`                 | `readonly boolean?`                | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent.                         |
+| `observe(config, context)` | `Promise<ObservationResult>`       | Yes      | One-shot observation: check for changes and return any observations.                                                        |
+| `watch?(config, context)`  | `AsyncIterable<ObservationResult>` | No       | Optional continuous watch mode, driven by the runtime for sources that implement it (NP4). Stops on `context.signal` abort. |
 
 `JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
 
@@ -71,10 +71,10 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 ### 2.3 Observation result
 
-`observe()` returns an `ObservationResult`:
+`observe()` returns and `watch()` yields an `ObservationResult`:
 
 - `observations: Observation[]` — zero or more source observations.
-- `nextState?: unknown` — optional source-owned persisted state to use in the next cycle.
+- `nextState?: unknown` — optional source-owned restart state committed with this finite batch. Omitted/undefined preserves the prior baseline; null resets to the existing empty-state representation `{}`.
 - `outcome?: "rebaselined" | "no-files-matched"` — optional diagnostic for a zero-observation run
   that is meaningfully different from ordinary `no-change`. The runtime records it in
   `observation_history` only when the source returned zero observations and emitted nothing.
@@ -118,9 +118,18 @@ event-materialization consequences are specified in
 [002 §4.1](./002-runtime-delivery.md) and [002 §5.1](./002-runtime-delivery.md). Verified:
 `libs/core/src/observation/types.ts`, `libs/core/src/runtime/service.ts`.
 
+A watch yield is a complete finite batch whose observations and checkpoint commit together before
+Interpret or the next pull. `ObservationContext.checkpoint` is removed; independent checkpoint
+writes and legacy bare-observation yields are unsupported. This is a breaking plugin migration,
+accepted by the user on 2026-11-01 to prevent advancing a checkpoint past unadmitted observations.
+Use `yield { observations: [...], nextState }`, or an empty array for a state-only batch. Do not split
+one checkpoint's covered observations across future yields. Whole-admission failure stops the
+iterator and preserves its old restart baseline. See [002 §2.4](./002-runtime-delivery.md#24-watch-mode-source-state-checkpointing)
+for the decision rationale, failure contract and migration examples.
+
 ### 2.4 Stateful sources
 
-If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
+If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). A CLI initial baseline requires non-nullish `nextState`; zero observations alone do not establish one. State remains source-owned and may be a primitive; the CLI MUST NOT require an object or SHA shape. A `no-files-matched` diagnostic takes precedence over this baseline check. On subsequent calls, the stored state is available via `context.previousState`.
 
 `file-fingerprint`, `api-poll`, `command-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
 
@@ -760,10 +769,10 @@ monitor, it MUST skip that monitor's `observe()` call (G5/NP4, [002 §2.3](./002
 1. The source re-computes the SHA-256 fingerprint of the affected file(s).
 2. It compares against the in-memory fingerprint state (the same `FingerprintState` shape as
    `nextState` in §3.2).
-3. For each changed, created, or deleted path, it **yields** one `Observation` through the
-   `AsyncIterable<Observation>` exactly as `observe()` would, using the same observation shape
-   (§3.2), change-kind classification (§3.3), and salience policy (§3.4).
-4. It updates the in-memory fingerprint state.
+3. It collects changed, created, or deleted paths into the finite `observations` array, using the
+   same observation shape (§3.2), change-kind classification (§3.3), and salience policy (§3.4).
+4. It yields `{ observations, nextState }`, associating the resulting fingerprint state with exactly
+   that batch. The runtime commits both before requesting a newer batch.
 
 A small internal coalesce window (~50–100 ms) MAY be applied before emitting, to absorb
 editor atomic-save sequences (write-tmp → rename) as a single change event. This is an
@@ -859,40 +868,23 @@ insufficient.
 auto` with watcher init forced to fail MUST see the monitor switch to polling AND a warning
 > visible in its explain output.
 
-### 3.10 Periodic source-state checkpointing during watch (TARGET)
+### 3.10 Source-state batches during watch (TARGET)
 
-> **Status: target.** Part of the §3.8 event-driven feature. This section describes a new core
-> contract addition (also specified in [002 §2.4](./002-runtime-delivery.md)) required for
-> mid-watch crash safety. All rules here are target.
+> **Status: target for file-fingerprint.** The event-driven source feature in §3.8 must adopt the
+> current core batch contract in [002 §2.4](./002-runtime-delivery.md#24-watch-mode-source-state-checkpointing).
+> No bundled source implements continuous watch yet.
 
-While `watch()` is running, the in-memory fingerprint state advances with every OS event —
-but without periodic persistence, a mid-watch daemon crash would lose that state. On restart the
-daemon would re-observe from the last persisted baseline and re-emit observations for changes that
-had already been delivered and acknowledged, creating duplicate deliveries.
+The fingerprint state associated with a finite batch of file observations is yielded as that
+batch's `nextState`. It must not include changes whose observations are deferred to another batch.
+The runtime persists the fingerprint baseline and observations together before optional Interpret.
+A checkpoint-only reconciliation yields `{ observations: [], nextState }`; it may not bypass pending
+source observations. Do not use an out-of-band callback or rely on warning-and-continue after a
+failed state write: whole-admission failure closes the iterator and preserves the old baseline.
 
-To prevent this, `file-fingerprint`'s `watch()` implementation MUST periodically checkpoint its
-updated fingerprint state back to the runtime using the watch-checkpoint mechanism specified in
-[002 §2.4](./002-runtime-delivery.md). The checkpoint carries the current `FingerprintState` as
-`nextState` so the runtime can persist it durably — respecting the G14 durable-write-before-Interpret
-ordering ([002 §1.1.8](./002-runtime-delivery.md)) — before any downstream pipeline work.
-
-> **Why this is a core-contract addition.** Today ([002 §2.3](./002-runtime-delivery.md)), the
-> runtime leaves `sourceState` untouched while a watcher is running (source state is only advanced
-> by `observe()` returning `nextState`). Watch-mode checkpointing requires the runtime to accept an
-> out-of-band state write from an active watcher. The new `context`-level callback or periodic
-> `{ observation, nextState }` checkpoint shape is the mechanism for this write-back; its exact
-> TypeScript shape is specified in [002 §2.4](./002-runtime-delivery.md).
-
-A checkpoint interval of approximately the `interval` field (or the default 30s if omitted) is
-a reasonable default. The checkpoint MUST be durable before the runtime interprets the accompanying
-observation (G14 ordering). If the checkpoint write fails, `watch()` SHOULD treat this as a
-transient error, log a warning, and continue watching — a failed checkpoint is not cause to abort
-the watcher.
-
-> **Test implication.** A test that (a) starts a watcher, (b) triggers file changes that are
-> observed and yielded, (c) simulates a daemon crash before the next checkpoint, and (d) restarts the
-> daemon MUST see the reconcile-on-start pass (§3.8) report only the changes that occurred
-> _after_ the last checkpoint — not re-report changes that were delivered before the crash.
+On restart, reconciliation begins from the last committed baseline. A crash before admission
+requires replay of that batch; a crash after admission must find its events or recovery obligations
+along with the advanced baseline. A source that intentionally lags checkpoints can replay already
+admitted changes, so this contract does not promise exactly-once acquisition or delivery.
 
 ## 4. Bundled Source: `api-poll`
 
@@ -1318,7 +1310,11 @@ Required field: `paths` (array of strings — path prefixes or globs passed to `
 
 ### 6.2 Behavior
 
-`incoming-changes` is `stateful: true`. The first call resolves the current commit SHA via `git rev-parse`, stores it as `nextState: { ref: '<sha>' }`, and returns an empty `observations` array — this is the baseline run; it does **not** report the existing tree as changed.
+`incoming-changes` is `stateful: true`. The first call resolves the authored revision unchanged
+via `git rev-parse --verify --end-of-options <ref>` to one complete object ID, then separately
+resolves `<object-id>^{commit}` to a commit SHA. It stores that SHA as `nextState: { ref: '<sha>' }`
+and returns an empty `observations` array. This is the baseline run; it does **not** report the
+existing tree as changed.
 
 On subsequent calls, the source:
 
@@ -1348,11 +1344,44 @@ with `git ls-remote origin refs/heads/<branch>` (§11.8).
 
 ### 6.5 Error resilience
 
-- If `git rev-parse` fails (not a git repo, unknown branch, option-injection guard triggered), `observe()` returns `{ observations: [] }` with no `nextState` — it silently waits for the repo/branch to become valid.
-- If `git diff` fails (e.g., the stored SHA was gc'd or history-rewritten), `observe()` re-baselines: it returns `{ observations: [], nextState: { ref: currentRef } }` and starts fresh from the current ref.
-- `git show` failures (per-file snapshot fetch) are silenced and result in `snapshotText` being absent; the observation is still emitted.
+**Current**, resolving the previous silent-wait rule per [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474) (Refs #305):
 
-These guards ensure a source error does not propagate to the runtime tick loop.
+- Current-ref resolution MUST verify one commit object. Commit-ish expressions and annotated tags
+  peeling to commits are accepted; tree/blob objects, unknown refs, option-looking invalid refs,
+  inaccessible/non-repository cwd, and unavailable Git reject with an ordinary source `Error`.
+  Arguments use an array with an option terminator; SHA-1 and SHA-256 object IDs are supported.
+  Resolve the authored expression **unchanged** to a single complete object ID before adding
+  commit-peeling syntax to that validated ID. Appending `^{commit}` directly to authored input
+  can change a file path (`HEAD:payload`) or a commit-search regex (`:/Initial`) instead of
+  verifying object type. For example, tracking files `payload` and `payload^{commit}` MUST NOT
+  allow `HEAD:payload` to establish a blob baseline. Conversely, `:/Initial` MUST retain its
+  ordinary Git meaning and baseline the matching commit, even when it differs from HEAD.
+  HEAD, full object IDs, annotated commit tags and extended single-commit expressions remain
+  valid. This preserves [Git revision syntax](https://git-scm.com/docs/gitrevisions); it is object
+  verification, not a restriction to branch-name syntax.
+
+- The exact error message is:
+
+  > incoming-changes: could not resolve the configured ref to a commit. Check watch.cwd (an accessible Git repository), watch.branch (default HEAD), and that git is installed. No baseline was established or advanced; continuous monitoring will retry.
+
+  This static single-line message contains no raw child stderr or interpolated configuration.
+  The runtime isolates it as `errored`, keeps the last-good source and notify state, and retries
+  automatically. It emits no synthetic source event. On recovery, diff from the last-good SHA;
+  if no baseline ever succeeded, establish the first baseline without emitting the existing tree.
+
+- If `git diff` fails (e.g., the stored SHA was gc'd), `observe()` re-baselines quietly:
+  `{ observations: [], nextState: { ref: currentRef }, outcome: 'rebaselined' }`. A history rewrite
+  whose old commit remains diffable produces the ordinary net diff, not an automatic rebaseline.
+- `git show` failures (per-file snapshot fetch) remain nonfatal and omit `snapshotText`; the
+  observation is still emitted. Resolve, diff and show explicitly capture child stderr and MUST
+  NOT leak it to the terminal, including when an error is caught.
+
+No public unavailable outcome, schema or stored-state migration is introduced. Source consumers
+that previously assumed resolution always fulfilled must now handle the existing rejection
+contract. The runtime already does so. Its existing error path leaves the scheduling timestamp
+unchanged (due monitors retry each daemon tick; #559 tracks that retry cost). Held debounce and
+rollup work still flushes at its own deadline or window while the source fails
+([002 §2.6](./002-runtime-delivery.md)). Already-materialized events remain deliverable.
 
 ## 7. Source Registry, Validation, and Schema Generation
 
@@ -1569,6 +1598,28 @@ no orphan). Platform-specific mechanism:
   kind of child). The documented choice is `taskkill /PID <pid> /T /F` — forceful and tree-wide —
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
   from on this platform.
+
+**Every escalation step is identity-verified at signal time** (issue #479,
+[008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step's process-table read starts while
+the direct child is still unreaped, so the members that read lists (pid and start time) are
+confirmed as the command's group even if the command exits before the read completes; the step then
+signals the group (or, if that read found the group already empty, needs no signal). The gate reads the group's membership again the moment the direct child is
+reaped, which confirms processes forked after the SIGTERM step (for example a worker started by a
+TERM trap just before the command exits). Through the grace period the gate keeps reading the
+group's membership every 250 ms, one read at a time, until the SIGKILL follow-up starts; each
+reading that still holds a confirmed member confirms every member it lists, so a TERM-ignoring
+member that forks a process and later exits passes the group on to it. The SIGKILL follow-up
+usually runs after the direct child has been reaped; it is sent if any confirmed member is still in
+the group, and an empty group needs no signal. Only when continuity is lost (the group holds none
+of the processes ever confirmed) or the process table cannot be read is the group left alone: the
+step abstains and writes a warning to the daemon's stderr (the daemon log) naming the group, the
+members it saw and why identity could not be confirmed. Continuity is lost when the group emptied
+and its id was reused, or when, after the direct child has exited, a member forks and exits
+between two consecutive readings (within one 250 ms interval plus one read; the read time grows
+under load, up to the 5 s `ps` cap) while no other confirmed member is alive; in that second case
+the forked process escapes the bound. That residual, and the latency the reads add to each step, are stated
+in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
+`taskkill` runs only while the direct child is still unreaped.
 
 Resolution on timeout is driven by the direct child's own `exit` event, never by waiting for its
 stdio streams to `close`. A descendant that inherited stdout/stderr (the `sleep` in the example

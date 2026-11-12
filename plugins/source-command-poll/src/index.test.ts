@@ -1050,9 +1050,18 @@ describe('source-command-poll', () => {
         // correct implementation allocates once per over-cap chunk. What must
         // hold regardless of how the write is chunked is that every retained
         // copy is bounded — exactly, not just at-most — at the cap.
-        expect(allocUnsafeSlowSpy).toHaveBeenCalled();
-        for (const result of allocUnsafeSlowSpy.mock.results) {
-          const retained = result.value as Buffer;
+        //
+        // The spy is process-wide, so it also sees unrelated allocations (for
+        // example Node's 64 KiB `readFile` buffer for size-0 `/proc` files
+        // during timeout cleanup on Linux). Only copies that hold the retained
+        // stderr bytes (all 'E') belong to this assertion.
+        const retainedCopies = allocUnsafeSlowSpy.mock.results
+          .map((call) => call.value as Buffer)
+          .filter(
+            (buffer) => buffer.length > 0 && buffer.every((b) => b === 0x45),
+          );
+        expect(retainedCopies.length).toBeGreaterThan(0);
+        for (const retained of retainedCopies) {
           expect(retained.length).toBe(stderrRetentionCapBytes);
           expect(retained.buffer.byteLength).toBe(stderrRetentionCapBytes);
         }

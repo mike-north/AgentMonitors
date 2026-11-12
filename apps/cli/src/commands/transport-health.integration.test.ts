@@ -14,6 +14,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { writeLocalState } from '../local-state.js';
+import { callDaemon } from '../daemon-ipc.js';
+import type { HookDeliveryDiagnosis } from '@agentmonitors/core';
 
 /**
  * Delivery-transport health, driven through the real CLI (issue #425).
@@ -555,26 +557,12 @@ This monitor fires on a schedule.
     expect(result.exitCode).toBe(0);
   });
 
-  // --- Failure mode (c): reminders suppressed by coalesced-until-ack --------
-  // The hardest case, and the reason this is a HEALTH surface: the daemon is
-  // up, a lead session is open, an event materialized on a real transition —
-  // and the agent is still never told, because that unread event is already
-  // claimed. Driven end to end through the real CLI.
-  //
-  // Deterministic by construction (issue #425 review — the prior version of
-  // this test wrapped every assertion in
-  // `if (result.stdout.includes('[reminders-suppressed]'))`, so if the
-  // schedule-monitor-plus-`daemon once` precondition it relied on ever failed
-  // to materialize the state in time, EVERY assertion below was silently
-  // skipped and the test passed green while proving nothing — exactly the
-  // hardest failure mode this whole surface exists to catch, going unguarded).
-  // This version follows the same real-daemon recipe issue #333's regression
-  // test uses: open the session FIRST, then drive an actual file-fingerprint
-  // change through a live daemon tick and POLL for the resulting unread event
-  // before claiming it — so the precondition is confirmed to hold, never
-  // merely hoped for.
-  it('reports muted reminders with the session-scoped ack remediation, and fails the verdict', async () => {
-    const dir = path.join(tempDir, 'transports-suppressed');
+  // A claimed backlog is healthy under the fresh-batch policy: A stays unread,
+  // B still surfaces, and only explicit acknowledgment removes either event.
+  // Legacy-daemon mute remediation remains covered by transport-health.test.ts.
+  it('keeps claimed work healthy and surfaces a fresh reminder before explicit scoped acknowledgment', async () => {
+    // Each invocation (including a Vitest retry) owns a new DB and source state.
+    const dir = mkdtempSync(path.join(tempDir, 'transports-progress-'));
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     const monitorDir = path.join(monitorsRoot, 'docs-watcher');
     mkdirSync(monitorDir, { recursive: true });
@@ -612,33 +600,20 @@ This monitor fires on a schedule.
       AGENTMONITORS_SOCKET: socketPath,
     };
 
+    const fixture = { dir, monitorsRoot, dataHome, socketPath, env };
+    // Complete the real source baseline before changing the file. Readiness of
+    // a listening socket alone does not prove the first observation has run.
+    const baseline = runWithEnv(
+      ['daemon', 'once', monitorsRoot, '--workspace', dir],
+      env,
+      dir,
+    );
+    expect(baseline.exitCode, baseline.stderr).toBe(0);
     const daemon = await startDaemon(monitorsRoot, dir, env, socketPath);
     try {
-      const opened = runWithEnv(
-        [
-          'session',
-          'open',
-          '--host-session-id',
-          HOST_SESSION,
-          '--workspace',
-          dir,
-          '--format',
-          'json',
-        ],
-        env,
-        dir,
-      );
-      expect(opened.exitCode).toBe(0);
-      const sessionId = (JSON.parse(opened.stdout) as { id: string }).id;
-
-      // Let the baseline tick complete, then change the watched file — a real
-      // daemon tick materializes exactly one durable, unread normal event
-      // (mirrors issue #333's regression test).
-      await new Promise((resolve) => setTimeout(resolve, 1200));
-      writeFileSync(watchedFile, 'changed: added eval()', 'utf-8');
-
-      const unread = () =>
-        runWithEnv(
+      const sessionId = openLeadSession(fixture);
+      const unreadIds = (): string[] => {
+        const result = runWithEnv(
           [
             'events',
             'list',
@@ -651,67 +626,122 @@ This monitor fires on a schedule.
           env,
           dir,
         );
-      const eventDeadline = Date.now() + 10_000;
-      while (Date.now() < eventDeadline) {
-        const polled = unread();
-        if (
-          polled.exitCode === 0 &&
-          (JSON.parse(polled.stdout) as unknown[]).length >= 1
-        ) {
-          break;
+        expect(result.exitCode, result.stderr).toBe(0);
+        return (JSON.parse(result.stdout) as { id: string }[]).map(
+          (event) => event.id,
+        );
+      };
+      const waitForUnread = async (count: number): Promise<string[]> => {
+        const deadline = Date.now() + 10_000;
+        while (Date.now() < deadline) {
+          const ids = unreadIds();
+          if (ids.length >= count) {
+            expect(ids).toHaveLength(count);
+            return ids;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 250));
         }
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
-      // Confirmed, not hoped for: the precondition the rest of this test
-      // depends on actually holds before we act on it.
-      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+        throw new Error(
+          `Expected ${count} unread event(s), got ${unreadIds().length}`,
+        );
+      };
+      const claim = () => {
+        const result = runWithEnv(
+          [
+            'hook',
+            'claim',
+            '--session',
+            sessionId,
+            '--lifecycle',
+            'turn-interruptible',
+            '--format',
+            'json',
+          ],
+          env,
+          dir,
+        );
+        expect(result.exitCode, result.stderr).toBe(0);
+        return JSON.parse(result.stdout) as {
+          mode: string;
+          urgency: string;
+        } | null;
+      };
+      const diagnose = () =>
+        callDaemon<HookDeliveryDiagnosis>(
+          'hook.diagnose',
+          {
+            sessionId,
+            lifecycle: 'turn-interruptible',
+          },
+          { socketPath },
+        );
+      const assertHealthy = () => {
+        // A registered transport makes this a positive delivery-health check,
+        // rather than the idle "via none" outcome of an absent heartbeat.
+        seedHeartbeat(fixture, 'hook');
+        const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+        expect(result.exitCode, result.stdout + result.stderr).toBe(0);
+        expect(result.stdout).toContain('✓ delivery-verdict');
+        expect(result.stdout).toContain('via hook');
+        expect(result.stdout).not.toContain('[reminders-suppressed]');
+        expect(result.stdout).not.toContain('coalesced-until-ack');
+        expect(result.stdout).not.toContain('agentmonitors events ack');
+      };
+      const acknowledge = (eventId: string) => {
+        const result = runWithEnv(
+          [
+            'events',
+            'ack',
+            '--session',
+            sessionId,
+            '--event-ids',
+            eventId,
+            '--socket',
+            socketPath,
+          ],
+          env,
+          dir,
+        );
+        expect(result.exitCode, result.stderr).toBe(0);
+      };
 
-      const claim = runWithEnv(
-        [
-          'hook',
-          'claim',
-          '--session',
-          sessionId,
-          '--lifecycle',
-          'turn-interruptible',
-          '--format',
-          'json',
-        ],
-        env,
-        dir,
-      );
-      expect(claim.exitCode).toBe(0);
-      const claimed = JSON.parse(claim.stdout) as { mode: string } | null;
-      // The first turn-interruptible claim over an unclaimed normal event
-      // always surfaces the coalesced reminder (002 §9.2) and durably claims
-      // the event (never acknowledges it) — confirming the exact
-      // claimed-but-unread state the suppression guard holds on, rather than
-      // assuming the claim did what it was expected to.
-      expect(claimed?.mode).toBe('delivery');
-      // Still unread (claiming never acknowledges — BP2/SP4): the suppression
-      // guard's precondition (an unread event that IS claimed) is exactly
-      // this state, confirmed rather than assumed.
-      expect(JSON.parse(unread().stdout)).toHaveLength(1);
+      expect(unreadIds()).toEqual([]);
+      writeFileSync(watchedFile, 'first changed content', 'utf-8');
+      const [a] = await waitForUnread(1);
+      if (!a) throw new Error('First event missing');
+      expect(claim()).toMatchObject({ mode: 'delivery', urgency: 'normal' });
+      expect(unreadIds()).toEqual([a]);
+      expect(claim()).toBeNull();
+      expect((await diagnose()).holds).toEqual([
+        expect.objectContaining({
+          reason: 'no-new-work',
+          pendingCount: 0,
+          claimedEventIds: [a],
+        }),
+      ]);
+      assertHealthy();
 
-      const result = runWithEnv(['doctor', '--workspace', dir], env, dir);
+      // No acknowledgment of A occurs before B is observed and delivered.
+      writeFileSync(watchedFile, 'second changed content', 'utf-8');
+      const both = await waitForUnread(2);
+      expect(both).toContain(a);
+      const b = both.find((id) => id !== a);
+      if (!b) throw new Error('Fresh event missing');
+      expect((await diagnose()).holds).toEqual([]);
+      expect(claim()).toMatchObject({ mode: 'delivery', urgency: 'normal' });
+      expect(unreadIds().sort()).toEqual([a, b].sort());
+      expect(claim()).toBeNull();
+      expect((await diagnose()).holds[0]?.reason).toBe('no-new-work');
+      assertHealthy();
 
-      expect(result.stdout).toContain('[reminders-suppressed]');
-      expect(result.stdout).toContain('coalesced-until-ack');
-      expect(result.stdout).toContain(
-        `agentmonitors events ack --session ${sessionId}`,
-      );
-      // Regression (issue #425 review, round 6): scoped to the exact claimed
-      // event id and the resolved socket, never a blanket
-      // `--session <id>` with no `--event-ids` (which would ack every unread
-      // row on the session) nor the wrong daemon's socket.
-      const claimedEventId = (
-        JSON.parse(unread().stdout) as { id: string }[]
-      )[0]?.id;
-      expect(claimedEventId).toBeDefined();
-      expect(result.stdout).toContain(`--event-ids ${claimedEventId}`);
-      expect(result.stdout).toContain(`--socket ${socketPath}`);
-      expect(result.stdout).toContain('✗ delivery-verdict');
-      expect(result.exitCode).toBe(1);
+      // Scoped acknowledgment clears only the selected durable event, even
+      // though both have already been surfaced by separate reminders.
+      acknowledge(a);
+      expect(unreadIds()).toEqual([b]);
+      expect(claim()).toBeNull();
+      acknowledge(b);
+      expect(unreadIds()).toEqual([]);
+      expect((await diagnose()).holds).toEqual([]);
     } finally {
       daemon.stop();
       await daemon.waitForExit();

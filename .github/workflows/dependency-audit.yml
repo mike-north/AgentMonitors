@@ -1,6 +1,6 @@
 name: Dependency Audit
 
-# Production-dependency advisory gate (issue #290). A dedicated workflow
+# Production and bundled-dependency advisory gate (issue #290). A dedicated workflow
 # (rather than a job folded into ci.yml) because this is a security-cadence
 # concern, not a per-PR correctness check: it needs its own `schedule:`
 # trigger independent of PR/push activity. It is not a required status check
@@ -10,6 +10,12 @@ on:
   pull_request:
     paths:
       - '**/package.json'
+      - '**/tsup.config.ts'
+      # Existing dev imports can become bundled without a manifest change.
+      - 'libs/core/**'
+      - 'plugins/source-*/**'
+      - 'apps/cli/**'
+      - 'scripts/publish-release-packages.mjs'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
       - 'scripts/audit-allowlist.json'
@@ -20,6 +26,12 @@ on:
       - main
     paths:
       - '**/package.json'
+      - '**/tsup.config.ts'
+      # Existing dev imports can become bundled without a manifest change.
+      - 'libs/core/**'
+      - 'plugins/source-*/**'
+      - 'apps/cli/**'
+      - 'scripts/publish-release-packages.mjs'
       - 'pnpm-lock.yaml'
       - 'pnpm-workspace.yaml'
       - 'scripts/audit-allowlist.json'
@@ -32,7 +44,7 @@ on:
 
 jobs:
   dependency-audit:
-    name: Production Dependency Audit
+    name: Production and Bundled Dependency Audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -52,5 +64,7 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Audit production dependencies (fails on unresolved high/critical advisories)
+      # The gate refreshes workspace exports with an uncached serial build,
+      # then builds temporary metafiles. No separate build step is required.
+      - name: Audit production and bundled dependencies (fails on unresolved high/critical advisories)
         run: pnpm check:dependency-audit

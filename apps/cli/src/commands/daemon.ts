@@ -1,10 +1,17 @@
+/**
+ * Own daemon lifecycle commands and continuous runtime coordination. Tick output
+ * must distinguish healthy silence from failed observations or rejected config
+ * so an operator can act on a paused monitor.
+ */
 import path from 'node:path';
 import { Command, Option } from 'commander';
 import type {
+  ChildProcessHandle,
   RuntimeStatus,
   RuntimeTickResult,
   WatchHandle,
 } from '@agentmonitors/core';
+import { isChildUnreaped, sendVerifiedSignal } from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
 import {
@@ -94,17 +101,9 @@ export async function waitForDetachedDaemonReady(
 /** How long to wait for a SIGTERM'd detach child to exit before escalating. */
 const DETACH_TERMINATE_GRACE_MS = 3_000;
 const DETACH_TERMINATE_POLL_MS = 50;
-
-/** Whether `pid` still names a live process this user may signal. */
-function isProcessAlive(pid: number): boolean {
-  try {
-    // Signal 0 performs the permission/existence check without delivering.
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
+/** What the cleanup signal is for, in user terms (008 §5 abstention reports). */
+const DETACH_CLEANUP_ACTION =
+  'cleanup of the background daemon this command started';
 
 /**
  * Terminate the child THIS command spawned and wait until it is actually gone,
@@ -117,10 +116,15 @@ function isProcessAlive(pid: number): boolean {
  * error message suggests then collides with the daemon this very invocation
  * orphaned. Terminating makes the failure report true.
  *
- * Only ever call this with the pid WE spawned. A daemon proven to be serving
- * under a different pid belongs to someone else (a concurrent lazy boot) and
- * must never be signalled; that case still terminates our own losing child,
- * which is ours to clean up.
+ * Only ever call this with the handle of the child WE spawned. A daemon proven
+ * to be serving under a different pid belongs to someone else (a concurrent
+ * lazy boot) and must never be signalled; that case still terminates our own
+ * losing child, which is ours to clean up.
+ *
+ * Every signal is identity-verified (008 §5): it is sent through the spawned
+ * child's own handle, and only while Node still holds that child unreaped. A
+ * child that has already exited is never signalled by pid — by then the OS may
+ * have given the pid to unrelated work — and counts as gone.
  *
  * SIGTERM first so the daemon's own handler can close its socket cleanly, then
  * escalate to SIGKILL if it has not exited within the grace window — otherwise
@@ -131,31 +135,26 @@ function isProcessAlive(pid: number): boolean {
  * terminate-and-confirm contract deterministically, with no daemon needed.
  */
 export async function terminateSpawnedDetachedDaemon(
-  pid: number | undefined,
+  child: ChildProcessHandle | undefined,
   graceMs: number = DETACH_TERMINATE_GRACE_MS,
   pollMs: number = DETACH_TERMINATE_POLL_MS,
 ): Promise<boolean> {
-  if (pid === undefined) return true;
-  if (!isProcessAlive(pid)) return true;
-  try {
-    process.kill(pid, 'SIGTERM');
-  } catch {
-    // Vanished between the liveness probe and the signal — the desired state.
-    return true;
-  }
+  if (child === undefined || !isChildUnreaped(child)) return true;
+  const target = { kind: 'spawned-process', handle: child } as const;
+  const options = { action: DETACH_CLEANUP_ACTION };
+  await sendVerifiedSignal(target, 'SIGTERM', options);
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) return true;
+    if (!isChildUnreaped(child)) return true;
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
-  try {
-    process.kill(pid, 'SIGKILL');
-  } catch {
-    return true;
-  }
+  await sendVerifiedSignal(target, 'SIGKILL', options);
   // Give the OS a moment to reap, then report the truth either way.
-  await new Promise((resolve) => setTimeout(resolve, pollMs));
-  return !isProcessAlive(pid);
+  const reapDeadline = Date.now() + Math.max(pollMs, 500);
+  while (isChildUnreaped(child) && Date.now() < reapDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+  return !isChildUnreaped(child);
 }
 
 /**
@@ -318,11 +317,13 @@ function appendErroredLines(
  * run within a monitor's next-due window is never mistaken for "no monitors
  * found" (issue #152). Returns the summary unchanged when nothing was skipped.
  *
- * The suffix reports the total skipped count and the soonest next-due time so
+ * Cadence skips report their count and soonest next-due time so
  * an author immediately knows how long to wait, e.g.:
  *   `(2 not yet due — next due in 28s)`
  *
- * The wording is intentionally generic: "not yet due" is accurate for both
+ * Source-config skips instead name the monitor and validation diagnostic;
+ * correcting config, rather than waiting, is required to resume observation.
+ * The cadence wording "not yet due" is accurate for both
  * interval-based monitors (file-fingerprint, api-poll) and schedule monitors
  * whose cron window has not opened, avoiding "interval not elapsed" language
  * that would be misleading for cron-driven sources.
@@ -332,12 +333,22 @@ function appendSkippedSuffix(
   skipped: RuntimeTickResult['skippedMonitors'],
   now: Date,
 ): string {
-  if (skipped.length === 0) return summary;
-  const soonestMs = Math.min(
-    ...skipped.map((s) => s.nextDueAt.getTime() - now.getTime()),
-  );
-  const soonestSec = Math.max(0, Math.ceil(soonestMs / 1000));
-  return `${summary} (${String(skipped.length)} not yet due — next due in ${String(soonestSec)}s)`;
+  const notDue = skipped.filter((entry) => entry.nextDueAt !== undefined);
+  if (notDue.length > 0) {
+    const soonestMs = Math.min(
+      ...notDue.map((entry) => entry.nextDueAt.getTime() - now.getTime()),
+    );
+    const soonestSec = Math.max(0, Math.ceil(soonestMs / 1000));
+    summary += ` (${String(notDue.length)} not yet due — next due in ${String(soonestSec)}s)`;
+  }
+  // Invalid config needs author action, not a fictitious next-due countdown.
+  // Include the complete shared diagnostic even when this tick emitted nothing.
+  for (const entry of skipped) {
+    if (entry.validationError !== undefined) {
+      summary += `\n  ${entry.monitorId}: skipped — ${entry.validationError}`;
+    }
+  }
+  return summary;
 }
 
 /**
@@ -406,12 +417,15 @@ export async function runLoop(
     while (!isStoppingRequested()) {
       try {
         const result = await runtime.tick(monitorsDir, workspacePath);
-        // Log when the tick emitted events OR when one or more monitors
-        // errored — a silent `emitted 0` must not hide a broken source
+        // Log events, observation failures, and validation skips: a silent
+        // `emitted 0` must not hide a broken source or rejected config
         // (issue #117). A clean no-change tick still logs nothing.
         if (
           result.emittedEventIds.length > 0 ||
-          result.erroredObservations.length > 0
+          result.erroredObservations.length > 0 ||
+          result.skippedMonitors.some(
+            (entry) => entry.validationError !== undefined,
+          )
         ) {
           const summary = appendErroredLines(
             `Emitted ${String(result.emittedEventIds.length)} event(s) from ${String(result.evaluatedMonitors.length)} monitor(s)${
@@ -421,7 +435,9 @@ export async function runLoop(
             }`,
             result.erroredObservations,
           );
-          console.log(summary);
+          console.log(
+            appendSkippedSuffix(summary, result.skippedMonitors, new Date()),
+          );
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -781,7 +797,9 @@ Foreground vs background:
           // timeout would otherwise leave a live background daemon the user
           // was told failed, and a subsequent retry would then hit "already
           // running" against it.
-          const terminated = await terminateSpawnedDetachedDaemon(pid);
+          const terminated = await terminateSpawnedDetachedDaemon(
+            spawned.child,
+          );
           // Thread the cleanup result into the report the same way the
           // identity-unproven branch below does: the caller needs to know
           // whether it is actually safe to retry, not just that we tried
@@ -841,7 +859,9 @@ Foreground vs background:
           // Only OUR pid is signalled: when `servingPid` proves a different
           // daemon owns the socket, that one is untouched — the process we
           // terminate is the losing child we ourselves spawned.
-          const terminated = await terminateSpawnedDetachedDaemon(pid);
+          const terminated = await terminateSpawnedDetachedDaemon(
+            spawned.child,
+          );
           const cleanupNote = describeSpawnedCleanupOutcome(
             pid,
             pidNote,

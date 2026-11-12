@@ -1,3 +1,4 @@
+/** Local daemon transport: bounded request admission, dispatch, and connection lifecycle. */
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
@@ -30,6 +31,11 @@ import type {
   Urgency,
 } from '@agentmonitors/core';
 import { z } from 'zod';
+import {
+  INPUT_LIMIT_ERROR_CODE,
+  MAX_DAEMON_REQUEST_BYTES,
+  requestInputLimitViolation,
+} from './input-limits.js';
 import { resolveDbPath } from './db-path.js';
 import { resolveDataRoot } from './workspace-paths.js';
 
@@ -53,6 +59,8 @@ const daemonMethodSchema = z.enum([
   'events.ack',
   'events.retractObject',
   'events.suppressObject',
+  'verifyArtifacts.register',
+  'verifyArtifacts.requestCleanup',
   'hook.claim',
   'hook.reserve',
   'hook.commit',
@@ -62,6 +70,8 @@ const daemonMethodSchema = z.enum([
   'hook.diagnose',
   'history.list',
   'monitor.explain',
+  'retry.rearm',
+  'retry.skip',
   'doctor.report',
   'daemon.tick',
   'watch.declare',
@@ -134,6 +144,28 @@ const eventsSuppressObjectParamsSchema = z.object({
   ttlMs: z.number().int().positive(),
   workspacePath: z.string().optional(),
 });
+// verify --use-workspace-daemon's durable artifact ownership (issue #562):
+// registered BEFORE the scratch file is created, so the daemon can keep that
+// exact key out of later sessions even if the run is killed before any event
+// projects. Only a verify scratch path carrying the run's own token is
+// accepted; a real watched path never gains by-key cleanup authority.
+const verifyArtifactsRegisterParamsSchema = z.object({
+  runId: z.string().regex(/^[0-9a-f]{12}$/, {
+    message: 'runId must be a 12-character lowercase hex verify run token',
+  }),
+  ownerSessionId: z.string(),
+  workspacePath: z.string().min(1),
+  monitorId: z.string(),
+  objectKey: z.string().refine(isVerifyScratchObjectKey, {
+    message:
+      'objectKey must be a verify scratch path (agentmonitors-verify-<token>); a real watched path keeps its exact event-id cleanup.',
+  }),
+});
+// The owner's explicit cleanup request after its proof: records permanent
+// cleanup authority for the run's artifact and retracts its existing events.
+const verifyArtifactsRequestCleanupParamsSchema = z.object({
+  runId: z.string(),
+});
 const hookClaimParamsSchema = z.object({
   sessionId: z.string(),
   lifecycle: deliveryLifecycleSchema,
@@ -172,6 +204,17 @@ const monitorExplainParamsSchema = z.object({
   workspacePath: z.string().optional(),
   historyLimit: z.number().int().positive().optional(),
   eventLimit: z.number().int().positive().optional(),
+});
+// Operator repair of one terminal materialization retry (005 `monitor retry`).
+// The route is required: a retry is only repaired through the exact
+// workspace/monitor it was admitted in, never by id alone.
+const retryRearmParamsSchema = z.object({
+  monitorId: z.string().min(1),
+  retryId: z.string().min(1),
+  workspacePath: z.string().min(1),
+});
+const retrySkipParamsSchema = retryRearmParamsSchema.extend({
+  reason: z.string().optional(),
 });
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
@@ -266,7 +309,7 @@ export interface DaemonStatusResult extends RuntimeStatus {
 }
 
 /**
- * Thrown by {@link callDaemon} when the daemon could not be *reached* — the
+ * Thrown by {@link callDaemon} when no reply came back from the daemon — the
  * socket was absent/refused, the connection dropped, or the request timed out.
  *
  * This is deliberately distinct from a plain `Error` carrying a daemon-side
@@ -275,14 +318,29 @@ export interface DaemonStatusResult extends RuntimeStatus {
  * fall back on this class — falling back on an application error would mask the
  * real failure and misreport it as "daemon not running" (issue #94 review,
  * comment 3408123745).
+ *
+ * {@link DaemonConnectionError.requestSent} says which side of the request the
+ * failure fell on. A read-only fallback may ignore it; a caller that would
+ * otherwise *write* in-process must not when it is `true`, because a daemon
+ * that accepted the request may already have applied it.
  */
 export class DaemonConnectionError extends Error {
   override readonly name = 'DaemonConnectionError';
+  /**
+   * `false` when the connection itself failed (no socket, refused, or never
+   * connected before the timeout): no daemon received the request. `true`
+   * once the request was written to a connected daemon and then no reply
+   * arrived (timeout, error or close): the daemon may have acted on it, so
+   * its outcome is unknown.
+   */
+  readonly requestSent: boolean;
   constructor(
     message: string,
     readonly cause?: unknown,
+    requestSent = false,
   ) {
     super(message);
+    this.requestSent = requestSent;
   }
 }
 
@@ -764,6 +822,18 @@ function handleRequest(
         }),
       });
     }
+    case 'verifyArtifacts.register': {
+      const params = verifyArtifactsRegisterParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.registerVerifyArtifact(params));
+    }
+    case 'verifyArtifacts.requestCleanup': {
+      const params = verifyArtifactsRequestCleanupParamsSchema.parse(
+        request.params,
+      );
+      return Promise.resolve(
+        runtime.requestVerifyArtifactCleanup({ runId: params.runId }),
+      );
+    }
     case 'hook.claim': {
       const params = hookClaimParamsSchema.parse(request.params);
       return Promise.resolve(
@@ -834,6 +904,21 @@ function handleRequest(
         ...(params.historyLimit ? { historyLimit: params.historyLimit } : {}),
         ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
       });
+    }
+    case 'retry.rearm': {
+      const params = retryRearmParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.rearmMaterializationRetry(params));
+    }
+    case 'retry.skip': {
+      const params = retrySkipParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.skipMaterializationRetry({
+          monitorId: params.monitorId,
+          retryId: params.retryId,
+          workspacePath: params.workspacePath,
+          ...(params.reason !== undefined ? { reason: params.reason } : {}),
+        }),
+      );
     }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
@@ -970,30 +1055,78 @@ export function createDaemonServer({
 
   let serverClosed = false;
   const server = net.createServer((socket) => {
-    let buffer = '';
-    socket.setEncoding('utf-8');
+    let buffer = Buffer.alloc(0);
+    let byteLength = 0;
+    // One connection admits one request, even when more frames arrive while
+    // asynchronous dispatch is in flight. Rejection cannot dispatch a suffix.
+    let admitted = false;
 
     const respond = (payload: DaemonResponse) => {
+      admitted = true;
+      buffer = Buffer.alloc(0);
       socket.end(`${JSON.stringify(payload)}\n`);
     };
 
-    socket.on('data', (chunk) => {
-      buffer += typeof chunk === 'string' ? chunk : chunk.toString('utf-8');
-      const newline = buffer.indexOf('\n');
+    // A peer may disconnect after rejection. Its reset is connection-local,
+    // never an uncaught error that terminates unrelated sessions' daemon.
+    socket.on('error', () => {
+      admitted = true;
+      buffer = Buffer.alloc(0);
+    });
+    socket.on('data', (chunk: Buffer) => {
+      if (admitted) {
+        return;
+      }
+      const newline = chunk.indexOf(0x0a);
+      const part = newline === -1 ? chunk : chunk.subarray(0, newline);
+      if (byteLength + part.length > MAX_DAEMON_REQUEST_BYTES) {
+        respond({
+          id: UNPARSEABLE_REQUEST_ID,
+          code: INPUT_LIMIT_ERROR_CODE,
+          error: `Request must be at most ${String(MAX_DAEMON_REQUEST_BYTES)} bytes`,
+        });
+        return;
+      }
+      // Grow a single bounded allocation. Retaining one Buffer per chunk
+      // would let tiny fragments amplify memory beyond the byte budget.
+      const needed = byteLength + part.length;
+      if (needed > buffer.length) {
+        const capacity = Math.min(
+          MAX_DAEMON_REQUEST_BYTES,
+          Math.max(needed, buffer.length * 2, 4096),
+        );
+        const grown = Buffer.allocUnsafe(capacity);
+        buffer.copy(grown, 0, 0, byteLength);
+        buffer = grown;
+      }
+      part.copy(buffer, byteLength);
+      byteLength = needed;
       if (newline === -1) return;
-
-      const raw = buffer.slice(0, newline);
-      buffer = buffer.slice(newline + 1);
+      admitted = true;
+      const raw = buffer.subarray(0, byteLength).toString('utf8');
+      buffer = Buffer.alloc(0);
 
       let request: DaemonRequest;
       try {
-        request = daemonRequestSchema.parse(JSON.parse(raw));
+        const decoded: unknown = JSON.parse(raw);
+        const violation = requestInputLimitViolation(decoded);
+        if (violation) {
+          const id =
+            decoded !== null &&
+            typeof decoded === 'object' &&
+            // Only the sender's own id can correlate an admission response.
+            Object.hasOwn(decoded, 'id') &&
+            'id' in decoded &&
+            typeof decoded.id === 'string'
+              ? decoded.id
+              : UNPARSEABLE_REQUEST_ID;
+          respond({ id, code: INPUT_LIMIT_ERROR_CODE, error: violation });
+          return;
+        }
+        request = daemonRequestSchema.parse(decoded);
       } catch {
-        // `error` stays byte-for-byte the legacy text (see
-        // `LEGACY_UNPARSEABLE_REQUEST_MESSAGE`) so an old client sees the same
-        // message as before; `code` is purely additive — an old client's
-        // `daemonResponseSchema` ignores an unrecognized field, so this never
-        // breaks it (issue #382).
+        // Preserve legacy invalid-request diagnostics for existing clients;
+        // admission failures above have their own stable machine code.
         respond({
           id: UNPARSEABLE_REQUEST_ID,
           error: LEGACY_UNPARSEABLE_REQUEST_MESSAGE,
@@ -1152,6 +1285,7 @@ export async function callDaemon<T = unknown>(
       socket.removeAllListeners('data');
       socket.removeAllListeners('error');
       socket.removeAllListeners('connect');
+      socket.removeAllListeners('close');
       socket.setTimeout(0);
       fn();
     };
@@ -1166,12 +1300,19 @@ export async function callDaemon<T = unknown>(
       });
     };
 
+    // Set once the request is handed to a connected socket. From then on a
+    // missing reply leaves the daemon's outcome unknown (`requestSent`).
+    let requestSent = false;
+
     socket.setTimeout(timeoutMs, () => {
-      // A timeout means the daemon could not be reached in time — a connection
-      // failure, not a daemon-side application error.
+      // No reply in time — a connection failure, not a daemon-side
+      // application error. Before the request was written it means no daemon
+      // accepted the connection; after, the daemon may still be handling it.
       fail(
         new DaemonConnectionError(
           `Timed out waiting for AgentMon daemon at ${socketPath}`,
+          undefined,
+          requestSent,
         ),
       );
     });
@@ -1179,13 +1320,26 @@ export async function callDaemon<T = unknown>(
     socket.setEncoding('utf-8');
     socket.on('error', (error) => {
       // Socket-level errors (ECONNREFUSED, ENOENT, dropped connection, …) mean
-      // the daemon was unreachable — classify them as connection failures so a
+      // no reply came back — classify them as connection failures so a
       // caller's "daemon unavailable" fallback can distinguish them from a real
       // daemon-side application error.
       fail(
         new DaemonConnectionError(
           error instanceof Error ? error.message : String(error),
           error,
+          requestSent,
+        ),
+      );
+    });
+    socket.on('close', () => {
+      // The peer closed without a complete reply line (a close with an error
+      // was already settled by the 'error' handler above). Without this, a
+      // closed socket would leave the promise unsettled.
+      fail(
+        new DaemonConnectionError(
+          `AgentMon daemon at ${socketPath} closed the connection without a reply`,
+          undefined,
+          requestSent,
         ),
       );
     });
@@ -1217,6 +1371,7 @@ export async function callDaemon<T = unknown>(
       }
     });
     socket.on('connect', () => {
+      requestSent = true;
       socket.write(`${JSON.stringify(request)}\n`);
     });
     socket.connect(socketPath);

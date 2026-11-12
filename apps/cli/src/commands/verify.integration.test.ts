@@ -10,6 +10,7 @@
  * @see docs/specs/005-cli-reference.md §16
  */
 import {
+  execFile,
   execFileSync,
   spawn,
   type ChildProcess,
@@ -17,16 +18,28 @@ import {
 } from 'node:child_process';
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import {
+  createDb,
+  RuntimeStore,
+  type MonitorEventRecord,
+  type VerifyArtifactRecord,
+} from '@agentmonitors/core';
+import { assertVerifySucceeded } from '../test-support/verify-result.js';
+import { listObservationHistoryClient } from '../runtime-client.js';
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 
@@ -78,6 +91,21 @@ function writeMonitor(
 }
 
 /** Files matching the auto-trigger scratch name (must be gone after cleanup). */
+/**
+ * The verify-artifact ownership records the workspace daemon's database holds
+ * (issue #562), read through a short-lived connection of our own.
+ */
+function verifyArtifactsIn(dbPath: string | undefined): VerifyArtifactRecord[] {
+  if (dbPath === undefined) throw new Error('AGENTMONITORS_DB is not set');
+  const db = createDb(dbPath);
+  try {
+    return new RuntimeStore(db).listVerifyArtifacts();
+  } finally {
+    // InboxDb hides its driver; close only the connection opened here.
+    (db as unknown as { $client: { close(): void } }).$client.close();
+  }
+}
+
 function scratchFiles(workspace: string): string[] {
   return readdirSync(workspace).filter((name) =>
     name.startsWith('agentmonitors-verify-'),
@@ -112,7 +140,7 @@ describe('agentmonitors verify', () => {
       ['verify', 'docs-watch', '--workspace', ws, '--format', 'json'],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       stages: { name: string; status: string }[];
@@ -152,7 +180,7 @@ describe('agentmonitors verify', () => {
       ['verify', 'debounced', '--workspace', ws, '--format', 'json'],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       failure: { kind: string } | null;
@@ -276,7 +304,7 @@ describe('agentmonitors verify', () => {
       ],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       stages: { name: string; status: string; detail: string }[];
@@ -366,7 +394,7 @@ describe('agentmonitors verify', () => {
       ],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       failure: { kind: string; message: string } | null;
@@ -430,7 +458,7 @@ describe('agentmonitors verify', () => {
       ],
       ws,
     );
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
     const report = JSON.parse(result.stdout) as {
       ok: boolean;
       failure: { kind: string; message: string } | null;
@@ -630,6 +658,29 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
     }
   }
 
+  /** {@link runWs} without blocking the event loop (for in-process relays). */
+  function runWsAsync(
+    args: string[],
+    cwd: string,
+    env: Record<string, string>,
+  ): Promise<RunResult> {
+    return new Promise((resolve) => {
+      execFile(
+        CLI[0],
+        [CLI[1], ...args],
+        { encoding: 'utf-8', env, cwd },
+        (error, stdout, stderr) => {
+          const status = (error as { code?: unknown } | null)?.code;
+          resolve({
+            stdout,
+            stderr,
+            exitCode: error ? (typeof status === 'number' ? status : 1) : 0,
+          });
+        },
+      );
+    });
+  }
+
   beforeAll(() => {
     tempDir = mkdtempSync(path.join(tmpdir(), 'verify-ws-'));
   });
@@ -747,7 +798,10 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         ok: boolean;
         stages: { name: string; status: string }[];
       };
-      expect(verifyReport.ok).toBe(true);
+      expect(
+        verifyReport.ok,
+        `${verifyResult.stdout}\n${verifyResult.stderr}`,
+      ).toBe(true);
       expect(verifyResult.exitCode).toBe(0);
       // The scratch file itself is gone from disk (unchanged cleanup contract).
       expect(scratchFiles(ws)).toHaveLength(0);
@@ -793,6 +847,19 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         await delay(400);
       }
       expect(realDelivered).toBe(true);
+
+      // The run owned its artifact durably and requested its cleanup (#562):
+      // exactly one record, keyed by the run token the scratch name carries.
+      const artifacts = verifyArtifactsIn(env['AGENTMONITORS_DB']);
+      expect(artifacts).toHaveLength(1);
+      const [artifact] = artifacts;
+      expect(artifact).toMatchObject({
+        monitorId: 'docs-watch',
+        cleanupCause: 'owner-request',
+      });
+      expect(path.basename(artifact?.objectKey ?? '')).toBe(
+        `agentmonitors-verify-${artifact?.runId ?? ''}.md`,
+      );
     } finally {
       // Tear the daemon down within the test so a retry starts clean.
       runWs(['daemon', 'stop'], ws, env);
@@ -812,6 +879,318 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
       rmSync(socketDir, { recursive: true, force: true });
     }
   }, 90_000);
+
+  it('falls back to the legacy cleanup against a daemon that predates artifact ownership, still leaving no scratch event', async () => {
+    // Version skew: a current CLI talking to a daemon built before durable
+    // verify-artifact ownership existed. The relay answers the ownership
+    // registration exactly as such a daemon does (`unsupported_request`) and
+    // forwards every other request to a real daemon, so the run takes the
+    // legacy cleanup path end to end.
+    const ws = mkdtempSync(path.join(tempDir, 'skew-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'ams-'));
+    const baseEnv = Object.fromEntries(
+      Object.entries(process.env).filter(([, v]) => v !== undefined),
+    ) as Record<string, string>;
+    const daemonSocket = path.join(socketDir, 'd.sock');
+    const relaySocket = path.join(socketDir, 'r.sock');
+    const daemonEnv: Record<string, string> = {
+      ...baseEnv,
+      AGENTMONITORS_SOCKET: daemonSocket,
+      AGENTMONITORS_DB: path.join(socketDir, 'verify.db'),
+    };
+    const env: Record<string, string> = {
+      ...daemonEnv,
+      AGENTMONITORS_SOCKET: relaySocket,
+    };
+
+    // The relay runs in this test process, so every CLI call routed through it
+    // must leave the event loop free (execFileSync would deadlock the relay).
+    const refusedMethods: string[] = [];
+    const relay = net.createServer((client) => {
+      let pending = '';
+      client.on('error', () => undefined);
+      client.on('data', (chunk) => {
+        pending += chunk.toString('utf-8');
+        const newline = pending.indexOf('\n');
+        if (newline === -1) return;
+        const line = pending.slice(0, newline + 1);
+        client.removeAllListeners('data');
+        const request = JSON.parse(line) as { id: string; method: string };
+        if (request.method === 'verifyArtifacts.register') {
+          refusedMethods.push(request.method);
+          client.end(
+            `${JSON.stringify({
+              id: request.id,
+              error: `Unknown method: ${request.method}`,
+              code: 'unsupported_request',
+            })}\n`,
+          );
+          return;
+        }
+        const upstream = net.createConnection(daemonSocket);
+        upstream.on('error', () => client.destroy());
+        upstream.on('connect', () => upstream.write(line));
+        upstream.pipe(client);
+      });
+    });
+    await new Promise<void>((resolve) => relay.listen(relaySocket, resolve));
+
+    expect(
+      (await runWsAsync(['init', '--enable-only'], ws, env)).exitCode,
+    ).toBe(0);
+    writeMonitor(
+      ws,
+      'docs-watch',
+      `name: Docs watch\nwatch:\n  type: file-fingerprint\n  globs:\n    - '*.md'\n  cwd: ${JSON.stringify(ws)}\n  interval: '1s'\nurgency: normal`,
+    );
+    writeFileSync(path.join(ws, 'readme.md'), 'hello', 'utf-8');
+
+    const daemon: ChildProcess = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        path.join(ws, '.claude', 'monitors'),
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '500',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env: daemonEnv, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+
+    try {
+      let dstdout = '';
+      let dstderr = '';
+      daemon.stdout?.setEncoding('utf-8');
+      daemon.stderr?.setEncoding('utf-8');
+      daemon.stdout?.on('data', (c: string) => (dstdout += c));
+      daemon.stderr?.on('data', (c: string) => (dstderr += c));
+      const bootDeadline = Date.now() + 15_000;
+      while (
+        Date.now() < bootDeadline &&
+        !dstdout.includes('AgentMon daemon listening')
+      ) {
+        if (daemon.exitCode !== null) {
+          throw new Error(
+            `daemon exited early (${String(daemon.exitCode)}).\n${dstdout}\n${dstderr}`,
+          );
+        }
+        await delay(100);
+      }
+      expect(dstdout).toContain('AgentMon daemon listening');
+
+      const sessionResult = await runWsAsync(
+        [
+          'session',
+          'open',
+          '--host-session-id',
+          'user-session',
+          '--workspace',
+          ws,
+          '--format',
+          'id',
+        ],
+        ws,
+        env,
+      );
+      expect(sessionResult.exitCode, sessionResult.stderr).toBe(0);
+      const sessionId = sessionResult.stdout.trim();
+
+      const verifyResult = await runWsAsync(
+        [
+          'verify',
+          'docs-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--format',
+          'json',
+        ],
+        ws,
+        env,
+      );
+      const verifyReport = JSON.parse(verifyResult.stdout) as { ok: boolean };
+      expect(
+        verifyReport.ok,
+        `${verifyResult.stdout}\n${verifyResult.stderr}`,
+      ).toBe(true);
+      expect(verifyResult.exitCode).toBe(0);
+      // The run did ask for ownership and was refused, so it took the fallback.
+      expect(refusedMethods).toEqual(['verifyArtifacts.register']);
+      expect(scratchFiles(ws)).toHaveLength(0);
+
+      const afterVerify = await runWsAsync(
+        ['events', 'list', '--session', sessionId, '--format', 'json'],
+        ws,
+        env,
+      );
+      expect(afterVerify.exitCode).toBe(0);
+      expect(afterVerify.stdout).not.toContain('agentmonitors-verify-');
+      expect(JSON.parse(afterVerify.stdout) as unknown[]).toHaveLength(0);
+      // No ownership record exists: the refused registration wrote nothing.
+      expect(verifyArtifactsIn(daemonEnv['AGENTMONITORS_DB'])).toHaveLength(0);
+    } finally {
+      runWs(['daemon', 'stop'], ws, daemonEnv);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const t = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+            resolve();
+          }, 3_000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(t);
+            resolve();
+          });
+        });
+      }
+      await new Promise<void>((resolve) => relay.close(() => resolve()));
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 90_000);
+
+  it('keeps a real daemon observation recorded before the trigger command finishes', async () => {
+    const ws = mkdtempSync(path.join(tempDir, 'boundary-'));
+    const socketDir = mkdtempSync(path.join(tmpdir(), 'amb-'));
+    const dbPath = path.join(socketDir, 'verify.db');
+    const env: Record<string, string> = {
+      ...(Object.fromEntries(
+        Object.entries(process.env).filter(([, value]) => value !== undefined),
+      ) as Record<string, string>),
+      AGENTMONITORS_SOCKET: path.join(socketDir, 'd.sock'),
+      AGENTMONITORS_DB: dbPath,
+    };
+    expect(runWs(['init', '--enable-only'], ws, env).exitCode).toBe(0);
+    const watched = path.join(ws, 'watched.txt');
+    writeFileSync(watched, 'baseline contents');
+    writeMonitor(
+      ws,
+      'boundary-watch',
+      `watch:\n  type: command-poll\n  command:\n    - cat\n    - ${JSON.stringify(watched)}\n  interval: '1s'\nurgency: normal`,
+    );
+    const evidencePath = path.join(ws, 'boundary-evidence.json');
+    const scriptPath = path.join(ws, 'trigger.cjs');
+    const sqliteModule = createRequire(import.meta.url).resolve(
+      'better-sqlite3',
+    );
+    // This owned trigger waits for the actual durable daemon history row before
+    // completing. The test therefore does not depend on a lucky wall-clock phase
+    // or infer persistence from a source-side marker/timeout.
+    writeFileSync(
+      scriptPath,
+      `
+      const fs = require('node:fs');
+      const Database = require(${JSON.stringify(sqliteModule)});
+      const db = new Database(${JSON.stringify(dbPath)}, { readonly: true });
+      const route = ['boundary-watch', ${JSON.stringify(ws)}];
+      const latest = db.prepare('SELECT id FROM observation_history WHERE monitor_id = ? AND workspace_path = ? ORDER BY id DESC LIMIT 1').get(...route);
+      const query = db.prepare("SELECT id, created_at FROM observation_history WHERE monitor_id = ? AND workspace_path = ? AND id > ? AND result = 'triggered' ORDER BY id DESC LIMIT 1");
+      const startedAt = Date.now();
+      fs.writeFileSync(${JSON.stringify(watched)}, 'changed by bounded trigger');
+      let recorded;
+      while (Date.now() - startedAt < 10000) {
+        recorded = query.get(...route, latest.id);
+        if (recorded) break;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      }
+      if (!recorded) throw new Error('Daemon did not persist the triggered observation');
+      const evidence = { beforeId: latest.id, triggeredId: recorded.id, persistedAtMs: recorded.created_at * 1000, completedAt: Date.now() };
+      fs.writeFileSync(${JSON.stringify(evidencePath)}, JSON.stringify(evidence));
+      db.close();
+    `,
+    );
+    const daemon = spawn(
+      CLI[0],
+      [
+        CLI[1],
+        'daemon',
+        'run',
+        path.join(ws, '.claude', 'monitors'),
+        '--workspace',
+        ws,
+        '--poll-ms',
+        '100',
+        '--reap-after-ms',
+        '0',
+      ],
+      { cwd: ws, env, stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    let output = '';
+    daemon.stdout?.setEncoding('utf8');
+    daemon.stderr?.setEncoding('utf8');
+    daemon.stdout?.on('data', (chunk: string) => {
+      output += chunk;
+    });
+    daemon.stderr?.on('data', (chunk: string) => {
+      output += chunk;
+    });
+    try {
+      const deadline = Date.now() + 15000;
+      while (
+        !output.includes('AgentMon daemon listening') &&
+        Date.now() < deadline &&
+        daemon.exitCode === null
+      )
+        await delay(50);
+      expect(output).toContain('AgentMon daemon listening');
+      const command = `node '${scriptPath.replaceAll("'", "'\\''")}'`;
+      const result = runWs(
+        [
+          'verify',
+          'boundary-watch',
+          '--use-workspace-daemon',
+          '--workspace',
+          ws,
+          '--trigger-cmd',
+          command,
+          '--timeout-ms',
+          '8000',
+          '--format',
+          'json',
+        ],
+        ws,
+        env,
+      );
+      const evidence = JSON.parse(readFileSync(evidencePath, 'utf8')) as {
+        beforeId: string;
+        triggeredId: string;
+        persistedAtMs: number;
+        completedAt: number;
+      };
+      expect(evidence.triggeredId > evidence.beforeId).toBe(true);
+      expect(evidence.persistedAtMs).toBeLessThanOrEqual(evidence.completedAt);
+      const report = JSON.parse(result.stdout) as {
+        ok: boolean;
+        stages: { name: string; status: string }[];
+        additionalContext: string | null;
+      };
+      expect(report.ok, JSON.stringify({ report, evidence })).toBe(true);
+      expect(result.exitCode, `${result.stdout}\n${result.stderr}`).toBe(0);
+      expect(report.stages.find(({ name }) => name === 'observe')?.status).toBe(
+        'pass',
+      );
+      expect(report.additionalContext).toBeTruthy();
+    } finally {
+      runWs(['daemon', 'stop'], ws, env);
+      if (daemon.exitCode === null) {
+        daemon.kill('SIGTERM');
+        await new Promise<void>((resolve) => {
+          const timer = globalThis.setTimeout(() => {
+            daemon.kill('SIGKILL');
+          }, 3000);
+          daemon.once('exit', () => {
+            globalThis.clearTimeout(timer);
+            resolve();
+          });
+        });
+      }
+      rmSync(socketDir, { recursive: true, force: true });
+    }
+  }, 40000);
 
   // Issue #418 (HIGH): a LITERAL single-file glob whose watched file did not exist
   // is a case verify triggers by creating the REAL watched file — its objectKey is
@@ -915,27 +1294,34 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         ws,
         env,
       );
-      const verifyReport = JSON.parse(verifyResult.stdout) as {
-        ok: boolean;
-        stages: { name: string; status: string }[];
-      };
-      expect(verifyReport.ok).toBe(true);
-      expect(verifyResult.exitCode).toBe(0);
-      // verify's own trigger file is gone from disk again (it created + removed it).
-      expect(scratchFiles(ws)).toHaveLength(0);
+      await assertVerifySucceeded(verifyResult, () =>
+        listObservationHistoryClient(
+          { monitorId: 'file-watch', workspacePath: ws, limit: 10 },
+          env['AGENTMONITORS_SOCKET'],
+        ),
+      );
+      // A literal trigger uses the real watched name, not the scratch prefix.
+      // Both the file and its synthetic create/delete events must be gone before
+      // a later create can serve as evidence of non-suppression.
+      const watched = path.join(ws, 'watched.txt');
+      expect(existsSync(watched)).toBe(false);
+      const afterVerify = runWs(
+        ['events', 'list', '--session', sessionId, '--format', 'json'],
+        ws,
+        env,
+      );
+      expect(afterVerify.exitCode, afterVerify.stderr).toBe(0);
+      expect(JSON.parse(afterVerify.stdout)).toEqual([]);
 
       // ── The finding: a REAL create at the watched path AFTER verify must be
       // delivered and SURVIVE. Pre-fix, a durable tombstone keyed to this real path
       // swept it on the tick it materialized, so it never appeared. Post-fix there
       // is no tombstone at a real path, so it lands and stays.
-      writeFileSync(
-        path.join(ws, 'watched.txt'),
-        'a genuine change\n',
-        'utf-8',
-      );
-      let realDelivered = false;
+      const realContents = 'a genuine change\n';
+      writeFileSync(watched, realContents, 'utf-8');
+      let realEvent: MonitorEventRecord | undefined;
       const realDeadline = Date.now() + 20_000;
-      while (Date.now() < realDeadline && !realDelivered) {
+      while (Date.now() < realDeadline && !realEvent) {
         const unread = runWs(
           [
             'events',
@@ -949,23 +1335,66 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
           ws,
           env,
         );
-        if (unread.exitCode === 0 && unread.stdout.includes('watched.txt')) {
-          realDelivered = true;
-          break;
-        }
+        expect(unread.exitCode, unread.stderr).toBe(0);
+        const events = JSON.parse(unread.stdout) as MonitorEventRecord[];
+        realEvent = events.find(
+          (event) =>
+            event.monitorId === 'file-watch' &&
+            event.objectKey === watched &&
+            event.snapshotText === realContents,
+        );
+        if (realEvent) break;
         await delay(400);
       }
-      expect(realDelivered).toBe(true);
+      expect(
+        realEvent,
+        'the real file contents must materialize for the lead session',
+      ).toBeDefined();
+      expect(realEvent?.deliveryState).toBe('unread');
 
-      // And it SURVIVES subsequent ticks (a tombstone would have swept it by now).
-      await delay(2_000);
+      // Prove survival across completed observations, not elapsed wall time:
+      // a loaded daemon may not run any ticks during a fixed sleep.
+      const historyQuery = {
+        monitorId: 'file-watch',
+        workspacePath: ws,
+        limit: 10,
+      };
+      const history = await listObservationHistoryClient(
+        historyQuery,
+        env['AGENTMONITORS_SOCKET'],
+      );
+      const frontier = history[0]?.id;
+      expect(frontier).toBeDefined();
+      const survivalDeadline = Date.now() + 20_000;
+      let subsequentObservations = 0;
+      while (Date.now() < survivalDeadline && subsequentObservations < 2) {
+        const rows = await listObservationHistoryClient(
+          historyQuery,
+          env['AGENTMONITORS_SOCKET'],
+        );
+        subsequentObservations = rows.filter(
+          (row) => frontier !== undefined && row.id > frontier,
+        ).length;
+        if (subsequentObservations < 2) await delay(100);
+      }
+      expect(
+        subsequentObservations,
+        'daemon must complete two later observations',
+      ).toBeGreaterThanOrEqual(2);
       const stillThere = runWs(
         ['events', 'list', '--session', sessionId, '--format', 'json'],
         ws,
         env,
       );
       expect(stillThere.exitCode).toBe(0);
-      expect(stillThere.stdout).toContain('watched.txt');
+      const surviving = JSON.parse(stillThere.stdout) as MonitorEventRecord[];
+      expect(
+        surviving.find((event) => event.id === realEvent?.id),
+      ).toMatchObject({
+        objectKey: watched,
+        snapshotText: realContents,
+        deliveryState: 'unread',
+      });
     } finally {
       runWs(['daemon', 'stop'], ws, env);
       if (daemon.exitCode === null) {
@@ -1138,6 +1567,11 @@ describe('agentmonitors verify --use-workspace-daemon (issues #407/#418)', () =>
         await delay(500);
       }
       expect(clean).toBe(true);
+      // The interrupted run's artifact was registered before creation and has
+      // cleanup authority now (#562), so its key stays out of later sessions.
+      const artifacts = verifyArtifactsIn(env['AGENTMONITORS_DB']);
+      expect(artifacts).toHaveLength(1);
+      expect(artifacts[0]?.cleanupRequestedAt).not.toBeNull();
     } finally {
       runWs(['daemon', 'stop'], ws, env);
       if (daemon.exitCode === null) {

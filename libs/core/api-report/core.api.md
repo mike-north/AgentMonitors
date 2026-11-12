@@ -23,7 +23,7 @@ export class AgentMonitorRuntime {
     cancelEphemeralMonitor(sessionId: string, ephemeralId: string): EphemeralMonitorRecord;
     claimDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryClaim | null;
     // (undocumented)
-    closeSession(sessionId: string): AgentSessionRecord;
+    closeSession(sessionId: string, now?: Date): AgentSessionRecord;
     commitDelivery(reservationId: string): DeliveryClaim | null;
     declareEphemeralMonitor(input: DeclareEphemeralMonitorInput): EphemeralMonitorRecord;
     diagnoseHookDelivery(sessionId: string, lifecycle: DeliveryLifecycle): HookDeliveryDiagnosis;
@@ -37,13 +37,20 @@ export class AgentMonitorRuntime {
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
     // (undocumented)
     listSessions(): AgentSessionRecord[];
+    listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[];
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
+    rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryRepairResult;
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
+    registerVerifyArtifact(input: RegisterVerifyArtifactInput): VerifyArtifactRecord;
     releaseDelivery(reservationId: string): void;
+    requestVerifyArtifactCleanup(input: {
+        runId: string;
+        now?: Date;
+    }): VerifyArtifactCleanupResult;
     reserveDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryReservation | null;
     retractObjectEvents(input: {
         workspacePath?: string | null;
@@ -51,6 +58,7 @@ export class AgentMonitorRuntime {
         objectKey: string;
         eventIds: string[];
     }): number;
+    skipMaterializationRetry(input: MaterializationRetrySkipInput): MaterializationRetryRepairResult;
     // (undocumented)
     status(): RuntimeStatus;
     suppressObjectEvents(input: {
@@ -151,6 +159,17 @@ export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 
 
 // @public
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
+
+// @public
+export interface ChildProcessHandle {
+    readonly exitCode: number | null;
+    // (undocumented)
+    kill(signal?: NodeJS.Signals | number): boolean;
+    once?(event: 'exit', listener: () => void): unknown;
+    // (undocumented)
+    readonly pid?: number | undefined;
+    readonly signalCode: NodeJS.Signals | null;
+}
 
 // @public
 export function classifyReminderHold(urgency: 'normal' | 'low', unreadCount: number, pendingCount: number, claimedEventIds?: string[], leasedCount?: number): HookDeliveryHold | null;
@@ -271,6 +290,9 @@ export interface DerivedFactRule {
 }
 
 // @public
+export function describeSignalAbstention(abstention: SignalAbstention): string;
+
+// @public
 export function diffKeyedCollection(parsedOutput: unknown, config: KeyedCollectionConfig, monitorObjectKey: string, previousSnapshot: KeyedSnapshot | undefined, observationFields?: {
     payload?: Record<string, unknown>;
     queryScope?: Record<string, string | string[]>;
@@ -290,6 +312,9 @@ export interface DoctorDeliveryCounts {
 }
 
 // @public
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+// @public
 export interface DoctorMonitorRollup {
     cadence: string;
     delivery: DoctorDeliveryCounts;
@@ -305,6 +330,7 @@ export interface DoctorMonitorRollup {
     nextDueAt?: Date;
     // (undocumented)
     sourceName: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
     // (undocumented)
     urgency: Urgency;
     valid: boolean;
@@ -392,6 +418,15 @@ export interface EphemeralMonitorRecord {
 export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
 
 // @public
+export interface EphemeralMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
+    monitorId: string;
+    sessionId: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
+    validationError?: string;
+}
+
+// @public
 export interface ErroredObservation {
     // (undocumented)
     message: string;
@@ -429,6 +464,12 @@ export function fingerprintText(content: string): string;
 export function generateMonitorSchema(sources: ObservationSource[]): JsonSchema;
 
 // @public
+export interface GroupMembershipTracking {
+    readonly signal?: AbortSignal;
+    readonly untilMs: number;
+}
+
+// @public
 export interface HookDeliveryDiagnosis {
     // (undocumented)
     holds: HookDeliveryHold[];
@@ -455,7 +496,7 @@ export interface HookDeliveryHold {
 }
 
 // @public
-export type HookDeliveryHoldReason = 'settle-window' | 'already-claimed' | 'coalesced-until-ack' | 'reserved-in-flight';
+export type HookDeliveryHoldReason = 'settle-window' | 'no-new-work' | 'already-claimed' | 'coalesced-until-ack' | 'reserved-in-flight';
 
 // @public (undocumented)
 export interface HookState {
@@ -484,6 +525,9 @@ export interface HookState {
     updatedAt: string;
     urgent?: UrgentItem[];
 }
+
+// @public
+export type IdentityEvidence = 'live-child-handle' | 'recorded-identity';
 
 // @public (undocumented)
 export interface InboxDb {
@@ -583,6 +627,9 @@ export type InterpretResult = {
 export function invalidTimezoneError(watchConfig: Record<string, unknown>, scopeSchema: JsonSchema): string | undefined;
 
 // @public
+export function isChildUnreaped(handle: ChildProcessHandle): boolean;
+
+// @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;
 
 // @public
@@ -591,7 +638,7 @@ export function isValidIanaTimeZone(timeZone: string): boolean;
 // @public
 export function isVerifyScratchObjectKey(objectKey: string): boolean;
 
-// @public (undocumented)
+// @public
 export type JsonSchema = Record<string, unknown>;
 
 // @public
@@ -623,6 +670,9 @@ export const MATERIALIZATION_RETRY_MAX_BYTES: number;
 export const MATERIALIZATION_RETRY_MAX_RECORDS = 256;
 
 // @public
+export const MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH = 200;
+
+// @public
 export class MaterializationRetryCapacityError extends Error {
     constructor(monitorId: string);
     readonly code = "materialization_retry_capacity_exceeded";
@@ -638,6 +688,13 @@ export interface MaterializationRetryDiagnostic {
     nextAttemptAt: Date | null;
     status: MaterializationRetryStatus;
     updatedAt: Date;
+}
+
+// @public
+export class MaterializationRetryNotFoundError extends Error {
+    constructor(retryId: string);
+    readonly code = "materialization_retry_not_found";
+    readonly retryId: string;
 }
 
 // @public
@@ -666,10 +723,31 @@ export interface MaterializationRetryRecord {
 }
 
 // @public
+export interface MaterializationRetryRepairInput {
+    monitorId: string;
+    retryId: string;
+    workspacePath: string;
+}
+
+// @public
+export type MaterializationRetryRepairOutcome = 'rearmed' | 'skipped' | 'verify-artifact-cleanup';
+
+// @public
+export interface MaterializationRetryRepairResult {
+    outcome: MaterializationRetryRepairOutcome;
+    retry: MaterializationRetryDiagnostic;
+}
+
+// @public
 export class MaterializationRetrySerializationError extends Error {
     constructor(path: string, reason: string);
     readonly code = "materialization_retry_serialization_failed";
     readonly path: string;
+}
+
+// @public
+export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
+    reason?: string;
 }
 
 // @public
@@ -684,7 +762,17 @@ export interface MaterializationRetrySummary {
 }
 
 // @public
+export class MaterializationRetryTransitionError extends Error {
+    constructor(retryId: string, reason: string);
+    readonly code = "materialization_retry_invalid_transition";
+    readonly retryId: string;
+}
+
+// @public
 export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
+
+// @internal
+export function _monitorCommandLine(command: readonly string[], flags: readonly string[], ids: readonly string[]): string;
 
 // @public (undocumented)
 export interface MonitorDefinition {
@@ -732,6 +820,7 @@ export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 // @public
 export interface MonitorDoctorReport {
     duplicateIds: DuplicateMonitorId[];
+    ephemeralMonitorWork?: EphemeralMonitorWork[];
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
@@ -741,6 +830,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     monitorsDir: string;
     monitorsDirExists: boolean;
+    orphanedMonitorWork?: OrphanedMonitorWork[];
     parseErrors: DoctorParseError[];
     workspacePath: string;
 }
@@ -752,6 +842,7 @@ export interface MonitorEventRecord {
     body: string;
     // (undocumented)
     createdAt: Date;
+    definitionFingerprint?: string | null;
     deliveryState?: MonitorDeliveryState;
     // (undocumented)
     diffText: string | null;
@@ -856,136 +947,102 @@ export type MonitorExplainStageStatus = 'ok' | 'pending' | 'healthy' | 'failure'
 export type MonitorFrontmatter = z.infer<typeof monitorFrontmatterSchema>;
 
 // @public (undocumented)
-export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
-    name: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
+export const monitorFrontmatterSchema: z.ZodPipe<z.ZodObject<{
+    name: z.ZodOptional<z.ZodString>;
     watch: z.ZodObject<{
         type: z.ZodString;
-    }, "strip", z.ZodUnknown, z.objectOutputType<{
-        type: z.ZodString;
-    }, z.ZodUnknown, "strip">, z.objectInputType<{
-        type: z.ZodString;
-    }, z.ZodUnknown, "strip">>;
-    urgency: z.ZodOptional<z.ZodEffects<z.ZodString, {
+    }, z.core.$catchall<z.ZodUnknown>>;
+    urgency: z.ZodOptional<z.ZodPipe<z.ZodString, z.ZodTransform<{
         lo: "low" | "normal" | "high";
         hi: "low" | "normal" | "high";
-    }, string>>;
-    notify: z.ZodOptional<z.ZodDiscriminatedUnion<"strategy", [z.ZodObject<{
+    }, string>>>;
+    notify: z.ZodOptional<z.ZodDiscriminatedUnion<[z.ZodObject<{
         strategy: z.ZodLiteral<"debounce">;
         'settle-for': z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        strategy: "debounce";
-        'settle-for': string;
-    }, {
-        strategy: "debounce";
-        'settle-for': string;
-    }>, z.ZodObject<{
+    }, z.core.$strip>, z.ZodObject<{
         strategy: z.ZodLiteral<"throttle">;
         'suppress-for': z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        strategy: "throttle";
-        'suppress-for': string;
-    }, {
-        strategy: "throttle";
-        'suppress-for': string;
-    }>, z.ZodObject<{
+    }, z.core.$strip>, z.ZodObject<{
         strategy: z.ZodLiteral<"rollup">;
         window: z.ZodString;
-        timezone: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
-    }, "strip", z.ZodTypeAny, {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    }, {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    }>]>>;
-    'baseline-strategy': z.ZodDefault<z.ZodEnum<["incremental", "net"]>>;
-    tags: z.ZodOptional<z.ZodArray<z.ZodString, "many">>;
-    shape: z.ZodOptional<z.ZodEffects<z.ZodObject<{
-        derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
+        timezone: z.ZodOptional<z.ZodString>;
+    }, z.core.$strip>], "strategy">>;
+    'baseline-strategy': z.ZodDefault<z.ZodEnum<{
+        incremental: "incremental";
+        net: "net";
+    }>>;
+    tags: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodString>, unknown>>;
+    shape: z.ZodOptional<z.ZodPreprocess<z.ZodObject<{
+        derive: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodObject<{
             name: z.ZodString;
             when: z.ZodString;
-        }, "strip", z.ZodTypeAny, {
-            name: string;
-            when: string;
-        }, {
-            name: string;
-            when: string;
-        }>, "many">>;
+        }, z.core.$strip>>, unknown>>;
         render: z.ZodOptional<z.ZodLiteral<"rendered">>;
-    }, "strip", z.ZodTypeAny, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    }, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    }>, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    }, {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
+    }, z.core.$strip>, {
+        derive?: unknown;
         render?: "rendered" | undefined;
     }>>;
-    payload: z.ZodOptional<z.ZodEffects<z.ZodObject<{
-        form: z.ZodEnum<["prose", "structured", "artifact", "rendered"]>;
+    payload: z.ZodOptional<z.ZodObject<{
+        form: z.ZodEnum<{
+            rendered: "rendered";
+            prose: "prose";
+            structured: "structured";
+            artifact: "artifact";
+        }>;
         transform: z.ZodOptional<z.ZodObject<{
-            language: z.ZodEnum<["jq", "cel"]>;
+            language: z.ZodEnum<{
+                jq: "jq";
+                cel: "cel";
+            }>;
             expression: z.ZodString;
-        }, "strip", z.ZodTypeAny, {
-            language: "jq" | "cel";
-            expression: string;
-        }, {
-            language: "jq" | "cel";
-            expression: string;
+        }, z.core.$strip>>;
+        encoding: z.ZodOptional<z.ZodEnum<{
+            json: "json";
+            yaml: "yaml";
+            toon: "toon";
+            toml: "toml";
         }>>;
-        encoding: z.ZodOptional<z.ZodEnum<["json", "yaml", "toon", "toml"]>>;
-    }, "strip", z.ZodTypeAny, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }>, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }, {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    }>>;
-}, "strip", z.ZodTypeAny, {
+    }, z.core.$strip>>;
+}, z.core.$strip>, z.ZodTransform<{
+    baselineStrategy: "incremental" | "net";
+    urgency: "low" | "normal" | "high";
+    urgencyMax: "low" | "normal" | "high";
     watch: {
+        [x: string]: unknown;
         type: string;
-    } & {
-        [k: string]: unknown;
+    };
+    name?: string | undefined;
+    notify?: {
+        strategy: "debounce";
+        'settle-for': string;
+    } | {
+        strategy: "throttle";
+        'suppress-for': string;
+    } | {
+        strategy: "rollup";
+        window: string;
+        timezone?: string | undefined;
+    } | undefined;
+    tags?: string[] | undefined;
+    shape?: {
+        derive?: {
+            name: string;
+            when: string;
+        }[] | undefined;
+        render?: "rendered" | undefined;
+    } | undefined;
+    payload?: {
+        form: "rendered" | "prose" | "structured" | "artifact";
+        transform?: {
+            language: "jq" | "cel";
+            expression: string;
+        } | undefined;
+        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
+    } | undefined;
+}, {
+    watch: {
+        [x: string]: unknown;
+        type: string;
     };
     'baseline-strategy': "incremental" | "net";
     name?: string | undefined;
@@ -993,13 +1050,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         lo: "low" | "normal" | "high";
         hi: "low" | "normal" | "high";
     } | undefined;
-    shape?: {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    } | undefined;
     notify?: {
         strategy: "debounce";
         'settle-for': string;
@@ -1012,22 +1062,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         timezone?: string | undefined;
     } | undefined;
     tags?: string[] | undefined;
-    payload?: {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    } | undefined;
-}, {
-    watch: {
-        type: string;
-    } & {
-        [k: string]: unknown;
-    };
-    name?: string | undefined;
-    urgency?: string | undefined;
     shape?: {
         derive?: {
             name: string;
@@ -1035,19 +1069,6 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         }[] | undefined;
         render?: "rendered" | undefined;
     } | undefined;
-    notify?: {
-        strategy: "debounce";
-        'settle-for': string;
-    } | {
-        strategy: "throttle";
-        'suppress-for': string;
-    } | {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    } | undefined;
-    'baseline-strategy'?: "incremental" | "net" | undefined;
-    tags?: string[] | undefined;
     payload?: {
         form: "rendered" | "prose" | "structured" | "artifact";
         transform?: {
@@ -1056,80 +1077,7 @@ export const monitorFrontmatterSchema: z.ZodEffects<z.ZodObject<{
         } | undefined;
         encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
     } | undefined;
-}>, {
-    baselineStrategy: "incremental" | "net";
-    urgency: "low" | "normal" | "high";
-    urgencyMax: "low" | "normal" | "high";
-    watch: {
-        type: string;
-    } & {
-        [k: string]: unknown;
-    };
-    name?: string | undefined;
-    shape?: {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    } | undefined;
-    notify?: {
-        strategy: "debounce";
-        'settle-for': string;
-    } | {
-        strategy: "throttle";
-        'suppress-for': string;
-    } | {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    } | undefined;
-    tags?: string[] | undefined;
-    payload?: {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    } | undefined;
-}, {
-    watch: {
-        type: string;
-    } & {
-        [k: string]: unknown;
-    };
-    name?: string | undefined;
-    urgency?: string | undefined;
-    shape?: {
-        derive?: {
-            name: string;
-            when: string;
-        }[] | undefined;
-        render?: "rendered" | undefined;
-    } | undefined;
-    notify?: {
-        strategy: "debounce";
-        'settle-for': string;
-    } | {
-        strategy: "throttle";
-        'suppress-for': string;
-    } | {
-        strategy: "rollup";
-        window: string;
-        timezone?: string | undefined;
-    } | undefined;
-    'baseline-strategy'?: "incremental" | "net" | undefined;
-    tags?: string[] | undefined;
-    payload?: {
-        form: "rendered" | "prose" | "structured" | "artifact";
-        transform?: {
-            language: "jq" | "cel";
-            expression: string;
-        } | undefined;
-        encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-    } | undefined;
-}>;
+}>>;
 
 // @public (undocumented)
 export interface MonitorRuntimeState {
@@ -1165,37 +1113,17 @@ export interface NotifyRuntimeState {
 }
 
 // @public (undocumented)
-export const notifySchema: z.ZodDiscriminatedUnion<"strategy", [z.ZodObject<{
+export const notifySchema: z.ZodDiscriminatedUnion<[z.ZodObject<{
     strategy: z.ZodLiteral<"debounce">;
     'settle-for': z.ZodString;
-}, "strip", z.ZodTypeAny, {
-    strategy: "debounce";
-    'settle-for': string;
-}, {
-    strategy: "debounce";
-    'settle-for': string;
-}>, z.ZodObject<{
+}, z.core.$strip>, z.ZodObject<{
     strategy: z.ZodLiteral<"throttle">;
     'suppress-for': z.ZodString;
-}, "strip", z.ZodTypeAny, {
-    strategy: "throttle";
-    'suppress-for': string;
-}, {
-    strategy: "throttle";
-    'suppress-for': string;
-}>, z.ZodObject<{
+}, z.core.$strip>, z.ZodObject<{
     strategy: z.ZodLiteral<"rollup">;
     window: z.ZodString;
-    timezone: z.ZodOptional<z.ZodEffects<z.ZodString, string, string>>;
-}, "strip", z.ZodTypeAny, {
-    strategy: "rollup";
-    window: string;
-    timezone?: string | undefined;
-}, {
-    strategy: "rollup";
-    window: string;
-    timezone?: string | undefined;
-}>]>;
+    timezone: z.ZodOptional<z.ZodString>;
+}, z.core.$strip>], "strategy">;
 
 // @public (undocumented)
 export type NotifyStrategy = 'debounce' | 'throttle' | 'rollup';
@@ -1214,9 +1142,8 @@ export interface Observation {
     title: string;
 }
 
-// @public (undocumented)
+// @public
 export interface ObservationContext {
-    checkpoint?: (nextState: unknown) => Promise<void>;
     now: Date;
     previousState?: unknown;
     signal?: AbortSignal;
@@ -1252,10 +1179,9 @@ export interface ObservationHistoryRecord {
 // @public
 export type ObservationOutcome = 'triggered' | 'suppressed' | 'no-change' | 'no-files-matched' | 'errored' | 'rebaselined';
 
-// @public (undocumented)
+// @public
 export interface ObservationResult {
     nextState?: unknown;
-    // (undocumented)
     observations: Observation[];
     outcome?: 'rebaselined' | 'no-files-matched';
     warnings?: string[];
@@ -1267,7 +1193,7 @@ export interface ObservationSource {
     observe(config: Record<string, unknown>, context: ObservationContext): Promise<ObservationResult>;
     readonly scopeSchema: JsonSchema;
     readonly stateful?: boolean;
-    watch?(config: Record<string, unknown>, context: ObservationContext): AsyncIterable<Observation>;
+    watch?(config: Record<string, unknown>, context: ObservationContext): AsyncIterable<ObservationResult>;
 }
 
 // @public (undocumented)
@@ -1290,10 +1216,19 @@ export interface OpenSessionInput {
 export const OPERATION_TIMEOUT_PATTERN: string;
 
 // @public
+export interface OrphanedMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
+    monitorId: string;
+    monitorKind: DoctorMonitorKind;
+    unretainedObservationLoss?: UnretainedObservationLoss;
+}
+
+// @public
 export function parseDuration(duration: string): number;
 
 // @public (undocumented)
 export interface ParseError {
+    code?: 'INPUT_LIMIT_EXCEEDED';
     // (undocumented)
     error: string;
     // (undocumented)
@@ -1335,48 +1270,27 @@ export type PayloadEncoding = 'json' | 'yaml' | 'toon' | 'toml';
 export type PayloadForm = 'prose' | 'structured' | 'artifact' | 'rendered';
 
 // @public
-export const payloadSchema: z.ZodEffects<z.ZodObject<{
-    form: z.ZodEnum<["prose", "structured", "artifact", "rendered"]>;
+export const payloadSchema: z.ZodObject<{
+    form: z.ZodEnum<{
+        rendered: "rendered";
+        prose: "prose";
+        structured: "structured";
+        artifact: "artifact";
+    }>;
     transform: z.ZodOptional<z.ZodObject<{
-        language: z.ZodEnum<["jq", "cel"]>;
+        language: z.ZodEnum<{
+            jq: "jq";
+            cel: "cel";
+        }>;
         expression: z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        language: "jq" | "cel";
-        expression: string;
-    }, {
-        language: "jq" | "cel";
-        expression: string;
+    }, z.core.$strip>>;
+    encoding: z.ZodOptional<z.ZodEnum<{
+        json: "json";
+        yaml: "yaml";
+        toon: "toon";
+        toml: "toml";
     }>>;
-    encoding: z.ZodOptional<z.ZodEnum<["json", "yaml", "toon", "toml"]>>;
-}, "strip", z.ZodTypeAny, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}>, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}, {
-    form: "rendered" | "prose" | "structured" | "artifact";
-    transform?: {
-        language: "jq" | "cel";
-        expression: string;
-    } | undefined;
-    encoding?: "json" | "yaml" | "toon" | "toml" | undefined;
-}>;
+}, z.core.$strip>;
 
 // @public
 export interface PayloadTransform {
@@ -1405,13 +1319,61 @@ export const PRIVATE_DIR_MODE = 448;
 export const PRIVATE_FILE_MODE = 384;
 
 // @public
+export interface ProcessIdentityRecord {
+    readonly pgid: number;
+    // (undocumented)
+    readonly pid: number;
+    // (undocumented)
+    readonly startTime: string;
+}
+
+// @public
+export type ProcessTableReader = () => Promise<ProcessTableReading>;
+
+// @public
+export type ProcessTableReading = {
+    readonly supported: true;
+    readonly processes: readonly ProcessIdentityRecord[];
+} | {
+    readonly supported: false;
+    readonly reason: string;
+};
+
+// @public
 export function readBridgeState(statePath: string): HookState | null;
+
+// @public
+export function readMonitorFileSync(filePath: string): string | undefined;
+
+// @public
+export function readProcessTable(platform?: NodeJS.Platform): Promise<ProcessTableReading>;
+
+// @public
+export interface RecordedProcessTarget {
+    // (undocumented)
+    readonly kind: 'recorded-process';
+    // (undocumented)
+    readonly record: ProcessIdentityRecord;
+}
+
+// @public
+export interface RegisterVerifyArtifactInput {
+    monitorId: string;
+    now?: Date;
+    objectKey: string;
+    ownerSessionId: string;
+    runId: string;
+    workspacePath: string;
+}
 
 // @public
 export function renderArtifact(snapshot: unknown, facts: readonly DerivedFact[]): string;
 
 // @public
 export function renderShapeArtifact(snapshot: unknown, now: number, rules: readonly DerivedFactRule[]): string;
+
+// @public
+export function reportSignalAbstention(abstention: SignalAbstention): void;
 
 // @public
 export function resolveDottedPath(root: unknown, path: string): unknown;
@@ -1456,7 +1418,13 @@ export class RuntimeStore {
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
     // @internal
-    completeMaterializationRetry<T>(id: string, operation: () => T): T;
+    completeMaterializationRetry(id: string, input: Omit<MonitorEventRecord, 'id'>, baseline?: {
+        previousContent: string | null;
+    }, options?: {
+        restrictToSessionId?: string;
+    }): MonitorEventRecord;
+    // @internal
+    discardRetiredVerifyArtifactRetry(id: string): boolean;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
@@ -1469,6 +1437,7 @@ export class RuntimeStore {
     // (undocumented)
     getSessionById(id: string): AgentSessionRecord;
     getSessionObjectCursor(sessionId: string, monitorId: string, objectKey: string, workspacePath?: string | null): SessionObjectCursorRecord | null;
+    getVerifyArtifact(runId: string): VerifyArtifactRecord | null;
     insertEphemeralMonitor(input: {
         id: string;
         sessionId: string;
@@ -1484,9 +1453,13 @@ export class RuntimeStore {
         previousContent: string | null;
     }, options?: {
         restrictToSessionId?: string;
-        maxSessionBaselineAt?: Date;
     }): MonitorEventRecord;
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
+    isVerifyArtifactCleanupEffective(input: {
+        workspacePath: string;
+        monitorId: string;
+        objectKey: string;
+    }): boolean;
     // (undocumented)
     latestSnapshot(monitorId: string, objectKey: string, workspacePath?: string | null): {
         content: string;
@@ -1501,12 +1474,24 @@ export class RuntimeStore {
     listObservationHistory(query?: ObservationHistoryQuery): ObservationHistoryRecord[];
     // (undocumented)
     listSessions(): AgentSessionRecord[];
+    listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[];
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    materializationRetryCapacity(monitorId: string, workspacePath: string | null): {
+        records: number;
+        bytes: number;
+    };
+    materializationRetryMonitorIds(workspacePath: string | null): string[];
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
+    // @internal
+    oldestMaterializationRetry(monitorId: string, workspacePath: string | null): MaterializationRetryRecord | undefined;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    // @internal
+    outstandingUnretainedObservationLoss(monitorId: string, workspacePath: string): UnretainedObservationLoss | undefined;
+    pendingEventIdsOutsideDefinition(monitorId: string, workspacePath: string | null, currentFingerprint: string): string[];
     // (undocumented)
     pendingEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
     perRecipientDiffsForAllSessions(sessionIds: string[], eventId: string): Map<string, string>;
@@ -1517,6 +1502,14 @@ export class RuntimeStore {
     reapEphemeralMonitor(id: string): void;
     reapEphemeralMonitorsForSession(sessionId: string): string[];
     rearmMaterializationRetry(id: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    rearmTerminalMaterializationRetry(id: string, route: {
+        monitorId: string;
+        workspacePath: string | null;
+    }, now?: Date): {
+        outcome: 'rearmed' | 'verify-artifact-cleanup';
+        retry: MaterializationRetryRecord;
+    };
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
         decision: 'deliver' | 'suppress' | 'failed';
         reason?: string | undefined;
@@ -1530,6 +1523,27 @@ export class RuntimeStore {
         result: ObservationOutcome;
         observationData: Record<string, unknown>;
     }): void;
+    // @internal
+    recordObservationLoss(input: {
+        monitorId: string;
+        workspacePath: string | null;
+        sourceName: string;
+        objectKey: string | undefined;
+        observationData: Record<string, unknown>;
+        eventWatermark?: number;
+    }): void;
+    recordVerifyArtifactCleanup(runId: string, cause: VerifyArtifactCleanupCause, at: Date): {
+        artifact: VerifyArtifactRecord;
+        recorded: boolean;
+    };
+    registerVerifyArtifact(input: {
+        runId: string;
+        ownerSessionId: string;
+        workspacePath: string;
+        monitorId: string;
+        objectKey: string;
+        registeredAt: Date;
+    }): VerifyArtifactRecord;
     retractObjectEvents(input: {
         workspacePath?: string | null;
         monitorId: string;
@@ -1547,8 +1561,6 @@ export class RuntimeStore {
         removedEventIds: string[];
         affectedSessionIds: string[];
     };
-    // @internal
-    runInImmediateTransaction<T>(operation: () => T): T;
     // (undocumented)
     saveSnapshot(input: {
         workspacePath?: string | null;
@@ -1580,6 +1592,17 @@ export class RuntimeStore {
         notifyState?: unknown;
         lastObservationAt?: Date | null;
     }): void;
+    // @internal
+    skipMaterializationRetry(id: string, route: {
+        monitorId: string;
+        workspacePath: string | null;
+    }, loss: {
+        objectKey: string | undefined;
+        observationData: Record<string, unknown>;
+    }): {
+        outcome: 'skipped' | 'verify-artifact-cleanup';
+        retry: MaterializationRetryRecord;
+    };
     staleActiveSessions(workspacePath: string | null, staleBefore: Date): AgentSessionRecord[];
     // (undocumented)
     status(): RuntimeStatus;
@@ -1587,6 +1610,8 @@ export class RuntimeStore {
     touchSession(sessionId: string): void;
     // (undocumented)
     unreadEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
+    // @internal
+    unretainedObservationMonitorIds(workspacePath: string): string[];
     // (undocumented)
     updateSessionRecap(sessionId: string): void;
     upsertObjectSuppression(input: {
@@ -1597,6 +1622,8 @@ export class RuntimeStore {
         createdAt: Date;
         expiresAt: Date;
     }): void;
+    verifyArtifactsAwaitingCleanup(workspacePath: string): VerifyArtifactRecord[];
+    verifyArtifactsAwaitingCleanupForOwner(ownerSessionId: string): VerifyArtifactRecord[];
 }
 
 // @public
@@ -1631,6 +1658,9 @@ export const schedulingDefaults: {
     readonly highUrgencyClaimSettleMs: 15000;
     readonly highUrgencyDefaultDebounceSettleMs: 15000;
 };
+
+// @public
+export function sendVerifiedSignal(target: SignalTarget, signal: NodeJS.Signals, options: VerifiedSignalOptions): Promise<SignalOutcome>;
 
 // @public (undocumented)
 export interface SessionEventFilter {
@@ -1708,42 +1738,15 @@ export interface ShapedObservation {
 // @public
 export function shapeObservation(observation: Observation, now: Date, config: ShapeStageConfig): ShapedObservation;
 
-// @public (undocumented)
-export const shapeSchema: z.ZodEffects<z.ZodObject<{
-    derive: z.ZodOptional<z.ZodArray<z.ZodObject<{
+// @public
+export const shapeSchema: z.ZodPreprocess<z.ZodObject<{
+    derive: z.ZodOptional<z.ZodPreprocess<z.ZodArray<z.ZodObject<{
         name: z.ZodString;
         when: z.ZodString;
-    }, "strip", z.ZodTypeAny, {
-        name: string;
-        when: string;
-    }, {
-        name: string;
-        when: string;
-    }>, "many">>;
+    }, z.core.$strip>>, unknown>>;
     render: z.ZodOptional<z.ZodLiteral<"rendered">>;
-}, "strip", z.ZodTypeAny, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
-    render?: "rendered" | undefined;
-}, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
-    render?: "rendered" | undefined;
-}>, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
-    render?: "rendered" | undefined;
-}, {
-    derive?: {
-        name: string;
-        when: string;
-    }[] | undefined;
+}, z.core.$strip>, {
+    derive?: unknown;
     render?: "rendered" | undefined;
 }>;
 
@@ -1756,11 +1759,54 @@ export interface ShapeStageConfig {
 }
 
 // @public
-export interface SkippedMonitor {
+export function shellArg(value: string): string;
+
+// @public
+export function shellSingleQuote(value: string): string;
+
+// @public
+export interface SignalAbstention {
+    readonly action: string;
     // (undocumented)
+    readonly observed: readonly ProcessIdentityRecord[];
+    readonly reason: string;
+    // (undocumented)
+    readonly signal: NodeJS.Signals;
+    // (undocumented)
+    readonly target: {
+        readonly kind: 'process' | 'process-group';
+        readonly id: number;
+    };
+}
+
+// @public
+export type SignalOutcome = {
+    readonly status: 'sent';
+    readonly evidence: IdentityEvidence;
+} | {
+    readonly status: 'not-needed';
+    readonly detail: string;
+} | {
+    readonly status: 'abstained';
+    readonly abstention: SignalAbstention;
+} | {
+    readonly status: 'failed';
+    readonly detail: string;
+};
+
+// @public
+export type SignalTarget = SpawnedProcessTarget | SpawnedProcessGroupTarget | RecordedProcessTarget;
+
+// @public
+export type SkippedMonitor = {
     monitorId: string;
     nextDueAt: Date;
-}
+    validationError?: never;
+} | {
+    monitorId: string;
+    validationError: string;
+    nextDueAt?: never;
+};
 
 // @public
 export class SourceRegistry {
@@ -1774,6 +1820,29 @@ export class SourceRegistry {
     names(): string[];
     // (undocumented)
     register(source: ObservationSource): void;
+}
+
+// @public
+export function spawnedProcessGroup(leader: ChildProcessHandle): SpawnedProcessGroupTarget;
+
+// @public
+export interface SpawnedProcessGroupTarget {
+    // (undocumented)
+    readonly kind: 'spawned-process-group';
+    // (undocumented)
+    readonly leader: ChildProcessHandle;
+    // (undocumented)
+    readonly pgid: number;
+    // (undocumented)
+    verifiedMembers: readonly ProcessIdentityRecord[];
+}
+
+// @public
+export interface SpawnedProcessTarget {
+    // (undocumented)
+    readonly handle: ChildProcessHandle;
+    // (undocumented)
+    readonly kind: 'spawned-process';
 }
 
 // @public (undocumented)
@@ -1798,6 +1867,17 @@ export type TransformOutcome = {
     delivered: false;
     value?: undefined;
 };
+
+// @public
+export interface UnretainedObservationLoss {
+    count: number;
+    error: string;
+    objectKey?: string;
+    position?: number;
+    recordedAt: Date;
+    spanSize?: number;
+    title?: string;
+}
 
 // @public (undocumented)
 export type Urgency = 'low' | 'normal' | 'high';
@@ -1828,6 +1908,36 @@ export function validateScope(scope: Record<string, unknown>, scopeSchema: JsonS
 
 // @public
 export function validateWatchScope(scope: Record<string, unknown>, scopeSchema: JsonSchema): string[];
+
+// @public
+export interface VerifiedSignalOptions {
+    readonly action: string;
+    readonly deliver?: (signal: NodeJS.Signals) => void;
+    readonly readProcessTable?: ProcessTableReader;
+    readonly reportAbstention?: (abstention: SignalAbstention) => void;
+    readonly trackMembership?: GroupMembershipTracking;
+}
+
+// @public
+export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';
+
+// @public
+export interface VerifyArtifactCleanupResult {
+    artifact: VerifyArtifactRecord;
+    retractedEventCount: number;
+}
+
+// @public
+export interface VerifyArtifactRecord {
+    cleanupCause: VerifyArtifactCleanupCause | null;
+    cleanupRequestedAt: Date | null;
+    monitorId: string;
+    objectKey: string;
+    ownerSessionId: string;
+    registeredAt: Date;
+    runId: string;
+    workspacePath: string;
+}
 
 // @public
 export interface WatchHandle {

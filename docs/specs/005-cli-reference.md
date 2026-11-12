@@ -281,6 +281,10 @@ agentmonitors validate [path] [options]
 | `[path]`            | positional (optional) | `.claude/monitors` | Path to monitors directory    |
 | `--format <format>` | option (choices)      | `text`             | Output format: `text`, `json` |
 
+Monitor admission follows [001](./001-monitor-definition.md#monitor-input-admission-current):
+at most 1 MiB of UTF-8 content, 256 tags, and 128 derive rules. Oversized monitors
+are invalid and produce a bounded diagnostic naming `INPUT_LIMIT_EXCEEDED`.
+
 ### Output
 
 **Text format:**
@@ -352,7 +356,7 @@ so `invalid`/`errors` already reflect the duplicate without requiring a consumer
 
 1. Parses all `MONITOR.md` files via `scanMonitors()` from `@agentmonitors/core` (parse errors are included in `errors`).
 2. Checks each monitor's `watch.type` field against the built-in `SourceRegistry`; unknown sources produce an error listing available sources.
-3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateScope` helper — types, enums, `required`, `items`, and other keywords, not just field presence.
+3. Validates each monitor's `watch` config (minus `type`) against the source's full `scopeSchema` (draft-07) via the exported core `validateWatchScope` helper (wrapping `validateScope`) — types, enums, `required`, `items`, and other keywords, plus actionable collection-strategy and timezone diagnostics.
 4. Rejects duplicate monitor IDs within the scanned tree (see [001 §4](./001-monitor-definition.md)).
 5. If a parse failure appears to use the pre-migration top-level `source:` + `scope:` shape, appends a hint to rewrite it as `watch: { type, ... }`.
 
@@ -513,6 +517,19 @@ All transition subcommands (`ack`, `start`, `complete`, `fail`, `archive`) print
 
 Reads a single `MONITOR.md` file, resolves its source, and runs a live observation cycle to verify configuration without writing to the database. For stateful sources (`source.stateful === true`), automatically runs a second observation after 100 ms to demonstrate change detection.
 
+### Source configuration validation
+
+Before calling `source.observe()`, validates `watch` minus `type` through the same
+`validateWatchScope` helper as `validate` (§3). Invalid source configuration exits 1 before any
+source network request or command execution. Rejection details match `validate`; the command adds
+an `Invalid monitor scope: ` prefix. Text errors go only to stderr as `Error: <message>`; JSON errors
+go only to stdout as `{ "error": "<message>" }`. `validate` retains its stdout summary/error-list
+contract in both formats.
+
+**Verified in:** `apps/cli/src/commands/monitor-scope-parity.integration.test.ts` —
+`monitor test / validate scope parity` covers identical invalid scopes in both formats and checks
+HTTP/file sentinels before `monitor test` error-output assertions, with valid source controls.
+
 ### Usage
 
 ```
@@ -532,7 +549,11 @@ agentmonitors monitor test <path> [options]
 - If a source reports `outcome: "no-files-matched"` (currently `file-fingerprint` when its
   scope expands to zero files), prints an error naming `watch.globs` / `watch.cwd` and does not
   establish a baseline or run the second observation.
-- For stateful sources with no first-run observations: prints baseline message, runs second observation, then either prints observations or explains no changes were detected.
+- For stateful sources with no first-run observations and non-nullish `nextState`: prints
+  baseline message, runs second observation, then either prints observations or explains no
+  changes were detected. State is source-owned; primitives such as `0`, `false`, and `""` are valid.
+  Absent/null initial state fails with `Observation failed: Stateful source "<sourceName>" returned no baseline state.`
+  The `no-files-matched` diagnostic above takes precedence over this guard.
 - Prints observation titles and snapshots.
 - If a directory (rather than a single file) is passed: prints an error to stderr naming
   `agentmonitors validate` as the symmetric command for a whole directory, and exits 1 — instead of
@@ -553,6 +574,15 @@ agentmonitors monitor test <path> [options]
 ```
 
 `baseline: true` indicates the JSON result is from the second (post-baseline) observation.
+It MUST NOT be reported when initial baseline establishment failed. An unavailable
+`incoming-changes` repo/ref rejects with the exact source diagnostic in 003 §6.5. Text prints
+`Error: Observation failed: <diagnostic>` to stderr (after the existing testing banner on stdout),
+exits 1, and prints no baseline/second-observation/configured-correctly success claim. JSON writes
+only `{ "error": "Observation failed: <diagnostic>" }` to stdout, stderr empty, exit 1. There is no
+new unavailable outcome field. If the initial observation established a baseline but the second
+rejects, use the same failure envelope/exit 1; the baseline line already printed in text remains
+truthful, but no successful follow-up summary is printed. Neither failure nor success writes DB
+state in `monitor test` (Refs #305, decision #555).
 
 When a source reports `outcome: "no-files-matched"`, JSON output is:
 
@@ -571,9 +601,9 @@ When a source reports `outcome: "no-files-matched"`, JSON output is:
 
 ### Exit codes
 
-Exits 1 on: file not found, parse error, unknown source, observation exception, or
-`no-files-matched`. Exits 0 on successful dry-run, including genuine quiet/no-change runs where the
-source matched its scope.
+Exits 1 on: file not found, parse error, unknown source, observation exception,
+`no-files-matched`, or absent/null initial state from a stateful source. Exits 0 on successful
+dry-run, including genuine quiet/no-change runs where the source matched its scope.
 
 ### `monitor history` — Observation audit trail
 
@@ -638,6 +668,13 @@ threw; the failure was isolated so other monitors still ran — see
 baseline without computing a delta, e.g. after a force-pushed/gc'd ref; distinct from `no-change`) —
 plus the monitor id, source name, and timestamp.
 
+For an `errored` row, text appends two spaces and its nonempty string
+`observationData.error` after the source column. Strip VT sequences and C0/DEL/C1 controls,
+collapse whitespace to one line, and cap the displayed error at 512 Unicode code points including
+`...` when truncated. Rows without a usable error keep the existing columns. JSON/toon retain the
+existing row shape and original error value; no stored bytes change. Socket and offline fallback
+use the same text rendering apart from the existing no-daemon banner.
+
 ### `monitor explain` — Pipeline diagnosis
 
 **Status:** Fully implemented (socket with a no-daemon in-process DB fallback).
@@ -672,6 +709,14 @@ Text output prints one line per stage with a status glyph, followed by a verdict
 - `⏳` — `pending` (intentionally holding, e.g. debounce/throttle, or upstream hasn't produced input)
 - `✗` — `failure` (a real fault: invalid definition, errored observe, missing projection, daemon
   down)
+
+For an errored observation with a usable error string, the observation reason is
+`Source observation failed: <displayed error>` using the same bounded single-line error policy as
+history text. For example: `✗ Observation: Source observation failed: <003 §6.5 diagnostic>`.
+JSON/toon expose this reason and `status: "failure"`, while `details` and the included history
+retain the original error data. Another stage can still win the verdict under the existing
+severity order. History/explain exit codes are unchanged: a successfully retrieved diagnostic
+report exits 0 even when it reports a source failure.
 
 A genuinely idle monitor therefore renders `○` at the observation stage with an affirmative verdict
 (e.g. "Source ran, observed 0 changes — your watched target genuinely hasn't changed (not a bug)."),
@@ -748,6 +793,154 @@ The report is rendered according to three cases:
 A daemon-side **application** error (the daemon answered with an error) is **not** masked as "daemon
 not running": it is surfaced verbatim as `Explain failed: <message>` with exit code 1. Malformed
 command arguments remain normal CLI errors.
+
+### `monitor retry` — Repair a terminal materialization retry (_current_)
+
+**Status:** Implemented (socket, with an in-process fallback when no daemon is reachable).
+
+A materialization retry that fails its last automatic attempt becomes _terminal_, and its monitor
+takes no newer input until the retry is repaired (002 §2.7). These two commands are the repairs.
+They name a retry exactly as `monitor explain` and `doctor` list it (`Retry <id>: status=terminal …`):
+by its monitor id and its record id.
+
+```
+agentmonitors monitor retry rearm [--workspace <path>] [--socket <path>] [--format <toon|text|json>] -- <monitorId> <retryId>
+agentmonitors monitor retry skip  [--reason <text>] [--workspace <path>] [--socket <path>] [--format <toon|text|json>] -- <monitorId> <retryId>
+```
+
+| Argument / Flag      | Default             | Description                                                                        |
+| -------------------- | ------------------- | ---------------------------------------------------------------------------------- |
+| `<monitorId>`        | —                   | Monitor whose retry outbox holds the retry                                         |
+| `<retryId>`          | —                   | The retry's record id, as `monitor explain` and `doctor` list it                   |
+| `--reason <text>`    | none                | `skip` only: why the observation is given up, recorded with the loss (≤ 200 chars) |
+| `--workspace <path>` | current working dir | The workspace the retry was admitted in; also which workspace's daemon/db to reach |
+| `--socket <path>`    | resolved default    | Unix domain socket path for the daemon (resolved like `monitor explain`, §1)       |
+| `--format`           | auto (see §1)       | `toon`, `text`, or `json`                                                          |
+
+- **`rearm`** returns the retry to automatic retry: its failed attempts and last error reset and its
+  first retry delay (1 second) starts again. Its identity, stored observation and place in the
+  monitor's order are unchanged. The monitor stays paused until the retry completes; then it takes
+  newer input in order. If the retried attempt fails again, the retry backs off and can become
+  terminal again exactly as before (attempt limit and backoff are unchanged).
+- **`skip`** gives the retry up. In one transaction, its observation is recorded as an outstanding
+  loss and the retry is removed. The loss is a drop under the one loss rule (002 §2), so `doctor`
+  fails the monitor's check and `monitor explain` reports a materialization failure until a later
+  event for the same object key supersedes it, with the wording and clearing rule of §15. Its
+  error is the retry's last error followed by
+  `Retry skipped after <n> failed attempts[: <reason>].` The reason is trimmed and may be at most
+  200 characters, so the note and the reason always appear in full; when the whole error would
+  pass the 1,024-character diagnostic cap, the last error is shortened and ends in `…`. The
+  monitor takes newer input on its next tick, once no other retained work is ahead of it.
+- **A retired verify artifact's retry.** When the retry's observation is a verify scratch artifact
+  whose cleanup authority is in effect (002 §2.8), both commands remove the retry as
+  verify-artifact cleanup instead: no loss is recorded, `doctor` and `monitor explain` report no
+  dropped observation for it, and `rearm` does not re-arm it. Dropping it is the cleanup its owner
+  asked for, and no later event could supersede a loss for its scratch key. The decision is made
+  inside the repair's own store transaction. The command succeeds, wakes a paused watcher like any
+  repair, and the monitor takes newer input on its next tick unless other retained work is ahead
+  of it.
+
+Both commands refuse, exit 1, and change nothing when:
+
+- no retry of that monitor in that workspace has the id (a retry of another monitor or workspace is
+  treated as not found): `<Re-arm|Skip> failed for retry <id> of monitor <monitorId> in workspace
+<path>: Materialization retry record not found: <id>`;
+- the retry is not terminal. A pending retry is still attempted automatically, so neither repair
+  applies: `… Materialization retry record is pending, not terminal, so it cannot be
+<re-armed|skipped>. It is still retried automatically (<n> of 5 attempts failed; next attempt at
+<iso8601>): <id>`;
+- `skip` only: the trimmed reason is longer than 200 characters: `Skip failed for retry <id> of
+monitor <monitorId> in workspace <path>: Skip reason is <n> characters; at most 200 are allowed.`
+
+The command asks the workspace's daemon (`retry.rearm` / `retry.skip`, Zod-validated params
+`{ monitorId, retryId, workspacePath, reason? }`), waiting up to 15 seconds for its reply. While
+another process holds the store's write lock, the daemon's own tick can wait up to 5 seconds for it
+before the daemon reads the request, and the repair's write may then wait up to 5 seconds more; the
+15 seconds cover both waits with a margin. A daemon blocked on a lock for longer than that can still
+answer too late: the command then reports the outcome as unknown (below), and the daemon may apply
+the repair after the command has given up. A daemon repair
+(re-arm or skip) also wakes a watcher of that monitor that is paused on the retry, instead of
+leaving it to its one-minute recheck. Which path applies depends on how far the request got:
+
+- **No daemon accepted the connection** (no socket, connection refused): no daemon has the
+  request, so the command applies the same core transaction to the workspace-resolved database
+  (§1 "Database path resolution") and prints `No daemon running — applied to the persisted store;
+it takes effect on the next tick.` first.
+- **A daemon accepted the request but no reply arrived** (the wait above ran out, or the
+  connection closed first): the daemon may already have applied the repair, or may still apply it
+  once it reads the request, so the outcome is unknown. The command writes nothing, exits 1 and prints
+  ``<Re-arm|Skip> outcome unknown for retry <id> of monitor <monitorId> in workspace <path>: the
+daemon received the request but no reply arrived (<cause>). The <re-arm|skip> may already have
+been applied, or may still be applied; nothing was written to the store from here. Check with `<explain command>` or
+`<doctor command>` before running it again.`` (the commands are quoted and scoped as below).
+- **The daemon answered with an error** (a refusal, or a daemon too old to know the method): the
+  error is reported, never retried in-process.
+
+Text output, after a re-arm:
+
+```
+Re-armed retry <id> of monitor <monitorId>: its failed attempts are reset and it is next attempted at <iso8601>.
+The monitor stays paused until this retry completes, then takes newer input in order.
+```
+
+After a skip:
+
+```
+Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see `agentmonitors monitor explain [--workspace <path> --dir <path>] -- <monitorId>`.
+The monitor takes newer input on its next tick unless other retained work is still ahead of it.
+```
+
+After either repair of a retired verify artifact's retry:
+
+```
+Removed retry <id> of monitor <monitorId> as verify-artifact cleanup: its observation is a verify scratch artifact whose cleanup has taken effect, so it is neither re-armed nor recorded as a loss.
+The monitor takes newer input on its next tick unless other retained work is still ahead of it.
+```
+
+The suggested `monitor explain` (and, for an unknown outcome, `doctor`) runs verbatim from the
+directory the repair ran in, quoted and scoped the way `doctor` scopes its remediation commands:
+an argument that is not shell-safe is single-quoted, and when `--workspace` names another directory
+than the current one the command carries `--workspace <path>` and that workspace's own definitions
+(`--dir <workspace>/.claude/monitors` for `explain`; `doctor` reads them by default).
+
+JSON/TOON output is `{ action: "rearm"|"skip", outcome:
+"rearmed"|"skipped"|"verify-artifact-cleanup", monitorId, workspacePath, via: "daemon"|"in-process",
+retry }`. `outcome` says what the repair did (`verify-artifact-cleanup` for a retired verify
+artifact's retry, whichever the action). `retry` is the record's safe metadata (`id`, `status`,
+`attemptCount`, `nextAttemptAt`, `lastError`, `createdAt`, `updatedAt`): after a re-arm, its new
+state; after a removal, its state when it was removed. The stored observation is never part of it. A refusal prints
+`{ "error": "<message above>" }`.
+
+The tick report names both commands for a terminal retry (002 §2.7), as do the `monitor explain`
+materialization reason and the `doctor` remediation (§15). These repairs and every suggested
+`monitor explain`/`monitor history` command **MUST** place all flags before an option terminator
+`--`, followed by the monitor and retry IDs, so IDs such as `-watcher` remain positional.
+This is the current behavior. For example:
+
+```sh
+agentmonitors monitor retry rearm --workspace /work/project -- -watcher 01K000000000000000000000000
+agentmonitors monitor explain --workspace /work/project --dir /work/project/.claude/monitors -- -watcher
+agentmonitors monitor history --workspace /work/project -- -watcher
+```
+
+Shell quoting and workspace scoping remain unchanged. Any additional flags (including `--format`
+and `--reason`) belong before `--`. Verified by the explain/doctor × rearm/skip leading-hyphen
+regressions in `apps/cli/src/retry-repair.test.ts`, which execute the suggestions verbatim through
+`/bin/sh` from another directory and check the persisted repair. Follow-up regressions in the same
+suite execute skip-success and both unknown-outcome explain hints, plus doctor explain/history
+hints for dropped observations, pending retries, terminal retries, orphan drops and orphan retained
+work. They use `-watcher` and verify that inspection reads the intended retry or loss without
+changing it.
+
+Verified: `apps/cli/src/retry-repair.test.ts` (built CLI against a real `daemon run`: re-arm then
+success with later input in order, re-arm then failure, skip with the loss in `doctor` and
+`monitor explain` until superseded, each with one daemon and across a daemon restart; refusals
+through the daemon and in-process; a reachable daemon's error reported, never applied
+in-process; the in-process path, running the re-arm `doctor` suggests; re-arm and skip of a
+retired verify artifact's retry through the daemon and in-process, with no loss and the monitor
+resuming, and unregistered and foreign-workspace controls that still record the loss),
+`libs/core/src/runtime/retry-repair.test.ts` and
+`libs/core/src/runtime/retry-repair-retired-artifact.test.ts`.
 
 ---
 
@@ -997,8 +1190,10 @@ which left them to discover `& disown` and their own log redirection. With `--de
    Every non-success `--detach` outcome — readiness timeout, spawn error, race loss, and unproven
    identity — terminates the process THIS invocation spawned and confirms it is gone (`SIGTERM`,
    escalating to `SIGKILL` if it has not exited within a short grace window) before returning. Only
-   the spawned pid is ever signalled: a daemon proven to be serving under a DIFFERENT pid belongs to
-   a concurrent lazy boot and is left untouched. Without this, "the daemon did not start" could be
+   the spawned child is ever signalled, through its own handle and only while it is still unreaped
+   ([008 §5](./008-reliability-process-hygiene.md)): a child that has already exited counts as gone
+   and its pid, which the OS may have reused, is never signalled. A daemon proven to be serving under
+   a DIFFERENT pid belongs to a concurrent lazy boot and is left untouched. Without this, "the daemon did not start" could be
    false — an unowned daemon would keep serving, indefinitely under `--reap-after-ms 0`, and the
    retry the error message suggests would collide with the process that invocation orphaned. The
    error message states whether the cleanup succeeded.
@@ -1954,11 +2149,118 @@ expression for `schedule` sources, else the observe interval), **last-observed**
 delivery-state counts for the workspace's lead session. It also reports materialization retry rows
 as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check fail so a paused or
 exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
-explain <id>` command. Explain lists bounded safe retry metadata (record id, status, attempts,
+explain <id>` command. While the outbox holds a terminal retry, the monitor is stopped (002 §2.7)
+and the remediation also names both repairs for its oldest terminal retry, the one that pauses it:
+``Once the cause is fixed, retry it with `agentmonitors monitor retry rearm -- <id> <retryId>`, or
+give it up as a recorded loss with `agentmonitors monitor retry skip -- <id> <retryId>`.`` (each
+carrying `--workspace` before `--` when it differs from the invoking directory; the repairs have no
+`--dir`).
+See `monitor retry` (§6). Explain lists bounded safe retry metadata (record id, status, attempts,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
+
+A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
+cannot retain a suffix": its retry suffix could not be retained, a debounce or rollup hold
+refused it because it cannot be serialized (002 §4.7), or an operator skipped its terminal retry
+(§6 `monitor retry skip`), and nothing has superseded it yet) fails its
+check even though `retry-outbox` shows `0/0`, since the drop has no retry record. This check
+outranks the retry checks. Its detail is
+`observation dropped (<count> outstanding; newest: <which> at <iso8601>): <error>` followed by the
+rollup line. `<count>` covers every kind of drop; `<error>` is the newest drop's own error, which
+ends in `Not retained for retry: <reason>` for an outbox drop, is the refusal message for a refused
+one, and ends in `Retry skipped after <n> failed attempts[: <reason>].` for a skipped retry. `<which>` uses explain's wording (002 §10.7). The remediation
+names `monitor explain [flags…] -- <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
+`monitor history [flags…] -- <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
+when the check clears: `A dropped observation cannot be retried. This check clears once a later
+event of this monitor materializes for each dropped object key; a drop without an object key clears
+once a later observation span of this monitor materializes an event and drops nothing.` That is
+002 §2's supersession rule exactly: a quiet (`no-change`) tick, a debounce or rollup hold, an
+observe failure, a span whose only failure was retained, events for other object keys, and a
+daemon restart all leave the check failing. Doctor JSON carries the same data in
+`monitors[].unretainedObservationLoss` (`null` when there is none). Socket clients revive
+`recordedAt`, keep only the documented fields and normalize their text like retry errors.
+
+A drop also stays a failure without one valid, unambiguous current definition. A removed,
+parse-failed or duplicated id carries the loss in its `orphanedMonitorWork` entry as
+`unretainedObservationLoss` (a duplicated id's monitor rows omit it, and their text rollup adds
+`dropped-observation=orphaned`). A parsed but invalid definition keeps it on its monitor row,
+whose check is a `skip`. Either way doctor adds a failing `dropped-observation:<id>` check, after
+the per-monitor checks and with any `retry-outbox:<id>` check for that id, whose detail is the
+`observation dropped (…): <error>` text above and whose remediation names
+`monitor history [--workspace <path>] -- <id>` (with `--workspace` as above), says to repair the definition or reported
+failure, and gives the same clearing rule.
+
+An ephemeral monitor (`agentmonitors watch`, 007 §4) has no `MONITOR.md`, so it has no monitor row
+and nothing to repair. While it is live, its drop and retained work are reported in
+`ephemeralMonitorWork` and its `dropped-observation:<id>` / `retry-outbox:<id>` checks begin
+`ephemeral monitor of session <sessionId>; ` and say it has no MONITOR.md definition; the drop
+check keeps the clearing rule above. When the group carries `validationError` (its persisted
+scope is now rejected by its source, so every tick skips it), both checks instead state that
+reason and say no later event can clear the work, in text and JSON. They say that cancelling the
+watch and declaring it again with a valid scope restores observation, but the new declaration gets
+a new id, so this id's outstanding drop and retained work stay reported under its retired id and
+the check keeps failing. After `watch cancel` or reaping it is a _retired_ ephemeral
+monitor in `orphanedMonitorWork` (`monitorKind: "ephemeral"`): its checks begin
+`retired ephemeral monitor; `, say it was cancelled or reaped, never had a definition and will not
+observe again, and that the drop check therefore keeps failing (002 §2). No command clears it.
+Retained-work remediation for either names `monitor explain [flags…] -- <id>` (its definition stage reports no
+`MONITOR.md`, but it still lists the retained record IDs, in text and structured output) and
+`monitor history [--workspace <path>] -- <id>`.
+
+Verified: `apps/cli/src/retry-diagnostics.test.ts` (real ticks with a native fault; text and JSON
+through the built CLI, kept failing after a tick of other object keys and cleared by a later
+event for the dropped key; removed, unparseable and invalid definitions; and a real `daemon run`
+socket after a quiet scheduled tick).
+
 Otherwise the line carries an explicit `never observed` marker (the monitor has no observation
 history) / `lead-session=none` marker (the workspace has no lead session). The three delivery states
 are distinct (000 AP): claiming a delivery never acknowledges it.
+
+**Retained-work diagnostics (current):** doctor/explain expose workspace-scoped safe retry
+metadata. Outboxes of live ephemeral monitors appear in `ephemeralMonitorWork`; other outboxes
+without an unambiguous parsed definition appear in `orphanedMonitorWork`, including removed,
+parse-failed and duplicate definitions and retired ephemeral monitors. Each outbox occurs once:
+attached to one current monitor, under its live ephemeral monitor, or in an orphan group. Orphan
+entries carry only `monitorId`, `monitorKind` (`persistent` or `ephemeral`),
+`materializationRetries` (only while the outbox holds records) and `unretainedObservationLoss`
+(only while one is outstanding, above), never an invented empty summary, source, urgency or
+cadence. Ephemeral entries carry `monitorId`, `sessionId` and the same two optional fields.
+Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
+for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
+`--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
+`retry-outbox:<id>` check independently of the original definition diagnostics. Its remediation
+says retained work drains only while the monitor is ticked with a valid definition and, while the
+outbox holds a terminal retry, names `monitor retry rearm` and `monitor retry skip` for the oldest
+one, scoped as above; skipping is the way to clear terminal work whose monitor will not run again.
+Parse and duplicate
+errors remain visible even when no valid monitor row exists; doctor JSON includes `parseErrors`
+and `duplicateIds` as well as the health checks.
+
+Socket clients reconstruct created/updated/non-null next-attempt Dates in all retry summaries;
+terminal next-attempt stays null. Unknown retry fields are excluded, and errors are C0/C1/DEL and
+Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
+is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
+doctor JSON defaults them to empty summaries/arrays. A monitor row's summary defaults to empty unless that
+id's orphan group holds retained work (for example a duplicated id whose outbox is in an orphan group), in which
+case the row claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. When the
+group holds only a drop, the outbox is empty: the row shows `retry-outbox=0/0` and the text rollup adds
+`dropped-observation=orphaned`. For an older daemon that reports no orphan groups at all, the empty default
+applies; explain preserves the omitted optional field.
+Text explain uses an existing top-level summary, including an explicitly empty one, in preference
+to recognized materialization-stage details. If that optional field is omitted, it displays the
+available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
+summaries and unrelated stage details do not fabricate retry records.
+
+Explain's local fallback preserves definition/scheduling failures with their retained work. A
+valid definition with retry-only state is a persisted report with the no-daemon notice, not a
+"no persisted state" remediation. Repeated diagnostic reads must not mutate retry state, observe,
+materialize, deliver, or re-arm work. Remediation identifies the monitor and retained record IDs;
+the only commands that change retained work are `monitor retry rearm` and `monitor retry skip`
+(§6), and they apply only to a terminal retry. The runtime itself drains retained work before newer source
+input ([002 §2.7](./002-runtime-delivery.md#27-retained-work-drains-before-newer-source-input-current)).
+
+Verified: `apps/cli/src/retry-diagnostics.test.ts` uses a real owned JSONL socket and built CLI plus
+legacy SQLite rows, including same-ID other-workspace exclusion, missing/invalid/duplicate
+and retry-only reports, safe metadata shape, and unchanged durable state.
 
 ### Output
 
@@ -2039,9 +2341,37 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
         "terminal": 0,
         "bytes": 0,
         "records": []
+      },
+      "unretainedObservationLoss": {
+        "count": 1,
+        "recordedAt": "<iso8601>",
+        "error": "<string>",
+        "position": 300,
+        "spanSize": 600,
+        "objectKey": "<string, when recorded>",
+        "title": "<string, when recorded>"
       }
     }
   ],
+  "orphanedMonitorWork": [
+    {
+      "monitorId": "<string>",
+      "monitorKind": "persistent | ephemeral",
+      "materializationRetries": "<same shape as monitors[], present only while the outbox holds records>",
+      "unretainedObservationLoss": "<same shape as monitors[], present only while outstanding>"
+    }
+  ],
+  "ephemeralMonitorWork": [
+    {
+      "monitorId": "ephemeral:<sessionId>/<ulid>",
+      "sessionId": "<string>",
+      "materializationRetries": "<present only while the outbox holds records>",
+      "unretainedObservationLoss": "<present only while outstanding>",
+      "validationError": "<present only while the persisted scope is rejected by its source>"
+    }
+  ],
+  "parseErrors": [],
+  "duplicateIds": [],
   "summary": { "passed": 0, "failed": 0, "skipped": 0, "idle": 0 }
 }
 ```
@@ -2158,28 +2488,36 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
    change itself (the **command** trigger mode above), and `--manual` blocks and watches for an
    out-of-band change instead. The scratch file / edit is reverted on exit **and** on SIGINT/SIGTERM;
    a `--trigger-cmd`'s effects are not (an arbitrary command has no known inverse).
-6. **Observe.** Poll observation history for a **post-trigger** outcome. A `triggered` row is
-   success. A `no-files-matched` row (glob matched zero files) is always a **fail-fast**. A
-   `no-change` row normally means the trigger did nothing (**fail fast**, point at `--manual`) —
-   **except** while a `debounce`/`throttle` notify window is settling: there the change was observed
-   but is being held, recorded as a `suppressed` row, and the emitting `triggered` row only appears at
-   flush. So a `suppressed` row is not a distinct `verify` verdict; it is treated as "settling" and
-   keeps the wait alive, suppressing the `no-change` fail-fast until the flush (or the budget) — the
-   post-trigger history is `[suppressed, no-change…, triggered]` (issue #399 criterion 4).
+6. **Observe.** Correlate observation recording with two history identity boundaries from the
+   same live daemon. The newest baseline record is captured **before** starting the trigger (or
+   prompting in manual mode). A newly recorded `triggered` row beyond that identity is success,
+   including a row persisted while a long trigger command is still running. Do not compare its
+   second-rounded `createdAt` against a millisecond trigger time: a real new row can share the
+   baseline's persisted timestamp. Previously recorded rows remain excluded even in that same second.
 
-   A `no-change` verdict requires **two distinct post-trigger observation-history rows** (different
-   ids), both reporting `no-change`, before it is treated as decisive (issue #442 round 19). A single
-   `no-change` row — however long it persists across polls — is not sufficient evidence: a daemon tick
-   already in flight (mid-scan) when the trigger fired can finish and record its necessarily-stale,
-   pre-trigger `no-change` row _after_ the trigger's timestamp under enough scheduling delay (a busy
-   CI runner), and every subsequent poll re-reads that SAME row — persistence alone is just the
-   caller's own clock passing, not new information. A second, genuinely later tick completing and also
-   reporting `no-change` is real evidence neither post-trigger tick observed the change. A `triggered`
-   row still wins immediately regardless. Confirming two distinct rows takes roughly two full monitor
-   poll intervals of wall time, so `verify` extends the observe stage's deadline (only when using the
-   **default** derived budget, never when an explicit `--timeout-ms` is given — an explicit override
-   is honored as the operator's real cap, and a timeout shorter than one interval still fails fast with
-   `budget-exceeded`) to at least `2 × interval + margin`.
+   The completion snapshot is a separate boundary for **negative** evidence. A command's idle
+   observations before it returns cannot establish that its final change did nothing. After this
+   boundary, `no-files-matched` is a fail-fast, and **two distinct** `no-change` records are required
+   for a no-change verdict. Rereading one retained row never counts twice. The two-row rule guards
+   against one stale scan already in flight at the trigger; manual mode never fails fast on either
+   negative outcome. Timeout budgets still begin when the trigger command returns (or manual mode
+   starts); changing evidence boundaries does not extend an explicit `--timeout-ms`.
+
+   A newly recorded `suppressed` row means the change is settling in a debounce/throttle window
+   (002 §9.2/§9.3). Remember this evidence even after that row leaves the bounded history window;
+   no-change rows cannot overrule it. The eventual visible `triggered` flush wins immediately.
+   Consecutive bounded history windows must overlap at the last seen identity before absence can
+   support a negative verdict. If a long command, retention, or missing history breaks that chain,
+   an unseen success or suppression may have been lost: refuse negative verdicts and wait for
+   visible positive evidence or `budget-exceeded`. Do not silently treat truncated history as no change.
+
+   Identity order is the existing monotonic observation-ID order within the same daemon writer,
+   not a persisted sequence across process restarts or arbitrary concurrent writers. Recording
+   after the boundary does not claim causal attribution of an arbitrary external source change to
+   the trigger. No new source protocol, timestamp precision or runtime scheduling rule is introduced.
+   Confirming two distinct rows takes roughly two full monitor poll intervals, so the default
+   observe deadline remains at least `2 × interval + margin`. An explicit timeout remains the
+   operator's cap and is never stretched to fit the discriminator.
 
    That observe-stage extension can let a **real** `triggered` row land after the single-interval
    `detect` deadline the rest of the phase was sized against — e.g. a 20s-interval monitor with a
@@ -2205,18 +2543,28 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
    change (issue #407). Verify erases its own events using one of **two mechanisms with deliberately
    non-overlapping safe domains** (issue #418), chosen by whether the trigger's object key is
    synthetic or a real watched path:
-   - **Synthetic scratch key → durable tombstone (the non-blocking path, issue #414).** For a scratch
-     sibling (`…/agentmonitors-verify-<token><ext>`, a path no real monitored object ever shares),
-     verify deletes the file and, in one **non-blocking** call, **retracts the create event it already
-     delivered AND installs a durable, self-expiring _object-event suppression_** (a tombstone) keyed
-     to that object. It does **not** wait for the deletion to re-materialize (the #407 approach cost a
-     whole extra interval + settle cycle and ran ~2× as long as plain `verify` while still showing
-     plain `verify`'s ETA — reading as a hang and overrunning default 2-minute timeouts). Instead the
-     daemon's tick **sweeps** the pending `File deleted: …/agentmonitors-verify-…` on the very tick it
-     materializes — before any later session can observe it. The sweep deletes **by object key**,
-     which is safe **only** because the key is synthetic, so it can never touch a real event at a
-     genuine path. The tombstone's TTL is derived from the monitor's own detect budget
-     (`detect + interval + settle`, min 60s).
+   - **Synthetic scratch key → durable exact ownership (the non-blocking path, issues #414/#562).**
+     For a scratch sibling (`…/agentmonitors-verify-<token><ext>`, a path no real monitored object
+     ever shares, whose `<token>` is the run's random identity), verify **registers ownership of that
+     exact key with the daemon before creating the file** (`verifyArtifacts.register`, 002 §2.8).
+     The registration names the run, its throwaway verify session, the workspace and the monitor
+     being verified. A registration the daemon refuses aborts the run with a `setup` failure before
+     any file is created. During the proof the scratch file's events flow normally. At cleanup,
+     verify **first** asks the daemon for cleanup (`verifyArtifacts.requestCleanup`), which retracts
+     the events already materialized for that key, and **then** deletes the file. From then on the
+     daemon drops every observation of that exact key for that monitor and workspace, both on arrival
+     and when held work flushes, with **no expiry**: the deletion, and any later report of it after
+     a delay, restart or config repair, never reaches a later session. It does **not** wait for the
+     deletion to re-materialize (the #407 approach cost a whole extra interval + settle cycle and
+     ran ~2× as long as plain `verify`).
+
+     **Against a daemon that predates ownership** (it answers the registration as an unsupported
+     request), verify falls back to the legacy cleanup: it deletes the file and, in one non-blocking
+     call, retracts the delivered create event and installs a **durable, self-expiring
+     _object-event suppression_** (a tombstone, `events.suppressObject`) whose TTL is derived from the
+     monitor's detect budget (`detect + interval + settle`, min 60s). That fallback is finite-window
+     protection only: a scratch deletion recovered after the tombstone expires can still reach a
+     later session. If the daemon also predates `events.suppressObject`, verify retracts by id.
 
    - **Real watched path → id-scoped retraction (issue #407).** For a **literal single-file glob whose
      file verify created** (a real monitored path), a by-key tombstone would be unsafe: a later
@@ -2227,25 +2575,35 @@ observe's actual resolution time + postObserveBudgetMs)` — the same settle + h
      literal-created case. A literal file that **pre-existed** (verify only edits and restores it) is
      never erased at all — those events reference real user content.
 
-   To keep this a defect-resistant invariant, the durable-tombstone entry point
-   (`AgentMonitorRuntime.suppressObjectEvents`, and the `events.suppressObject` IPC verb) **rejects a
-   non-synthetic object key outright** — a real watched path can never reach the by-key sweep. In
-   either mechanism, retracting an event also drops the per-recipient cursor its projection seeded,
-   scoped to the sessions that actually received it (never another session's baseline for the same
-   path).
+   To keep this a defect-resistant invariant, neither by-key entry point accepts a real path:
+   ownership registration (`AgentMonitorRuntime.registerVerifyArtifact`, `verifyArtifacts.register`)
+   requires a scratch key whose token is the run's identity, and the legacy tombstone
+   (`AgentMonitorRuntime.suppressObjectEvents`, `events.suppressObject`) **rejects a non-synthetic
+   object key outright**. In every mechanism, retracting an event also drops the per-recipient cursor
+   its projection seeded, scoped to the sessions that actually received it (never another session's
+   baseline for the same path).
 
-   **Interruption-safety (issue #414).** An interrupted `--use-workspace-daemon` run leaves **no
-   permanent stray state**: (a) on `SIGINT`/`SIGTERM` (e.g. a command/CI timeout) verify's signal
-   handler runs the same object-appropriate cleanup best-effort — reverts the file, then tombstones
-   (synthetic key) or id-retracts (real created file), and ends the throwaway verify session — before
-   exiting; (b) even on an uncatchable kill (`SIGKILL`/crash) that leaves an `active` verify session
-   and its scratch events, the daemon's session-reap backstop, when it later transitions that stale
-   `agentmonitors-verify-*` session to dormant, tombstones and retracts its scratch objects too (only
-   the synthetic scratch keys the session projected — matched by the well-known basename). That
-   backstop's tombstone TTL is derived from the object's **own monitor cadence**
-   (`max(5min, interval + settle + margin)`) so a long-interval monitor's deletion still lands inside
-   the window. The only residual is a daemon **death** between materialization and the sweep; the
-   tombstone (or the reap backstop on the next tick) still reconciles it, so it is never permanent.
+   **Interruption cleanup (issues #414/#562).** On `SIGINT`/`SIGTERM` (e.g. a command/CI timeout)
+   verify's signal handler reverts the file and then runs the same object-appropriate cleanup
+   best-effort: it requests cleanup of the owned artifact (or tombstones / id-retracts on the
+   fallback paths) and ends the throwaway verify session before exiting. On an uncatchable kill
+   (`SIGKILL`/crash) the ownership record already exists, because it was registered before the file
+   was created. Closing the owner session, or the daemon reaping it as stale (002 §6.2), gives the
+   artifact cleanup authority, retracts any events already materialized for its key and filters every
+   later observation of it, whether or not an event was ever projected. A crash between ending the
+   session and recording that authority is repaired on the next tick. Until the owner is reaped, a
+   killed run's artifact is still in its proof phase and its events remain visible. Ownership
+   records are retained without expiry (002 §2.8), so no restart, delay or config repair restores a
+   cleaned-up artifact's events.
+
+   **Guarantee.** For a run that registered its artifact, no event from the verified monitor for
+   the scratch key reaches a later lead session once cleanup authority is in effect (002 §2.8).
+   Sibling monitors that happen to watch the scratch path are not covered: their events for it are
+   neither filtered nor retracted. Legitimate work in the same
+   held batches, a foreign workspace with the same monitor and key, and real watched paths are
+   unaffected; real watched paths keep their exact-event-id cleanup. A scratch-looking path verify
+   did not register (for example, one left by an older client killed mid-run) carries no cleanup
+   authority and is treated as ordinary work.
 
 If the daemon exits at any point, `verify` fails fast with a **`daemon-died`** verdict and prints the
 daemon's captured output — never an ambiguous empty result.
@@ -2413,3 +2771,12 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `watch`    | `list`     | daemon (read-only)                                            | **Target** (§14.4, [007 §4](./007-agent-facing-interaction.md))   |
 | `watch`    | `cancel`   | daemon                                                        | **Target** (§14.4, [007 §4.4](./007-agent-facing-interaction.md)) |
 | `inspect`  | —          | daemon (read-only)                                            | **Target** (§14.5, [007 §5](./007-agent-facing-interaction.md))   |
+
+### Daemon request admission errors
+
+Socket-backed commands obey [002 §10.4](./002-runtime-delivery.md#104-ipc-wire-protocol):
+at most 1 MiB before the newline, 1,000 entries per array or record, 10,000 total
+values, and depth 32. Callers issuing bulk requests must keep each request within
+these budgets. The wire response carries `INPUT_LIMIT_EXCEEDED`; the CLI surfaces
+the daemon's error as an application error, not an unavailable-daemon fallback.
+The rejected request performs no runtime operation, and other sessions remain usable.

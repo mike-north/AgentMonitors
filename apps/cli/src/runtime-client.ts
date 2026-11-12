@@ -10,6 +10,9 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
+  MaterializationRetryRepairInput,
+  MaterializationRetryRepairResult,
+  MaterializationRetrySkipInput,
   MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
@@ -19,7 +22,14 @@ import type {
   ObservationHistoryRecord,
   OpenSessionInput,
   RuntimeTickResult,
+  UnretainedObservationLoss,
 } from '@agentmonitors/core';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetryRecord,
+  normalizeRetrySummary,
+  normalizeUnretainedObservationLoss,
+} from './retry-diagnostics.js';
 import { createRuntime } from './runtime.js';
 import { callDaemon, type DaemonStatusResult } from './daemon-ipc.js';
 
@@ -118,6 +128,9 @@ export async function retractObjectEventsClient(
  * runtime), while a later session still never sees the scratch event. MUST only
  * target verify's own `…/agentmonitors-verify-<token>` scratch path. Returns the
  * number of already-materialized events retracted immediately.
+ *
+ * Current verify uses this finite tombstone only against a daemon that predates
+ * verify artifact ownership ({@link registerVerifyArtifactClient}, issue #562).
  */
 export async function suppressObjectEventsClient(
   input: {
@@ -134,6 +147,47 @@ export async function suppressObjectEventsClient(
     socketPath ? { socketPath } : {},
   );
   return result.removed;
+}
+
+/**
+ * Register exact ownership of verify's synthetic scratch artifact on the LIVE
+ * daemon, before the file is created (issue #562). From then on the daemon can
+ * keep that exact key out of later sessions once cleanup takes effect, even if
+ * this run is killed before any event projects. An older daemon answers with
+ * `DaemonUnsupportedRequestError`; the caller then uses its legacy cleanup.
+ */
+export async function registerVerifyArtifactClient(
+  input: {
+    runId: string;
+    ownerSessionId: string;
+    workspacePath: string;
+    monitorId: string;
+    objectKey: string;
+  },
+  socketPath?: string,
+): Promise<void> {
+  await callDaemon(
+    'verifyArtifacts.register',
+    input,
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Ask the LIVE daemon to put this run's registered artifact under permanent
+ * cleanup authority and retract its existing events (issue #562). Idempotent.
+ * Returns the number of events retracted by this request.
+ */
+export async function requestVerifyArtifactCleanupClient(
+  runId: string,
+  socketPath?: string,
+): Promise<number> {
+  const result = await callDaemon<{ retractedEventCount: number }>(
+    'verifyArtifacts.requestCleanup',
+    { runId },
+    socketPath ? { socketPath } : {},
+  );
+  return result.retractedEventCount;
 }
 
 export async function claimDeliveryClient(
@@ -294,9 +348,17 @@ export async function explainMonitorClient(
   );
   return {
     ...report,
+    // Project the service's second public retry copy without rewriting other
+    // stage details, diagnosis order, or the primary verdict.
+    stages: report.stages.map((stage) =>
+      stage.id === 'materialization' &&
+      isMaterializationRetrySummary(stage.details)
+        ? { ...stage, details: { ...normalizeRetrySummary(stage.details) } }
+        : stage,
+    ),
     ...(report.materializationRetries
       ? {
-          materializationRetries: reviveMaterializationRetryDates(
+          materializationRetries: normalizeRetrySummary(
             report.materializationRetries,
           ),
         }
@@ -343,6 +405,95 @@ export async function cancelWatchClient(
     'watch.cancel',
     { sessionId, ephemeralId },
     socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Client timeout for the two retry repairs. The daemon runs each repair as one
+ * immediate SQLite transaction, which waits up to the store's 5-second busy
+ * timeout for another writer's lock before it fails. That wait can come twice:
+ * the store's busy wait is synchronous, so while another process holds the
+ * lock the daemon's own tick can block its event loop for up to 5 seconds
+ * before it even reads the request, and the repair's transaction may then wait
+ * up to 5 seconds more. This covers both waits with a margin, where the
+ * default 2-second client timeout would give up on a daemon about to apply the
+ * repair.
+ *
+ * It is not a bound on the daemon: a daemon blocked on a lock for longer still
+ * answers too late, the CLI reports the outcome as unknown, and the daemon may
+ * apply the repair after the CLI has given up.
+ */
+export const RETRY_REPAIR_TIMEOUT_MS = 15_000;
+
+/**
+ * A repair result with its retry's Dates revived and its last error
+ * normalized for display, whether it came over the socket or in-process.
+ */
+function normalizeRepairResult(
+  result: MaterializationRetryRepairResult,
+): MaterializationRetryRepairResult {
+  return { outcome: result.outcome, retry: normalizeRetryRecord(result.retry) };
+}
+
+/**
+ * Re-arm one terminal retry on the live daemon (005 `monitor retry rearm`),
+ * so a watcher paused on it in that process wakes at once. The returned
+ * record is safe metadata with its Dates revived.
+ */
+export async function rearmRetryClient(
+  input: MaterializationRetryRepairInput,
+  socketPath?: string,
+): Promise<MaterializationRetryRepairResult> {
+  return normalizeRepairResult(
+    await callDaemon<MaterializationRetryRepairResult>(
+      'retry.rearm',
+      { ...input },
+      {
+        timeoutMs: RETRY_REPAIR_TIMEOUT_MS,
+        ...(socketPath ? { socketPath } : {}),
+      },
+    ),
+  );
+}
+
+/** Skip one terminal retry on the live daemon (005 `monitor retry skip`). */
+export async function skipRetryClient(
+  input: MaterializationRetrySkipInput,
+  socketPath?: string,
+): Promise<MaterializationRetryRepairResult> {
+  return normalizeRepairResult(
+    await callDaemon<MaterializationRetryRepairResult>(
+      'retry.skip',
+      { ...input },
+      {
+        timeoutMs: RETRY_REPAIR_TIMEOUT_MS,
+        ...(socketPath ? { socketPath } : {}),
+      },
+    ),
+  );
+}
+
+/**
+ * Re-arm one terminal retry directly in the workspace's persisted store, for
+ * when no daemon is reachable. The store transaction is the same one the
+ * daemon would run; a daemon started later finds the retry pending.
+ */
+export function rearmRetryInProcess(
+  input: MaterializationRetryRepairInput,
+  dbPath: string,
+): MaterializationRetryRepairResult {
+  return normalizeRepairResult(
+    createRuntime(dbPath).rearmMaterializationRetry(input),
+  );
+}
+
+/** Skip one terminal retry directly in the persisted store (no daemon reachable). */
+export function skipRetryInProcess(
+  input: MaterializationRetrySkipInput,
+  dbPath: string,
+): MaterializationRetryRepairResult {
+  return normalizeRepairResult(
+    createRuntime(dbPath).skipMaterializationRetry(input),
   );
 }
 
@@ -452,19 +603,31 @@ const MONITOR_ROLLUP_DATE_FIELDS = [
   'lastEventAt',
 ] as const satisfies readonly (keyof DoctorMonitorRollup)[];
 
-function reviveMaterializationRetryDates(
-  summary: MaterializationRetrySummary,
-): MaterializationRetrySummary {
+/**
+ * The safe projection of one id's recovery obligations off the wire: the retry
+ * summary only when present and well-formed, the loss only when valid, or
+ * `undefined` when nothing reportable is left.
+ */
+function reviveMonitorWork(group: {
+  materializationRetries?: MaterializationRetrySummary;
+  unretainedObservationLoss?: UnretainedObservationLoss;
+}):
+  | {
+      materializationRetries?: MaterializationRetrySummary;
+      unretainedObservationLoss?: UnretainedObservationLoss;
+    }
+  | undefined {
+  // Same projection as an attached rollup summary.
+  const retries = group.materializationRetries
+    ? normalizeRetrySummary(group.materializationRetries)
+    : undefined;
+  const loss = normalizeUnretainedObservationLoss(
+    group.unretainedObservationLoss,
+  );
+  if (!retries && !loss) return undefined;
   return {
-    ...summary,
-    records: summary.records.map((record) => ({
-      ...record,
-      nextAttemptAt: record.nextAttemptAt
-        ? new Date(record.nextAttemptAt)
-        : null,
-      createdAt: new Date(record.createdAt),
-      updatedAt: new Date(record.updatedAt),
-    })),
+    ...(retries ? { materializationRetries: retries } : {}),
+    ...(loss ? { unretainedObservationLoss: loss } : {}),
   };
 }
 
@@ -475,6 +638,8 @@ function reviveMaterializationRetryDates(
  * the store; `doctor.ts` calls `.toISOString()` on report dates unconditionally
  * (unlike sibling commands, which only re-serialize their reports), so
  * `doctorReportClient` must uphold the same contract or that call throws.
+ * Attached and orphan retry summaries share the safe metadata projection, so
+ * version-skewed daemon errors and unexpected private fields cannot bypass it.
  */
 function reviveDoctorReportDates(
   report: MonitorDoctorReport,
@@ -482,6 +647,45 @@ function reviveDoctorReportDates(
   return {
     ...report,
     generatedAt: new Date(report.generatedAt),
+    ...(report.orphanedMonitorWork
+      ? {
+          orphanedMonitorWork: report.orphanedMonitorWork.flatMap((group) => {
+            const work = reviveMonitorWork(group);
+            if (!work) return [];
+            return [
+              {
+                monitorId: group.monitorId,
+                // Closed vocabulary on the wire: anything but `ephemeral`
+                // renders as a definition-backed id.
+                monitorKind:
+                  group.monitorKind === 'ephemeral'
+                    ? ('ephemeral' as const)
+                    : ('persistent' as const),
+                ...work,
+              },
+            ];
+          }),
+        }
+      : {}),
+    ...(report.ephemeralMonitorWork
+      ? {
+          ephemeralMonitorWork: report.ephemeralMonitorWork.flatMap((group) => {
+            const work = reviveMonitorWork(group);
+            return work
+              ? [
+                  {
+                    monitorId: group.monitorId,
+                    sessionId: group.sessionId,
+                    ...work,
+                    ...(group.validationError !== undefined
+                      ? { validationError: group.validationError }
+                      : {}),
+                  },
+                ]
+              : [];
+          }),
+        }
+      : {}),
     monitors: report.monitors.map((monitor) => {
       const revived = { ...monitor };
       for (const field of MONITOR_ROLLUP_DATE_FIELDS) {
@@ -489,10 +693,15 @@ function reviveDoctorReportDates(
         if (value !== undefined) revived[field] = new Date(value);
       }
       if (revived.materializationRetries) {
-        revived.materializationRetries = reviveMaterializationRetryDates(
+        revived.materializationRetries = normalizeRetrySummary(
           revived.materializationRetries,
         );
       }
+      const loss = normalizeUnretainedObservationLoss(
+        revived.unretainedObservationLoss,
+      );
+      if (loss) revived.unretainedObservationLoss = loss;
+      else delete revived.unretainedObservationLoss;
       return revived;
     }),
     leadSessions: report.leadSessions.map((session) => {

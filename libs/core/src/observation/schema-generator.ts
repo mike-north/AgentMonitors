@@ -1,3 +1,4 @@
+import { MAX_MONITOR_TAGS } from '../schema/input-limits.js';
 import type { JsonSchema, ObservationSource } from './types.js';
 
 /**
@@ -110,6 +111,7 @@ export function generateMonitorSchema(
       },
       tags: {
         type: 'array',
+        maxItems: MAX_MONITOR_TAGS,
         items: { type: 'string' },
       },
     },

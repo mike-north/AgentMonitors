@@ -12,7 +12,7 @@
  * NOT read back from the implementation.
  *
  * @see ../../../docs/specs/002-runtime-delivery.md §9.2 (normal reminder wording
- *   contract, coalesced-until-ack)
+ *   contract, fresh batches)
  * @see ../../../docs/specs/006-agent-integration.md §5 (delivery format:
  *   transport-owned attribution, per-batch ack instruction)
  * @see https://github.com/mike-north/AgentMonitors/issues/438
@@ -208,13 +208,9 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     expect(content).not.toContain('events ack');
   });
 
-  // Issue #434: the delivered payload must name the ack step, because claiming
-  // is not acknowledging — and until the recipient acknowledges, the
-  // coalesced-until-ack rule silently mutes every later normal reminder. This
-  // pins BOTH halves: the suppression still behaves exactly as 002 §9.2
-  // specifies (unchanged), AND the text that was actually delivered told the
-  // recipient how to prevent the mute.
-  it('delivers the ack instruction, then still coalesces until that ack happens', () => {
+  // Acknowledgment instructions remain necessary for handled work even though
+  // a fresh reminder no longer depends on acknowledgment of the previous batch.
+  it('delivers the ack instruction without withholding a later fresh batch', () => {
     const h = buildHarness('claude-434-coalesce');
     h.emit('normal', 'doc-1');
 
@@ -235,15 +231,16 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
     // (b) The recipient acts but does NOT ack. A newer event fires...
     h.emit('normal', 'doc-2');
 
-    // ...and the reminder is suppressed — unchanged 002 §9.2 behavior: the
-    // coalesced reminder re-fires only when EVERY unread normal event is
-    // unclaimed, and doc-1 is claimed-but-unacknowledged.
+    expect(
+      h.runtime.claimDelivery(h.sessionId, 'turn-interruptible')?.message,
+    ).toBe(expectedReminder());
+    expect(h.store.unreadEventsForSession(h.sessionId)).toHaveLength(2);
     expect(
       h.runtime.claimDelivery(h.sessionId, 'turn-interruptible'),
     ).toBeNull();
 
-    // (c) The instruction the payload gave is genuinely the remediation:
-    // acknowledging unmutes the band, so the next event is delivered again.
+    // Explicit acknowledgment clears the handled backlog; it is not needed to
+    // allow a third event to surface.
     h.runtime.acknowledgeSession(h.sessionId);
     h.emit('normal', 'doc-3');
     const afterAck = h.runtime.claimDelivery(h.sessionId, 'turn-interruptible');
@@ -341,4 +338,38 @@ describe('delivered text is self-sufficient and transport-attributed (issues #43
       `When handled, acknowledge: agentmonitors events ack --session ${h.sessionId}${SOCKET_CLAUSE} --event-ids ${ids}`,
     );
   });
+});
+
+// Each new pending batch must reach either rendering surface even while the
+// recipient keeps older work unread. A reminder is not an acknowledgment.
+describe('fresh reminder batches survive older unacknowledged work', () => {
+  it.each(['normal', 'low'] as const)(
+    'renders a fresh %s batch on both transports without repeating old claims',
+    (urgency) => {
+      const h = buildHarness(`fresh-${urgency}`);
+      const lifecycle =
+        urgency === 'normal' ? 'turn-interruptible' : 'turn-idle';
+      h.emit(urgency, 'old');
+      h.runtime.claimDelivery(h.sessionId, lifecycle);
+      h.emit(urgency, 'new');
+      const reserved = h.runtime.reserveDelivery(h.sessionId, lifecycle);
+      expect(reserved).not.toBeNull();
+      if (!reserved) throw new Error('Expected fresh reminder reservation');
+      const hook = renderHookDelivery(reserved.claim, 'UserPromptSubmit', {
+        socketPath: TEST_SOCKET_PATH,
+      });
+      const channel = renderChannelEvent(reserved.claim, {
+        socketPath: TEST_SOCKET_PATH,
+      });
+      expect(hook?.hookSpecificOutput.additionalContext).toContain(
+        expectedReminder(),
+      );
+      expect(channel.content).toContain(expectedReminder());
+      expect(channel.meta['urgency']).toBe(urgency);
+      expect(h.runtime.claimDelivery(h.sessionId, lifecycle)).toBeNull();
+      h.runtime.commitDelivery(reserved.reservationId);
+      expect(h.store.unreadEventsForSession(h.sessionId)).toHaveLength(2);
+      expect(h.runtime.claimDelivery(h.sessionId, lifecycle)).toBeNull();
+    },
+  );
 });

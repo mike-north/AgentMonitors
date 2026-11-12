@@ -49,10 +49,27 @@ export const agentSessions = sqliteTable('agent_sessions', {
   dormantAt: integer('dormant_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * The position this session took in the `monitor_events` materialization
+   * order when it was first registered: reserved from that table's
+   * AUTOINCREMENT counter, the same counter a retained observation reserves
+   * its `admission_sequence` from. A retry completed later projects only into
+   * sessions registered before the observation was admitted (002 §2.7), and
+   * this comparison does not depend on second-resolution timestamps. Resuming
+   * a session keeps its original position. NULL on sessions registered before
+   * positions were reserved.
+   */
+  registrationSequence: integer('registration_sequence'),
 });
 
+/**
+ * Shared observation history. Persisted observation time is the primary event
+ * order; a private SQLite sequence breaks equal-time ties across all writers.
+ * Public event IDs remain stable references for projections and delivery state.
+ */
 export const monitorEvents = sqliteTable('monitor_events', {
-  id: text('id').primaryKey(),
+  sequence: integer('sequence').primaryKey({ autoIncrement: true }),
+  id: text('id').notNull().unique(),
   workspacePath: text('workspace_path'),
   monitorId: text('monitor_id').notNull(),
   sourceName: text('source_name').notNull(),
@@ -75,10 +92,35 @@ export const monitorEvents = sqliteTable('monitor_events', {
   queryScope: text('query_scope').notNull().default('{}'),
   tags: text('tags').notNull().default('[]'),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * Where this event's observation was admitted in the materialization order,
+   * when that differs from `sequence`: set only on an event completed from the
+   * retry outbox, to the position its retry reserved at admission (0 for a
+   * retry admitted before positions were reserved). NULL on every event
+   * materialized in its admitting span, whose admission position is its own
+   * `sequence`. Supersession of a dropped observation compares admission, not
+   * commit, so an older retry completed after a drop cannot clear it (002 §2).
+   */
+  admissionSequence: integer('admission_sequence'),
+  // A content fingerprint of the parts of the monitor's definition that decide
+  // what an event is (urgency, urgencyMax, body, name, watch minus scheduling
+  // keys, shape, payload, baseline-strategy; 002 §5.3) at materialization time
+  // (issue #451),
+  // letting `monitor explain` detect a pending event that predates the
+  // monitor's current definition without altering the event's own already-
+  // correct urgency/title/body. NULL on legacy rows materialized before this
+  // column existed.
+  definitionFingerprint: text('definition_fingerprint'),
 });
 
+/**
+ * Retained object artifacts. Public ULIDs identify snapshots; SQLite's private
+ * sequence orders committed materializations across writers independently of
+ * wall clocks. Rolled-back allocations have no durable ordering significance.
+ */
 export const monitorSnapshots = sqliteTable('monitor_snapshots', {
-  id: text('id').primaryKey(),
+  sequence: integer('sequence').primaryKey({ autoIncrement: true }),
+  id: text('id').notNull().unique(),
   workspacePath: text('workspace_path'),
   monitorId: text('monitor_id').notNull(),
   objectKey: text('object_key').notNull(),
@@ -111,6 +153,15 @@ export const materializationRetryOutbox = sqliteTable(
     lastError: text('last_error'),
     createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
     updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+    /**
+     * The position this observation took in the `monitor_events` materialization
+     * order when it was admitted: reserved from that table's AUTOINCREMENT
+     * counter in the admitting transaction, so it is strictly after every event
+     * and drop committed before it and before every later one. Its completed
+     * event carries it as `admission_sequence`. NULL on rows admitted before
+     * positions were reserved.
+     */
+    admissionSequence: integer('admission_sequence'),
   },
 );
 
@@ -301,6 +352,44 @@ export const objectEventSuppressions = sqliteTable(
   },
 );
 
+/** Why a verify artifact's cleanup authority took effect. */
+export const verifyArtifactCleanupCauses = [
+  'owner-request',
+  'owner-inactive',
+] as const;
+
+/**
+ * Durable, exact ownership of one synthetic artifact a `verify` run creates
+ * against a persistent workspace daemon (issue #562). The run registers the row
+ * **before** creating its scratch file, so the daemon knows the file is
+ * verify's own even if the run is killed before any event projects.
+ *
+ * While the owner session is active and has not asked for cleanup, events for
+ * the key flow normally: that is verify's proof delivery. Once cleanup takes
+ * effect (`cleanup_requested_at` set, or the owner session is no longer
+ * active), the runtime filters this exact `(workspace_path, monitor_id,
+ * object_key)` at the incoming-observation and held-emission boundaries, so no
+ * later session receives the artifact.
+ *
+ * Rows have no expiry and are never retired automatically: recovery can be
+ * delayed arbitrarily and no source signal proves it has finished. Only verify
+ * registration creates rows, one per run (`run_id` is the run's random token,
+ * which the scratch file name also carries), so growth is bounded by the
+ * number of `--use-workspace-daemon` runs. Retaining retired keys is also what
+ * prevents another run from reusing one.
+ */
+export const verifyArtifacts = sqliteTable('verify_artifacts', {
+  runId: text('run_id').primaryKey(),
+  ownerSessionId: text('owner_session_id').notNull(),
+  workspacePath: text('workspace_path').notNull(),
+  monitorId: text('monitor_id').notNull(),
+  objectKey: text('object_key').notNull(),
+  registeredAt: integer('registered_at', { mode: 'timestamp' }).notNull(),
+  /** First moment cleanup authority was recorded; never cleared. */
+  cleanupRequestedAt: integer('cleanup_requested_at', { mode: 'timestamp' }),
+  cleanupCause: text('cleanup_cause', { enum: verifyArtifactCleanupCauses }),
+});
+
 export const observationHistory = sqliteTable('observation_history', {
   id: text('id').primaryKey(),
   monitorId: text('monitor_id').notNull(),
@@ -322,4 +411,22 @@ export const observationHistory = sqliteTable('observation_history', {
     ],
   }).notNull(),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * Set only on an unretained-admission drop row (002 §2): the dropped
+   * observation's raw `objectKey`, matched exactly against
+   * `monitor_events.object_key`. NULL on a drop of an observation without a
+   * string object key, and on every other row.
+   */
+  unretainedObjectKey: text('unretained_object_key'),
+  /**
+   * Set only on a drop row, and what marks it as one: the high-water mark of
+   * the `monitor_events` materialization order (its AUTOINCREMENT counter,
+   * which also covers positions reserved by retained retries) when the drop
+   * was recorded, read inside the admitting transaction. An event for the same
+   * monitor, workspace and object key whose observation was admitted above it
+   * (`admission_sequence`, else `sequence`) supersedes the drop. Event
+   * `created_at` is observation time, not admission order, so it cannot order
+   * an event against a history row.
+   */
+  unretainedEventWatermark: integer('unretained_event_watermark'),
 });

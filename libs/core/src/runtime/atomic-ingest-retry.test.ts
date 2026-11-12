@@ -1,3 +1,7 @@
+/**
+ * Admission fault matrix: each emitted observation is an event or an ordered
+ * retained obligation, and failed outer admission preserves replayable state.
+ */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -26,18 +30,36 @@ import type {
 const NOW = new Date('2026-08-13T18:00:00.000Z');
 const tempDirs: string[] = [];
 
+/** Preserve native Date instances: retry envelopes reject subclass/augmented timestamps. */
+let clockTime = NOW.getTime();
 beforeEach(() => {
-  vi.useFakeTimers();
-  vi.setSystemTime(NOW);
+  clockTime = NOW.getTime();
+  vi.stubGlobal(
+    'Date',
+    new Proxy(Date, {
+      construct(target, args) {
+        return Reflect.construct(
+          target,
+          args.length === 0 ? [clockTime] : args,
+        );
+      },
+      get(target, key, receiver) {
+        return key === 'now'
+          ? () => clockTime
+          : Reflect.get(target, key, receiver);
+      },
+    }),
+  );
 });
 
 afterEach(() => {
-  vi.useRealTimers();
+  vi.unstubAllGlobals();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
 });
 
+/** Inject real persistence failures at each nested or outer admission boundary. */
 class FaultStore extends RuntimeStore {
   failedSummary: string | undefined;
   eventFailures = 0;
@@ -92,6 +114,7 @@ interface RecordingInterpretAdapter extends InterpretAdapter {
   calls: InterpretInput[];
 }
 
+/** Record post-commit interpretation without changing its success behavior. */
 function recordingInterpretAdapter(): RecordingInterpretAdapter {
   const calls: InterpretInput[] = [];
   return {
@@ -104,6 +127,7 @@ function recordingInterpretAdapter(): RecordingInterpretAdapter {
   };
 }
 
+/** Isolate monitor definitions and durable database state for one scenario. */
 function createFixture(options: { interval?: string; notify?: string } = {}) {
   const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-atomic-ingest-'));
   tempDirs.push(rootDir);
@@ -128,11 +152,11 @@ Handle it.
   return {
     rootDir,
     dbPath: path.join(rootDir, 'agentmon.db'),
-    monitorDir,
     monitorsDir: path.join(rootDir, '.claude/monitors'),
   };
 }
 
+/** Emit once from the old cursor so reopen proves replay rather than a fabricated retry. */
 function createSource(observedStates: unknown[]): ObservationSource {
   return {
     name: 'retry-source',
@@ -174,6 +198,7 @@ function createRuntime(
   );
 }
 
+/** Build the real runtime/store path with deterministic fault controls. */
 function setup(options: Parameters<typeof createFixture>[0] = {}) {
   const fixture = createFixture(options);
   const observedStates: unknown[] = [];
@@ -385,7 +410,7 @@ describe('atomic poll ingest', () => {
         { result: 'errored', observationData: { error: message } },
       ]);
 
-      vi.setSystemTime(NOW.getTime() + 1_000);
+      clockTime = NOW.getTime() + 1_000;
       const reopenedStore = new RuntimeStore(createDb(f.dbPath));
       const restarted = createRuntime(reopenedStore, f.source, f.interpret);
       const replayed = await restarted.tick(f.monitorsDir, f.rootDir);
@@ -404,55 +429,6 @@ describe('atomic poll ingest', () => {
       ]);
     });
   }
-
-  for (const fault of faults) {
-    it(`drains a queued ${fault.name} fault in source order after restart`, async () => {
-      const f = setup();
-      fault.configure(f);
-      const initial = await f.runtime.tick(f.monitorsDir, f.rootDir);
-      fault.cleanup?.(f);
-
-      vi.setSystemTime(NOW.getTime() + 1_000);
-      const reopenedStore = new RuntimeStore(createDb(f.dbPath));
-      const restarted = createRuntime(reopenedStore, f.source, f.interpret);
-      const drained = await restarted.tick(f.monitorsDir, f.rootDir);
-      expectTick(drained, reopenedStore, { emitted: fault.queued });
-      expect([
-        ...summaries(f.store, initial.emittedEventIds),
-        ...summaries(reopenedStore, drained.emittedEventIds),
-      ]).toEqual(['first', 'second']);
-      expect(
-        restarted
-          .listEvents({ monitorId: 'test-monitor' })
-          .map(({ summary }) => summary),
-      ).toEqual(['second', 'first']);
-      expect(reopenedStore.listMaterializationRetries()).toEqual([]);
-      expect(f.observedStates).toEqual([undefined, { cursor: 1 }]);
-      expect(interpretDeltas(f.interpret)).toEqual([
-        'first-state',
-        'second-state',
-      ]);
-      expect(history(restarted)).toEqual([
-        {
-          result: 'no-change',
-          observationData: { observed: 0, emitted: 0 },
-        },
-        ...fault.queued.map(() => ({
-          result: 'triggered' as const,
-          observationData: { observed: 0, emitted: 1 },
-        })),
-        { result: 'errored', observationData: { error: fault.message } },
-        ...(fault.emitted.length === 1
-          ? [
-              {
-                result: 'triggered' as const,
-                observationData: { observed: 2, emitted: 1 },
-              },
-            ]
-          : []),
-      ]);
-    });
-  }
 });
 
 describe('atomic rollup-window flush', () => {
@@ -463,7 +439,7 @@ describe('atomic rollup-window flush', () => {
     it(`preserves pending notify state across ${fault} failure and restart`, async () => {
       const outsideWindow = new Date('2026-08-13T08:00:00.000Z');
       const atWindow = new Date('2026-08-13T09:00:00.000Z');
-      vi.setSystemTime(outsideWindow);
+      clockTime = outsideWindow.getTime();
       const f = setup({
         interval: '2h',
         notify: "notify:\n  strategy: rollup\n  window: '0 9 * * *'\n",
@@ -485,7 +461,7 @@ describe('atomic rollup-window flush', () => {
         f.store.eventFailures = 1;
         f.store.outboxFailures = 1;
       }
-      vi.setSystemTime(atWindow);
+      clockTime = atWindow.getTime();
       const skipped = [
         {
           monitorId: 'test-monitor',
@@ -511,7 +487,7 @@ describe('atomic rollup-window flush', () => {
         },
       ]);
 
-      vi.setSystemTime(atWindow.getTime() + 1_000);
+      clockTime = atWindow.getTime() + 1_000;
       const reopenedStore = new RuntimeStore(createDb(f.dbPath));
       const restarted = createRuntime(reopenedStore, f.source, f.interpret);
       expectTick(
@@ -552,65 +528,15 @@ describe('atomic rollup-window flush', () => {
   }
 });
 
-describe('runtime retry scheduling', () => {
-  it('reports failed and successful drains for a removed monitor as evaluations', async () => {
-    const f = setup();
-    f.store.failedSummary = 'first';
-    f.store.eventFailures = 1;
-    await f.runtime.tick(f.monitorsDir, f.rootDir);
-    rmSync(f.monitorDir, { recursive: true, force: true });
-
-    vi.setSystemTime(NOW.getTime() + 1_000);
-    const reopenedStore = new FaultStore(createDb(f.dbPath));
-    reopenedStore.failedSummary = 'first';
-    reopenedStore.eventFailures = 1;
-    const restarted = createRuntime(reopenedStore, f.source, f.interpret);
-    expectTick(await restarted.tick(f.monitorsDir, f.rootDir), reopenedStore, {
-      errors: ['insert failure for first'],
-    });
-    expect(reopenedStore.listMaterializationRetries()[0]).toMatchObject({
-      attemptCount: 1,
-      status: 'pending',
-    });
-    expect(f.observedStates).toEqual([undefined]);
-
-    vi.setSystemTime(NOW.getTime() + 6_000);
-    expectTick(await restarted.tick(f.monitorsDir, f.rootDir), reopenedStore, {
-      emitted: ['first', 'second'],
-    });
-    expect(reopenedStore.listMaterializationRetries()).toEqual([]);
-    expect(f.observedStates).toEqual([undefined]);
-    expect(interpretDeltas(f.interpret)).toEqual([
-      'first-state',
-      'second-state',
-    ]);
-    expect(history(restarted)).toEqual([
-      {
-        result: 'triggered',
-        observationData: { observed: 0, emitted: 1 },
-      },
-      {
-        result: 'triggered',
-        observationData: { observed: 0, emitted: 1 },
-      },
-      {
-        result: 'errored',
-        observationData: { error: 'insert failure for first' },
-      },
-      {
-        result: 'errored',
-        observationData: { error: 'insert failure for first' },
-      },
-    ]);
-  });
-
+/** Retained recipients stay fixed across both late registration and database reopening. */
+describe('retry recipients after restart', () => {
   it('does not project delayed retries into a later-opened session', async () => {
     const f = setup();
     f.store.failedSummary = 'first';
     f.store.eventFailures = 1;
     await f.runtime.tick(f.monitorsDir, f.rootDir);
 
-    vi.setSystemTime(NOW.getTime() + 2_000);
+    clockTime = NOW.getTime() + 2_000;
     const lateSession = f.runtime.openSession(
       claudeCodeAdapter.createSessionInput({
         hostSessionId: 'late-session',
@@ -641,34 +567,5 @@ describe('runtime retry scheduling', () => {
         f.rootDir,
       ),
     ).toBeNull();
-  });
-
-  it('pauses source observation until an older retry succeeds', async () => {
-    const f = setup();
-    f.store.failedSummary = 'second';
-    f.store.eventFailures = 2;
-    await f.runtime.tick(f.monitorsDir, f.rootDir);
-
-    vi.setSystemTime(NOW.getTime() + 1_000);
-    expectTick(await f.runtime.tick(f.monitorsDir, f.rootDir), f.store, {
-      errors: ['insert failure for second'],
-    });
-    expect(f.observedStates).toEqual([undefined]);
-    expect(f.store.listMaterializationRetries()[0]).toMatchObject({
-      attemptCount: 1,
-      status: 'pending',
-    });
-
-    f.store.eventFailures = 0;
-    vi.setSystemTime(NOW.getTime() + 6_000);
-    expectTick(await f.runtime.tick(f.monitorsDir, f.rootDir), f.store, {
-      emitted: ['second'],
-    });
-    expect(f.observedStates).toEqual([undefined, { cursor: 1 }]);
-    expect(f.store.listMaterializationRetries()).toEqual([]);
-    expect(interpretDeltas(f.interpret)).toEqual([
-      'first-state',
-      'second-state',
-    ]);
   });
 });

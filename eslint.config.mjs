@@ -13,6 +13,9 @@ export default tseslint.config(
       '.Codex/**',
       '.codex/**',
       '.worktrees/**',
+      // Whole checkouts of this repo, outside every tsconfig and each as large as
+      // the repo itself. ESLint does not read .gitignore, which also lists them.
+      '.claude/worktrees/**',
       'scratch/**',
       'experiments/**',
       'apps/website/**',
@@ -49,7 +52,9 @@ export default tseslint.config(
     ...tseslint.configs.disableTypeChecked,
   },
   {
-    files: ['scripts/**/*.mjs'],
+    // Owned child-process fixtures are native Node JavaScript outside the
+    // TypeScript project, like repository scripts, but still receive lint checks.
+    files: ['scripts/**/*.mjs', 'libs/core/src/runtime/test-fixtures/**/*.mjs'],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: {

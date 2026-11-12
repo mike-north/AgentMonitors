@@ -1,54 +1,25 @@
 import type { DeliveryLifecycle } from './types.js';
 
 /**
- * Reminder diagnosis (issue #333, 002 §9.2–§9.3).
- *
- * The coalesced generic inbox reminder for `normal` (at `turn-interruptible`,
- * §9.2) and `low` (at `turn-idle`, §9.3) urgency is delivered **only if all
- * unread events of that urgency are still unclaimed**. Once any unread event of
- * that urgency has been claimed (its `firstNotifiedAt` is set) but not yet
- * acknowledged, the reminder is suppressed — it does not re-fire until the
- * claimed events are acknowledged. A fresh unclaimed event of the same band
- * arriving in the meantime does NOT restore it: the band-scoped equality guard
- * (unread count === pending count) stays unequal as long as any claimed row
- * remains in the unread total, regardless of how many new unclaimed rows join it.
- *
- * This is the exact trap a blind study subject hit: a first
- * `hook claim --lifecycle turn-interruptible` surfaced the reminder AND claimed
- * the underlying normal event; a second identical claim then returned `null`
- * (nothing surfaced) with no explanation. Per the silent-failure-honesty
- * invariant (capability C12, and §1.1.8's "why nothing fired" principle), that
- * silence must be inspectable rather than presented as a dead end. This module
- * turns the guard's decision into a named, human-readable verdict surfaced by
- * `monitor explain` (§10.7 projection-and-delivery stage).
- *
- * The reminder guard is a **session-level, cross-monitor** decision (it counts
- * every unread event of the urgency band for the session, regardless of which
- * monitor produced it — see `AgentMonitorRuntime.claimDelivery`), so the counts
- * fed to this function are session-scoped, not monitor-scoped.
+ * Explains why a normal/low reminder is absent without changing delivery state.
+ * A fresh pending batch surfaces independently of older claimed rows. The only
+ * band-wide hold is a temporary in-flight reservation, which prevents duplicate
+ * generic reminders across transports until commit, release or lease expiry.
+ * With no pending work, claimed rows remain unread but are not reminded again.
+ * Counts are per session and urgency band, including all matching monitors.
  */
 
 /** Urgency bands that surface a coalesced generic reminder (not `high`). */
 export type ReminderUrgency = 'normal' | 'low';
 
 /**
- * Why a coalesced reminder is currently suppressed:
- * - `already-claimed` — every unread event of the band is already durably
- *   claimed (the classic single-monitor case: the reminder fired once,
- *   claiming the event, and will not fire again until it is acknowledged).
- * - `coalesced-until-ack` — a mix of claimed and unclaimed unread events exists
- *   (a leased-but-not-yet-claimed row may also be present and is reported
- *   separately via `leasedCount`); because the reminder coalesces until
- *   acknowledgment, the presence of a claimed-but-unacknowledged event holds it
- *   back even though a newer unclaimed event is also pending.
- * - `reserved-in-flight` — NO unread event of the band is durably claimed, but
- *   at least one is currently LEASED by an in-flight channel-push reservation
- *   (issue #300). A lease is not a claim and resolves itself, so this reason
- *   must never recommend `events ack` — acknowledging a leased-but-unseen row
- *   before the push resolves can permanently lose it if the push then fails
- *   (round 10 review).
+ * Why no fresh reminder can surface. `coalesced-until-ack` is retained only for
+ * compatibility with historical diagnostics; new decisions never emit it.
+ * `no-new-work` means no fresh pending work remains; `already-claimed` is legacy. `reserved-in-flight`
+ * is a temporary lease and must never suggest acknowledgment as a remedy.
  */
 export type ReminderSuppressionReason =
+  | 'no-new-work'
   | 'already-claimed'
   | 'coalesced-until-ack'
   | 'reserved-in-flight';
@@ -105,7 +76,6 @@ function buildMessage(
   sessionId: string,
   urgency: ReminderUrgency,
   unreadCount: number,
-  claimedCount: number,
   leasedCount: number,
   reason: ReminderSuppressionReason,
 ): string {
@@ -121,42 +91,17 @@ function buildMessage(
       `needed — it will be claimed shortly, or become claimable again if that push fails.`
     );
   }
-  const leasedNote =
-    leasedCount > 0
-      ? ` (${String(leasedCount)} more of this band are being surfaced by an in-flight channel-push reservation and need no action)`
-      : '';
-  if (reason === 'already-claimed') {
-    return (
-      `${head} all ${String(unreadCount)} unread ${urgency} event(s) are already claimed ` +
-      `(coalesced-until-ack). The generic inbox reminder does not re-fire until they are ` +
-      `acknowledged (\`${ackCmd}\`) — a new unclaimed ${urgency} event arriving in the meantime ` +
-      `does not restore it.`
-    );
-  }
   return (
-    `${head} ${String(claimedCount)} of ${String(unreadCount)} unread ${urgency} event(s) are ` +
-    `already claimed (coalesced-until-ack)${leasedNote}. The coalesced reminder re-fires only when ` +
-    `every unread ${urgency} event is unclaimed — acknowledge the claimed ones (\`${ackCmd}\`).`
+    `${head} all ${String(unreadCount)} unread ${urgency} event(s) are already claimed. ` +
+    `They remain unread until explicitly acknowledged (\`${ackCmd}\`). ` +
+    `A fresh unclaimed ${urgency} event will trigger a new reminder; previously claimed events are not repeated.`
   );
 }
 
 /**
- * Diagnose, per session-and-band, whether the coalesced reminder is currently
- * suppressed and why.
- *
- * The delivery guard (§9.2/§9.3) fires the reminder iff `pendingCount > 0 &&
- * pendingCount === unreadCount`, where `pendingCount` already excludes rows
- * LEASED by an in-flight channel-push reservation (issue #300) — i.e. at least
- * one unread event exists and **every** unread event is unclaimed AND
- * unleased. Equivalently, with `claimedCount = unreadCount - pendingCount -
- * leasedCount`, it fires iff `unreadCount > 0 && claimedCount === 0 &&
- * leasedCount === 0`. So the reminder is SUPPRESSED exactly when `unreadCount
- * > 0 && (claimedCount > 0 || leasedCount > 0)`; every other state either
- * delivers the reminder (nothing to explain) or has no unread work at all. A
- * pure lease (`claimedCount === 0 && leasedCount > 0`) gets the distinct
- * `reserved-in-flight` reason, which never recommends ack (round 10 review).
- *
- * Bands with no unread work, or whose reminder would fire, produce no finding.
+ * Diagnose the same pending-work and reservation gates used for actual delivery.
+ * A prior claim is not a reason to hold a fresh pending batch; a live lease is.
+ * Empty bands and ready batches need no suppression explanation.
  */
 export function diagnoseReminderSuppression(
   counts: readonly ReminderSessionCounts[],
@@ -165,16 +110,10 @@ export function diagnoseReminderSuppression(
   for (const c of counts) {
     const leasedCount = c.leasedCount ?? 0;
     const claimedCount = c.unreadCount - c.pendingCount - leasedCount;
-    // Guard for the reminder firing: unread > 0 AND every unread event
-    // unclaimed AND unleased. Suppressed iff there is unread work AND at
-    // least one is already claimed or leased.
-    if (c.unreadCount <= 0 || (claimedCount <= 0 && leasedCount <= 0)) continue;
+    if (c.unreadCount <= 0 || (c.pendingCount > 0 && leasedCount <= 0))
+      continue;
     const reason: ReminderSuppressionReason =
-      claimedCount <= 0
-        ? 'reserved-in-flight'
-        : c.pendingCount <= 0 && leasedCount <= 0
-          ? 'already-claimed'
-          : 'coalesced-until-ack';
+      leasedCount > 0 ? 'reserved-in-flight' : 'no-new-work';
     findings.push({
       sessionId: c.sessionId,
       urgency: c.urgency,
@@ -187,7 +126,6 @@ export function diagnoseReminderSuppression(
         c.sessionId,
         c.urgency,
         c.unreadCount,
-        claimedCount,
         leasedCount,
         reason,
       ),

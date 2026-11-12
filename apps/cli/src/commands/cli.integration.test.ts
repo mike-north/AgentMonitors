@@ -38,8 +38,11 @@ import {
 } from '../channel-render.js';
 import { escapeShellPath } from '../delivery-event-render.js';
 import {
+  AgentMonitorRuntime,
+  claudeCodeAdapter,
   createDb,
   RuntimeStore,
+  SourceRegistry,
   type StoredObservationEnvelope,
 } from '@agentmonitors/core';
 
@@ -459,11 +462,6 @@ async function startStaticResultDaemon(
 let tempDir: string;
 
 beforeAll(() => {
-  execFileSync('pnpm', ['build'], {
-    cwd: CLI_PACKAGE_DIR,
-    stdio: 'pipe',
-    env: process.env,
-  });
   tempDir = mkdtempSync(path.join(tmpdir(), 'agentmonitors-test-'));
 });
 
@@ -1396,7 +1394,11 @@ describe('init', () => {
       // words — the latter would silently stop testing anything if the
       // rationale were ever reworded.
       expect(monitor).toContain('# urgency overridden via --urgency');
-      expect(monitor).not.toContain('coalesced-until-ack');
+      expect(monitor).not.toContain(
+        type === 'pr-review'
+          ? 'MEMBERSHIP set of PRs'
+          : 'earned by the payload filter',
+      );
 
       const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
       expect(validated.exitCode).toBe(0);
@@ -3546,8 +3548,8 @@ This monitor fires on a schedule.
   // Issue #297: a schedule monitor with an invalid IANA timezone made
   // Intl.DateTimeFormat throw OUTSIDE the per-monitor observe/ingest try/catches
   // — aborting the whole tick before any other monitor ran. This proves the
-  // fix at the `daemon once` surface: the bad monitor is isolated (errored, not
-  // a crash) and a sibling schedule monitor with a valid timezone still fires.
+  // bad config is now rejected by source preflight, while a sibling schedule
+  // monitor with a valid timezone still fires.
   it('isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits', () => {
     const dir = path.join(tempDir, 'once-bad-timezone');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
@@ -3571,7 +3573,10 @@ This monitor has a typo'd timezone.
     expect(result.exitCode).toBe(0);
     // The valid sibling still fires — the tick was NOT aborted.
     expect(result.stdout).toContain('emitted 1 event(s)');
-    expect(result.stdout).toContain('1 errored:');
+    expect(result.stdout).toContain(
+      'aaa-bad-timezone: skipped — scope.timezone:',
+    );
+    expect(result.stdout).not.toContain('1 errored:');
     expect(result.stdout).toContain('aaa-bad-timezone:');
     expect(result.stdout).toContain('Not/AZone');
   });
@@ -4626,8 +4631,8 @@ This monitor fires on a schedule.
 
   // Issue #297: `monitor explain` MUST NOT crash for a monitor whose schedule
   // timezone is invalid — it must render the failure as an actionable
-  // observation-stage diagnostic instead of a raw thrown RangeError.
-  it('explains an invalid schedule timezone as an observation-stage failure instead of crashing', () => {
+  // definition-stage diagnostic from source preflight instead of a raw RangeError.
+  it('explains an invalid schedule timezone as a definition-stage failure instead of crashing', () => {
     const dir = path.join(tempDir, 'explain-bad-timezone');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     const monitorsDir = path.join(monitorsRoot, 'bad-tz');
@@ -4670,12 +4675,12 @@ This monitor has a typo'd timezone.
     );
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('✗ Observation:');
-    expect(result.stdout).toContain('Verdict: failure at Observation');
+    expect(result.stdout).toContain('✗ Definition:');
+    expect(result.stdout).toContain('Verdict: failure at Definition');
     // The message must name the true cause (scheduling/timezone), not imply a
     // source observation ran and errored — text output only renders `reason`,
     // so the bad value must be inline (PR #433 review, discussion_r3608549689).
-    expect(result.stdout).toContain('schedule could not be evaluated');
+    expect(result.stdout).toContain('not a valid IANA time zone name');
     expect(result.stdout).toContain('Not/AZone');
   });
 
@@ -4948,6 +4953,66 @@ This monitor has a typo'd timezone.
     const rows = JSON.parse(json.stdout) as { monitorId: string }[];
     expect(rows.length).toBeGreaterThan(0);
     expect(rows.every((row) => row.monitorId === 'fires')).toBe(true);
+  });
+
+  it('history shows the serializer reason of a not-held observation even when its title is very long (002 §4.7, #570)', async () => {
+    const dir = path.join(tempDir, 'history-not-held-long-title');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(path.join(monitorsRoot, 'held'), { recursive: true });
+    writeFileSync(
+      path.join(monitorsRoot, 'held', 'MONITOR.md'),
+      '---\nname: Held\nwatch:\n  type: unserializable-source\n  interval: 1s\nurgency: normal\nnotify:\n  strategy: debounce\n  settle-for: 10s\n---\nInstructions\n',
+      'utf-8',
+    );
+    const dbPath = path.join(dir, 'agentmon.db');
+    // Seed the refusal through the real runtime: no bundled source can emit an
+    // unserializable payload, so a test-only source stands in for one.
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'unserializable-source',
+      stateful: true,
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            {
+              title: '\u001b[31mBad\u001b[0m\nsecond line ' + 'é'.repeat(600),
+              snapshotText: 'bad',
+              objectKey: 'bad',
+              payload: { count: 1n },
+            },
+          ],
+          nextState: { cursor: 1 },
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(createDb(dbPath)),
+      registry,
+      [claudeCodeAdapter],
+    );
+    const tick = await runtime.tick(monitorsRoot, dir);
+    expect(tick.erroredObservations).toHaveLength(1);
+
+    const socketPath = deadSocketPath('history-not-held');
+    const result = runWithEnv(
+      [
+        'monitor',
+        'history',
+        'held',
+        '--socket',
+        socketPath,
+        '--workspace',
+        dir,
+        '--format',
+        'text',
+      ],
+      { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath },
+      dir,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(
+      /was not held for debounce: it cannot be serialized \(Do not know how to serialize a BigInt\)\./u,
+    );
   });
 
   it('history with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT', () => {
@@ -5467,8 +5532,10 @@ Handle it.
     expect(doctorText.stdout).toMatch(
       /monitor:terminal-retry.*terminal materialization retry.*retry-outbox=0\/1/u,
     );
-    expect(doctorText.stdout).toContain(
-      'agentmonitors monitor explain terminal-retry',
+    // A symlinked temp root may need an explicit workspace spelling even
+    // when the subprocess starts there; the monitor ID stays positional.
+    expect(doctorText.stdout).toMatch(
+      /`agentmonitors monitor explain(?: --workspace [^`]+)? -- terminal-retry`/u,
     );
 
     const doctorJson = runWithEnv(
@@ -10105,10 +10172,10 @@ describe('hook deliver', () => {
 // surface the coalesced normal reminder (002 §9.2). The study subject had run an
 // EARLIER turn-interruptible claim (S3 phase 11) that surfaced the reminder AND
 // claimed the event; the second identical claim was then correctly suppressed
-// because the reminder coalesces until acknowledgment. The real defect was the
+// because no fresh work remained. The real defect was the
 // SILENCE — no way to discover why. This test pins both: (1) the reminder
 // surfaces on the first claim; (2) after a claim, the reminder is suppressed and
-// `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
+// `monitor explain` NAMES the reason (no-new-work).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
   /**
    * The coalesced reminder body the runtime emits (002 §9.2, issues
@@ -10310,14 +10377,16 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       // Suppression is EXPECTED behavior, not a fault.
       expect(delivery?.status).toBe('ok');
       expect(delivery?.reason).toContain('already claimed');
-      expect(delivery?.reason).toContain('coalesced-until-ack');
+      expect(delivery?.reason).toContain(
+        'fresh unclaimed normal event will trigger',
+      );
       const findings = delivery?.details?.reminderSuppression;
       expect(findings).toHaveLength(1);
       expect(findings?.[0]).toMatchObject({
         sessionId: session.id,
         urgency: 'normal',
         lifecycle: 'turn-interruptible',
-        reason: 'already-claimed',
+        reason: 'no-new-work',
       });
     } finally {
       daemon.stop();

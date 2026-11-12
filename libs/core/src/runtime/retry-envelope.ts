@@ -1,8 +1,15 @@
+/**
+ * Defines the retry outbox's supported plain-data domain. Validation rejects
+ * detectable unsupported values without caller-defined reads or serialization
+ * hooks. Callers must supply records, not objects with private intrinsic state;
+ * only the observation timestamp has typed hydration semantics.
+ */
+import { types } from 'node:util';
 import type { StoredObservationEnvelope } from './types.js';
 
 /**
- * Raised when a retry envelope cannot be persisted and restored without
- * changing its data.
+ * Raised for a detected violation of the retry envelope's supported plain-data
+ * domain, before any member of its batch is persisted.
  *
  * @public
  */
@@ -31,6 +38,33 @@ function childPath(parent: string, key: string): string {
     : `${parent}[${JSON.stringify(key)}]`;
 }
 
+/**
+ * Prototype identity does not establish that a value is an ordinary data record:
+ * built-ins retain internal state when their prototypes are replaced. These
+ * intrinsic checks reject the brands Node exposes without coercion or hooks.
+ * Callers still own the plain-data precondition for undetectable private state.
+ */
+function hasUnsupportedIntrinsicState(value: object): boolean {
+  return (
+    types.isBoxedPrimitive(value) ||
+    types.isMap(value) ||
+    types.isSet(value) ||
+    types.isWeakMap(value) ||
+    types.isWeakSet(value) ||
+    types.isAnyArrayBuffer(value) ||
+    types.isArrayBufferView(value) ||
+    types.isRegExp(value) ||
+    types.isNativeError(value) ||
+    types.isPromise(value) ||
+    types.isMapIterator(value) ||
+    types.isSetIterator(value) ||
+    types.isGeneratorObject(value) ||
+    types.isArgumentsObject(value) ||
+    types.isModuleNamespaceObject(value) ||
+    types.isExternal(value)
+  );
+}
+
 function assertJsonSafe(
   value: unknown,
   path: string,
@@ -40,14 +74,40 @@ function assertJsonSafe(
   if (typeof value === 'number') {
     if (!Number.isFinite(value))
       fail(path, 'non-finite numbers are unsupported.');
+    if (Object.is(value, -0))
+      fail(path, 'negative zero cannot round-trip through JSON.');
     return;
   }
   if (typeof value !== 'object')
     fail(path, `${typeof value} values are unsupported.`);
-  if (value instanceof Date) {
-    if (path !== '$.observedAt' || Number.isNaN(value.getTime()))
-      fail(path, 'Date values are unsupported here.');
+  // Proxies can present plain descriptors while changing reads or supplying
+  // hidden toJSON hooks. Detect even revoked proxies before any reflection.
+  if (types.isProxy(value)) fail(path, 'proxy values are unsupported.');
+  // Brand checks must not walk the prototype chain: a non-proxy object can
+  // inherit a proxy whose traps mutate its data during instanceof. Inspect
+  // intrinsic brands and direct prototype identity only throughout validation.
+  if (types.isDate(value)) {
+    // Only the observation timestamp has a defined Date hydration contract.
+    // Own properties and subclasses can customize serialization or carry data
+    // JSON would discard; reject them without calling any caller-supplied hook.
+    if (
+      path !== '$.observedAt' ||
+      Reflect.getPrototypeOf(value) !== Date.prototype ||
+      Reflect.ownKeys(value).length !== 0
+    ) {
+      fail(path, 'only an unmodified observedAt Date is supported.');
+    }
+    let timestamp: number;
+    try {
+      timestamp = Date.prototype.getTime.call(value);
+    } catch {
+      fail(path, 'a real Date value is required.');
+    }
+    if (Number.isNaN(timestamp)) fail(path, 'an invalid Date is unsupported.');
     return;
+  }
+  if (hasUnsupportedIntrinsicState(value)) {
+    fail(path, 'intrinsic object state is not plain JSON data.');
   }
   if (ancestors.has(value)) fail(path, 'cyclic references are unsupported.');
 
@@ -99,9 +159,19 @@ export function serializeRetryEnvelope(
   envelope: StoredObservationEnvelope,
 ): string {
   assertJsonSafe(envelope, '$', new Set());
-  if (!Object.hasOwn(envelope, 'observedAt'))
+  const observedAt: unknown = Object.getOwnPropertyDescriptor(
+    envelope,
+    'observedAt',
+  )?.value;
+  if (!types.isDate(observedAt)) {
     fail('$.observedAt', 'a valid Date is required.');
-  return JSON.stringify(envelope);
+  }
+  // Do not let JSON.stringify select a Date serialization hook: persist the
+  // already-validated instant explicitly, then restore that typed leaf on read.
+  return JSON.stringify({
+    ...envelope,
+    observedAt: Date.prototype.toISOString.call(observedAt),
+  });
 }
 
 /** Restore the one typed Date after reading a validated JSON envelope. @internal */

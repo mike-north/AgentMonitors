@@ -176,25 +176,21 @@ function setup(
 
 describe('Interpret stage (G14, 002 §1.1.8)', () => {
   it('invokes the adapter only after the event, projection, and snapshot commit', async () => {
-    const committed: {
-      store?: RuntimeStore;
-      sessionId?: string;
-      rootDir?: string;
-    } = {};
+    let probeError: unknown;
+    let observed:
+      | {
+          eventCount: number;
+          projectionCount: number;
+          snapshot: { content: string } | null;
+          cursorContent: string | undefined;
+        }
+      | undefined;
     const fake = fakeAdapter(() => {
-      if (!committed.store || !committed.sessionId || !committed.rootDir) {
-        throw new Error(
-          'Interpret ran before the test installed its commit probe.',
-        );
+      try {
+        probe();
+      } catch (error) {
+        probeError = error;
       }
-      const events = committed.store.listEvents();
-      expect(events).toHaveLength(1);
-      expect(
-        committed.store.listEvents({ sessionId: committed.sessionId }),
-      ).toHaveLength(1);
-      expect(
-        committed.store.latestSnapshot('interp', 'obj-1', committed.rootDir),
-      ).toMatchObject({ eventId: events[0]?.id, content: 'v1' });
       return { decision: 'deliver', digest: 'committed' };
     });
     const { runtime, store, monitorsDir, rootDir } = setup(
@@ -208,13 +204,44 @@ describe('Interpret stage (G14, 002 §1.1.8)', () => {
         workspacePath: rootDir,
       }),
     );
-    committed.store = store;
-    committed.sessionId = session.id;
-    committed.rootDir = rootDir;
-
+    // A separate connection observes only committed rows, never uncommitted
+    // writes visible to the materializing connection inside its transaction.
+    const reader = new RuntimeStore(
+      createDb(path.join(rootDir, 'agentmon.db')),
+    );
+    const probe = () => {
+      observed = {
+        eventCount: reader.listEvents().length,
+        projectionCount: reader.listEvents({ sessionId: session.id }).length,
+        snapshot: reader.latestSnapshot('interp', 'obj-1', rootDir),
+        cursorContent: reader.getSessionObjectCursor(
+          session.id,
+          'interp',
+          'obj-1',
+          rootDir,
+        )?.baselineContent,
+      };
+    };
     await runtime.tick(monitorsDir, rootDir);
 
+    // Assertions must be outside the adapter: Interpret intentionally catches
+    // adapter exceptions, including assertion errors, to preserve its fallback.
+    expect(probeError).toBeUndefined();
     expect(fake.calls).toHaveLength(1);
+    expect(observed).toEqual({
+      eventCount: 1,
+      projectionCount: 1,
+      snapshot: { content: 'v1' },
+      cursorContent: 'v1',
+    });
+    expect([
+      ...store
+        .interpretDigestsForSession(
+          session.id,
+          store.listEvents().map((event) => event.id),
+        )
+        .values(),
+    ]).toEqual(['committed']);
   });
 
   it('does not invoke Interpret when deterministic materialization rolls back', async () => {
