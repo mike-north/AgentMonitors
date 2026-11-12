@@ -36,6 +36,18 @@ When parse-time validation sees the old top-level `source:` + `scope:` shape, `v
 
 The validator is `@cfworker/json-schema`, which walks the schema at runtime rather than compiling with the `Function` constructor, so validation is safe under restrictive CSP / Workers-style environments.
 
+The shared helper validates a private schema copy and does not annotate plugin-owned
+schema objects. A frozen valid schema must still validate normally. Setup/evaluation
+exceptions are nonempty `Source schema validation failed: <cause>` diagnostics,
+not successful validation and not a reason to abort the whole monitor set. Existing
+scope mismatch and collection/timezone messages remain unchanged. Tests must cover
+malformed patterns, deep-frozen valid schemas, ordinary valid/invalid scopes, and
+schema immutability, using real registered-source/SQLite tick and watcher-startup
+boundaries. Assert healthy sibling effects, per-monitor diagnostics, retained
+baseline/cursor/overdue notify work, and repair/restart recovery. Tick failures must
+not strand suppression cleanup or hook refresh. Covered by
+`schema/validate-scope.test.ts` and `runtime/validation-exceptions.test.ts` in core.
+
 > **Target extension (not yet implemented).** Validation of `shape` predicate determinism and
 > `payload.form` / `payload.transform` / `payload.encoding` is a **_target_** obligation for the
 > `validate` surface. When implemented, `validate` will additionally reject: a `shape.derive.when`
@@ -121,6 +133,40 @@ opaque source state, event and history rows remain unchanged by diagnosis, and t
 not invoke a source. This is a same-runtime ordering check, not a cross-process snapshot guarantee.
 The permanent scenarios are in `libs/core/src/runtime/retry-diagnostics.test.ts`.
 
+Runtime source-config preflight is **current** behavior (002 §2.0). Tests **MUST**
+prove rejection before source side effects using a real registered source, exact
+`validateWatchScope` diagnostic parity with tick/explain/doctor, healthy sibling
+progress, and invalid-to-fixed recovery across runtime restart with baseline and
+held notify work retained. Cover directory ticks, persisted ephemeral ticks after
+schema changes, and continuous watcher startup. Invalid config intentionally stops
+observation, including configs that previously ran; daemon text/JSON and continuous
+logging must make that pause visible. The built CLI must also prove the authoring
+and diagnostic surfaces agree. Include a real bundled `file-fingerprint` source
+with valid globs and a malformed interval: doctor must report the validation error
+without scheduling it or inventing a due time, retain healthy sibling results, and
+leave source/notify state, events, and observation history unchanged. A stale verify
+session with a real projected scratch event and an edited invalid interval must
+be reaped without unsafe cadence evaluation: retract/tombstone owned scratch work,
+retain the source baseline and held legitimate work, report the config skip, and
+progress a healthy sibling. Assert the existing fallback expiry at five minutes
+for unparseable cadence or a missing definition, and preserve derivable timing despite
+unrelated source-schema errors. A real-source/SQLite delayed-repair case must retain
+665000ms for invalid globs + 10m interval + 5s settle, close/reopen the store, repair
+at 12:08 after a 12:02 reap, and exclude scratch from an actual later-session claim
+while delivering legitimate held work and preserving a foreign workspace. This
+bounded regression does not resolve the known current arbitrary-pause/held-only
+ownership gap: retained fingerprints or held deletions may outlive suppression,
+and held-only creates may escape discovery. The no-later-scratch-event goal remains;
+current tests must not be cited as proof of that unconditional guarantee.
+[Decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828)
+assigns the complete delayed-repair/held-only claim acceptance to
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), sequenced after
+#305/#537/#554. This known gap does not block #557 after its window/docs correction.
+Covered by `libs/core/src/runtime/cadence-window.test.ts`,
+`libs/core/src/runtime/object-event-suppressions.test.ts`,
+`libs/core/src/runtime/source-validation.test.ts` and
+`apps/cli/src/commands/runtime-source-validation.test.ts`.
+
 ### 2.6 CLI integration tests
 
 CLI integration tests are the primary proof surface for: command wiring; output shape and argument validation; round-trip behavior through the daemon/runtime interface.
@@ -192,6 +238,16 @@ status, signal and output rather than vitest's bare timeout.
 
 Running a CLI test file directly with vitest bypasses the Nx dependency and executes whatever bundle
 already exists; build first, or use `pnpm nx test @agentmonitors/cli`.
+
+**Current, normative:** the core test target declares its own `build` alongside dependency
+builds. Its runtime regression suite imports the real API source, whose runtime package imports
+resolve to core's compiled exports. `pnpm nx test @agentmonitors/core` therefore MUST build core
+before running tests, including when core's `dist` is absent and caching is disabled. The
+`object-event-suppressions` suite must pass all 14 existing cases on its first attempt. Removing
+only the own-build prerequisite under the same cold conditions must expose the package-entry
+module-load failure; restoring it must restore the cold pass. Direct Vitest invocation bypasses
+this prerequisite and requires a prior core build. Tests MUST NOT start builds themselves; the
+source/test module graph remains unchanged.
 
 **Current, normative:** the `source-incoming-changes` test target also declares its own `build`
 alongside dependency builds. Its revision-expression tests execute both TypeScript source and
@@ -405,22 +461,22 @@ The spec set is incomplete unless each major rule has at least one concrete test
 
 ### 3.3 Runtime delivery
 
-| Scenario                                                                                                         | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Source state survives runtime restart                                                                            | Covered (`libs/core/src/runtime/service.test.ts` — "persists source state across runtime restarts and emits changes later")                                                                                                                                                                                                                                                                                                                         |
-| High urgency waits for settle window before interruptible delivery                                               | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; "emits all debounced high-urgency observations after the settle window")                                                                                                                                                                                                                                      |
-| Normal urgency coalesces — second delivery not offered until session is acknowledged                             | Covered (`libs/core/src/runtime/service.test.ts` — "coalesces normal-urgency reminders until unread events are acknowledged")                                                                                                                                                                                                                                                                                                                       |
-| Low urgency delivers only at idle lifecycle points                                                               | Covered (`libs/core/src/runtime/service.test.ts` — "defers low-urgency delivery until idle lifecycle points")                                                                                                                                                                                                                                                                                                                                       |
-| Recap emits recent unread events and command hints                                                               | Covered (`libs/core/src/runtime/service.test.ts` — "returns recap deliveries after post-compact with recap messaging")                                                                                                                                                                                                                                                                                                                              |
-| Events project only into matching workspace sessions                                                             | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters"; `apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                 |
-| Scope filters query `queryScope` correctly                                                                       | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters")                                                                                                                                                                                                                                                                                                              |
-| Hook state reflects pending and unread counts correctly                                                          | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; `libs/core/src/hook-bridge/bridge.test.ts` — `computeHookState` suite)                                                                                                                                                                                                                                        |
-| Cron timezone matching works correctly                                                                           | Covered (`libs/core/src/runtime/service.test.ts` — "matches schedule cron expressions in the configured timezone")                                                                                                                                                                                                                                                                                                                                  |
-| An invalid schedule timezone is isolated to that monitor, not the whole tick (issue #297)                        | Covered (`libs/core/src/runtime/service.test.ts` — "isolates an invalid schedule timezone so a sibling monitor still emits (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits")                                                                                                                                           |
-| `monitor.explain` renders an invalid schedule timezone as an observation-stage failure, not a crash (issue #297) | Covered (`libs/core/src/runtime/service.test.ts` — "explains an invalid schedule timezone as an observation-stage failure, not a crash (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "explains an invalid schedule timezone as an observation-stage failure instead of crashing")                                                                                                                                                |
-| `doctor` reports an invalid schedule timezone as invalid without crashing (issue #297)                           | Covered (`libs/core/src/runtime/doctor-report.test.ts` — "reports an invalid schedule timezone as invalid without crashing, isolated from a healthy sibling (issue #297)")                                                                                                                                                                                                                                                                          |
-| `validate`/`monitor test` reject an invalid IANA schedule/rollup timezone at authoring time (issue #297)         | Covered (`libs/core/src/schema/validate-scope.test.ts` — `validateWatchScope` schedule-timezone suite; `libs/core/src/schema/monitor-schema.test.ts` — "rejects a rollup monitor with an invalid IANA timezone"; `apps/cli/src/commands/cli.integration.test.ts` — "rejects a schedule monitor with an invalid IANA timezone, alongside a valid sibling" (`validate`), "rejects a schedule monitor with an invalid IANA timezone" (`monitor test`)) |
-| Subagent sessions do not receive events projected to the lead session                                            | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                                                                                                                                               |
+| Scenario                                                                                                 | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| -------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Source state survives runtime restart                                                                    | Covered (`libs/core/src/runtime/service.test.ts` — "persists source state across runtime restarts and emits changes later")                                                                                                                                                                                                                                                                                                                         |
+| High urgency waits for settle window before interruptible delivery                                       | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; "emits all debounced high-urgency observations after the settle window")                                                                                                                                                                                                                                      |
+| Normal urgency coalesces — second delivery not offered until session is acknowledged                     | Covered (`libs/core/src/runtime/service.test.ts` — "coalesces normal-urgency reminders until unread events are acknowledged")                                                                                                                                                                                                                                                                                                                       |
+| Low urgency delivers only at idle lifecycle points                                                       | Covered (`libs/core/src/runtime/service.test.ts` — "defers low-urgency delivery until idle lifecycle points")                                                                                                                                                                                                                                                                                                                                       |
+| Recap emits recent unread events and command hints                                                       | Covered (`libs/core/src/runtime/service.test.ts` — "returns recap deliveries after post-compact with recap messaging")                                                                                                                                                                                                                                                                                                                              |
+| Events project only into matching workspace sessions                                                     | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters"; `apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                 |
+| Scope filters query `queryScope` correctly                                                               | Covered (`libs/core/src/runtime/service.test.ts` — "projects events only into matching workspace sessions and supports scope filters")                                                                                                                                                                                                                                                                                                              |
+| Hook state reflects pending and unread counts correctly                                                  | Covered (`libs/core/src/runtime/service.test.ts` — "claims high-urgency deliveries after the debounce window and updates hook state"; `libs/core/src/hook-bridge/bridge.test.ts` — `computeHookState` suite)                                                                                                                                                                                                                                        |
+| Cron timezone matching works correctly                                                                   | Covered (`libs/core/src/runtime/service.test.ts` — "matches schedule cron expressions in the configured timezone")                                                                                                                                                                                                                                                                                                                                  |
+| An invalid schedule timezone is isolated to that monitor, not the whole tick (issue #297)                | Covered (`libs/core/src/runtime/service.test.ts` — "isolates an invalid schedule timezone so a sibling monitor still emits (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits")                                                                                                                                           |
+| `monitor.explain` renders an invalid schedule timezone as a diagnostic failure, not a crash (issue #297) | Covered (`libs/core/src/runtime/service.test.ts` — "explains an invalid schedule timezone as an observation-stage failure, not a crash (issue #297)"; `apps/cli/src/commands/cli.integration.test.ts` — "explains an invalid schedule timezone as a definition-stage failure instead of crashing")                                                                                                                                                  |
+| `doctor` reports an invalid schedule timezone as invalid without crashing (issue #297)                   | Covered (`libs/core/src/runtime/doctor-report.test.ts` — "reports an invalid schedule timezone as invalid without crashing, isolated from a healthy sibling (issue #297)")                                                                                                                                                                                                                                                                          |
+| `validate`/`monitor test` reject an invalid IANA schedule/rollup timezone at authoring time (issue #297) | Covered (`libs/core/src/schema/validate-scope.test.ts` — `validateWatchScope` schedule-timezone suite; `libs/core/src/schema/monitor-schema.test.ts` — "rejects a rollup monitor with an invalid IANA timezone"; `apps/cli/src/commands/cli.integration.test.ts` — "rejects a schedule monitor with an invalid IANA timezone, alongside a valid sibling" (`validate`), "rejects a schedule monitor with an invalid IANA timezone" (`monitor test`)) |
+| Subagent sessions do not receive events projected to the lead session                                    | Covered (`apps/cli/src/commands/cli.integration.test.ts` — "projects events only to the lead session when a subagent session exists")                                                                                                                                                                                                                                                                                                               |
 
 ### 3.4 Persistence and snapshotting
 
@@ -531,6 +587,15 @@ uncommitted observation recovery, power-loss durability, or the pending material
 
 ### 3.5.1 Verify observation boundary
 
+**Current cleanup verification limit:** the observation/claim checks below do not
+prove arbitrary delayed scratch cleanup. Finite tombstones can expire before
+retained baseline/held-envelope recovery, and projected-event discovery misses a
+held-only scratch create. Preserve the intended no-later-scratch-event requirement,
+but track those missing recovery/ownership cases under
+[#562](https://github.com/mike-north/AgentMonitors/issues/562), per
+[decision #561](https://github.com/mike-north/AgentMonitors/issues/561#issuecomment-6666500828),
+until its exact ownership and explicit-retirement repair lands. See 005 §16 step 9.
+
 `apps/cli/src/verify-observe.test.ts` verifies distinct old/new observation identities with actual
 SQLite second-rounded timestamps, command-start versus completion evidence, repeated-row refusal,
 adjacent and truncated windows, retained settling evidence and manual-mode/explicit-timeout rules.
@@ -617,7 +682,7 @@ When sources disagree, the spec process MUST NOT silently average them together.
 - The runtime/session event pipeline is the primary delivery path.
 - The inbox item lifecycle is separate from the event pipeline, not merely another view of the same data.
 - Duplicate monitor IDs are a correctness hazard: `scanMonitors()` reports collisions, and `validate` rejects duplicate IDs within the scanned tree (§2.2).
-- Source-specific validation is fully enforced by `validate` against each source's `scopeSchema` using draft-07 JSON Schema checks, including types, enums, required fields, and nested items. Both `validate` and `monitor test` use `validateWatchScope` for the same rejection details; `monitor test` rejects invalid scopes before source observation (§2.2/§2.4).
+- Source-specific validation is fully enforced by `validate` against each source's `scopeSchema` using draft-07 JSON Schema checks, including types, enums, required fields, and nested items. Both `validate` and `monitor test` use `validateWatchScope` for the same rejection details; `monitor test` rejects invalid scopes before source observation (§2.2/§2.4). Runtime execution rejects the same invalid config before source effects (002 §2.0), preserving state until corrected.
 
 ### 5.2 Evidence priority during this transition
 

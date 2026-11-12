@@ -1574,11 +1574,15 @@ export interface ShapeStageConfig {
 }
 
 // @public
-export interface SkippedMonitor {
-    // (undocumented)
+export type SkippedMonitor = {
     monitorId: string;
     nextDueAt: Date;
-}
+    validationError?: never;
+} | {
+    monitorId: string;
+    validationError: string;
+    nextDueAt?: never;
+};
 
 // @public
 export class SourceRegistry {
