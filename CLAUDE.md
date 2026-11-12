@@ -191,5 +191,11 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   fixes _this repo's own_ audit/build — it isn't carried into a published package's own dependency
   tree, so it doesn't protect an external `npm install` of an unbundled (non-`noExternal`) dependency
   path; only a direct package.json bump (or an upstream fix) does that.
+  `@agentmonitors/core` therefore bundles its CEL stack (`cel-js`, `chevrotain`, `@chevrotain/*`,
+  `lodash-es`, `ramda`) into its build (`noExternal` in `libs/core/tsup.config.ts`) and lists them
+  as `devDependencies`, so consumers install the patched versions this workspace resolves; their
+  licenses ship in `libs/core/THIRD_PARTY_NOTICES.md`. Adding a bundled dependency means adding its
+  notice there. `pnpm test:standalone-consumer` installs the packed packages outside the workspace
+  and fails on any high/critical `npm audit --omit=dev` advisory (or if the audit cannot run).
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.

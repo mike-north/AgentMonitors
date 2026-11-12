@@ -20,7 +20,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "THIRD_PARTY_NOTICES.md"
   ],
   "scripts": {
     "build": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.build.json",
@@ -34,7 +35,6 @@
   "dependencies": {
     "@cfworker/json-schema": "^4.1.1",
     "better-sqlite3": "^13.0.3",
-    "cel-js": "0.8.2",
     "drizzle-orm": "^0.45.2",
     "glob": "^11.0.1",
     "gray-matter": "^4.0.3",
@@ -44,6 +44,7 @@
   },
   "devDependencies": {
     "@types/better-sqlite3": "^9.6.0",
+    "cel-js": "0.8.2",
     "@types/node": "^22.15.0",
     "drizzle-kit": "^0.31.3"
   },
