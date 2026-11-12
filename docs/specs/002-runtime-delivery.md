@@ -869,7 +869,8 @@ Continuous `watchMonitors()` startup **MUST** apply the same preflight before
 calling `watch()` or reserving a watcher slot. Invalid monitors are excluded from
 the returned handle and reported through `onError` (or stderr when no callback is
 provided), with the same joined diagnostic. Watchers already running keep their
-startup config; live watcher reload is outside this contract.
+startup config; live watcher reload is outside this contract. When the rejected scope
+has held work, its admission closes until valid recovery (§4.6).
 
 `monitor explain` **MUST** report a definition failure and `doctor` **MUST** report
 an invalid monitor with the same diagnostic as `validate`. A rejected monitor's outstanding
@@ -940,7 +941,7 @@ as an observation-stage failure, not a crash") and `doctor-report.test.ts`.
 
 In addition to the one-shot `observe()` tick loop, the runtime drives continuous `watch()` for sources that implement it (NP4). `AgentMonitorRuntime.watchMonitors(monitorsDir, workspacePath)` scans the tree and, for each monitor whose source exposes `watch()`, consumes its `AsyncIterable<ObservationResult>`, funnelling each finite batch through the **same** notify dispatch → event materialization → session projection pipeline as `observe()` (the shared `ingest()` path). It returns a `WatchHandle` whose `stop()` aborts (via `context.signal`) and awaits every watcher. `daemon run` starts watchers at startup and stops them on shutdown.
 
-While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source yields its associated restart baseline in each batch's `nextState`; the runtime commits it with the batch ([§2.4](#24-watch-mode-source-state-checkpointing)). A restarted watcher receives that persisted baseline in `context.previousState`.
+While a monitor has an active watcher, the tick loop **MUST** skip its `observe()`, so it is never driven twice. A watcher **MUST** be released from the active-watcher set whenever it exits for **any** reason — the `watch()` iterable completing normally, an error (other than the runtime's own abort; that case is also reported via the `onError` callback), or `stop()`/abort — after its admitted batch settles, after which the tick loop resumes driving that monitor via `observe()` and a later `watchMonitors()` can re-establish it. A watcher that ends normally must therefore not remain pinned in the active-watcher set (which would permanently starve `observe()`). Each active-watcher slot carries a per-watcher identity token so a superseded watcher only ever releases its **own** slot, never a newer watcher's. A `watch()` source yields its associated restart baseline in each batch's `nextState`; the runtime commits it with the batch ([§2.4](#24-watch-mode-source-state-checkpointing)). A restarted watcher receives that persisted baseline in `context.previousState`.
 
 > **Example:** a source that opens an OS file-system watcher yields a batch containing a `modified` observation and its next fingerprint state when a file changes, rather than waiting for the next poll interval; `stop()` closes the OS watcher via the aborted signal.
 >
@@ -1029,6 +1030,30 @@ Verified by `watch-batch-admission.test.ts` (whole batch/suffix before suspended
 read visibility, rollback/reopen, state-only failure, missing/undefined/null state semantics, legacy
 refusal, workspace isolation, abort, replacement ownership and lifecycle cleanup), with existing
 end-to-end watch/poll exclusivity scenarios retained in `service.test.ts`.
+
+#### Notify admission gate and teardown
+
+While the notify admission gate ([§4.6](#46-effective-notify-policy-edits-current)) is closed — a
+failed edit drain, an unresolved source, or a rejected scope with held work — a yielded batch waits
+on the consumer's stack and the iterator is not pulled again. The waiting batch is not admitted, so
+it records no drop and queues no retry; its observations and `nextState` stay unpersisted until the
+gate opens. Admission rereads the gate, cancellation and the watcher's ownership token in the same
+synchronous turn as the batch's transaction. The watcher's source factory is likewise created only
+once the gate is open, from the latest admitted definition and the baseline persisted at that turn.
+
+`stop()`/abort releases a waiting batch unadmitted. A superseded watcher's batch is never admitted,
+and that watcher releases only its own cache lease, never its successor's slot. Because one batch is
+admitted at a time, completion or an iterator error happens only after the last admitted batch has
+settled; only then does the watcher retire its slot and lease, so polling or a replacement watcher
+reads the resulting durable baseline rather than overtaking it.
+
+**Example.** A batch carrying cursor 111 waits while an edited-policy drain is blocked. A recovery
+tick commits the old hold, then the batch is admitted with cursor 111; only after that may polling or
+a later batch advance the baseline to 999. Reopening SQLite shows 999, never a stale 111.
+
+`runtime/notify-checkpoint-teardown.test.ts` and `runtime/notify-boundaries.test.ts` verify waiting
+batches at a closed gate, completion and error after admission, abort, token supersession, polling
+and replacement exclusion, workspace/monitor isolation and independent SQLite reopen.
 
 ### 2.5 Tick result
 
@@ -1304,8 +1329,8 @@ three clocks especially visible:
    batch is flushed as a unit. If materialized as individual events, each event carries its own
    effective urgency.
 
-6. **No per-change interrupts.** A monitor with `strategy: rollup` **MUST NOT** deliver anything
-   outside a window opening. Observations accumulate silently between windows. This is the defining
+6. **No per-change interrupts.** Except for the effective-policy-edit boundary in §4.6,
+   a monitor with `strategy: rollup` **MUST NOT** deliver anything outside a window opening. Observations accumulate silently between windows. This is the defining
    property: the author trades per-change interrupts for a predictable delivery schedule.
 
 **Relationship to the Pace stage (§1.1.1).** Rollup is entirely on the **shared** side of the
@@ -1337,6 +1362,195 @@ explicitly names lower token and observation cost as a first-class motivation fo
 signal become a candidate for delivery" (§1.1.1): immediately on change, after the signal settles,
 at most once per window, or on an author-defined schedule. No further Pace modes are anticipated at
 this stage.
+
+### 4.6 Effective notify-policy edits (_current_)
+
+> **Status: current.** Refs #537; decision [#556](https://github.com/mike-north/AgentMonitors/issues/556#issuecomment-6665228377).
+> An author-caused policy edit is a narrow early-flush exception to debounce settling (§4.3)
+> and rollup's window-only rule (§4.4). It does not claim or acknowledge a delivery.
+
+The runtime **MUST** reconcile effective pacing edits before source-due and active-watcher
+skips, without requiring new source input. Each held envelope's captured definition determines
+its original policy. Effective policy includes the strategy, normalized duration, rollup cron
+and timezone (default UTC), granted whole-batch escalation (§4.1), and
+urgency/salience-dependent defaults when notify is omitted.
+Equivalent duration spellings and explicit/default UTC are unchanged policies. A body/title edit
+alone does not change pacing. The effective policy is compared over absent salience and all three
+salience levels, so an urgency band edit only changes pacing when the resolved notify behavior
+changes. A scalar urgency edit with unchanged explicit debounce retains its clock; a band edit
+that changes the grant to flush a held batch early is an effective pacing change. This includes
+observations resolving to immediate or throttle: escalation is tested before either branch.
+
+On a changed policy, the runtime **MUST** flush **all** existing debounce/rollup holds before
+observing new work under the edited policy. This covers debounce → immediate/throttle/rollup,
+rollup → immediate/throttle/debounce, and effective parameter/default changes within a strategy.
+Unchanged effective policy preserves normal clocks. Omitted notify at high urgency still means
+15s debounce (§4.1), not immediate.
+
+The flush uses each envelope's original content, effective urgency, title/source policy, payload,
+observation timestamp and handling/Shape/Interpret definition. Observation body still takes
+precedence over captured monitor instructions. Missing legacy effective urgency is backfilled
+from the captured definition per §3; missing/invalid captured semantics **MUST** block recovery,
+never borrow values from the new definition. Already-materialized rows remain immutable (#451).
+Old holds retain their order; mixed legacy hold arrays use stable observation-time order, with
+array order and then debounce-before-rollup as ties. Retired throttle suppression and rollup
+minute guards **MUST** be cleared when adopting a changed policy; they cannot suppress accepted
+old work or the new policy's first observation. Private persisted policy identity permits guard
+reset across restarts; it is not an authoring field. Changes to that private encoding alone must
+not flush unchanged captured work or reset its clocks; complete captured definitions still detect
+real effective edits when older metadata omitted an escalation bit.
+
+**Legacy identity learning (current).** If successful unchanged reconciliation finds no private
+policy key on an existing scoped row, it **MUST** record the current effective identity under the
+same owned writer boundary. This is metadata learning, not an edit: preserve all guards, holds,
+observation clocks, opaque source state and materialized artifacts. It must not make observation
+due or create a synthetic previous-state baseline for a fresh scope. A later known effective edit,
+including after restart, can then retire its suppression/minute guards before new work. With no
+historical key or held definition, edits before that first successful scan are unknowable and are
+not retroactively inferred. Failed validation or identity persistence does not record a successful
+key; existing compatible key encodings retain unchanged clocks.
+
+**Source-baseline preservation (current).** Every notify-only reconciliation commit, including
+retiring guards without held work and atomically draining holds, **MUST** update only notify-owned
+metadata and its legitimate materialization artifacts. It must preserve the persisted
+`source_state`, `last_fingerprint` and `last_observation_at` columns exactly, without decoding and
+reserializing the source baseline. Source ingestion (poll results and watch batches, §2.4) retains
+its existing ownership.
+For example, a legacy raw JSON `null` baseline with a fingerprint remains `null` after a not-due
+throttle `1h` → `1s` edit and SQLite reopen; the next actual source call receives `previousState:
+null`, not `{}`. The edit neither makes observation due nor creates a fresh baseline. Failed
+notify persistence rolls back held materialization and metadata together, preserving those same
+source columns. This extends the source ownership rule in §3 and 003 §2 to effective edits;
+`runtime/notify-only-baseline.test.ts` verifies tick/startup, guard resets, drains, rollback and the
+next real source input across restart.
+
+**Discovery freshness (current).** A directory scan supplies candidate file paths, not authority
+for a later policy mutation. Tick and watcher startup **MUST** synchronously reread each authored
+definition immediately before its reconciliation transaction, without an intervening await. That
+read is the admission linearization point: a file edit after it belongs to a subsequent discovery.
+An older scan delayed on another monitor cannot restore obsolete pacing, drain newer held work,
+or reopen a gate blocked by a newer edit. Missing/invalid scan diagnostics likewise recheck the
+captured file before closing its gate. File location is not identity (001 §2): if a live owner's latest
+admitted definition for the **same monitor ID and workspace** has a different path, both locations
+are reread. A valid current replacement protects admission from an obsolete path's disappearance;
+cached contents alone never authorize it. A missing/invalid current replacement or unresolved source
+still blocks. Two valid same-ID locations remain a fatal duplicate, not a cached-path preference.
+Missing-definition diagnostics use this same scoped resolution, including current source/scope
+validation for held work. Returning to a previously used policy or moving back to a previous location
+remains legitimate. Fallback requires genuine absence evidence: a metadata query must report
+ENOENT or ENOTDIR for the admitted location. A false boolean existence probe also represents access
+or query failure and **MUST NOT** authorize replacement. Permission, other I/O or unclassified
+metadata failures keep admission blocked with the original read diagnostic and retained holds.
+Closing permission **MUST NOT** forget the current location to revalidate: repeated unchanged
+tick/startup and captured-route discoveries remain blocked until that location is valid or genuine
+absence permits moveback. A newly selected location that fails source resolution or reconciliation
+also becomes the current location while blocked; subsequent file edits there are reread, not replaced
+with cached contents. One current pathname belongs to the existing counted live ownership, separately
+from open/closed permission. It contains no instruction snapshot or historical locations and retires
+with the last watcher/poll/deferred-result lease. No retired location governs a future owner.
+Established source/handling snapshots are not restarted or reconfigured; independent scopes continue.
+
+**Atomic edit drain.** The runtime **MUST** own one synchronous immediate SQLite transaction,
+reread current held state under that writer boundary, and commit the entire old batch's events,
+projections, cursor seeds, snapshots and removal of corresponding holds together. No stale read
+before the writer lock can authorize removal or replay. Event materialization units may nest as
+savepoints; the edit drain must not join an externally owned transaction. This prevents two
+runtimes from duplicating or overwriting one drain. Optional Interpret runs after commit using
+each event's own projected recipients. This does not guarantee exactly-once downstream effects
+(000 NP2).
+
+Unknown-source handling **MUST** inspect current workspace-scoped operational holds at source
+resolution, not membership captured before an earlier monitor awaited. A live watcher may create
+its first hold during that await. Existing admission closes on unresolved source even without holds;
+with current held work the failure is scoped, the holds remain, and healthy siblings continue. The
+existing fatal unknown-source behavior without held work is preserved. A watch batch cannot
+advance under that invalid definition and is admitted only after valid reconciliation, or released
+unadmitted on cancellation.
+
+Any deterministic write failure **MUST** roll back every event and all original held/source/timing
+state. The runtime reports the blocked edit through existing tick errors and best-effort history,
+retains holds even if diagnostic persistence fails, and defers only that monitor's new observation
+and source-baseline advancement. Healthy siblings and other workspace scopes continue. Restart or
+another edit retries from durable captured state. Watcher acceptance is backpressured while
+blocked: the consumer retains its current unaccepted batch and does not request another (§2.4).
+Admission **MUST** re-read the current gate in the same synchronous turn as the durable mutation;
+a definition captured before an `await` cannot authorize a later write. A waiting batch whose gate
+closes before its mutation waits for recovery or cancellation. The admitted span's deterministic
+writes finish before optional async Interpret can interleave another edit.
+
+An edit drain and ordinary admission fail differently. Ordinary ingest and window flushes keep
+their span contract (§2): a dispatched observation that cannot materialize is retained with its
+ordered suffix for retry, or recorded as a drop when the outbox cannot retain it. An edit drain is
+all-or-nothing: if any held envelope cannot materialize, the whole drain rolls back, the holds stay
+held and the gate stays closed, and it records no drop and queues no retry. Work blocked at a closed
+gate (a waiting batch or a retained poll result) has not been admitted, so it records neither. A
+drop is a history outcome, never held work, so it neither keeps the gate closed nor is drained by an
+edit. An outstanding drop stays outstanding across an edit unless the drain materializes an event
+that supersedes it under the §2 rule.
+Reconciliation can resume it without reloading the live source. Its reconciled pacing and
+urgency band govern future yields; its established execution/handling snapshot remains until an
+explicit restart.
+Watcher startup **MUST** reconcile existing scoped watcher/evaluating-poll/deferred-result ownership
+even when the current registered source has no watch factory. Factory capability controls creation,
+not admission for live work. A failed drain, or an invalid scope while held work exists, blocks
+watch batch admission and baseline writes; valid recovery commits old work before they resume.
+No new watcher, source reload or polling is introduced. An observe-only scope without its own live ownership remains untouched
+by watcher startup, even if other scopes have owners.
+Successful startup drains **MUST** refresh the affected workspace's session
+hook state after commit, even if the source never yields and no tick follows; failed transactions
+must not publish an unread prefix. This rule does not introduce unrelated live-definition reload behavior.
+
+Polling shares this boundary: concurrent rescans may reconcile a monitor while its `observe()` is
+in flight. The runtime **MUST** recheck current admission before the returned result's deterministic
+writes, applying current pacing with the established execution/handling snapshot. Only one source
+observation may be in flight or awaiting admission per monitor/workspace. Once an operation
+relinquishes that admission, its later completion/error reporting **MUST NOT** remove a successor's
+slot or wake waiters as if that successor had finished. If reconciliation is
+blocked, retain that returned result locally and finish the tick with an explainable error, so the
+daemon can run a later recovery scan. A successful rescan drains the old captured holds and admits
+the retained result before another observation or watcher factory can overtake its source baseline.
+This local retention is not a durable recovery queue: before admission, the persisted source cursor
+remains unchanged, so restart reobserves from that cursor under the existing source contract.
+
+Watcher factory creation **MUST** reread the gate and cancellation in its synchronous creation
+turn. Its full initial definition is the latest admitted definition at actual creation; subsequent
+pacing changes preserve that established execution/handling snapshot. Outstanding polls precede
+factory creation, including a startup overlapping polling without a failed edit.
+
+Cached notify definitions **MUST** belong only to live watcher/poll admissions or locally retained
+results. Removing a deferred result for handoff **MUST** release exactly its retained lease on
+every invocation exit, including definition assembly or source-result argument getters failing
+before ingestion starts. Other live watcher/poll owners keep their leases. Such handoff failures
+remain visible as ordinary observation failures **after** the edit transaction committed; they
+cannot claim the drained holds were retained or restore them. Poll completion and watcher teardown
+release their ownership; cancellation/session close/dormancy also retire unadmitted ephemeral results. Reaping cannot resurrect their timing/baselines
+or keep private instruction snapshots as historical cache entries. Cleanup of this process-local
+metadata does not delete durable holds, event history or diagnostics. Missing/invalid definitions
+with operational work retain that work until valid reconciliation or its existing lifetime rules.
+
+An invalid/unreadable/missing current definition **MUST** retain its operational holds and report
+the blocking reason. Current source-scope validation at this boundary protects existing holds;
+it does not introduce general observe-time preflight for monitors without held work. When a tick
+or watcher startup rejects a scope (§2.0) that has durable holds or a retained poll result,
+admission closes and a running watcher's next batch waits for valid reconciliation. Without
+such held work, the rejection never closes admission by itself: a watcher whose admission is open
+keeps its startup config, while one already blocked (an unresolved source, a failed drain) stays
+blocked until a valid definition is reconciled, and nothing it yielded is lost.
+There is no implicit cancellation on removal, rename or invalid metadata. Draining retained retries
+(§2) and flushing unchanged policies after source errors are separate contracts, not added by this rule.
+
+**Example.** At 08:00, debounce holds A at normal urgency with instructions X. At 08:00:02 the author
+selects daily rollup and instructions Y. Reconciliation commits A immediately with normal/X and
+its original 08:00 timestamp, before any new source observation. New B uses Y and waits for rollup's
+09:00 window. If A's write fails, A remains held and B is not newly observed until the drain succeeds.
+
+**Verification:** `runtime/notify-boundaries.test.ts` covers immediate/throttle escalation identity,
+real watcher batch microtask races, synchronous acceptance before Interpret, and actual
+hook-file refresh after idle/completed startup drains. `runtime/notify-policy-edit.test.ts` covers the transition/default/parameter
+matrix, captured fields, unchanged clocks, missing/invalid definitions, SQLite trigger failures
+(including a later batch event and hold removal), sibling/workspace isolation, watcher backpressure,
+post-commit Interpret, actual owned-child SIGKILL before/after commit and independent-process stale
+read reconciliation. Child probes load the same TypeScript source without invoking a package build.
 
 ## 5. Event Materialization
 

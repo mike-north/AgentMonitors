@@ -455,7 +455,9 @@ describe('source config execution preflight', () => {
     const f = fixture();
     f.source.watch = async function* (config) {
       appendFileSync(f.marker, String(config['value']));
-      yield { title: 'Watch change', summary: 'Watch change' };
+      yield {
+        observations: [{ title: 'Watch change', summary: 'Watch change' }],
+      };
     };
     f.write('aaa-invalid', '  value: 42');
     f.write('zzz-healthy', '  value: healthy');
@@ -463,6 +465,11 @@ describe('source config execution preflight', () => {
     const { runtime } = f.open();
     const handle = await runtime.watchMonitors(f.monitorsDir, f.root, {
       onError: (id, error) => errors.push(`${id}: ${error.message}`),
+    });
+    // Watch admission is asynchronous; let the healthy sibling's factory run
+    // before stopping rather than aborting it mid-admission.
+    await vi.waitFor(() => {
+      expect(existsSync(f.marker)).toBe(true);
     });
     await handle.stop();
     expect(handle.monitorIds).toEqual(['zzz-healthy']);

@@ -13,15 +13,18 @@ import { stripVTControlCharacters } from 'node:util';
 import { ulid } from 'ulid';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
+import {
+  parseMonitorFile,
+  type ParseOutcome,
+} from '../parser/parse-monitor.js';
 import type { MonitorDefinition, Urgency } from '../schema/types.js';
 import { monitorFrontmatterSchema } from '../schema/monitor-schema.js';
 import { validateWatchScope } from '../schema/validate-scope.js';
 import { parseDuration } from '../notify/notifier.js';
 import type {
   Observation,
-  ObservationContext,
-  ObservationResult,
   ObservationSource,
+  ObservationResult,
 } from '../observation/types.js';
 import type { SourceRegistry } from '../observation/registry.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
@@ -46,6 +49,19 @@ import {
   computeNetCollapseView,
   netCollapseGroupKey,
 } from './store.js';
+import {
+  heldMonitorIds,
+  withStoreWriter,
+  learnNotifyPolicyIdentity,
+  commitNotifyPolicyEdit,
+} from './store-writer.js';
+import {
+  notifyPolicyKey,
+  storedNotifyPolicyMatches,
+  validateCapturedNotifyEnvelope,
+  capturedNotifyRoute,
+  type PolicyNotifyState,
+} from './notify-policy.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
@@ -719,7 +735,7 @@ interface MaterializationSpanOptions {
   workspacePath: string;
   nextMonitorState?: {
     sourceState?: unknown;
-    notifyState: NotifyRuntimeState;
+    notifyState: PolicyNotifyState;
     lastObservationAt?: Date | null;
   };
   sourceOutcome?: 'rebaselined' | 'no-files-matched';
@@ -731,6 +747,14 @@ interface MaterializationSpanOptions {
 interface DurableMaterializationSpan {
   materialized: MaterializedObservation[];
   failures: MaterializationFailure[];
+}
+
+/** The baseline a retained poll result was observed from; both are set together. */
+function retainedBaseline(admission: PollAdmission): string {
+  if (admission.expectedSourceState === undefined) {
+    throw new Error('Retained poll result has no captured source baseline.');
+  }
+  return admission.expectedSourceState;
 }
 
 /** Match the persisted source baseline representation without retaining source-mutable objects. */
@@ -956,6 +980,21 @@ class SuffixRetention {
   }
 }
 
+/** One live poll's captured execution, returned-but-unadmitted work, and declaration lifetime. */
+interface PollAdmission {
+  readonly monitor: MonitorDefinition;
+  readonly now: Date;
+  readonly workspacePath: string;
+  readonly ephemeralSessionId?: string;
+  result?: ObservationResult;
+  /**
+   * The persisted source baseline `result` was observed from. Its later
+   * admission is refused if that baseline has changed in the meantime.
+   */
+  expectedSourceState?: string;
+  retired?: boolean;
+}
+
 /**
  * The pure decision a delivery makes (issue #300): the rendered {@link
  * DeliveryClaim} plus the candidate rows a commit must mark claimed. Produced by
@@ -985,6 +1024,7 @@ export class AgentMonitorRuntime {
    * loop still uses membership (`has`) to skip `observe()` for actively-watched
    * monitors.
    */
+  /** Identity belongs to one workspace/monitor, including a blocked startup. */
   private readonly activeWatchers = new Map<string, symbol>();
 
   /**
@@ -1049,6 +1089,7 @@ export class AgentMonitorRuntime {
   }
 
   closeSession(sessionId: string): AgentSessionRecord {
+    const ephemerals = this.store.listEphemeralMonitorsForSession(sessionId);
     const session = this.store.closeSession(sessionId);
     // Reap the session's ephemeral monitors (007 §4.4): a session that ends or
     // goes dormant MUST release its session-scoped watches immediately — they
@@ -1057,6 +1098,7 @@ export class AgentMonitorRuntime {
     // (the session record goes dormant, not deleted) so a late delivery is never
     // silently dropped (007 §4.4 default retention, PP1).
     this.store.reapEphemeralMonitorsForSession(sessionId);
+    for (const record of ephemerals) this.retirePollAdmission(record.id);
     this.refreshHookState(session.id);
     return session;
   }
@@ -1207,6 +1249,7 @@ export class AgentMonitorRuntime {
       );
     }
     this.store.reapEphemeralMonitor(ephemeralId);
+    this.retirePollAdmission(ephemeralId);
     return this.store.getEphemeralMonitorById(ephemeralId);
   }
 
@@ -3130,13 +3173,33 @@ export class AgentMonitorRuntime {
     );
     this.reapDormantSessions(now, workspacePath, monitorsById);
 
+    this.reportMissingHeldDefinitions(result, workspacePath, acc);
+
     // Persistent monitors (directory-authored). An unknown source is a hard tick
     // failure — the author can fix the file.
     for (const parsed of result.monitors) {
-      const monitor = parsed.monitor;
+      const monitor = this.revalidateDiscoveredMonitor(
+        parsed.monitor,
+        workspacePath,
+        acc,
+      );
+      if (!monitor) continue;
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
+        // Source resolution is an admission boundary even without held work.
+        // A live watcher can create its first hold while an earlier scope awaits.
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+        if (this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
+          this.reportNotifyEditFailure(
+            monitor.id,
+            workspacePath,
+            sourceName,
+            `Notify edit blocked: unknown source "${sourceName}"; accepted holds retained.`,
+            acc,
+          );
+          continue;
+        }
         throw new Error(
           `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
@@ -3206,6 +3269,608 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /** Hold membership can change across source/Interpret awaits; only this scope's live state counts. */
+  private hasCurrentNotifyHold(id: string, workspacePath: string): boolean {
+    const notify = this.store.getMonitorState(id, workspacePath).notifyState;
+    return (
+      (notify.pendingDebounce?.observations.length ?? 0) > 0 ||
+      (notify.pendingRollup?.observations.length ?? 0) > 0
+    );
+  }
+
+  /**
+   * Held work that a rejected current scope must protect: durable notify holds,
+   * or a returned poll result retained until reconciliation succeeds. Without
+   * either, a running watcher keeps ingesting under its startup snapshot and
+   * the admission gate stays as it was (002 §2.0, §4.6).
+   */
+  private hasHeldNotifyWork(id: string, workspacePath: string): boolean {
+    const key = JSON.stringify([workspacePath, id]);
+    return (
+      this.hasCurrentNotifyHold(id, workspacePath) ||
+      this.pollAdmissions.get(key)?.result !== undefined
+    );
+  }
+
+  /**
+   * Fallback is authorized only by positive evidence that the admitted location
+   * is absent. A boolean existence probe also hides permission and I/O failures;
+   * those cannot retire an unreadable current definition in favor of another.
+   * Preserve the original read diagnostic when metadata cannot prove absence.
+   */
+  private isNotifyDefinitionPathAbsent(filePath: string): boolean {
+    try {
+      statSync(filePath);
+      return false;
+    } catch (error) {
+      return (
+        error instanceof Error &&
+        'code' in error &&
+        (error.code === 'ENOENT' || error.code === 'ENOTDIR')
+      );
+    }
+  }
+
+  /**
+   * A path is a location, not monitor identity. A live scoped owner's latest
+   * admitted path may supersede a discovered/captured path after relocation.
+   * Reread both files: cached contents never authorize admission, and two valid
+   * same-id definitions remain a duplicate error rather than a preference rule.
+   * Only the existing owner's one path is consulted; no path history survives it.
+   */
+  private readCurrentNotifyDefinition(
+    id: string,
+    workspacePath: string,
+    candidatePath?: string,
+  ): ParseOutcome | undefined {
+    const candidate = candidatePath
+      ? parseMonitorFile(candidatePath)
+      : undefined;
+    if (candidate?.ok && candidate.monitor.id !== id) {
+      return {
+        ok: false,
+        filePath: candidate.monitor.filePath,
+        error: `Candidate definition does not identify monitor "${id}".`,
+      };
+    }
+    const admittedPath = this.notifyPolicyUsers.get(
+      JSON.stringify([workspacePath, id]),
+    )?.currentPath;
+    if (!admittedPath || admittedPath === candidatePath) return candidate;
+    const current = parseMonitorFile(admittedPath);
+    if (current.ok && current.monitor.id !== id) {
+      return {
+        ok: false,
+        filePath: admittedPath,
+        error: `Current definition does not identify monitor "${id}".`,
+      };
+    }
+    if (candidate?.ok && current.ok) {
+      throw new Error(
+        `Duplicate monitor ids: "${id}" (${candidate.monitor.filePath}, ${current.monitor.filePath}).`,
+      );
+    }
+    if (current.ok) return current;
+    // Moving back is legitimate only when the admitted location is proven
+    // absent. An unreadable location remains authoritative until validated;
+    // permission/query failures must not turn another file into its replacement.
+    if (candidate?.ok && this.isNotifyDefinitionPathAbsent(admittedPath)) {
+      return candidate;
+    }
+    return current;
+  }
+
+  /**
+   * Discovery supplies candidate paths, not continuing authority to edit policy.
+   * Reread one authored definition immediately before its synchronous preparation:
+   * an earlier scope may have awaited source/Interpret work since the directory
+   * scan. This read linearizes admission with the following writer transaction
+   * in the same JS turn; later file edits require subsequent discovery. It adds
+   * no revision history and never reloads an established source/handling snapshot.
+   */
+  private revalidateDiscoveredMonitor(
+    discovered: MonitorDefinition,
+    workspacePath: string,
+    acc: TickAccumulator,
+  ): MonitorDefinition | undefined {
+    const current = this.readCurrentNotifyDefinition(
+      discovered.id,
+      workspacePath,
+      discovered.filePath,
+    );
+    if (current?.ok) return current.monitor;
+    this.setWatchPolicy(
+      discovered.id,
+      workspacePath,
+      null,
+      current?.filePath ?? discovered.filePath,
+    );
+    this.reportNotifyEditFailure(
+      discovered.id,
+      workspacePath,
+      discovered.frontmatter.watch.type,
+      `Notify edit blocked: ${current?.error ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`,
+      acc,
+    );
+    return undefined;
+  }
+
+  /** Diagnose operational holds whose authored definition cannot be admitted. */
+  private reportMissingHeldDefinitions(
+    result: Awaited<ReturnType<typeof scanMonitors>>,
+    workspacePath: string,
+    acc: TickAccumulator,
+  ): void {
+    const knownIds = new Set(
+      result.monitors.map((parsed) => parsed.monitor.id),
+    );
+    // Missing/invalid definitions cannot cancel operational holds. Diagnose only
+    // held ids here; ordinary definition preflight remains a separate concern.
+    const heldIds = new Set(heldMonitorIds(this.store, workspacePath));
+    for (const id of heldIds) {
+      // Ephemeral definitions live in SQLite, not in the scanned directory.
+      // Their independent declaration/reap lifecycle does not imply a file edit.
+      if (knownIds.has(id) || id.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
+        continue;
+      }
+      const held = this.store.getMonitorState(id, workspacePath).notifyState;
+      const captured = capturedNotifyRoute(
+        held.pendingDebounce?.observations.at(0) ??
+          held.pendingRollup?.observations.at(0),
+      );
+      // The scan itself can finish out of order with a newer discovery. A stale
+      // missing/invalid result must not close that newer definition's live gate.
+      const current = this.readCurrentNotifyDefinition(
+        id,
+        workspacePath,
+        captured.filePath,
+      );
+      let reason = current?.ok ? undefined : current?.error;
+      if (current?.ok) {
+        const sourceName = current.monitor.frontmatter.watch.type;
+        const source = this.registry.get(sourceName);
+        if (!source) reason = `unknown source "${sourceName}"`;
+        else {
+          const errors = validateWatchScope(
+            watchConfig(current.monitor.frontmatter.watch),
+            source.scopeSchema,
+          );
+          if (!errors.length) continue;
+          reason = `Invalid monitor definition: ${errors.join('; ')}`;
+        }
+      }
+      const message = `Notify edit blocked: ${reason ?? 'monitor definition is missing or unreadable'}; accepted holds retained.`;
+      this.setWatchPolicy(
+        id,
+        workspacePath,
+        null,
+        current?.ok
+          ? current.monitor.filePath
+          : (current?.filePath ?? captured.filePath),
+      );
+      this.reportNotifyEditFailure(
+        id,
+        workspacePath,
+        captured.sourceName ?? 'unknown',
+        message,
+        acc,
+      );
+    }
+  }
+
+  /**
+   * Scanned notify definitions gate watcher acceptance, without restarting or
+   * reconfiguring the live source. A null definition means old held work or its
+   * definition is blocked; the current yield remains on the consumer's stack.
+   * Location provenance belongs to its counted owner and survives a closed gate.
+   */
+  private readonly watchPolicies = new Map<string, MonitorDefinition | null>();
+  /**
+   * Counted live ownership carries one current location separately from gate
+   * permission. Blocking cannot erase that authority; the last user retires it.
+   * This private record holds no instructions or path history. Durable holds
+   * remain in SQLite and are not deleted with process-local ownership.
+   */
+  private readonly notifyPolicyUsers = new Map<
+    string,
+    {
+      /** Watchers, evaluating polls and deferred results each retain their own lease. */
+      users: number;
+      /** Latest selected location, including a definition that has not reconciled successfully. */
+      currentPath?: string;
+    }
+  >();
+  /** In-flight or blocked poll results retain their execution snapshot until admitted or retired. */
+  private readonly pollAdmissions = new Map<string, PollAdmission>();
+
+  /** Cache ownership spans async work, never the lifetime of a retired declaration. */
+  private retainNotifyPolicy(id: string, workspacePath: string): void {
+    const key = JSON.stringify([workspacePath, id]);
+    const owner = this.notifyPolicyUsers.get(key);
+    if (owner) owner.users++;
+    else this.notifyPolicyUsers.set(key, { users: 1 });
+    if (!this.watchPolicies.has(key)) this.watchPolicies.set(key, null);
+  }
+
+  /** Release only process-local admission metadata; accepted durable work is never deleted here. */
+  private releaseNotifyPolicy(id: string, workspacePath: string): void {
+    const key = JSON.stringify([workspacePath, id]);
+    const owner = this.notifyPolicyUsers.get(key);
+    if (owner && owner.users > 1) owner.users--;
+    else {
+      // Permission, current location and cached instructions share this exact
+      // lifetime; no retired owner can govern a future declaration or discovery.
+      this.notifyPolicyUsers.delete(key);
+      this.watchPolicies.delete(key);
+    }
+  }
+
+  /** A reaped declaration cannot admit late source results or retain deferred instruction snapshots. */
+  private retirePollAdmission(id: string): void {
+    for (const [key, admission] of this.pollAdmissions) {
+      if (admission.monitor.id !== id) continue;
+      admission.retired = true;
+      if (admission.result) {
+        this.pollAdmissions.delete(key);
+        this.releaseNotifyPolicy(id, admission.workspacePath);
+        this.wakeNotifyPolicy(key);
+      }
+    }
+  }
+
+  /** Poll completion and reconciliation both unblock source admission without polling. */
+  private wakeNotifyPolicy(key: string): void {
+    for (const wake of this.watchPolicyWaiters.get(key) ?? []) wake();
+  }
+
+  /** Waiting source acceptance/checkpoints wake on reconciliation or teardown. */
+  private readonly watchPolicyWaiters = new Map<string, Set<() => void>>();
+
+  /**
+   * Publish permission and current location within existing ownership. A blocked
+   * definition may identify a new location before it ever reconciles successfully.
+   * Closing without a new location preserves the latest authority, including
+   * when an older asynchronous failure reports after a newer scan.
+   */
+  private setWatchPolicy(
+    id: string,
+    workspacePath: string,
+    definition: MonitorDefinition | null,
+    blockedPath?: string,
+  ): void {
+    const key = JSON.stringify([workspacePath, id]);
+    const owner = this.notifyPolicyUsers.get(key);
+    if (!owner) return;
+    const currentPath = definition?.filePath ?? blockedPath;
+    if (currentPath !== undefined) owner.currentPath = currentPath;
+    this.watchPolicies.set(key, definition);
+    this.wakeNotifyPolicy(key);
+  }
+
+  /**
+   * Wait for explicit durable reconciliation before source creation, checkpoint,
+   * or yield acceptance. Watch setup initializes this gate even without a tick;
+   * an absent gate is an invariant error, not permission or an indefinite wait.
+   */
+  private async waitForWatchDefinition(
+    id: string,
+    workspacePath: string,
+    signal: AbortSignal,
+  ): Promise<MonitorDefinition | undefined> {
+    const key = JSON.stringify([workspacePath, id]);
+    if (!this.watchPolicies.has(key)) {
+      throw new Error('Watcher notify acceptance was not initialized.');
+    }
+    while (
+      !signal.aborted &&
+      (this.watchPolicies.get(key) === null || this.pollAdmissions.has(key))
+    ) {
+      await new Promise<void>((resolve) => {
+        const waiters =
+          this.watchPolicyWaiters.get(key) ?? new Set<() => void>();
+        const wake = () => {
+          signal.removeEventListener('abort', wake);
+          waiters.delete(wake);
+          if (!waiters.size) {
+            this.watchPolicyWaiters.delete(key);
+          }
+          resolve();
+        };
+        waiters.add(wake);
+        this.watchPolicyWaiters.set(key, waiters);
+        signal.addEventListener('abort', wake, { once: true });
+      });
+    }
+    if (signal.aborted) {
+      return undefined;
+    }
+    return this.watchPolicies.get(key) ?? undefined;
+  }
+
+  /**
+   * Admit a watcher operation against the current gate in the same synchronous
+   * turn as its durable work. A definition returned through an await is only a
+   * wake-up hint: reconciliation can close or replace the gate before resumption.
+   * Blocked work sleeps on gate changes/abort, retaining its FIFO chain position.
+   */
+  private async acceptWatchWork<T>(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    signal: AbortSignal,
+    work: (accepted: MonitorDefinition) => T,
+  ): Promise<T | undefined> {
+    const key = JSON.stringify([workspacePath, monitor.id]);
+    for (;;) {
+      await this.waitForWatchPolicy(monitor, workspacePath, signal);
+      const current = this.watchPolicies.get(key);
+      if (signal.aborted) return undefined;
+      if (!current || this.pollAdmissions.has(key)) continue;
+      // Factory callers use this entire definition as their initial snapshot;
+      // established sources merge only pacing into their pinned snapshot.
+      return work(current);
+    }
+  }
+
+  /** Apply reconciled pacing to an already established source/handling snapshot. */
+  private async waitForWatchPolicy(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    signal: AbortSignal,
+  ): Promise<MonitorDefinition | undefined> {
+    const current = await this.waitForWatchDefinition(
+      monitor.id,
+      workspacePath,
+      signal,
+    );
+    return current ? this.applyWatchPolicy(monitor, current) : undefined;
+  }
+
+  /** Live pacing changes cannot reload the established execution/handling snapshot. */
+  private applyWatchPolicy(
+    monitor: MonitorDefinition,
+    current: MonitorDefinition,
+  ): MonitorDefinition {
+    // Only pacing/urgency follow reconciliation. Execution and handling remain
+    // the established source's snapshot until it is explicitly restarted; this
+    // boundary does not introduce unrelated live-definition reload behavior.
+    const frontmatter = {
+      ...monitor.frontmatter,
+      urgency: current.frontmatter.urgency,
+      urgencyMax: current.frontmatter.urgencyMax,
+    };
+    if (current.frontmatter.notify) {
+      frontmatter.notify = current.frontmatter.notify;
+    } else {
+      delete frontmatter.notify;
+    }
+    return { ...monitor, frontmatter };
+  }
+
+  /** Report a blocked edit through existing error contracts without mutating holds. */
+  private reportNotifyEditFailure(
+    id: string,
+    workspacePath: string,
+    sourceName: string,
+    message: string,
+    acc: TickAccumulator,
+  ): void {
+    acc.erroredObservations.push({ monitorId: id, message });
+    try {
+      this.store.recordObservationHistory({
+        monitorId: id,
+        workspacePath,
+        sourceName,
+        result: 'errored',
+        observationData: { error: message },
+      });
+    } catch {
+      /* The retained holds remain authoritative even if diagnostics cannot persist. */
+    }
+  }
+
+  /**
+   * Own the edit's deterministic write unit. Re-read under the writer lock so
+   * another runtime's committed drain cannot be duplicated or overwritten by a
+   * decision made from an earlier read. Event units nest as SQLite savepoints;
+   * every hold and materialization write commits together or all roll back.
+   */
+  private reconcileNotifyEdit(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    restrictToSessionId?: string,
+  ) {
+    return withStoreWriter(this.store, () => {
+      const state = this.store.getMonitorState(monitor.id, workspacePath);
+      const notify: PolicyNotifyState = state.notifyState;
+      const key = notifyPolicyKey(monitor);
+      const held = [
+        ...(notify.pendingDebounce?.observations ?? []),
+        ...(notify.pendingRollup?.observations ?? []),
+      ];
+      for (const envelope of held) {
+        // Persisted envelopes are older-version data. Missing captured semantics
+        // must block recovery, never borrow instructions or urgency from an edit.
+        validateCapturedNotifyEnvelope(envelope, monitor.id);
+      }
+      const changed =
+        held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
+        (notify.policyKey !== undefined &&
+          !storedNotifyPolicyMatches(notify.policyKey, key));
+      if (!changed) {
+        // A successful current scan establishes future comparison identity even
+        // when legacy state has only guards. Missing metadata is not an edit:
+        // preserve every clock/hold and never infer an unknowable earlier policy.
+        if (notify.policyKey === undefined) {
+          learnNotifyPolicyIdentity(this.store, monitor.id, workspacePath, key);
+        }
+        return [];
+      }
+      const drained = held
+        .map(hydrateStoredObservationEnvelope)
+        .sort((a, b) => a.observedAt.getTime() - b.observedAt.getTime())
+        .map((envelope) => {
+          const materialized = this.materializeObservation({
+            monitor: envelope.monitor,
+            sourceName: envelope.monitor.frontmatter.watch.type,
+            observation: envelope.observation,
+            observedAt: envelope.observedAt,
+            workspacePath,
+            effectiveUrgency: envelope.effectiveUrgency,
+            ...(restrictToSessionId !== undefined
+              ? { restrictToSessionId }
+              : {}),
+          });
+          if (!materialized) {
+            throw new Error('Captured held observation cannot materialize.');
+          }
+          return {
+            ...materialized,
+            monitor: envelope.monitor,
+            sessions: [...this.store.projectedSessionIdsForLastEvent()],
+          };
+        });
+      // Suppression/window guards belong to the retired policy. They cannot
+      // suppress accepted old work or the new policy's first observation.
+      const nextNotify: PolicyNotifyState = { ...notify, policyKey: key };
+      delete nextNotify.pendingDebounce;
+      delete nextNotify.pendingRollup;
+      delete nextNotify.suppressedUntil;
+      delete nextNotify.rollupLastFiredMinute;
+      // Pacing adoption owns notify metadata and the materialized held batch,
+      // never the source's opaque baseline or its observation clock.
+      commitNotifyPolicyEdit(this.store, monitor.id, workspacePath, nextNotify);
+      if (drained.length)
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result: 'triggered',
+          observationData: {
+            observed: 0,
+            emitted: drained.length,
+            reason: 'notify-policy-edit',
+          },
+        });
+      return drained;
+    });
+  }
+
+  /**
+   * Publish acceptance only after the owned edit transaction succeeds. Startup
+   * and tick use this same boundary; optional Interpret remains after commit.
+   * A failed attempt retains durable work and leaves a cancellable blocked gate.
+   * Callers run the source-config preflight (002 §2.0) on this same definition
+   * in the same synchronous turn, so an invalid scope never reaches the drain.
+   */
+  private async prepareNotifyPolicy(
+    monitor: MonitorDefinition,
+    workspacePath: string,
+    acc: TickAccumulator,
+    ephemeralSessionId?: string,
+  ): Promise<boolean> {
+    this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+    const sourceName = monitor.frontmatter.watch.type;
+
+    try {
+      const drained = this.reconcileNotifyEdit(
+        monitor,
+        workspacePath,
+        ephemeralSessionId,
+      );
+      acc.emittedEventIds.push(...drained.map((item) => item.event.id));
+      // Wake-ups resume only after this synchronous turn. Publish before
+      // invoking ingestion so a reentrant Interpret edit cannot be overwritten
+      // by this older preparation after the retained span's writes finish.
+      this.setWatchPolicy(monitor.id, workspacePath, monitor);
+      const key = JSON.stringify([workspacePath, monitor.id]);
+      const pending = this.pollAdmissions.get(key);
+      if (pending?.result) {
+        this.pollAdmissions.delete(key);
+        try {
+          let resumed: Promise<MaterializationSpanResult>;
+          try {
+            // Argument getters and definition assembly can fail before ingest
+            // starts. The removed result owns exactly one retained lease; release
+            // it on every invocation exit without disturbing other live owners.
+            // Ingest performs deterministic writes synchronously before yielding.
+            resumed = this.ingest(
+              this.applyWatchPolicy(pending.monitor, monitor),
+              pending.result.observations,
+              pending.now,
+              {
+                workspacePath,
+                expectedSourceState: retainedBaseline(pending),
+                ...(pending.result.nextState !== undefined
+                  ? { nextSourceState: { value: pending.result.nextState } }
+                  : {}),
+                ...(pending.result.outcome
+                  ? { sourceOutcome: pending.result.outcome }
+                  : {}),
+                ...(pending.ephemeralSessionId !== undefined
+                  ? { ephemeralSessionId: pending.ephemeralSessionId }
+                  : {}),
+              },
+            );
+          } finally {
+            this.releaseNotifyPolicy(monitor.id, workspacePath);
+          }
+          const ingested = await resumed;
+          acc.emittedEventIds.push(...ingested.emittedEventIds);
+          if (ingested.failures.length > 0) {
+            acc.erroredObservations.push({
+              monitorId: monitor.id,
+              message: summarizeMaterializationFailures(ingested.failures),
+            });
+          }
+        } catch (error) {
+          // The edit transaction already committed. A failed ordinary handoff
+          // cannot restore those holds or truthfully report a blocked edit.
+          this.reportNotifyEditFailure(
+            monitor.id,
+            workspacePath,
+            sourceName,
+            `Deferred observation failed after notify reconciliation committed: ${error instanceof Error ? error.message : String(error)}`,
+            acc,
+          );
+        }
+      }
+      for (const item of drained) {
+        if (
+          item.monitor.frontmatter.payload?.form === 'prose' &&
+          this.interpretAdapter
+        ) {
+          try {
+            await this.runInterpret(
+              item.monitor,
+              item.event,
+              item.diffText,
+              item.sessions,
+            );
+          } catch (error) {
+            this.reportNotifyEditFailure(
+              monitor.id,
+              workspacePath,
+              sourceName,
+              `Interpret failed after notify edit committed: ${error instanceof Error ? error.message : String(error)}`,
+              acc,
+            );
+          }
+        }
+      }
+    } catch (error) {
+      this.setWatchPolicy(monitor.id, workspacePath, null);
+      this.reportNotifyEditFailure(
+        monitor.id,
+        workspacePath,
+        sourceName,
+        `Notify edit blocked; accepted holds retained: ${error instanceof Error ? error.message : String(error)}`,
+        acc,
+      );
+      return false;
+    }
+    return true;
+  }
+
   /**
    * Evaluate ONE monitor on a tick — shared by the persistent (directory) and
    * ephemeral (007 §4) paths so both flow the IDENTICAL scheduling → observe →
@@ -3222,26 +3887,73 @@ export class AgentMonitorRuntime {
     acc: TickAccumulator,
     ephemeralSessionId?: string,
   ): Promise<void> {
-    const sourceName = monitor.frontmatter.watch.type;
+    this.retainNotifyPolicy(monitor.id, workspacePath);
+    try {
+      await this.evaluateOwnedMonitorOnTick(
+        monitor,
+        source,
+        now,
+        workspacePath,
+        acc,
+        ephemeralSessionId,
+      );
+    } finally {
+      this.releaseNotifyPolicy(monitor.id, workspacePath);
+    }
+  }
 
-    // Validate before scheduling or notify hydration: even an overdue held batch
-    // must remain untouched while author config is invalid. Rechecking here also
-    // protects persisted ephemeral scopes after a source schema upgrade.
-    const errors = validateWatchScope(
+  /** Evaluate one leased scope; concurrent rescans may reconcile it while observe is in flight. */
+  private async evaluateOwnedMonitorOnTick(
+    monitor: MonitorDefinition,
+    source: ObservationSource,
+    now: Date,
+    workspacePath: string,
+    acc: TickAccumulator,
+    ephemeralSessionId?: string,
+  ): Promise<void> {
+    const key = JSON.stringify([workspacePath, monitor.id]);
+    const resuming = this.pollAdmissions.get(key)?.result !== undefined;
+    const sourceName = monitor.frontmatter.watch.type;
+    // Preflight the current author config before notify preparation, which can
+    // hydrate or flush held work: invalid config must leave that work untouched.
+    const preflightErrors = validateWatchScope(
       watchConfig(monitor.frontmatter.watch),
       source.scopeSchema,
     );
-    if (errors.length > 0) {
+    if (preflightErrors.length > 0) {
+      // Held work is protected: close the admission gate so a running watcher or
+      // poll cannot commit beside it under the rejected definition. Without held
+      // work, running watchers keep their startup config (002 §2.0, §4.6).
+      if (this.hasHeldNotifyWork(monitor.id, workspacePath)) {
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+      }
       acc.skippedMonitors.push({
         monitorId: monitor.id,
-        validationError: errors.join('; '),
+        validationError: preflightErrors.join('; '),
       });
       return;
     }
+    if (
+      !(await this.prepareNotifyPolicy(
+        monitor,
+        workspacePath,
+        acc,
+        ephemeralSessionId,
+      ))
+    ) {
+      return;
+    }
+
+    // Preparation can await Interpret while another rescan closes/replaces the gate.
+    const current = this.watchPolicies.get(key);
+    if (!current || resuming || this.pollAdmissions.has(key)) return;
+    // Only pacing/urgency follow the gate, so the preflighted scope still holds.
+    monitor = this.applyWatchPolicy(monitor, current);
 
     // A monitor with an active continuous watcher is driven by that watcher;
     // skip its one-shot observe() so it is not processed twice (G5).
-    if (this.activeWatchers.has(monitor.id)) return;
+    if (this.activeWatchers.has(JSON.stringify([workspacePath, monitor.id])))
+      return;
 
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
     if (schedule.error) {
@@ -3403,6 +4115,13 @@ export class AgentMonitorRuntime {
     // Skipping ingest() means setMonitorState() is never called, which is
     // what preserves the previously-persisted sourceState so the next tick's
     // diff spans from the last good baseline rather than an empty state.
+    const admission: PollAdmission = {
+      monitor,
+      now,
+      workspacePath,
+      ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+    };
+    this.pollAdmissions.set(key, admission);
     let observationResult;
     let expectedSourceState: string;
     try {
@@ -3420,6 +4139,8 @@ export class AgentMonitorRuntime {
         },
       );
     } catch (observeError) {
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
       // observe() failed: record errored outcome (best-effort) and skip
       // this monitor entirely for this tick. ingest() is NOT called, which
       // preserves sourceState as described above.
@@ -3447,6 +4168,33 @@ export class AgentMonitorRuntime {
       return;
     }
 
+    if (admission.retired) {
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
+      return;
+    }
+
+    // A returned result is retained in process memory until a later public
+    // rescan admits it. Returning this tick keeps the daemon free to recover the
+    // failed edit; no new source call or baseline can overtake the retained result.
+    // A blocked span reaches no admission, so it records no drop and queues no
+    // retry: the result and the durable holds stay as they are (002 §2, §4.6).
+    const latest = this.watchPolicies.get(key);
+    if (!latest) {
+      admission.result = observationResult;
+      admission.expectedSourceState = expectedSourceState;
+      this.retainNotifyPolicy(monitor.id, workspacePath);
+      this.reportNotifyEditFailure(
+        monitor.id,
+        workspacePath,
+        sourceName,
+        'Notify admission blocked; returned observation retained until reconciliation succeeds.',
+        acc,
+      );
+      return;
+    }
+    monitor = this.applyWatchPolicy(monitor, latest);
+
     // Block 2 — ingest(): a materialization failure is returned once it has a
     // durable outcome (a queued retry, or an in-transaction `errored` row when
     // the outbox cannot retain its suffix). Only a transaction-wide ROLLBACK or
@@ -3454,7 +4202,7 @@ export class AgentMonitorRuntime {
     // because no source advance can safely commit; this catch reports it while
     // leaving the prior source baseline available.
     try {
-      const ingested = await this.ingest(
+      const ingestion = this.ingest(
         monitor,
         observationResult.observations,
         now,
@@ -3470,6 +4218,11 @@ export class AgentMonitorRuntime {
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
         },
       );
+      // Deterministic admission ran synchronously in that call; relinquish the
+      // poll slot before awaiting post-commit Interpret.
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
+      const ingested = await ingestion;
       acc.emittedEventIds.push(...ingested.emittedEventIds);
       if (ingested.failures.length > 0) {
         acc.erroredObservations.push({
@@ -3478,6 +4231,13 @@ export class AgentMonitorRuntime {
         });
       }
     } catch (ingestError) {
+      // A synchronous failure may still own admission; an asynchronous
+      // rejection may resume after this poll relinquished it to a successor.
+      // Only the current owner can retire the slot and wake its waiters.
+      if (this.pollAdmissions.get(key) === admission) {
+        this.pollAdmissions.delete(key);
+        this.wakeNotifyPolicy(key);
+      }
       const message = errorMessage(ingestError);
       acc.erroredObservations.push({ monitorId: monitor.id, message });
       try {
@@ -3578,7 +4338,12 @@ export class AgentMonitorRuntime {
           sourceState: options.nextSourceState
             ? options.nextSourceState.value
             : monitorState.sourceState,
-          notifyState: dispatch.nextState,
+          // Private pacing identity lets a later effective edit retire this
+          // policy's guards across restarts (002 §4.6).
+          notifyState: {
+            ...dispatch.nextState,
+            policyKey: notifyPolicyKey(monitor),
+          },
           lastObservationAt: now,
         },
         ...(options.sourceOutcome
@@ -3801,8 +4566,13 @@ export class AgentMonitorRuntime {
       }
     }
 
+    // Every event/projection/snapshot is committed before optional async work.
+    // Each event carries its own recipient set rather than another event's.
     for (const materialized of durable.materialized) {
-      await this.interpretMaterializedObservation(materialized);
+      await this.interpretMaterializedObservation(
+        materialized,
+        options.workspacePath,
+      );
     }
     return {
       emittedEventIds: durable.materialized.map(({ event }) => event.id),
@@ -3810,9 +4580,13 @@ export class AgentMonitorRuntime {
     };
   }
 
-  /** Interpret only committed work; optional adapter failures cannot undo admission. */
+  /**
+   * Interpret only committed work; optional adapter failures cannot undo
+   * admission. A failure is recorded best-effort as an `errored` row.
+   */
   private async interpretMaterializedObservation(
     materialized: MaterializedObservation,
+    workspacePath: string,
   ): Promise<void> {
     if (
       materialized.monitor.frontmatter.payload?.form !== 'prose' ||
@@ -3827,8 +4601,18 @@ export class AgentMonitorRuntime {
         materialized.diffText,
         materialized.projectedSessionIds,
       );
-    } catch {
-      // Interpret is best-effort after the deterministic durable boundary.
+    } catch (error) {
+      try {
+        this.store.recordObservationHistory({
+          monitorId: materialized.monitor.id,
+          workspacePath,
+          sourceName: materialized.monitor.frontmatter.watch.type,
+          result: 'errored',
+          observationData: { error: errorMessage(error) },
+        });
+      } catch {
+        // A diagnostic failure cannot undo already committed accepted work.
+      }
     }
   }
 
@@ -3863,8 +4647,9 @@ export class AgentMonitorRuntime {
    * pipeline as a ticked `observe()` (notify dispatch → materialization →
    * projection). Returns a handle whose `stop()` aborts and awaits every watcher.
    * While a watcher is active, the tick loop skips that monitor's `observe()`, so
-   * it is never driven twice. Sources without `watch()` are untouched and keep
-   * running on the tick loop.
+   * it is never driven twice. A source without `watch()` creates no factory:
+   * only already-owned scopes reconcile here, and unowned polling state remains
+   * untouched for the tick loop.
    *
    * Restart-safety: every accepted batch commits its associated source state.
    * Re-established watchers receive that baseline as previousState.
@@ -3877,19 +4662,62 @@ export class AgentMonitorRuntime {
     const result = await scanMonitors(monitorsDir);
     this.assertNoDuplicateIds(result, monitorsDir);
 
+    const startup: TickAccumulator = {
+      evaluated: [],
+      emittedEventIds: [],
+      erroredObservations: [],
+      skippedMonitors: [],
+    };
+    this.reportMissingHeldDefinitions(result, workspacePath, startup);
+    for (const error of startup.erroredObservations) {
+      options.onError?.(error.monitorId, new Error(error.message));
+    }
+
     const controllers = new Map<string, AbortController>();
     const tasks: Promise<void>[] = [];
 
     for (const parsed of result.monitors) {
-      const monitor = parsed.monitor;
+      const errorStart = startup.erroredObservations.length;
+      const monitor = this.revalidateDiscoveredMonitor(
+        parsed.monitor,
+        workspacePath,
+        startup,
+      );
+      if (!monitor) {
+        for (const error of startup.erroredObservations.slice(errorStart)) {
+          options.onError?.(error.monitorId, new Error(error.message));
+        }
+        continue;
+      }
       const sourceName = monitor.frontmatter.watch.type;
       const source = this.registry.get(sourceName);
       if (!source) {
+        // Never leave an existing watcher open under an unresolved definition;
+        // classify retained work from current scoped state, not the earlier scan.
+        this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
+        if (this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
+          const message = `Notify edit blocked: unknown source "${sourceName}"; accepted holds retained.`;
+          this.reportNotifyEditFailure(
+            monitor.id,
+            workspacePath,
+            sourceName,
+            message,
+            startup,
+          );
+          options.onError?.(monitor.id, new Error(message));
+          continue;
+        }
         throw new Error(
           `Monitor "${monitor.id}" references unknown source "${sourceName}".`,
         );
       }
-      if (!source.watch) continue;
+      const key = JSON.stringify([workspacePath, monitor.id]);
+      const existing = this.activeWatchers.has(key);
+      const canWatch = typeof source.watch === 'function';
+      // Factory capability does not exempt existing watcher/poll ownership from
+      // the current definition's admission boundary. Unowned observe-only scopes
+      // remain ordinary polling work, untouched by watcher startup.
+      if (!canWatch && !this.notifyPolicyUsers.has(key)) continue;
       // Watch startup is a source execution boundary just like a one-shot tick.
       // Isolate bad config before reserving a watcher slot or touching its state.
       const errors = validateWatchScope(
@@ -3897,6 +4725,17 @@ export class AgentMonitorRuntime {
         source.scopeSchema,
       );
       if (errors.length > 0) {
+        // Held work is protected: close the admission gate so an existing watcher
+        // or poll cannot commit beside it under the rejected definition. Without
+        // held work, running watchers keep their startup config (002 §2.0, §4.6).
+        if (this.hasHeldNotifyWork(monitor.id, workspacePath)) {
+          this.setWatchPolicy(
+            monitor.id,
+            workspacePath,
+            null,
+            monitor.filePath,
+          );
+        }
         const error = new Error(errors.join('; '));
         if (options.onError) {
           options.onError(monitor.id, error);
@@ -3907,27 +4746,49 @@ export class AgentMonitorRuntime {
         }
         continue;
       }
-      if (this.activeWatchers.has(monitor.id)) continue;
-
       const controller = new AbortController();
-      controllers.set(monitor.id, controller);
       // Identity token for THIS watcher: `consumeWatch` releases the slot only
       // while its own token is still current, and a superseded watcher's
       // straggling batch is rejected on token mismatch (002 §2.4).
       const watcherToken = Symbol(monitor.id);
-      this.activeWatchers.set(monitor.id, watcherToken);
+      if (canWatch && !existing) {
+        controllers.set(monitor.id, controller);
+        this.activeWatchers.set(key, watcherToken);
+        this.retainNotifyPolicy(monitor.id, workspacePath);
+      }
+      try {
+        const errorStart = startup.erroredObservations.length;
+        const emittedStart = startup.emittedEventIds.length;
+        await this.prepareNotifyPolicy(monitor, workspacePath, startup);
+        // Startup may never receive a yield or tick. Publish committed projections
+        // to the workspace's hook files even for an idle or completed source.
+        if (startup.emittedEventIds.length > emittedStart) {
+          this.refreshWorkspaceSessions(workspacePath);
+        }
+        for (const error of startup.erroredObservations.slice(errorStart)) {
+          options.onError?.(error.monitorId, new Error(error.message));
+        }
+        if (!canWatch || existing) continue;
 
-      const watch = source.watch.bind(source);
-      tasks.push(
-        this.consumeWatch(
-          monitor,
-          watch,
-          workspacePath,
-          controller.signal,
-          watcherToken,
-          options.onError,
-        ),
-      );
+        tasks.push(
+          this.consumeWatch(
+            monitor,
+            workspacePath,
+            controller.signal,
+            watcherToken,
+            options.onError,
+          ),
+        );
+      } catch (error) {
+        if (canWatch && !existing) {
+          controller.abort();
+          controllers.delete(monitor.id);
+          if (this.activeWatchers.get(key) === watcherToken)
+            this.activeWatchers.delete(key);
+          this.releaseNotifyPolicy(monitor.id, workspacePath);
+        }
+        throw error;
+      }
     }
 
     const monitorIds = [...controllers.keys()];
@@ -3955,31 +4816,49 @@ export class AgentMonitorRuntime {
    */
   private async consumeWatch(
     monitor: MonitorDefinition,
-    watch: (
-      config: Record<string, unknown>,
-      context: ObservationContext & { signal: AbortSignal },
-    ) => AsyncIterable<ObservationResult>,
     workspacePath: string,
     signal: AbortSignal,
     watcherToken: symbol,
     onError?: (monitorId: string, error: Error) => void,
   ): Promise<void> {
+    const key = JSON.stringify([workspacePath, monitor.id]);
     // Ownership is local to this runtime. A stopped or superseded iterator can
     // still settle a pending next(), but its late batch has no admission rights.
     const ownsWatch = () =>
-      !signal.aborted && this.activeWatchers.get(monitor.id) === watcherToken;
+      !signal.aborted && this.activeWatchers.get(key) === watcherToken;
     try {
-      const monitorState = this.store.getMonitorState(
-        monitor.id,
-        workspacePath,
-      );
-      let expectedSourceState = sourceStateToken(monitorState.sourceState);
-      const iterable = watch(watchConfig(monitor.frontmatter.watch), {
-        previousState: monitorState.sourceState,
-        now: new Date(),
+      // No source factory exists until durable reconciliation permits admission
+      // (002 §4.6). A corrected blocked declaration becomes the initial
+      // execution snapshot; later edits change only its pacing/urgency. The
+      // restart baseline handed to the factory is read in that same turn, and
+      // every batch must still find it persisted when it is admitted.
+      let expectedSourceState = '';
+      const iterable = await this.acceptWatchWork(
+        monitor,
         workspacePath,
         signal,
-      });
+        (admitted) => {
+          monitor = admitted;
+          const source = this.registry.get(monitor.frontmatter.watch.type);
+          if (!source?.watch) {
+            throw new Error(
+              `Monitor "${monitor.id}" has no available watch source after reconciliation.`,
+            );
+          }
+          const monitorState = this.store.getMonitorState(
+            monitor.id,
+            workspacePath,
+          );
+          expectedSourceState = sourceStateToken(monitorState.sourceState);
+          return source.watch(watchConfig(monitor.frontmatter.watch), {
+            previousState: monitorState.sourceState,
+            now: new Date(),
+            workspacePath,
+            signal,
+          });
+        },
+      );
+      if (!iterable) return;
       for await (const batch of iterable) {
         if (!ownsWatch()) break;
         // JavaScript plugins may still use the old bare-observation interface.
@@ -3994,19 +4873,40 @@ export class AgentMonitorRuntime {
           batch.nextState === undefined
             ? expectedSourceState
             : sourceStateToken(batch.nextState);
-        const ingested = await this.ingest(
+        // A closed gate (a failed edit drain, an unresolved source, or a
+        // rejected scope with held work) keeps this batch on the consumer's
+        // stack: no newer pull, and no drop or retry is recorded for it until
+        // valid reconciliation or abort (002 §4.6). Acceptance rereads the gate
+        // and this watcher's token in the same synchronous turn as the batch's
+        // admission transaction, which `ingest` runs before its first await.
+        const accepted = await this.acceptWatchWork(
           monitor,
-          batch.observations,
-          new Date(),
-          {
-            workspacePath,
-            expectedSourceState,
-            ...(batch.nextState !== undefined
-              ? { nextSourceState: { value: batch.nextState } }
-              : {}),
-            ...(batch.outcome ? { sourceOutcome: batch.outcome } : {}),
-          },
+          workspacePath,
+          signal,
+          (current) =>
+            this.activeWatchers.get(key) === watcherToken
+              ? {
+                  ingestion: this.ingest(
+                    this.applyWatchPolicy(monitor, current),
+                    batch.observations,
+                    new Date(),
+                    {
+                      workspacePath,
+                      expectedSourceState,
+                      ...(batch.nextState !== undefined
+                        ? { nextSourceState: { value: batch.nextState } }
+                        : {}),
+                      ...(batch.outcome
+                        ? { sourceOutcome: batch.outcome }
+                        : {}),
+                    },
+                  ),
+                }
+              : undefined,
         );
+        // Aborted or superseded while the batch waited: it was never admitted.
+        if (!accepted) break;
+        const ingested = await accepted.ingestion;
         expectedSourceState = nextExpectedSourceState;
         if (ingested.failures.length > 0) {
           onError?.(
@@ -4040,10 +4940,13 @@ export class AgentMonitorRuntime {
       }
     } finally {
       // for-await closes the iterator on a failed admission or early break.
-      // Release only this watcher's slot, never a successor's ownership token.
-      if (this.activeWatchers.get(monitor.id) === watcherToken) {
-        this.activeWatchers.delete(monitor.id);
+      // Every accepted batch has settled by now: the loop awaits each one
+      // before pulling again. Release only this watcher's slot, never a
+      // successor's ownership token; the cache lease is this watcher's own.
+      if (this.activeWatchers.get(key) === watcherToken) {
+        this.activeWatchers.delete(key);
       }
+      this.releaseNotifyPolicy(monitor.id, workspacePath);
     }
   }
 
@@ -4153,12 +5056,9 @@ export class AgentMonitorRuntime {
     // §4.4 step 6). It never uses the debounce/throttle/immediate paths below,
     // so it short-circuits the rest of dispatchNotify.
     //
-    // Clear any stale `pendingDebounce` state first: if the monitor's strategy
-    // was previously `debounce` and was changed to `rollup`, the held batch
-    // must not linger in notifyState indefinitely (it can never be flushed by
-    // the rollup path). Drop it here so the strategy-change is clean.
+    // Effective edits drain captured holds atomically before this dispatcher
+    // runs. Dispatch never owns cancellation of a different strategy's work.
     if (monitor.frontmatter.notify?.strategy === 'rollup') {
-      delete nextState.pendingDebounce;
       return this.dispatchRollup(monitor, observations, observedAt, nextState);
     }
 

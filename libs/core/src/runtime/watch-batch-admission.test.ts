@@ -280,9 +280,15 @@ describe('watch batch admission', () => {
       const table =
         failure === 'outbox' ? 'materialization_retry_outbox' : 'monitor_state';
       const operation = failure === 'outbox' ? 'INSERT' : 'UPDATE';
+      // Only the batch's own state write advances the observation clock;
+      // startup's notify-identity learning (002 §4.6) must still succeed.
+      const when =
+        failure === 'outbox'
+          ? ''
+          : ' WHEN NEW.last_observation_at IS NOT OLD.last_observation_at';
       // The actual insert/update runs after earlier sibling writes, exercising outer rollback.
       f.writer.client.exec(
-        `CREATE TRIGGER admission_failure BEFORE ${operation} ON ${table} BEGIN SELECT RAISE(ABORT, 'admission failed'); END;`,
+        `CREATE TRIGGER admission_failure BEFORE ${operation} ON ${table}${when} BEGIN SELECT RAISE(ABORT, 'admission failed'); END;`,
       );
       const errors: Error[] = [];
       const handle = await f.runtime.watchMonitors(f.monitorsDir, f.root, {
@@ -292,7 +298,14 @@ describe('watch batch admission', () => {
         await vi.waitFor(() => expect(errors).toHaveLength(1));
         await vi.waitFor(() => expect(cleaned).toBe(true));
         expect(resumed).toBe(false);
-        expect(f.reader.getMonitorState('watched', f.root)).toEqual(before);
+        // Startup recorded only the private pacing identity; the batch changed nothing.
+        expect(f.reader.getMonitorState('watched', f.root)).toEqual({
+          ...before,
+          notifyState: {
+            ...before.notifyState,
+            policyKey: expect.any(String),
+          },
+        });
         expect(f.reader.listEvents()).toEqual([]);
         expect(f.reader.listMaterializationRetries()).toEqual([]);
         expect(interpretation.calls).toEqual([]);
@@ -512,6 +525,10 @@ describe('watch batch admission', () => {
     const first = await f.runtime.watchMonitors(f.monitorsDir, f.root, {
       onError: (_id, error) => errors.push(error),
     });
+    // The source factory runs only after startup reconciliation opens the gate.
+    await vi.waitFor(() =>
+      expect(errors.map(({ message }) => message)).toEqual(['setup failed']),
+    );
     await first.stop();
     expect(errors.map(({ message }) => message)).toEqual(['setup failed']);
     const second = await f.runtime.watchMonitors(f.monitorsDir, f.root);

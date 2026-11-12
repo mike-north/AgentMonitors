@@ -97,6 +97,7 @@ import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
 } from './retry-envelope.js';
+import { registerStoreWriter } from './store-writer.js';
 
 type InternalInboxDb = BetterSQLite3Database<
   typeof import('../inbox/schema.js')
@@ -430,7 +431,12 @@ function scopeMatches(
 }
 
 export class RuntimeStore {
+  /**
+   * Share this connection's writer boundary with internal runtime edit drains
+   * and register the runtime-owned admission span runner.
+   */
   constructor(private readonly db: InboxDb) {
+    registerStoreWriter(this, db);
     // Runtime-owned spans compose store operations without adding executable
     // callbacks to the published store API. Cache visibility follows the outer
     // commit, including when nested event savepoints succeeded before rollback.

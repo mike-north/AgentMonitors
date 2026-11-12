@@ -1,0 +1,56 @@
+---
+'@agentmonitors/core': patch
+---
+
+Changing a monitor's effective notify policy now flushes its already-held debounce or rollup work
+before observing new work. This deliberate early flush can occur before the old deadline or rollup
+window. Captured urgency, content and timestamps stay unchanged; the new policy applies to new work.
+Edit drains atomically commit events and hold removal. Failed drains retain the old work and defer
+that monitor's new observation until reconciliation succeeds.
+
+Escalation grants participate in effective policy edits even for immediate/throttle observations.
+A yielded watch batch rechecks admission in the same turn as its durable write; failed drains
+keep it waiting unadmitted, and the source is not pulled again until it is admitted. Startup drains
+refresh session hook state even when the source stays idle.
+
+Concurrent polling rechecks admission after observation and retains blocked results locally so a
+later tick can recover without advancing the old cursor. Watcher creation uses the latest admitted
+initial definition, and policy snapshots retire with their live admission instead of accumulating
+retired monitor instructions.
+
+A watcher retires its scoped ownership only after its admitted batch settles, so recovery polling
+or replacement watchers read that batch's baseline before advancing their own. Aborted and
+superseded watchers never admit a late batch, so they cannot rewind a newer cursor.
+
+Reporting an older poll's ingestion failure no longer releases a successor's active admission,
+preventing overlapping source observations and baseline regression during failure cleanup.
+
+Tick and watcher startup reread each authored definition immediately before policy reconciliation,
+so delayed discovery cannot restore obsolete pacing or drain newer holds. Deferred-result handoff
+releases its retained snapshot lease even when argument access fails before ingestion, preserving
+other live owners and reporting the already committed edit accurately.
+
+Unknown-source admission checks current scoped holds, including a watcher's first hold created while
+another monitor awaits, and blocks invalid-definition watch batches without skipping healthy
+siblings. A live same-ID/workspace definition moved between flat and folder forms remains usable
+when an older discovery or captured envelope still names its obsolete path. Current replacement
+files and source semantics are reread; invalid definitions and duplicate IDs remain rejected.
+
+A valid earlier location can replace an admitted path only when metadata proves that location
+absent (ENOENT/ENOTDIR). Permission and I/O failures retain the blocked gate, original holds and
+read diagnostic instead of being mistaken for deletion by a boolean existence check.
+
+Closing admission now retains the current admitted or blocked location within its existing live
+owner. Repeated unchanged discovery cannot reopen fallback while that location is still invalid
+or unreadable. The one pathname retires with the last live lease; new owners read fresh definitions
+and no historical paths or extra instruction snapshots are retained.
+
+Successful unchanged reconciliation learns missing private policy identity on existing legacy
+state without resetting clocks, holds or source baselines, so later effective edits retire old
+guards across restart. Watcher startup also reconciles existing scoped ownership before skipping
+a current source without a watch factory; it neither polls nor creates replacement watchers and
+leaves unowned observe-only state untouched.
+
+Effective policy adoption now preserves opaque source baselines, legacy fingerprints and observation
+clocks exactly while resetting guards or draining held work, so the next source call receives its
+original previous state across restart. Notify-only persistence remains in the same atomic drain.

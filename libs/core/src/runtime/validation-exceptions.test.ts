@@ -98,10 +98,14 @@ function fixture() {
       const value = String(config['value']);
       if (context.previousState !== value) {
         yield {
-          title: value,
-          summary: value,
-          objectKey: name,
-          snapshotText: value,
+          observations: [
+            {
+              title: value,
+              summary: value,
+              objectKey: name,
+              snapshotText: value,
+            },
+          ],
         };
       }
     },
@@ -228,6 +232,15 @@ describe('source validator exception isolation', () => {
             onError: (id, error) => errors.push({ id, message: error.message }),
           },
         );
+        // Watch admission is asynchronous (durable reconciliation precedes the
+        // source factory), so wait for the healthy sibling's factory to run
+        // before stopping rather than aborting it mid-admission.
+        await vi.waitFor(() => {
+          expect(existsSync(f.marker('zzz-source', 'watch'))).toBe(true);
+          if (accepted) {
+            expect(existsSync(f.marker('aaa-source', 'watch'))).toBe(true);
+          }
+        });
         await handle.stop();
         expect(handle.monitorIds).toEqual(
           accepted ? ['aaa-source', 'zzz-source'] : ['zzz-source'],
