@@ -289,6 +289,16 @@ function explicitSchemaObjects(
     .all();
 }
 
+/** Every object that existed before still exists with the same stored SQL; extra objects are fine. */
+function expectObjectsSurvive(
+  before: readonly { type: string; name: string; sql: string }[],
+  after: readonly { type: string; name: string; sql: string }[],
+): void {
+  for (const object of before) {
+    expect(after).toContainEqual(object);
+  }
+}
+
 function rowsByRowid(
   client: Database.Database,
   table: string,
@@ -329,8 +339,8 @@ describe('opening a database written by a released version (#569)', () => {
     });
 
     // Indexes and triggers that applied before the rebuild apply after it, with
-    // their exact stored SQL.
-    expect(explicitSchemaObjects(migrated)).toEqual(objectsBefore);
+    // their exact stored SQL. Objects the current schema adds later are allowed.
+    expectObjectsSurvive(objectsBefore, explicitSchemaObjects(migrated));
     expect(migrated.pragma('integrity_check', { simple: true })).toBe('ok');
 
     // The current writer can still insert: a carried legacy column never keeps
@@ -354,7 +364,7 @@ describe('opening a database written by a released version (#569)', () => {
     expect(rowsByRowid(reopened, 'monitor_events')).toHaveLength(
       shape.events.length + 1,
     );
-    expect(explicitSchemaObjects(reopened)).toEqual(objectsBefore);
+    expectObjectsSurvive(objectsBefore, explicitSchemaObjects(reopened));
   });
 
   it('carries a legacy-only column with its declared type and default, relaxing a NOT NULL that has no default', () => {
@@ -388,6 +398,35 @@ describe('opening a database written by a released version (#569)', () => {
       type: 'TEXT',
       notnull: 1,
     });
+  });
+
+  it('carries an expression default (#569: table_xinfo drops the outer parentheses)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      // SQLite accepts a non-constant default in ADD COLUMN only on an empty table.
+      extraDDL: sql`
+        ALTER TABLE monitor_events ADD COLUMN noted_local TEXT DEFAULT (datetime('now'));
+        ALTER TABLE monitor_events ADD COLUMN doubled INTEGER NOT NULL DEFAULT (1 + 1);
+      `,
+    });
+
+    const migrated = openWithCurrentCode(dbPath);
+    migrated
+      .prepare(
+        `INSERT INTO monitor_events (id, monitor_id, source_name, urgency, title, created_at)
+         VALUES ('01M6BSHAPE0000000000000NEW', 'm', 's', 'normal', 't', ?)`,
+      )
+      .run(OBSERVED_AT + 100);
+    const row = migrated
+      .prepare<
+        [],
+        { noted_local: string | null; doubled: number }
+      >(`SELECT noted_local, doubled FROM monitor_events WHERE id = '01M6BSHAPE0000000000000NEW'`)
+      .get();
+    expect(row?.doubled).toBe(2);
+    // datetime('now') renders 'YYYY-MM-DD HH:MM:SS'.
+    expect(row?.noted_local).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
   });
 });
 
@@ -462,5 +501,106 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
     expect((caught as Error).message).toMatch(/monitor_snapshots/);
     expect((caught as Error).message).toMatch(/"content_length"/);
     expect(durableState(dbPath)).toEqual(before);
+  });
+
+  /** Seed a 0.9–0.13 layout whose events DDL is rewritten, open it, and expect a refusal that changes nothing. */
+  function expectRefusal(
+    eventsDDL: string,
+    rows: Record<string, unknown>[],
+    expected: { table: string; column: string },
+  ): void {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL,
+      events: rows,
+    });
+    const before = durableState(dbPath);
+
+    let caught: unknown;
+    try {
+      createDb(dbPath);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      name: 'SchemaMigrationError',
+      table: expected.table,
+      column: expected.column,
+    });
+    expect((caught as Error).message).toContain(expected.table);
+    expect((caught as Error).message).not.toContain('_ordered');
+    expect(durableState(dbPath)).toEqual(before);
+  }
+
+  it('names the real table and column for a NULL retained in a NOT NULL DEFAULT column (#569 review F2)', () => {
+    // A hand-built table whose `body` lost its NOT NULL can hold NULL, which the
+    // current `body TEXT NOT NULL DEFAULT ''` rejects.
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        "body TEXT NOT NULL DEFAULT ''",
+        "body TEXT DEFAULT ''",
+      ),
+      [eventRow(1, { body: null })],
+      { table: 'monitor_events', column: 'body' },
+    );
+  });
+
+  it('refuses a carried column with an inline UNIQUE rather than silently allowing duplicates (#569 review F3)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, ext_ref TEXT UNIQUE',
+      ),
+      [eventRow(1, { ext_ref: 'a' })],
+      { table: 'monitor_events', column: 'ext_ref' },
+    );
+  });
+
+  it('refuses a table-level UNIQUE the rebuild cannot reproduce (#569 review F3)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, UNIQUE (monitor_id, created_at)',
+      ),
+      [eventRow(1)],
+      { table: 'monitor_events', column: 'monitor_id' },
+    );
+  });
+
+  it('refuses a table-level CHECK, naming a column it reads (#569 review F3)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        "created_at INTEGER NOT NULL, CHECK (urgency IN ('low', 'normal', 'high'))",
+      ),
+      [eventRow(1)],
+      { table: 'monitor_events', column: 'urgency' },
+    );
+  });
+
+  it('refuses an inline CHECK on a carried column (#569 review F3)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, ext_n INTEGER CHECK (ext_n > 0)',
+      ),
+      [eventRow(1, { ext_n: 3 })],
+      { table: 'monitor_events', column: 'ext_n' },
+    );
+  });
+
+  it('does not mistake CHECK text inside a string default for a constraint (#569 review F3)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL: EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        "created_at INTEGER NOT NULL, note TEXT DEFAULT 'CHECK (x)'",
+      ),
+    });
+    const migrated = openWithCurrentCode(dbPath);
+    expect(rowsByRowid(migrated, 'monitor_events')).toHaveLength(2);
   });
 });

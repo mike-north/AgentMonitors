@@ -615,6 +615,90 @@ interface LiveColumn {
   hidden: number;
 }
 
+/** Blank out string literals and quoted identifiers so keyword scans cannot match inside them. */
+function blankQuoted(sqlText: string): string {
+  return sqlText.replace(
+    /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]/g,
+    (m) => ' '.repeat(m.length),
+  );
+}
+
+/**
+ * Refuse a live table whose constraints the rebuild cannot recreate, rather
+ * than silently loosen them (spec 002 §5.2). A uniqueness guarantee that
+ * quietly disappears lets duplicates in afterwards, so it is a data-integrity
+ * change, not a cosmetic one.
+ *
+ * Reproduced: the current definitions of the columns the current schema owns
+ * (including `id` uniqueness, which also covers a released `id TEXT PRIMARY
+ * KEY`), and every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX`.
+ * Refused: any other UNIQUE or PRIMARY KEY constraint (inline on a carried
+ * column or table-level, which SQLite backs with an automatic index), and any
+ * CHECK constraint, inline or table-level. Collation and REFERENCES clauses are
+ * the only constraint losses that are tolerated; they do not change which rows
+ * are admitted.
+ */
+function refuseUnreproducibleConstraints(
+  sqlite: BetterSQLiteClient,
+  table: string,
+  live: readonly LiveColumn[],
+  currentNames: ReadonlySet<string>,
+): void {
+  const indexes = sqlite.pragma(`index_list(${table})`) as {
+    name: string;
+    origin: string;
+  }[];
+  for (const index of indexes) {
+    if (index.origin !== 'u' && index.origin !== 'pk') continue;
+    const members = (
+      sqlite.pragma(`index_info(${quoteIdentifier(index.name)})`) as {
+        name: string | null;
+      }[]
+    ).flatMap((member) => (member.name === null ? [] : [member.name]));
+    // The current schema declares `id` UNIQUE, so a lone `id` key is recreated.
+    if (members.length === 1 && members[0]?.toLowerCase() === 'id') continue;
+    const culprit =
+      members.find((name) => !currentNames.has(name.toLowerCase())) ??
+      members[0];
+    if (culprit !== undefined) {
+      throw new SchemaMigrationError(
+        table,
+        culprit,
+        'is covered by a UNIQUE or PRIMARY KEY constraint the rebuild cannot reproduce',
+      );
+    }
+  }
+
+  const row = sqlite
+    .prepare<
+      [string],
+      { sql: string | null }
+    >(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?`)
+    .get(table);
+  const text = blankQuoted(row?.sql ?? '');
+  const check = /\bCHECK\s*\(/i.exec(text);
+  if (check) {
+    // Read the balanced expression to name a column it mentions.
+    let depth = 0;
+    let end = check.index + check[0].length - 1;
+    for (; end < text.length; end += 1) {
+      if (text[end] === '(') depth += 1;
+      else if (text[end] === ')' && --depth === 0) break;
+    }
+    const expression = text.slice(check.index, end + 1);
+    const mentioned = live.find((column) =>
+      new RegExp(`\\b${column.name.replace(/[^\w]/g, '.')}\\b`, 'i').test(
+        expression,
+      ),
+    );
+    throw new SchemaMigrationError(
+      table,
+      (mentioned ?? live[0])?.name ?? table,
+      'is covered by a CHECK constraint the rebuild cannot reproduce',
+    );
+  }
+}
+
 /**
  * Rebuild a table written before the private `sequence` order key existed, so
  * it gains that key while keeping everything it holds (spec 002 §5.2).
@@ -629,16 +713,21 @@ interface LiveColumn {
  *   add in place, and columns an operator added. A carried column keeps NOT NULL
  *   only when it has a default: the current writer never names it, so a NOT NULL
  *   without a default would reject every new row. Collation, CHECK and
- *   REFERENCES clauses on a carried column are not reproduced.
+ *   REFERENCES clauses on a carried column are not reproduced; they do not
+ *   change which rows are admitted.
  * - Because every column survives, every explicit index (and every trigger the
  *   coordinator restores) still resolves. All are recreated from their exact
- *   stored SQL; none is dropped.
+ *   stored SQL; none is dropped. Automatic indexes behind UNIQUE and PRIMARY KEY
+ *   constraints are not explicit indexes and are not recreated, so the rebuild
+ *   refuses a table that has one other than the lone `id` key (see
+ *   {@link refuseUnreproducibleConstraints}), as it does any CHECK constraint.
  *
- * A row or column that cannot be carried stops the migration with a
+ * A row, column or constraint that cannot be carried stops the migration with a
  * {@link SchemaMigrationError} naming the table and column: a generated column
- * (its expression is not recoverable from table metadata), or a retained row
- * holding NULL in a column the current schema requires (a released
- * `id TEXT PRIMARY KEY` admits NULL). The caller's immediate transaction then
+ * (its expression is not recoverable from table metadata), a UNIQUE/PRIMARY KEY
+ * or CHECK constraint the rebuild cannot recreate, or a retained row holding
+ * NULL in a column the current schema requires, with or without a default (a
+ * released `id TEXT PRIMARY KEY` admits NULL). The caller's immediate transaction then
  * rolls the database back to its original schema and data.
  *
  * Retained rows take positions in current hidden rowid order. That orders the
@@ -669,17 +758,19 @@ function rebuildWithMaterializationOrder(
       'is a generated column, and its expression cannot be carried across the rebuild',
     );
   }
+  refuseUnreproducibleConstraints(sqlite, table, live, currentNames);
   // A required current column must hold a value in every retained row: either
   // the old table has it and no row holds NULL, or the old table has no rows.
   for (const column of columns) {
-    const required =
-      column.name !== 'sequence' &&
-      /\bNOT NULL\b/.test(column.definition) &&
-      !/\bDEFAULT\b/.test(column.definition);
-    if (!required) continue;
-    const condition = liveNames.has(column.name.toLowerCase())
-      ? `${quoteIdentifier(column.name)} IS NULL`
-      : '1';
+    if (column.name === 'sequence' || !/\bNOT NULL\b/.test(column.definition)) {
+      continue;
+    }
+    // An explicit NULL is rejected even by a NOT NULL column that has a default.
+    // A column the old table lacks takes its default, so it only needs a check
+    // when it has none.
+    const inLive = liveNames.has(column.name.toLowerCase());
+    if (!inLive && /\bDEFAULT\b/.test(column.definition)) continue;
+    const condition = inLive ? `${quoteIdentifier(column.name)} IS NULL` : '1';
     const missing = sqlite
       .prepare(`SELECT 1 FROM ${table} WHERE ${condition} LIMIT 1`)
       .get();
@@ -698,7 +789,9 @@ function rebuildWithMaterializationOrder(
       const constraint =
         column.dflt_value === null
           ? ''
-          : `${column.notnull !== 0 ? ' NOT NULL' : ''} DEFAULT ${column.dflt_value}`;
+          : // table_xinfo reports the default without its outer parentheses, so
+            // restore them: that form is valid for literals and expressions alike.
+            `${column.notnull !== 0 ? ' NOT NULL' : ''} DEFAULT (${column.dflt_value})`;
       return {
         name: column.name,
         definition: `${column.type}${constraint}`,

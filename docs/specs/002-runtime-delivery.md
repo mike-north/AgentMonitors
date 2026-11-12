@@ -1284,20 +1284,38 @@ not from a fixed column list. Columns the current schema defines take their curr
 definitions (§15); one the old table lacks takes its default. Every other column — one a
 released version later stopped creating (0.0.1–0.3.0's `monitor_events.event_kind`), one a
 later change adds in place, or one an operator added — is carried with its values, its
-declared type and its default. A carried column keeps `NOT NULL` only when it has a
-default, because the current writer never names it; its collation, `CHECK` and
-`REFERENCES` clauses are not reproduced. Since every column survives, every explicit
-index and trigger still resolves and is recreated from its exact stored SQL; the rebuild
-drops none. Opening any database a released version wrote therefore succeeds without
+declared type and its default; an expression default such as `(datetime('now'))` is carried
+as an expression. A carried column keeps `NOT NULL` only when it has a default, because the
+current writer never names it.
+
+What the rebuild preserves, loses and refuses:
+
+- **Preserved:** every column and its values; each carried column's type and default; the
+  current definitions of current columns (including `id` uniqueness, which also covers a
+  released `id TEXT PRIMARY KEY`); every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX` and
+  every trigger, recreated from its exact stored SQL.
+- **Lost:** a carried column's collation and `REFERENCES` clause. Neither changes which rows
+  the table admits, though a `COLLATE NOCASE` column behind an explicit unique index then
+  compares case-sensitively.
+- **Refused:** any `UNIQUE` or `PRIMARY KEY` constraint other than the lone `id` key (inline on
+  a carried column, or table-level; SQLite backs each with an automatic index that is not an
+  explicit index and cannot be recreated), and any `CHECK` constraint, inline or table-level.
+  Dropping these would silently admit rows the table rejected, so the open stops with a
+  `SchemaMigrationError` instead.
+
+Since every column survives, every explicit index and trigger still resolves; the rebuild
+drops none of them. Opening any database a released version wrote therefore succeeds without
 losing an event or snapshot value.
 
 A rebuild that cannot carry a row or column stops before copying and reports a
 `SchemaMigrationError` naming the table and column, for example
 `Cannot migrate monitor_events to the current schema: column "id" has no value in a
 retained row, and the current schema requires one. The database was left unchanged.`
-This covers a generated column (its expression is not recoverable from table metadata)
-and a retained row holding `NULL` in a column the current schema requires (a released
-`id TEXT PRIMARY KEY` admits `NULL`). The schema transaction rolls back, so the database
+This covers a generated column (its expression is not recoverable from table metadata),
+a `UNIQUE`/`PRIMARY KEY`/`CHECK` constraint it cannot recreate (above), and a retained row
+holding `NULL` in a column the current schema requires, with or without a default (a
+released `id TEXT PRIMARY KEY` admits `NULL`). The error names the live table and column,
+never the scratch table. The schema transaction rolls back, so the database
 keeps its original schema and data; the open fails the same way until that row or column
 is repaired.
 
