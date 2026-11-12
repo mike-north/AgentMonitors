@@ -464,6 +464,11 @@ describe('source config execution preflight', () => {
     const handle = await runtime.watchMonitors(f.monitorsDir, f.root, {
       onError: (id, error) => errors.push(`${id}: ${error.message}`),
     });
+    // Watch admission is asynchronous; let the healthy sibling's factory run
+    // before stopping rather than aborting it mid-admission.
+    await vi.waitFor(() => {
+      expect(existsSync(f.marker)).toBe(true);
+    });
     await handle.stop();
     expect(handle.monitorIds).toEqual(['zzz-healthy']);
     expect(readFileSync(f.marker, 'utf8')).toBe('healthy');
