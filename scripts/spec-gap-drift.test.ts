@@ -13,6 +13,7 @@ import {
   checkSpecGapDrift,
   findClosedRoadmapGaps,
   findGapMarkers,
+  findRoadmapGaps,
   loadRepoSpecs,
   repoPathExists,
 } from './lib/spec-gap-drift.mjs';
@@ -29,6 +30,13 @@ const ROADMAP = [
 
 const exists = () => true;
 
+/** Ensure the tracked gap bullets remain recognizable regardless of their status. */
+function expectTrackedGaps(roadmapText: string) {
+  expect(findRoadmapGaps(roadmapText).map(({ id }) => id)).toEqual(
+    expect.arrayContaining(['T1', 'T2', 'T3', 'T4']),
+  );
+}
+
 describe('spec gap drift (real docs)', () => {
   it('has no roadmap-closed gap whose spec marker remains, no unnumbered marker, and no dangling cited test file', () => {
     const { specs, roadmapText } = loadRepoSpecs();
@@ -37,14 +45,40 @@ describe('spec gap drift (real docs)', () => {
     ).toEqual([]);
   });
 
-  it('reads the roadmap closed list', () => {
-    expect(findClosedRoadmapGaps(loadRepoSpecs().roadmapText)).toEqual(
-      expect.arrayContaining(['T1', 'T2', 'T3', 'T4']),
-    );
+  it('reads the tracked roadmap gaps', () => {
+    expectTrackedGaps(loadRepoSpecs().roadmapText);
   });
 });
 
 describe('spec gap drift (fixtures)', () => {
+  const trackedRoadmap = [
+    '## Test gaps',
+    '- **T1** (open) — reopened.',
+    '- **T2** — closed.',
+    '- **T3** — closed.',
+    '- **T4** — closed.',
+  ].join('\n');
+
+  it('accepts a documented reopened gap in the checker and parse guard', () => {
+    expect(
+      checkSpecGapDrift({
+        specs: { '004-x.md': '**TEST GAP T1** — reopened' },
+        roadmapText: trackedRoadmap,
+        pathExists: exists,
+      }),
+    ).toEqual([]);
+    expectTrackedGaps(trackedRoadmap);
+  });
+
+  it('rejects an unrecognizable heading or bullet format in the parse guard', () => {
+    expect(() =>
+      expectTrackedGaps(trackedRoadmap.replace('## Test gaps', '## Gaps')),
+    ).toThrow();
+    expect(() =>
+      expectTrackedGaps(trackedRoadmap.replaceAll('- **', '* **')),
+    ).toThrow();
+  });
+
   it('fails when a spec still carries the marker for a gap the roadmap closed', () => {
     const problems = checkSpecGapDrift({
       specs: { '004-x.md': 'row | **TEST GAP T1** — missing' },

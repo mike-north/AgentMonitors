@@ -1,4 +1,4 @@
-// Drift detection between the roadmap's closed test gaps and the numbered specs'
+// Parse tracked roadmap test gaps and detect drift against numbered specs'
 // open gap markers (spec 004 §3.0).
 //
 // A tracked test gap has a stable id `T<n>`. The numbered spec that governs it
@@ -40,18 +40,29 @@ export function findGapMarkers(text) {
   return markers;
 }
 
-/** Ids the roadmap's "Test gaps" section claims closed. */
-export function findClosedRoadmapGaps(roadmapText) {
+/** Tracked ids and their open or closed status in the roadmap's "Test gaps" section. */
+export function findRoadmapGaps(roadmapText) {
   const lines = roadmapText.split('\n');
   const start = lines.findIndex((line) => /^## Test gaps\s*$/.test(line));
   if (start === -1) return [];
-  const closed = [];
+  const gaps = [];
   for (const line of lines.slice(start + 1)) {
     if (/^## /.test(line)) break;
     const match = ROADMAP_BULLET_RE.exec(line);
-    if (match && !line.includes('(open)')) closed.push(`T${match[1]}`);
+    if (match)
+      gaps.push({
+        id: `T${match[1]}`,
+        status: line.includes('(open)') ? 'open' : 'closed',
+      });
   }
-  return closed;
+  return gaps;
+}
+
+/** Ids the roadmap's "Test gaps" section claims closed. */
+export function findClosedRoadmapGaps(roadmapText) {
+  return findRoadmapGaps(roadmapText)
+    .filter(({ status }) => status === 'closed')
+    .map(({ id }) => id);
 }
 
 /** Repo-relative test file paths a spec cites in backticks. */
