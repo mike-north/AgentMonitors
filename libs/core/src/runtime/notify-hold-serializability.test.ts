@@ -71,7 +71,7 @@ type HeldStrategy = 'debounce' | 'rollup';
 function fixture(
   policy: string,
   batches: (() => Observation[])[],
-  watched?: () => Observation[],
+  watched?: () => Iterable<Observation>,
 ) {
   vi.useFakeTimers();
   vi.setSystemTime(START);
@@ -148,11 +148,13 @@ function fixture(
   return {
     edit,
     tick: () => current.runtime.tick(monitors, root),
-    async watch() {
+    async watch(onError?: (monitorId: string, error: Error) => void) {
       const errors: { monitorId: string; message: string }[] = [];
       const handle = await current.runtime.watchMonitors(monitors, root, {
-        onError: (monitorId, error) =>
-          errors.push({ monitorId, message: error.message }),
+        onError: (monitorId, error) => {
+          errors.push({ monitorId, message: error.message });
+          onError?.(monitorId, error);
+        },
       });
       await watchDrained;
       await handle.stop();
@@ -375,4 +377,98 @@ it('JSON-encodable payloads are still held: undefined members and Dates are not 
   expect(first.erroredObservations).toEqual([]);
   expect(f.heldTitles()).toEqual(['A']);
   expect(f.errored()).toEqual([]);
+});
+
+it('a throwing watcher onError cannot lose a debounce batch flushed in the same dispatch as a refusal (#570 review F1)', async () => {
+  // A is held; 60s later a dispatch flushes it (due) and refuses Bad. The
+  // report callback throws, as a caller's logger can. The flushed batch and
+  // the refusal row are committed work and must survive that.
+  const f = fixture(policies.debounce, [], function* () {
+    yield observation('A');
+    f.advance(60_000);
+    yield observation('Bad', { count: 1n });
+  });
+  await f.watch(() => {
+    throw new Error('logger down');
+  });
+
+  expect(f.eventSummaries()).toEqual(['A']);
+  expect(f.state().notifyState.pendingDebounce).toBeUndefined();
+  expect(
+    f.errored().map((row) => (row.observationData as { error: string }).error),
+  ).toEqual([
+    expect.stringMatching(/^Observation "Bad" was not held for debounce:/u),
+  ]);
+});
+
+it('a rejected observation sanitizes its title to one terminal-safe line (#570 review F3)', async () => {
+  const f = fixture(policies.debounce, [
+    () => [observation('\u001b[31mRED\u001b[0m\nline2\u0007', { n: 1n })],
+  ]);
+  const result = await f.tick();
+  const message = result.erroredObservations[0]?.message ?? '';
+  expect(message).toMatch(
+    /^Observation "RED line2" was not held for debounce: it cannot be serialized \(/u,
+  );
+  // eslint-disable-next-line no-control-regex -- asserting no control bytes survive
+  expect(message).not.toMatch(/[\u0000-\u001f\u007f-\u009f]/u);
+});
+
+it('a refusal does not reset the hold dueAt (#570 review F3, 002 §4.3/§4.7)', async () => {
+  const f = fixture(policies.debounce, [
+    () => [observation('A')],
+    () => [observation('Bad', { n: 1n })],
+  ]);
+  await f.tick();
+  const dueAt = f.state().notifyState.pendingDebounce?.dueAt;
+  expect(dueAt).toBeDefined();
+  f.advance(5_000);
+  await f.tick();
+  expect(f.errored()).toHaveLength(1);
+  expect(f.state().notifyState.pendingDebounce?.dueAt).toBe(dueAt);
+});
+
+it('a long title is capped so the reason survives the 512-code-point display cap (#570 review F4)', async () => {
+  const f = fixture(policies.debounce, [
+    () => [observation('é'.repeat(600), { n: 1n })],
+  ]);
+  const result = await f.tick();
+  const message = result.erroredObservations[0]?.message ?? '';
+  expect(Array.from(message).length).toBeLessThanOrEqual(512);
+  expect(message).toMatch(/it cannot be serialized \(.*BigInt.*\)\.$/u);
+  expect(message).toContain('...');
+});
+
+it('a toJSON that throws a value whose toString throws still yields a refusal with a fixed reason and does not wedge (#570 review F5b)', async () => {
+  const evil = {
+    toString(): string {
+      throw new Error('no string');
+    },
+  };
+  const f = fixture(policies.debounce, [
+    () => [
+      observation('Evil', {
+        x: {
+          toJSON() {
+            throw evil;
+          },
+        },
+      }),
+      observation('A'),
+    ],
+    () => [observation('B')],
+  ]);
+  const first = await f.tick();
+  expect(first.erroredObservations).toEqual([
+    {
+      monitorId: 'held',
+      message:
+        'Observation "Evil" was not held for debounce: it cannot be serialized (unknown serialization error).',
+    },
+  ]);
+  expect(f.heldTitles()).toEqual(['A']);
+  expect(f.state().sourceState).toEqual({ cursor: 1 });
+  f.advance(2_000);
+  await f.tick();
+  expect(f.heldTitles()).toEqual(['A', 'B']);
 });

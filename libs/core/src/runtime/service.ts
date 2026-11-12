@@ -335,7 +335,10 @@ function explainVerdict(stages: MonitorExplainStage[]): {
  * including the truncation marker. CLI history mirrors this private policy
  * without expanding the core plugin API with a presentation-only helper.
  */
-function displayObservationError(value: unknown): string | undefined {
+function displayObservationError(
+  value: unknown,
+  limit = 512,
+): string | undefined {
   if (typeof value !== 'string') return undefined;
   const line = stripVTControlCharacters(value)
     // eslint-disable-next-line no-control-regex -- Remove literal terminal control bytes from legacy diagnostics.
@@ -343,8 +346,8 @@ function displayObservationError(value: unknown): string | undefined {
     .replace(/\s+/gu, ' ')
     .trim();
   const points = Array.from(line);
-  return points.length > 512
-    ? `${points.slice(0, 509).join('')}...`
+  return points.length > limit
+    ? `${points.slice(0, limit - 3).join('')}...`
     : line || undefined;
 }
 
@@ -491,6 +494,14 @@ function serializeObservation(
 }
 
 /**
+ * Longest observation title, in code points, a not-held outcome message
+ * carries. It is well below the 512-code-point display cap that history and
+ * explain apply to the whole message, so a long title can never push the
+ * serializer's reason out of the human views (002 §4.7).
+ */
+const NOT_HELD_TITLE_LIMIT = 200;
+
+/**
  * Admission check for held notify work (002 §4.7). Debounce and rollup holds
  * persist their envelopes as JSON in `monitor_state.notify_state`, so an
  * envelope `JSON.stringify` cannot encode (a BigInt, a cyclic reference, a
@@ -498,6 +509,15 @@ function serializeObservation(
  * monitor fail. The check runs the same serializer the hold write uses, once,
  * where an envelope would join a hold; an envelope that passes stays
  * serializable inside every later hold write.
+ *
+ * Limit: the hold write serializes the envelope again, so the check proves
+ * serializability only for values that serialize the same way twice. A
+ * non-deterministic accessor (one that returns a BigInt only on a later read)
+ * can still pass this check and fail the later write; that is not defended.
+ *
+ * Total by construction: building the outcome text never throws, even when
+ * the serializer threw a value whose own `toString` throws. Such a reason
+ * falls back to a fixed string.
  *
  * Returns `undefined` when the envelope can be held, otherwise the complete
  * single-line `errored` outcome text naming the observation, the strategy and
@@ -511,13 +531,25 @@ function notHeldReason(
     JSON.stringify(envelope);
     return undefined;
   } catch (error) {
-    const reason =
-      displayObservationError(
+    let reason: string | undefined;
+    try {
+      reason = displayObservationError(
         error instanceof Error ? error.message : String(error),
-      ) ?? 'unknown serialization error';
-    const title =
-      displayObservationError(envelope.observation.title) ?? '(untitled)';
-    return `Observation "${title}" was not held for ${strategy}: it cannot be serialized (${reason}).`;
+      );
+    } catch {
+      // A hostile thrown value whose conversion to text throws: use the fixed
+      // reason rather than let the refusal itself escape and wedge the monitor.
+    }
+    let title: string | undefined;
+    try {
+      title = displayObservationError(
+        envelope.observation.title,
+        NOT_HELD_TITLE_LIMIT,
+      );
+    } catch {
+      // Same guard for a title that is not a plain string.
+    }
+    return `Observation "${title ?? '(untitled)'}" was not held for ${strategy}: it cannot be serialized (${reason ?? 'unknown serialization error'}).`;
   }
 }
 
@@ -3862,7 +3894,8 @@ export class AgentMonitorRuntime {
       /**
        * Reports each observation a debounce/rollup hold refused (002 §4.7):
        * the tick loop adds it to `erroredObservations`, a watcher to `onError`.
-       * Its durable `errored` history row is written here either way.
+       * Its durable `errored` history row is written here either way. Called
+       * after the span has materialized; an exception it throws is ignored.
        */
       onNotHeld?: (message: string) => void;
     },
@@ -3905,9 +3938,10 @@ export class AgentMonitorRuntime {
 
     // An observation a hold refused (002 §4.7) is neither emitted nor held: its
     // outcome is this `errored` row, written after the state commit that
-    // advanced past it and before the span's batch row.
+    // advanced past it and before the span's batch row. It is reported to the
+    // caller only after the span has materialized (below), so a throwing
+    // report callback can never cut off already-committed work.
     for (const { message } of dispatch.notHeld) {
-      options.onNotHeld?.(message);
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -3917,9 +3951,19 @@ export class AgentMonitorRuntime {
           observationData: { error: message },
         });
       } catch {
-        // best-effort audit — the caller has already reported the outcome
+        // best-effort audit — the outcome is still reported below
       }
     }
+    const reportNotHeld = (): void => {
+      for (const { message } of dispatch.notHeld) {
+        try {
+          options.onNotHeld?.(message);
+        } catch {
+          // Reporting is best-effort: the state, the `errored` row and any
+          // materialized events are already committed.
+        }
+      }
+    };
 
     // Audit-history recording and per-observation materialization are shared
     // with the not-due rollup flush in tick() via materializeSpan() (issue
@@ -3928,17 +3972,21 @@ export class AgentMonitorRuntime {
     // (002 §10.7) and record every emitted observation on the shared chain.
     // The `net` collapse (002 §1.1.7) is NO LONGER applied here — it is a
     // per-recipient claim-time decision (G10 PR-B); see materializeSpan().
-    return await this.materializeSpan(monitor, dispatch.emitted, {
-      observed: observations.length,
-      notHeld: dispatch.notHeld.length,
-      workspacePath: options.workspacePath,
-      ...(options.sourceOutcome
-        ? { sourceOutcome: options.sourceOutcome }
-        : {}),
-      ...(options.ephemeralSessionId !== undefined
-        ? { ephemeralSessionId: options.ephemeralSessionId }
-        : {}),
-    });
+    try {
+      return await this.materializeSpan(monitor, dispatch.emitted, {
+        observed: observations.length,
+        notHeld: dispatch.notHeld.length,
+        workspacePath: options.workspacePath,
+        ...(options.sourceOutcome
+          ? { sourceOutcome: options.sourceOutcome }
+          : {}),
+        ...(options.ephemeralSessionId !== undefined
+          ? { ephemeralSessionId: options.ephemeralSessionId }
+          : {}),
+      });
+    } finally {
+      reportNotHeld();
+    }
   }
 
   /**
