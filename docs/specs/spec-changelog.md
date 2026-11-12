@@ -34,6 +34,16 @@ were rejected because macOS hides the environment of platform binaries. Adds the
 inventory (§5.2) and records the interim abstention surface: a warning line on the daemon's stderr.
 The durable, deduplicated warning surface stays target under #507, and the restart sweep under #478.
 
+## 2026-11-11 — Source-config rejection closes admission only for held work (002 §2.0/§4.6, 004 §2.5) — Refs #537
+
+Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
+rejection closes the scope's admission gate only when it has durable holds or a retained poll
+result, so a running watcher cannot commit beside that work under the rejected definition. Without
+held work, the rejection never closes admission by itself, so a watcher with open admission keeps
+its startup config, while one already blocked stays blocked until valid reconciliation (002 §4.6).
+Require tick and rescan
+proofs of both cases.
+
 ## 2026-11-10 — Doctor does not invent an outbox for unattributed monitor rows; scoped remediation (004, 005) — Refs #496
 
 Doctor attributes each retry outbox once. A monitor row whose id has an orphan group claims no
@@ -42,6 +52,107 @@ other row without a summary, including a duplicated id with no retained work and
 older daemon report that carries no orphan groups, gets the empty summary (`0/0`). Retained-work remediation names
 `monitor explain` with `--workspace`/`--dir` when doctor was given non-default values. 004 now
 describes the retry CLI suite as running the shared Nx-built bundle, not an owned package layout.
+
+## 2026-11-06 — Preserve opaque source baselines during notify edits (002 §3/§4.6, 004 §2.5) — Refs #537
+
+Clarify the existing source-state ownership rule for guard-only resets and held drains: effective
+policy adoption updates notify metadata and materialization artifacts without reserializing raw
+source state, clearing fingerprints or changing observation clocks. Require tick/startup and
+full-reopen proofs of the next actual source's previousState, clock-only scheduling in fixtures,
+real notify-write rollback and a narrow broad-setter reversion. Ordinary ingestion/checkpoint
+semantics and ordinary flush recovery remain separate.
+
+## 2026-11-06 — Learn legacy identity and reconcile factory-less owned scopes (002 §4.6, 004 §2.5) — Refs #537
+
+A successful unchanged scan learns missing private identity on an existing row without retiring
+its guards or changing source baselines. Later known edits can reset retired guards across restart;
+no pre-first-scan history is inferred. Failed validation/write does not learn identity.
+Factory capability does not exempt existing watcher/poll ownership from startup reconciliation.
+Current invalid scope or failed drain blocks live writes; unowned observe-only state remains ordinary
+polling work. Require actual public SQLite/reopen proofs and independent narrow reversions.
+
+## 2026-11-06 — Retain current location through blocked admission (002 §4.6, 004 §2.5) — Refs #537
+
+Separate current location provenance from gate permission within the existing counted owner.
+A closed gate cannot forget the admitted/blocked location and authorize unchanged fallback on a
+later scan. Revalidate current files until valid recovery or proven absence, including locations
+that never reconciled successfully. Keep only one pathname, no instructions/history, and retire
+it with the last live lease. Require repeated public tick/startup/captured-route permission proofs,
+fresh edits, genuine moveback, owner retirement/recreation and a narrow loss-of-provenance reversion.
+
+## 2026-11-06 — Proven absence before location fallback (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify that boolean nonexistence is not proof of deletion: access or I/O failures can produce the
+same result. Only metadata ENOENT/ENOTDIR permits replacing an admitted location with a valid
+earlier location. Other failures preserve the original read diagnostic, held work and blocked
+admission without starving siblings. Require actual POSIX permission/checkpoint/yield/reopen proof,
+faithful filesystem fault controls, genuine moveback controls and narrow classification reversion.
+
+## 2026-11-06 — Live held membership and same-ID location authority (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify that holds may first appear while earlier discovery work awaits: unknown-source admission
+closes immediately and classifies current workspace-scoped holds, preserving scoped failures with
+holds and existing fatal behavior without them. A filename is not monitor identity. Revalidate a
+live owner's current same-ID/workspace replacement before an obsolete discovered/captured path can
+close its gate. Validate current file/source/scope, retain fatal duplicates, and add no path history
+or execution reload. Require actual checkpoint/yield/recovery/reopen and relocation controls across
+public tick/startup, plus independent narrow reversions.
+
+## 2026-11-06 — Fresh authored admission and balanced deferred handoffs (002 §4.6, 004 §2.5) — Refs #537
+
+Directory discovery can outlive the definition it read while another monitor awaits. Clarify the
+synchronous per-file revalidation boundary immediately before reconciliation, including stale
+missing/invalid diagnostics; no generation history or live source restart is introduced. Deferred
+handoff releases its retained cache lease even when argument access fails before ingestion. Its
+error describes the already committed drain rather than claiming old holds remain. Require actual
+public tick/startup overlap, SQLite faults/reopen, live-owner controls and independent repair reversions.
+
+## 2026-11-06 — Late poll errors preserve successor admissions (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify source exclusion after a poll relinquishes its synchronous admission: its later asynchronous
+ingestion error reporting cannot remove a successor's slot or wake work through it. Require public
+overlapping ticks, a real SQLite fault, ordered durable reopen and watcher/checkpoint/scope controls.
+This does not add ordinary ingestion rollback or a durable recovery queue.
+
+## 2026-11-05 — Close checkpoint admission before scope retirement (002 §2.4, 004 §2.5) — Refs #537
+
+Clarify the existing G14/notify-boundary guarantee across natural completion and iterator error.
+Close admission immediately, retaining the monitor/workspace exclusion and cache lease until
+accepted pre-close writes settle. A recovery rescan opens their gate without letting polling or
+replacement sources overtake them; actual writes also recheck token/cancellation. Replace the
+obsolete delete-before-drain/stable-reference description. Require source/SQLite/reopen evidence
+that cursor 111 precedes a later source baseline 999, plus cancellation and scoped successor controls.
+
+## 2026-11-05 — Poll admission and live policy ownership (002 §4.6, 004 §2.5) — Refs #537
+
+Extend the existing #556 admission rule explicitly across asynchronous polling and source creation.
+A blocked returned poll result retains its original source cursor and handling, finishes the tick
+without deadlocking recovery scans, and is admitted under current pacing before later source work.
+Factory creation rechecks cancellation/current admission and pins the latest initial snapshot.
+Process-local policy caches belong to live work and retire with completion/teardown or ephemeral
+lifetime; they do not retain retired instruction history or delete durable holds. Require actual
+public-tick/source/SQLite interleavings and bounded lifecycle controls. No durable ordinary recovery
+queue or new source outcome is introduced.
+
+## 2026-11-05 — Notify admission and startup publication boundaries (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify the existing #556 rule at asynchronous watcher admission: immediate/throttle escalation
+participates in effective policy identity without resetting unchanged prior private-key clocks;
+a previously captured gate cannot authorize a mutation
+after reconciliation blocks it. Deterministic span writes precede async Interpret, and committed
+startup projections refresh hook files even without a later yield/tick. Require actual watcher-chain
+microtask, SQLite failure and hook-file regressions with positive controls. Ordinary flush recovery
+and source execution/handling reload remain outside this rule.
+
+## 2026-11-05 — Effective notify edits drain captured holds (002 §4.6, 004 §2.5) — Refs #537
+
+Record decision #556: a changed effective notify policy flushes accepted old work before new
+source observation, even before a debounce deadline or rollup window. Preserve captured semantics;
+unchanged pacing and body-only edits keep normal clocks. The whole edit drain rereads under an
+owned writer transaction and commits materialization with hold removal; failure retains all state
+and backpressures only that monitor. Specify restart, missing-definition diagnostics, independent
+writer exclusion, real SQLite faults and actual bounded-child kill acceptance. Ordinary flush
+recovery remains separate.
 
 ## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
 
