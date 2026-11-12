@@ -604,3 +604,156 @@ describe('retry recipients for rows written before positions were reserved', () 
     expect(recipientsOfA(client)).toEqual([before.id]);
   });
 });
+
+/**
+ * Held work beside retained work (002 §2.6, §2.7). A debounce flush whose
+ * write fails leaves its batch as a retry while the same span starts a newer
+ * hold. When the source then rejects, the held-work flush that a failing
+ * source would otherwise run (§2.6) must not release the newer hold ahead of
+ * the retry: the drain comes first and the source is not called.
+ */
+describe('held work waits behind retained work while the source fails', () => {
+  let clock: ReturnType<typeof stubClock>;
+  beforeEach(() => {
+    clock = stubClock(T0);
+  });
+
+  function heldBesideRetry() {
+    const root = mkdtempSync(path.join(tmpdir(), 'agentmon-retry-drain-held-'));
+    tempRoots.push(root);
+    const monitorsDir = path.join(root, 'monitors');
+    const id = 'm';
+    mkdirSync(path.join(monitorsDir, id), { recursive: true });
+    writeFileSync(
+      path.join(monitorsDir, id, 'MONITOR.md'),
+      md`---
+name: ${id}
+watch:
+  type: drain-source
+  label: ${id}
+  interval: 1s
+urgency: normal
+notify:
+  strategy: debounce
+  settle-for: 1s
+---
+Handle it.
+`,
+      'utf8',
+    );
+    const db = createDb(path.join(root, 'runtime.db'));
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    clients.push(client);
+    const store = new RuntimeStore(db);
+    const calls: { monitor: string; eventsBefore: string[] }[] = [];
+    const source = cursorSource(
+      [{ id: 'm', spans: [['A'], ['C']] }],
+      calls,
+      () => eventSummaries(client),
+    );
+    const failing = { source: false };
+    const registry = new SourceRegistry();
+    registry.register({
+      ...source,
+      observe(config, context) {
+        if (!failing.source) return source.observe(config, context);
+        calls.push({ monitor: 'm', eventsBefore: eventSummaries(client) });
+        return Promise.reject(new Error('source unavailable'));
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry, [
+      claudeCodeAdapter,
+    ]);
+    const held = () =>
+      (
+        store.getMonitorState('m', root).notifyState as {
+          pendingDebounce?: {
+            observations: { observation: { summary: string } }[];
+          };
+        }
+      ).pendingDebounce?.observations.map(
+        ({ observation }) => observation.summary,
+      );
+    return { root, monitorsDir, client, store, runtime, calls, failing, held };
+  }
+
+  /** A held, then flushed at its deadline into a failing write while C is held. */
+  async function retainAWhileCIsHeld(f: ReturnType<typeof heldBesideRetry>) {
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(f.held()).toEqual(['A']);
+    failSummary(f.client, 'A');
+    clock.advance(1_000);
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retrySummaries(f.client)).toEqual(['A']);
+    expect(f.held()).toEqual(['C']);
+    expect(eventSummaries(f.client)).toEqual([]);
+    expect(f.calls).toHaveLength(2);
+    f.failing.source = true;
+  }
+
+  function triggeredRows(f: ReturnType<typeof heldBesideRetry>) {
+    return f.runtime
+      .listObservationHistory({ monitorId: 'm' })
+      .filter(({ result }) => result === 'triggered');
+  }
+
+  it('keeps a due hold held behind a failing retry, then flushes it after the retry', async () => {
+    const f = heldBesideRetry();
+    await retainAWhileCIsHeld(f);
+    const triggeredBefore = triggeredRows(f).length;
+
+    // Both the retry and C's debounce deadline are due; the retry still fails.
+    clock.advance(2_000);
+    const blocked = await f.runtime.tick(f.monitorsDir, f.root);
+    // Nothing newer than A is released: C stays held, no event exists.
+    expect(eventSummaries(f.client)).toEqual([]);
+    expect(f.held()).toEqual(['C']);
+    expect(retrySummaries(f.client)).toEqual(['A']);
+    expect(blocked.emittedEventIds).toEqual([]);
+    // Only the retry failure is reported: the source was not called, so no
+    // source failure occurred and no held flush ran.
+    expect(blocked.erroredObservations).toEqual([
+      { monitorId: 'm', message: expect.stringContaining('A write failed') },
+    ]);
+    expect(f.calls).toHaveLength(2);
+    expect(triggeredRows(f)).toHaveLength(triggeredBefore);
+
+    // Once the retry completes, the failing source's held flush releases C
+    // after it, never ahead of it.
+    repair(f.client, 'A');
+    clock.advance(600_000);
+    const drained = await f.runtime.tick(f.monitorsDir, f.root);
+    expect(eventSummaries(f.client)).toEqual(['A', 'C']);
+    expect(drained.emittedEventIds).toHaveLength(2);
+    expect(drained.erroredObservations).toEqual([
+      { monitorId: 'm', message: 'source unavailable' },
+    ]);
+    expect(f.held()).toBeUndefined();
+    expect(retrySummaries(f.client)).toEqual([]);
+    expect(f.calls).toHaveLength(3);
+  });
+
+  it('keeps a due hold held behind a terminal retry while the source fails', async () => {
+    const f = heldBesideRetry();
+    await retainAWhileCIsHeld(f);
+    const triggeredBefore = triggeredRows(f).length;
+
+    for (let tick = 0; tick < 6; tick += 1) {
+      clock.advance(600_000);
+      const result = await f.runtime.tick(f.monitorsDir, f.root);
+      expect(eventSummaries(f.client)).toEqual([]);
+      expect(f.held()).toEqual(['C']);
+      expect(result.emittedEventIds).toEqual([]);
+      expect(result.erroredObservations).toEqual([
+        { monitorId: 'm', message: expect.stringContaining('A write failed') },
+      ]);
+    }
+    const [retry] = f.store.listMaterializationRetries({ monitorId: 'm' });
+    expect(retry?.status).toBe('terminal');
+    // Never observed behind the retry: no source failure, no held flush.
+    expect(f.calls).toHaveLength(2);
+    expect(f.held()).toEqual(['C']);
+    expect(eventSummaries(f.client)).toEqual([]);
+    expect(triggeredRows(f)).toHaveLength(triggeredBefore);
+  });
+});

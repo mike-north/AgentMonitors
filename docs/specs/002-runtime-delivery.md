@@ -1126,7 +1126,8 @@ retrying a failing source is unchanged.
 Verified: `libs/core/src/runtime/service.ts` — the `observe()` catch in the tick loop,
 `flushHeldWorkDespiteSourceFailure()`, `flushHeldNotifyWork()` and `reportHeldNotifyFlush()`.
 Proven by `libs/core/src/runtime/held-work-source-errors.test.ts` and
-`libs/core/src/runtime/source-error-state.test.ts` (Refs #558).
+`libs/core/src/runtime/source-error-state.test.ts` (Refs #558). The order against retained work
+is proven by `libs/core/src/runtime/retry-drain.test.ts`.
 
 ### 2.7 Retained work drains before newer source input (current)
 
@@ -1200,8 +1201,9 @@ no source call while a retry fails or backs off; a retry that keeps failing, rep
 `errored` row every tick through terminal while a sibling keeps emitting; retained work from
 before a restart drained first in order, exactly once; a same-second session that never receives
 the retry while an earlier one does; a retained watch batch drained before the next pull; a
-restarted watcher kept closed until a tick drains its batch; and the fallbacks for rows and
-sessions without positions.
+restarted watcher kept closed until a tick drains its batch; held debounce work that stays held
+behind a failing or terminal retry while the source rejects, then flushes after the retry
+completes; and the fallbacks for rows and sessions without positions.
 `libs/core/src/inbox/db.released-shapes.test.ts` opens every released `agent_sessions` shape.
 
 ## 3. Persisted Monitor State

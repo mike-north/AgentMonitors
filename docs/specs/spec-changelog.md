@@ -23,7 +23,8 @@ because such a hold is always newer: ordering takes precedence over the timeline
 That includes the held flush on a tick whose source call fails (§2.6): the drain runs first and a
 monitor with retained work does not call its source, so that flush never runs ahead of a pending,
 failing or terminal retry, and a terminal retry keeps the hold held until it is re-armed. §2.6
-states the same order from its side. A span is therefore only admitted into an empty outbox. Sessions now reserve a position in the
+states the same order from its side, and 004 §3.4 lists the regression. A span is therefore only
+admitted into an empty outbox. Sessions now reserve a position in the
 materialization order when first registered (`agent_sessions.registration_sequence`, additive
 migration), and a completed retry projects only into sessions positioned before its admission,
 so a session opened in the same second is still ordered correctly. Rows written before positions
