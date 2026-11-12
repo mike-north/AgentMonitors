@@ -12,6 +12,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  unlinkSync,
   utimesSync,
   writeFileSync,
 } from 'node:fs';
@@ -60,6 +61,7 @@ async function runFixture(
   options: {
     readonly foreign?: boolean;
     readonly unavailable?: true | 'lsof';
+    readonly predecessor?: boolean;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'isolation-proof-'));
@@ -148,6 +150,12 @@ process.send('ready');`,
       // ps exposes second-resolution start identity. Age past that full second
       // before launching the coordinator, rather than guessing at its birth order.
       await delay(1_100);
+      if (options.predecessor) {
+        // The peer still holds the unlinked inode. macOS lsof reports its old
+        // pathname; the replacement must remain unheld for guard purposes.
+        unlinkSync(join(installation, 'existing'));
+        writeFileSync(join(installation, 'existing'), 'original');
+      }
     }
     // A threads-only Vitest fixture owns no detached processes. Node's
     // synchronous deadline bounds its one process and all worker threads;
@@ -495,3 +503,14 @@ it.skipIf(process.platform === 'win32')(
     expect(roots).not.toContain(join(process.env.TMPDIR ?? '', dirname));
   },
 );
+
+it('rejects an edit when a foreign descriptor holds only a replaced predecessor', async () => {
+  const result = await runFixture(
+    `${foreignWrite}\nit('poison',()=>writeFileSync(installation+'/existing','modified'));`,
+    false,
+    { foreign: true, predecessor: true },
+  );
+  expect(result.testSummary.numPassedTests).toBe(2);
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('Real user paths changed');
+}, 20000);

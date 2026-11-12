@@ -660,7 +660,9 @@ and non-file metadata changes MUST fail. An existing regular file's content or
 metadata change MAY be reported without failure only when read-only `ps`/`lsof`
 inspection proves that the same process held that file open at both snapshots,
 started before the run, and is neither the coordinator nor its descendant at either
-snapshot. PID/start identity and file device/inode MUST agree across snapshots.
+snapshot. PID/start identity and file device/inode MUST agree across snapshots. Each open
+descriptor's device/inode MUST also match its file snapshot: on macOS an unlinked
+open predecessor can retain the same reported pathname as a replacement.
 Second-resolution process start times MUST be conservatively older than the run's
 start; ambiguous birth order grants no exception. The output MUST name each PID,
 command, and exact file. An unrelated held file grants no directory-wide exception.

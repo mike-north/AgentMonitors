@@ -23,7 +23,7 @@ const inspection = {
     [10, processRow],
     [20, { pid: 20, parent: 1, start: 2000, command: 'coordinator' }],
   ]),
-  files: new Map([['/held', new Set([10])]]),
+  files: new Map([['/held', [{ pid: 10, device: '1', inode: '2' }]]]),
 };
 
 it('reports stable pre-run peer identity and keeps unheld changes strict', () => {
@@ -114,3 +114,23 @@ it('keeps files with unknown filesystem identity strict', () => {
     ).strict,
   ).toEqual(['/held']);
 });
+
+it.each(['before', 'after'])(
+  'rejects an open predecessor at the %s snapshot',
+  (when) => {
+    const stale = {
+      ...inspection,
+      files: new Map([['/held', [{ pid: 10, device: '1', inode: '3' }]]]),
+    };
+    expect(
+      classifyPathChanges(
+        { '/held': file },
+        { '/held': edited },
+        when === 'before' ? stale : inspection,
+        when === 'after' ? stale : inspection,
+        2000,
+        20,
+      ).strict,
+    ).toEqual(['/held']);
+  },
+);

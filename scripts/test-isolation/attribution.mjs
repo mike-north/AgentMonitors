@@ -6,7 +6,9 @@
  *
  * Only regular-file changes with stable file identity and the same pre-run,
  * non-descendant holder at both snapshots may be reported without failure.
- * Creation/removal, replacement, directories, and unknown inspection stay strict.
+ * Descriptor device/inode must match the snapshot too: a stale open descriptor
+ * may retain a replaced file's pathname on macOS. Creation/removal, replacement,
+ * directories, and unknown inspection stay strict.
  * ps start times have second precision: the entire reported birth second must
  * precede the run. This deliberately refuses ambiguous, very recent peers.
  */
@@ -14,7 +16,8 @@ import { spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 
 /** @typedef {{pid: number, parent: number, start: number, command: string}} ProcessIdentity */
-/** @typedef {{processes: Map<number, ProcessIdentity>, files: Map<string, Set<number>>} | {reason: string}} Inspection */
+/** @typedef {{pid: number, device: string, inode: string}} OpenFileIdentity */
+/** @typedef {{processes: Map<number, ProcessIdentity>, files: Map<string, OpenFileIdentity[]>} | {reason: string}} Inspection */
 
 /**
  * Bound each native reader independently. No inspection path sends signals to
@@ -65,23 +68,46 @@ export function inspectOpenFiles() {
     }
     if (!processes.has(process.pid))
       throw new Error('coordinator missing from ps');
-    const output = readTool('lsof', ['-nP', '-Fpn']);
-    /** @type {Map<string, Set<number>>} */
+    const output = readTool('lsof', ['-nP', '-FpnDit']);
+    /** @type {Map<string, OpenFileIdentity[]>} */
     const files = new Map();
     let pid;
+    /** @type {{type?: string, device?: string, inode?: string, name?: string} | undefined} */
+    let descriptor;
+    /**
+     * A pathname alone can name an unlinked predecessor on macOS. Retain the
+     * descriptor's own device/inode, not a fresh stat of whatever has that name.
+     */
+    function finishDescriptor() {
+      if (descriptor?.type !== 'REG' || !descriptor.name?.startsWith('/'))
+        return;
+      if (pid === undefined || !descriptor.device || !descriptor.inode) {
+        throw new Error('unreadable lsof file identity');
+      }
+      const device = BigInt(descriptor.device).toString();
+      const inode = BigInt(descriptor.inode).toString();
+      const records = files.get(descriptor.name) ?? [];
+      records.push({ pid, device, inode });
+      files.set(descriptor.name, records);
+    }
     for (const line of output.split('\n')) {
-      if (/^p\d+$/.test(line)) pid = Number(line.slice(1));
-      else if (line.startsWith('n/')) {
-        if (pid === undefined)
-          throw new Error('unreadable lsof process identity');
-        const file = line.slice(1);
-        const holders = files.get(file) ?? new Set();
-        holders.add(pid);
-        files.set(file, holders);
-      } else if (line && !/^[fn]/.test(line)) {
-        throw new Error('unreadable lsof record');
+      if (/^p\d+$/.test(line)) {
+        finishDescriptor();
+        pid = Number(line.slice(1));
+        descriptor = undefined;
+      } else if (line.startsWith('f')) {
+        finishDescriptor();
+        descriptor = {};
+      } else if (line) {
+        if (!descriptor) throw new Error('unreadable lsof record');
+        if (line.startsWith('t')) descriptor.type = line.slice(1);
+        else if (line.startsWith('D')) descriptor.device = line.slice(1);
+        else if (line.startsWith('i')) descriptor.inode = line.slice(1);
+        else if (line.startsWith('n')) descriptor.name = line.slice(1);
+        else throw new Error('unreadable lsof field');
       }
     }
+    finishDescriptor();
     return { processes, files };
   } catch (error) {
     return { reason: error instanceof Error ? error.message : String(error) };
@@ -159,18 +185,26 @@ export function classifyPathChanges(
         a.inode === b.inode
       ) {
         const name = canonical(file);
-        for (const pid of first.files.get(name) ??
+        for (const opened of first.files.get(name) ??
           first.files.get(file) ??
           []) {
+          const pid = opened.pid;
           const old = first.processes.get(pid);
           const current = last.processes.get(pid);
           if (
+            opened.device === a.device &&
+            opened.inode === a.inode &&
             old &&
             current &&
             old.start === current.start &&
             old.command === current.command &&
             old.start + 1_000 <= startedAt &&
-            last.files.get(name)?.has(pid) &&
+            (last.files.get(name) ?? last.files.get(file) ?? []).some(
+              (entry) =>
+                entry.pid === pid &&
+                entry.device === b.device &&
+                entry.inode === b.inode,
+            ) &&
             outsideRun(pid, first.processes, coordinator) &&
             outsideRun(pid, last.processes, coordinator)
           ) {
