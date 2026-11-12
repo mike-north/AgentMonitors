@@ -93,6 +93,7 @@ import {
   defaultNotifyConfigForUrgency,
   EPHEMERAL_MONITOR_ID_PREFIX,
   type NotifyDispatchResult,
+  type NotHeldObservation,
   type NotifyRuntimeState,
   type DeliveryLifecycle,
   type SessionHookState,
@@ -487,6 +488,37 @@ function serializeObservation(
     observedAt,
     effectiveUrgency: effectiveObservationUrgency(monitor, observation),
   };
+}
+
+/**
+ * Admission check for held notify work (002 §4.7). Debounce and rollup holds
+ * persist their envelopes as JSON in `monitor_state.notify_state`, so an
+ * envelope `JSON.stringify` cannot encode (a BigInt, a cyclic reference, a
+ * throwing `toJSON` or getter) would make every later state write for the
+ * monitor fail. The check runs the same serializer the hold write uses, once,
+ * where an envelope would join a hold; an envelope that passes stays
+ * serializable inside every later hold write.
+ *
+ * Returns `undefined` when the envelope can be held, otherwise the complete
+ * single-line `errored` outcome text naming the observation, the strategy and
+ * the serializer's reason.
+ */
+function notHeldReason(
+  envelope: StoredObservationEnvelope,
+  strategy: 'debounce' | 'rollup',
+): string | undefined {
+  try {
+    JSON.stringify(envelope);
+    return undefined;
+  } catch (error) {
+    const reason =
+      displayObservationError(
+        error instanceof Error ? error.message : String(error),
+      ) ?? 'unknown serialization error';
+    const title =
+      displayObservationError(envelope.observation.title) ?? '(untitled)';
+    return `Observation "${title}" was not held for ${strategy}: it cannot be serialized (${reason}).`;
+  }
 }
 
 function hydrateStoredObservationEnvelope(
@@ -3393,6 +3425,11 @@ export class AgentMonitorRuntime {
                 ...(pending.ephemeralSessionId !== undefined
                   ? { ephemeralSessionId: pending.ephemeralSessionId }
                   : {}),
+                onNotHeld: (message) =>
+                  acc.erroredObservations.push({
+                    monitorId: monitor.id,
+                    message,
+                  }),
               },
             );
           } finally {
@@ -3749,6 +3786,8 @@ export class AgentMonitorRuntime {
             ? { sourceOutcome: observationResult.outcome }
             : {}),
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+          onNotHeld: (message) =>
+            acc.erroredObservations.push({ monitorId: monitor.id, message }),
         },
       );
       this.pollAdmissions.delete(key);
@@ -3820,6 +3859,12 @@ export class AgentMonitorRuntime {
        * in the same workspace (007 §4.6 isolation).
        */
       ephemeralSessionId?: string;
+      /**
+       * Reports each observation a debounce/rollup hold refused (002 §4.7):
+       * the tick loop adds it to `erroredObservations`, a watcher to `onError`.
+       * Its durable `errored` history row is written here either way.
+       */
+      onNotHeld?: (message: string) => void;
     },
   ): Promise<string[]> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
@@ -3858,6 +3903,24 @@ export class AgentMonitorRuntime {
       lastObservationAt: now,
     });
 
+    // An observation a hold refused (002 §4.7) is neither emitted nor held: its
+    // outcome is this `errored` row, written after the state commit that
+    // advanced past it and before the span's batch row.
+    for (const { message } of dispatch.notHeld) {
+      options.onNotHeld?.(message);
+      try {
+        this.store.recordObservationHistory({
+          monitorId: monitor.id,
+          workspacePath: options.workspacePath,
+          sourceName: monitor.frontmatter.watch.type,
+          result: 'errored',
+          observationData: { error: message },
+        });
+      } catch {
+        // best-effort audit — the caller has already reported the outcome
+      }
+    }
+
     // Audit-history recording and per-observation materialization are shared
     // with the not-due rollup flush in tick() via materializeSpan() (issue
     // #180): both the source-interval-elapsed (`ingest`) path and the
@@ -3867,6 +3930,7 @@ export class AgentMonitorRuntime {
     // per-recipient claim-time decision (G10 PR-B); see materializeSpan().
     return await this.materializeSpan(monitor, dispatch.emitted, {
       observed: observations.length,
+      notHeld: dispatch.notHeld.length,
       workspacePath: options.workspacePath,
       ...(options.sourceOutcome
         ? { sourceOutcome: options.sourceOutcome }
@@ -3918,6 +3982,12 @@ export class AgentMonitorRuntime {
     emitted: StoredObservationEnvelope[],
     options: {
       observed: number;
+      /**
+       * How many of the `observed` observations a hold refused (002 §4.7).
+       * Each already has its own `errored` row, so they do not count toward
+       * `suppressed`, and a span made only of them writes no batch row.
+       */
+      notHeld?: number;
       workspacePath: string;
       sourceOutcome?: 'rebaselined' | 'no-files-matched';
       /** Ephemeral-monitor declaring session (007 §4.6) — see {@link ingest}. */
@@ -3925,27 +3995,34 @@ export class AgentMonitorRuntime {
     },
   ): Promise<string[]> {
     const observed = options.observed;
+    const notHeld = options.notHeld ?? 0;
     const emittedCount = emitted.length;
-    this.store.recordObservationHistory({
-      monitorId: monitor.id,
-      workspacePath: options.workspacePath,
-      sourceName: monitor.frontmatter.watch.type,
-      result:
-        emittedCount > 0
-          ? 'triggered'
-          : // `rebaselined` is, by contract (002 §observation_history), a tick
-            // that returned ZERO observations and advanced its baseline. Guard
-            // on observed === 0 so a source that mistakenly sets the diagnostic
-            // while also returning (suppressed) observations can't mask a
-            // genuine `suppressed` tick — the invariant is enforced here at the
-            // runtime boundary, not left to source authors.
-            observed === 0 && options.sourceOutcome !== undefined
-            ? options.sourceOutcome
-            : observed > 0
-              ? 'suppressed'
-              : 'no-change',
-      observationData: { observed, emitted: emittedCount },
-    });
+    if (emittedCount > 0 || observed > notHeld || notHeld === 0) {
+      this.store.recordObservationHistory({
+        monitorId: monitor.id,
+        workspacePath: options.workspacePath,
+        sourceName: monitor.frontmatter.watch.type,
+        result:
+          emittedCount > 0
+            ? 'triggered'
+            : // `rebaselined` is, by contract (002 §observation_history), a tick
+              // that returned ZERO observations and advanced its baseline. Guard
+              // on observed === 0 so a source that mistakenly sets the diagnostic
+              // while also returning (suppressed) observations can't mask a
+              // genuine `suppressed` tick — the invariant is enforced here at the
+              // runtime boundary, not left to source authors.
+              observed === 0 && options.sourceOutcome !== undefined
+              ? options.sourceOutcome
+              : observed > notHeld
+                ? 'suppressed'
+                : 'no-change',
+        observationData: {
+          observed,
+          emitted: emittedCount,
+          ...(notHeld > 0 ? { notHeld } : {}),
+        },
+      });
+    }
 
     // G10 PR-B (002 §1.1.7, Decision Q3): the shared `monitor_events` chain
     // records EVERY emitted observation in order, regardless of
@@ -4367,6 +4444,8 @@ export class AgentMonitorRuntime {
                   new Date(),
                   {
                     workspacePath,
+                    onNotHeld: (message) =>
+                      onError?.(monitor.id, new Error(message)),
                   },
                 ),
             );
@@ -4560,6 +4639,7 @@ export class AgentMonitorRuntime {
     state: NotifyRuntimeState,
   ): NotifyDispatchResult {
     const emitted: StoredObservationEnvelope[] = [];
+    const notHeld: NotHeldObservation[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
     // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
@@ -4649,6 +4729,15 @@ export class AgentMonitorRuntime {
         continue;
       }
 
+      // Hold acceptance (002 §4.7): an envelope that cannot be serialized never
+      // joins the batch, so the state write below cannot fail on it and the
+      // batch's other observations are unaffected.
+      const notHeldMessage = notHeldReason(envelope, 'debounce');
+      if (notHeldMessage !== undefined) {
+        notHeld.push({ observation, message: notHeldMessage });
+        continue;
+      }
+
       if (nextState.pendingDebounce) {
         nextState.pendingDebounce = {
           observations: [
@@ -4672,7 +4761,7 @@ export class AgentMonitorRuntime {
       };
     }
 
-    return { emitted, nextState };
+    return { emitted, nextState, notHeld };
   }
 
   /**
@@ -4707,21 +4796,19 @@ export class AgentMonitorRuntime {
     // Defensive: this method is only reached for rollup monitors, but narrow
     // the discriminated union so `window`/`timezone` are accessible.
     if (notify?.strategy !== 'rollup') {
-      return { emitted: [], nextState };
+      return { emitted: [], nextState, notHeld: [] };
     }
 
     // 1. Accumulate. Hydrate any restart-persisted envelopes (backfilling
     // `effectiveUrgency` per 002 §3 / issue #109) so a batch that survived a
     // daemon restart materializes with a valid urgency, then append this tick's
     // new observations.
-    const accumulated: StoredObservationEnvelope[] = [
-      ...(nextState.pendingRollup?.observations ?? []).map(
-        hydrateStoredObservationEnvelope,
-      ),
-      ...observations.map((observation) =>
-        serializeObservation(monitor, observation, observedAt),
-      ),
-    ];
+    const held = (nextState.pendingRollup?.observations ?? []).map(
+      hydrateStoredObservationEnvelope,
+    );
+    const arrived = observations.map((observation) =>
+      serializeObservation(monitor, observation, observedAt),
+    );
 
     // 2. Evaluate the delivery window with a once-per-minute deduplication
     // guard (002 §4.4 step 2): `cronMatchesDate` returns true for every
@@ -4739,22 +4826,32 @@ export class AgentMonitorRuntime {
     }
 
     // 3. Flush iff the window fires AND the batch is non-empty; an empty window
-    // produces no delivery (§4.4 step 3).
-    if (windowFires && accumulated.length > 0) {
+    // produces no delivery (§4.4 step 3). Observations arriving on the firing
+    // tick go straight to materialization and are never held.
+    if (windowFires && held.length + arrived.length > 0) {
       delete nextState.pendingRollup;
-      return { emitted: accumulated, nextState };
+      return { emitted: [...held, ...arrived], nextState, notHeld: [] };
     }
 
     // Otherwise keep accumulating silently — no per-change interrupts (§4.4
-    // step 6). Persist the batch (durable accumulation, §4.4 step 1) only when
+    // step 6). Hold acceptance (002 §4.7): an arriving envelope that cannot be
+    // serialized never joins the batch; its serializable siblings keep their
+    // order. Persist the batch (durable accumulation, §4.4 step 1) only when
     // there is something to hold; an empty window with nothing accumulated
     // leaves `pendingRollup` absent.
+    const notHeld: NotHeldObservation[] = [];
+    const accumulated = [...held];
+    for (const envelope of arrived) {
+      const message = notHeldReason(envelope, 'rollup');
+      if (message === undefined) accumulated.push(envelope);
+      else notHeld.push({ observation: envelope.observation, message });
+    }
     if (accumulated.length > 0) {
       nextState.pendingRollup = { observations: accumulated };
     } else {
       delete nextState.pendingRollup;
     }
-    return { emitted: [], nextState };
+    return { emitted: [], nextState, notHeld };
   }
 
   /** Commit the deterministic materialization boundary before optional Interpret. */
