@@ -1,6 +1,7 @@
-// Production-dependency audit gate (Refs #290).
+// Production and bundled-dependency advisory gate (Refs #290).
 //
-// Runs `pnpm audit --prod --audit-level high --json` and fails loudly on any
+// Runs production and full-lockfile audits, retaining exact bundled-version
+// findings from the latter, and fails loudly on any
 // high/critical advisory that isn't covered by a reviewed, non-expired entry
 // in `scripts/audit-allowlist.json`. This is the "explicit, reviewed
 // exception mechanism rather than blanket ignores" from the issue's
@@ -8,9 +9,12 @@
 // names, and it stops working (fails the gate) once its `expires` date
 // passes, forcing someone to look at it again rather than letting it rot.
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join, posix, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { parse } from 'yaml';
+import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(__dirname, '..');
@@ -154,7 +158,9 @@ export function assertValidAuditReport(report) {
 
 /**
  * Shells out to the real `pnpm audit` CLI and returns its parsed, validated
- * JSON report. `pnpm audit` exits non-zero both when it finds advisories
+ * JSON report. A full audit is used only to obtain bundled-version findings;
+ * its unrelated development advisories are filtered before policy evaluation.
+ * `pnpm audit` exits non-zero both when it finds advisories
  * at/above `--audit-level` *and* on a tooling failure, so the report has to
  * be read from the error too — `assertValidAuditReport` is what tells those
  * two cases apart. `cwd` is pinned to the repo root (rather than inherited
@@ -162,16 +168,22 @@ export function assertValidAuditReport(report) {
  * audits this workspace, not whatever pnpm project happens to be
  * discoverable from the caller's cwd.
  *
- * @param {{ cwd?: string }} [options]
+ * @param {{ cwd?: string, productionOnly?: boolean }} [options]
  * @returns {{ advisories: Record<string, unknown> }}
  */
-export function runPnpmAudit({ cwd = REPO_ROOT } = {}) {
+export function runPnpmAudit({ cwd = REPO_ROOT, productionOnly = true } = {}) {
   /** @type {unknown} */
   let parsed;
   try {
     const stdout = execFileSync(
       'pnpm',
-      ['audit', '--prod', '--audit-level', 'high', '--json'],
+      [
+        'audit',
+        ...(productionOnly ? ['--prod'] : []),
+        '--audit-level',
+        'high',
+        '--json',
+      ],
       { encoding: 'utf8', cwd },
     );
     parsed = JSON.parse(stdout);
@@ -184,6 +196,192 @@ export function runPnpmAudit({ cwd = REPO_ROOT } = {}) {
     }
   }
   return assertValidAuditReport(parsed);
+}
+
+/**
+ * Resolve the packages that published tsup builds may inline. The release
+ * inventory supplies build locations; their real noExternal strings/regexps
+ * select roots from each importer's locked graph, including development-only
+ * roots. Their entire runtime/optional closure is conservatively covered, even
+ * if tree shaking omits some files. Workspace links follow production edges;
+ * each linked package's own build config also contributes its bundled roots.
+ *
+ * This reads lockfile v9 snapshots, including peer-qualified instances, rather
+ * than node_modules or declared ranges. Unknown config/lock shapes fail closed
+ * so future build changes cannot silently reduce security coverage.
+ *
+ * @param {{ cwd?: string }} [options]
+ * @returns {Promise<Map<string, Set<string>>>}
+ * @internal
+ */
+export async function bundledDependencyVersions({ cwd = REPO_ROOT } = {}) {
+  const lock = parse(readFileSync(join(cwd, 'pnpm-lock.yaml'), 'utf8'));
+  if (
+    String(lock.lockfileVersion) !== '9.0' ||
+    !lock.importers ||
+    !lock.snapshots ||
+    !lock.packages
+  ) {
+    throw new Error(
+      'Unsupported bundled audit lockfile: expected v9 importers, packages and snapshots',
+    );
+  }
+  // Audit identity is registry package name plus exact locked version.
+  const inventory = new Map();
+
+  // A single visitor understands aliases, peer contexts and workspace links.
+  // Separate traversal sets let a node first discovered as unbundled later
+  // become a selected root without losing any of its dependency closure.
+  function walk(name, reference, importer, seen, visit) {
+    if (typeof reference !== 'string')
+      throw new Error(`Invalid locked reference for ${name}`);
+    if (reference.startsWith('link:')) {
+      const linked = posix.normalize(posix.join(importer, reference.slice(5)));
+      const key = `importer:${linked}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      const target = lock.importers[linked];
+      if (!target) throw new Error(`Missing bundled audit importer: ${linked}`);
+      for (const [child, ref] of Object.entries({
+        ...target.dependencies,
+        ...target.optionalDependencies,
+      })) {
+        walk(child, ref.version, linked, seen, visit);
+      }
+      return;
+    }
+    const key = lock.snapshots[`${name}@${reference}`]
+      ? `${name}@${reference}`
+      : reference;
+    const snapshot = lock.snapshots[key];
+    const base = key.split('(')[0];
+    const metadata = lock.packages[base];
+    const split = base.lastIndexOf('@');
+    if (!snapshot || !metadata || split <= 0)
+      throw new Error(`Unresolved bundled audit package: ${name}@${reference}`);
+    const packageName = base.slice(0, split);
+    const version = base.slice(split + 1);
+    // Aliases can reach an already-seen snapshot under a different import
+    // name. Evaluate selectors on that edge before deduplicating its children.
+    visit(packageName, version, key, name);
+    if (seen.has(key)) return;
+    seen.add(key);
+    for (const [child, ref] of Object.entries({
+      ...snapshot.dependencies,
+      ...snapshot.optionalDependencies,
+    })) {
+      walk(child, ref, importer, seen, visit);
+    }
+  }
+
+  /** Peer contexts share an audit identity, while distinct versions stay distinct. */
+  function include(name, version) {
+    if (!inventory.has(name)) inventory.set(name, new Set());
+    inventory.get(name).add(version);
+  }
+
+  for (const packageDir of PACKAGE_DIRS) {
+    const configPath = join(cwd, packageDir, 'tsup.config.ts');
+    if (!existsSync(configPath)) {
+      const manifest = JSON.parse(
+        readFileSync(join(cwd, packageDir, 'package.json'), 'utf8'),
+      );
+      if (manifest.scripts?.build?.includes('tsup'))
+        throw new Error(`Missing bundled audit build config: ${configPath}`);
+      continue;
+    }
+    // Native TypeScript loading is available on the project's required Node 24.
+    // Importing evaluates the same configuration the build uses, preserving
+    // regular expressions instead of approximating them with source-text parsing.
+    const loaded = (await import(pathToFileURL(configPath).href)).default;
+    const configs = Array.isArray(loaded) ? loaded : [loaded];
+    const importer = lock.importers[packageDir];
+    if (!importer)
+      throw new Error(`Missing bundled audit importer: ${packageDir}`);
+    for (const config of configs) {
+      // Tsup can resolve deferred options, but this reader supports evaluated
+      // objects only. A thenable must fail closed instead of looking empty.
+      if (
+        !config ||
+        typeof config !== 'object' ||
+        typeof config.then === 'function'
+      )
+        throw new Error(
+          `Unsupported bundled audit build config: ${configPath}`,
+        );
+      const selectors = config.noExternal ?? [];
+      if (
+        !Array.isArray(selectors) ||
+        selectors.some(
+          (selector) =>
+            typeof selector !== 'string' && !(selector instanceof RegExp),
+        )
+      ) {
+        throw new Error(`Unsupported noExternal in ${configPath}`);
+      }
+      const included = new Set();
+      const discovered = new Set();
+      for (const [name, ref] of Object.entries({
+        ...importer.dependencies,
+        ...importer.devDependencies,
+        ...importer.optionalDependencies,
+      })) {
+        walk(
+          name,
+          ref.version,
+          packageDir,
+          discovered,
+          (resolvedName, _version, key, importName) => {
+            const matches = selectors.some((selector) => {
+              return [resolvedName, importName].some((candidate) => {
+                if (typeof selector === 'string') {
+                  return candidate === selector;
+                }
+                selector.lastIndex = 0;
+                return selector.test(candidate);
+              });
+            });
+            if (matches) walk(resolvedName, key, packageDir, included, include);
+          },
+        );
+      }
+    }
+  }
+  return inventory;
+}
+
+/**
+ * Full audits expose bundled devDependencies to the registry. Only findings
+ * against exact bundled versions join the production report: unrelated build
+ * tooling and other versions of the same package retain their existing scope.
+ * Missing version evidence for a selected package is a tooling error, never a
+ * clean result. Pnpm performs advisory-range matching; this gate does not try
+ * to reimplement semver or infer vulnerability from package names alone.
+ *
+ * @param {{ advisories: Record<string, unknown> }} report
+ * @param {Map<string, Set<string>>} inventory
+ * @internal
+ */
+export function bundledAuditReport(report, inventory) {
+  const advisories = {};
+  for (const [id, advisory] of Object.entries(report.advisories)) {
+    const versions = inventory.get(advisory.module_name);
+    if (!versions) continue;
+    if (
+      !Array.isArray(advisory.findings) ||
+      advisory.findings.length === 0 ||
+      advisory.findings.some((finding) => typeof finding.version !== 'string')
+    ) {
+      throw new Error(
+        `Missing bundled audit finding versions for ${advisory.module_name}`,
+      );
+    }
+    const findings = advisory.findings.filter((finding) =>
+      versions.has(finding.version),
+    );
+    if (findings.length > 0) advisories[id] = { ...advisory, findings };
+  }
+  return { advisories };
 }
 
 /**
@@ -402,8 +600,19 @@ function formatAdvisory(advisory) {
   return `  - [${advisory.severity}] ${advisory.module_name}: ${advisory.title} (${advisory.github_advisory_id})\n    ${advisory.url}`;
 }
 
-export function main() {
-  const report = runPnpmAudit();
+/** Run both live inventories through the same expiring exception policy.
+ * @internal
+ */
+export async function main() {
+  const inventory = await bundledDependencyVersions();
+  const production = runPnpmAudit();
+  const bundled =
+    inventory.size === 0
+      ? { advisories: {} }
+      : bundledAuditReport(runPnpmAudit({ productionOnly: false }), inventory);
+  const report = {
+    advisories: { ...bundled.advisories, ...production.advisories },
+  };
   const exceptions = loadAllowlist();
   const { blocking, suppressed, expiredExceptions } = evaluateAuditReport(
     report,
@@ -437,7 +646,7 @@ export function main() {
   if (blocking.length > 0) {
     failed = true;
     console.error(
-      '\nUnresolved high/critical production-dependency advisories:',
+      '\nUnresolved high/critical production or bundled-dependency advisories:',
     );
     for (const advisory of blocking) {
       console.error(formatAdvisory(advisory));
@@ -450,7 +659,7 @@ export function main() {
 
   if (!failed) {
     console.log(
-      'pnpm audit --prod --audit-level high: clean (no unresolved high/critical advisories).',
+      'Production and bundled dependency audits: clean (no unresolved high/critical advisories).',
     );
   }
 
@@ -466,5 +675,5 @@ const isMainModule =
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (isMainModule) {
-  main();
+  await main();
 }

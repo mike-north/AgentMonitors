@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Live advisory coverage includes bundled dependency versions (004 §2.10)
+
+The separate dependency-audit gate covers production dependencies and the exact
+runtime/optional closure selected by published tsup builds' `noExternal` selectors.
+Moving bundled code to development dependencies does not remove advisory coverage.
+Both inventories use the existing scoped, expiring allowlist and fail closed on audit
+failures. Loopback registry fixtures cover synthetic bundled advisories and automatic
+coverage when `noExternal` gains another package.
+
 ## 2026-11-12 — Spec 004 gap markers reconciled with shipped coverage; gap-drift check (004 §3.0/§3.1/§3.5/§5.1; roadmap) — Closes #287
 
 The three remaining gap markers in 004 described coverage that already exists: `low` urgency

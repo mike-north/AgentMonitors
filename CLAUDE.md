@@ -39,7 +39,7 @@ pnpm check          # package checks (excludes website) + workspace checks + aip
 pnpm check:api-report   # validate every checked-in api-report/*.api.md against the compiled surface (CI; no --local)
 pnpm fix:api-report     # regenerate api-report/*.api.md + dist rollups locally (--local; commit the diff)
 pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
-pnpm check:dependency-audit # same audit, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
+pnpm check:dependency-audit # production + resolved bundled code, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
 pnpm fix:lint-ts    # eslint --fix
 pnpm fix:format     # prettier --write
 pnpm clean          # remove dist/ + api-extractor temp/ dirs and reset the nx cache
@@ -180,7 +180,7 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   current workspace version is still unpublished, deriving from the same `PACKAGE_DIRS` inventory as
   the publisher so the two can't drift. Because the publisher is idempotent, a partial publish
   reconciles on the next successful main CI run. See [`docs/release-process.md`](docs/release-process.md).
-- **Dependency audit**: `pnpm audit --prod --audit-level high` must stay clean. Fix by upgrading a
+- **Dependency audit**: production dependencies and code bundled into published builds must stay clean. Fix by upgrading a
   direct dependency (`libs/core`, `apps/cli`, `plugins/*` package.json) or, for a transitive
   advisory, a `pnpm-workspace.yaml` `overrides` pin — never a major bump without an issue explicitly
   authorizing it. A narrowly scoped, non-fixable advisory gets a reviewed, expiring entry in
@@ -193,9 +193,16 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   path; only a direct package.json bump (or an upstream fix) does that.
   `@agentmonitors/core` therefore bundles its CEL stack (`cel-js`, `chevrotain`, `@chevrotain/*`,
   `lodash-es`, `ramda`) into its build (`noExternal` in `libs/core/tsup.config.ts`) and lists them
-  as `devDependencies`, so consumers install the patched versions this workspace resolves; their
+  as `devDependencies`, so consumers receive the patched versions this workspace resolves; their
   licenses ship in `libs/core/THIRD_PARTY_NOTICES.md`. Adding a bundled dependency means adding its
-  notice there. `pnpm test:standalone-consumer` installs the packed packages outside the workspace
+  notice there. The live gate derives bundled roots from every published package's
+  `tsup.config.ts` `noExternal` selectors (strings and regular expressions) and follows
+  their resolved runtime/optional closure in `pnpm-lock.yaml`. It combines the production
+  audit with exact bundled-version findings from a full audit, using the same scoped,
+  expiring allowlist for both. Unrelated development tooling remains outside the gate;
+  unknown config/lock shapes or an unreachable audit endpoint fail closed. Adding a
+  `noExternal` package therefore adds advisory coverage without a second package list.
+  `pnpm test:standalone-consumer` installs the packed packages outside the workspace
   and fails on any high/critical `npm audit --omit=dev` advisory (or if the audit cannot run).
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.

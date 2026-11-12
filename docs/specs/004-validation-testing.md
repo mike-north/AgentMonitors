@@ -544,7 +544,15 @@ The explicit CI-only responsibilities are:
 The independent `.github/workflows/dependency-audit.yml` is a separately guarded
 exclusion from `pnpm verify`. Its daily security cadence, path-filtered PR/main triggers,
 and advisory guarantee remain unchanged. Run `pnpm check:dependency-audit` separately
-for the live production-advisory gate. `test:scripts` exercises audit fixtures and
+for the live production and bundled-code advisory gate. Bundled roots come from the
+published packages' `tsup.config.ts` `noExternal` selectors, with their runtime/optional
+closure and exact versions derived from lockfile v9 snapshots. Production advisories
+and exact bundled-version findings from a full audit share the scoped, expiring
+allowlist. Unrelated development advisories remain excluded. Unsupported build/lockfile
+shapes and audit endpoint failures fail closed. Loopback-only script regressions prove
+that a synthetic high advisory against bundled code fails, and that adding only a
+`noExternal` entry extends that coverage to the new dependency closure.
+`test:scripts` exercises audit fixtures and
 version-floor regressions; it does **not** substitute for a live advisory query. The
 parity guard pins the excluded workflow's known `pnpm check:dependency-audit` command
 and rejects unfamiliar executable steps/contexts rather than silently excluding additions.

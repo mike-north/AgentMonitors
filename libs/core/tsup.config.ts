@@ -11,7 +11,10 @@ import { defineConfig } from 'tsup';
  * `pnpm-workspace.yaml` override fixes only this repository's own install and
  * does not travel with a published package. Bundling ships the patched version
  * this workspace resolves. These packages are therefore `devDependencies`, and
- * their license notices are shipped in `THIRD_PARTY_NOTICES.md`.
+ * their license notices are shipped in `THIRD_PARTY_NOTICES.md`. The live
+ * `check:dependency-audit` gate reads these noExternal selectors and the lockfile
+ * to audit the exact bundled dependency closure alongside production code; a
+ * devDependency move therefore cannot remove shipped code from advisory coverage.
  *
  * Everything else stays external and is installed by the consumer. Core's
  * public types never mention these packages, so declarations are unaffected.

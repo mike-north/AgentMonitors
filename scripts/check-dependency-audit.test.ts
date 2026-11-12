@@ -17,13 +17,28 @@
  * @see https://pnpm.io/cli/audit
  * @see https://pnpm.io/cli/why
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer } from 'node:http';
+import { gunzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse, stringify } from 'yaml';
+import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 import {
   DEFAULT_ALLOWLIST_PATH,
   assertValidAuditReport,
+  bundledAuditReport,
   evaluateAuditReport,
   loadAllowlist,
   resolvedVersions,
@@ -759,4 +774,271 @@ describe('standalone experiment security resolutions', () => {
       }
     });
   }
+});
+
+/**
+ * Exercise the real CLI against a loopback bulk-advisory registry. Copying the
+ * build inputs and lockfile preserves workspace resolution without installing
+ * packages or asking a real registry about a synthetic advisory.
+ */
+describe('bundled dependency advisory gate', () => {
+  async function runFixture({
+    packageName = 'lodash-es',
+    addToBundle = false,
+    aliasRoot = false,
+    deferredConfig = false,
+    allowlisted = false,
+    outage = false,
+  } = {}) {
+    const repo = path.resolve(import.meta.dirname, '..');
+    const fixture = mkdtempSync(path.join(os.tmpdir(), 'bundled-audit-'));
+    for (const relative of [
+      'package.json',
+      'pnpm-lock.yaml',
+      'pnpm-workspace.yaml',
+      'scripts/check-dependency-audit.mjs',
+      'scripts/publish-release-packages.mjs',
+      'scripts/audit-allowlist.json',
+      ...PACKAGE_DIRS.flatMap((dir: string) => [dir + '/package.json']),
+      ...PACKAGE_DIRS.map((dir: string) => dir + '/tsup.config.ts').filter(
+        (file: string) => existsSync(path.join(repo, file)),
+      ),
+    ]) {
+      mkdirSync(path.dirname(path.join(fixture, relative)), {
+        recursive: true,
+      });
+      cpSync(path.join(repo, relative), path.join(fixture, relative));
+    }
+    symlinkSync(
+      path.join(repo, 'node_modules'),
+      path.join(fixture, 'node_modules'),
+      'dir',
+    );
+    // A dev-only package becomes shipped code solely through noExternal. Its
+    // child must be discovered by following the actual lockfile edges.
+    const lockPath = path.join(fixture, 'pnpm-lock.yaml');
+    const lock = parse(readFileSync(lockPath, 'utf8'));
+    const bundleName = aliasRoot ? 'bundle-alias' : 'future-bundle';
+    lock.importers['libs/core'].devDependencies[bundleName] = {
+      specifier: aliasRoot ? 'npm:future-bundle@1.0.0' : '1.0.0',
+      version: aliasRoot ? 'future-bundle@1.0.0' : '1.0.0',
+    };
+    lock.packages['future-bundle@1.0.0'] = {
+      resolution: { integrity: 'sha512-fixture' },
+    };
+    lock.packages['future-child@2.0.0'] = {
+      resolution: { integrity: 'sha512-fixture' },
+    };
+    lock.snapshots['future-bundle@1.0.0'] = {
+      dependencies: { 'future-child': '2.0.0' },
+    };
+    lock.snapshots['future-child@2.0.0'] = {};
+    writeFileSync(lockPath, stringify(lock));
+    if (addToBundle) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, 'utf8').replace(
+          'noExternal: [',
+          `noExternal: ['${bundleName}',`,
+        ),
+      );
+    }
+    if (deferredConfig) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, 'utf8')
+          .replace(
+            'export default defineConfig({',
+            'export default Promise.resolve(defineConfig({',
+          )
+          .replace(/}\);\s*$/, '}));\n'),
+      );
+    }
+    const id = 'GHSA-0000-0000-0000';
+    if (allowlisted) {
+      writeFileSync(
+        path.join(fixture, 'scripts/audit-allowlist.json'),
+        JSON.stringify({
+          exceptions: [
+            {
+              id,
+              package: packageName,
+              reason: 'Synthetic fixture only',
+              expires: '2099-01-01',
+            },
+          ],
+        }),
+      );
+    }
+    const submissions: Record<string, string[]>[] = [];
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      let body = Buffer.concat(chunks);
+      if (request.headers['content-encoding'] === 'gzip')
+        body = gunzipSync(body);
+      const payload = JSON.parse(body.toString() || '{}');
+      submissions.push(payload);
+      const unavailable = outage && payload['cel-js'];
+      response.writeHead(unavailable ? 503 : 200, {
+        'content-type': 'application/json',
+      });
+      response.end(
+        JSON.stringify(
+          unavailable
+            ? { error: 'Synthetic outage' }
+            : payload[packageName]
+              ? {
+                  [packageName]: [
+                    {
+                      id: 999999999,
+                      url: `https://github.com/advisories/${id}`,
+                      title: 'Synthetic bundled advisory',
+                      severity: 'high',
+                      vulnerable_versions: '*',
+                      cwe: [],
+                      cvss: { score: 8, vectorString: null },
+                    },
+                  ],
+                }
+              : {},
+        ),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string')
+        throw new Error('Expected loopback port');
+      const child = spawn(
+        process.execPath,
+        ['scripts/check-dependency-audit.mjs'],
+        {
+          cwd: fixture,
+          env: {
+            ...process.env,
+            pnpm_config_registry: `http://127.0.0.1:${address.port}`,
+            pnpm_config_fetch_retries: '0',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 30_000,
+        },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      const exit = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', resolve);
+      });
+      return { exit, output, submissions, id };
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  }
+
+  it('rejects a synthetic high advisory against the resolved bundled lodash version', async () => {
+    const result = await runFixture();
+    expect(result.submissions.length).toBeGreaterThan(0);
+    expect(result.output).toContain(result.id);
+    expect(result.exit).toBe(1);
+    expect(
+      result.submissions.some((payload) =>
+        payload['lodash-es']?.includes('4.18.1'),
+      ),
+    ).toBe(true);
+  }, 60_000);
+
+  it('audits a dev package and its closure when only noExternal gains that package', async () => {
+    const before = await runFixture({ packageName: 'future-child' });
+    expect(before.exit, before.output).toBe(0);
+    const after = await runFixture({
+      packageName: 'future-child',
+      addToBundle: true,
+    });
+    expect(after.output).toContain(after.id);
+    expect(after.exit).toBe(1);
+  }, 60_000);
+
+  it('follows an aliased noExternal root to its canonical registry dependency closure', async () => {
+    const result = await runFixture({
+      packageName: 'future-child',
+      addToBundle: true,
+      aliasRoot: true,
+    });
+    expect(result.output).toContain(result.id);
+    expect(result.exit).toBe(1);
+  }, 60_000);
+
+  it('rejects an unsupported deferred build config instead of treating it as no bundled packages', async () => {
+    const result = await runFixture({ deferredConfig: true });
+    expect(result.exit).not.toBe(0);
+    expect(result.output).toContain('Unsupported bundled audit build config');
+  }, 60_000);
+
+  it('still blocks synthetic production advisories', async () => {
+    const result = await runFixture({ packageName: 'zod' });
+    expect(result.output).toContain(result.id);
+    expect(result.exit).toBe(1);
+  }, 60_000);
+
+  it('applies the existing scoped allowlist to bundled advisories', async () => {
+    const result = await runFixture({ allowlisted: true });
+    expect(result.output).toContain('Suppressed by reviewed exception');
+    expect(result.exit, result.output).toBe(0);
+  }, 60_000);
+
+  it('fails closed when only the bundled audit endpoint is unavailable', async () => {
+    const result = await runFixture({ outage: true });
+    expect(result.submissions.some((payload) => payload['cel-js'])).toBe(true);
+    expect(result.exit).not.toBe(0);
+    expect(result.output).toContain('audit tooling failed');
+  }, 60_000);
+});
+
+/** Advisory scope follows resolved versions, even when tooling uses another line. */
+describe('bundledAuditReport', () => {
+  const inventory = new Map([['example-pkg', new Set(['2.0.0'])]]);
+
+  it('keeps only findings for the shipped version and excludes unrelated tooling', () => {
+    const report = bundledAuditReport(
+      {
+        advisories: {
+          old: advisory({ findings: [{ version: '1.0.0' }] }),
+          shipped: advisory({
+            findings: [{ version: '1.0.0' }, { version: '2.0.0' }],
+          }),
+          tooling: advisory({
+            module_name: 'tool-only',
+            findings: [{ version: '2.0.0' }],
+          }),
+        },
+      },
+      inventory,
+    );
+    expect(Object.keys(report.advisories)).toEqual(['shipped']);
+    expect(report.advisories.shipped.findings).toEqual([{ version: '2.0.0' }]);
+  });
+
+  it.each([undefined, [], [{}]])(
+    'rejects missing version evidence: %j',
+    (findings) => {
+      expect(() =>
+        bundledAuditReport(
+          { advisories: { selected: advisory({ findings }) } },
+          inventory,
+        ),
+      ).toThrow(/Missing bundled audit finding versions/);
+    },
+  );
 });
