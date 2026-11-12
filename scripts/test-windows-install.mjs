@@ -48,11 +48,11 @@ import {
   packPackage,
   resolveInstalledPackageFile,
 } from './lib/pack-helpers.mjs';
+import { packageManagerEntry } from './lib/package-manager-entry.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(SCRIPT_DIR, '..');
-const NPM_BIN = process.platform === 'win32' ? 'npm.cmd' : 'npm';
 
 /** Run a command to completion, throwing with full stdout/stderr on failure
  * so a broken step is diagnosable from CI logs alone. */
@@ -60,11 +60,6 @@ function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
-    // Node's CVE-2024-27980 hardening makes spawning a win32 `.cmd` shim
-    // without a shell throw EINVAL. None of our arguments contain spaces or
-    // shell metacharacters (CI temp/repo paths), so shelling the shim is
-    // safe here.
-    shell: command.endsWith('.cmd'),
     ...options,
   });
   if (result.error) {
@@ -81,7 +76,13 @@ function run(command, args, options = {}) {
 }
 
 export async function main() {
-  const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'am-windows-install-'));
+  const npmCli = packageManagerEntry('npm');
+  if (!npmCli) {
+    throw new Error(
+      'npm-cli.js not found in Node installation or PATH; install npm and expose its package on PATH.',
+    );
+  }
+  const tmpRoot = mkdtempSync(path.join(os.tmpdir(), 'am windows install-'));
   const packDir = path.join(tmpRoot, 'packed');
   const npmPrefixDir = path.join(tmpRoot, 'npm-global');
   const npmCacheDir = path.join(tmpRoot, 'npm-cache');
@@ -114,6 +115,9 @@ export async function main() {
     npm_config_python: missingPython,
   };
 
+  console.log(
+    `Package-manager entrypoint: ${process.env.npm_execpath ?? '(unavailable)'}`,
+  );
   console.log('Packing every publishable package (pnpm pack)...');
   const tarballs = PACKAGE_DIRS.map((dir) =>
     packPackage(path.join(REPO_ROOT, dir), packDir),
@@ -129,8 +133,9 @@ export async function main() {
       '(isolated prefix; no Python/node-gyp toolchain assumed)...',
   );
   run(
-    NPM_BIN,
+    process.execPath,
     [
+      npmCli,
       'install',
       '--global',
       '--prefix',
@@ -145,7 +150,7 @@ export async function main() {
   // Invoke @agentmonitors/cli's own installed entry point directly (`node
   // <path>`) rather than the npm-generated bin shim/symlink: this is what
   // actually forces the native better-sqlite3 addon to load, and sidesteps
-  // needing `shell: true` to execute a win32 `.cmd` shim.
+  // the need to execute a win32 `.cmd` shim through a shell.
   const cliEntryPoint = resolveInstalledPackageFile(
     npmPrefixDir,
     '@agentmonitors/cli',

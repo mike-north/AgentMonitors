@@ -1,9 +1,14 @@
 /**
- * Validates authored monitor declarations before runtime use. Mapping fields
- * retain their authored meaning across YAML loading and schema normalization;
- * this module does not coerce scalar declarations into configuration objects.
+ * Validates authored monitor declarations before runtime use, including admission
+ * before expensive element validation. Mapping fields retain their meaning across
+ * YAML loading and schema normalization; scalars do not become configurations.
  */
 import { z } from 'zod';
+import {
+  boundedMonitorArray,
+  MAX_MONITOR_TAGS,
+  MAX_MONITOR_DERIVE_RULES,
+} from './input-limits.js';
 import { validateCelPredicate } from '../runtime/shape.js';
 import {
   validatePayloadTransform,
@@ -198,7 +203,10 @@ const deriveRuleSchema = z.object({
 
 const shapeMappingSchema = z
   .object({
-    derive: z.array(deriveRuleSchema).optional(),
+    derive: boundedMonitorArray(
+      deriveRuleSchema,
+      MAX_MONITOR_DERIVE_RULES,
+    ).optional(),
     render: z.literal('rendered').optional(),
   })
   .superRefine((shape, ctx) => {
@@ -358,7 +366,7 @@ export const monitorFrontmatterSchema = z
     // decision, Refs #110, 001 §3.7 / 002 §1.1.7). An unknown value (anything
     // other than `incremental`/`net`) is rejected by the enum.
     'baseline-strategy': baselineStrategySchema,
-    tags: z.array(z.string()).optional(),
+    tags: boundedMonitorArray(z.string(), MAX_MONITOR_TAGS).optional(),
     shape: shapeSchema.optional(),
     payload: payloadSchema.optional(),
   })

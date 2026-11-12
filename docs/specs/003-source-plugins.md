@@ -120,7 +120,7 @@ event-materialization consequences are specified in
 
 ### 2.4 Stateful sources
 
-If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
+If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). A CLI initial baseline requires non-nullish `nextState`; zero observations alone do not establish one. State remains source-owned and may be a primitive; the CLI MUST NOT require an object or SHA shape. A `no-files-matched` diagnostic takes precedence over this baseline check. On subsequent calls, the stored state is available via `context.previousState`.
 
 `file-fingerprint`, `api-poll`, `command-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
 
@@ -1318,7 +1318,11 @@ Required field: `paths` (array of strings — path prefixes or globs passed to `
 
 ### 6.2 Behavior
 
-`incoming-changes` is `stateful: true`. The first call resolves the current commit SHA via `git rev-parse`, stores it as `nextState: { ref: '<sha>' }`, and returns an empty `observations` array — this is the baseline run; it does **not** report the existing tree as changed.
+`incoming-changes` is `stateful: true`. The first call resolves the authored revision unchanged
+via `git rev-parse --verify --end-of-options <ref>` to one complete object ID, then separately
+resolves `<object-id>^{commit}` to a commit SHA. It stores that SHA as `nextState: { ref: '<sha>' }`
+and returns an empty `observations` array. This is the baseline run; it does **not** report the
+existing tree as changed.
 
 On subsequent calls, the source:
 
@@ -1348,11 +1352,44 @@ with `git ls-remote origin refs/heads/<branch>` (§11.8).
 
 ### 6.5 Error resilience
 
-- If `git rev-parse` fails (not a git repo, unknown branch, option-injection guard triggered), `observe()` returns `{ observations: [] }` with no `nextState` — it silently waits for the repo/branch to become valid.
-- If `git diff` fails (e.g., the stored SHA was gc'd or history-rewritten), `observe()` re-baselines: it returns `{ observations: [], nextState: { ref: currentRef } }` and starts fresh from the current ref.
-- `git show` failures (per-file snapshot fetch) are silenced and result in `snapshotText` being absent; the observation is still emitted.
+**Current**, resolving the previous silent-wait rule per [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474) (Refs #305):
 
-These guards ensure a source error does not propagate to the runtime tick loop.
+- Current-ref resolution MUST verify one commit object. Commit-ish expressions and annotated tags
+  peeling to commits are accepted; tree/blob objects, unknown refs, option-looking invalid refs,
+  inaccessible/non-repository cwd, and unavailable Git reject with an ordinary source `Error`.
+  Arguments use an array with an option terminator; SHA-1 and SHA-256 object IDs are supported.
+  Resolve the authored expression **unchanged** to a single complete object ID before adding
+  commit-peeling syntax to that validated ID. Appending `^{commit}` directly to authored input
+  can change a file path (`HEAD:payload`) or a commit-search regex (`:/Initial`) instead of
+  verifying object type. For example, tracking files `payload` and `payload^{commit}` MUST NOT
+  allow `HEAD:payload` to establish a blob baseline. Conversely, `:/Initial` MUST retain its
+  ordinary Git meaning and baseline the matching commit, even when it differs from HEAD.
+  HEAD, full object IDs, annotated commit tags and extended single-commit expressions remain
+  valid. This preserves [Git revision syntax](https://git-scm.com/docs/gitrevisions); it is object
+  verification, not a restriction to branch-name syntax.
+
+- The exact error message is:
+
+  > incoming-changes: could not resolve the configured ref to a commit. Check watch.cwd (an accessible Git repository), watch.branch (default HEAD), and that git is installed. No baseline was established or advanced; continuous monitoring will retry.
+
+  This static single-line message contains no raw child stderr or interpolated configuration.
+  The runtime isolates it as `errored`, keeps the last-good source and notify state, and retries
+  automatically. It emits no synthetic source event. On recovery, diff from the last-good SHA;
+  if no baseline ever succeeded, establish the first baseline without emitting the existing tree.
+
+- If `git diff` fails (e.g., the stored SHA was gc'd), `observe()` re-baselines quietly:
+  `{ observations: [], nextState: { ref: currentRef }, outcome: 'rebaselined' }`. A history rewrite
+  whose old commit remains diffable produces the ordinary net diff, not an automatic rebaseline.
+- `git show` failures (per-file snapshot fetch) remain nonfatal and omit `snapshotText`; the
+  observation is still emitted. Resolve, diff and show explicitly capture child stderr and MUST
+  NOT leak it to the terminal, including when an error is caught.
+
+No public unavailable outcome, schema or stored-state migration is introduced. Source consumers
+that previously assumed resolution always fulfilled must now handle the existing rejection
+contract. The runtime already does so. Its existing error path leaves the scheduling timestamp
+unchanged (due monitors retry each daemon tick) and skips ordinary held-notify flushing until
+observation succeeds. Those consequences remain unchanged here; #558 tracks held work and #559
+tracks retry cost separately. Already-materialized events remain deliverable.
 
 ## 7. Source Registry, Validation, and Schema Generation
 

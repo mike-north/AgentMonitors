@@ -33,6 +33,7 @@ export type {
 
 // Parser
 export { parseMonitor, parseMonitorFile } from './parser/parse-monitor.js';
+export { readMonitorFileSync } from './parser/read-monitor-file.js';
 export type {
   ParseResult,
   ParseError,
@@ -123,6 +124,8 @@ export {
 } from './runtime/service.js';
 export {
   MaterializationRetryCapacityError,
+  MaterializationRetryNotFoundError,
+  MaterializationRetryTransitionError,
   RuntimeStore,
 } from './runtime/store.js';
 export { MaterializationRetrySerializationError } from './runtime/retry-envelope.js';
@@ -196,6 +199,7 @@ export type {
   MaterializationRetryQuery,
   MaterializationRetryRecord,
   MaterializationRetryStatus,
+  MaterializationRetrySummary,
   EnqueueMaterializationRetryInput,
   MonitorDoctorReport,
   MonitorEventRecord,
@@ -226,6 +230,7 @@ export type {
 export {
   defaultNotifyConfigForUrgency,
   MATERIALIZATION_RETRY_DELAYS_MS,
+  MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
   MATERIALIZATION_RETRY_MAX_RECORDS,
 } from './runtime/types.js';

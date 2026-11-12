@@ -370,22 +370,30 @@ carries commitments (#504's verification-gate expectations):
 
 - **Local gate ≡ CI gate.** What the workspace verification scripts run locally MUST match
   what CI enforces; a suite that runs only in CI (or only locally) is drift
-  ([#458](https://github.com/mike-north/AgentMonitors/issues/458)).
+  ([#458](https://github.com/mike-north/AgentMonitors/issues/458)). Files that exist only
+  because a tool is running on this machine are drift too: `.agentmonitors/` runtime state
+  ([002](./002-runtime-delivery.md) §11.3) and the worktrees nested under `.claude/worktrees/`
+  MUST NOT reach a workspace check.
 - **No masked flakes.** Retry budgets absorb the environment, never hide defects: a test
   that consumes its full retry budget on every run is a defect
   ([#452](https://github.com/mike-north/AgentMonitors/issues/452)), and a nondeterministic
   failure on an unrelated diff is a tracked defect with an owner, never re-rolled as routine
   ([#509](https://github.com/mike-north/AgentMonitors/issues/509),
   [#475](https://github.com/mike-north/AgentMonitors/issues/475),
-  [#477](https://github.com/mike-north/AgentMonitors/issues/477); #506 is the fixed
-  exemplar).
+  [#477](https://github.com/mike-north/AgentMonitors/issues/477);
+  [#548](https://github.com/mike-north/AgentMonitors/issues/548) is the fixed exemplar: #506
+  first widened an assertion to accept the symptom, which hid a test's descriptor double close
+  until the same defect surfaced as `spawn EBADF`).
 - **Failures are diagnosable from artifacts.** A CI-only failure MUST capture enough state
   (spawned daemon/subprocess logs) to be root-caused without re-running (#509's acceptance
   criterion).
 
 **Test implications (executable, not historical):** a gate-parity check asserting the CI
 workflow's test commands are derivable from the workspace scripts (#458's acceptance bar); a
-retry-budget assertion that the guarded suite passes with retries disabled (`--retry=0`) so a
+guard asking git and Prettier whether the adapter's hook-state path is ignored, which fails in CI
+even though CI never has such a file (`scripts/runtime-state-ignored.test.ts`); a guard asking git,
+Prettier and ESLint the same about a nested worktree path (`scripts/nested-worktrees-ignored.test.ts`);
+a retry-budget assertion that the guarded suite passes with retries disabled (`--retry=0`) so a
 budget-exhausting test fails loudly instead of masking (#452); a suite-teardown guard
 asserting `PATH` (and equivalent mutated global state) is restored even when a test times out
 (#477); and a forced-failure test per instrumented subprocess harness asserting its

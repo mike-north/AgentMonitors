@@ -161,6 +161,11 @@ temp/
 !.claude/monitors/spec-changes/
 !.claude/monitors/spec-changes/MONITOR.md
 
+# Agent Monitors runtime state: regenerable, written wherever a session opens.
+# Deliberately unanchored: a session can open in any directory of the checkout, and
+# Prettier reads only the root .gitignore.
+.agentmonitors/
+
 
 # Channel probe findings (experiments/channel-probe)
 agentmon-channel-probe.json
@@ -175,5 +180,10 @@ friction-log.md
 # Worktrees
 .worktrees
 .worktrees/
+# Whole checkouts of this repo, nested here so sessions can run in parallel. Anchored
+# rules elsewhere (apps/website/, experiments/, ...) do not reach their copies, so a
+# format check from the main checkout must not walk them. Prettier reads this file;
+# ESLint needs the matching entry in eslint.config.mjs.
+.claude/worktrees/
 .Codex/
 .codex/
