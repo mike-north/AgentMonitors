@@ -1666,13 +1666,13 @@ drops none of them. Opening any database a released version wrote therefore succ
 losing an event or snapshot value.
 
 A rebuild that cannot carry a row or column stops before copying and reports a
-`SchemaMigrationError` naming the table and column, for example
+`SchemaMigrationError` naming the table, and the column when one is identifiable, for example
 `Cannot migrate monitor_events to the current schema: column "id" has no value in a
 retained row, and the current schema requires one. The database was left unchanged.`
 This covers a generated column (its expression is not recoverable from table metadata),
-a `UNIQUE`/`PRIMARY KEY`/`CHECK`/`REFERENCES` constraint it cannot recreate (above), and a retained row
+a `UNIQUE`/`PRIMARY KEY`/`CHECK`/`REFERENCES` constraint it cannot recreate or a `STRICT` table (above), and a retained row
 holding `NULL` in a column the current schema requires, with or without a default (a
-released `id TEXT PRIMARY KEY` admits `NULL`). The error names the live table and column,
+released `id TEXT PRIMARY KEY` admits `NULL`). The error names the live table (and column, when one is identifiable),
 never the scratch table. The schema transaction rolls back, so the database
 keeps its original schema and data; the open fails the same way until that row or column
 is repaired.

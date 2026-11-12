@@ -371,9 +371,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   const retainedTriggers = suspendMaterializationMigrationTriggers(sqlite);
   migrateEventMaterializationOrder(sqlite);
   // Additive migration (002 §2, unretained admission outcomes), after the order
-  // migration, whose rebuild carries this column only when it already exists:
-  // an event completed from the retry outbox records where its observation was
-  // admitted. Older rows keep NULL (admitted where they committed).
+  // migration. The rebuild target declares this column, so a rebuilt table
+  // always has it; this step serves a table that already had the order
+  // sequence before the column existed. An event completed from the retry
+  // outbox records where its observation was admitted. Older rows keep NULL
+  // (admitted where they committed).
   addColumnIfMissing(sqlite, 'monitor_events', 'admission_sequence', 'INTEGER');
   // Additive migration (issue #451): a `monitor_events` table created before
   // this column existed lacks `definition_fingerprint`. Add it if missing so
@@ -566,7 +568,10 @@ function suspendMaterializationMigrationTriggers(
  * `CREATE TABLE` and the materialization-order rebuild target, so the two cannot
  * drift apart. Columns that later changes add in place (`addColumnIfMissing`)
  * stay out of these lists: the rebuild carries them when the old table has them,
- * and the additive step adds them when it does not.
+ * and the additive step adds them when it does not. `admission_sequence` is the
+ * exception: it is part of the base `monitor_events` shape, so a fresh table and
+ * every rebuild target declare it, and its additive step only serves a table
+ * that already had the order sequence before the column existed.
  */
 interface ColumnDefinition {
   readonly name: string;
@@ -840,12 +845,14 @@ function refuseUnreproducibleConstraints(
  *   stored SQL; none is dropped. Automatic indexes behind UNIQUE and PRIMARY KEY
  *   constraints are not explicit indexes and are not recreated, so the rebuild
  *   refuses a table that has one other than the lone `id` key (see
- *   {@link refuseUnreproducibleConstraints}), as it does any CHECK or REFERENCES constraint.
+ *   {@link refuseUnreproducibleConstraints}), as it does any CHECK or REFERENCES
+ *   constraint and a STRICT table.
  *
  * A row, column or constraint that cannot be carried stops the migration with a
- * {@link SchemaMigrationError} naming the table and column: a generated column
- * (its expression is not recoverable from table metadata), a UNIQUE/PRIMARY KEY
- * CHECK or REFERENCES constraint the rebuild cannot recreate, or a retained row holding
+ * {@link SchemaMigrationError} naming the table, and the column when one is
+ * identifiable: a generated column (its expression is not recoverable from table
+ * metadata), a UNIQUE/PRIMARY KEY, CHECK or REFERENCES constraint the rebuild
+ * cannot recreate, a STRICT table, or a retained row holding
  * NULL in a column the current schema requires, with or without a default (a
  * released `id TEXT PRIMARY KEY` admits NULL). The caller's immediate transaction then
  * rolls the database back to its original schema and data.
