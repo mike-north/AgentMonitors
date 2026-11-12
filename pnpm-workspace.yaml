@@ -23,7 +23,7 @@ overrides:
   ajv@8>fast-uri: ^3.1.9
   # MCP's HTTP transports share Hono 4. Keep both parents on the patched line.
   '@modelcontextprotocol/sdk@1>hono': ^4.13.11
-  '@hono/node-server@1>hono': ^4.13.11
+  '@hono/node-server@2>hono': ^4.13.11
   # express-rate-limit 8 accepts the patched 10.x address parser.
   express-rate-limit@8>ip-address: ^10.7.4
   # glob 11 uses minimatch 10. Older minimatch/brace-expansion majors in build
