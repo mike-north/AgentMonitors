@@ -508,12 +508,14 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
     eventsDDL: string,
     rows: Record<string, unknown>[],
     expected: { table: string; column: string },
+    extraDDL?: string,
   ): void {
     const dbPath = tempDbPath();
     seedReleasedShape(dbPath, {
       ...shapeNamed('0.9.0–0.13.0'),
       eventsDDL,
       events: rows,
+      ...(extraDDL === undefined ? {} : { extraDDL }),
     });
     const before = durableState(dbPath);
 
@@ -589,6 +591,119 @@ describe('a materialization-order rebuild that cannot complete (#569)', () => {
       [eventRow(1, { ext_n: 3 })],
       { table: 'monitor_events', column: 'ext_n' },
     );
+  });
+
+  it('refuses a carried REFERENCES clause, which would admit orphan rows once foreign keys are enforced (#569 review S1)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, parent TEXT REFERENCES parents(pid)',
+      ),
+      [eventRow(1)],
+      { table: 'monitor_events', column: 'parent' },
+      sql`CREATE TABLE parents (pid TEXT PRIMARY KEY);`,
+    );
+  });
+
+  it('drops NOT NULL on a carried column that has no default, and says so (#569 review S1)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL: EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, ext_req TEXT NOT NULL',
+      ),
+      events: [eventRow(1, { ext_req: 'kept' })],
+    });
+    const migrated = openWithCurrentCode(dbPath);
+    const column = migrated
+      .prepare<[], { name: string; notnull: number }>(
+        'PRAGMA table_xinfo(monitor_events)',
+      )
+      .all()
+      .find((c) => c.name === 'ext_req');
+    // Reproducing NOT NULL would make the current writer, which never names the
+    // column, reject every new row; spec 002 §5.2 lists the relaxation as lost.
+    expect(column?.notnull).toBe(0);
+  });
+
+  it('ignores CHECK text inside a line comment (#569 review S3)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL: EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, ext TEXT -- see CHECK (ext) in runbook\n',
+      ),
+    });
+    expect(
+      rowsByRowid(openWithCurrentCode(dbPath), 'monitor_events'),
+    ).toHaveLength(2);
+  });
+
+  it('ignores CHECK text inside a block comment (#569 review S3)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL: EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, ext TEXT /* check(x) */',
+      ),
+    });
+    expect(
+      rowsByRowid(openWithCurrentCode(dbPath), 'monitor_events'),
+    ).toHaveLength(2);
+  });
+
+  it('still refuses a real CHECK after a comment holding an apostrophe (#569 review S3)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        "created_at INTEGER NOT NULL, -- operator's note\n ext INTEGER DEFAULT 1 CHECK (ext > 0), note2 TEXT DEFAULT 'z'",
+      ),
+      [eventRow(1, { ext: 2 })],
+      { table: 'monitor_events', column: 'ext' },
+    );
+  });
+
+  it('refuses a rowid-alias PRIMARY KEY on a carried column (#569 review S4)', () => {
+    expectRefusal(
+      EVENTS_0_9_0.replace(
+        'id TEXT PRIMARY KEY,',
+        'id TEXT NOT NULL UNIQUE,',
+      ).replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, rid INTEGER PRIMARY KEY',
+      ),
+      [eventRow(1, { rid: 5 })],
+      { table: 'monitor_events', column: 'rid' },
+    );
+  });
+
+  it('tells the operator how to proceed, and does not blame id for a column-less CHECK (#569 review S5)', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, {
+      ...shapeNamed('0.9.0–0.13.0'),
+      eventsDDL: EVENTS_0_9_0.replace(
+        'created_at INTEGER NOT NULL',
+        'created_at INTEGER NOT NULL, CHECK (1)',
+      ),
+    });
+    let caught: unknown;
+    try {
+      createDb(dbPath);
+    } catch (error) {
+      caught = error;
+    }
+    const message = (caught as Error).message;
+    expect(message).toContain('monitor_events');
+    expect(message).toContain('table-level');
+    expect(message).not.toContain('"id"');
+    expect(message).toContain(
+      'SQLite cannot drop an inline constraint in place',
+    );
+    expect(message).toContain('rebuild the table by hand without it');
+    expect(message).toContain('restore the database');
   });
 
   it('does not mistake CHECK text inside a string default for a constraint (#569 review F3)', () => {

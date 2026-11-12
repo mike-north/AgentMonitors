@@ -583,19 +583,22 @@ function createTableSql(
 export class SchemaMigrationError extends Error {
   /** The table whose rebuild stopped. */
   readonly table: string;
-  /** The column that stopped it. */
-  readonly column: string;
+  /** The column that stopped it; absent for a table-level constraint that names none. */
+  readonly column: string | undefined;
 
   constructor(
     table: string,
-    column: string,
+    column: string | undefined,
     reason: string,
-    options?: { cause?: unknown },
+    options?: { cause?: unknown; remedy?: string },
   ) {
+    const subject =
+      column === undefined ? '' : `column ${quoteIdentifier(column)} `;
     super(
-      `Cannot migrate ${table} to the current schema: column ${quoteIdentifier(column)} ${reason}. ` +
+      `Cannot migrate ${table} to the current schema: ${subject}${reason}. ` +
+        (options?.remedy === undefined ? '' : `${options.remedy} `) +
         'The database was left unchanged.',
-      options,
+      options?.cause === undefined ? undefined : { cause: options.cause },
     );
     this.name = 'SchemaMigrationError';
     this.table = table;
@@ -612,13 +615,30 @@ interface LiveColumn {
   type: string;
   notnull: number;
   dflt_value: string | null;
+  /** 1-based position within the PRIMARY KEY, or 0 when not part of it. */
+  pk: number;
   hidden: number;
 }
 
-/** Blank out string literals and quoted identifiers so keyword scans cannot match inside them. */
+/**
+ * What an operator can do about a constraint the rebuild cannot recreate.
+ * SQLite has no `ALTER TABLE ... DROP CONSTRAINT`, so removal means a manual
+ * table rebuild or a restore.
+ */
+const UNREPRODUCIBLE_CONSTRAINT_REMEDY =
+  'SQLite cannot drop an inline constraint in place; rebuild the table by hand without it ' +
+  '(or restore the database), and the open will then proceed.';
+
+/**
+ * Blank out string literals, quoted identifiers and SQL comments so keyword
+ * scans cannot match inside them. Comments are consumed in the same pass as
+ * quotes, so a quote inside a comment never pairs with a later one; SQLite keeps
+ * comments in the stored `CREATE TABLE` text. An unterminated block comment
+ * runs to the end of the text, as SQLite reads it.
+ */
 function blankQuoted(sqlText: string): string {
   return sqlText.replace(
-    /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]/g,
+    /'(?:[^']|'')*'|"(?:[^"]|"")*"|`[^`]*`|\[[^\]]*\]|--[^\n]*|\/\*[\s\S]*?(?:\*\/|$)/g,
     (m) => ' '.repeat(m.length),
   );
 }
@@ -634,9 +654,12 @@ function blankQuoted(sqlText: string): string {
  * KEY`), and every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX`.
  * Refused: any other UNIQUE or PRIMARY KEY constraint (inline on a carried
  * column or table-level, which SQLite backs with an automatic index), and any
- * CHECK constraint, inline or table-level. Collation and REFERENCES clauses are
- * the only constraint losses that are tolerated; they do not change which rows
- * are admitted.
+ * CHECK constraint, inline or table-level, any REFERENCES clause (the current
+ * connection enforces foreign keys, so a carried one would reject rows the
+ * rebuilt table admits), and a rowid-alias PRIMARY KEY on any column other than
+ * `id` (it has no automatic index to detect). Tolerated losses are collation
+ * and the NOT NULL of a carried column without a default; see
+ * {@link rebuildWithMaterializationOrder}.
  */
 function refuseUnreproducibleConstraints(
   sqlite: BetterSQLiteClient,
@@ -644,6 +667,28 @@ function refuseUnreproducibleConstraints(
   live: readonly LiveColumn[],
   currentNames: ReadonlySet<string>,
 ): void {
+  const rowidAlias = live.find(
+    (column) => column.pk > 0 && column.name.toLowerCase() !== 'id',
+  );
+  if (rowidAlias) {
+    throw new SchemaMigrationError(
+      table,
+      rowidAlias.name,
+      'is covered by a UNIQUE or PRIMARY KEY constraint the rebuild cannot reproduce',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
+  const references = sqlite.pragma(`foreign_key_list(${table})`) as {
+    from: string;
+  }[];
+  if (references[0] !== undefined) {
+    throw new SchemaMigrationError(
+      table,
+      references[0].from,
+      'is covered by a REFERENCES constraint the rebuild cannot reproduce',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
+    );
+  }
   const indexes = sqlite.pragma(`index_list(${table})`) as {
     name: string;
     origin: string;
@@ -665,6 +710,7 @@ function refuseUnreproducibleConstraints(
         table,
         culprit,
         'is covered by a UNIQUE or PRIMARY KEY constraint the rebuild cannot reproduce',
+        { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
       );
     }
   }
@@ -693,8 +739,11 @@ function refuseUnreproducibleConstraints(
     );
     throw new SchemaMigrationError(
       table,
-      (mentioned ?? live[0])?.name ?? table,
-      'is covered by a CHECK constraint the rebuild cannot reproduce',
+      mentioned?.name,
+      mentioned === undefined
+        ? 'has a table-level CHECK constraint the rebuild cannot reproduce'
+        : 'is covered by a CHECK constraint the rebuild cannot reproduce',
+      { remedy: UNREPRODUCIBLE_CONSTRAINT_REMEDY },
     );
   }
 }
@@ -712,20 +761,22 @@ function refuseUnreproducibleConstraints(
  *   creating (0.0.1–0.3.0's `monitor_events.event_kind`), columns later changes
  *   add in place, and columns an operator added. A carried column keeps NOT NULL
  *   only when it has a default: the current writer never names it, so a NOT NULL
- *   without a default would reject every new row. Collation, CHECK and
- *   REFERENCES clauses on a carried column are not reproduced; they do not
- *   change which rows are admitted.
+ *   without a default would reject every new row. So a carried column's
+ *   collation, and its NOT NULL when it has no default, are not reproduced: the
+ *   rebuilt column admits NULL where the old one did not. CHECK and REFERENCES
+ *   clauses are refused rather than dropped, since dropping either changes
+ *   which rows the table admits.
  * - Because every column survives, every explicit index (and every trigger the
  *   coordinator restores) still resolves. All are recreated from their exact
  *   stored SQL; none is dropped. Automatic indexes behind UNIQUE and PRIMARY KEY
  *   constraints are not explicit indexes and are not recreated, so the rebuild
  *   refuses a table that has one other than the lone `id` key (see
- *   {@link refuseUnreproducibleConstraints}), as it does any CHECK constraint.
+ *   {@link refuseUnreproducibleConstraints}), as it does any CHECK or REFERENCES constraint.
  *
  * A row, column or constraint that cannot be carried stops the migration with a
  * {@link SchemaMigrationError} naming the table and column: a generated column
  * (its expression is not recoverable from table metadata), a UNIQUE/PRIMARY KEY
- * or CHECK constraint the rebuild cannot recreate, or a retained row holding
+ * CHECK or REFERENCES constraint the rebuild cannot recreate, or a retained row holding
  * NULL in a column the current schema requires, with or without a default (a
  * released `id TEXT PRIMARY KEY` admits NULL). The caller's immediate transaction then
  * rolls the database back to its original schema and data.

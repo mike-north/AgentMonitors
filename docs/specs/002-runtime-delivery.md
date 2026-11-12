@@ -1294,14 +1294,23 @@ What the rebuild preserves, loses and refuses:
   current definitions of current columns (including `id` uniqueness, which also covers a
   released `id TEXT PRIMARY KEY`); every explicit `CREATE INDEX` / `CREATE UNIQUE INDEX` and
   every trigger, recreated from its exact stored SQL.
-- **Lost:** a carried column's collation and `REFERENCES` clause. Neither changes which rows
-  the table admits, though a `COLLATE NOCASE` column behind an explicit unique index then
-  compares case-sensitively.
+- **Lost:** a carried column's collation (a `COLLATE NOCASE` column behind an explicit unique
+  index then compares case-sensitively), and its `NOT NULL` when it has no default: the
+  rebuilt column admits `NULL` where the old one did not, because the current writer never
+  names the column and would otherwise fail every insert.
 - **Refused:** any `UNIQUE` or `PRIMARY KEY` constraint other than the lone `id` key (inline on
   a carried column, or table-level; SQLite backs each with an automatic index that is not an
-  explicit index and cannot be recreated), and any `CHECK` constraint, inline or table-level.
-  Dropping these would silently admit rows the table rejected, so the open stops with a
-  `SchemaMigrationError` instead.
+  explicit index and cannot be recreated, and a rowid-alias `INTEGER PRIMARY KEY` on another
+  column has none to detect, so it is found through the column's primary-key position); any
+  `CHECK` constraint, inline or table-level, found by scanning the stored table text with
+  string literals, quoted identifiers and SQL comments blanked; and any `REFERENCES` clause
+  (found through `PRAGMA foreign_key_list`), since the connection enforces foreign keys and
+  the rebuilt table would admit orphan rows the old one rejected. Dropping these would
+  silently admit rows the table rejected, so the open stops with a `SchemaMigrationError`
+  instead. The message names the table, and the column when one is identifiable (a `CHECK`
+  that mentions no column is reported as table-level), and ends with the remedy: SQLite
+  cannot drop an inline constraint in place, so rebuild the table by hand without it (or
+  restore the database), and the open will then proceed.
 
 Since every column survives, every explicit index and trigger still resolves; the rebuild
 drops none of them. Opening any database a released version wrote therefore succeeds without
@@ -1312,7 +1321,7 @@ A rebuild that cannot carry a row or column stops before copying and reports a
 `Cannot migrate monitor_events to the current schema: column "id" has no value in a
 retained row, and the current schema requires one. The database was left unchanged.`
 This covers a generated column (its expression is not recoverable from table metadata),
-a `UNIQUE`/`PRIMARY KEY`/`CHECK` constraint it cannot recreate (above), and a retained row
+a `UNIQUE`/`PRIMARY KEY`/`CHECK`/`REFERENCES` constraint it cannot recreate (above), and a retained row
 holding `NULL` in a column the current schema requires, with or without a default (a
 released `id TEXT PRIMARY KEY` admits `NULL`). The error names the live table and column,
 never the scratch table. The schema transaction rolls back, so the database
