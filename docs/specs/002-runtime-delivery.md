@@ -686,14 +686,16 @@ A dropped observation **MUST NOT** be less visible than a retained one. One rule
 observation the runtime could not keep, so every kind of loss is a _drop_ with the same identity:
 
 - an observation the outbox could not retain (above), whose row's error ends in
-  `Not retained for retry: <reason>`; and
+  `Not retained for retry: <reason>`;
 - an observation a debounce or rollup hold refused because it cannot be serialized (§4.7), whose
-  row's error is the refusal's own message.
+  row's error is the refusal's own message; and
+- the observation of a terminal retry an operator skipped (§2.7, "Operator repair"), whose row's
+  error is the retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`
 
-Both rows are written by one recording function (`RuntimeStore.recordObservationLoss()`,
-internal), inside the admitting span's transaction, with the same drop identity (see
-[`observation_history`](#observation_history)). Each row is written at the lost observation's
-place in the span's order. An outbox drop is recorded where its materialization failed. A refusal
+Every such row is written by one recording function (`RuntimeStore.recordObservationLoss()`,
+internal), with the same drop identity (see [`observation_history`](#observation_history)). A
+drop or a refusal is written inside the admitting span's transaction, at the lost observation's
+place in the span's order; a skip, inside the skip's own transaction (below). An outbox drop is recorded where its materialization failed. A refusal
 is recorded after the dispatched events of observations older than it: held work flushed in the
 same dispatch and siblings that arrived before it and went straight to materialization. That
 includes the observations a debounce batch held when the refusal was made, if an escalation later in
@@ -733,6 +735,19 @@ An observation held before a drop and flushed in a later span therefore supersed
 same key. Within the dropping span itself, a flush in the same dispatch orders the held observations
 by arrival, as described above, so one held before a refusal does not supersede it.
 
+A terminal retry that an operator **skips** (§2.7, "Operator repair") is recorded as the same kind
+of outstanding drop, through the same recording function and the same `errored` row, and is
+superseded by the same rules with one difference: its high-water mark is the retry's own admission position (`admission_sequence`), not
+the counter at the time of the skip. The observation was admitted when the retry was queued, so
+retained work admitted after it, which carries newer state for the key, supersedes the loss when
+it completes; a retry queued before positions were reserved uses the counter at the skip instead.
+Its `observationData` is `{ error, skipped: true, retryId, objectKey?, title? }`: `error` is the
+retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`. The reason
+is at most 200 characters after trimming (a longer one refuses the skip, [005](./005-cli-reference.md)
+`monitor retry`), so the note always fits the 1,024-character cap in full; the last error takes
+the rest and, when it does not fit, is shortened and ends in `…`. `objectKey`/`title` follow the
+same safe-text rule. It has no `position` or `spanSize`, since the retry outlived the span that admitted it.
+
 Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
 rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
 retained, not a later span that materializes events only for other keys, and not a daemon restart.
@@ -741,8 +756,8 @@ outstanding:
 
 - `explainMonitor`'s materialization stage is `failure` (§10.7), so its verdict fails;
 - `doctorReport` attaches `unretainedObservationLoss` to that monitor's rollup: the outstanding
-  count, across both kinds, and the newest outstanding drop's time, error, position, span size,
-  `objectKey` and `title`. A refusal records no position or span size. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
+  count, across every kind, and the newest outstanding drop's time, error, position, span size,
+  `objectKey` and `title`. A refusal or a skipped retry records no position or span size. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
   per-monitor rollup).
 - When the monitor has no one unambiguous parsed definition (its definition was removed, fails to
   parse, or its id is duplicated), the loss goes to that id's entry in `orphanedMonitorWork`
@@ -1184,18 +1199,62 @@ Each tick that leaves retained work in place reports it:
 - a failed attempt, or a failed removal of a retired artifact's row: one `erroredObservations`
   entry with the error, beside its `errored` row;
 - a `terminal` row: one `erroredObservations` entry and one `errored` row on every tick it keeps
-  the monitor paused, naming the retry and its last error. A terminal row is never attempted
-  automatically; it stays until an operator re-arms it, and the monitor stays paused until then;
+  the monitor paused, naming the retry, both repairs (`agentmonitors monitor retry rearm
+[--workspace <path>] -- <monitorId> <retryId>` and `agentmonitors monitor retry skip
+[--workspace <path>] -- <monitorId> <retryId>`) and its last error. All flags precede `--` so a
+  leading-hyphen monitor ID stays positional (005 §6). A terminal row is never attempted
+  automatically; it stays until an operator re-arms or skips it, and the monitor stays paused
+  until then;
 - a row backing off: a `skippedMonitors` entry whose `nextDueAt` is the row's next attempt time.
 
 Other monitors are unaffected: each monitor drains and pauses on its own outbox.
+
+**Operator repair.** A terminal row leaves its state only through one of two explicit repairs
+(`AgentMonitorRuntime.rearmMaterializationRetry` / `skipMaterializationRetry`, exposed as
+`agentmonitors monitor retry rearm|skip`, [005 §6](./005-cli-reference.md)). Each names the row by
+its workspace, monitor id and record id; a row of another monitor or workspace is not found. Each
+**MUST** refuse a row that is not terminal and change nothing: a `pending` row is still attempted
+automatically, so resetting it would evade its attempt budget, and skipping it would give up work
+the runtime can still complete.
+
+| From                                | Repair | To                                                                                   |
+| ----------------------------------- | ------ | ------------------------------------------------------------------------------------ |
+| `terminal`                          | re-arm | `pending`, attempts 0, no last error, next attempt after the first retry delay (§15) |
+| `terminal`                          | skip   | removed, with an outstanding loss recorded in the same transaction (§2)              |
+| `terminal`, retired verify artifact | either | removed as verify-artifact cleanup, with no loss and no `errored` row (§2.8)         |
+| `pending`                           | either | refused, unchanged                                                                   |
+
+- **Re-arm** keeps the row's identity, envelope and admission position, so the drain takes it in
+  its original place. Once it completes, the monitor resumes and takes newer input in order; if
+  the attempt fails, the row backs off and can become terminal again as before. The attempt limit
+  and backoff are unchanged.
+- **Skip** records the row's observation as an outstanding loss and deletes the row in one
+  immediate transaction, so neither happens without the other. The loss is reported and
+  superseded like any other drop (§2). With the row gone, the drain continues with the next
+  row, or, when the outbox is empty, the monitor takes newer input on its next tick.
+- **A retired verify artifact's row.** When the row's observation is a verify artifact whose
+  cleanup authority is in effect (§2.8), either repair removes it through the same discard the
+  drain uses, with the same predicate, inside the repair's own immediate transaction, and records
+  nothing: no loss, no `errored` row, no history row. Dropping it is the cleanup its owner asked
+  for, not lost work, and a loss for its scratch key could never be superseded, since every later
+  observation of that key is dropped too. Re-arm **MUST NOT** re-arm such a row. The decision is
+  made under the repair's writer lock, never from an earlier read, so cleanup recorded by another
+  writer after the caller read the row is honored. The repair succeeds, reports the outcome
+  `verify-artifact-cleanup`, and wakes a paused watcher like any other repair; the monitor resumes
+  as after a skip.
+
+A watcher paused on a terminal row is woken by a repair made in its own process, instead of
+waiting for its one-minute recheck. A repair made by another process (the CLI's in-process path
+while no daemon runs) takes effect on the next tick or recheck. Both repairs survive a restart:
+a re-armed row is an ordinary pending row, and a skip's loss row and removal are durable.
 
 A continuous watcher drains its monitor's outbox before its first pull and after every admitted
 batch, before pulling again. It waits for a backing-off row's next attempt, reports each failed
 attempt through `onError` (with its `errored` row) and then waits for that row's persisted next
 attempt, or for the first retry delay when the failure could not be recorded (so a row left due
 is never re-attempted in a tight loop), and reports a terminal row once, then rechecks
-it every minute until it is re-armed or the watcher stops. A watched monitor is drained by ticks
+it every minute, or at once after a repair in its process, until it is re-armed or skipped or the
+watcher stops. A watched monitor is drained by ticks
 as well, so an edit is not reconciled ahead of its retained work; each completion is one
 synchronous transaction, so a tick and a watcher never complete the same row. Watcher startup
 drains first too. When retained work remains at startup, the watcher's admission gate stays closed
@@ -1270,12 +1329,12 @@ The first cause is recorded with its time (`cleanupRequestedAt`, `cleanupCause`)
 reconciliation keeps the first record. `owner-inactive` is recorded when the runtime closes or reaps
 the owner and again by reconciliation at the start of every tick, so a crash between ending the
 session and recording the cause is repaired on the next tick. Until it is recorded, an inactive owner
-supplies authority at both filter boundaries below. When authority is recorded, the runtime
+supplies authority at every boundary below. When authority is recorded, the runtime
 retracts every existing event for the exact key in that workspace and refreshes hook state, in
 one store write.
 
 **Filtering.** With authority in effect, the runtime drops observations whose object key equals the
-registered key, for the registered monitor and workspace only, at two boundaries:
+registered key, for the registered monitor and workspace only, at three boundaries:
 
 1. **Incoming observations** — after the CEL pre-filter and before notify dispatch (§4), inside the
    same transaction. A dropped observation never enters a debounce or rollup hold and never consumes
@@ -1297,6 +1356,9 @@ registered key, for the registered monitor and workspace only, at two boundaries
    refusal in the same dispatch (§4.7) is placed among the envelopes that survive this filter, not
    all dispatched ones (§2), so a dropped artifact never moves a refusal after a newer event of its
    key.
+3. **Operator repair** — `monitor retry rearm|skip` (§2.7, "Operator repair") on a terminal retry
+   row whose observation has authority in effect removes the row through the same discard, in the
+   repair's own immediate transaction, recording no loss and never re-arming it.
 
 Authority has **no wall-clock expiry**, and no successful poll, empty observation or other source
 outcome retires it. Source plugins are unaware of ownership: their opaque state, baselines and
@@ -1336,7 +1398,10 @@ the tick and watcher drains, including a terminal one, a legitimate row behind a
 cleanup recorded by a second writer before completion commits, and a removal that cannot commit,
 with exactness controls),
 `libs/core/src/runtime/verify-artifact-ownership-refusal-position.test.ts` (a hold refusal behind a
-dropped artifact keeps its place among the kept envelopes, with an unfiltered control) and
+dropped artifact keeps its place among the kept envelopes, with an unfiltered control),
+`libs/core/src/runtime/retry-repair-retired-artifact.test.ts` (re-arm and skip of a terminal
+retired-artifact row remove it with no loss, the monitor resumes and a paused watcher wakes, with
+unregistered, foreign-workspace and proof-phase controls that still record the loss or re-arm) and
 `libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in
 `libs/core/src/inbox/schema.ts` (`verify_artifacts`).
 
@@ -2669,12 +2734,13 @@ verdict without removing this observation-stage diagnostic. Verified: `source-er
 and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
 
 While the monitor has an outstanding dropped observation (§2, "Admission outcomes when the outbox
-cannot retain a suffix"; an observation a hold refused, §4.7, is one too), the materialization
+cannot retain a suffix"; an observation a hold refused, §4.7, and a skipped terminal retry, §2.7,
+are drops too), the materialization
 stage is `failure` with reason
 `<count> observation(s) were dropped because the runtime could not keep them; the newest,
-<which>, failed: <displayed error>`. The count covers both kinds of drop, and the error says which
+<which>, failed: <displayed error>`. The count covers every kind of drop, and the error says which
 kind the newest was. `<which>` is `observation <position> of <spanSize>` (or `an observation` when
-no position was recorded, as for a refusal), followed by `(<objectKey>, "<title>")` with whichever
+no position was recorded, as for a refusal or a skipped retry), followed by `(<objectKey>, "<title>")` with whichever
 of the two were recorded; the error uses the display rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
 retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
@@ -2980,8 +3046,10 @@ characters. The same rule applies at admission and every failed-attempt update.
 Failed automatic attempts wait at least 5 seconds, 30 seconds, 2 minutes, and 5 minutes; the fifth
 failed automatic attempt marks the row `terminal` and clears `next_attempt_at`. Due queries never
 return a terminal row. Terminal rows remain durable and consume capacity until an operator
-explicitly re-arms them. Re-arm preserves the identity and envelope, resets attempts and last error,
-and schedules the initial delay again. Re-arming a pending row is an invalid transition.
+explicitly re-arms or skips them (§2.7, "Operator repair"). Re-arm preserves the identity and
+envelope, resets attempts and last error, and schedules the initial delay again. Skip records the
+observation as an outstanding loss (§2) and deletes the row in one immediate transaction. Re-arming
+or skipping a pending row is an invalid transition.
 
 Completion accepts a deterministically rendered event from the retained envelope, not a caller
 callback. The store **MUST** reject terminal work before any event write, and **MUST** require the

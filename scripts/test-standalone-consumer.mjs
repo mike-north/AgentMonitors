@@ -99,6 +99,46 @@ function run(command, args, cwd) {
   }
 }
 
+/**
+ * Asserts a fresh install of the packed packages carries no high or critical
+ * advisory in its production dependency tree. Workspace-local pnpm overrides
+ * do not reach a consumer's install, so this audits what a consumer resolves.
+ * Fails loudly (never passes silently) if the registry audit endpoint cannot
+ * be reached or returns anything other than a vulnerability summary.
+ */
+function auditConsumerInstall(projectDir) {
+  const result = spawnSync(NPM_BIN, ['audit', '--omit=dev', '--json'], {
+    cwd: projectDir,
+    encoding: 'utf8',
+  });
+  let report;
+  try {
+    report = JSON.parse(result.stdout);
+  } catch {
+    throw new Error(
+      `npm audit produced no JSON report (exit ${String(result.status)}): ${result.stderr}`,
+    );
+  }
+  const counts = report?.metadata?.vulnerabilities;
+  if (report?.error !== undefined || counts === undefined) {
+    throw new Error(
+      `npm audit could not complete (registry audit endpoint unavailable?): ${JSON.stringify(report?.error ?? report)}`,
+    );
+  }
+  if (counts.high > 0 || counts.critical > 0) {
+    const details = Object.values(report.vulnerabilities ?? {})
+      .filter((v) => v.severity === 'high' || v.severity === 'critical')
+      .map((v) => `${v.name} (${v.severity})`)
+      .join(', ');
+    throw new Error(
+      `Fresh install of the packed packages has high/critical advisories: ${details}`,
+    );
+  }
+  console.log(
+    `npm audit --omit=dev: no high/critical advisories ${JSON.stringify(counts)}`,
+  );
+}
+
 const SMOKE_SCRIPT = `import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -572,6 +612,9 @@ async function main() {
     projectDir,
   );
   run(NPM_BIN, ['install', ...tarballs], projectDir);
+
+  console.log('Auditing the standalone install (production dependencies)...');
+  auditConsumerInstall(projectDir);
 
   console.log('Running standalone TypeScript check...');
   run(NPM_BIN, ['run', 'check'], projectDir);

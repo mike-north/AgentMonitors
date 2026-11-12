@@ -70,6 +70,8 @@ const daemonMethodSchema = z.enum([
   'hook.diagnose',
   'history.list',
   'monitor.explain',
+  'retry.rearm',
+  'retry.skip',
   'doctor.report',
   'daemon.tick',
   'watch.declare',
@@ -203,6 +205,17 @@ const monitorExplainParamsSchema = z.object({
   historyLimit: z.number().int().positive().optional(),
   eventLimit: z.number().int().positive().optional(),
 });
+// Operator repair of one terminal materialization retry (005 `monitor retry`).
+// The route is required: a retry is only repaired through the exact
+// workspace/monitor it was admitted in, never by id alone.
+const retryRearmParamsSchema = z.object({
+  monitorId: z.string().min(1),
+  retryId: z.string().min(1),
+  workspacePath: z.string().min(1),
+});
+const retrySkipParamsSchema = retryRearmParamsSchema.extend({
+  reason: z.string().optional(),
+});
 const daemonTickParamsSchema = z.object({
   monitorsDir: z.string(),
   workspacePath: z.string().optional(),
@@ -296,7 +309,7 @@ export interface DaemonStatusResult extends RuntimeStatus {
 }
 
 /**
- * Thrown by {@link callDaemon} when the daemon could not be *reached* — the
+ * Thrown by {@link callDaemon} when no reply came back from the daemon — the
  * socket was absent/refused, the connection dropped, or the request timed out.
  *
  * This is deliberately distinct from a plain `Error` carrying a daemon-side
@@ -305,14 +318,29 @@ export interface DaemonStatusResult extends RuntimeStatus {
  * fall back on this class — falling back on an application error would mask the
  * real failure and misreport it as "daemon not running" (issue #94 review,
  * comment 3408123745).
+ *
+ * {@link DaemonConnectionError.requestSent} says which side of the request the
+ * failure fell on. A read-only fallback may ignore it; a caller that would
+ * otherwise *write* in-process must not when it is `true`, because a daemon
+ * that accepted the request may already have applied it.
  */
 export class DaemonConnectionError extends Error {
   override readonly name = 'DaemonConnectionError';
+  /**
+   * `false` when the connection itself failed (no socket, refused, or never
+   * connected before the timeout): no daemon received the request. `true`
+   * once the request was written to a connected daemon and then no reply
+   * arrived (timeout, error or close): the daemon may have acted on it, so
+   * its outcome is unknown.
+   */
+  readonly requestSent: boolean;
   constructor(
     message: string,
     readonly cause?: unknown,
+    requestSent = false,
   ) {
     super(message);
+    this.requestSent = requestSent;
   }
 }
 
@@ -877,6 +905,21 @@ function handleRequest(
         ...(params.eventLimit ? { eventLimit: params.eventLimit } : {}),
       });
     }
+    case 'retry.rearm': {
+      const params = retryRearmParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.rearmMaterializationRetry(params));
+    }
+    case 'retry.skip': {
+      const params = retrySkipParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.skipMaterializationRetry({
+          monitorId: params.monitorId,
+          retryId: params.retryId,
+          workspacePath: params.workspacePath,
+          ...(params.reason !== undefined ? { reason: params.reason } : {}),
+        }),
+      );
+    }
     case 'daemon.tick': {
       const params = daemonTickParamsSchema.parse(request.params);
       return runtime.tick(params.monitorsDir, params.workspacePath);
@@ -1242,6 +1285,7 @@ export async function callDaemon<T = unknown>(
       socket.removeAllListeners('data');
       socket.removeAllListeners('error');
       socket.removeAllListeners('connect');
+      socket.removeAllListeners('close');
       socket.setTimeout(0);
       fn();
     };
@@ -1256,12 +1300,19 @@ export async function callDaemon<T = unknown>(
       });
     };
 
+    // Set once the request is handed to a connected socket. From then on a
+    // missing reply leaves the daemon's outcome unknown (`requestSent`).
+    let requestSent = false;
+
     socket.setTimeout(timeoutMs, () => {
-      // A timeout means the daemon could not be reached in time — a connection
-      // failure, not a daemon-side application error.
+      // No reply in time — a connection failure, not a daemon-side
+      // application error. Before the request was written it means no daemon
+      // accepted the connection; after, the daemon may still be handling it.
       fail(
         new DaemonConnectionError(
           `Timed out waiting for AgentMon daemon at ${socketPath}`,
+          undefined,
+          requestSent,
         ),
       );
     });
@@ -1269,13 +1320,26 @@ export async function callDaemon<T = unknown>(
     socket.setEncoding('utf-8');
     socket.on('error', (error) => {
       // Socket-level errors (ECONNREFUSED, ENOENT, dropped connection, …) mean
-      // the daemon was unreachable — classify them as connection failures so a
+      // no reply came back — classify them as connection failures so a
       // caller's "daemon unavailable" fallback can distinguish them from a real
       // daemon-side application error.
       fail(
         new DaemonConnectionError(
           error instanceof Error ? error.message : String(error),
           error,
+          requestSent,
+        ),
+      );
+    });
+    socket.on('close', () => {
+      // The peer closed without a complete reply line (a close with an error
+      // was already settled by the 'error' handler above). Without this, a
+      // closed socket would leave the promise unsettled.
+      fail(
+        new DaemonConnectionError(
+          `AgentMon daemon at ${socketPath} closed the connection without a reply`,
+          undefined,
+          requestSent,
         ),
       );
     });
@@ -1307,6 +1371,7 @@ export async function callDaemon<T = unknown>(
       }
     });
     socket.on('connect', () => {
+      requestSent = true;
       socket.write(`${JSON.stringify(request)}\n`);
     });
     socket.connect(socketPath);

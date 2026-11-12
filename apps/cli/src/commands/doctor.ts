@@ -1,4 +1,3 @@
-import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Command, Option } from 'commander';
@@ -29,6 +28,14 @@ import {
   doctorReportInProcess,
 } from '../runtime-client.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
+import {
+  explainCommand,
+  historyCommand,
+  _monitorCommandLine,
+  shellSingleQuote,
+  workspaceFlags,
+  workspaceMonitorsDir,
+} from '../suggested-commands.js';
 import { resolveDataRoot } from '../workspace-paths.js';
 import { getCliVersion } from '../cli-version.js';
 import {
@@ -102,14 +109,6 @@ const DAEMON_REMEDIATION =
 // home directory) — so the payload itself can. `shellSingleQuote` closes the
 // quote, escapes the embedded `'`, and reopens it (the standard POSIX idiom)
 // so the printed command stays runnable verbatim regardless of the path.
-function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-/** Quote only when the value is not already shell-safe, keeping ordinary ids readable. */
-function shellArg(value: string): string {
-  return /^[\w./@:+-]+$/.test(value) ? value : shellSingleQuote(value);
-}
 
 function leadSessionRemediation(workspacePath: string): string {
   // Build the manual stdin payload with JSON.stringify so the embedded path is
@@ -155,49 +154,30 @@ function orphanedWorkFor(
   );
 }
 
-/** Path equality that tolerates symlinked spellings (e.g. macOS /tmp vs /private/tmp). */
-function samePath(a: string, b: string): boolean {
-  // Resolve symlinks through the nearest existing ancestor so not-yet-created
-  // directories still compare equal.
-  const canonical = (value: string): string => {
-    const resolved = path.resolve(value);
-    try {
-      return realpathSync(resolved);
-    } catch {
-      const parent = path.dirname(resolved);
-      return parent === resolved
-        ? resolved
-        : path.join(canonical(parent), path.basename(resolved));
-    }
-  };
-  return canonical(a) === canonical(b);
-}
-
 /**
- * `monitor history <id>` scoped like `explainCommand`. History scopes by
- * `--workspace` only (it has no `--dir`), so only that flag is carried.
+ * `monitor retry rearm|skip <id> <retryId>` for the oldest terminal retry of
+ * an outbox, the one that keeps its monitor paused, carrying `--workspace`
+ * like `historyCommand` (the repairs have no `--dir`). `undefined` when
+ * the outbox holds no terminal record.
  */
-function historyCommand(report: MonitorDoctorReport, id: string): string {
-  const flags: string[] = [];
-  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
-    flags.push('--workspace', shellArg(report.workspacePath));
-  }
-  return ['agentmonitors monitor history', shellArg(id), ...flags].join(' ');
+function retryRepairCommands(
+  report: MonitorDoctorReport,
+  id: string,
+  summary: MaterializationRetrySummary | undefined,
+): { rearm: string; skip: string } | undefined {
+  const oldest = summary?.records.find(({ status }) => status === 'terminal');
+  if (!oldest) return undefined;
+  const flags = workspaceFlags(report.workspacePath);
+  const ids = [id, oldest.id];
+  return {
+    rearm: _monitorCommandLine(['retry', 'rearm'], flags, ids),
+    skip: _monitorCommandLine(['retry', 'skip'], flags, ids),
+  };
 }
 
-/** `monitor explain <id>` carrying the scope doctor was given, so it reads the same workspace. */
-function explainCommand(report: MonitorDoctorReport, id: string): string {
-  const flags: string[] = [];
-  // Workspace keys are the `path.resolve()` spelling and `monitor explain` uses
-  // `process.cwd()` (already a real path), so a symlinked spelling is a different
-  // workspace and must be carried. `--dir` is only read as files, so realpath is fine.
-  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
-    flags.push('--workspace', shellArg(report.workspacePath));
-  }
-  if (!samePath(report.monitorsDir, '.claude/monitors')) {
-    flags.push('--dir', shellArg(report.monitorsDir));
-  }
-  return ['agentmonitors monitor explain', shellArg(id), ...flags].join(' ');
+/** The two repairs for a stopped monitor, in one sentence. */
+function retryRepairSentence(repairs: { rearm: string; skip: string }): string {
+  return `Once the cause is fixed, retry it with \`${repairs.rearm}\`, or give it up as a recorded loss with \`${repairs.skip}\`.`;
 }
 
 const STATUS_GLYPH: Record<DoctorCheckStatus, string> = {
@@ -437,7 +417,7 @@ function buildChecks(
         name,
         status: 'fail',
         detail: `terminal materialization retry  ${rollup}`,
-        remediation: `Inspect safe retry details with \`${explainCommand(report, monitor.id)}\`, investigate the listed record IDs and repair the reported failure. This CLI does not yet provide a retry action.`,
+        remediation: terminalRemediation(report, monitor.id, retryOutbox),
       });
     } else if ((retryOutbox?.pending ?? 0) > 0) {
       checks.push({
@@ -616,6 +596,37 @@ function addUnretainedLossCheck(
   });
 }
 
+/** A stopped monitor: inspect the retry, then re-arm or skip it (005 `monitor retry`). */
+function terminalRemediation(
+  report: MonitorDoctorReport,
+  monitorId: string,
+  summary: MaterializationRetrySummary | undefined,
+): string {
+  const inspect = `Inspect safe retry details with \`${explainCommand(report, monitorId)}\` and repair the reported failure.`;
+  const repairs = retryRepairCommands(report, monitorId, summary);
+  return repairs ? `${inspect} ${retryRepairSentence(repairs)}` : inspect;
+}
+
+/**
+ * Retained work without one valid current definition. A terminal record can
+ * be re-armed or skipped like any other; only a monitor that is ticked again
+ * ever drains a re-armed or pending record, so skipping is the way to clear
+ * work whose monitor will not run.
+ */
+function retainedWorkRemediation(
+  report: MonitorDoctorReport,
+  monitorId: string,
+  summary: MaterializationRetrySummary,
+  inspect: string,
+): string {
+  const repairs = retryRepairCommands(report, monitorId, summary);
+  const drains =
+    'Retained work drains only while this monitor is ticked with a valid definition.';
+  return repairs
+    ? `${inspect} ${drains} Re-arm the terminal retry with \`${repairs.rearm}\`, or give it up as a recorded loss with \`${repairs.skip}\`.`
+    : `${inspect} ${drains}`;
+}
+
 /** Recovery obligations remain failures even without one valid current definition. */
 function addRetainedWorkCheck(
   checks: DoctorCheck[],
@@ -643,7 +654,12 @@ function addRetainedWorkCheck(
     name: `retry-outbox:${monitorId}`,
     status: 'fail',
     detail: `${ownerPrefix(owner)}retained materialization work  retry-outbox=${String(summary.pending)}/${String(summary.terminal)}  bytes=${String(summary.bytes)}`,
-    remediation: `${remediation} This CLI does not yet provide a retry action.`,
+    remediation: retainedWorkRemediation(
+      report,
+      monitorId,
+      summary,
+      remediation,
+    ),
   });
 }
 
@@ -1103,7 +1119,7 @@ export const doctorCommand = new Command('doctor')
       const workspace = path.resolve(options.workspace);
       const monitorsDir = options.dir
         ? path.resolve(options.dir)
-        : path.join(workspace, '.claude', 'monitors');
+        : workspaceMonitorsDir(workspace);
 
       try {
         const state = readLocalState(workspace);

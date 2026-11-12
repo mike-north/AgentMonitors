@@ -42,6 +42,7 @@ export class AgentMonitorRuntime {
     openSession(input: OpenSessionInput): AgentSessionRecord;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
+    rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryRepairResult;
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
     registerVerifyArtifact(input: RegisterVerifyArtifactInput): VerifyArtifactRecord;
@@ -57,6 +58,7 @@ export class AgentMonitorRuntime {
         objectKey: string;
         eventIds: string[];
     }): number;
+    skipMaterializationRetry(input: MaterializationRetrySkipInput): MaterializationRetryRepairResult;
     // (undocumented)
     status(): RuntimeStatus;
     suppressObjectEvents(input: {
@@ -685,6 +687,9 @@ export const MATERIALIZATION_RETRY_MAX_BYTES: number;
 export const MATERIALIZATION_RETRY_MAX_RECORDS = 256;
 
 // @public
+export const MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH = 200;
+
+// @public
 export class MaterializationRetryCapacityError extends Error {
     constructor(monitorId: string);
     readonly code = "materialization_retry_capacity_exceeded";
@@ -735,10 +740,31 @@ export interface MaterializationRetryRecord {
 }
 
 // @public
+export interface MaterializationRetryRepairInput {
+    monitorId: string;
+    retryId: string;
+    workspacePath: string;
+}
+
+// @public
+export type MaterializationRetryRepairOutcome = 'rearmed' | 'skipped' | 'verify-artifact-cleanup';
+
+// @public
+export interface MaterializationRetryRepairResult {
+    outcome: MaterializationRetryRepairOutcome;
+    retry: MaterializationRetryDiagnostic;
+}
+
+// @public
 export class MaterializationRetrySerializationError extends Error {
     constructor(path: string, reason: string);
     readonly code = "materialization_retry_serialization_failed";
     readonly path: string;
+}
+
+// @public
+export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
+    reason?: string;
 }
 
 // @public
@@ -761,6 +787,9 @@ export class MaterializationRetryTransitionError extends Error {
 
 // @public
 export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
+
+// @internal
+export function _monitorCommandLine(command: readonly string[], flags: readonly string[], ids: readonly string[]): string;
 
 // @public (undocumented)
 export interface MonitorDefinition {
@@ -1511,6 +1540,14 @@ export class RuntimeStore {
     reapEphemeralMonitor(id: string): void;
     reapEphemeralMonitorsForSession(sessionId: string): string[];
     rearmMaterializationRetry(id: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    rearmTerminalMaterializationRetry(id: string, route: {
+        monitorId: string;
+        workspacePath: string | null;
+    }, now?: Date): {
+        outcome: 'rearmed' | 'verify-artifact-cleanup';
+        retry: MaterializationRetryRecord;
+    };
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
         decision: 'deliver' | 'suppress' | 'failed';
         reason?: string | undefined;
@@ -1531,6 +1568,7 @@ export class RuntimeStore {
         sourceName: string;
         objectKey: string | undefined;
         observationData: Record<string, unknown>;
+        eventWatermark?: number;
     }): void;
     recordVerifyArtifactCleanup(runId: string, cause: VerifyArtifactCleanupCause, at: Date): {
         artifact: VerifyArtifactRecord;
@@ -1592,6 +1630,17 @@ export class RuntimeStore {
         notifyState?: unknown;
         lastObservationAt?: Date | null;
     }): void;
+    // @internal
+    skipMaterializationRetry(id: string, route: {
+        monitorId: string;
+        workspacePath: string | null;
+    }, loss: {
+        objectKey: string | undefined;
+        observationData: Record<string, unknown>;
+    }): {
+        outcome: 'skipped' | 'verify-artifact-cleanup';
+        retry: MaterializationRetryRecord;
+    };
     staleActiveSessions(workspacePath: string | null, staleBefore: Date): AgentSessionRecord[];
     // (undocumented)
     status(): RuntimeStatus;
@@ -1746,6 +1795,12 @@ export interface ShapeStageConfig {
     // (undocumented)
     shape?: ShapeConfig | undefined;
 }
+
+// @public
+export function shellArg(value: string): string;
+
+// @public
+export function shellSingleQuote(value: string): string;
 
 // @public
 export interface SignalAbstention {

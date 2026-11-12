@@ -25,6 +25,7 @@ import {
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
 import { appendErrorHints } from '../command-hints.js';
+import { monitorRetryCommand } from './monitor-retry.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
@@ -875,3 +876,6 @@ appendErrorHints(monitorHistoryCommand, [
     hint: 'monitor history scopes by --workspace (the project directory), not --dir.',
   },
 ]);
+
+// Repairs for the retained work `monitor explain` lists (005 `monitor retry`).
+monitorTestCommand.addCommand(monitorRetryCommand);
