@@ -326,28 +326,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   // trail, consistent with the monitor_state re-baseline above).
   addColumnIfMissing(sqlite, 'observation_history', 'workspace_path', 'TEXT');
 
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS monitor_events (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      urgency TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL DEFAULT '',
-      payload TEXT NOT NULL DEFAULT '{}',
-      snapshot_metadata TEXT NOT NULL DEFAULT '{}',
-      snapshot_text TEXT,
-      diff_text TEXT,
-      object_key TEXT,
-      baseline_strategy TEXT,
-      query_scope TEXT NOT NULL DEFAULT '{}',
-      tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL
-    )
-  `);
+  sqlite.exec(
+    createTableSql('monitor_events', MONITOR_EVENT_COLUMNS, {
+      ifNotExists: true,
+    }),
+  );
 
   // Additive migration (G10 PR-B, 002 §1.1.7): a `monitor_events` table created
   // before PR-B lacks the persisted `baseline_strategy` column. Add it if
@@ -369,18 +352,11 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
     'TEXT',
   );
 
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS monitor_snapshots (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      object_key TEXT NOT NULL,
-      event_id TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    )
-  `);
+  sqlite.exec(
+    createTableSql('monitor_snapshots', MONITOR_SNAPSHOT_COLUMNS, {
+      ifNotExists: true,
+    }),
+  );
 
   migrateSnapshotMaterializationOrder(sqlite);
   for (const trigger of retainedTriggers) sqlite.exec(trigger.sql);
@@ -531,114 +507,255 @@ function suspendMaterializationMigrationTriggers(
 }
 
 /**
- * Preserve event identities and their projection/snapshot/cursor references
- * while adding a private tie-break for equal persisted observation timestamps.
- * This runs under the schema-build immediate transaction, after older additive
- * event-column migrations. No event payload or observed time is rewritten.
- *
- * Current hidden rowid orders the retained legacy bootstrap only; lost earlier
- * chronology is not reconstructible. SQLite allocates all subsequent positions
- * atomically, preserves them across VACUUM/reopen and does not reuse committed
- * deleted positions. The coordinator suspends triggers across both rebuilds;
- * this table-local helper restores only retained indexes.
- * The repository's event relationships are logical IDs, not SQLite foreign keys.
+ * One column of a table this module creates: its name and the rest of its SQL
+ * column definition. The lists below are the single source for both the fresh
+ * `CREATE TABLE` and the materialization-order rebuild target, so the two cannot
+ * drift apart. Columns that later changes add in place (`addColumnIfMissing`)
+ * stay out of these lists: the rebuild carries them when the old table has them,
+ * and the additive step adds them when it does not.
  */
-function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
-  if (tableHasColumn(sqlite, 'monitor_events', 'sequence')) return;
+interface ColumnDefinition {
+  readonly name: string;
+  readonly definition: string;
+}
 
-  const indexes = sqlite
-    .prepare<[], { sql: string }>(
-      `SELECT sql FROM sqlite_master
-       WHERE tbl_name = 'monitor_events' AND type = 'index'
-         AND sql IS NOT NULL ORDER BY type, name`,
-    )
-    .all();
-  // A table written by the definition-fingerprint change before ordering existed
-  // already holds fingerprints; carry them over rather than resetting to unknown.
-  const fingerprintSource = tableHasColumn(
-    sqlite,
-    'monitor_events',
-    'definition_fingerprint',
-  )
-    ? 'definition_fingerprint'
-    : 'NULL';
-  sqlite.exec(`
-    CREATE TABLE monitor_events_ordered (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      source_name TEXT NOT NULL,
-      urgency TEXT NOT NULL,
-      title TEXT NOT NULL,
-      body TEXT NOT NULL DEFAULT '',
-      summary TEXT NOT NULL DEFAULT '',
-      payload TEXT NOT NULL DEFAULT '{}',
-      snapshot_metadata TEXT NOT NULL DEFAULT '{}',
-      snapshot_text TEXT,
-      diff_text TEXT,
-      object_key TEXT,
-      baseline_strategy TEXT,
-      query_scope TEXT NOT NULL DEFAULT '{}',
-      tags TEXT NOT NULL DEFAULT '[]',
-      created_at INTEGER NOT NULL,
-      definition_fingerprint TEXT
+/** `monitor_events` as a fresh database creates it (002 §15). */
+const MONITOR_EVENT_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'sequence', definition: 'INTEGER PRIMARY KEY AUTOINCREMENT' },
+  { name: 'id', definition: 'TEXT NOT NULL UNIQUE' },
+  { name: 'workspace_path', definition: 'TEXT' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'source_name', definition: 'TEXT NOT NULL' },
+  { name: 'urgency', definition: 'TEXT NOT NULL' },
+  { name: 'title', definition: 'TEXT NOT NULL' },
+  { name: 'body', definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: 'summary', definition: "TEXT NOT NULL DEFAULT ''" },
+  { name: 'payload', definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { name: 'snapshot_metadata', definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { name: 'snapshot_text', definition: 'TEXT' },
+  { name: 'diff_text', definition: 'TEXT' },
+  { name: 'object_key', definition: 'TEXT' },
+  { name: 'baseline_strategy', definition: 'TEXT' },
+  { name: 'query_scope', definition: "TEXT NOT NULL DEFAULT '{}'" },
+  { name: 'tags', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { name: 'created_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** `monitor_snapshots` as a fresh database creates it (002 §15). */
+const MONITOR_SNAPSHOT_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'sequence', definition: 'INTEGER PRIMARY KEY AUTOINCREMENT' },
+  { name: 'id', definition: 'TEXT NOT NULL UNIQUE' },
+  { name: 'workspace_path', definition: 'TEXT' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'object_key', definition: 'TEXT NOT NULL' },
+  { name: 'event_id', definition: 'TEXT NOT NULL' },
+  { name: 'content', definition: 'TEXT NOT NULL' },
+  { name: 'created_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** Quote a SQLite identifier so any stored name, including quotes, round-trips. */
+function quoteIdentifier(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+/** Render `CREATE TABLE` for one of this module's column lists. */
+function createTableSql(
+  table: string,
+  columns: readonly ColumnDefinition[],
+  options: { ifNotExists?: boolean } = {},
+): string {
+  const body = columns
+    .map((column) => `${quoteIdentifier(column.name)} ${column.definition}`)
+    .join(',\n  ');
+  const guard = options.ifNotExists === true ? 'IF NOT EXISTS ' : '';
+  return `CREATE TABLE ${guard}${table} (\n  ${body}\n)`;
+}
+
+/**
+ * A schema migration found a row or column it cannot carry into the current
+ * layout. Thrown inside the schema-build immediate transaction, so the database
+ * is left exactly as it was; the message names the table and column so an
+ * operator can repair that data and reopen. Not re-exported from the package
+ * entry point: callers see it as an `Error` thrown by `createDb`.
+ *
+ * @internal
+ */
+export class SchemaMigrationError extends Error {
+  /** The table whose rebuild stopped. */
+  readonly table: string;
+  /** The column that stopped it. */
+  readonly column: string;
+
+  constructor(
+    table: string,
+    column: string,
+    reason: string,
+    options?: { cause?: unknown },
+  ) {
+    super(
+      `Cannot migrate ${table} to the current schema: column ${quoteIdentifier(column)} ${reason}. ` +
+        'The database was left unchanged.',
+      options,
     );
-    INSERT INTO monitor_events_ordered
-      (id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
-       payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-       baseline_strategy, query_scope, tags, created_at, definition_fingerprint)
-      SELECT id, workspace_path, monitor_id, source_name, urgency, title, body, summary,
-        payload, snapshot_metadata, snapshot_text, diff_text, object_key,
-        baseline_strategy, query_scope, tags, created_at, ${fingerprintSource}
-      FROM monitor_events ORDER BY rowid;
-    DROP TABLE monitor_events;
-    ALTER TABLE monitor_events_ordered RENAME TO monitor_events;
+    this.name = 'SchemaMigrationError';
+    this.table = table;
+    this.column = column;
+  }
+}
+
+/**
+ * A live column as `PRAGMA table_xinfo` reports it. `hidden` is 0 for an
+ * ordinary column, 2 or 3 for a generated one (virtual or stored).
+ */
+interface LiveColumn {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  hidden: number;
+}
+
+/**
+ * Rebuild a table written before the private `sequence` order key existed, so
+ * it gains that key while keeping everything it holds (spec 002 §5.2).
+ *
+ * The target layout is derived from the live table, not a fixed column list:
+ *
+ * - Columns the current schema defines take their current definitions; one the
+ *   old table lacks takes its default.
+ * - Every other column is carried across with its declared type and default,
+ *   and its values. This covers columns a released version later stopped
+ *   creating (0.0.1–0.3.0's `monitor_events.event_kind`), columns later changes
+ *   add in place, and columns an operator added. A carried column keeps NOT NULL
+ *   only when it has a default: the current writer never names it, so a NOT NULL
+ *   without a default would reject every new row. Collation, CHECK and
+ *   REFERENCES clauses on a carried column are not reproduced.
+ * - Because every column survives, every explicit index (and every trigger the
+ *   coordinator restores) still resolves. All are recreated from their exact
+ *   stored SQL; none is dropped.
+ *
+ * A row or column that cannot be carried stops the migration with a
+ * {@link SchemaMigrationError} naming the table and column: a generated column
+ * (its expression is not recoverable from table metadata), or a retained row
+ * holding NULL in a column the current schema requires (a released
+ * `id TEXT PRIMARY KEY` admits NULL). The caller's immediate transaction then
+ * rolls the database back to its original schema and data.
+ *
+ * Retained rows take positions in current hidden rowid order. That orders the
+ * retained legacy bootstrap only; chronology lost earlier is not reconstructible.
+ * SQLite allocates later positions atomically, preserves them across
+ * VACUUM/reopen and does not reuse committed deleted positions. The repository's
+ * event relationships are logical IDs, not SQLite foreign keys.
+ */
+function rebuildWithMaterializationOrder(
+  sqlite: BetterSQLiteClient,
+  table: 'monitor_events' | 'monitor_snapshots',
+  columns: readonly ColumnDefinition[],
+): void {
+  if (tableHasColumn(sqlite, table, 'sequence')) return;
+
+  const live = sqlite.pragma(`table_xinfo(${table})`) as LiveColumn[];
+  // SQLite column names compare case-insensitively.
+  const liveNames = new Set(live.map((column) => column.name.toLowerCase()));
+  const currentNames = new Set(
+    columns.map((column) => column.name.toLowerCase()),
+  );
+
+  const generated = live.find((column) => column.hidden !== 0);
+  if (generated) {
+    throw new SchemaMigrationError(
+      table,
+      generated.name,
+      'is a generated column, and its expression cannot be carried across the rebuild',
+    );
+  }
+  // A required current column must hold a value in every retained row: either
+  // the old table has it and no row holds NULL, or the old table has no rows.
+  for (const column of columns) {
+    const required =
+      column.name !== 'sequence' &&
+      /\bNOT NULL\b/.test(column.definition) &&
+      !/\bDEFAULT\b/.test(column.definition);
+    if (!required) continue;
+    const condition = liveNames.has(column.name.toLowerCase())
+      ? `${quoteIdentifier(column.name)} IS NULL`
+      : '1';
+    const missing = sqlite
+      .prepare(`SELECT 1 FROM ${table} WHERE ${condition} LIMIT 1`)
+      .get();
+    if (missing !== undefined) {
+      throw new SchemaMigrationError(
+        table,
+        column.name,
+        'has no value in a retained row, and the current schema requires one',
+      );
+    }
+  }
+
+  const carried: ColumnDefinition[] = live
+    .filter((column) => !currentNames.has(column.name.toLowerCase()))
+    .map((column) => {
+      const constraint =
+        column.dflt_value === null
+          ? ''
+          : `${column.notnull !== 0 ? ' NOT NULL' : ''} DEFAULT ${column.dflt_value}`;
+      return {
+        name: column.name,
+        definition: `${column.type}${constraint}`,
+      };
+    });
+  const copied = live.map((column) => quoteIdentifier(column.name)).join(', ');
+  const indexes = sqlite
+    .prepare<[string], { name: string; sql: string }>(
+      `SELECT name, sql FROM sqlite_master
+       WHERE tbl_name = ? AND type = 'index' AND sql IS NOT NULL
+       ORDER BY name`,
+    )
+    .all(table);
+
+  const ordered = `${table}_ordered`;
+  sqlite.exec(createTableSql(ordered, [...columns, ...carried]));
+  sqlite.exec(`
+    INSERT INTO ${ordered} (${copied})
+      SELECT ${copied} FROM ${table} ORDER BY rowid;
+    DROP TABLE ${table};
+    ALTER TABLE ${ordered} RENAME TO ${table};
   `);
   for (const index of indexes) sqlite.exec(index.sql);
 }
 
 /**
+ * Give retained events a SQLite-owned materialization order (the equal-time
+ * tie-break, 002 §1.1.7) while preserving event identities and their
+ * projection/snapshot/cursor references. Runs under the schema-build immediate
+ * transaction, after older additive event-column migrations; no event payload
+ * or observed time is rewritten. The coordinator suspends triggers across both
+ * rebuilds; see {@link rebuildWithMaterializationOrder} for the column, index
+ * and failure policy.
+ */
+function migrateEventMaterializationOrder(sqlite: BetterSQLiteClient): void {
+  rebuildWithMaterializationOrder(
+    sqlite,
+    'monitor_events',
+    MONITOR_EVENT_COLUMNS,
+  );
+}
+
+/**
  * Give retained snapshots a SQLite-owned materialization order without changing
- * their public identities or artifacts. The schema-build immediate transaction
- * owns this rebuild, so concurrent openers cannot see a partially copied table.
- *
- * Legacy hidden rowid order is the available bootstrap policy, not a recovery
- * of historical chronology lost before migration (for example by VACUUM).
- * New explicit integer keys survive VACUUM and reopen; AUTOINCREMENT prevents
- * reuse after committed deletion. Rolled-back allocations may be reused because
- * no committed snapshot ever acquired them. This helper restores retained indexes;
- * the coordinator restores triggers only after both table names are valid.
+ * their public identities or artifacts (002 §5.2). The schema-build immediate
+ * transaction owns this rebuild, so concurrent openers cannot see a partially
+ * copied table. Rolled-back allocations may be reused because no committed
+ * snapshot ever acquired them. The coordinator restores triggers only after both
+ * table names are valid; see {@link rebuildWithMaterializationOrder} for the
+ * column, index and failure policy.
  */
 function migrateSnapshotMaterializationOrder(sqlite: BetterSQLiteClient): void {
-  if (tableHasColumn(sqlite, 'monitor_snapshots', 'sequence')) return;
-
-  const indexes = sqlite
-    .prepare<[], { sql: string }>(
-      `SELECT sql FROM sqlite_master
-       WHERE tbl_name = 'monitor_snapshots' AND type = 'index'
-         AND sql IS NOT NULL ORDER BY type, name`,
-    )
-    .all();
-  sqlite.exec(`
-    CREATE TABLE monitor_snapshots_ordered (
-      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-      id TEXT NOT NULL UNIQUE,
-      workspace_path TEXT,
-      monitor_id TEXT NOT NULL,
-      object_key TEXT NOT NULL,
-      event_id TEXT NOT NULL,
-      content TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    );
-    INSERT INTO monitor_snapshots_ordered
-      (id, workspace_path, monitor_id, object_key, event_id, content, created_at)
-      SELECT id, workspace_path, monitor_id, object_key, event_id, content, created_at
-      FROM monitor_snapshots ORDER BY rowid;
-    DROP TABLE monitor_snapshots;
-    ALTER TABLE monitor_snapshots_ordered RENAME TO monitor_snapshots;
-  `);
-  for (const index of indexes) sqlite.exec(index.sql);
+  rebuildWithMaterializationOrder(
+    sqlite,
+    'monitor_snapshots',
+    MONITOR_SNAPSHOT_COLUMNS,
+  );
 }
 
 /**
