@@ -3914,7 +3914,7 @@ Handle it.
     // Subclass RuntimeStore to throw once on the sentinel observation so
     // ingest() fails for that specific observation without patching private
     // methods. The failure is retained and drains from the outbox before the
-    // watcher pulls its next batch (002 §2.6).
+    // watcher pulls its next batch (002 §2.7).
     class FlakyStore extends RuntimeStore {
       failures = 1;
       override insertEvent(
@@ -5066,7 +5066,7 @@ Handle it.
   // relaxed to match the window (002 §4.4), and it had drifted: it applied
   // neither behavior. Both paths now share admitSpan() for durable admission and
   // finishMaterializationSpan() for the audit row; the not-due path reaches them
-  // through flushRollupWindow(), which reads the held batch under the writer lock.
+  // through flushHeldNotifyWork(), which reads the held batch under the writer lock.
   //
   // Expected delta/history counts below are written BY HAND from the spec, not
   // captured from program output.
@@ -5424,7 +5424,7 @@ Daily digest.
     // No regression for the empty not-due tick: the window check runs on EVERY
     // not-due tick, but an empty flush (window closed, or nothing accumulated)
     // must NOT write a `no-change` audit row each tick — only a real flush is
-    // recorded. (flushRollupWindow() returns before finishMaterializationSpan()
+    // recorded. (flushHeldNotifyWork() returns before finishMaterializationSpan()
     // when the window emits nothing; an open empty window still commits its
     // minute marker.)
     it('does not record an audit row for a not-due tick that flushes nothing', async () => {

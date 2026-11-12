@@ -1,6 +1,6 @@
 /**
  * Retained materialization work is drained before newer source input
- * (002 §2.6). For one monitor, every retry in the outbox completes, in the
+ * (002 §2.7). For one monitor, every retry in the outbox completes, in the
  * order it was admitted, before that monitor's source is asked for anything
  * newer; a retry that keeps failing pauses only its own monitor and is
  * reported every tick it recurs; and a delayed retry never reaches a session
@@ -10,7 +10,7 @@
  * Faults are real SQLite triggers on `monitor_events`, so they behave the same
  * on the admitting connection and after the store is reopened.
  *
- * @see ../../../../docs/specs/002-runtime-delivery.md §2.6, §15 `materialization_retry_outbox`
+ * @see ../../../../docs/specs/002-runtime-delivery.md §2.7, §15 `materialization_retry_outbox`
  * @see https://www.sqlite.org/lang_createtrigger.html#raise
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';

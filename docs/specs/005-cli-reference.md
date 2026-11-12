@@ -2091,7 +2091,7 @@ valid definition with retry-only state is a persisted report with the no-daemon 
 "no persisted state" remediation. Repeated diagnostic reads must not mutate retry state, observe,
 materialize, deliver, or re-arm work. Remediation identifies the monitor and retained record IDs;
 there is no retry action command. The runtime itself drains retained work before newer source
-input ([002 §2.6](./002-runtime-delivery.md#26-retained-work-drains-before-newer-source-input-current)).
+input ([002 §2.7](./002-runtime-delivery.md#27-retained-work-drains-before-newer-source-input-current)).
 
 Verified: `apps/cli/src/retry-diagnostics.test.ts` uses a real owned JSONL socket and built CLI plus
 legacy SQLite rows, including same-ID other-workspace exclusion, missing/invalid/duplicate

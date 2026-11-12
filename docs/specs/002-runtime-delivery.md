@@ -630,7 +630,7 @@ For each runtime tick, the implementation **MUST**:
 3. resolve each parsed monitor's `source` name against the source registry
 4. fail the tick if a parsed monitor references an unknown source
 5. validate the source-specific `watch` config (minus `type`) with `validateWatchScope`; skip invalid config before scheduling, observation, notify processing, or admission, so a rejected config records no drop and queues no retry
-   5a. drain the monitor's retained materialization work oldest admission first, and skip the rest of the monitor's evaluation while any of it remains (§2.6)
+   5a. drain the monitor's retained materialization work oldest admission first, and skip the rest of the monitor's evaluation while any of it remains (§2.7)
 6. determine whether the monitor is due to run
 7. call the source's `observe()` method with: the monitor's `scope`, the monitor's previously persisted source state if any, the runtime-supplied `now` timestamp
 8. route returned observations through notify dispatch
@@ -754,10 +754,12 @@ the advanced baseline. The next tick observes newer input. A BigInt payload fail
 and is outside the outbox domain: that one observation is `errored` and its siblings materialize.
 
 The same rule applies to the poll path (`ingest()`), the watch path (one yielded batch is one
-span, §2.4), and the not-due rollup window flush (`flushRollupWindow()`, §4.4). For the rollup
-flush, the notify state that clears `pendingRollup` commits in the same transaction as the
-flushed span. A flush that rolls back leaves the whole window held, records a best-effort
-`errored` row, and reports the error on the tick result. The next window check retries it.
+span, §2.4), and the held-work flush (`flushHeldNotifyWork()`): the not-due rollup window check
+(§4.4) and a flush while the source fails (§2.6). For that flush, the notify state that clears
+the hold (`pendingRollup` or `pendingDebounce`) commits in the same transaction as the flushed
+span. A flush that rolls back leaves the whole batch held, records a best-effort `errored` row,
+and reports the error on the tick result. The next tick that reaches the hold retries it: the
+next window check for a rollup batch, the next due tick for a debounce batch (§2.6).
 
 Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts`: a capacity overflow on
 the poll path, with its drop row, batch-row count, explain verdict and doctor rollup, kept
@@ -771,7 +773,7 @@ drop of a removed, unparseable, duplicated or invalid definition reported in doc
 outstanding across a later observe failure and accumulated with a later drop; a span whose only
 observation is dropped, kept through later quiet ticks; bounded, control-free identity text with
 no payload; explain and doctor failing for both a retained and a dropped failure; a suffix that exactly fills the outbox and one record over
-(a span is only admitted into an empty outbox, §2.6); a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
+(a span is only admitted into an empty outbox, §2.7); a BigInt payload; a non-serializable later sibling; rollup window flushes that overflow,
 fit, or roll back; and watch batches over capacity or with a BigInt payload. Each asserts the
 three-outcome invariant and that the next tick or batch makes progress.
 
@@ -810,7 +812,7 @@ The exported RuntimeStore API does not expose an executable transaction callback
 claim that SQLite cancels asynchronous JavaScript effects. Watch batches use the same admission boundary under §2.4.
 
 Verified: `libs/core/src/runtime/service.ts` — `AgentMonitorRuntime.tick()`, `ingest()`, and
-`admitSpan()`, `flushRollupWindow()` and `finishMaterializationSpan()`.
+`admitSpan()`, `flushHeldNotifyWork()` and `finishMaterializationSpan()`.
 
 ### 2.0 Source-config preflight (current)
 
@@ -1001,7 +1003,7 @@ Whole-admission failure **MUST** preserve the prior source/notify state and all 
 record/report the error best-effort, close the iterator, and stop before requesting newer input.
 A restart or one-shot fallback receives the prior baseline and can replay the unadmitted batch.
 Durable retry obligations remain distinct from completed materialization. A watcher drains them
-before its next pull (§2.6); the final owned-process crash proof remains separate runtime
+before its next pull (§2.7); the final owned-process crash proof remains separate runtime
 recovery work.
 
 Aborted or superseded watchers **MUST NOT** admit late batches. After an abort during Interpret,
@@ -1039,7 +1041,7 @@ end-to-end watch/poll exclusivity scenarios retained in `service.test.ts`.
 
 While the notify admission gate ([§4.6](#46-effective-notify-policy-edits-current)) is closed — a
 failed edit drain, an unresolved source, a rejected scope with held work, or retained work that
-watcher startup could not drain (§2.6) — a yielded batch waits
+watcher startup could not drain (§2.7) — a yielded batch waits
 on the consumer's stack and the iterator is not pulled again. The waiting batch is not admitted, so
 it records no drop and queues no retry; its observations and `nextState` stay unpersisted until the
 gate opens. Admission rereads the gate, cancellation and the watcher's ownership token in the same
@@ -1064,10 +1066,10 @@ and replacement exclusion, workspace/monitor isolation and independent SQLite re
 
 `tick()` returns a `RuntimeTickResult` summarizing the tick:
 
-- `evaluatedMonitors` — the ids of every monitor whose `observe()` or retained-work drain (§2.6) was attempted this tick (including monitors whose outcome was `errored`). A monitor that drains and then observes appears once.
+- `evaluatedMonitors` — the ids of every monitor whose `observe()` or retained-work drain (§2.7) was attempted this tick (including monitors whose outcome was `errored`). A monitor that drains and then observes appears once.
 - `emittedEventIds` — the ids of the durable events materialized this tick.
-- `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed), and one per observation a debounce/rollup hold refused because it cannot be serialized (§4.7), and one per monitor whose retained work failed a drain attempt or is paused behind a terminal retry (§2.6). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
-- `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open), or because its oldest retained retry is backing off, in which case `nextDueAt` is that retry's next attempt time (§2.6). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
+- `erroredObservations` — one `{ monitorId, message }` entry per monitor whose observation failed this tick (its `observe()` threw/rejected, or its `ingest()` failed), one when a held-work flush rolled back or left failed materializations (§2.6, §4.4), one per observation a debounce/rollup hold refused because it cannot be serialized (§4.7), and one per monitor whose retained work failed a drain attempt or is paused behind a terminal retry (§2.7). Each entry is pushed from the **same** code path that writes the `errored` row to `observation_history` (§15 `observation_history`), so the result is the single source of truth for tick-time failures — it is never recomputed by re-scanning history. A monitor that genuinely observed no change does **not** appear here.
+- `skippedMonitors` — either `{ monitorId, validationError }` for invalid source config (§2.0), or `{ monitorId, nextDueAt }` for a valid monitor skipped because it was not yet due (interval not elapsed or cron window not open), or because its oldest retained retry is backing off, in which case `nextDueAt` is that retry's next attempt time (§2.7). The due time comes from the same scheduling decision that gates evaluation. An active continuous watcher does not appear as a cadence skip; validation of a newly scanned invalid definition still reports its config problem. Consumers must check which field is present before reading a due time.
 
 The runtime **MUST** surface `erroredObservations` so a caller (e.g. the CLI tick output, §10.1/§10.2) can report a failed observation rather than print a clean `emitted 0` that an author cannot distinguish from a genuine no-change.
 
@@ -1075,7 +1077,58 @@ The runtime **MUST** surface `skippedMonitors` so a caller can distinguish "moni
 
 Verified: `libs/core/src/runtime/types.ts` — `RuntimeTickResult`, `ErroredObservation`, `SkippedMonitor`; `libs/core/src/runtime/service.ts` — `tick()` populates `erroredObservations` in both the `observe()` and `ingest()` error branches alongside the `recordObservationHistory({ result: 'errored' })` write; populates `skippedMonitors` in the `!schedule.due` branch from the same scheduling decision.
 
-### 2.6 Retained work drains before newer source input (current)
+### 2.6 Held notify work while the source fails (_current_)
+
+Notify timing belongs to the runtime, not the source (§1.1.3), so a failing source **MUST NOT**
+stop work that a hold already accepted. When a due monitor's `observe()` throws or rejects, the
+runtime records the failure and then, if the monitor holds debounce or rollup work, runs the
+same notify dispatch a successful tick with no new observations would run (§4.3, §4.4). A held
+debounce batch whose `dueAt` has passed flushes, and a rollup batch flushes when its `window`
+matches. The flush needs no new observation and no successful source recovery.
+
+- **Same admission path.** The flush reads the held batch, window marker, source checkpoint and
+  `lastObservationAt` under its admission write lock, and commits the flushed span (events,
+  retained retries or `errored` rows, §2) together with the notify state that clears the hold,
+  in one transaction. It is the same flush as the not-due rollup window check
+  (`flushHeldNotifyWork()`), and it is admitted while the failed poll still owns admission.
+- **Nothing advances but the hold.** The source baseline and `lastObservationAt` are committed
+  exactly as read, so the monitor stays due and the next tick asks the source again (the
+  existing retry cadence). Flushed events keep their captured content, effective urgency and
+  observation time. The error is never turned into an event, and earlier events are untouched.
+- **The failure stays visible.** The tick result lists the source failure in
+  `erroredObservations` beside the flushed ids in `emittedEventIds`. The flush writes its
+  `triggered` row (`observed: 0`) and the source failure's `errored` row is written after it, so
+  the newest history row, and `monitor explain`'s observation stage (§10.7), still report the
+  failing source. A process that dies after the flush commits but before that `errored` row is
+  written leaves the flush durable; because the scheduling timestamp did not advance, the next
+  tick observes again and records the failure.
+- **A failed flush keeps the work.** If the flush transaction rolls back (for example, its state
+  write fails), the whole batch stays held. The failure is reported on the tick result and as a
+  best-effort `errored` row, and the next tick tries again. Other monitors, and the same monitor
+  id in another workspace, are unaffected.
+- **Untrusted definitions still block.** The flush runs only while the monitor's admission gate
+  is open. A schema-invalid definition is skipped before observation (§2.0), a missing one is
+  never evaluated, and a definition rejected while `observe()` is in flight closes the gate
+  (§4.6); in each case held work stays held.
+- **Retained work comes first.** Held work, including this flush, **MUST** wait behind a
+  pending, backing-off, failing or terminal retry: ordering takes precedence over the flush's
+  timeliness. This flush runs only on a tick that reached `observe()`, and a monitor reaches
+  `observe()` only after its retained materialization work has drained (§2.7). While a retry
+  remains, the monitor does nothing else that tick: its source is not called, so no source
+  failure occurs and held work stays held behind the retry, which the tick reports instead
+  (§2.7). A hold beside retained work is always newer than it, so flushing the hold first would
+  reorder events. A terminal retry therefore keeps its monitor's held work held until the retry
+  is re-armed.
+
+Not covered: continuous watchers (§2.3) do not run a tick-time `observe()`, and the cadence of
+retrying a failing source is unchanged.
+
+Verified: `libs/core/src/runtime/service.ts` — the `observe()` catch in the tick loop,
+`flushHeldWorkDespiteSourceFailure()`, `flushHeldNotifyWork()` and `reportHeldNotifyFlush()`.
+Proven by `libs/core/src/runtime/held-work-source-errors.test.ts` and
+`libs/core/src/runtime/source-error-state.test.ts` (Refs #558).
+
+### 2.7 Retained work drains before newer source input (current)
 
 Work the runtime has accepted but not yet materialized — the retry outbox's rows for one
 workspace/monitor (§2, [`materialization_retry_outbox`](#materialization_retry_outbox)) — **MUST**
@@ -1096,11 +1149,14 @@ rollup window flush (§4.4), the due check or `observe()`, the runtime drains th
 
 While any row remains, the monitor's source is not called, and nothing else that would put newer
 work ahead of the retained work runs: no edit reconciliation, no deferred poll result, no rollup
-window flush, and no debounce flush (that one happens only through admission of a new span). A
+window flush, and no debounce flush (a held debounce batch flushes only on a tick that reaches
+`observe()`, including one whose source call fails, §2.6). A
 hold that exists beside retained work is always newer than it, because a monitor with retained
-work admits no span, so releasing the hold first would reorder events. Held work therefore waits
-behind a failing or terminal retry; this includes a held flush on a tick whose source call fails.
-A consequence is that a span is only ever admitted into an empty outbox for its monitor.
+work admits no span, so releasing the hold first would reorder events. Held work therefore
+**MUST** wait behind a pending, failing or terminal retry; ordering takes precedence over the
+timeliness of held work. That includes the held flush on a tick whose source call fails (§2.6),
+which never runs ahead of retained work: the drain comes first, and a monitor with retained work
+does not call its source that tick. A consequence is that a span is only ever admitted into an empty outbox for its monitor.
 
 Each tick that leaves retained work in place reports it:
 
@@ -1145,8 +1201,8 @@ no source call while a retry fails or backs off; a retry that keeps failing, rep
 before a restart drained first in order, exactly once; a same-second session that never receives
 the retry while an earlier one does; a retained watch batch drained before the next pull; a
 restarted watcher kept closed until a tick drains its batch; and the fallbacks for rows and
-sessions without positions. `libs/core/src/inbox/db.released-shapes.test.ts` opens every released
-`agent_sessions` shape.
+sessions without positions.
+`libs/core/src/inbox/db.released-shapes.test.ts` opens every released `agent_sessions` shape.
 
 ## 3. Persisted Monitor State
 
@@ -1336,7 +1392,7 @@ Verified: `libs/core/src/runtime/service.ts` — `dispatchNotify()` throttle bra
 
 ### 4.3 Debounce semantics
 
-For `debounce`: incoming observations are accumulated in a pending batch; each new observation resets the batch's `dueAt` time to `observedAt + settle-for`; a later runtime tick at or after that due time flushes the full pending batch. An observation that cannot be serialized is not accepted into the batch and does not reset `dueAt` (§4.7). This means debounce delivery is bounded by both the configured settle interval and the daemon's tick cadence.
+For `debounce`: incoming observations are accumulated in a pending batch; each new observation resets the batch's `dueAt` time to `observedAt + settle-for`; a later runtime tick at or after that due time flushes the full pending batch, including a tick whose `observe()` fails (§2.6), once any retained work ahead of it has drained (§2.7). An observation that cannot be serialized is not accepted into the batch and does not reset `dueAt` (§4.7). This means debounce delivery is bounded by both the configured settle interval and the daemon's tick cadence.
 
 Verified: `libs/core/src/runtime/service.ts` — `dispatchNotify()` debounce flush path (lines 499–508) and accumulation paths (lines 540–561).
 
@@ -1414,7 +1470,7 @@ three clocks especially visible:
    Verified by `rollup-admission.test.ts`: independently owned competing runtimes before BEGIN,
    a reader opened before admission, retained-suffix barriers, rollback/reopen, and empty/closed-window
    error isolation. This does not add source leader election; §2 limits still apply, and the window
-   check waits behind retained work (§2.6).
+   check waits behind retained work (§2.7).
 
 4. **Batch representation.** The flushed batch becomes one or more `monitor_events` rows (one per
    accumulated observation) rather than a single merged row, so the full event history is
@@ -1468,7 +1524,7 @@ this stage.
 
 The runtime **MUST** reconcile effective pacing edits before source-due and active-watcher
 skips, without requiring new source input. Reconciliation follows the monitor's retained-work
-drain and waits while retained work remains (§2.6). Each held envelope's captured definition determines
+drain and waits while retained work remains (§2.7). Each held envelope's captured definition determines
 its original policy. Effective policy includes the strategy, normalized duration, rollup cron
 and timezone (default UTC), granted whole-batch escalation (§4.1), and
 urgency/salience-dependent defaults when notify is omitted.
@@ -2791,7 +2847,7 @@ Both expose `retryId`; neither includes the stored envelope. Storage failures re
 from these domain failures.
 
 _Current:_ storage, retry transitions and atomic completion primitives, and runtime
-drain-before-intake adoption (§2.6): ticks and watchers complete rows oldest admission first
+drain-before-intake adoption (§2.7): ticks and watchers complete rows oldest admission first
 before the monitor accepts newer input.
 Verified by `retry-outbox.test.ts` and `retry-lifecycle.test.ts`: due boundaries, invalid transitions,
 callback non-execution, actual snapshot/deletion fault rollback, failure-text sanitization and
@@ -2844,7 +2900,7 @@ error controls and length at its wire boundary as well as at text display. Omitt
 fields remain supported; doctor JSON uses empty summaries/groups while explain preserves omission.
 Real owned-socket tests verify dates rather than inferring correctness from core Date objects.
 
-Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Retained rows drain before newer input (§2.6). Final crash acceptance remains separate work.
+Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Retained rows drain before newer input (§2.7). Final crash acceptance remains separate work.
 
 ### `session_event_state`
 
@@ -2908,7 +2964,7 @@ One row per known agent session. Upserted on open (via `hostSessionId` + `adapte
 `registration_sequence` is the position a session reserved in the `monitor_events` materialization
 order (that table's AUTOINCREMENT counter, the counter a retry's `admission_sequence` comes from)
 when it was first registered. A completed retry projects only into sessions registered before its
-admission (§2.6). Resuming a session keeps the position. It is `NULL` on sessions registered before
+admission (§2.7). Resuming a session keeps the position. It is `NULL` on sessions registered before
 positions were reserved; the additive migration adds the column to every released shape.
 
 ### `monitor_state`
@@ -2969,10 +3025,10 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `errored` — a failure occurred and was **isolated** so the tick (or watcher) continued. Three sub-cases:
-  - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped.
+  - `observe()` threw or rejected in the tick loop: `ingest()` was never called, so the monitor's persisted `sourceState` is left exactly as it was and no subsequent delta is dropped. Held notify work that comes due still flushes (§2.6; never ahead of retained work, §2.7); its `triggered` row is written first, so this `errored` row stays the newest.
   - A dispatched observation failed to materialize. The same rows are written whether the span
-    came from `ingest()` (tick or watch path) or from the not-due notify-window flush
-    (`flushRollupWindow()`). The outcome depends on the failure kind (ordered retry suffix and
+    came from `ingest()` (tick or watch path) or from the held-work flush
+    (`flushHeldNotifyWork()`, §2.6, §4.4). The outcome depends on the failure kind (ordered retry suffix and
     admission-unit rules: §2):
     - _Savepoint-local failure_ (e.g. `RAISE(ABORT)` on an event, projection/cursor or snapshot
       write): that envelope's own materialization rolls back, the earlier committed prefix stays,
@@ -3020,10 +3076,8 @@ An audit trail of each due monitor's outcome per tick. For every evaluated monit
 
   An unavailable `incoming-changes` repository/ref uses this existing source-error path (003 §6.5,
   decision #555, Refs #305). Source state, notify state and `lastObservationAt` remain unchanged,
-  including across reopening the store. Once due, rejection is retried on each daemon tick;
-  ordinary debounce/rollup dispatch in that monitor's due-ingest path waits for observation to
-  succeed. These are current error-path consequences, not a guarantee that accepted held work
-  can wait indefinitely: #558 tracks held-work flushing and #559 tracks retry cost separately.
+  including across reopening the store, except that held notify work still flushes on its own
+  timing (§2.6). Once due, rejection is retried on each daemon tick; #559 tracks that retry cost.
   Other monitors continue, and already-materialized events remain deliverable.
 
 - `rebaselined` — the source advanced its persisted baseline to the current point but could not compute a delta (e.g. a force-pushed or gc'd prior ref). The source returned zero observations and set `ObservationResult.outcome: 'rebaselined'`; the runtime maps this to `rebaselined` rather than `no-change`. The runtime enforces the zero-observation invariant: `rebaselined` is recorded **only** when the tick emitted nothing **and** returned zero observations — if a source sets the diagnostic while also returning observations (which are then held/suppressed), the tick is recorded as `suppressed`, not `rebaselined`. This outcome is distinct from `no-change` (genuinely nothing changed) and from `errored` (the source threw). `observationData` is `{ observed: 0, emitted: 0 }`.

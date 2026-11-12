@@ -429,7 +429,7 @@ describe('poll admission when the outbox cannot take the suffix', () => {
   });
 
   // A monitor with retained work drains it before taking newer input
-  // (002 §2.6), so a span is only ever admitted into an empty outbox and the
+  // (002 §2.7), so a span is only ever admitted into an empty outbox and the
   // boundary is the whole outbox, decided within one span. A fault at index 4
   // of a 260-observation span leaves a 256-record suffix, which fits exactly;
   // a fault at index 3 leaves 257, one record over.
@@ -1005,7 +1005,7 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     expect(loss(f)).toMatchObject({ count: 1, objectKey: 'object-1' });
 
     // The retained k3-1 (object-8) drains before the next span is observed
-    // (002 §2.6); an event for another key does not supersede the drop.
+    // (002 §2.7); an event for another key does not supersede the drop.
     f.writer.client.exec('DROP TRIGGER fault_k3_1');
     const otherKeys = await nextPoll(f);
     expect(otherKeys.emittedEventIds).toHaveLength(3);
@@ -1214,7 +1214,7 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     expect(
       f.reader.materializationRetrySummary(MONITOR_ID, f.root).pending,
     ).toBe(1);
-    // A monitor with retained work no longer admits a span (002 §2.6), so a
+    // A monitor with retained work no longer admits a span (002 §2.7), so a
     // drop recorded after a still-pending retry exists only in a database
     // written before that rule. Record the drop directly, as admission would.
     new RuntimeStore(f.writer.db).recordUnretainedObservation({

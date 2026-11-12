@@ -799,7 +799,7 @@ function sessionRow(index: number): Record<string, unknown> {
   };
 }
 
-describe('opening agent_sessions written by a released version (002 §2.6)', () => {
+describe('opening agent_sessions written by a released version (002 §2.7)', () => {
   it.each(SHAPES)(
     'keeps every session of $name, without a registration position, and positions new sessions',
     (shape) => {

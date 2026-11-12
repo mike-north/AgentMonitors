@@ -261,7 +261,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       registration_sequence INTEGER
     )
   `);
-  // Additive migration (002 §2.6): a session reserves its registration
+  // Additive migration (002 §2.7): a session reserves its registration
   // position in the event materialization order, so a delayed retry can tell
   // whether the session existed when its observation was admitted. Sessions
   // registered by an earlier version keep NULL and fall back to their

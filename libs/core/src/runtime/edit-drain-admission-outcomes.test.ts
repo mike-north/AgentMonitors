@@ -289,7 +289,7 @@ describe('an edit drain whose held envelope cannot be retained', () => {
     expect(f.drops()).toEqual([]);
 
     // Retained work drains before an edit is reconciled or the source is
-    // asked for more (002 §2.6). While its oldest retry keeps failing, the
+    // asked for more (002 §2.7). While its oldest retry keeps failing, the
     // edit waits: nothing drains, drops or is queued, and the source is idle.
     f.write(DEBOUNCE);
     const polls = f.control.polls;

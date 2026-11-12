@@ -54,7 +54,7 @@ export const agentSessions = sqliteTable('agent_sessions', {
    * order when it was first registered: reserved from that table's
    * AUTOINCREMENT counter, the same counter a retained observation reserves
    * its `admission_sequence` from. A retry completed later projects only into
-   * sessions registered before the observation was admitted (002 §2.6), and
+   * sessions registered before the observation was admitted (002 §2.7), and
    * this comparison does not depend on second-resolution timestamps. Resuming
    * a session keeps its original position. NULL on sessions registered before
    * positions were reserved.

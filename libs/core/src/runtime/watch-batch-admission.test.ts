@@ -245,7 +245,7 @@ describe('watch batch admission', () => {
         );
         interpretation.release();
         // A retained suffix drains, after its first backoff, before the next
-        // pull (002 §2.6).
+        // pull (002 §2.7).
         await vi.waitFor(() => expect(resumed).toBe(true), {
           timeout: 5_000,
           interval: 50,

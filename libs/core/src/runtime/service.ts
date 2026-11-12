@@ -972,7 +972,7 @@ const TERMINAL_RETRY_RECHECK_MS = 60_000;
 
 /**
  * Why retained work still blocks newer source input after a drain attempt
- * (002 §2.6): an attempt failed this time, the oldest retry is terminal and
+ * (002 §2.7): an attempt failed this time, the oldest retry is terminal and
  * waits for an operator re-arm, or it is backing off until `nextAttemptAt`.
  */
 type RetryDrainBlock =
@@ -4055,7 +4055,7 @@ export class AgentMonitorRuntime {
       return;
     }
     // Work this monitor already accepted completes before anything newer
-    // (002 §2.6): before held-work reconciliation, a retained poll result,
+    // (002 §2.7): before held-work reconciliation, a retained poll result,
     // a rollup window flush or a source call. A watched monitor is drained
     // here too, so a notify edit cannot release newer held work ahead of it;
     // its watcher also drains before each pull. Each completion is one
@@ -4140,39 +4140,20 @@ export class AgentMonitorRuntime {
       // be evaluated on every tick regardless of the source polling interval.
       // A monitor whose interval has not yet elapsed must still flush its
       // accumulated batch when the delivery window opens, so we dispatch
-      // `dispatchRollup` with zero new observations to trigger a window check.
+      // with zero new observations to trigger a window check.
       if (monitor.frontmatter.notify?.strategy === 'rollup') {
-        try {
-          const flushed = await this.flushRollupWindow(
+        await this.reportHeldNotifyFlush(
+          this.flushHeldNotifyWork(
             monitor,
             now,
             workspacePath,
             ephemeralSessionId,
-          );
-          acc.emittedEventIds.push(...flushed.emittedEventIds);
-          if (flushed.failures.length > 0) {
-            acc.erroredObservations.push({
-              monitorId: monitor.id,
-              message: summarizeMaterializationFailures(flushed.failures),
-            });
-          }
-        } catch (error) {
-          // Scheduling, empty-state and emitting admission failures all remain
-          // local to this monitor; healthy siblings must still be evaluated.
-          const message = errorMessage(error);
-          acc.erroredObservations.push({ monitorId: monitor.id, message });
-          try {
-            this.store.recordObservationHistory({
-              monitorId: monitor.id,
-              workspacePath,
-              sourceName,
-              result: 'errored',
-              observationData: { error: message },
-            });
-          } catch {
-            // Audit is best-effort after the failed admission rolled back.
-          }
-        }
+          ),
+          monitor.id,
+          workspacePath,
+          sourceName,
+          acc,
+        );
       }
 
       return;
@@ -4212,11 +4193,9 @@ export class AgentMonitorRuntime {
         },
       );
     } catch (observeError) {
-      this.pollAdmissions.delete(key);
-      this.wakeNotifyPolicy(key);
-      // observe() failed: record errored outcome (best-effort) and skip
-      // this monitor entirely for this tick. ingest() is NOT called, which
-      // preserves sourceState as described above.
+      // observe() failed: ingest() is NOT called, which preserves sourceState
+      // as described above, and the scheduling timestamp stays where the last
+      // successful observation left it.
       const message =
         observeError instanceof Error
           ? observeError.message
@@ -4225,6 +4204,28 @@ export class AgentMonitorRuntime {
       // `daemon once`/`daemon run` can report the failure instead of a bare
       // `emitted 0`.
       acc.erroredObservations.push({ monitorId: monitor.id, message });
+      // Runtime-owned timing does not wait on the source (002 §2.6): work held
+      // before the failure still flushes at its debounce deadline or rollup
+      // window. Like a successful poll, the flush is admitted synchronously
+      // while this poll still owns admission; only then is the slot released.
+      const flush = this.flushHeldWorkDespiteSourceFailure(
+        monitor,
+        admission,
+        now,
+        workspacePath,
+        ephemeralSessionId,
+      );
+      this.pollAdmissions.delete(key);
+      this.wakeNotifyPolicy(key);
+      await this.reportHeldNotifyFlush(
+        flush,
+        monitor.id,
+        workspacePath,
+        sourceName,
+        acc,
+      );
+      // The source failure is recorded after any flush, so it stays the
+      // newest outcome: progress on held work never reads as a healthy source.
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4334,7 +4335,7 @@ export class AgentMonitorRuntime {
   /**
    * Complete one monitor's retained materialization work, oldest admission
    * first, until its outbox is empty or a retry cannot complete now
-   * (002 §2.6). Each retry renders the event its stored envelope describes and
+   * (002 §2.7). Each retry renders the event its stored envelope describes and
    * commits it, its projections and the removal of the retry row together;
    * only sessions registered before the observation was admitted receive it.
    *
@@ -4438,7 +4439,7 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Report a tick that left retained work in place (002 §2.6). A failed
+   * Report a tick that left retained work in place (002 §2.7). A failed
    * attempt already has its `errored` row; a terminal retry gets one on every
    * tick it keeps the monitor paused, alongside the tick-result entry. A retry
    * that is backing off is a schedule wait, reported with its next attempt
@@ -4473,7 +4474,7 @@ export class AgentMonitorRuntime {
 
   /**
    * Hold a watcher's next pull until its monitor's retained work has drained
-   * (002 §2.6), retrying on the outbox's own backoff. Failed attempts are
+   * (002 §2.7), retrying on the outbox's own backoff. Failed attempts are
    * reported each time; a terminal retry is reported once and then only
    * rechecked. Returns `false` once the watcher no longer owns its monitor.
    */
@@ -4690,12 +4691,20 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Check a notify window without acquiring new source observations. Read the
-   * authoritative batch, minute marker, source checkpoint and observation time
-   * only after obtaining the writer lock; a schedule snapshot cannot safely
-   * supply this decision after another runtime has committed newer work.
+   * Flush held notify work whose time has come without acquiring new source
+   * observations: a rollup window check on a not-due tick (002 §4.4), or a
+   * debounce deadline or rollup window reached while the source's observe()
+   * fails (002 §2.6). Notify dispatch runs with an empty arrival set, so it
+   * decides exactly as a successful tick with no new observations would.
+   *
+   * Read the authoritative batch, minute marker, source checkpoint and
+   * observation time only after obtaining the writer lock; a schedule
+   * snapshot cannot safely supply this decision after another runtime has
+   * committed newer work. Only the notify state changes: the source baseline
+   * and scheduling timestamp are committed back as they were read, so a flush
+   * never stands in for a successful observation.
    */
-  private async flushRollupWindow(
+  private async flushHeldNotifyWork(
     monitor: MonitorDefinition,
     now: Date,
     workspacePath: string,
@@ -4703,9 +4712,12 @@ export class AgentMonitorRuntime {
   ): Promise<MaterializationSpanResult> {
     const admitted = runRuntimeTransaction(this.store, () => {
       const current = this.store.getMonitorState(monitor.id, workspacePath);
-      const dispatch = this.dispatchRollup(monitor, [], now, {
-        ...current.notifyState,
-      });
+      const dispatch = this.dispatchNotify(
+        monitor,
+        [],
+        now,
+        current.notifyState,
+      );
       const options: MaterializationSpanOptions = {
         observed: 0,
         workspacePath,
@@ -4730,6 +4742,74 @@ export class AgentMonitorRuntime {
       admitted.durable,
       admitted.options,
     );
+  }
+
+  /**
+   * The held-work flush for a poll whose observe() failed (002 §2.6). Runs
+   * under the admission gate current at this moment: a retired poll, or a
+   * closed gate for a rejected or missing definition (002 §2.0, §4.6), leaves
+   * held work untouched. Everything up to the flush's commit runs before this
+   * returns, so the caller can release poll admission right after the call;
+   * any failure, including a storage read, arrives as a rejection.
+   */
+  private async flushHeldWorkDespiteSourceFailure(
+    monitor: MonitorDefinition,
+    admission: PollAdmission,
+    now: Date,
+    workspacePath: string,
+    ephemeralSessionId: string | undefined,
+  ): Promise<MaterializationSpanResult> {
+    const latest = admission.retired
+      ? undefined
+      : this.watchPolicies.get(JSON.stringify([workspacePath, monitor.id]));
+    if (!latest || !this.hasCurrentNotifyHold(monitor.id, workspacePath)) {
+      return { emittedEventIds: [], failures: [] };
+    }
+    return await this.flushHeldNotifyWork(
+      this.applyWatchPolicy(monitor, latest),
+      now,
+      workspacePath,
+      ephemeralSessionId,
+    );
+  }
+
+  /**
+   * Put a held-work flush's outcome on the tick result. A flush that rolled
+   * back keeps its whole batch held for the next check; it is reported on the
+   * tick result and as a best-effort `errored` row, and stays local to this
+   * monitor so healthy siblings are still evaluated.
+   */
+  private async reportHeldNotifyFlush(
+    flush: Promise<MaterializationSpanResult>,
+    monitorId: string,
+    workspacePath: string,
+    sourceName: string,
+    acc: TickAccumulator,
+  ): Promise<void> {
+    try {
+      const flushed = await flush;
+      acc.emittedEventIds.push(...flushed.emittedEventIds);
+      if (flushed.failures.length > 0) {
+        acc.erroredObservations.push({
+          monitorId,
+          message: summarizeMaterializationFailures(flushed.failures),
+        });
+      }
+    } catch (error) {
+      const message = errorMessage(error);
+      acc.erroredObservations.push({ monitorId, message });
+      try {
+        this.store.recordObservationHistory({
+          monitorId,
+          workspacePath,
+          sourceName,
+          result: 'errored',
+          observationData: { error: message },
+        });
+      } catch {
+        // Audit is best-effort after the failed admission rolled back.
+      }
+    }
   }
 
   /**
@@ -5116,7 +5196,7 @@ export class AgentMonitorRuntime {
         const emittedStart = startup.emittedEventIds.length;
         // Work retained before startup (including before a restart) drains
         // before held work is reconciled or the source is asked for anything
-        // (002 §2.6). If it cannot drain yet, the admission gate stays closed
+        // (002 §2.7). If it cannot drain yet, the admission gate stays closed
         // and no edit is reconciled; a later tick drains it and opens the gate.
         const blocked = this.hasRetainedWork(monitor.id, workspacePath)
           ? await this.drainMaterializationRetries(
@@ -5192,7 +5272,7 @@ export class AgentMonitorRuntime {
    * pull. A whole-admission failure ends this iterator so its source cannot
    * advance beyond work that is absent from durable storage. Retained retries
    * count as successful admission, and the watcher drains them before its
-   * next pull (002 §2.6).
+   * next pull (002 §2.7).
    */
   private async consumeWatch(
     monitor: MonitorDefinition,
@@ -5240,7 +5320,7 @@ export class AgentMonitorRuntime {
       );
       if (!iterable) return;
       // Work retained before this watcher started (including before a
-      // restart) completes before its first pull (002 §2.6).
+      // restart) completes before its first pull (002 §2.7).
       if (
         this.hasRetainedWork(monitor.id, workspacePath) &&
         !(await this.drainBeforeWatchPull(
@@ -5699,7 +5779,7 @@ export class AgentMonitorRuntime {
    * becomes, without writing it. Admission writes it with
    * {@link RuntimeStore.insertEvent}; a retained retry hands the same
    * rendering to {@link RuntimeStore.completeMaterializationRetry}, so a
-   * drained retry produces exactly the event its span would have (002 §2.6).
+   * drained retry produces exactly the event its span would have (002 §2.7).
    * Returns `null` for an observation its payload gate suppresses.
    */
   private renderObservationEvent(input: ProcessObservationInput): {

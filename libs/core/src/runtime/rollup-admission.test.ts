@@ -252,7 +252,7 @@ function beforeAdmission(
   return () => {
     expect(firedAt, 'competing commit never fired').toBeDefined();
     expect(firedAt).toContain(
-      target === 'flush' ? 'flushRollupWindow' : 'withStoreWriter',
+      target === 'flush' ? 'flushHeldNotifyWork' : 'withStoreWriter',
     );
   };
 }
@@ -452,7 +452,7 @@ describe('not-due rollup admission', () => {
         .tick(f.monitorsDir, f.root);
       // The window does not flush again. Its retained suffix, now due, drains
       // on the reopened runtime in its original order, each exactly once
-      // (002 §2.6).
+      // (002 §2.7).
       expect(f.reader.listMaterializationRetries()).toEqual([]);
       expect(
         f.observer.client

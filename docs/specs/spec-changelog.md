@@ -9,9 +9,9 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-11-12 — Retained work drains before newer source input; retry recipients ordered by registration position (002 §2/§2.4/§2.5/§2.6/§4.6/§15; 004 §3.4; 005) — Refs #567
+## 2026-11-12 — Retained work drains before newer source input; retry recipients ordered by registration position (002 §2/§2.4/§2.5/§2.6/§2.7/§4.6/§15; 004 §3.4; 005) — Refs #567
 
-Add 002 §2.6. Work the runtime accepted but has not materialized now completes before its monitor
+Add 002 §2.7. Work the runtime accepted but has not materialized now completes before its monitor
 accepts anything newer. Each tick drains the monitor's retry outbox, oldest admission first, after
 the source-config preflight and before edit reconciliation, deferred poll results, rollup window
 flushes and `observe()`. A watcher drains before its first pull and after each batch; at startup,
@@ -19,13 +19,33 @@ retained work it cannot drain keeps its admission gate closed until a tick drain
 remains the monitor pauses: a failed attempt is reported with an `errored` history row and a tick
 `erroredObservations` entry, a backing-off row as a `skippedMonitors` entry at its next attempt, and
 a terminal row on every tick until it is re-armed. Held notify work waits behind retained work,
-including a held flush on a tick whose source call fails, because such a hold is always newer. A
-span is therefore only admitted into an empty outbox. Sessions now reserve a position in the
+because such a hold is always newer: ordering takes precedence over the timeliness of held work.
+That includes the held flush on a tick whose source call fails (§2.6): the drain runs first and a
+monitor with retained work does not call its source, so that flush never runs ahead of a pending,
+failing or terminal retry, and a terminal retry keeps the hold held until it is re-armed. §2.6
+states the same order from its side. A span is therefore only admitted into an empty outbox. Sessions now reserve a position in the
 materialization order when first registered (`agent_sessions.registration_sequence`, additive
 migration), and a completed retry projects only into sessions positioned before its admission,
 so a session opened in the same second is still ordered correctly. Rows written before positions
-existed fall back as described in §2.6. Previously a retry waited on its backoff while newer input
+existed fall back as described in §2.7. Previously a retry waited on its backoff while newer input
 was admitted ahead of it, and a late retry projected into every matching session.
+
+## 2026-11-12 — Held notify work flushes on time while its source fails (002 §2.6, §2.5, §4.3, §`observation_history`; 003 §6.5; 004 §3.3) — Refs #558
+
+Close the gap the `incoming-changes` source-error decision left open (#555): a due monitor whose
+`observe()` keeps failing used to keep accepted debounce and rollup work held indefinitely,
+because the error path returned before notify dispatch and the unchanged scheduling timestamp
+kept the not-due rollup check from running. New 002 §2.6: after recording the failure, the
+runtime runs the held-work flush (the not-due rollup window check, now `flushHeldNotifyWork()`,
+generalized to any held strategy) with no new observations. It flushes a passed debounce
+deadline or a matching rollup window, commits only the notify state change, and keeps the
+source baseline and `lastObservationAt`, so the monitor stays due and is retried as before. The
+source failure is reported beside the flushed ids, and its `errored` row is written after the
+flush's `triggered` row so history and explain still show the failing source. A rolled-back
+flush keeps the batch held. Schema-invalid, missing and rejected-in-flight definitions still
+block. No public outcome type or API change; continuous watchers and retry cadence (#559) are
+unchanged. 003 §6.5 and the #305 scenario list in 004 drop the old "held work waits for a
+successful observe" consequence; 004 §3.3 adds the required scenario.
 
 ## 2026-11-12 — A notify-policy edit drains held rollup work in the rollup flush's owned transaction (002 §4.4/§4.6; 004 §3.4) — Refs #498
 

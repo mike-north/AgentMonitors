@@ -518,7 +518,7 @@ export class RuntimeStore {
             createdAt: now,
             updatedAt: now,
             // Ordered against retry admissions without relying on whole-second
-            // timestamps (002 §2.6); a resumed session keeps this position.
+            // timestamps (002 §2.7); a resumed session keeps this position.
             registrationSequence: this.reserveAdmissionSequence(),
           })
           .run();
@@ -1318,7 +1318,7 @@ export class RuntimeStore {
             .where(eq(materializationRetryOutbox.id, id))
             .get();
           // Only sessions that existed when the observation was admitted
-          // receive it, however long the retry took (002 §2.6).
+          // receive it, however long the retry took (002 §2.7).
           const result = this.writeEvent(input, baseline, options, {
             admissionSequence: admission?.admissionSequence ?? null,
             observedAt: current.envelope.observedAt,
@@ -2011,7 +2011,7 @@ export class RuntimeStore {
 
   /**
    * Keep the sessions that were registered before a retained observation was
-   * admitted (002 §2.6). Both positions come from the materialization-order
+   * admitted (002 §2.7). Both positions come from the materialization-order
    * counter, so a session registered in the same second as the admission is
    * still ordered correctly. Data written before positions were reserved
    * falls back as follows: a retry without a position predates every
@@ -2066,7 +2066,7 @@ export class RuntimeStore {
    *
    * Registering a session reserves a position the same way, so a retry can
    * be ordered against the sessions that existed when it was admitted
-   * (002 §2.6). A registration position never belongs to an event.
+   * (002 §2.7). A registration position never belongs to an event.
    */
   private reserveAdmissionSequence(): number {
     const client = asInternalDb(this.db).$client;
