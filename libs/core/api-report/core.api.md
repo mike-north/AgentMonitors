@@ -304,6 +304,9 @@ export interface DoctorDeliveryCounts {
 }
 
 // @public
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+// @public
 export interface DoctorMonitorRollup {
     cadence: string;
     delivery: DoctorDeliveryCounts;
@@ -319,6 +322,7 @@ export interface DoctorMonitorRollup {
     nextDueAt?: Date;
     // (undocumented)
     sourceName: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
     // (undocumented)
     urgency: Urgency;
     valid: boolean;
@@ -404,6 +408,15 @@ export interface EphemeralMonitorRecord {
 //
 // @public
 export type EphemeralMonitorStatus = (typeof ephemeralMonitorStatus)[number];
+
+// @public
+export interface EphemeralMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
+    monitorId: string;
+    sessionId: string;
+    unretainedObservationLoss?: UnretainedObservationLoss;
+    validationError?: string;
+}
 
 // @public
 export interface ErroredObservation {
@@ -617,7 +630,7 @@ export function isValidIanaTimeZone(timeZone: string): boolean;
 // @public
 export function isVerifyScratchObjectKey(objectKey: string): boolean;
 
-// @public (undocumented)
+// @public
 export type JsonSchema = Record<string, unknown>;
 
 // @public
@@ -772,6 +785,7 @@ export type MonitorDeliveryState = 'unread' | 'claimed' | 'acknowledged';
 // @public
 export interface MonitorDoctorReport {
     duplicateIds: DuplicateMonitorId[];
+    ephemeralMonitorWork?: EphemeralMonitorWork[];
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
@@ -781,7 +795,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     monitorsDir: string;
     monitorsDirExists: boolean;
-    orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
+    orphanedMonitorWork?: OrphanedMonitorWork[];
     parseErrors: DoctorParseError[];
     workspacePath: string;
 }
@@ -1093,9 +1107,8 @@ export interface Observation {
     title: string;
 }
 
-// @public (undocumented)
+// @public
 export interface ObservationContext {
-    checkpoint?: (nextState: unknown) => Promise<void>;
     now: Date;
     previousState?: unknown;
     signal?: AbortSignal;
@@ -1131,10 +1144,9 @@ export interface ObservationHistoryRecord {
 // @public
 export type ObservationOutcome = 'triggered' | 'suppressed' | 'no-change' | 'no-files-matched' | 'errored' | 'rebaselined';
 
-// @public (undocumented)
+// @public
 export interface ObservationResult {
     nextState?: unknown;
-    // (undocumented)
     observations: Observation[];
     outcome?: 'rebaselined' | 'no-files-matched';
     warnings?: string[];
@@ -1146,7 +1158,7 @@ export interface ObservationSource {
     observe(config: Record<string, unknown>, context: ObservationContext): Promise<ObservationResult>;
     readonly scopeSchema: JsonSchema;
     readonly stateful?: boolean;
-    watch?(config: Record<string, unknown>, context: ObservationContext): AsyncIterable<Observation>;
+    watch?(config: Record<string, unknown>, context: ObservationContext): AsyncIterable<ObservationResult>;
 }
 
 // @public (undocumented)
@@ -1169,9 +1181,11 @@ export interface OpenSessionInput {
 export const OPERATION_TIMEOUT_PATTERN: string;
 
 // @public
-export interface OrphanedMaterializationRetrySummary {
+export interface OrphanedMonitorWork {
+    materializationRetries?: MaterializationRetrySummary;
     monitorId: string;
-    summary: MaterializationRetrySummary;
+    monitorKind: DoctorMonitorKind;
+    unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 // @public
@@ -1410,10 +1424,17 @@ export class RuntimeStore {
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    materializationRetryCapacity(monitorId: string, workspacePath: string | null): {
+        records: number;
+        bytes: number;
+    };
     materializationRetryMonitorIds(workspacePath: string | null): string[];
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    // @internal
+    outstandingUnretainedObservationLoss(monitorId: string, workspacePath: string): UnretainedObservationLoss | undefined;
     pendingEventIdsOutsideDefinition(monitorId: string, workspacePath: string | null, currentFingerprint: string): string[];
     // (undocumented)
     pendingEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
@@ -1436,6 +1457,14 @@ export class RuntimeStore {
         workspacePath: string | null;
         sourceName: string;
         result: ObservationOutcome;
+        observationData: Record<string, unknown>;
+    }): void;
+    // @internal
+    recordUnretainedObservation(input: {
+        monitorId: string;
+        workspacePath: string | null;
+        sourceName: string;
+        objectKey: string | undefined;
         observationData: Record<string, unknown>;
     }): void;
     retractObjectEvents(input: {
@@ -1493,6 +1522,8 @@ export class RuntimeStore {
     touchSession(sessionId: string): void;
     // (undocumented)
     unreadEventsForSession(sessionId: string, urgency?: 'low' | 'normal' | 'high'): MonitorEventRecord[];
+    // @internal
+    unretainedObservationMonitorIds(workspacePath: string): string[];
     // (undocumented)
     updateSessionRecap(sessionId: string): void;
     upsertObjectSuppression(input: {
@@ -1740,6 +1771,17 @@ export type TransformOutcome = {
     delivered: false;
     value?: undefined;
 };
+
+// @public
+export interface UnretainedObservationLoss {
+    count: number;
+    error: string;
+    objectKey?: string;
+    position?: number;
+    recordedAt: Date;
+    spanSize?: number;
+    title?: string;
+}
 
 // @public (undocumented)
 export type Urgency = 'low' | 'normal' | 'high';

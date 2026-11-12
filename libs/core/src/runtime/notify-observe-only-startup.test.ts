@@ -12,12 +12,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { SourceRegistry } from '../observation/registry.js';
-import type {
-  JsonSchema,
-  Observation,
-  ObservationContext,
-  ObservationResult,
-} from '../observation/types.js';
+import type { JsonSchema, ObservationResult } from '../observation/types.js';
 import { validateWatchScope } from '../schema/validate-scope.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
@@ -71,8 +66,10 @@ async function fixture(mode: 'watch' | 'poll' | 'none') {
   const registry = new SourceRegistry();
   const started = deferred<undefined>();
   const completion = deferred<ObservationResult>();
-  let context: (ObservationContext & { signal: AbortSignal }) | undefined;
-  let next: ((result: IteratorResult<Observation>) => void) | undefined;
+  let signal: AbortSignal | undefined;
+  let next: ((result: IteratorResult<ObservationResult>) => void) | undefined;
+  /** Resolved when the watcher next pulls: the previous batch was fully admitted. */
+  let pulled: (() => void)[] = [];
   let factories = 0;
   let oldPollCalls = 0;
   let observeOnlyCalls = 0;
@@ -103,14 +100,17 @@ async function fixture(mode: 'watch' | 'poll' | 'none') {
     watch(config, ctx) {
       factories++;
       factoryToken = config.token;
-      context = ctx;
+      signal = ctx.signal;
       return {
         [Symbol.asyncIterator]() {
           return this;
         },
-        next(): Promise<IteratorResult<Observation>> {
+        next(): Promise<IteratorResult<ObservationResult>> {
           return new Promise((resolve) => {
             next = resolve;
+            const waiting = pulled;
+            pulled = [];
+            for (const admitted of waiting) admitted();
             if (ctx.signal.aborted) resolve({ done: true, value: undefined });
             else
               ctx.signal.addEventListener(
@@ -272,23 +272,47 @@ async function fixture(mode: 'watch' | 'poll' | 'none') {
     get healthyFactories() {
       return healthyFactories;
     },
-    async emit(title: string) {
+    /** True while the established watcher is waiting for its next batch. */
+    get requesting() {
+      return next !== undefined;
+    },
+    /**
+     * Yield one batch from the established watcher once it requests input.
+     * `outcome` settles `admitted` when the watcher pulls again (the batch's
+     * transaction and Interpret finished) or `dropped` if it is aborted first.
+     */
+    async batch(titles: string[], nextState?: unknown) {
       await until(() => next !== undefined);
       const accept = next;
       next = undefined;
-      if (!accept) throw new Error('Source is not requesting input');
+      const watchSignal = signal;
+      if (!accept || !watchSignal)
+        throw new Error('Source is not requesting input');
+      const outcome = new Promise<'admitted' | 'dropped'>((resolve) => {
+        pulled.push(() => resolve('admitted'));
+        if (watchSignal.aborted) resolve('dropped');
+        else
+          watchSignal.addEventListener('abort', () => resolve('dropped'), {
+            once: true,
+          });
+      });
+      tasks.push(outcome);
       accept({
         done: false,
-        value: { title, snapshotText: title, objectKey: 'obj' },
+        value: {
+          observations: titles.map((title) => ({
+            title,
+            snapshotText: title,
+            objectKey: 'obj',
+          })),
+          ...(nextState !== undefined ? { nextState } : {}),
+        },
       });
       await settle();
+      return { outcome };
     },
-    checkpoint() {
-      if (!context?.checkpoint)
-        throw new Error('Actual source checkpoint unavailable');
-      const task = context.checkpoint({ cursor: 999 });
-      tasks.push(task);
-      return task;
+    async emit(title: string) {
+      await this.batch([title]);
     },
     due() {
       store.setMonitorState('held', root, {
@@ -341,7 +365,7 @@ for (const failure of ['scope', 'sqlite'] as const) {
   it(
     'observe-only startup ' +
       failure +
-      ' blocks an existing watcher and recovers before checkpoint/yield',
+      ' blocks an existing watcher and drains held work before its pending batch',
     async () => {
       const f = await fixture('watch');
       await f.emit('A');
@@ -354,12 +378,15 @@ for (const failure of ['scope', 'sqlite'] as const) {
         );
       const failed = await f.startup();
       let settled = false;
-      const checkpoint = f.checkpoint().then(() => {
+      // One batch carries B and its cursor: neither may commit beside held A.
+      const pending = await f.batch(['B'], { cursor: 999 });
+      void pending.outcome.then(() => {
         settled = true;
       });
-      await f.emit('B');
       const blocked = f.state();
       const acceptedWhileBlocked = settled;
+      // Backpressure: the waiting batch is not followed by a newer pull.
+      const pulledWhileBlocked = f.requesting;
       const repeated = await f.startup();
       const afterRepeated = f.state();
       const acceptedAfterRepeat = settled;
@@ -370,7 +397,7 @@ for (const failure of ['scope', 'sqlite'] as const) {
       const recoveredByStartup = f.rows().length === 2;
       // Cleanup recovery for a parent regression occurs only after capturing its actual startup result.
       if (!recoveredByStartup) await f.tick();
-      await checkpoint;
+      expect(await pending.outcome).toBe('admitted');
       await until(() => f.rows().length === 2);
       if (failure === 'scope') {
         // The source-config preflight (002 §2.0) reports exactly the `validate`
@@ -389,6 +416,7 @@ for (const failure of ['scope', 'sqlite'] as const) {
       expect(blocked).toEqual(retained);
       expect(afterRepeated).toEqual(retained);
       expect(acceptedWhileBlocked).toBe(false);
+      expect(pulledWhileBlocked).toBe(false);
       expect(acceptedAfterRepeat).toBe(false);
       expect(recovery.errors).toEqual([]);
       expect(recoveredByStartup).toBe(true);
@@ -405,31 +433,34 @@ for (const failure of ['scope', 'sqlite'] as const) {
   );
 }
 
-it('tick-rejected scope blocks an existing watcher with held work and recovers before checkpoint/yield', async () => {
+it('tick-rejected scope blocks an existing watcher with held work and drains it before its pending batch', async () => {
   const f = await fixture('watch');
   await f.emit('A');
   const retained = f.state();
   f.edit('observe-only', 7);
   const rejected = await f.tick();
   let settled = false;
-  const checkpoint = f.checkpoint().then(() => {
+  const pending = await f.batch(['B'], { cursor: 999 });
+  void pending.outcome.then(() => {
     settled = true;
   });
-  await f.emit('B');
   const blocked = f.state();
   const rowsWhileBlocked = f.rows();
   const acceptedWhileBlocked = settled;
+  const pulledWhileBlocked = f.requesting;
   f.edit();
   const recovery = await f.tick();
-  await checkpoint;
+  expect(await pending.outcome).toBe('admitted');
   await until(() => f.rows().length === 2);
   expect(rejected.skippedMonitors).toEqual([
     { monitorId: 'held', validationError: SCOPE_DIAGNOSTIC },
   ]);
   expect(rejected.erroredObservations).toEqual([]);
   expect(retained.notifyState.pendingDebounce?.observations).toHaveLength(1);
-  // Neither yield B nor checkpoint({ cursor: 999 }) commits beside held A.
+  // Neither B nor its { cursor: 999 } baseline commits beside held A, and the
+  // waiting batch is not followed by a newer pull.
   expect(acceptedWhileBlocked).toBe(false);
+  expect(pulledWhileBlocked).toBe(false);
   expect(blocked).toEqual(retained);
   expect(blocked.notifyState.pendingDebounce?.observations).toHaveLength(1);
   expect(blocked.sourceState).toEqual(retained.sourceState);
@@ -474,24 +505,32 @@ for (const via of ['tick', 'rescan'] as const) {
       // startup snapshot (debounce pacing, original handling).
       await f.emit('A');
       let settled = false;
-      const checkpoint = f.checkpoint().then(() => {
+      const baseline = await f.batch([], { cursor: 999 });
+      void baseline.outcome.then(() => {
         settled = true;
       });
       await settle();
       expect(settled).toBe(true);
-      await checkpoint;
+      expect(await baseline.outcome).toBe('admitted');
       const accepted = f.state();
       expect(accepted.notifyState.pendingDebounce?.observations).toHaveLength(
         1,
       );
       expect(accepted.sourceState).toEqual({ cursor: 999 });
       expect(f.rows()).toEqual([]);
-      // Once A is held, the same rejection protects it from later yields.
+      // Once A is held, the same rejection protects it from later batches.
       await reject();
-      await f.emit('B');
+      let later = false;
+      const pending = await f.batch(['B']);
+      void pending.outcome.then(() => {
+        later = true;
+      });
       expect(f.state()).toEqual(accepted);
+      expect(later).toBe(false);
+      expect(f.requesting).toBe(false);
       f.edit();
       await f.tick();
+      expect(await pending.outcome).toBe('admitted');
       await until(() => f.rows().length === 2);
       expect(f.rows()).toEqual(AB);
       expect(f.state().sourceState).toEqual({ cursor: 999 });
@@ -510,14 +549,16 @@ it('valid observe-only startup drains old work while preserving its established 
   await f.emit('A');
   f.edit();
   const startup = await f.startup();
-  const committedBeforeCheckpoint = f.rows();
-  await f.checkpoint();
+  const committedBeforeBaseline = f.rows();
+  const baseline = await f.batch([], { cursor: 999 });
+  expect(await baseline.outcome).toBe('admitted');
   await f.emit('B');
   const acceptedBeforeTick = f.rows();
   expect(startup.errors).toEqual([]);
   expect(startup.handle.monitorIds).toEqual([]);
-  expect(committedBeforeCheckpoint).toEqual([AB[0]]);
+  expect(committedBeforeBaseline).toEqual([AB[0]]);
   expect(acceptedBeforeTick).toEqual(AB);
+  expect(f.state().sourceState).toEqual({ cursor: 999 });
   expect(f.factories).toBe(1);
   expect(f.factoryToken).toBe('initial');
   expect(f.observeOnlyCalls).toBe(0);

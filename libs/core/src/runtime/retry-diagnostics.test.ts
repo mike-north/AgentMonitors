@@ -228,19 +228,24 @@ describe('retained-work diagnostics', () => {
       workspacePath: root,
       now: NOW,
     });
-    expect(
-      report.orphanedMaterializationRetries?.map((group) => group.monitorId),
-    ).toEqual(['duplicate', 'missing', 'parse']);
-    for (const group of report.orphanedMaterializationRetries ?? []) {
-      expect(Object.keys(group).sort()).toEqual(['monitorId', 'summary']);
-      expect(group.summary.terminal).toBe(1);
+    expect(report.orphanedMonitorWork?.map((group) => group.monitorId)).toEqual(
+      ['duplicate', 'missing', 'parse'],
+    );
+    for (const group of report.orphanedMonitorWork ?? []) {
+      expect(Object.keys(group).sort()).toEqual([
+        'materializationRetries',
+        'monitorId',
+        'monitorKind',
+      ]);
+      expect(group.monitorKind).toBe('persistent');
+      expect(group.materializationRetries?.terminal).toBe(1);
     }
     const summaries = [
       ...report.monitors.flatMap((monitor) =>
         monitor.materializationRetries ? [monitor.materializationRetries] : [],
       ),
-      ...(report.orphanedMaterializationRetries ?? []).map(
-        (group) => group.summary,
+      ...(report.orphanedMonitorWork ?? []).flatMap((group) =>
+        group.materializationRetries ? [group.materializationRetries] : [],
       ),
     ];
     const ids = summaries.flatMap((summary) =>
@@ -293,7 +298,7 @@ describe('retained-work diagnostics', () => {
         const summary =
           kind === 'valid'
             ? doctor.monitors[0]?.materializationRetries
-            : doctor.orphanedMaterializationRetries?.[0]?.summary;
+            : doctor.orphanedMonitorWork?.[0]?.materializationRetries;
         for (const found of [report.materializationRetries, summary]) {
           expect(found).toMatchObject({
             pending: row.status === 'pending' ? 1 : 0,
@@ -349,7 +354,8 @@ describe('retained-work diagnostics', () => {
       expected,
     );
     expect(
-      doctor.orphanedMaterializationRetries?.[0]?.summary.records[0]?.lastError,
+      doctor.orphanedMonitorWork?.[0]?.materializationRetries?.records[0]
+        ?.lastError,
     ).toBe(expected);
     expect(store.getMaterializationRetry(row.id).lastError).toBe(legacyError);
   });
@@ -368,16 +374,16 @@ describe('retained-work diagnostics', () => {
     });
     expect(report.monitorsDirExists).toBe(false);
     expect(report.monitors).toEqual([]);
+    expect(report.orphanedMonitorWork?.map((group) => group.monitorId)).toEqual(
+      ['first', 'second'],
+    );
     expect(
-      report.orphanedMaterializationRetries?.map((group) => group.monitorId),
-    ).toEqual(['first', 'second']);
-    expect(
-      report.orphanedMaterializationRetries?.[0]?.summary.records.map(
+      report.orphanedMonitorWork?.[0]?.materializationRetries?.records.map(
         (row) => row.id,
       ),
     ).toEqual(rows.map((row) => row.id));
     expect(
-      report.orphanedMaterializationRetries?.[1]?.summary.records.map(
+      report.orphanedMonitorWork?.[1]?.materializationRetries?.records.map(
         (row) => row.id,
       ),
     ).toEqual([last.id]);
