@@ -404,3 +404,66 @@ it('records an empty first startup without boot, process-table or environment sc
   expect(readProcessTable).not.toHaveBeenCalled();
   expect(readCommandMarks).not.toHaveBeenCalled();
 });
+
+it('identifies unrelated unreadable marks without attributing a readable detached escape', async () => {
+  const f = await fixture();
+  const parent = { pid: 4242, pgid: 4242, startTime: 'parent' };
+  const escape = { pid: 4243, pgid: 7000, startTime: 'escape' };
+  const unreadable = { pid: 4244, pgid: 8000, startTime: 'unreadable' };
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [parent, escape, unreadable],
+  });
+  let checkedPendingReceipt = false;
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => {
+    if (pids.length === 1 && pids[0] === parent.pid) {
+      const sql = new Database(`${f.db}.commands.sqlite`);
+      try {
+        const row = sql
+          .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+          .get();
+        if (
+          typeof row !== 'object' ||
+          row === null ||
+          !('result' in row) ||
+          typeof row.result !== 'string'
+        )
+          throw new Error('Missing durable running receipt');
+        expect(JSON.parse(row.result).outcomes).toContainEqual(
+          expect.objectContaining({ pid: unreadable.pid, status: 'abstained' }),
+        );
+        checkedPendingReceipt = true;
+      } finally {
+        sql.close();
+      }
+    }
+    return {
+      supported: true,
+      marks: pids.includes(parent.pid)
+        ? new Map([[parent.pid, f.token]])
+        : new Map(),
+      unreadable: pids.includes(unreadable.pid) ? [unreadable.pid] : [],
+    };
+  });
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const result = await f.journal.sweep();
+  expect(result.status).toBe('incomplete');
+  expect(checkedPendingReceipt).toBe(true);
+  expect(kill).toHaveBeenCalledExactlyOnceWith(parent.pid, 'SIGKILL');
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: parent.pid,
+      status: 'reaped',
+    }),
+  );
+  const abstentions = result.outcomes.filter(
+    (outcome) => outcome.status === 'abstained',
+  );
+  expect(abstentions.length).toBeGreaterThan(0);
+  expect(abstentions.every((outcome) => outcome.pid === unreadable.pid)).toBe(
+    true,
+  );
+  expect(result.outcomes.some((outcome) => outcome.pid === escape.pid)).toBe(
+    false,
+  );
+});

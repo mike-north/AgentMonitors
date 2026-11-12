@@ -109,6 +109,9 @@ spawn-PID records and signal-time evidence changes. The new signal site is inven
 queries; the first command awaits its durable admission mark, while actual previous lives are
 still swept before readiness. Capture fixtures record their own wrapper identities and use
 verified per-process cleanup instead of signalling a PGID guessed from a PPID.
+Unreadable ownership marks retain their affected PIDs as discovery abstentions, without attributing
+those processes to a command. Escape silence is per process: unrelated unreadable marks can make
+the overall pass incomplete while positively confirmed work is reaped.
 
 ## 2026-11-12 — Spec 004 gap markers reconciled with shipped coverage; gap-drift check (004 §3.0/§3.1/§3.5/§5.1; roadmap) — Closes #287
 

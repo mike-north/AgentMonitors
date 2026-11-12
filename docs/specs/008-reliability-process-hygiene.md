@@ -221,8 +221,12 @@ Diagnostics are durable `restart_sweeps.result` receipts in the journal: `runnin
 `incomplete`, start timestamp and per-life/per-PID `reaped`, `abstained`, `gone`, `failed` or
 `owner-alive` outcomes. A reap includes PID, start-time/group evidence, boot and daemon life;
 abstentions include the reason. An empty complete receipt proves the pass ran with nothing to do;
-unreadable discovery is incomplete, and an interrupted pass stays running. Decisions are saved
-incrementally and the most recent 20 receipts per workspace are retained. `reaped` additionally requires
+unreadable discovery is incomplete, and an interrupted pass stays running. Each unreadable
+same-user ownership mark records an abstention with its PID, without claiming that PID belongs to
+the command. An incomplete pass may still reap positively confirmed work. A readable detached
+mark-erased escape has no outcome even when an unrelated unreadable PID makes the pass incomplete.
+Decisions are saved incrementally, including discovery obstacles before later identity queries,
+and the most recent 20 receipts per workspace are retained. `reaped` additionally requires
 terminal evidence (absence, a different start-time incarnation, or a zombie/dead state), not just
 an accepted signal. A sent signal with unconfirmed termination is `failed` with a reason.
 Abstained lives remain for later reconciliation. This is the input for #507; no new active warning surface ships here.

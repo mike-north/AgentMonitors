@@ -891,6 +891,10 @@ group-confirmed unmarked children, late forks, malformed records, bounded discov
 confirmation, zero host queries for empty-journal readiness, recycled anchor PIDs between discovery readings, an old owner PID reused by the new
 daemon, and PID reuse during the last marker read. Source tests prove optional PID bookkeeping
 failures cannot abandon live supervision.
+Unreadable-mark controls require per-PID abstentions durable before later identity queries;
+an unrelated unreadable environment may make discovery incomplete without producing an outcome
+for a readable detached mark-erased escape. Escape coverage must still prove the parent's reap,
+the child's survival, and no diagnostic for that child.
 
 ### 3.5.2 Literal-path verify cleanup and first-attempt acceptance
 

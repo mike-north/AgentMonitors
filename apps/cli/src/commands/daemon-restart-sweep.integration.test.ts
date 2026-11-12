@@ -240,12 +240,45 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
     it('leaves a detached mark-erased escape alone without a diagnostic warning', async () => {
       const pids = await orphan('escaped');
       await start();
-      await expect.poll(() => diagnostics()?.status).toBe('complete');
-      expect(ownedWorkerTerminated(pids.parent)).toBe(true);
-      expect(ownedWorkerTerminated(pids.child)).toBe(false);
-      expect(diagnostics()?.outcomes.some((o) => o.pid === pids.child)).toBe(
-        false,
+      await expect
+        .poll(() => diagnostics()?.status)
+        .toMatch(/^(complete|incomplete)$/);
+      const receipt = diagnostics();
+      if (receipt === undefined)
+        throw new Error('Missing finished sweep receipt');
+      const evidence = JSON.stringify(receipt);
+      expect(ownedWorkerTerminated(pids.parent), evidence).toBe(true);
+      expect(ownedWorkerTerminated(pids.child), evidence).toBe(false);
+      expect(receipt.outcomes, evidence).toContainEqual(
+        expect.objectContaining({ pid: pids.parent, status: 'reaped' }),
       );
+      expect(
+        receipt.outcomes.some((o) => o.pid === pids.child),
+        evidence,
+      ).toBe(false);
+      expect(
+        receipt.outcomes.some((o) => o.status === 'failed'),
+        evidence,
+      ).toBe(false);
+      // A shared host may have other unreadable environments. Their explicitly
+      // named abstentions cannot turn a readable, mark-erased escape into owned
+      // work or require the entire host's discovery to be complete.
+      if (receipt.status === 'incomplete') {
+        const abstentions = receipt.outcomes.filter(
+          (o) => o.status === 'abstained',
+        );
+        expect(abstentions.length, evidence).toBeGreaterThan(0);
+        for (const outcome of abstentions) {
+          expect(outcome, evidence).toMatchObject({
+            pid: expect.any(Number),
+            reason:
+              'Same-user ownership mark could not be read; command attribution is unknown',
+          });
+          expect([pids.parent, pids.child], evidence).not.toContain(
+            outcome.pid,
+          );
+        }
+      }
     }, 30_000);
 
     for (const previousBoot of [false, true]) {

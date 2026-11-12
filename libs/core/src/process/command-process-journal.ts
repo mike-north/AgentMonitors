@@ -229,12 +229,19 @@ export class CommandProcessJournal implements CommandProcessOwner {
       return finish('incomplete');
     }
     let complete = (marks.unreadable?.length ?? 0) === 0;
-    if (!complete)
+    // An unreadable environment is a discovery obstacle, never evidence that
+    // its process belongs to a command life. Preserve the PID so consumers can
+    // distinguish that uncertainty from a readable mark-erased escape.
+    for (const pid of marks.unreadable ?? [])
       outcomes.push({
         status: 'abstained',
         life: this.life,
-        reason: 'Some same-user ownership marks could not be read',
+        pid,
+        reason: UNREADABLE_OWNERSHIP_REASON,
       });
+    // A later identity query can block or the daemon can crash. The running
+    // receipt must already retain the obstacles discovered by this reading.
+    if (!complete) save('running');
     const lives = rows.map((raw) => lifeSchema.safeParse(raw));
     // A daemon can itself inherit an old command mark. A currently registered
     // live daemon owner is never cleanup work, including this very process.
@@ -497,16 +504,26 @@ export class CommandProcessJournal implements CommandProcessOwner {
         const nextMarks = await readCommandMarks(
           next.processes.map((p) => p.pid),
         );
-        if (!nextMarks.supported || (nextMarks.unreadable?.length ?? 0) > 0) {
+        if (!nextMarks.supported) {
           complete = false;
           retained = true;
           outcomes.push({
             status: 'abstained',
             life: previous.life,
-            reason: nextMarks.supported
-              ? 'Some same-user ownership marks could not be read'
-              : nextMarks.reason,
+            reason: nextMarks.reason,
           });
+          break;
+        }
+        if ((nextMarks.unreadable?.length ?? 0) > 0) {
+          complete = false;
+          retained = true;
+          for (const pid of nextMarks.unreadable ?? [])
+            outcomes.push({
+              status: 'abstained',
+              life: previous.life,
+              pid,
+              reason: UNREADABLE_OWNERSHIP_REASON,
+            });
           break;
         }
         reading = next;
@@ -560,6 +577,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
 
 /** Bound startup discovery even if marked work continuously forks while being reconciled. */
 const MAX_DISCOVERY_PASSES = 8;
+
+/** Missing mark evidence names an uncertainty; it does not attribute the PID to a command. */
+const UNREADABLE_OWNERSHIP_REASON =
+  'Same-user ownership mark could not be read; command attribution is unknown';
 
 /** A failed or changing anchor cannot lend its old group authority to unrelated work. */
 type GroupAnchorConfirmation =
