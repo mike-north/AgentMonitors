@@ -1431,8 +1431,10 @@ An observation that fails the check is **not held**:
 3. It gets one `errored` `observation_history` row whose `observationData.error` is
    `Observation "<title>" was not held for <debounce|rollup>: it cannot be serialized (<reason>).`
    The title and reason are each reduced to one terminal-safe line. The title is capped at 200 code
-   points and the reason at 512, so the reason stays visible when history and explain cap the whole
-   message at 512. If the serializer's reason cannot be read (it threw a value that cannot be
+   points and the reason at 512. The stored row and JSON history keep the whole message; history and
+   explain text, and explain's stage reasons, cap it at 512 code points, so the start of the reason
+   always stays visible there, but a long reason (for example a deep circular-structure path) can be
+   cut. If the serializer's reason cannot be read (it threw a value that cannot be
    converted to text), the reason is the fixed text `unknown serialization error`; building the
    message never throws.
 4. The same message is reported where the path reports failures: the tick result's

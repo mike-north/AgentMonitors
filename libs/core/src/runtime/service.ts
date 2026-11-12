@@ -497,7 +497,8 @@ function serializeObservation(
  * Longest observation title, in code points, a not-held outcome message
  * carries. It is well below the 512-code-point display cap that history and
  * explain apply to the whole message, so a long title can never push the
- * serializer's reason out of the human views (002 §4.7).
+ * start of the serializer's reason out of the human views; a long reason can
+ * still be cut there, while the stored row keeps it whole (002 §4.7).
  */
 const NOT_HELD_TITLE_LIMIT = 200;
 
