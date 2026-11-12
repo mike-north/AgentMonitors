@@ -496,6 +496,14 @@ The `RuntimeStore.saveSnapshot()` and `RuntimeStore.latestSnapshot()` methods (i
 | Retained retry diagnostics survive unusable definitions and stay isolated | Covered (`libs/core/src/runtime/retry-diagnostics.test.ts` — all explain early returns, removed/parse-failed/duplicate doctor outboxes, same-id workspace and NULL-scope isolation, omitted-workspace fallback, 257 rows across two monitors, metadata privacy/order and read-only state preservation).                                                                                     |
 | Retry summaries never expose captured envelopes or payloads               | Covered (`libs/core/src/runtime/retry-outbox.test.ts` and `retry-diagnostics.test.ts` — explicit safe metadata shape and private captured-input sentinels absent across reports).                                                                                                                                                                                                           |
 
+Retry CLI/IPC diagnostics are covered by `apps/cli/src/retry-diagnostics.test.ts`: real socket
+roundtrips revive distinct created/updated/next-attempt Dates for explain, doctor attached summaries
+and orphan groups; older-daemon omissions work in both commands and formats. Its CLI subprocesses run the shared Nx-built
+`apps/cli/dist/index.cjs` (built by `nx test`'s dependency, never rebuilt by the test, per §2.9).
+No retries or timing delays mask artifact ownership. Built CLI text/JSON
+preserve missing/invalid/duplicate definition errors and retained IDs exactly once, normalize legacy
+unsafe errors, exclude private metadata fields and other workspaces, and leave durable state unchanged.
+
 ### Snapshot materialization order
 
 `runtime/snapshot-materialization-order.test.ts` verifies that the diff predecessor is

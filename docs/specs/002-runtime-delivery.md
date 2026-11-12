@@ -2181,8 +2181,11 @@ value. It **MUST NOT** skip or relabel the row or return fabricated healthy tota
 private envelope remain unchanged; this adds no lifecycle value or automatic repair behavior.
 
 Report additions remain optional for older-daemon compatibility. _Current:_ core retry metadata
-reports. _Target:_ CLI rendering and socket date revival, including orphan groups, in #496. Core
-Date values are not evidence of correctly reconstructed dates after a JSON IPC roundtrip.
+reports, CLI text/JSON rendering, and socket Date revival for explain, attached doctor summaries,
+and orphan groups. The CLI projects only the documented retry metadata fields and normalizes legacy
+error controls and length at its wire boundary as well as at text display. Omitted older-daemon
+fields remain supported; doctor JSON uses empty summaries/groups while explain preserves omission.
+Real owned-socket tests verify dates rather than inferring correctness from core Date objects.
 
 ### `session_event_state`
 

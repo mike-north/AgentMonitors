@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-10 — Doctor does not invent an outbox for unattributed monitor rows; scoped remediation (004, 005) — Refs #496
+
+Doctor attributes each retry outbox once. A monitor row whose id has an orphan group claims no
+count: JSON omits `materializationRetries` and the text rollup shows `retry-outbox=orphaned`. Any
+other row without a summary, including a duplicated id with no retained work and every row of an
+older daemon report that carries no orphan groups, gets the empty summary (`0/0`). Retained-work remediation names
+`monitor explain` with `--workspace`/`--dir` when doctor was given non-default values. 004 now
+describes the retry CLI suite as running the shared Nx-built bundle, not an owned package layout.
+
 ## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
 
 States a contract the runtime already satisfied: a pending event is delivered with the urgency,
@@ -32,6 +41,13 @@ materialization diagnosis with an omitted suffix. Require deterministic real-par
 and no-interleaving controls across valid, missing, invalid, duplicate and unschedulable definitions,
 with native rows and opaque state preserved. This does not establish a cross-process snapshot,
 change timestamps, or add automatic retry admission to the diagnostic primitives.
+
+## 2026-11-07 — Keep nested-only retry details visible in text explain (005) — Refs #496
+
+Text explain selects recognized materialization retry details when a partial compatibility report
+omits the optional top-level summary. It preserves structured omission, existing stage reasons and
+verdict, and canonical top-level precedence; available safe record details appear once. Empty or
+absent summaries and unrelated stage details do not fabricate or duplicate records.
 
 ## 2026-11-07 — Reject unsupported persisted retry status (002) — Refs #495
 
@@ -471,6 +487,16 @@ evidence across window rotation, and refuse negative verdicts when history gaps 
 Keep explicit timeout caps and two-distinct-row no-change confirmation. Unit tests use actual persisted
 equal-second rows; a real daemon regression waits for durable triggered history before command exit.
 
+## 2026-11-01 — CLI retained-work diagnostics across IPC and definition failures (002, 004, 005) — Refs #496
+
+Adopt optional orphan groups alongside current-monitor summaries in doctor text/JSON. Preserve
+original definition errors while adding failing retained-work checks and actionable record IDs.
+Reconstruct all retry Dates through real socket clients and normalize legacy error controls/length
+while projecting only safe metadata. Older daemons may omit both attached summaries and orphan
+groups. Explain retains retry-only fallback reports. Tests use actual JSONL sockets, the built CLI,
+and legacy SQLite rows to verify metadata privacy, exactly-once scope, and diagnostic nonmutation.
+Remediation does not claim an available retry command or automatic retry adoption.
+
 ## 2026-10-31 — Retained-work diagnostics independent of definitions (002 persistence, 004 §3.4) — Refs #495
 
 Require retry metadata in every core explain outcome, preserving the actual definition/scheduling
@@ -624,7 +650,9 @@ checked before mutation, and safe errors are control-stripped and bounded. The l
 fixed retry delays, terminal state after five failures, explicit re-arm, and transaction-coupled
 completion so a thrown materialization cannot delete its durable retry. Operator diagnostics follow
 with bounded id/status/attempt/error/timestamp metadata in core reports; stored envelopes and
-payloads never cross that reporting boundary. CLI rendering follows in the next stack layer.
+payloads never cross that reporting boundary. `monitor explain` renders those records, `doctor`
+names the exact monitor command and fails for pending or terminal work, and reports from older
+daemons default to an empty outbox instead of breaking the CLI.
 
 ## 2026-08-13 — Event materialization is one atomic durable unit (002 §5, 004 §3.4) — Refs #295, #481
 
