@@ -59,6 +59,8 @@ const daemonMethodSchema = z.enum([
   'events.ack',
   'events.retractObject',
   'events.suppressObject',
+  'verifyArtifacts.register',
+  'verifyArtifacts.requestCleanup',
   'hook.claim',
   'hook.reserve',
   'hook.commit',
@@ -141,6 +143,28 @@ const eventsSuppressObjectParamsSchema = z.object({
   }),
   ttlMs: z.number().int().positive(),
   workspacePath: z.string().optional(),
+});
+// verify --use-workspace-daemon's durable artifact ownership (issue #562):
+// registered BEFORE the scratch file is created, so the daemon can keep that
+// exact key out of later sessions even if the run is killed before any event
+// projects. Only a verify scratch path carrying the run's own token is
+// accepted; a real watched path never gains by-key cleanup authority.
+const verifyArtifactsRegisterParamsSchema = z.object({
+  runId: z.string().regex(/^[0-9a-f]{12}$/, {
+    message: 'runId must be a 12-character lowercase hex verify run token',
+  }),
+  ownerSessionId: z.string(),
+  workspacePath: z.string().min(1),
+  monitorId: z.string(),
+  objectKey: z.string().refine(isVerifyScratchObjectKey, {
+    message:
+      'objectKey must be a verify scratch path (agentmonitors-verify-<token>); a real watched path keeps its exact event-id cleanup.',
+  }),
+});
+// The owner's explicit cleanup request after its proof: records permanent
+// cleanup authority for the run's artifact and retracts its existing events.
+const verifyArtifactsRequestCleanupParamsSchema = z.object({
+  runId: z.string(),
 });
 const hookClaimParamsSchema = z.object({
   sessionId: z.string(),
@@ -797,6 +821,18 @@ function handleRequest(
             : {}),
         }),
       });
+    }
+    case 'verifyArtifacts.register': {
+      const params = verifyArtifactsRegisterParamsSchema.parse(request.params);
+      return Promise.resolve(runtime.registerVerifyArtifact(params));
+    }
+    case 'verifyArtifacts.requestCleanup': {
+      const params = verifyArtifactsRequestCleanupParamsSchema.parse(
+        request.params,
+      );
+      return Promise.resolve(
+        runtime.requestVerifyArtifactCleanup({ runId: params.runId }),
+      );
     }
     case 'hook.claim': {
       const params = hookClaimParamsSchema.parse(request.params);

@@ -128,6 +128,9 @@ export async function retractObjectEventsClient(
  * runtime), while a later session still never sees the scratch event. MUST only
  * target verify's own `…/agentmonitors-verify-<token>` scratch path. Returns the
  * number of already-materialized events retracted immediately.
+ *
+ * Current verify uses this finite tombstone only against a daemon that predates
+ * verify artifact ownership ({@link registerVerifyArtifactClient}, issue #562).
  */
 export async function suppressObjectEventsClient(
   input: {
@@ -144,6 +147,47 @@ export async function suppressObjectEventsClient(
     socketPath ? { socketPath } : {},
   );
   return result.removed;
+}
+
+/**
+ * Register exact ownership of verify's synthetic scratch artifact on the LIVE
+ * daemon, before the file is created (issue #562). From then on the daemon can
+ * keep that exact key out of later sessions once cleanup takes effect, even if
+ * this run is killed before any event projects. An older daemon answers with
+ * `DaemonUnsupportedRequestError`; the caller then uses its legacy cleanup.
+ */
+export async function registerVerifyArtifactClient(
+  input: {
+    runId: string;
+    ownerSessionId: string;
+    workspacePath: string;
+    monitorId: string;
+    objectKey: string;
+  },
+  socketPath?: string,
+): Promise<void> {
+  await callDaemon(
+    'verifyArtifacts.register',
+    input,
+    socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Ask the LIVE daemon to put this run's registered artifact under permanent
+ * cleanup authority and retract its existing events (issue #562). Idempotent.
+ * Returns the number of events retracted by this request.
+ */
+export async function requestVerifyArtifactCleanupClient(
+  runId: string,
+  socketPath?: string,
+): Promise<number> {
+  const result = await callDaemon<{ retractedEventCount: number }>(
+    'verifyArtifacts.requestCleanup',
+    { runId },
+    socketPath ? { socketPath } : {},
+  );
+  return result.retractedEventCount;
 }
 
 export async function claimDeliveryClient(

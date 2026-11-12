@@ -47,6 +47,7 @@ import {
 import {
   MaterializationRetryNotFoundError,
   MaterializationRetryTransitionError,
+  RetiredVerifyArtifactRetryError,
   RuntimeStore,
   computeNetCollapseView,
   netCollapseGroupKey,
@@ -66,6 +67,10 @@ import {
 } from './notify-policy.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
+import {
+  isVerifyScratchObjectKey,
+  verifyScratchRunId,
+} from './verify-scratch-key.js';
 import {
   SAFE_DIAGNOSTIC_TEXT_MAX,
   safeDiagnosticText,
@@ -109,6 +114,10 @@ import type {
   UnretainedObservationLoss,
   RuntimeTickResult,
   StoredObservationEnvelope,
+  RegisterVerifyArtifactInput,
+  VerifyArtifactCleanupCause,
+  VerifyArtifactCleanupResult,
+  VerifyArtifactRecord,
   WatchHandle,
 } from './types.js';
 import {
@@ -132,6 +141,8 @@ const DEFAULT_HIGH_URGENCY_SETTLE_MS =
   schedulingDefaults.highUrgencyClaimSettleMs;
 const MAX_RECAP_EVENTS = 10;
 
+export { isVerifyScratchObjectKey };
+
 /**
  * Per-session dormancy threshold (002 §6.2 / 007 §4.4). A session that has not
  * advanced its `lastActiveAt` for at least this long is treated as **dormant by
@@ -144,47 +155,6 @@ const MAX_RECAP_EVENTS = 10;
  */
 const DEFAULT_SESSION_DORMANCY_MS = 30 * 60 * 1_000;
 
-/**
- * The `hostSessionId` prefix `verify` gives its throwaway lead session
- * (`agentmonitors-verify-<token>`). The reap backstop (issue #414) uses it to
- * recognize an orphaned verify session left by an uncatchably-killed
- * `--use-workspace-daemon` run and clean up its scratch events.
- */
-const VERIFY_SESSION_ID_PREFIX = 'agentmonitors-verify-';
-
-/**
- * TTL (issue #414) for the tombstone the reap backstop installs over an orphaned
- * verify run's scratch object — long enough for a not-yet-materialized deletion
- * to appear and be swept, short enough to leave nothing lingering.
- */
-const ORPHANED_VERIFY_SUPPRESSION_TTL_MS = 5 * 60 * 1_000;
-
-/**
- * Slack added on top of a monitor's derived poll-interval + settle when the reap
- * backstop sizes an orphan tombstone (issue #418), so a deletion materializing a
- * tick or two late still lands inside the window before it expires.
- */
-const ORPHANED_VERIFY_SUPPRESSION_MARGIN_MS = 60 * 1_000;
-
-/**
- * True when `objectKey`'s basename is a `verify` scratch file
- * (`agentmonitors-verify-<token>[.ext]`) — a synthetic path verify created and
- * deleted, which no real monitored object ever carries (issue #414). It is the
- * canonical predicate gating every by-KEY object-event sweep (the reap backstop
- * AND {@link AgentMonitorRuntime.suppressObjectEvents}) so a by-key deletion can
- * only ever erase verify's own artifacts, never a real event at a genuine
- * watched path. Exported so the daemon-socket boundary can reject a non-scratch
- * key before it ever reaches the runtime.
- *
- * Splits on BOTH `/` and `\` so a Windows-style absolute `objectKey` (which
- * `verify` builds with `path.join`) still resolves to its basename — otherwise
- * the guard would fail to recognize a scratch key on Windows and leave stray
- * sessions/events behind (issue #418 review).
- */
-export function isVerifyScratchObjectKey(objectKey: string): boolean {
-  const basename = objectKey.split(/[\\/]/).pop() ?? objectKey;
-  return /^agentmonitors-verify-[0-9a-f]{12}(\..*)?$/.test(basename);
-}
 const EXPLAIN_STAGE_LABELS: Record<MonitorExplainStageId, string> = {
   definition: 'Definition',
   scheduling: 'Scheduling',
@@ -1114,6 +1084,34 @@ function retryDiagnostic(
   };
 }
 
+/**
+ * Hold refusals placed among the envelopes admission keeps (002 §2, §2.8).
+ * Dispatch counts each refusal's `emittedBefore` in the full dispatched list;
+ * once the ownership filter drops retired verify artifacts, a refusal belongs
+ * after the kept envelopes that preceded it there, and before the rest.
+ * `kept` must be `dispatched` filtered in order. The result stays
+ * non-decreasing, as `admitSpan` requires.
+ */
+function refusalsAmongKept(
+  refusals: readonly NotHeldObservation[],
+  dispatched: readonly StoredObservationEnvelope[],
+  kept: readonly StoredObservationEnvelope[],
+): readonly NotHeldObservation[] {
+  if (kept.length === dispatched.length) return refusals;
+  // keptBefore[i]: how many of dispatched[0..i) survived the filter.
+  const keptBefore = [0];
+  let next = 0;
+  for (const envelope of dispatched) {
+    if (kept[next] === envelope) next += 1;
+    keptBefore.push(next);
+  }
+  return refusals.map((refusal) => ({
+    ...refusal,
+    emittedBefore:
+      keptBefore[Math.min(refusal.emittedBefore, dispatched.length)] ?? next,
+  }));
+}
+
 /** Report how many failures were queued or recorded errored, preserving the first error. */
 function summarizeMaterializationFailures(
   failures: MaterializationFailure[],
@@ -1378,9 +1376,19 @@ export class AgentMonitorRuntime {
     return session;
   }
 
-  closeSession(sessionId: string): AgentSessionRecord {
+  closeSession(sessionId: string, now = new Date()): AgentSessionRecord {
     const ephemerals = this.store.listEphemeralMonitorsForSession(sessionId);
     const session = this.store.closeSession(sessionId);
+    // An ended owner no longer needs verify's proof delivery: its registered
+    // artifacts gain cleanup authority now (002 §2.8, issue #562). A crash
+    // between the close above and this record is repaired by the next tick's
+    // reconciliation, and the exact-key filter already treats a dormant owner
+    // as ended in the meantime.
+    for (const artifact of this.store.verifyArtifactsAwaitingCleanupForOwner(
+      sessionId,
+    )) {
+      this.applyVerifyArtifactCleanup(artifact.runId, 'owner-inactive', now);
+    }
     // Reap the session's ephemeral monitors (007 §4.4): a session that ends or
     // goes dormant MUST release its session-scoped watches immediately — they
     // must not outlive the session, leak into another session, or resurrect
@@ -1590,150 +1598,171 @@ export class AgentMonitorRuntime {
    * its ephemeral monitors — a backstop for a session that vanished without an
    * explicit `session close`. Distinct from the daemon-wide idle self-termination
    * (002 §10.2), which stops the whole daemon once ALL a workspace's sessions are
-   * inactive.
+   * inactive. A stale verify session is ended through the same close, which
+   * gives its registered artifacts cleanup authority (issue #562).
    */
-  private reapDormantSessions(
-    now: Date,
-    workspacePath: string,
-    monitorsById: Map<string, MonitorDefinition>,
-  ): void {
+  private reapDormantSessions(now: Date, workspacePath: string): void {
     const staleBefore = new Date(now.getTime() - this.sessionDormancyMs);
     for (const session of this.store.staleActiveSessions(
       workspacePath,
       staleBefore,
     )) {
-      // #414 backstop: a `verify --use-workspace-daemon` run killed uncatchably
-      // (SIGKILL/crash) before it could clean up leaves an `active` verify
-      // session AND its scratch file's create/delete events — the exact stray
-      // state issue #414 forbids. When we reap such a session, tombstone + retract
-      // its synthetic scratch objects too, so nothing it left reaches a later
-      // session. Captured BEFORE the close (projections persist, but read first).
-      const scratchObjects = session.hostSessionId.startsWith(
-        VERIFY_SESSION_ID_PREFIX,
-      )
-        ? this.verifyScratchObjectsForSession(session.id)
-        : [];
       // Reuse closeSession so the dormancy transition and an explicit close
-      // share ONE path (status → dormant, ephemeral monitors reaped, hook state
-      // refreshed).
-      this.closeSession(session.id);
-      for (const object of scratchObjects) {
-        this.suppressObjectEvents({
-          monitorId: object.monitorId,
-          objectKey: object.objectKey,
-          workspacePath: object.workspacePath,
-          // Derive the tombstone's life from the object's OWN monitor cadence when
-          // it is still authored (issue #418): a long-interval/long-settle monitor
-          // needs a window that outlasts its next poll + settle, or the scratch
-          // deletion re-materializes AFTER the tombstone has expired and lingers.
-          // Source preflight is separate: unrelated invalid config must not
-          // shorten safely derivable cadence protection during cleanup.
-          ttlMs: this.orphanSuppressionTtlMs(
-            monitorsById.get(object.monitorId),
-          ),
-          now,
-        });
-      }
+      // share ONE path (status → dormant, ephemeral monitors reaped, verify
+      // artifacts handed cleanup authority, hook state refreshed).
+      this.closeSession(session.id, now);
     }
   }
 
   /**
-   * The distinct synthetic scratch objects (`agentmonitors-verify-<token>…`) an
-   * orphaned verify session projected events for (issue #414). Used by the reap
-   * backstop above to tombstone+retract them. Matching is by the well-known
-   * scratch-file basename, which no real monitored object ever carries, so the
-   * subsequent by-key retraction can never touch real events.
+   * Register durable, exact ownership of a verify scratch artifact before the
+   * run creates it (002 §2.8, issue #562). While the owner session is active
+   * and has not requested cleanup, the artifact's events flow normally, which
+   * is verify's proof delivery. Cleanup authority later takes effect through
+   * {@link requestVerifyArtifactCleanup}, the owner's close, or stale-owner
+   * reaping, and then lasts without expiry.
+   *
+   * Only a verify scratch key (`…/agentmonitors-verify-<runId><ext>`) whose
+   * token equals `runId` is accepted: a real watched path can never acquire
+   * by-key cleanup authority, and each key belongs to exactly one run.
+   * Idempotent per run, including across restarts.
+   *
+   * @throws for a non-scratch key, a key carrying another run's token, a run
+   *   or key already registered differently, or an owner session that is
+   *   missing, not active, or in another workspace.
    */
-  private verifyScratchObjectsForSession(sessionId: string): {
-    monitorId: string;
-    objectKey: string;
-    workspacePath: string | null;
-  }[] {
-    const seen = new Set<string>();
-    const objects: {
-      monitorId: string;
-      objectKey: string;
-      workspacePath: string | null;
-    }[] = [];
-    for (const event of this.store.listEvents({ sessionId })) {
-      if (
-        event.objectKey === null ||
-        !isVerifyScratchObjectKey(event.objectKey)
-      )
-        continue;
-      const key = `${event.monitorId}::${event.objectKey}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      objects.push({
-        monitorId: event.monitorId,
-        objectKey: event.objectKey,
-        workspacePath: event.workspacePath ?? null,
-      });
+  registerVerifyArtifact(
+    input: RegisterVerifyArtifactInput,
+  ): VerifyArtifactRecord {
+    const keyRunId = verifyScratchRunId(input.objectKey);
+    if (keyRunId === undefined) {
+      throw new Error(
+        `registerVerifyArtifact refuses "${input.objectKey}": only a verify scratch path (agentmonitors-verify-<token>) can be owned; a real watched path keeps its exact event-id cleanup.`,
+      );
     }
-    return objects;
+    if (keyRunId !== input.runId) {
+      throw new Error(
+        `registerVerifyArtifact refuses "${input.objectKey}": the key does not carry the run identity "${input.runId}".`,
+      );
+    }
+    return this.store.registerVerifyArtifact({
+      runId: input.runId,
+      ownerSessionId: input.ownerSessionId,
+      workspacePath: input.workspacePath,
+      monitorId: input.monitorId,
+      objectKey: input.objectKey,
+      registeredAt: input.now ?? new Date(),
+    });
   }
 
   /**
-   * TTL for the tombstone the reap backstop installs over an orphaned verify run's
-   * scratch object (issue #418). The fixed {@link ORPHANED_VERIFY_SUPPRESSION_TTL_MS}
-   * floor can undershoot a monitor whose poll interval + notify settle exceeds it —
-   * the scratch deletion would then re-materialize AFTER the tombstone expired and
-   * linger for a later session. When the object's monitor is still authored (its
-   * definition is in this tick's scan) we derive the max of the floor and
-   * (interval + settle + margin) so the window always outlasts one full
-   * observe-and-settle cycle. Only unavailable or unparseable runtime cadence
-   * uses the floor; unrelated source-schema errors do not erase authored timing
-   * or known defaults. This is a bounded window, not proof that source/held work
-   * has drained after an arbitrary pause. Source preflight still gates execution.
+   * The owner's explicit cleanup request after its proof (002 §2.8, issue
+   * #562): record cleanup authority for the run's artifact and retract every
+   * event already materialized for that exact key in its monitor and
+   * workspace. From then on the key is filtered at the incoming-observation
+   * and held-emission boundaries. Idempotent: a retry keeps the first request
+   * time and cause.
+   *
+   * @throws when `runId` never registered an artifact.
    */
-  private orphanSuppressionTtlMs(
-    monitor: MonitorDefinition | undefined,
-  ): number {
-    if (!monitor) return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-    const watch = monitor.frontmatter.watch;
-    let nextPollMs: number;
-    if (watch.type === 'schedule') {
-      // Schedule observation cadence is fixed independently of cron validity.
-      nextPollMs = schedulingDefaults.scheduleTickMs;
-    } else if (watch['interval'] === undefined) {
-      nextPollMs =
-        watch.type === 'api-poll'
-          ? DEFAULT_API_POLL_MS
-          : DEFAULT_FILE_FINGERPRINT_POLL_MS;
-    } else {
-      const interval = watch['interval'];
-      if (typeof interval !== 'string') {
-        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-      }
-      // Catch only the pure duration parser. Cleanup must not turn storage or
-      // unrelated scheduler failures into a silently shortened lifetime.
-      try {
-        nextPollMs = parseDuration(interval);
-      } catch {
-        return ORPHANED_VERIFY_SUPPRESSION_TTL_MS;
-      }
+  requestVerifyArtifactCleanup(input: {
+    runId: string;
+    now?: Date;
+  }): VerifyArtifactCleanupResult {
+    if (!this.store.getVerifyArtifact(input.runId)) {
+      throw new Error(
+        `Verify run "${input.runId}" is not registered; only a registered artifact has cleanup authority.`,
+      );
     }
-    const notify = monitor.frontmatter.notify;
-    // The settle window that can delay the deletion's materialization: a debounce
-    // holds the batch for `settle-for`; a throttle can defer up to `suppress-for`.
-    const settleRaw =
-      notify?.strategy === 'debounce'
-        ? notify['settle-for']
-        : notify?.strategy === 'throttle'
-          ? notify['suppress-for']
-          : undefined;
-    let settleMs = 0;
-    if (typeof settleRaw === 'string') {
-      try {
-        settleMs = parseDuration(settleRaw);
-      } catch {
-        settleMs = 0;
-      }
-    }
-    return Math.max(
-      ORPHANED_VERIFY_SUPPRESSION_TTL_MS,
-      nextPollMs + settleMs + ORPHANED_VERIFY_SUPPRESSION_MARGIN_MS,
+    return this.applyVerifyArtifactCleanup(
+      input.runId,
+      'owner-request',
+      input.now ?? new Date(),
     );
+  }
+
+  /**
+   * Record cleanup authority and retract the exact key's materialized events
+   * in one owned writer transaction, then refresh the affected sessions. A
+   * crash before commit leaves neither; a retry repeats both safely.
+   */
+  private applyVerifyArtifactCleanup(
+    runId: string,
+    cause: VerifyArtifactCleanupCause,
+    now: Date,
+  ): VerifyArtifactCleanupResult {
+    const result = withStoreWriter(this.store, () => {
+      const { artifact } = this.store.recordVerifyArtifactCleanup(
+        runId,
+        cause,
+        now,
+      );
+      const retracted = this.store.retractObjectEventsByKey({
+        monitorId: artifact.monitorId,
+        objectKey: artifact.objectKey,
+        workspacePath: artifact.workspacePath,
+      });
+      return { artifact, ...retracted };
+    });
+    for (const sessionId of result.affectedSessionIds) {
+      this.refreshHookState(sessionId);
+    }
+    return {
+      artifact: result.artifact,
+      retractedEventCount: result.removedEventIds.length,
+    };
+  }
+
+  /**
+   * Give cleanup authority to registered artifacts whose owner session is
+   * missing or no longer active but has no recorded cleanup yet: a run killed
+   * before its own request, or a crash between an owner's close and this
+   * record. The exact-key filter already treats such an owner as ended; this
+   * makes that durable and retracts anything materialized during the proof.
+   */
+  private reconcileVerifyArtifacts(now: Date, workspacePath: string): void {
+    for (const artifact of this.store.verifyArtifactsAwaitingCleanup(
+      workspacePath,
+    )) {
+      this.applyVerifyArtifactCleanup(artifact.runId, 'owner-inactive', now);
+    }
+  }
+
+  /**
+   * Drop items for a verify artifact whose cleanup authority is in effect —
+   * the exact registered key in this monitor and workspace only (002 §2.8,
+   * issue #562). Applied at the incoming-observation boundary (before notify
+   * dispatch) and the held-emission boundary (before materialization), so
+   * neither a fresh nor a held observation of the artifact reaches a later
+   * session. Every other item, including siblings in the same batch, is kept
+   * in order. Non-scratch keys skip the lookup: they are never verify artifacts, whatever the store holds.
+   */
+  private withoutRetiredVerifyArtifacts<T>(
+    monitorId: string,
+    workspacePath: string,
+    items: readonly T[],
+    objectKeyOf: (item: T) => string | undefined,
+  ): T[] {
+    return items.filter((item) => {
+      const objectKey = objectKeyOf(item);
+      return (
+        objectKey === undefined ||
+        !isVerifyScratchObjectKey(objectKey) ||
+        !this.store.isVerifyArtifactCleanupEffective({
+          workspacePath,
+          monitorId,
+          objectKey,
+        })
+      );
+    });
+  }
+
+  /**
+   * Every retained verify artifact ownership record (002 §2.8, issue #562),
+   * optionally for one workspace. Records are never removed.
+   */
+  listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[] {
+    return this.store.listVerifyArtifacts(workspacePath);
   }
 
   listSessions(): AgentSessionRecord[] {
@@ -3545,12 +3574,10 @@ export class AgentMonitorRuntime {
     // transition stale active sessions to dormant and reap their ephemeral
     // monitors, so a session that vanished without an explicit close still
     // releases its session-scoped watches this tick (and they never fire below).
-    // The scanned monitors are threaded in so the reap can size an orphan verify
-    // tombstone from the object's own monitor cadence (issue #418).
-    const monitorsById = new Map<string, MonitorDefinition>(
-      result.monitors.map((parsed) => [parsed.monitor.id, parsed.monitor]),
-    );
-    this.reapDormantSessions(now, workspacePath, monitorsById);
+    this.reapDormantSessions(now, workspacePath);
+    // Verify artifacts whose owner ended without a recorded cleanup gain it
+    // before any observation or held work is admitted (002 §2.8, issue #562).
+    this.reconcileVerifyArtifacts(now, workspacePath);
 
     this.reportMissingHeldDefinitions(result, workspacePath, acc);
 
@@ -4122,7 +4149,14 @@ export class AgentMonitorRuntime {
         }
         return [];
       }
-      const drained = held
+      // Held-emission boundary (002 §2.8, issue #562): the drain materializes
+      // captured work, so a retired verify artifact is dropped here as well.
+      const drained = this.withoutRetiredVerifyArtifacts(
+        monitor.id,
+        workspacePath,
+        held,
+        (envelope) => envelope.observation.objectKey,
+      )
         .map(hydrateStoredObservationEnvelope)
         .sort((a, b) => a.observedAt.getTime() - b.observedAt.getTime())
         .map((envelope) => {
@@ -4658,6 +4692,29 @@ export class AgentMonitorRuntime {
         workspacePath,
       );
       if (!retry) return result;
+      // A retained observation of a verify artifact whose cleanup authority
+      // took effect after it was queued is dropped, not drained (002 §2.8).
+      // This runs before the terminal and backoff checks, so a dropped row
+      // never holds back newer legitimate work, even when it is terminal.
+      // The discard evaluates the same predicate on the same row under its
+      // writer lock, so a refused discard means the row is gone or no longer
+      // retired (authority can lapse before it is recorded); the re-read decides.
+      if (
+        this.withoutRetiredVerifyArtifacts(
+          monitorId,
+          workspacePath,
+          [retry],
+          (r) => r.envelope.observation.objectKey,
+        ).length === 0
+      ) {
+        const blocked = this.discardRetiredRetry(
+          monitorId,
+          workspacePath,
+          retry,
+        );
+        if (blocked) return { ...result, blocked };
+        continue;
+      }
       if (retry.status === 'terminal') {
         return {
           ...result,
@@ -4709,6 +4766,18 @@ export class AgentMonitorRuntime {
           projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
         };
       } catch (retryError) {
+        // Another writer recorded the artifact's cleanup after this drain
+        // read the row. Completion refused under its writer lock and wrote
+        // nothing; the row is dropped as if the read had seen the authority.
+        if (retryError instanceof RetiredVerifyArtifactRetryError) {
+          const blocked = this.discardRetiredRetry(
+            monitorId,
+            workspacePath,
+            retry,
+          );
+          if (blocked) return { ...result, blocked };
+          continue;
+        }
         const cause = errorMessage(retryError);
         let message = `Materialization retry ${retry.id} failed: ${cause}`;
         try {
@@ -4728,6 +4797,36 @@ export class AgentMonitorRuntime {
       result.emittedEventIds.push(materialized.event.id);
       // Interpret follows the committed completion, as it does for a span.
       await this.interpretMaterializedObservation(materialized, workspacePath);
+    }
+  }
+
+  /**
+   * Drop one retained row whose observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8), for {@link drainMaterializationRetries}.
+   * The store re-evaluates authority on the same row under its writer lock, so
+   * a refused discard means the row is gone or no longer retired: the caller
+   * re-reads the oldest row and that read decides. A discard that cannot
+   * commit is a failed drain step, reported like a failed completion: the row
+   * stays in place, an `errored` history row is recorded, and the returned
+   * block holds the monitor behind it.
+   */
+  private discardRetiredRetry(
+    monitorId: string,
+    workspacePath: string,
+    retry: MaterializationRetryRecord,
+  ): RetryDrainBlock | undefined {
+    try {
+      this.store.discardRetiredVerifyArtifactRetry(retry.id);
+      return undefined;
+    } catch (discardError) {
+      const message = `Materialization retry ${retry.id} could not be discarded after its verify artifact's cleanup took effect: ${errorMessage(discardError)}`;
+      this.recordErroredHistory(
+        monitorId,
+        workspacePath,
+        retry.sourceName,
+        message,
+      );
+      return { kind: 'failed', message };
     }
   }
 
@@ -4952,14 +5051,28 @@ export class AgentMonitorRuntime {
           'Monitor source baseline changed before admission; discard this stale batch and observe again from persisted state.',
         );
       }
+      // Incoming-observation boundary (002 §2.8, issue #562): a verify
+      // artifact under cleanup authority never enters notify state or
+      // emission. Decided under the writer lock so a concurrent cleanup
+      // request is honored. The source checkpoint still advances; its opaque
+      // state is never rewritten.
+      const admittedObservations = this.withoutRetiredVerifyArtifacts(
+        monitor.id,
+        options.workspacePath,
+        passedObservations,
+        (observation) => observation.objectKey,
+      );
       const dispatch = this.dispatchNotify(
         monitor,
-        passedObservations,
+        admittedObservations,
         now,
         monitorState.notifyState,
       );
       const spanOptions: MaterializationSpanOptions = {
-        observed: observations.length,
+        // A filtered verify artifact is not an observation of the workspace.
+        observed:
+          observations.length -
+          (passedObservations.length - admittedObservations.length),
         notHeld: dispatch.notHeld.length,
         workspacePath: options.workspacePath,
         nextMonitorState: {
@@ -5058,12 +5171,19 @@ export class AgentMonitorRuntime {
       return {
         durable: this.admitSpan(monitor, dispatch.emitted, options),
         options,
-        emitted: dispatch.emitted.length,
       };
     });
     // Even an empty matching window commits its minute marker, but routine
     // window checks must not manufacture no-change history or empty deliveries.
-    if (admitted.emitted === 0) return { emittedEventIds: [], failures: [] };
+    // The check counts what materialized, not what dispatch emitted: a flush
+    // whose only held work was a filtered verify artifact (002 §2.8) is empty
+    // too. It has already cleared the hold, and it writes no row, so on the
+    // failing-source path the source's `errored` row stays the newest (002 §2.6).
+    if (
+      admitted.durable.materialized.length === 0 &&
+      admitted.durable.failures.length === 0
+    )
+      return { emittedEventIds: [], failures: [] };
     return await this.finishMaterializationSpan(
       monitor,
       admitted.durable,
@@ -5177,13 +5297,29 @@ export class AgentMonitorRuntime {
    * has started, later refusals are recorded after that suffix is queued: the
    * suffix's admission positions are reserved only then, and a retry of an
    * older observation must not supersede a newer loss.
+   *
+   * A refusal's `emittedBefore` counts positions in `dispatched`. Admission
+   * places it among the envelopes that survive the ownership filter instead
+   * (002 §2.8), so a dropped artifact never pushes a refusal past a newer
+   * event of its key.
    */
   private admitSpan(
     monitor: MonitorDefinition,
-    emitted: StoredObservationEnvelope[],
+    dispatched: StoredObservationEnvelope[],
     options: MaterializationSpanOptions,
     notHeld: readonly NotHeldObservation[] = [],
   ): DurableMaterializationSpan {
+    // Held-emission boundary (002 §2.8, issue #562): a held envelope for a
+    // verify artifact whose cleanup authority took effect while it waited
+    // (debounce, rollup or escalation flush) is dropped here, before
+    // materialization or retry admission. Its batch siblings keep their order.
+    const emitted = this.withoutRetiredVerifyArtifacts(
+      monitor.id,
+      options.workspacePath,
+      dispatched,
+      (envelope) => envelope.observation.objectKey,
+    );
+    const refusals = refusalsAmongKept(notHeld, dispatched, emitted);
     const materialized: MaterializedObservation[] = [];
     const failures: MaterializationFailure[] = [];
     const retention = new SuffixRetention(
@@ -5196,9 +5332,9 @@ export class AgentMonitorRuntime {
     let refusalsRecorded = 0;
     const recordRefusalsBefore = (position: number) => {
       for (
-        let refusal = notHeld[refusalsRecorded];
+        let refusal = refusals[refusalsRecorded];
         refusal !== undefined && refusal.emittedBefore <= position;
-        refusal = notHeld[++refusalsRecorded]
+        refusal = refusals[++refusalsRecorded]
       ) {
         this.recordObservationLoss(
           monitor.id,
