@@ -207,7 +207,7 @@ function materializationRetryKey(
   );
 }
 
-/** Persist single-line diagnostics without allowing source text to control terminal layout. */
+/** Bound persisted and projected failure text without letting it control terminal layout. */
 function safeRetryError(message: string): string {
   return (
     message
@@ -1003,26 +1003,83 @@ export class RuntimeStore {
       .map(rowToMaterializationRetry);
   }
 
-  /** Return capacity and lifecycle counts for one workspace/monitor outbox. */
+  /**
+   * Discover every retained outbox in one exact workspace without loading
+   * private envelopes. A row-list limit cannot serve this purpose: capacity is
+   * per monitor, so the first full outbox must not hide other monitor routes.
+   * Results use monitor-id order for stable workspace diagnostic output.
+   * @public
+   */
+  materializationRetryMonitorIds(workspacePath: string | null): string[] {
+    return asInternalDb(this.db)
+      .selectDistinct({ monitorId: materializationRetryOutbox.monitorId })
+      .from(materializationRetryOutbox)
+      .where(
+        workspacePath === null
+          ? isNull(materializationRetryOutbox.workspacePath)
+          : eq(materializationRetryOutbox.workspacePath, workspacePath),
+      )
+      .orderBy(asc(materializationRetryOutbox.monitorId))
+      .all()
+      .map(({ monitorId }) => monitorId);
+  }
+
+  /** Return bounded operator-safe retry diagnostics without stored envelopes. */
   materializationRetrySummary(
     monitorId: string,
     workspacePath: string | null,
   ): MaterializationRetrySummary {
     const rows = asInternalDb(this.db)
       .select({
+        id: materializationRetryOutbox.id,
         status: materializationRetryOutbox.status,
         bytes: materializationRetryOutbox.envelopeBytes,
+        attemptCount: materializationRetryOutbox.attemptCount,
+        nextAttemptAt: materializationRetryOutbox.nextAttemptAt,
+        lastError: materializationRetryOutbox.lastError,
+        createdAt: materializationRetryOutbox.createdAt,
+        updatedAt: materializationRetryOutbox.updatedAt,
       })
       .from(materializationRetryOutbox)
       .where(materializationRetryKey(monitorId, workspacePath))
+      .orderBy(
+        asc(materializationRetryOutbox.createdAt),
+        asc(materializationRetryOutbox.id),
+      )
       .all();
+    // SQLite TEXT is not validated by the lifecycle type annotation. Reject
+    // unsupported persisted states before constructing totals or records; a
+    // diagnostic read must preserve retained evidence rather than relabel it.
+    // Keep the failure fixed and bounded without echoing private stored text.
+    if (
+      rows.some(
+        ({ status }: { status: unknown }) =>
+          status !== 'pending' && status !== 'terminal',
+      )
+    ) {
+      throw new Error(
+        'Cannot summarize materialization retries: unsupported persisted status.',
+      );
+    }
     return rows.reduce<MaterializationRetrySummary>(
       (summary, row) => {
         summary[row.status] += 1;
         summary.bytes += row.bytes;
+        summary.records.push({
+          id: row.id,
+          status: row.status,
+          attemptCount: row.attemptCount,
+          nextAttemptAt: row.nextAttemptAt ?? null,
+          // Older writers may have retained unbounded/control-bearing errors.
+          // Normalize the public projection without rewriting durable evidence.
+          lastError:
+            row.lastError === null ? null : safeRetryError(row.lastError),
+          createdAt: row.createdAt,
+          updatedAt: row.updatedAt,
+        });
         return summary;
       },
-      { pending: 0, terminal: 0, bytes: 0 },
+      { pending: 0, terminal: 0, bytes: 0, records: [] },
     );
   }
 

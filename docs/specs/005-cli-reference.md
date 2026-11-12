@@ -1998,9 +1998,49 @@ this section's own diagnoses-only contract.
 For each monitor, `doctor` reports: **id**, **source type**, **urgency**, **cadence** (the cron
 expression for `schedule` sources, else the observe interval), **last-observed** time (or `never`),
 **next-due** time, **last-event** time (or `none`), and the **unread / claimed / acknowledged**
-delivery-state counts for the workspace's lead session — or an explicit `never observed` marker (the
-monitor has no observation history) / `lead-session=none` marker (the workspace has no lead session).
-The three delivery states are distinct (000 AP): claiming a delivery never acknowledges it.
+delivery-state counts for the workspace's lead session. It also reports materialization retry rows
+as `retry-outbox=<pending>/<terminal>`; either count makes that monitor's check fail so a paused or
+exhausted durable signal is not presented as healthy. Its remediation names the exact `monitor
+explain <id>` command. Explain lists bounded safe retry metadata (record id, status, attempts,
+next/update times, and the control-stripped error) but never the captured envelope or payload.
+Otherwise the line carries an explicit `never observed` marker (the monitor has no observation
+history) / `lead-session=none` marker (the workspace has no lead session). The three delivery states
+are distinct (000 AP): claiming a delivery never acknowledges it.
+
+**Retained-work diagnostics (current):** doctor/explain expose workspace-scoped safe retry
+metadata. Outboxes without an unambiguous parsed definition appear in
+`orphanedMaterializationRetries`, including removed, parse-failed and duplicate definitions.
+Each outbox occurs once, either attached to one current monitor or in an orphan group; orphan
+entries carry only `monitorId` and `summary`, never an invented source, urgency or cadence.
+Doctor text includes record IDs, status, attempts, deadlines, safe failure text and aggregate bytes
+for both locations. Retained-work remediation names the exact `monitor explain` command, carrying
+`--workspace`/`--dir` whenever doctor was given non-default values (a symlinked `--workspace` spelling is a distinct workspace and is carried). An orphan or invalid-definition outbox with pending/terminal work adds a failing
+`retry-outbox:<id>` check independently of the original definition diagnostics. Parse and duplicate
+errors remain visible even when no valid monitor row exists; doctor JSON includes `parseErrors`
+and `duplicateIds` as well as the health checks.
+
+Socket clients reconstruct created/updated/non-null next-attempt Dates in all retry summaries;
+terminal next-attempt stays null. Unknown retry fields are excluded, and errors are C0/C1/DEL and
+Unicode separator normalized and capped at 1,024 characters for old-daemon compatibility. This
+is not arbitrary secret redaction. Older daemons may omit retry summaries and orphan groups:
+doctor JSON defaults them to empty summaries/arrays. A monitor row's summary defaults to empty unless that
+id has an orphan group (for example a duplicated id whose outbox is in an orphan group), in which case the row
+claims no count: JSON omits the field and the text rollup says `retry-outbox=orphaned`. For an older daemon that
+reports no orphan groups at all, the empty default applies; explain preserves the omitted optional field.
+Text explain uses an existing top-level summary, including an explicitly empty one, in preference
+to recognized materialization-stage details. If that optional field is omitted, it displays the
+available stage retry records once without synthesizing the top-level field in JSON/TOON. Absent
+summaries and unrelated stage details do not fabricate retry records.
+
+Explain's local fallback preserves definition/scheduling failures with their retained work. A
+valid definition with retry-only state is a persisted report with the no-daemon notice, not a
+"no persisted state" remediation. Repeated diagnostic reads must not mutate retry state, observe,
+materialize, deliver, or re-arm work. Remediation identifies the monitor and retained record IDs;
+this slice provides no retry action command or automatic drain-before-observe adoption.
+
+Verified: `apps/cli/src/retry-diagnostics.test.ts` uses a real owned JSONL socket and built CLI plus
+legacy SQLite rows, including same-ID other-workspace exclusion, missing/invalid/duplicate
+and retry-only reports, safe metadata shape, and unchanged durable state.
 
 ### Output
 
@@ -2075,9 +2115,23 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
       "nextDueAt": "<iso8601 | null>",
       "cadence": "<string>",
       "lastEventAt": "<iso8601 | null>",
-      "delivery": { "unread": 0, "claimed": 0, "acknowledged": 0 }
+      "delivery": { "unread": 0, "claimed": 0, "acknowledged": 0 },
+      "materializationRetries": {
+        "pending": 0,
+        "terminal": 0,
+        "bytes": 0,
+        "records": []
+      }
     }
   ],
+  "orphanedMaterializationRetries": [
+    {
+      "monitorId": "<string>",
+      "summary": { "pending": 0, "terminal": 0, "bytes": 0, "records": [] }
+    }
+  ],
+  "parseErrors": [],
+  "duplicateIds": [],
   "summary": { "passed": 0, "failed": 0, "skipped": 0, "idle": 0 }
 }
 ```

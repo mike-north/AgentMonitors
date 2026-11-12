@@ -1129,8 +1129,19 @@ export class AgentMonitorRuntime {
     const now = input.now ?? new Date();
     const historyLimit = input.historyLimit ?? 10;
     const eventLimit = input.eventLimit ?? 10;
+    // Retained work belongs to the workspace/monitor route, independently of
+    // whether its current definition still exists or can be scheduled. Resolve
+    // the same default scope as tick before any definition-error return.
+    const workspacePath = input.workspacePath ?? input.monitorsDir;
     const stages: MonitorExplainStage[] = [];
     const scan = await scanMonitors(input.monitorsDir);
+    // Read retry metadata after asynchronous discovery so work admitted while
+    // it waits is not omitted beside the later event and history reads. Keep
+    // this before definition refusals, which still need retained-work metadata.
+    const materializationRetries = this.store.materializationRetrySummary(
+      input.monitorId,
+      workspacePath,
+    );
     const parseError = scan.errors.find(
       (error) => monitorIdFromFilePath(error.filePath) === input.monitorId,
     );
@@ -1159,6 +1170,7 @@ export class AgentMonitorRuntime {
         events: [],
         projections: [],
         leadSessions: [],
+        materializationRetries,
       };
     }
 
@@ -1179,6 +1191,7 @@ export class AgentMonitorRuntime {
         events: [],
         projections: [],
         leadSessions: [],
+        materializationRetries,
       };
     }
 
@@ -1207,6 +1220,7 @@ export class AgentMonitorRuntime {
         events: [],
         projections: [],
         leadSessions: [],
+        materializationRetries,
       };
     }
 
@@ -1243,6 +1257,7 @@ export class AgentMonitorRuntime {
         events: [],
         projections: [],
         leadSessions: [],
+        materializationRetries,
       };
     }
 
@@ -1252,16 +1267,6 @@ export class AgentMonitorRuntime {
         sourceName,
       }),
     );
-
-    // Workspace-scope consistency (issue #345 / #307 review). Every stage of one
-    // report MUST read a single scope. `workspacePath` is optional on the
-    // `monitor.explain` wire; when omitted, default it to the SAME workspace the
-    // tick loop uses when it is called without one (`tick(monitorsDir)` defaults
-    // `workspacePath` to `monitorsDir`). Otherwise the scheduling/monitor-state
-    // stages would read a NULL scope no write path populates ("never ticked, due
-    // now") while the observation/event/history stages read unscoped across ALL
-    // workspaces — a self-contradictory report and a cross-workspace history leak.
-    const workspacePath = input.workspacePath ?? input.monitorsDir;
 
     const runtimeState = this.store.getMonitorState(
       input.monitorId,
@@ -1310,6 +1315,7 @@ export class AgentMonitorRuntime {
         events: [],
         projections: [],
         leadSessions: [],
+        materializationRetries,
       };
     }
     const lastObservationAt = runtimeState.lastObservationAt;
@@ -1524,7 +1530,25 @@ export class AgentMonitorRuntime {
         workspacePath,
       })
       .slice(0, eventLimit);
-    if (events.length === 0) {
+    if (materializationRetries.terminal > 0) {
+      stages.push(
+        explainStage(
+          'materialization',
+          'failure',
+          `${String(materializationRetries.terminal)} observation(s) exhausted automatic materialization retries and require operator repair.`,
+          { ...materializationRetries },
+        ),
+      );
+    } else if (materializationRetries.pending > 0) {
+      stages.push(
+        explainStage(
+          'materialization',
+          'pending',
+          `${String(materializationRetries.pending)} observation(s) are durably queued for materialization retry.`,
+          { ...materializationRetries },
+        ),
+      );
+    } else if (events.length === 0) {
       // When no event has materialized yet because the notify layer has a queued
       // batch (actively settling or overdue-but-unflushed), materialization is
       // pending — not a failure. The observation was observed but the runtime
@@ -1728,6 +1752,7 @@ export class AgentMonitorRuntime {
       events,
       projections,
       leadSessions,
+      materializationRetries,
     };
   }
 
@@ -1769,6 +1794,10 @@ export class AgentMonitorRuntime {
       .sessionsForWorkspace(workspacePath)
       .filter((session) => session.role === 'lead');
 
+    // A duplicate id has no unambiguous current definition. Keep its retained
+    // work in the orphaned group exactly once, rather than attributing it to
+    // each conflicting definition and multiplying the reported obligations.
+    const duplicateMonitorIds = new Set(scan.duplicateIds.map(({ id }) => id));
     const monitors: DoctorMonitorRollup[] = [];
     let invalidCount = 0;
     for (const { monitor } of scan.monitors) {
@@ -1854,6 +1883,9 @@ export class AgentMonitorRuntime {
         // 'acknowledged' (an explicit === check trips no-unnecessary-condition).
         else delivery.acknowledged += 1;
       }
+      const materializationRetries = duplicateMonitorIds.has(monitor.id)
+        ? undefined
+        : this.store.materializationRetrySummary(monitor.id, workspacePath);
 
       monitors.push({
         id: monitor.id,
@@ -1872,8 +1904,29 @@ export class AgentMonitorRuntime {
         ),
         ...(lastEventAt ? { lastEventAt } : {}),
         delivery,
+        ...(materializationRetries ? { materializationRetries } : {}),
       });
     }
+
+    // Discover routes from metadata, not captured envelopes or a capped row
+    // listing. Capacity is per monitor, so a full outbox cannot hide another.
+    const representedMonitorIds = new Set(
+      monitors
+        .filter(
+          ({ materializationRetries }) => materializationRetries !== undefined,
+        )
+        .map(({ id }) => id),
+    );
+    const orphanedMaterializationRetries = this.store
+      .materializationRetryMonitorIds(workspacePath)
+      .filter((monitorId) => !representedMonitorIds.has(monitorId))
+      .map((monitorId) => ({
+        monitorId,
+        summary: this.store.materializationRetrySummary(
+          monitorId,
+          workspacePath,
+        ),
+      }));
 
     return {
       generatedAt: now,
@@ -1881,6 +1934,7 @@ export class AgentMonitorRuntime {
       workspacePath,
       monitorsDirExists,
       monitors,
+      orphanedMaterializationRetries,
       invalidCount,
       duplicateIds: scan.duplicateIds,
       parseErrors,
