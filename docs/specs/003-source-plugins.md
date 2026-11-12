@@ -1379,9 +1379,9 @@ with `git ls-remote origin refs/heads/<branch>` (§11.8).
 No public unavailable outcome, schema or stored-state migration is introduced. Source consumers
 that previously assumed resolution always fulfilled must now handle the existing rejection
 contract. The runtime already does so. Its existing error path leaves the scheduling timestamp
-unchanged (due monitors retry each daemon tick) and skips ordinary held-notify flushing until
-observation succeeds. Those consequences remain unchanged here; #558 tracks held work and #559
-tracks retry cost separately. Already-materialized events remain deliverable.
+unchanged (due monitors retry each daemon tick; #559 tracks that retry cost). Held debounce and
+rollup work still flushes at its own deadline or window while the source fails
+([002 §2.6](./002-runtime-delivery.md)). Already-materialized events remain deliverable.
 
 ## 7. Source Registry, Validation, and Schema Generation
 
