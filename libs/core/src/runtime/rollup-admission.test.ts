@@ -890,3 +890,171 @@ describe('native rollback in held rollup flush', () => {
     expect(reopened.getMonitorState('rollup', f.root)).toEqual(expectedState);
   });
 });
+
+/**
+ * An effective notify-policy edit drains held rollup work outside any window
+ * (002 §4.6). That drain is a held rollup flush too, so it shares the flush's
+ * owned runtime transaction (002 §4.4): it reads the hold under the writer
+ * lock, and a fault rolls back every event, projection, cursor, snapshot,
+ * metadata write and the store's recipient cache together. Unlike the window
+ * flush, it is all-or-nothing: no prefix commits and no suffix is retained.
+ */
+describe('notify-policy edit draining held rollup work', () => {
+  /** The edited definition's window; the source is still not due then. */
+  const EDITED_WINDOW = Date.parse('2026-11-01T10:00:00Z');
+
+  /**
+   * Move the window to 10:00, an effective rollup policy change. The longer
+   * interval keeps the source not due through it (pacing identity ignores it).
+   */
+  function editWindow(f: Awaited<ReturnType<typeof fixture>>) {
+    const monitorFile = path.join(f.monitorsDir, 'rollup', 'MONITOR.md');
+    writeFileSync(
+      monitorFile,
+      readFileSync(monitorFile, 'utf8')
+        .replace("window: '0 9 * * *'", "window: '0 10 * * *'")
+        .replace('interval: 2h', 'interval: 4h'),
+    );
+  }
+
+  /** Private persisted pacing identity (002 §4.6), outside NotifyRuntimeState's type. */
+  function storedPolicyKey(f: Awaited<ReturnType<typeof fixture>>): unknown {
+    return (
+      f.reader.getMonitorState('rollup', f.root).notifyState as {
+        policyKey?: unknown;
+      }
+    ).policyKey;
+  }
+
+  it('drains the hold read under the writer lock, including work committed just before it', async () => {
+    const f = await fixture();
+    f.interpretation.release();
+    const held = f.before.notifyState.pendingRollup?.observations ?? [];
+    expect(held).toHaveLength(3);
+    const late = {
+      ...held[0],
+      observation: {
+        title: 'late',
+        summary: 'late',
+        objectKey: 'late',
+        snapshotText: 'late-content',
+      },
+      observedAt: new Date(BEFORE + 500).toISOString(),
+    };
+    editWindow(f);
+    clockTime = BEFORE + 1000;
+    // Another writer commits one more held envelope before this drain's BEGIN.
+    const interposed = beforeAdmission(f, () =>
+      f.reader.setMonitorState('rollup', f.root, {
+        ...f.before,
+        notifyState: {
+          ...f.before.notifyState,
+          pendingRollup: { observations: [...held, late] },
+        },
+      }),
+    );
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+    interposed();
+    expect(result.erroredObservations).toEqual([]);
+    expect(result.emittedEventIds).toHaveLength(4);
+    expect(
+      f.reader
+        .listEvents({ monitorId: 'rollup' })
+        .map(({ summary }) => summary)
+        .sort(),
+    ).toEqual(['late', 'step-1', 'step-2', 'step-3']);
+    const after = f.reader.getMonitorState('rollup', f.root);
+    expect(after.notifyState.pendingRollup).toBeUndefined();
+    expect(after.notifyState.rollupLastFiredMinute).toBeUndefined();
+    expect(storedPolicyKey(f)).not.toBe(
+      (f.before.notifyState as { policyKey?: unknown }).policyKey,
+    );
+    // A notify-only drain never touches the source baseline or its clock.
+    expect(after.sourceState).toBe(f.before.sourceState);
+    expect(after.lastObservationAt).toEqual(f.before.lastObservationAt);
+    expect(f.reader.listMaterializationRetries()).toEqual([]);
+    expect(f.interpretation.calls).toHaveLength(4);
+    expect(f.observations()).toBe(1);
+  });
+
+  for (const action of ['ROLLBACK', 'ABORT'] as const) {
+    it(`rolls a native ${action} back whole, recipient cache included, then drains once`, async () => {
+      const f = await fixture();
+      f.interpretation.release();
+      const prior = seedPriorRecipient(f);
+      const previousRows = rollupArtifactRows(f);
+      const previousHistory = f.reader.listObservationHistory({
+        monitorId: 'rollup',
+      });
+      editWindow(f);
+      installRollupNativeFault(f, action);
+      // The edited window is open, but a blocked edit keeps the gate closed:
+      // no window flush may admit the old hold under the new policy instead.
+      clockTime = EDITED_WINDOW;
+      const blocked = await f.runtime.tick(f.monitorsDir, f.root);
+      expect(blocked.emittedEventIds).toEqual([]);
+      expect(blocked.erroredObservations).toHaveLength(1);
+      expect(blocked.erroredObservations[0]).toMatchObject({
+        monitorId: 'rollup',
+        message: expect.stringContaining(
+          'Notify edit blocked; accepted holds retained',
+        ),
+      });
+      expect(f.writer.client.inTransaction).toBe(false);
+      // Even a statement-local ABORT commits no prefix and queues no suffix:
+      // the hold, its old identity and every artifact stay exactly as they were.
+      expect(rollupArtifactRows(f)).toEqual(previousRows);
+      expect(f.reader.getMonitorState('rollup', f.root)).toEqual(f.before);
+      expect(f.reader.listMaterializationRetries()).toEqual([]);
+      expect(f.store.projectedSessionIdsForLastEvent()).toEqual([
+        prior.session.id,
+      ]);
+      expect(f.interpretation.calls).toEqual([]);
+      expect(f.observations()).toBe(1);
+      // The blocked edit reports one errored row and records no drop.
+      const history = f.reader.listObservationHistory({ monitorId: 'rollup' });
+      expect(history).toHaveLength(previousHistory.length + 1);
+      expect(
+        history.filter(
+          ({ observationData }) => 'notRetained' in observationData,
+        ),
+      ).toEqual([]);
+
+      f.writer.client.exec('DROP TRIGGER native_rollup_fault');
+      clockTime += 1000;
+      const drained = await f.runtime.tick(f.monitorsDir, f.root);
+      expect(drained.erroredObservations).toEqual([]);
+      expect(drained.emittedEventIds).toHaveLength(3);
+      const events = f.reader.listEvents({
+        monitorId: 'rollup',
+        workspacePath: f.root,
+      });
+      expect(
+        events
+          .map(({ summary, snapshotText, body }) => [
+            summary,
+            snapshotText,
+            body,
+          ])
+          .sort(),
+      ).toEqual([
+        ['step-1', 'alpha', 'Inspect the changes.'],
+        ['step-2', '', 'Inspect the changes.'],
+        ['step-3', 'omega', 'Inspect the changes.'],
+      ]);
+      for (const session of f.sessions)
+        expect(f.reader.listEvents({ sessionId: session.id })).toHaveLength(3);
+      expect(f.reader.getMonitorState('rollup', f.root)).toMatchObject({
+        sourceState: f.before.sourceState,
+        lastObservationAt: f.before.lastObservationAt,
+      });
+      expect(
+        f.reader.getMonitorState('rollup', f.root).notifyState.pendingRollup,
+      ).toBeUndefined();
+      expect(f.interpretation.calls).toHaveLength(3);
+      const repeated = await f.runtime.tick(f.monitorsDir, f.root);
+      expect(repeated.emittedEventIds).toEqual([]);
+      expect(f.reader.listEvents({ monitorId: 'rollup' })).toHaveLength(3);
+    });
+  }
+});

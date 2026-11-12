@@ -1474,7 +1474,10 @@ reread current held state under that writer boundary, and commit the entire old 
 projections, cursor seeds, snapshots and removal of corresponding holds together. No stale read
 before the writer lock can authorize removal or replay. Event materialization units may nest as
 savepoints; the edit drain must not join an externally owned transaction. This prevents two
-runtimes from duplicating or overwriting one drain. Optional Interpret runs after commit using
+runtimes from duplicating or overwriting one drain. A drain of held rollup work is a held rollup
+flush outside any window: it uses the same store-owned runtime transaction as the not-due window
+flush (§4.4), so a rollback also restores the store's last-projected recipient cache. Unlike the
+window flush it commits no prefix and retains no suffix; any failure rolls the whole drain back. Optional Interpret runs after commit using
 each event's own projected recipients. This does not guarantee exactly-once downstream effects
 (000 NP2).
 
