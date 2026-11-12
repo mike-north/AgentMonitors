@@ -636,8 +636,8 @@ function createTableSql(
 /**
  * A schema migration found a row or column it cannot carry into the current
  * layout. Thrown inside the schema-build immediate transaction, so the database
- * is left exactly as it was; the message names the table and column so an
- * operator can repair that data and reopen. Not re-exported from the package
+ * is left exactly as it was; the message names the table, and the column when
+ * one is identifiable, so an operator can repair that data and reopen. Not re-exported from the package
  * entry point: callers see it as an `Error` thrown by `createDb`.
  *
  * @internal
