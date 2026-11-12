@@ -17,13 +17,29 @@
  * @see https://pnpm.io/cli/audit
  * @see https://pnpm.io/cli/why
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
+import {
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { createServer } from 'node:http';
+import { gunzipSync } from 'node:zlib';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { parse, stringify } from 'yaml';
+import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 import {
   DEFAULT_ALLOWLIST_PATH,
   assertValidAuditReport,
+  bundledAuditReport,
   evaluateAuditReport,
   loadAllowlist,
   resolvedVersions,
@@ -759,4 +775,576 @@ describe('standalone experiment security resolutions', () => {
       }
     });
   }
+});
+
+/**
+ * Exercise the real CLI against a loopback bulk-advisory registry. Copying the
+ * build inputs and lockfile preserves workspace resolution without installing
+ * packages or asking a real registry about a synthetic advisory.
+ */
+describe('bundled dependency advisory gate', () => {
+  async function runFixture({
+    packageName = 'lodash-es',
+    addToBundle = false,
+    aliasRoot = false,
+    deferredConfig = false,
+    implicitBundle = false,
+    brokenBuild = false,
+    unusedSelector = false,
+    pluginBundle = false,
+    missingMetadata = false,
+    overlappingFormats = false,
+    workspaceImport = false,
+    otherVersion = false,
+    allowlisted = false,
+    outage = false,
+  } = {}) {
+    const repo = path.resolve(import.meta.dirname, '..');
+    const fixture = mkdtempSync(path.join(os.tmpdir(), 'bundled-audit-'));
+    for (const relative of [
+      'package.json',
+      'pnpm-lock.yaml',
+      'pnpm-workspace.yaml',
+      'scripts/check-dependency-audit.mjs',
+      'scripts/publish-release-packages.mjs',
+      'scripts/audit-allowlist.json',
+      ...PACKAGE_DIRS.flatMap((dir: string) => [dir + '/package.json']),
+      ...PACKAGE_DIRS.map((dir: string) => dir + '/tsup.config.ts').filter(
+        (file: string) => existsSync(path.join(repo, file)),
+      ),
+    ]) {
+      mkdirSync(path.dirname(path.join(fixture, relative)), {
+        recursive: true,
+      });
+      cpSync(path.join(repo, relative), path.join(fixture, relative));
+    }
+    symlinkSync(
+      path.join(repo, 'node_modules'),
+      path.join(fixture, 'node_modules'),
+      'dir',
+    );
+    // Minimal real entries exercise tsup's externalization and injected code,
+    // without rebuilding the application's unrelated runtime in every fixture.
+    for (const dir of PACKAGE_DIRS) {
+      if (!existsSync(path.join(fixture, dir, 'tsup.config.ts'))) continue;
+      mkdirSync(path.join(fixture, dir, 'src'), { recursive: true });
+      writeFileSync(
+        path.join(fixture, dir, 'src/index.ts'),
+        dir === 'libs/core'
+          ? "export * from 'cel-js';\n"
+          : 'export const location = import.meta.url;\n',
+      );
+      // Preserve the package's actual dependency links, allowing tsup to see
+      // development imports just as it does in the published build.
+      mkdirSync(path.join(fixture, dir, 'node_modules'), { recursive: true });
+      const modules = path.join(repo, dir, 'node_modules');
+      for (const name of readdirSync(modules)) {
+        const target = path.join(fixture, dir, 'node_modules', name);
+        if (name === '@agentmonitors') {
+          // Workspace imports must use this fixture's build, never an existing
+          // dist directory reachable through the original workspace symlinks.
+          mkdirSync(target, { recursive: true });
+          for (const child of readdirSync(path.join(modules, name))) {
+            const workspace = PACKAGE_DIRS.find(
+              (candidate: string) =>
+                JSON.parse(
+                  readFileSync(
+                    path.join(repo, candidate, 'package.json'),
+                    'utf8',
+                  ),
+                ).name === `@agentmonitors/${child}`,
+            );
+            symlinkSync(
+              workspace
+                ? path.join(fixture, workspace)
+                : path.join(modules, name, child),
+              path.join(target, child),
+              'dir',
+            );
+          }
+        } else {
+          symlinkSync(path.join(modules, name), target, 'dir');
+        }
+      }
+    }
+
+    if (implicitBundle) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, 'utf8').replace(/ {2}noExternal:.*\n/, ''),
+      );
+    }
+    if (brokenBuild) {
+      // Old output must never stand in for a build whose current source fails.
+      execFileSync(
+        process.execPath,
+        [
+          path.join(repo, 'node_modules/tsup/dist/cli-default.js'),
+          '--metafile',
+        ],
+        {
+          cwd: path.join(fixture, 'libs/core'),
+          timeout: 20_000,
+          stdio: 'pipe',
+        },
+      );
+      writeFileSync(
+        path.join(fixture, 'libs/core/src/index.ts'),
+        "export * from 'missing-fixture-package';",
+      );
+    }
+    if (pluginBundle) {
+      const dir = 'plugins/source-schedule';
+      symlinkSync(
+        path.join(repo, 'libs/core/node_modules/cel-js'),
+        path.join(fixture, dir, 'node_modules/cel-js'),
+        'dir',
+      );
+      writeFileSync(
+        path.join(fixture, dir, 'src/index.ts'),
+        "export * from 'cel-js';\n",
+      );
+      writeFileSync(
+        path.join(fixture, 'libs/core/src/index.ts'),
+        'export const empty = true;\n',
+      );
+    }
+    if (workspaceImport) {
+      writeFileSync(
+        path.join(fixture, 'apps/cli/src/index.ts'),
+        "export * from '@agentmonitors/core';\n",
+      );
+    }
+    // The fixture's build uses real tsup for every package in dependency order.
+    // Minimal sources need no declaration rollup, unlike the full root build.
+    const rootManifestPath = path.join(fixture, 'package.json');
+    const rootManifest = JSON.parse(readFileSync(rootManifestPath, 'utf8'));
+    rootManifest.scripts.build = 'node scripts/build-audit-fixture.mjs';
+    writeFileSync(rootManifestPath, JSON.stringify(rootManifest));
+    writeFileSync(
+      path.join(fixture, 'scripts/build-audit-fixture.mjs'),
+      `
+      import { execFileSync } from 'node:child_process';
+      import { existsSync } from 'node:fs';
+      import path from 'node:path';
+      import { PACKAGE_DIRS } from './publish-release-packages.mjs';
+      for (const dir of PACKAGE_DIRS) {
+        if (existsSync(path.join(dir, 'tsup.config.ts'))) {
+          execFileSync(process.execPath, [path.resolve('node_modules/tsup/dist/cli-default.js')], { cwd: dir, stdio: 'pipe', timeout: 20000 });
+        }
+      }
+    `,
+    );
+    // A fixture package and child provide real bundled files and locked audit
+    // identities. Aliases must resolve to canonical registry package names.
+    const lockPath = path.join(fixture, 'pnpm-lock.yaml');
+    const lock = parse(readFileSync(lockPath, 'utf8'));
+    const bundleName = aliasRoot ? 'bundle-alias' : 'future-bundle';
+    lock.importers['libs/core'].devDependencies[bundleName] = {
+      specifier: aliasRoot ? 'npm:future-bundle@1.0.0' : '1.0.0',
+      version: aliasRoot ? 'future-bundle@1.0.0' : '1.0.0',
+    };
+    lock.packages['future-bundle@1.0.0'] = {
+      resolution: { integrity: 'sha512-fixture' },
+    };
+    lock.packages['future-child@2.0.0'] = {
+      resolution: { integrity: 'sha512-fixture' },
+    };
+    lock.snapshots['future-bundle@1.0.0'] = {
+      dependencies: { 'future-child': '2.0.0' },
+    };
+    lock.snapshots['future-child@2.0.0'] = {};
+    if (otherVersion) {
+      // The registry receives both versions, but only 0.8.2 is in the bundle.
+      lock.importers['.'].devDependencies['other-cel'] = {
+        specifier: 'npm:cel-js@99.0.0',
+        version: 'cel-js@99.0.0',
+      };
+      lock.packages['cel-js@99.0.0'] = {
+        resolution: { integrity: 'sha512-fixture' },
+      };
+      lock.snapshots['cel-js@99.0.0'] = {};
+    }
+    writeFileSync(lockPath, stringify(lock));
+    const modules = path.join(fixture, 'libs/core/node_modules');
+    for (const [name, version, source] of [
+      ['future-bundle', '1.0.0', "export * from 'future-child';"],
+      ['future-child', '2.0.0', 'export const child = 42;'],
+    ]) {
+      const dir = path.join(
+        modules,
+        name === 'future-bundle' ? bundleName : name,
+      );
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(
+        path.join(dir, 'package.json'),
+        JSON.stringify({ name, version, type: 'module', main: 'index.js' }),
+      );
+      writeFileSync(path.join(dir, 'index.js'), source);
+    }
+    if (addToBundle) {
+      writeFileSync(
+        path.join(fixture, 'libs/core/src/index.ts'),
+        `export * from 'cel-js';\nexport * from '${bundleName}';\n`,
+      );
+    }
+    if (addToBundle) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, 'utf8').replace(
+          'noExternal: [',
+          `noExternal: ['${bundleName}',`,
+        ),
+      );
+    }
+    if (missingMetadata || overlappingFormats) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      const content = readFileSync(configPath, 'utf8');
+      writeFileSync(
+        configPath,
+        missingMetadata
+          ? content.replace(
+              '  entry:',
+              '  esbuildOptions(options) { options.metafile = false; },\n  entry:',
+            )
+          : content
+              .replace('defineConfig({', 'defineConfig([{')
+              .replace(
+                /}\);\s*$/,
+                '}, { entry: ["src/index.ts"], format: ["esm"] }]);\n',
+              ),
+      );
+    }
+    if (unusedSelector) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, 'utf8').replace(
+          'noExternal: [',
+          "noExternal: ['unused-fixture',",
+        ),
+      );
+    }
+    if (deferredConfig) {
+      const configPath = path.join(fixture, 'libs/core/tsup.config.ts');
+      writeFileSync(
+        configPath,
+        readFileSync(configPath, 'utf8')
+          .replace(
+            'export default defineConfig({',
+            'export default Promise.resolve(defineConfig({',
+          )
+          .replace(/}\);\s*$/, '}));\n'),
+      );
+    }
+    if (implicitBundle || packageName === 'tsup' || pluginBundle) {
+      const dir = pluginBundle
+        ? 'plugins/source-schedule'
+        : implicitBundle
+          ? 'libs/core'
+          : 'apps/cli';
+      execFileSync(
+        process.execPath,
+        [path.join(repo, 'node_modules/tsup/dist/cli-default.js')],
+        {
+          cwd: path.join(fixture, dir),
+          timeout: 20_000,
+          stdio: 'pipe',
+        },
+      );
+      const map = JSON.parse(
+        readFileSync(
+          path.join(
+            fixture,
+            dir,
+            'dist',
+            dir === 'apps/cli' ? 'index.cjs.map' : 'index.js.map',
+          ),
+          'utf8',
+        ),
+      );
+      expect(
+        map.sources.some((source: string) =>
+          source.includes(
+            packageName === 'tsup' ? '/tsup/assets/cjs_shims.js' : '/cel-js/',
+          ),
+        ),
+      ).toBe(true);
+    }
+    const id = 'GHSA-0000-0000-0000';
+    if (allowlisted) {
+      writeFileSync(
+        path.join(fixture, 'scripts/audit-allowlist.json'),
+        JSON.stringify({
+          exceptions: [
+            {
+              id,
+              package: packageName,
+              reason: 'Synthetic fixture only',
+              expires: '2099-01-01',
+            },
+          ],
+        }),
+      );
+    }
+    const submissions: Record<string, string[]>[] = [];
+    const server = createServer(async (request, response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of request) chunks.push(Buffer.from(chunk));
+      let body = Buffer.concat(chunks);
+      if (request.headers['content-encoding'] === 'gzip')
+        body = gunzipSync(body);
+      const payload = JSON.parse(body.toString() || '{}');
+      submissions.push(payload);
+      const unavailable = outage && payload['cel-js'];
+      response.writeHead(unavailable ? 503 : 200, {
+        'content-type': 'application/json',
+      });
+      response.end(
+        JSON.stringify(
+          unavailable
+            ? { error: 'Synthetic outage' }
+            : payload[packageName]
+              ? {
+                  [packageName]: [
+                    {
+                      id: 999999999,
+                      url: `https://github.com/advisories/${id}`,
+                      title: 'Synthetic bundled advisory',
+                      severity: 'high',
+                      vulnerable_versions: otherVersion ? '99.0.0' : '*',
+                      cwe: [],
+                      cvss: { score: 8, vectorString: null },
+                    },
+                  ],
+                }
+              : {},
+        ),
+      );
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    try {
+      const address = server.address();
+      if (!address || typeof address === 'string')
+        throw new Error('Expected loopback port');
+      const child = spawn(
+        process.execPath,
+        ['scripts/check-dependency-audit.mjs'],
+        {
+          cwd: fixture,
+          env: {
+            ...process.env,
+            pnpm_config_registry: `http://127.0.0.1:${address.port}`,
+            pnpm_config_fetch_retries: '0',
+            // Synthetic lock entries intentionally differ from the linked install.
+            // Never let pnpm replace that shared installation before fixture builds.
+            pnpm_config_verify_deps_before_run: 'warn',
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+          timeout: 30_000,
+        },
+      );
+      let output = '';
+      child.stdout.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        output += chunk.toString();
+      });
+      const exit = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject);
+        child.once('close', resolve);
+      });
+      return { exit, output, submissions, id };
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  }
+
+  it('rejects a high advisory for a default-bundled dev import without noExternal', async () => {
+    const result = await runFixture({
+      packageName: 'cel-js',
+      implicitBundle: true,
+    });
+    expect(
+      result.submissions.some((payload) =>
+        payload['cel-js']?.includes('0.8.2'),
+      ),
+    ).toBe(true);
+    expect(result.output).toContain(result.id);
+    expect(result.exit, result.output).toBe(1);
+  }, 60_000);
+
+  it('rejects a high advisory for tsup code injected by shims', async () => {
+    const result = await runFixture({ packageName: 'tsup' });
+    expect(
+      result.submissions.some((payload) => payload.tsup?.includes('8.5.1')),
+    ).toBe(true);
+    expect(result.output).toContain(result.id);
+    expect(result.exit, result.output).toBe(1);
+  }, 60_000);
+
+  it('audits default-bundled inputs from a published plugin', async () => {
+    const result = await runFixture({
+      packageName: 'cel-js',
+      pluginBundle: true,
+    });
+    expect(result.output).toContain(result.id);
+    expect(result.exit, result.output).toBe(1);
+  }, 60_000);
+
+  it('fails on a broken build even when stale metadata exists', async () => {
+    const result = await runFixture({ brokenBuild: true });
+    expect(result.exit, result.output).not.toBe(0);
+    expect(result.submissions).toHaveLength(0);
+    expect(result.output).toContain('missing-fixture-package');
+  }, 60_000);
+
+  it('reports unused noExternal intent without failing a clean audit', async () => {
+    const result = await runFixture({
+      packageName: 'future-child',
+      unusedSelector: true,
+    });
+    expect(result.exit, result.output).toBe(0);
+    expect(result.output).toContain('unused-fixture');
+  }, 60_000);
+
+  it('fails closed when a build emits no metafile', async () => {
+    const result = await runFixture({ missingMetadata: true });
+    expect(result.exit, result.output).not.toBe(0);
+    expect(result.submissions).toHaveLength(0);
+    expect(result.output).toContain('metafile-esm.json');
+  }, 60_000);
+
+  it('rejects configs whose metafiles could overwrite each other', async () => {
+    const result = await runFixture({ overlappingFormats: true });
+    expect(result.exit, result.output).not.toBe(0);
+    expect(result.submissions).toHaveLength(0);
+    expect(result.output).toContain('Overlapping bundled audit formats');
+  }, 60_000);
+
+  it('builds workspace inputs before bundling the CLI on a fresh checkout', async () => {
+    const result = await runFixture({
+      packageName: 'cel-js',
+      workspaceImport: true,
+    });
+    expect(result.output).toContain(result.id);
+    expect(result.exit, result.output).toBe(1);
+  }, 60_000);
+
+  it('excludes a synthetic advisory for another resolved version of a bundled package', async () => {
+    const result = await runFixture({
+      packageName: 'cel-js',
+      otherVersion: true,
+    });
+    expect(
+      result.submissions.some(
+        (payload) =>
+          payload['cel-js']?.includes('0.8.2') &&
+          payload['cel-js']?.includes('99.0.0'),
+      ),
+    ).toBe(true);
+    expect(result.exit, result.output).toBe(0);
+  }, 60_000);
+
+  it('rejects a synthetic high advisory against the resolved bundled lodash version', async () => {
+    const result = await runFixture();
+    expect(result.submissions.length).toBeGreaterThan(0);
+    expect(result.output).toContain(result.id);
+    expect(result.exit).toBe(1);
+    expect(
+      result.submissions.some((payload) =>
+        payload['lodash-es']?.includes('4.18.1'),
+      ),
+    ).toBe(true);
+  }, 60_000);
+
+  it('audits the transitive inputs of an imported noExternal package', async () => {
+    const before = await runFixture({ packageName: 'future-child' });
+    expect(before.exit, before.output).toBe(0);
+    const after = await runFixture({
+      packageName: 'future-child',
+      addToBundle: true,
+    });
+    expect(after.output).toContain(after.id);
+    expect(after.exit).toBe(1);
+  }, 60_000);
+
+  it('follows an aliased noExternal root to its canonical registry dependency closure', async () => {
+    const result = await runFixture({
+      packageName: 'future-child',
+      addToBundle: true,
+      aliasRoot: true,
+    });
+    expect(result.output).toContain(result.id);
+    expect(result.exit).toBe(1);
+  }, 60_000);
+
+  it('rejects an unsupported deferred build config instead of treating it as no bundled packages', async () => {
+    const result = await runFixture({ deferredConfig: true });
+    expect(result.exit).not.toBe(0);
+    expect(result.output).toContain('Unsupported bundled audit build config');
+  }, 60_000);
+
+  it('still blocks synthetic production advisories', async () => {
+    const result = await runFixture({ packageName: 'zod' });
+    expect(result.output).toContain(result.id);
+    expect(result.exit).toBe(1);
+  }, 60_000);
+
+  it('applies the existing scoped allowlist to bundled advisories', async () => {
+    const result = await runFixture({ allowlisted: true });
+    expect(result.output).toContain('Suppressed by reviewed exception');
+    expect(result.exit, result.output).toBe(0);
+  }, 60_000);
+
+  it('fails closed when only the bundled audit endpoint is unavailable', async () => {
+    const result = await runFixture({ outage: true });
+    expect(result.submissions.some((payload) => payload['cel-js'])).toBe(true);
+    expect(result.exit).not.toBe(0);
+    expect(result.output).toContain('audit tooling failed');
+  }, 60_000);
+});
+
+/** Advisory scope follows resolved versions, even when tooling uses another line. */
+describe('bundledAuditReport', () => {
+  const inventory = new Map([['example-pkg', new Set(['2.0.0'])]]);
+
+  it('keeps only findings for the shipped version and excludes unrelated tooling', () => {
+    const report = bundledAuditReport(
+      {
+        advisories: {
+          old: advisory({ findings: [{ version: '1.0.0' }] }),
+          shipped: advisory({
+            findings: [{ version: '1.0.0' }, { version: '2.0.0' }],
+          }),
+          tooling: advisory({
+            module_name: 'tool-only',
+            findings: [{ version: '2.0.0' }],
+          }),
+        },
+      },
+      inventory,
+    );
+    expect(Object.keys(report.advisories)).toEqual(['shipped']);
+    expect(report.advisories.shipped.findings).toEqual([{ version: '2.0.0' }]);
+  });
+
+  it.each([undefined, [], [{}]])(
+    'rejects missing version evidence: %j',
+    (findings) => {
+      expect(() =>
+        bundledAuditReport(
+          { advisories: { selected: advisory({ findings }) } },
+          inventory,
+        ),
+      ).toThrow(/Missing bundled audit finding versions/);
+    },
+  );
 });

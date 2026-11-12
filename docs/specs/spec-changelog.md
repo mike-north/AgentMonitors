@@ -73,6 +73,26 @@ daemon-backed command. Before, such a command was left waiting and exited 0 with
 exits 1 and reports `daemon-unreachable`, and `monitor explain` falls back in-process as it does
 when no daemon is reachable.
 
+## 2026-11-12 — Bundled advisory coverage follows actual build inputs (004 §2.10)
+
+Replace selector/closure inventory with fresh esbuild metafiles for every published
+tsup build. Default-inlined imports and injected tool code ship even without a
+`noExternal` declaration and therefore receive the same exact-version advisory
+coverage. After installation, the gate refreshes workspace exports with an uncached,
+serialized build, then bundles sequentially for metadata. It fails on build or metadata
+errors and never reuses stale artifacts. Unused selectors are informational.
+Loopback regressions demonstrate default imports, shims, plugins and stale-output
+rejection alongside the existing explicit bundle and allowlist cases.
+
+## 2026-11-12 — Live advisory coverage includes bundled dependency versions (004 §2.10)
+
+The separate dependency-audit gate covers production dependencies and the exact
+runtime/optional closure selected by published tsup builds' `noExternal` selectors.
+Moving bundled code to development dependencies does not remove advisory coverage.
+Both inventories use the existing scoped, expiring allowlist and fail closed on audit
+failures. Loopback registry fixtures cover synthetic bundled advisories and automatic
+coverage when `noExternal` gains another package.
+
 ## 2026-11-12 — Spec 004 gap markers reconciled with shipped coverage; gap-drift check (004 §3.0/§3.1/§3.5/§5.1; roadmap) — Closes #287
 
 The three remaining gap markers in 004 described coverage that already exists: `low` urgency

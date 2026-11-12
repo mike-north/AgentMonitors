@@ -1,6 +1,7 @@
-// Production-dependency audit gate (Refs #290).
+// Production and bundled-dependency advisory gate (Refs #290).
 //
-// Runs `pnpm audit --prod --audit-level high --json` and fails loudly on any
+// Runs production and full-lockfile audits, retaining exact bundled-version
+// findings from the latter, and fails loudly on any
 // high/critical advisory that isn't covered by a reviewed, non-expired entry
 // in `scripts/audit-allowlist.json`. This is the "explicit, reviewed
 // exception mechanism rather than blanket ignores" from the issue's
@@ -8,9 +9,19 @@
 // names, and it stops working (fails the gate) once its `expires` date
 // passes, forcing someone to look at it again rather than letting it rot.
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+import { parse } from 'yaml';
+import { PACKAGE_DIRS } from './publish-release-packages.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = join(__dirname, '..');
@@ -154,7 +165,9 @@ export function assertValidAuditReport(report) {
 
 /**
  * Shells out to the real `pnpm audit` CLI and returns its parsed, validated
- * JSON report. `pnpm audit` exits non-zero both when it finds advisories
+ * JSON report. A full audit is used only to obtain bundled-version findings;
+ * its unrelated development advisories are filtered before policy evaluation.
+ * `pnpm audit` exits non-zero both when it finds advisories
  * at/above `--audit-level` *and* on a tooling failure, so the report has to
  * be read from the error too — `assertValidAuditReport` is what tells those
  * two cases apart. `cwd` is pinned to the repo root (rather than inherited
@@ -162,16 +175,22 @@ export function assertValidAuditReport(report) {
  * audits this workspace, not whatever pnpm project happens to be
  * discoverable from the caller's cwd.
  *
- * @param {{ cwd?: string }} [options]
+ * @param {{ cwd?: string, productionOnly?: boolean }} [options]
  * @returns {{ advisories: Record<string, unknown> }}
  */
-export function runPnpmAudit({ cwd = REPO_ROOT } = {}) {
+export function runPnpmAudit({ cwd = REPO_ROOT, productionOnly = true } = {}) {
   /** @type {unknown} */
   let parsed;
   try {
     const stdout = execFileSync(
       'pnpm',
-      ['audit', '--prod', '--audit-level', 'high', '--json'],
+      [
+        'audit',
+        ...(productionOnly ? ['--prod'] : []),
+        '--audit-level',
+        'high',
+        '--json',
+      ],
       { encoding: 'utf8', cwd },
     );
     parsed = JSON.parse(stdout);
@@ -184,6 +203,280 @@ export function runPnpmAudit({ cwd = REPO_ROOT } = {}) {
     }
   }
   return assertValidAuditReport(parsed);
+}
+
+/**
+ * Audit actual third-party inputs from fresh published-package bundles. Tsup's
+ * noExternal is declared intent, not an inventory: development imports and
+ * injected shims can also ship. Rebuilding with metafiles captures all three.
+ *
+ * Each package builds sequentially into a new directory, so neither missing
+ * nor stale dist output can become a false clean result. A fresh workspace
+ * build first supplies internal package exports (the CLI bundles core's dist).
+ * Audit builds then add metafiles without changing the release artifacts. CI
+ * needs installed dependencies but no pre-existing build artifacts.
+ *
+ * @param {{ cwd?: string }} [options]
+ * @returns {Promise<Map<string, Set<string>>>}
+ * @internal
+ */
+export async function bundledDependencyVersions({ cwd = REPO_ROOT } = {}) {
+  const lock = parse(readFileSync(join(cwd, 'pnpm-lock.yaml'), 'utf8'));
+  if (
+    String(lock.lockfileVersion) !== '9.0' ||
+    !lock.importers ||
+    !lock.snapshots ||
+    !lock.packages
+  ) {
+    throw new Error(
+      'Unsupported bundled audit lockfile: expected v9 importers, packages and snapshots',
+    );
+  }
+  const inventory = new Map();
+  let workspaceBuilt = false;
+
+  /**
+   * Resolve the physical package owning an input, including scoped packages,
+   * aliases and pnpm peer contexts. The installed identity must also exist in
+   * the frozen lockfile; a range, inferred version or unknown virtual input is
+   * never accepted as evidence of which third-party code shipped.
+   */
+  function inputPackage(input, packageRoot) {
+    if (!input.replaceAll('\\', '/').includes('node_modules/'))
+      return undefined;
+    const physical = realpathSync(resolve(packageRoot, input)).replaceAll(
+      '\\',
+      '/',
+    );
+    const marker = physical.lastIndexOf('/node_modules/');
+    if (marker < 0) throw new Error(`Unresolved bundled audit input: ${input}`);
+    const tail = physical.slice(marker + '/node_modules/'.length).split('/');
+    const name = tail.slice(0, tail[0].startsWith('@') ? 2 : 1).join('/');
+    const root = physical.slice(0, marker + '/node_modules/'.length) + name;
+    const manifest = JSON.parse(
+      readFileSync(join(root, 'package.json'), 'utf8'),
+    );
+    const key = `${manifest.name}@${manifest.version}`;
+    if (
+      typeof manifest.name !== 'string' ||
+      typeof manifest.version !== 'string' ||
+      !lock.packages[key]
+    ) {
+      throw new Error(`Unresolved bundled audit package: ${key} (${input})`);
+    }
+    return { name: manifest.name, version: manifest.version };
+  }
+
+  for (const packageDir of PACKAGE_DIRS) {
+    const packageRoot = join(cwd, packageDir);
+    const manifest = JSON.parse(
+      readFileSync(join(packageRoot, 'package.json'), 'utf8'),
+    );
+    // The launcher has no build. Every package with a build must be understood,
+    // so a future build tool cannot silently escape the published inventory.
+    if (!manifest.scripts?.build) continue;
+    const configPath = join(packageRoot, 'tsup.config.ts');
+    if (
+      manifest.scripts.build.split('&&')[0].trim() !== 'tsup' ||
+      !existsSync(configPath)
+    ) {
+      throw new Error(`Unsupported bundled audit build config: ${configPath}`);
+    }
+    const loaded = (await import(pathToFileURL(configPath).href)).default;
+    const configs = Array.isArray(loaded) ? loaded : [loaded];
+    if (configs.length === 0)
+      throw new Error(`Empty bundled audit build config: ${configPath}`);
+    const formats = new Set();
+    for (const config of configs) {
+      if (
+        !config ||
+        typeof config !== 'object' ||
+        typeof config.then === 'function'
+      ) {
+        throw new Error(
+          `Unsupported bundled audit build config: ${configPath}`,
+        );
+      }
+      const configuredFormats = config.format ?? ['cjs'];
+      if (
+        !Array.isArray(configuredFormats) ||
+        configuredFormats.length === 0 ||
+        configuredFormats.some(
+          (format) => !['esm', 'cjs', 'iife'].includes(format),
+        )
+      ) {
+        throw new Error(`Unsupported bundled audit formats: ${configPath}`);
+      }
+      for (const format of configuredFormats) {
+        // Tsup names metafiles by format. Two configurations sharing a format
+        // would overwrite evidence and could hide the earlier bundle's inputs.
+        if (formats.has(format))
+          throw new Error(
+            `Overlapping bundled audit formats: ${configPath} (${format})`,
+          );
+        formats.add(format);
+      }
+      const selectors = config.noExternal ?? [];
+      if (
+        !Array.isArray(selectors) ||
+        selectors.some(
+          (selector) =>
+            typeof selector !== 'string' && !(selector instanceof RegExp),
+        )
+      ) {
+        throw new Error(`Unsupported noExternal in ${configPath}`);
+      }
+    }
+    if (!workspaceBuilt) {
+      // Rebuild internal exports before bundling dependents. Cache reuse could
+      // otherwise embed an old core bundle whose third-party inputs are hidden
+      // inside compiled workspace code. One serial root build owns declarations
+      // and dependency ordering; separate temporary builds own audit metadata.
+      console.log(
+        'Building published packages before the bundled-input audit...',
+      );
+      execFileSync('pnpm', ['build'], {
+        cwd,
+        env: {
+          ...process.env,
+          NX_PARALLEL: '1',
+          NX_SKIP_NX_CACHE: 'true',
+          NX_DAEMON: 'false',
+          NX_ISOLATE_PLUGINS: 'false',
+          NX_TUI: 'false',
+        },
+        encoding: 'utf8',
+        timeout: 600_000,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      workspaceBuilt = true;
+    }
+    const outputDir = mkdtempSync(
+      join(tmpdir(), 'agentmonitors-bundle-audit-'),
+    );
+    const packageNames = new Set();
+    try {
+      // A fresh destination and required metafiles make build failure or missing
+      // output fatal. Existing release artifacts are never read or overwritten.
+      execFileSync(
+        process.execPath,
+        [
+          join(cwd, 'node_modules/tsup/dist/cli-default.js'),
+          '--metafile',
+          '--out-dir',
+          outputDir,
+        ],
+        {
+          cwd: packageRoot,
+          encoding: 'utf8',
+          timeout: 120_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      );
+      for (const format of formats) {
+        const metafile = JSON.parse(
+          readFileSync(join(outputDir, `metafile-${format}.json`), 'utf8'),
+        );
+        if (
+          !metafile.inputs ||
+          !metafile.outputs ||
+          Object.keys(metafile.outputs).length === 0
+        ) {
+          throw new Error(
+            `Missing bundled audit output: ${packageDir} (${format})`,
+          );
+        }
+        // esbuild reports parsed inputs even if fully tree-shaken. Output
+        // contributions identify code actually shipped in this build.
+        const inputs = new Set(
+          Object.values(metafile.outputs).flatMap((output) =>
+            Object.entries(output.inputs ?? {})
+              .filter(([, contribution]) => contribution.bytesInOutput > 0)
+              .map(([input]) => input),
+          ),
+        );
+        if (inputs.size === 0)
+          throw new Error(
+            `Missing bundled audit inputs: ${packageDir} (${format})`,
+          );
+        for (const input of inputs) {
+          const dependency = inputPackage(input, packageRoot);
+          if (!dependency) continue;
+          packageNames.add(dependency.name);
+          // Alias selectors express importer names, while audit identities use
+          // canonical names. Recognize a shipped alias when reporting intent.
+          const importer = lock.importers[packageDir];
+          for (const [name, reference] of Object.entries({
+            ...importer?.dependencies,
+            ...importer?.devDependencies,
+            ...importer?.optionalDependencies,
+          })) {
+            if (
+              reference.version?.split('(')[0] ===
+              `${dependency.name}@${dependency.version}`
+            )
+              packageNames.add(name);
+          }
+          if (!inventory.has(dependency.name))
+            inventory.set(dependency.name, new Set());
+          inventory.get(dependency.name).add(dependency.version);
+        }
+      }
+    } finally {
+      // This directory is exclusively owned by this invocation, never dist or
+      // another build's output. Cleanup does not affect release artifacts.
+      rmSync(outputDir, { recursive: true, force: true });
+    }
+    for (const config of configs) {
+      for (const selector of config.noExternal ?? []) {
+        const matched = [...packageNames].some((name) => {
+          if (typeof selector === 'string') return name === selector;
+          selector.lastIndex = 0;
+          return selector.test(name);
+        });
+        if (!matched)
+          console.warn(
+            `Declared noExternal selector absent from ${packageDir} bundle: ${selector}`,
+          );
+      }
+    }
+  }
+  return inventory;
+}
+
+/**
+ * Full audits expose bundled devDependencies to the registry. Only findings
+ * against exact bundled versions join the production report: unrelated build
+ * tooling and other versions of the same package retain their existing scope.
+ * Missing version evidence for a selected package is a tooling error, never a
+ * clean result. Pnpm performs advisory-range matching; this gate does not try
+ * to reimplement semver or infer vulnerability from package names alone.
+ *
+ * @param {{ advisories: Record<string, unknown> }} report
+ * @param {Map<string, Set<string>>} inventory
+ * @internal
+ */
+export function bundledAuditReport(report, inventory) {
+  const advisories = {};
+  for (const [id, advisory] of Object.entries(report.advisories)) {
+    const versions = inventory.get(advisory.module_name);
+    if (!versions) continue;
+    if (
+      !Array.isArray(advisory.findings) ||
+      advisory.findings.length === 0 ||
+      advisory.findings.some((finding) => typeof finding.version !== 'string')
+    ) {
+      throw new Error(
+        `Missing bundled audit finding versions for ${advisory.module_name}`,
+      );
+    }
+    const findings = advisory.findings.filter((finding) =>
+      versions.has(finding.version),
+    );
+    if (findings.length > 0) advisories[id] = { ...advisory, findings };
+  }
+  return { advisories };
 }
 
 /**
@@ -402,8 +695,19 @@ function formatAdvisory(advisory) {
   return `  - [${advisory.severity}] ${advisory.module_name}: ${advisory.title} (${advisory.github_advisory_id})\n    ${advisory.url}`;
 }
 
-export function main() {
-  const report = runPnpmAudit();
+/** Run both live inventories through the same expiring exception policy.
+ * @internal
+ */
+export async function main() {
+  const inventory = await bundledDependencyVersions();
+  const production = runPnpmAudit();
+  const bundled =
+    inventory.size === 0
+      ? { advisories: {} }
+      : bundledAuditReport(runPnpmAudit({ productionOnly: false }), inventory);
+  const report = {
+    advisories: { ...bundled.advisories, ...production.advisories },
+  };
   const exceptions = loadAllowlist();
   const { blocking, suppressed, expiredExceptions } = evaluateAuditReport(
     report,
@@ -437,7 +741,7 @@ export function main() {
   if (blocking.length > 0) {
     failed = true;
     console.error(
-      '\nUnresolved high/critical production-dependency advisories:',
+      '\nUnresolved high/critical production or bundled-dependency advisories:',
     );
     for (const advisory of blocking) {
       console.error(formatAdvisory(advisory));
@@ -450,7 +754,7 @@ export function main() {
 
   if (!failed) {
     console.log(
-      'pnpm audit --prod --audit-level high: clean (no unresolved high/critical advisories).',
+      'Production and bundled dependency audits: clean (no unresolved high/critical advisories).',
     );
   }
 
@@ -466,5 +770,5 @@ const isMainModule =
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (isMainModule) {
-  main();
+  await main();
 }
