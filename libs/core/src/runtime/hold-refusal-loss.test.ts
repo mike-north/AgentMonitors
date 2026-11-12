@@ -591,4 +591,57 @@ describe('which spans supersede a debounce refusal (#575)', () => {
     expect(f.eventSummaries()).toContain('K2');
     await expectCleared(f);
   });
+
+  it('a newer sibling held after a second flush in the refusing span supersedes it: the list of held-before-refusal observations is cleared by the first flush', async () => {
+    const f = fixture(
+      policies.debounce,
+      [
+        () => [],
+        // A is held, Bad is refused, E1 flushes [A, E1]; C is held anew and
+        // E2 flushes [C, E2]. Only A was held before the refusal, so C is
+        // newer than Bad and supersedes it.
+        () => [
+          obs('A', { key: 'K' }),
+          obs('Bad', { key: 'K', payload: bigint() }),
+          { ...obs('E1'), salience: 'high' as const },
+          obs('C', { key: 'K' }),
+          { ...obs('E2'), salience: 'high' as const },
+        ],
+      ],
+      'normal..high',
+    );
+    await f.tick();
+    await f.tick();
+    expect(f.eventSummaries()).toEqual(['A', 'E1', 'C', 'E2']);
+    await expectCleared(f);
+  });
+
+  it('a newer sibling materialized directly, ahead of a later escalation flush, supersedes a refusal made with nothing held', async () => {
+    const f = fixture(
+      '',
+      [
+        () => [],
+        // With no authored notify, an escalated Bad is held by the default
+        // high debounce and refused with nothing held. E2 is held, N (normal)
+        // materializes directly, and E3 flushes [E2, E3]. N is newer than Bad.
+        () => [
+          {
+            ...obs('Bad', { key: 'K', payload: bigint() }),
+            salience: 'high' as const,
+          },
+          { ...obs('E2'), salience: 'high' as const },
+          obs('N', { key: 'K' }),
+          { ...obs('E3'), salience: 'high' as const },
+        ],
+      ],
+      'normal..high',
+    );
+    await f.tick();
+    const span = await f.tick();
+    expect(span.erroredObservations).toEqual([
+      { monitorId: MONITOR_ID, message: refusalText('Bad', 'debounce') },
+    ]);
+    expect(f.eventSummaries()).toEqual(['N', 'E2', 'E3']);
+    await expectCleared(f);
+  });
 });

@@ -727,8 +727,9 @@ these outcomes supersede it:
   its own drops.
 
 Held work counts when it is flushed, because a hold does not reserve a materialization position.
-An observation held before a drop and flushed after it therefore supersedes a drop of the same
-key.
+An observation held before a drop and flushed in a later span therefore supersedes a drop of the
+same key. Within the dropping span itself, a flush in the same dispatch orders the held observations
+by arrival, as described above, so one held before a refusal does not supersede it.
 
 Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
 rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
