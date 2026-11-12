@@ -39,7 +39,7 @@ pnpm check          # package checks (excludes website) + workspace checks + aip
 pnpm check:api-report   # validate every checked-in api-report/*.api.md against the compiled surface (CI; no --local)
 pnpm fix:api-report     # regenerate api-report/*.api.md + dist rollups locally (--local; commit the diff)
 pnpm audit:prod             # pnpm audit --prod --audit-level high (raw report)
-pnpm check:dependency-audit # same audit, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
+pnpm check:dependency-audit # production + resolved bundled code, gated by scripts/audit-allowlist.json (CI: .github/workflows/dependency-audit.yml)
 pnpm fix:lint-ts    # eslint --fix
 pnpm fix:format     # prettier --write
 pnpm clean          # remove dist/ + api-extractor temp/ dirs and reset the nx cache
@@ -180,7 +180,7 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   current workspace version is still unpublished, deriving from the same `PACKAGE_DIRS` inventory as
   the publisher so the two can't drift. Because the publisher is idempotent, a partial publish
   reconciles on the next successful main CI run. See [`docs/release-process.md`](docs/release-process.md).
-- **Dependency audit**: `pnpm audit --prod --audit-level high` must stay clean. Fix by upgrading a
+- **Dependency audit**: production dependencies and code bundled into published builds must stay clean. Fix by upgrading a
   direct dependency (`libs/core`, `apps/cli`, `plugins/*` package.json) or, for a transitive
   advisory, a `pnpm-workspace.yaml` `overrides` pin — never a major bump without an issue explicitly
   authorizing it. A narrowly scoped, non-fixable advisory gets a reviewed, expiring entry in
@@ -191,5 +191,26 @@ tick) and a couple of fallbacks run **in-process without the socket** — see
   fixes _this repo's own_ audit/build — it isn't carried into a published package's own dependency
   tree, so it doesn't protect an external `npm install` of an unbundled (non-`noExternal`) dependency
   path; only a direct package.json bump (or an upstream fix) does that.
+  `@agentmonitors/core` therefore bundles its CEL stack (`cel-js`, `chevrotain`, `@chevrotain/*`,
+  `lodash-es`, `ramda`) into its build (`noExternal` in `libs/core/tsup.config.ts`) and lists them
+  as `devDependencies`, so consumers receive the patched versions this workspace resolves; their
+  licenses ship in `libs/core/THIRD_PARTY_NOTICES.md`. Adding a bundled dependency means adding its
+  notice there. The live gate rebuilds every published tsup package sequentially into fresh temporary
+  output with `--metafile`, then audits the third-party inputs that contribute bytes to
+  those outputs. This includes default-inlined development imports and injected tool
+  code such as tsup's shims, even without a matching `noExternal` selector. Installed
+  package identities must match exact versions in `pnpm-lock.yaml`. `noExternal` remains
+  declared build intent; selectors absent from the bundle are reported without failing.
+  Fresh audit builds require installed dependencies, not existing `dist` output, so CI
+  runs the gate after its frozen install. The gate first runs a serialized workspace
+  build with Nx caching disabled so the CLI sees fresh internal package exports. It
+  then builds temporary metafiles without changing release artifacts. Build failure
+  or missing metadata fails closed; stale output is never reused. The extra build
+  cost avoids timestamp-based freshness assumptions. The production audit and exact bundled
+  findings from a full audit share the scoped, expiring allowlist. Unbundled development
+  tooling stays excluded; unsupported build/lock shapes or unreachable endpoints fail
+  closed.
+  `pnpm test:standalone-consumer` installs the packed packages outside the workspace
+  and fails on any high/critical `npm audit --omit=dev` advisory (or if the audit cannot run).
 - **Review priority** (per `.github/copilot-instructions.md`): durable-state bugs, session-isolation
   errors, and event loss during debounce/compaction/batching/restart come before style.
