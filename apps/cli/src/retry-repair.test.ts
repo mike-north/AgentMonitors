@@ -191,8 +191,15 @@ function erroredMessages(): string[] {
   }
 }
 
-/** Start `daemon run` and wait until it has ticked and serves its socket. */
-async function startDaemon(pollMs: number): Promise<() => Promise<void>> {
+/**
+ * Start `daemon run` and wait until it has ticked and serves its socket.
+ * Sessions are reaped as soon as they are idle unless `reapAfterMs` says
+ * otherwise.
+ */
+async function startDaemon(
+  pollMs: number,
+  reapAfterMs = 0,
+): Promise<() => Promise<void>> {
   const before = erroredMessages().length;
   const daemon = spawn(
     process.execPath,
@@ -208,7 +215,7 @@ async function startDaemon(pollMs: number): Promise<() => Promise<void>> {
       '--socket',
       socketPath,
       '--reap-after-ms',
-      '0',
+      String(reapAfterMs),
     ],
     { cwd: root, env, stdio: ['ignore', 'pipe', 'pipe'] },
   );
@@ -870,4 +877,216 @@ describe('monitor retry without a daemon', () => {
         ?.reason,
     ).toMatch(/Retry skipped after 5 failed attempts\.$/u);
   }, 30_000);
+});
+
+describe('monitor retry on a retired verify artifact', () => {
+  /** A verify run token, as `verify --use-workspace-daemon` names its scratch file. */
+  const RUN = 'abcdef012345';
+
+  function scratchFile(): string {
+    return path.join(root, `agentmonitors-verify-${RUN}.md`);
+  }
+
+  /**
+   * Retain the suite monitor's change to its verify scratch file behind a
+   * native fault on that file's events only, and exhaust the retry. The fault
+   * stays installed, so only a repair can remove the row, while the monitor's
+   * real file still materializes. `ownership` says where the run's artifact
+   * is registered: in this workspace, in a foreign one, or nowhere.
+   */
+  async function seedScratchRetry(
+    ownership: 'registered' | 'foreign' | 'unregistered',
+  ): Promise<string> {
+    writeFileSync(
+      path.join(monitors, MONITOR, 'MONITOR.md'),
+      [
+        '---',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        "    - 'watched.txt'",
+        `    - 'agentmonitors-verify-${RUN}.md'`,
+        `  cwd: ${JSON.stringify(root)}`,
+        "  interval: '1s'",
+        'urgency: normal',
+        '---',
+        'Inspect.',
+        '',
+      ].join('\n'),
+    );
+    writeFileSync(watched, 'v1');
+    writeFileSync(scratchFile(), 's1');
+    const { store, client } = openStore();
+    try {
+      const registry = new SourceRegistry();
+      registry.register(fileFingerprintSource);
+      const runtime = new AgentMonitorRuntime(store, registry, [
+        claudeCodeAdapter,
+      ]);
+      if (ownership !== 'unregistered') {
+        const workspace =
+          ownership === 'registered' ? root : path.join(root, 'foreign');
+        mkdirSync(workspace, { recursive: true });
+        const owner = runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: `agentmonitors-verify-${RUN}`,
+            workspacePath: workspace,
+          }),
+        );
+        runtime.registerVerifyArtifact({
+          runId: RUN,
+          ownerSessionId: owner.id,
+          workspacePath: workspace,
+          monitorId: MONITOR,
+          objectKey: scratchFile(),
+        });
+      }
+      await runtime.tick(monitors, root);
+      writeFileSync(scratchFile(), 's2');
+      client.exec(`CREATE TRIGGER scratch_fault BEFORE INSERT ON monitor_events
+        WHEN instr(NEW.title || NEW.body || NEW.payload, 'agentmonitors-verify-') > 0
+        BEGIN SELECT RAISE(ABORT, 'native fault on the scratch file'); END;`);
+      // The file's mtime must move past the baseline's whole second.
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      const retained = await runtime.tick(monitors, root);
+      expect(retained.erroredObservations).toHaveLength(1);
+      const [retry] = store.listMaterializationRetries({ monitorId: MONITOR });
+      if (!retry) throw new Error('no retained retry');
+      for (let n = 0; n < MATERIALIZATION_RETRY_MAX_ATTEMPTS; n += 1) {
+        store.markMaterializationRetryFailed(retry.id, 'native fault');
+      }
+      expect(store.getMaterializationRetry(retry.id).status).toBe('terminal');
+      return retry.id;
+    } finally {
+      client.close();
+    }
+  }
+
+  /** The run requests cleanup, as verify does after its proof (002 §2.8). */
+  function retireScratch(): void {
+    const { store, client } = openStore();
+    try {
+      new AgentMonitorRuntime(store, new SourceRegistry(), [
+        claudeCodeAdapter,
+      ]).requestVerifyArtifactCleanup({ runId: RUN });
+    } finally {
+      client.close();
+    }
+  }
+
+  /** The text a repair prints when it removed the row as cleanup (005). */
+  function expectCleanupText(stdout: string, id: string): void {
+    expect(stdout).toContain(
+      `Removed retry ${id} of monitor ${MONITOR} as verify-artifact cleanup: its observation is a verify scratch artifact whose cleanup has taken effect, so it is neither re-armed nor recorded as a loss.`,
+    );
+    expect(stdout).toContain(
+      'The monitor takes newer input on its next tick unless other retained work is still ahead of it.',
+    );
+  }
+
+  /** No loss is reported, and newer legitimate input arrives after it. */
+  async function expectNoLossAndResume(baseline: string[]): Promise<void> {
+    const doctor = await doctorJson();
+    expect(doctor.monitors[0]?.unretainedObservationLoss).toBeNull();
+    expect(doctor.checks).toContainEqual(
+      expect.objectContaining({ name: `monitor:${MONITOR}` }),
+    );
+    expect(
+      doctor.checks.find(({ name }) => name === `monitor:${MONITOR}`)?.status,
+    ).not.toBe('fail');
+    writeFileSync(watched, 'v3');
+    await vi.waitFor(
+      () => expect(eventContents()).toEqual([...baseline, 'v3']),
+      { timeout: 15_000, interval: 100 },
+    );
+    const resumed = await doctorJson();
+    expect(resumed.monitors[0]?.unretainedObservationLoss).toBeNull();
+  }
+
+  it.each(['skip', 'rearm'] as const)(
+    '%s through the daemon removes it as cleanup, records no loss, and the monitor resumes',
+    async (verb) => {
+      const id = await seedScratchRetry('registered');
+      const baseline = eventContents();
+      const lossesBefore = erroredMessages().length;
+      // A daemon that keeps the owner session and does not tick again, so
+      // only the repair can remove the paused row.
+      const stop = await startDaemon(600_000, 3_600_000);
+      expect(retryRow(id)?.status).toBe('terminal');
+      retireScratch();
+      const erroredBefore = erroredMessages().length;
+      expect(erroredBefore).toBeGreaterThan(lossesBefore);
+
+      const result = await run(repairArgs(verb, id, '--format', 'text'));
+      expect(result.code).toBe(0);
+      expect(result.stdout).not.toContain('applied to the persisted store');
+      expectCleanupText(result.stdout, id);
+      expect(retryRow(id)).toBeUndefined();
+      // Neither a loss row nor any other errored row was written.
+      expect(erroredMessages()).toHaveLength(erroredBefore);
+
+      await stop();
+      await startDaemon(200);
+      await expectNoLossAndResume(baseline);
+    },
+    60_000,
+  );
+
+  it.each(['skip', 'rearm'] as const)(
+    '%s in-process removes it as cleanup, records no loss, and the monitor resumes',
+    async (verb) => {
+      const id = await seedScratchRetry('registered');
+      const baseline = eventContents();
+      retireScratch();
+      const erroredBefore = erroredMessages().length;
+
+      const result = await run(repairArgs(verb, id, '--format', 'json'));
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        action: verb,
+        outcome: 'verify-artifact-cleanup',
+        monitorId: MONITOR,
+        workspacePath: root,
+        via: 'in-process',
+        retry: { id, status: 'terminal', attemptCount: 5 },
+      });
+      expect(retryRow(id)).toBeUndefined();
+      expect(erroredMessages()).toHaveLength(erroredBefore);
+
+      await startDaemon(200);
+      await expectNoLossAndResume(baseline);
+    },
+    60_000,
+  );
+
+  it.each([
+    { ownership: 'unregistered', label: 'not registered' },
+    {
+      ownership: 'foreign',
+      label: 'registered and retired only in a foreign workspace',
+    },
+  ] as const)(
+    'skip still records the loss when the scratch key is $label',
+    async ({ ownership }) => {
+      const id = await seedScratchRetry(ownership);
+      if (ownership === 'foreign') retireScratch();
+
+      const result = await run(repairArgs('skip', id, '--format', 'json'));
+      expect(result.code).toBe(0);
+      expect(JSON.parse(result.stdout)).toMatchObject({
+        action: 'skip',
+        outcome: 'skipped',
+        via: 'in-process',
+      });
+      const doctor = await doctorJson();
+      expect(doctor.monitors[0]?.unretainedObservationLoss).toMatchObject({
+        count: 1,
+        objectKey: scratchFile(),
+        error: expect.stringContaining(
+          'Retry skipped after 5 failed attempts.',
+        ),
+      });
+    },
+    30_000,
+  );
 });

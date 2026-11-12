@@ -934,6 +934,40 @@ export interface MaterializationRetrySkipInput extends MaterializationRetryRepai
   reason?: string;
 }
 
+/**
+ * What an operator repair did to a terminal retry (002 §2.7, §2.8):
+ *
+ * - `rearmed`: the retry is back on automatic retry, its attempts reset;
+ * - `skipped`: the retry is removed and its observation is recorded as an
+ *   outstanding loss (002 §2);
+ * - `verify-artifact-cleanup`: the retry is removed and nothing is recorded,
+ *   because its observation is a verify artifact whose cleanup authority is in
+ *   effect (002 §2.8). Dropping it is the cleanup its owner asked for, not lost
+ *   work, so either repair removes it this way instead of re-arming it or
+ *   recording a loss.
+ *
+ * @public
+ */
+export type MaterializationRetryRepairOutcome =
+  | 'rearmed'
+  | 'skipped'
+  | 'verify-artifact-cleanup';
+
+/**
+ * The result of an operator repair of a terminal retry
+ * ({@link AgentMonitorRuntime.rearmMaterializationRetry},
+ * {@link AgentMonitorRuntime.skipMaterializationRetry}). @public
+ */
+export interface MaterializationRetryRepairResult {
+  /** What the repair did; see {@link MaterializationRetryRepairOutcome}. */
+  outcome: MaterializationRetryRepairOutcome;
+  /**
+   * The retry's safe metadata: as it is after a re-arm, or as it was when it
+   * was removed.
+   */
+  retry: MaterializationRetryDiagnostic;
+}
+
 /** Aggregate and bounded record-level diagnostics for one retry outbox. @public */
 export interface MaterializationRetrySummary {
   /** Records still eligible for automatic retry. */

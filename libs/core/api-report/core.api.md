@@ -42,7 +42,7 @@ export class AgentMonitorRuntime {
     openSession(input: OpenSessionInput): AgentSessionRecord;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
-    rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryDiagnostic;
+    rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryRepairResult;
     // (undocumented)
     refreshHookState(sessionId: string): SessionHookState;
     registerVerifyArtifact(input: RegisterVerifyArtifactInput): VerifyArtifactRecord;
@@ -58,7 +58,7 @@ export class AgentMonitorRuntime {
         objectKey: string;
         eventIds: string[];
     }): number;
-    skipMaterializationRetry(input: MaterializationRetrySkipInput): MaterializationRetryDiagnostic;
+    skipMaterializationRetry(input: MaterializationRetrySkipInput): MaterializationRetryRepairResult;
     // (undocumented)
     status(): RuntimeStatus;
     suppressObjectEvents(input: {
@@ -701,6 +701,15 @@ export interface MaterializationRetryRepairInput {
     monitorId: string;
     retryId: string;
     workspacePath: string;
+}
+
+// @public
+export type MaterializationRetryRepairOutcome = 'rearmed' | 'skipped' | 'verify-artifact-cleanup';
+
+// @public
+export interface MaterializationRetryRepairResult {
+    outcome: MaterializationRetryRepairOutcome;
+    retry: MaterializationRetryDiagnostic;
 }
 
 // @public
@@ -1429,6 +1438,14 @@ export class RuntimeStore {
     reapEphemeralMonitor(id: string): void;
     reapEphemeralMonitorsForSession(sessionId: string): string[];
     rearmMaterializationRetry(id: string, now?: Date): MaterializationRetryRecord;
+    // @internal
+    rearmTerminalMaterializationRetry(id: string, route: {
+        monitorId: string;
+        workspacePath: string | null;
+    }, now?: Date): {
+        outcome: 'rearmed' | 'verify-artifact-cleanup';
+        retry: MaterializationRetryRecord;
+    };
     recordInterpretDecision(sessionId: string, eventId: string, decision: {
         decision: 'deliver' | 'suppress' | 'failed';
         reason?: string | undefined;
@@ -1518,7 +1535,10 @@ export class RuntimeStore {
     }, loss: {
         objectKey: string | undefined;
         observationData: Record<string, unknown>;
-    }): MaterializationRetryRecord;
+    }): {
+        outcome: 'skipped' | 'verify-artifact-cleanup';
+        retry: MaterializationRetryRecord;
+    };
     staleActiveSessions(workspacePath: string | null, staleBefore: Date): AgentSessionRecord[];
     // (undocumented)
     status(): RuntimeStatus;

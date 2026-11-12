@@ -1285,6 +1285,48 @@ export class RuntimeStore {
   }
 
   /**
+   * An operator's re-arm of terminal retained work (002 §2.7), named by its
+   * workspace/monitor route. In one immediate transaction it either returns
+   * the row to automatic retry through
+   * {@link RuntimeStore.rearmMaterializationRetry}, or, when the row's
+   * observation is a verify artifact with cleanup authority in effect
+   * (002 §2.8), removes it through
+   * {@link RuntimeStore.discardRetiredVerifyArtifactRetry} instead: re-arming
+   * it would only retry scratch work its owner asked to be cleaned up.
+   *
+   * Only a terminal row of the named workspace/monitor can be re-armed; any
+   * other row, or a row that changed state after the caller read it, is
+   * rejected with nothing written.
+   *
+   * @internal
+   */
+  rearmTerminalMaterializationRetry(
+    id: string,
+    route: { monitorId: string; workspacePath: string | null },
+    now = new Date(),
+  ): {
+    outcome: 'rearmed' | 'verify-artifact-cleanup';
+    retry: MaterializationRetryRecord;
+  } {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const current = this.terminalRetryOnRoute(id, route);
+        if (this.discardRetiredVerifyArtifactRetry(id)) {
+          return {
+            outcome: 'verify-artifact-cleanup' as const,
+            retry: current,
+          };
+        }
+        return {
+          outcome: 'rearmed' as const,
+          retry: this.rearmMaterializationRetry(id, now),
+        };
+      })
+      .immediate();
+  }
+
+  /**
    * Give up terminal retained work for good (002 §2.7): record its observation
    * as an outstanding loss through {@link RuntimeStore.recordObservationLoss},
    * like every other drop, and remove the retry row, in one immediate
@@ -1296,6 +1338,13 @@ export class RuntimeStore {
    * a younger retained retry that completes, clears it. A row queued before
    * positions were reserved uses the current high-water mark instead, so only
    * an event materialized after the skip clears it.
+   *
+   * A row whose observation is a verify artifact with cleanup authority in
+   * effect (002 §2.8) is not lost work: it is removed through
+   * {@link RuntimeStore.discardRetiredVerifyArtifactRetry} in the same
+   * transaction and no loss is recorded, since no later event could ever
+   * supersede one for that key. The decision is made under the same writer
+   * lock as the write, never from the caller's earlier read.
    *
    * Only a terminal row of the named workspace/monitor can be skipped; any
    * other row, or a row that changed state after the caller read it, is
@@ -1310,19 +1359,19 @@ export class RuntimeStore {
       objectKey: string | undefined;
       observationData: Record<string, unknown>;
     },
-  ): MaterializationRetryRecord {
+  ): {
+    outcome: 'skipped' | 'verify-artifact-cleanup';
+    retry: MaterializationRetryRecord;
+  } {
     const db = asInternalDb(this.db);
     return db.$client
       .transaction(() => {
-        const current = this.getMaterializationRetry(id);
-        if (
-          current.monitorId !== route.monitorId ||
-          current.workspacePath !== route.workspacePath
-        ) {
-          throw new MaterializationRetryNotFoundError(id);
-        }
-        if (current.status !== 'terminal') {
-          throw new MaterializationRetryTransitionError(id, 'is not terminal');
+        const current = this.terminalRetryOnRoute(id, route);
+        if (this.discardRetiredVerifyArtifactRetry(id)) {
+          return {
+            outcome: 'verify-artifact-cleanup' as const,
+            retry: current,
+          };
         }
         const admission = db
           .select({
@@ -1351,9 +1400,31 @@ export class RuntimeStore {
             'disappeared before commit',
           );
         }
-        return current;
+        return { outcome: 'skipped' as const, retry: current };
       })
       .immediate();
+  }
+
+  /**
+   * The retry an operator repair names, read inside the repair's own
+   * transaction: refused as not found unless it belongs to the named
+   * workspace/monitor, and refused unless it is terminal.
+   */
+  private terminalRetryOnRoute(
+    id: string,
+    route: { monitorId: string; workspacePath: string | null },
+  ): MaterializationRetryRecord {
+    const current = this.getMaterializationRetry(id);
+    if (
+      current.monitorId !== route.monitorId ||
+      current.workspacePath !== route.workspacePath
+    ) {
+      throw new MaterializationRetryNotFoundError(id);
+    }
+    if (current.status !== 'terminal') {
+      throw new MaterializationRetryTransitionError(id, 'is not terminal');
+    }
+    return current;
   }
 
   /**

@@ -94,6 +94,7 @@ import type {
   MaterializationRetryDiagnostic,
   MaterializationRetryRecord,
   MaterializationRetryRepairInput,
+  MaterializationRetryRepairResult,
   MaterializationRetrySkipInput,
   MaterializationRetrySummary,
   MonitorDoctorReport,
@@ -1786,6 +1787,11 @@ export class AgentMonitorRuntime {
    * stays paused until the retry completes; once it does, the monitor takes
    * newer input in order. A watcher paused on the retry is woken at once.
    *
+   * A retry whose observation is a verify artifact with cleanup authority in
+   * effect (002 §2.8) is removed instead, with nothing recorded, and the
+   * outcome is `verify-artifact-cleanup`: retrying it would only materialize
+   * scratch work its owner asked to be cleaned up.
+   *
    * @throws {@link MaterializationRetryNotFoundError} when no retry of this
    *   monitor in this workspace has the id.
    * @throws {@link MaterializationRetryTransitionError} when the retry is not
@@ -1793,11 +1799,14 @@ export class AgentMonitorRuntime {
    */
   rearmMaterializationRetry(
     input: MaterializationRetryRepairInput,
-  ): MaterializationRetryDiagnostic {
+  ): MaterializationRetryRepairResult {
     this.terminalRetryFor(input, 're-armed');
-    const rearmed = this.store.rearmMaterializationRetry(input.retryId);
+    const { outcome, retry } = this.store.rearmTerminalMaterializationRetry(
+      input.retryId,
+      { monitorId: input.monitorId, workspacePath: input.workspacePath },
+    );
     this.wakeRetryRepairWaiters(input.workspacePath, input.monitorId);
-    return retryDiagnostic(rearmed);
+    return { outcome, retry: retryDiagnostic(retry) };
   }
 
   /**
@@ -1809,7 +1818,13 @@ export class AgentMonitorRuntime {
    * the observation's object key supersedes it. The monitor takes newer input
    * on its next tick once no other retained work remains ahead of it.
    *
-   * Returns the retry as it was when it was skipped.
+   * A retry whose observation is a verify artifact with cleanup authority in
+   * effect (002 §2.8) is removed with no loss recorded, and the outcome is
+   * `verify-artifact-cleanup`: dropping it is the cleanup, not lost work, and
+   * no later event could supersede a loss for that key. The store decides
+   * this under the skip's own writer lock.
+   *
+   * Returns the retry as it was when it was removed.
    *
    * @throws {@link MaterializationRetryNotFoundError} when no retry of this
    *   monitor in this workspace has the id.
@@ -1820,7 +1835,7 @@ export class AgentMonitorRuntime {
    */
   skipMaterializationRetry(
     input: MaterializationRetrySkipInput,
-  ): MaterializationRetryDiagnostic {
+  ): MaterializationRetryRepairResult {
     const reasonLength = input.reason?.trim().length ?? 0;
     if (reasonLength > MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH) {
       throw new RangeError(
@@ -1830,7 +1845,7 @@ export class AgentMonitorRuntime {
     const current = this.terminalRetryFor(input, 'skipped');
     // The same loss record every other drop gets (002 §2); the store writes it
     // inside the skip's own transaction, at the retry's admission position.
-    const skipped = this.store.skipMaterializationRetry(
+    const { outcome, retry } = this.store.skipMaterializationRetry(
       input.retryId,
       { monitorId: input.monitorId, workspacePath: input.workspacePath },
       observationLossRecord(
@@ -1839,7 +1854,7 @@ export class AgentMonitorRuntime {
       ),
     );
     this.wakeRetryRepairWaiters(input.workspacePath, input.monitorId);
-    return retryDiagnostic(skipped);
+    return { outcome, retry: retryDiagnostic(retry) };
   }
 
   /**

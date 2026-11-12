@@ -9,7 +9,7 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-11-12 — Re-arm or skip a terminal retry from the CLI (002 §2/§2.7/§15; 004 §3.4; 005 §6 `monitor retry`, §15) — Refs #584
+## 2026-11-12 — Re-arm or skip a terminal retry from the CLI (002 §2/§2.7/§2.8/§15; 004 §3.4; 005 §6 `monitor retry`, §15) — Refs #584
 
 A terminal materialization retry pauses its monitor (§2.7), and until now the only way out was
 editing the store by hand. Add two operator repairs, `agentmonitors monitor retry rearm
@@ -34,6 +34,16 @@ already have applied it. A skip's `--reason` is at most 200 characters after tri
 is refused), so the skip note and reason always survive the diagnostic cap and only a long last
 error is shortened, with `…`. The skip's `monitor explain` hint is quoted and `--workspace`-scoped
 like `doctor`'s remediation commands.
+
+With 002 §2.8's verify-artifact ownership, a terminal retry whose observation is a verify artifact
+with cleanup authority in effect is not lost work: either repair removes it through the ownership
+discard (the same predicate, inside the repair's own immediate transaction) and records no loss and
+no `errored` row, re-arm never re-arms it, and the command reports the outcome
+`verify-artifact-cleanup` (002 §2.7 "Operator repair", §2.8 boundary 3; 005 `monitor retry`).
+Recording a loss there would have left `doctor` and `explain` reporting it forever, since every
+later observation of the scratch key is dropped and none could supersede it. Both repairs now return
+`MaterializationRetryRepairResult` (`outcome` plus the retry's safe metadata), and the CLI's JSON
+output carries `outcome`.
 
 ## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2/§2.0/§2.7/§2.8/§10.5/§15; 004 §2.5/§3.4/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418, #575
 

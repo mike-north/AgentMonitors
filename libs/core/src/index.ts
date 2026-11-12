@@ -205,6 +205,8 @@ export type {
   MaterializationRetryQuery,
   MaterializationRetryDiagnostic,
   MaterializationRetryRepairInput,
+  MaterializationRetryRepairOutcome,
+  MaterializationRetryRepairResult,
   MaterializationRetrySkipInput,
   OrphanedMonitorWork,
   MaterializationRetryRecord,

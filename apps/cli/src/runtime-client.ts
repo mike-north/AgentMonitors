@@ -10,8 +10,8 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
-  MaterializationRetryDiagnostic,
   MaterializationRetryRepairInput,
+  MaterializationRetryRepairResult,
   MaterializationRetrySkipInput,
   MaterializationRetrySummary,
   MonitorDoctorReport,
@@ -419,6 +419,16 @@ export async function cancelWatchClient(
 export const RETRY_REPAIR_TIMEOUT_MS = 10_000;
 
 /**
+ * A repair result with its retry's Dates revived and its last error
+ * normalized for display, whether it came over the socket or in-process.
+ */
+function normalizeRepairResult(
+  result: MaterializationRetryRepairResult,
+): MaterializationRetryRepairResult {
+  return { outcome: result.outcome, retry: normalizeRetryRecord(result.retry) };
+}
+
+/**
  * Re-arm one terminal retry on the live daemon (005 `monitor retry rearm`),
  * so a watcher paused on it in that process wakes at once. The returned
  * record is safe metadata with its Dates revived.
@@ -426,9 +436,9 @@ export const RETRY_REPAIR_TIMEOUT_MS = 10_000;
 export async function rearmRetryClient(
   input: MaterializationRetryRepairInput,
   socketPath?: string,
-): Promise<MaterializationRetryDiagnostic> {
-  return normalizeRetryRecord(
-    await callDaemon<MaterializationRetryDiagnostic>(
+): Promise<MaterializationRetryRepairResult> {
+  return normalizeRepairResult(
+    await callDaemon<MaterializationRetryRepairResult>(
       'retry.rearm',
       { ...input },
       {
@@ -443,9 +453,9 @@ export async function rearmRetryClient(
 export async function skipRetryClient(
   input: MaterializationRetrySkipInput,
   socketPath?: string,
-): Promise<MaterializationRetryDiagnostic> {
-  return normalizeRetryRecord(
-    await callDaemon<MaterializationRetryDiagnostic>(
+): Promise<MaterializationRetryRepairResult> {
+  return normalizeRepairResult(
+    await callDaemon<MaterializationRetryRepairResult>(
       'retry.skip',
       { ...input },
       {
@@ -464,8 +474,8 @@ export async function skipRetryClient(
 export function rearmRetryInProcess(
   input: MaterializationRetryRepairInput,
   dbPath: string,
-): MaterializationRetryDiagnostic {
-  return normalizeRetryRecord(
+): MaterializationRetryRepairResult {
+  return normalizeRepairResult(
     createRuntime(dbPath).rearmMaterializationRetry(input),
   );
 }
@@ -474,8 +484,8 @@ export function rearmRetryInProcess(
 export function skipRetryInProcess(
   input: MaterializationRetrySkipInput,
   dbPath: string,
-): MaterializationRetryDiagnostic {
-  return normalizeRetryRecord(
+): MaterializationRetryRepairResult {
+  return normalizeRepairResult(
     createRuntime(dbPath).skipMaterializationRetry(input),
   );
 }

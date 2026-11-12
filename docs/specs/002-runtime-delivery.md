@@ -1215,11 +1215,12 @@ its workspace, monitor id and record id; a row of another monitor or workspace i
 automatically, so resetting it would evade its attempt budget, and skipping it would give up work
 the runtime can still complete.
 
-| From       | Repair | To                                                                                   |
-| ---------- | ------ | ------------------------------------------------------------------------------------ |
-| `terminal` | re-arm | `pending`, attempts 0, no last error, next attempt after the first retry delay (§15) |
-| `terminal` | skip   | removed, with an outstanding loss recorded in the same transaction (§2)              |
-| `pending`  | either | refused, unchanged                                                                   |
+| From                                | Repair | To                                                                                   |
+| ----------------------------------- | ------ | ------------------------------------------------------------------------------------ |
+| `terminal`                          | re-arm | `pending`, attempts 0, no last error, next attempt after the first retry delay (§15) |
+| `terminal`                          | skip   | removed, with an outstanding loss recorded in the same transaction (§2)              |
+| `terminal`, retired verify artifact | either | removed as verify-artifact cleanup, with no loss and no `errored` row (§2.8)         |
+| `pending`                           | either | refused, unchanged                                                                   |
 
 - **Re-arm** keeps the row's identity, envelope and admission position, so the drain takes it in
   its original place. Once it completes, the monitor resumes and takes newer input in order; if
@@ -1229,6 +1230,16 @@ the runtime can still complete.
   immediate transaction, so neither happens without the other. The loss is reported and
   superseded like any other drop (§2). With the row gone, the drain continues with the next
   row, or, when the outbox is empty, the monitor takes newer input on its next tick.
+- **A retired verify artifact's row.** When the row's observation is a verify artifact whose
+  cleanup authority is in effect (§2.8), either repair removes it through the same discard the
+  drain uses, with the same predicate, inside the repair's own immediate transaction, and records
+  nothing: no loss, no `errored` row, no history row. Dropping it is the cleanup its owner asked
+  for, not lost work, and a loss for its scratch key could never be superseded, since every later
+  observation of that key is dropped too. Re-arm **MUST NOT** re-arm such a row. The decision is
+  made under the repair's writer lock, never from an earlier read, so cleanup recorded by another
+  writer after the caller read the row is honored. The repair succeeds, reports the outcome
+  `verify-artifact-cleanup`, and wakes a paused watcher like any other repair; the monitor resumes
+  as after a skip.
 
 A watcher paused on a terminal row is woken by a repair made in its own process, instead of
 waiting for its one-minute recheck. A repair made by another process (the CLI's in-process path
@@ -1316,12 +1327,12 @@ The first cause is recorded with its time (`cleanupRequestedAt`, `cleanupCause`)
 reconciliation keeps the first record. `owner-inactive` is recorded when the runtime closes or reaps
 the owner and again by reconciliation at the start of every tick, so a crash between ending the
 session and recording the cause is repaired on the next tick. Until it is recorded, an inactive owner
-supplies authority at both filter boundaries below. When authority is recorded, the runtime
+supplies authority at every boundary below. When authority is recorded, the runtime
 retracts every existing event for the exact key in that workspace and refreshes hook state, in
 one store write.
 
 **Filtering.** With authority in effect, the runtime drops observations whose object key equals the
-registered key, for the registered monitor and workspace only, at two boundaries:
+registered key, for the registered monitor and workspace only, at three boundaries:
 
 1. **Incoming observations** — after the CEL pre-filter and before notify dispatch (§4), inside the
    same transaction. A dropped observation never enters a debounce or rollup hold and never consumes
@@ -1343,6 +1354,9 @@ registered key, for the registered monitor and workspace only, at two boundaries
    refusal in the same dispatch (§4.7) is placed among the envelopes that survive this filter, not
    all dispatched ones (§2), so a dropped artifact never moves a refusal after a newer event of its
    key.
+3. **Operator repair** — `monitor retry rearm|skip` (§2.7, "Operator repair") on a terminal retry
+   row whose observation has authority in effect removes the row through the same discard, in the
+   repair's own immediate transaction, recording no loss and never re-arming it.
 
 Authority has **no wall-clock expiry**, and no successful poll, empty observation or other source
 outcome retires it. Source plugins are unaware of ownership: their opaque state, baselines and
@@ -1382,7 +1396,10 @@ the tick and watcher drains, including a terminal one, a legitimate row behind a
 cleanup recorded by a second writer before completion commits, and a removal that cannot commit,
 with exactness controls),
 `libs/core/src/runtime/verify-artifact-ownership-refusal-position.test.ts` (a hold refusal behind a
-dropped artifact keeps its place among the kept envelopes, with an unfiltered control) and
+dropped artifact keeps its place among the kept envelopes, with an unfiltered control),
+`libs/core/src/runtime/retry-repair-retired-artifact.test.ts` (re-arm and skip of a terminal
+retired-artifact row remove it with no loss, the monitor resumes and a paused watcher wakes, with
+unregistered, foreign-workspace and proof-phase controls that still record the loss or re-arm) and
 `libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in
 `libs/core/src/inbox/schema.ts` (`verify_artifacts`).
 

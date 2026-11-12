@@ -831,6 +831,14 @@ agentmonitors monitor retry skip  <monitorId> <retryId> [--reason <text>] [--wor
   200 characters, so the note and the reason always appear in full; when the whole error would
   pass the 1,024-character diagnostic cap, the last error is shortened and ends in `…`. The
   monitor takes newer input on its next tick, once no other retained work is ahead of it.
+- **A retired verify artifact's retry.** When the retry's observation is a verify scratch artifact
+  whose cleanup authority is in effect (002 §2.8), both commands remove the retry as
+  verify-artifact cleanup instead: no loss is recorded, `doctor` and `monitor explain` report no
+  dropped observation for it, and `rearm` does not re-arm it. Dropping it is the cleanup its owner
+  asked for, and no later event could supersede a loss for its scratch key. The decision is made
+  inside the repair's own store transaction. The command succeeds, wakes a paused watcher like any
+  repair, and the monitor takes newer input on its next tick unless other retained work is ahead
+  of it.
 
 Both commands refuse, exit 1, and change nothing when:
 
@@ -878,16 +886,25 @@ Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an out
 The monitor takes newer input on its next tick unless other retained work is still ahead of it.
 ```
 
+After either repair of a retired verify artifact's retry:
+
+```
+Removed retry <id> of monitor <monitorId> as verify-artifact cleanup: its observation is a verify scratch artifact whose cleanup has taken effect, so it is neither re-armed nor recorded as a loss.
+The monitor takes newer input on its next tick unless other retained work is still ahead of it.
+```
+
 The suggested `monitor explain` (and, for an unknown outcome, `doctor`) runs verbatim from the
 directory the repair ran in, quoted and scoped the way `doctor` scopes its remediation commands:
 an argument that is not shell-safe is single-quoted, and when `--workspace` names another directory
 than the current one the command carries `--workspace <path>` and that workspace's own definitions
 (`--dir <workspace>/.claude/monitors` for `explain`; `doctor` reads them by default).
 
-JSON/TOON output is `{ action: "rearm"|"skip", monitorId, workspacePath, via: "daemon"|"in-process",
-retry }`, where `retry` is the record's safe metadata (`id`, `status`, `attemptCount`,
-`nextAttemptAt`, `lastError`, `createdAt`, `updatedAt`): after a re-arm, its new state; after a
-skip, its state when it was skipped. The stored observation is never part of it. A refusal prints
+JSON/TOON output is `{ action: "rearm"|"skip", outcome:
+"rearmed"|"skipped"|"verify-artifact-cleanup", monitorId, workspacePath, via: "daemon"|"in-process",
+retry }`. `outcome` says what the repair did (`verify-artifact-cleanup` for a retired verify
+artifact's retry, whichever the action). `retry` is the record's safe metadata (`id`, `status`,
+`attemptCount`, `nextAttemptAt`, `lastError`, `createdAt`, `updatedAt`): after a re-arm, its new
+state; after a removal, its state when it was removed. The stored observation is never part of it. A refusal prints
 `{ "error": "<message above>" }`.
 
 The tick report names both commands for a terminal retry (002 §2.7), as do the `monitor explain`
@@ -897,8 +914,11 @@ Verified: `apps/cli/src/retry-repair.test.ts` (built CLI against a real `daemon 
 success with later input in order, re-arm then failure, skip with the loss in `doctor` and
 `monitor explain` until superseded, each with one daemon and across a daemon restart; refusals
 through the daemon and in-process; a reachable daemon's error reported, never applied
-in-process; the in-process path, running the re-arm `doctor` suggests) and
-`libs/core/src/runtime/retry-repair.test.ts`.
+in-process; the in-process path, running the re-arm `doctor` suggests; re-arm and skip of a
+retired verify artifact's retry through the daemon and in-process, with no loss and the monitor
+resuming, and unregistered and foreign-workspace controls that still record the loss),
+`libs/core/src/runtime/retry-repair.test.ts` and
+`libs/core/src/runtime/retry-repair-retired-artifact.test.ts`.
 
 ---
 

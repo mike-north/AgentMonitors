@@ -272,17 +272,20 @@ describe('re-arming a terminal retry', () => {
       workspacePath: f.root,
     });
     expect(rearmed).toEqual({
-      id,
-      status: 'pending',
-      attemptCount: 0,
-      // 002 §15: re-arm schedules the initial delay again, rounded up.
-      nextAttemptAt: expect.any(Date),
-      lastError: null,
-      createdAt: expect.any(Date),
-      updatedAt: expect.any(Date),
+      outcome: 'rearmed',
+      retry: {
+        id,
+        status: 'pending',
+        attemptCount: 0,
+        // 002 §15: re-arm schedules the initial delay again, rounded up.
+        nextAttemptAt: expect.any(Date),
+        lastError: null,
+        createdAt: expect.any(Date),
+        updatedAt: expect.any(Date),
+      },
     });
     // The private envelope never leaves the runtime.
-    expect(Object.keys(rearmed)).not.toContain('envelope');
+    expect(Object.keys(rearmed.retry)).not.toContain('envelope');
 
     clock.advance(2_000);
     const tick = await opened.runtime.tick(f.monitorsDir, f.root);
@@ -357,7 +360,10 @@ describe('skipping a terminal retry', () => {
       workspacePath: f.root,
       reason: 'upstream object deleted',
     });
-    expect(skipped).toMatchObject({ id, status: 'terminal' });
+    expect(skipped).toMatchObject({
+      outcome: 'skipped',
+      retry: { id, status: 'terminal' },
+    });
     expect(retryCount(opened.client)).toBe(0);
 
     const expectedError = `A write failed Retry skipped after ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} failed attempts: upstream object deleted.`;

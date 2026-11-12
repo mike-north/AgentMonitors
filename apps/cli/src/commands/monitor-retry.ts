@@ -16,7 +16,7 @@ import path from 'node:path';
 import { Command, Option } from 'commander';
 import {
   MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
-  type MaterializationRetryDiagnostic,
+  type MaterializationRetryRepairResult,
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
@@ -82,13 +82,24 @@ function outcomeUnknownMessage(
   return `${label} outcome unknown for retry ${retryId} of monitor ${monitorId} in workspace ${workspacePath}: the daemon received the request but no reply arrived (${error.message}). The ${noun} may already have been applied; nothing was written to the store from here. Check with \`${explainCommand(scope, monitorId)}\` or \`${doctorCommandLine(scope)}\` before running it again.`;
 }
 
+/** Shown once a removed retry no longer holds its monitor back. */
+const RESUMES_LINE =
+  'The monitor takes newer input on its next tick unless other retained work is still ahead of it.';
+
 function successLines(
-  repair: RetryRepair,
   monitorId: string,
   workspacePath: string,
-  retry: MaterializationRetryDiagnostic,
+  { outcome, retry }: MaterializationRetryRepairResult,
 ): string[] {
-  if (repair === 'rearm') {
+  if (outcome === 'verify-artifact-cleanup') {
+    // 002 §2.8: either repair removes a retired verify artifact's retry as
+    // the cleanup its owner asked for; it is neither re-armed nor a loss.
+    return [
+      `Removed retry ${retry.id} of monitor ${monitorId} as verify-artifact cleanup: its observation is a verify scratch artifact whose cleanup has taken effect, so it is neither re-armed nor recorded as a loss.`,
+      RESUMES_LINE,
+    ];
+  }
+  if (outcome === 'rearmed') {
     return [
       `Re-armed retry ${retry.id} of monitor ${monitorId}: its failed attempts are reset and it is next attempted at ${retry.nextAttemptAt?.toISOString() ?? 'the next tick'}.`,
       'The monitor stays paused until this retry completes, then takes newer input in order.',
@@ -96,7 +107,7 @@ function successLines(
   }
   return [
     `Skipped retry ${retry.id} of monitor ${monitorId}. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see \`${explainCommand(suggestionScope(workspacePath), monitorId)}\`.`,
-    'The monitor takes newer input on its next tick unless other retained work is still ahead of it.',
+    RESUMES_LINE,
   ];
 }
 
@@ -123,11 +134,11 @@ async function runRepair(
       : {}),
   };
   const label = repair === 'rearm' ? 'Re-arm' : 'Skip';
-  let retry: MaterializationRetryDiagnostic;
+  let repaired: MaterializationRetryRepairResult;
   let via: AppliedVia = 'daemon';
   try {
     try {
-      retry =
+      repaired =
         repair === 'rearm'
           ? await rearmRetryClient(input, socketPath)
           : await skipRetryClient(input, socketPath);
@@ -154,7 +165,7 @@ async function runRepair(
         workspacePath,
         readLocalState(workspacePath),
       );
-      retry =
+      repaired =
         repair === 'rearm'
           ? rearmRetryInProcess(input, dbPath)
           : skipRetryInProcess(input, dbPath);
@@ -170,10 +181,11 @@ async function runRepair(
 
   const result = {
     action: repair,
+    outcome: repaired.outcome,
     monitorId,
     workspacePath,
     via,
-    retry,
+    retry: repaired.retry,
   };
   if (json) {
     console.log(JSON.stringify(result, null, 2));
@@ -184,7 +196,7 @@ async function runRepair(
     return;
   }
   if (via === 'in-process') console.log(NO_DAEMON_NOTICE);
-  for (const line of successLines(repair, monitorId, workspacePath, retry)) {
+  for (const line of successLines(monitorId, workspacePath, repaired)) {
     console.log(line);
   }
 }
