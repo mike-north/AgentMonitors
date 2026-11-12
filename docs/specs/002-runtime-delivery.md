@@ -686,14 +686,16 @@ A dropped observation **MUST NOT** be less visible than a retained one. One rule
 observation the runtime could not keep, so every kind of loss is a _drop_ with the same identity:
 
 - an observation the outbox could not retain (above), whose row's error ends in
-  `Not retained for retry: <reason>`; and
+  `Not retained for retry: <reason>`;
 - an observation a debounce or rollup hold refused because it cannot be serialized (§4.7), whose
-  row's error is the refusal's own message.
+  row's error is the refusal's own message; and
+- the observation of a terminal retry an operator skipped (§2.7, "Operator repair"), whose row's
+  error is the retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`
 
-Both rows are written by one recording function (`RuntimeStore.recordObservationLoss()`,
-internal), inside the admitting span's transaction, with the same drop identity (see
-[`observation_history`](#observation_history)). Each row is written at the lost observation's
-place in the span's order. An outbox drop is recorded where its materialization failed. A refusal
+Every such row is written by one recording function (`RuntimeStore.recordObservationLoss()`,
+internal), with the same drop identity (see [`observation_history`](#observation_history)). A
+drop or a refusal is written inside the admitting span's transaction, at the lost observation's
+place in the span's order; a skip, inside the skip's own transaction (below). An outbox drop is recorded where its materialization failed. A refusal
 is recorded after the dispatched events of observations older than it: held work flushed in the
 same dispatch and siblings that arrived before it and went straight to materialization. That
 includes the observations a debounce batch held when the refusal was made, if an escalation later in
@@ -732,14 +734,15 @@ same key. Within the dropping span itself, a flush in the same dispatch orders t
 by arrival, as described above, so one held before a refusal does not supersede it.
 
 A terminal retry that an operator **skips** (§2.7, "Operator repair") is recorded as the same kind
-of outstanding drop, through the same `errored` row, and is superseded by the same rules with one
-difference: its high-water mark is the retry's own admission position (`admission_sequence`), not
+of outstanding drop, through the same recording function and the same `errored` row, and is
+superseded by the same rules with one difference: its high-water mark is the retry's own admission position (`admission_sequence`), not
 the counter at the time of the skip. The observation was admitted when the retry was queued, so
 retained work admitted after it, which carries newer state for the key, supersedes the loss when
 it completes; a retry queued before positions were reserved uses the counter at the skip instead.
-Its error is the retry's last error followed by
-`Not retained for retry: skipped after <n> failed attempts[: <reason>].`; the row records the
-observation's `objectKey` and `title`, `skipped: true` and the retry id, and has no span position.
+Its `observationData` is `{ error, skipped: true, retryId, objectKey?, title? }`: `error` is the
+retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`, shortened
+like an outbox drop's so the note always fits, and `objectKey`/`title` follow the same safe-text
+rule. It has no `position` or `spanSize`, since the retry outlived the span that admitted it.
 
 Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
 rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
@@ -749,8 +752,8 @@ outstanding:
 
 - `explainMonitor`'s materialization stage is `failure` (§10.7), so its verdict fails;
 - `doctorReport` attaches `unretainedObservationLoss` to that monitor's rollup: the outstanding
-  count, across both kinds, and the newest outstanding drop's time, error, position, span size,
-  `objectKey` and `title`. A refusal records no position or span size. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
+  count, across every kind, and the newest outstanding drop's time, error, position, span size,
+  `objectKey` and `title`. A refusal or a skipped retry records no position or span size. `doctor` fails that monitor's check with the reason ([005](./005-cli-reference.md)
   per-monitor rollup).
 - When the monitor has no one unambiguous parsed definition (its definition was removed, fails to
   parse, or its id is duplicated), the loss goes to that id's entry in `orphanedMonitorWork`
@@ -1227,7 +1230,7 @@ the runtime can still complete.
   and backoff are unchanged.
 - **Skip** records the row's observation as an outstanding loss and deletes the row in one
   immediate transaction, so neither happens without the other. The loss is reported and
-  superseded like an admission drop (§2). With the row gone, the drain continues with the next
+  superseded like any other drop (§2). With the row gone, the drain continues with the next
   row, or, when the outbox is empty, the monitor takes newer input on its next tick.
 
 A watcher paused on a terminal row is woken by a repair made in its own process, instead of
@@ -2602,12 +2605,13 @@ verdict without removing this observation-stage diagnostic. Verified: `source-er
 and the CLI socket/fallback tests in `incoming-changes-diagnostics.test.ts` (Refs #305).
 
 While the monitor has an outstanding dropped observation (§2, "Admission outcomes when the outbox
-cannot retain a suffix"; an observation a hold refused, §4.7, is one too), the materialization
+cannot retain a suffix"; an observation a hold refused, §4.7, and a skipped terminal retry, §2.7,
+are drops too), the materialization
 stage is `failure` with reason
 `<count> observation(s) were dropped because the runtime could not keep them; the newest,
-<which>, failed: <displayed error>`. The count covers both kinds of drop, and the error says which
+<which>, failed: <displayed error>`. The count covers every kind of drop, and the error says which
 kind the newest was. `<which>` is `observation <position> of <spanSize>` (or `an observation` when
-no position was recorded, as for a refusal), followed by `(<objectKey>, "<title>")` with whichever
+no position was recorded, as for a refusal or a skipped retry), followed by `(<objectKey>, "<title>")` with whichever
 of the two were recorded; the error uses the display rule above. `details.unretainedObservationLoss` carries the same fields as doctor's
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
 retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays

@@ -449,7 +449,7 @@ describe.each([
     await maybeRestart(stop);
     // The daemon keeps ticking; an unchanged file supersedes nothing.
     await new Promise((resolve) => setTimeout(resolve, 1_000));
-    const expectedError = `native fault Not retained for retry: skipped after ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} failed attempts: superseded upstream.`;
+    const expectedError = `native fault Retry skipped after ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} failed attempts: superseded upstream.`;
     const doctor = await doctorJson();
     expect(doctor.monitors[0]?.unretainedObservationLoss).toMatchObject({
       count: 1,
@@ -632,9 +632,7 @@ describe('monitor retry without a daemon', () => {
     expect(doctor.monitors[0]?.unretainedObservationLoss).toMatchObject({
       count: 1,
       objectKey: watched,
-      error: expect.stringContaining(
-        'Not retained for retry: skipped after 5 failed attempts.',
-      ),
+      error: expect.stringContaining('Retry skipped after 5 failed attempts.'),
     });
     expect((await explainMaterialization()).status).toBe('failure');
   }, 30_000);

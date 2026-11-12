@@ -494,8 +494,9 @@ export interface DoctorDeliveryCounts {
  * still outstanding because nothing has superseded them (002 §2). One rule
  * covers every kind of drop: an observation the retry outbox could not retain
  * with its ordered suffix ("Admission outcomes when the outbox cannot retain a
- * suffix"), and an observation a debounce or rollup hold refused because it
- * cannot be serialized (002 §4.7). A drop with an object key
+ * suffix"), an observation a debounce or rollup hold refused because it
+ * cannot be serialized (002 §4.7), and the observation of a terminal retry an
+ * operator skipped (002 §2.7). A drop with an object key
  * is superseded only by a later event of the same monitor, workspace and
  * object key; a drop without one, only by a later span of that monitor in that
  * workspace that materializes an event and drops nothing. Quiet ticks, notify
@@ -513,13 +514,15 @@ export interface UnretainedObservationLoss {
   recordedAt: Date;
   /**
    * The newest drop's error: the materialization error followed by
-   * `Not retained for retry: <reason>` for an outbox drop, or the refusal
-   * message for a hold refusal (002 §4.7).
+   * `Not retained for retry: <reason>` for an outbox drop, the refusal
+   * message for a hold refusal (002 §4.7), or the retry's last error followed
+   * by `Retry skipped after <n> failed attempts[: <reason>].` for a skipped
+   * terminal retry (002 §2.7).
    */
   error: string;
-  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal). */
+  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal or a skipped retry). */
   position?: number;
-  /** How many observations that span dispatched, when recorded (never for a hold refusal). */
+  /** How many observations that span dispatched, when recorded (never for a hold refusal or a skipped retry). */
   spanSize?: number;
   /** The newest dropped observation's source `objectKey`, when it had one. */
   objectKey?: string;

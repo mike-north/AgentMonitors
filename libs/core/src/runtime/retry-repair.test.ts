@@ -349,7 +349,7 @@ describe('skipping a terminal retry', () => {
     expect(skipped).toMatchObject({ id, status: 'terminal' });
     expect(retryCount(opened.client)).toBe(0);
 
-    const expectedError = `A write failed Not retained for retry: skipped after ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} failed attempts: upstream object deleted.`;
+    const expectedError = `A write failed Retry skipped after ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} failed attempts: upstream object deleted.`;
     const doctor = await opened.runtime.doctorReport({
       monitorsDir: f.monitorsDir,
       workspacePath: f.root,
@@ -358,6 +358,19 @@ describe('skipping a terminal retry', () => {
       count: 1,
       recordedAt: expect.any(Date),
       error: expectedError,
+      objectKey: 'A',
+      title: 'A',
+    });
+    // 002 §2: the skip's row is a drop with its own marker and the removed
+    // retry's id; it is neither an outbox drop nor a hold refusal, and the
+    // retry outlived its span, so it has no span position.
+    const [lossRow] = opened.store
+      .listObservationHistory({ monitorId: 'm', workspacePath: f.root })
+      .filter(({ result }) => result === 'errored');
+    expect(lossRow?.observationData).toEqual({
+      error: expectedError,
+      skipped: true,
+      retryId: id,
       objectKey: 'A',
       title: 'A',
     });

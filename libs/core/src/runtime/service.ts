@@ -989,18 +989,19 @@ function heldRefusalData(refusal: NotHeldObservation): {
 }
 
 /**
- * The loss record of a skipped terminal retry (002 §2.7), in the shape of an
- * admission drop's so doctor and explain report it the same way: its last
- * error followed by `Not retained for retry: skipped …`, with the operator's
- * reason when one was given. It has no span position, since the retry
- * outlived the span that admitted it.
+ * The durable outcome of a terminal retry an operator skipped (002 §2.7),
+ * recorded as loss (002 §2). `error` is the retry's last error followed by
+ * `Retry skipped after <n> failed attempts.`, with the operator's reason when
+ * one was given; `skipped` marks the row for diagnostics, `retryId` names the
+ * removed retry, and the identity names which observation was lost. It has no
+ * span position, since the retry outlived the span that admitted it. The
+ * last error is shortened, if needed, so the skip note always fits the cap.
  */
 function skippedRetryObservationData(
   retry: MaterializationRetryRecord,
   reason: string | undefined,
 ): {
   error: string;
-  notRetained: true;
   skipped: true;
   retryId: string;
   objectKey?: string;
@@ -1008,7 +1009,7 @@ function skippedRetryObservationData(
 } {
   const note = reason?.trim() ? `: ${reason.trim()}` : '';
   const suffix = safeDiagnosticText(
-    ` Not retained for retry: skipped after ${String(retry.attemptCount)} failed attempts${note}.`,
+    ` Retry skipped after ${String(retry.attemptCount)} failed attempts${note}.`,
   );
   const error = safeDiagnosticText(
     safeDiagnosticText(retry.lastError ?? 'Materialization failed.').slice(
@@ -1016,19 +1017,32 @@ function skippedRetryObservationData(
       Math.max(0, SAFE_DIAGNOSTIC_TEXT_MAX - suffix.length),
     ) + suffix,
   );
-  const { objectKey, title } = retry.envelope.observation as {
-    objectKey?: unknown;
-    title?: unknown;
-  };
   return {
     error,
-    notRetained: true,
     skipped: true,
     retryId: retry.id,
-    ...(typeof objectKey === 'string'
-      ? { objectKey: safeDiagnosticText(objectKey) }
-      : {}),
-    ...(typeof title === 'string' ? { title: safeDiagnosticText(title) } : {}),
+    ...lostObservationIdentity(retry.envelope.observation),
+  };
+}
+
+/**
+ * What the store keeps for one lost observation (002 §2), whatever the kind of
+ * loss: the observation's raw `objectKey`, which is what supersedes the loss
+ * (a later event for exactly this key), and the display-safe outcome row.
+ * Only a string key counts; the display-safe copy in `observationData` is
+ * never used for matching.
+ */
+function observationLossRecord(
+  observation: Observation,
+  observationData: Record<string, unknown> & { error: string },
+): {
+  objectKey: string | undefined;
+  observationData: Record<string, unknown> & { error: string };
+} {
+  const { objectKey } = observation as { objectKey?: unknown };
+  return {
+    objectKey: typeof objectKey === 'string' ? objectKey : undefined,
+    observationData,
   };
 }
 
@@ -1771,18 +1785,15 @@ export class AgentMonitorRuntime {
     input: MaterializationRetrySkipInput,
   ): MaterializationRetryDiagnostic {
     const current = this.terminalRetryFor(input, 'skipped');
-    const { objectKey } = current.envelope.observation as {
-      objectKey?: unknown;
-    };
+    // The same loss record every other drop gets (002 §2); the store writes it
+    // inside the skip's own transaction, at the retry's admission position.
     const skipped = this.store.skipMaterializationRetry(
       input.retryId,
       { monitorId: input.monitorId, workspacePath: input.workspacePath },
-      {
-        // The raw key, as for an admission drop: a later event for exactly
-        // this key is what supersedes the loss (002 §2).
-        objectKey: typeof objectKey === 'string' ? objectKey : undefined,
-        observationData: skippedRetryObservationData(current, input.reason),
-      },
+      observationLossRecord(
+        current.envelope.observation,
+        skippedRetryObservationData(current, input.reason),
+      ),
     );
     this.wakeRetryRepairWaiters(input.workspacePath, input.monitorId);
     return retryDiagnostic(skipped);
@@ -5115,12 +5126,14 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Record one observation the runtime could not keep as outstanding loss
+   * Record one observation admission could not keep as outstanding loss
    * (002 §2), whatever the reason: the retry outbox could not retain it, or a
-   * hold refused it (002 §4.7). Every kind of loss goes through here, so each
-   * gets the same drop identity and the same supersession rule. Must run
-   * inside the admitting span's transaction, at the lost observation's place
-   * in the span's order (see {@link RuntimeStore.recordObservationLoss}).
+   * hold refused it (002 §4.7). Every admission loss goes through here, and
+   * this and a skipped retry's loss ({@link AgentMonitorRuntime.skipMaterializationRetry})
+   * both build their record with `observationLossRecord`, so each gets the
+   * same drop identity and the same supersession rule. Must run inside the
+   * admitting span's transaction, at the lost observation's place in the
+   * span's order (see {@link RuntimeStore.recordObservationLoss}).
    */
   private recordObservationLoss(
     monitorId: string,
@@ -5129,15 +5142,11 @@ export class AgentMonitorRuntime {
     observation: Observation,
     observationData: Record<string, unknown> & { error: string },
   ): void {
-    // The raw key, not the display-safe copy: a later event for exactly this
-    // key is what supersedes the loss (002 §2).
-    const { objectKey } = observation as { objectKey?: unknown };
     this.store.recordObservationLoss({
       monitorId,
       workspacePath,
       sourceName,
-      objectKey: typeof objectKey === 'string' ? objectKey : undefined,
-      observationData,
+      ...observationLossRecord(observation, observationData),
     });
   }
 

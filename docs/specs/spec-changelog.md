@@ -19,9 +19,11 @@ daemon methods `retry.rearm` / `retry.skip`, with an in-process fallback when no
 reachable. They name a retry as retry diagnostics list it and refuse, unchanged, a retry that is
 not terminal or does not belong to the named workspace/monitor. Re-arm returns the row to
 `pending` with its attempts reset (the existing store transition). Skip records the observation as
-an outstanding loss through the admission-drop record (§2), with the retry's last error and the
-reason, and deletes the row in the same transaction. The loss is superseded like a drop, measured
-from the retry's own admission position, so younger retained work for the same key clears it.
+an outstanding loss through the one loss record every drop uses (§2), with its own `skipped: true`
+marker and an error of the retry's last error followed by
+`Retry skipped after <n> failed attempts[: <reason>].`, and deletes the row in the same
+transaction. The loss is superseded like any drop, measured from the retry's own admission
+position, so younger retained work for the same key clears it.
 A repair wakes a watcher of that monitor paused in the same process. The tick report, the explain
 materialization reason and the `doctor` remediation for a stopped monitor now name both commands;
 `doctor` previously said the CLI had no retry action. Attempt limit and backoff are unchanged.

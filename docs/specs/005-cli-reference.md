@@ -823,11 +823,11 @@ agentmonitors monitor retry skip  <monitorId> <retryId> [--reason <text>] [--wor
   newer input in order. If the retried attempt fails again, the retry backs off and can become
   terminal again exactly as before (attempt limit and backoff are unchanged).
 - **`skip`** gives the retry up. In one transaction, its observation is recorded as an outstanding
-  loss and the retry is removed. The loss uses the same record as an observation admission could
-  not retain (002 §2), so `doctor` fails the monitor's check and `monitor explain` reports a
-  materialization failure until a later event for the same object key supersedes it, with the
-  wording and clearing rule of §15. Its error is the retry's last error followed by
-  `Not retained for retry: skipped after <n> failed attempts[: <reason>].` The monitor takes newer
+  loss and the retry is removed. The loss is a drop under the one loss rule (002 §2), so `doctor`
+  fails the monitor's check and `monitor explain` reports a materialization failure until a later
+  event for the same object key supersedes it, with the wording and clearing rule of §15. Its
+  error is the retry's last error followed by
+  `Retry skipped after <n> failed attempts[: <reason>].` The monitor takes newer
   input on its next tick, once no other retained work is ahead of it.
 
 Both commands refuse, exit 1, and change nothing when:
@@ -2092,14 +2092,15 @@ See `monitor retry` (§6). Explain lists bounded safe retry metadata (record id,
 next/update times, and the control-stripped error) but never the captured envelope or payload.
 
 A monitor with an outstanding dropped observation (002 §2, "Admission outcomes when the outbox
-cannot retain a suffix": its retry suffix could not be retained, or a debounce or rollup hold
-refused it because it cannot be serialized (002 §4.7), and nothing has superseded it yet) fails its
+cannot retain a suffix": its retry suffix could not be retained, a debounce or rollup hold
+refused it because it cannot be serialized (002 §4.7), or an operator skipped its terminal retry
+(§6 `monitor retry skip`), and nothing has superseded it yet) fails its
 check even though `retry-outbox` shows `0/0`, since the drop has no retry record. This check
 outranks the retry checks. Its detail is
 `observation dropped (<count> outstanding; newest: <which> at <iso8601>): <error>` followed by the
-rollup line. `<count>` covers both kinds of drop; `<error>` is the newest drop's own error, which
-ends in `Not retained for retry: <reason>` for an outbox drop and is the refusal message for a
-refused one. `<which>` uses explain's wording (002 §10.7). The remediation
+rollup line. `<count>` covers every kind of drop; `<error>` is the newest drop's own error, which
+ends in `Not retained for retry: <reason>` for an outbox drop, is the refusal message for a refused
+one, and ends in `Retry skipped after <n> failed attempts[: <reason>].` for a skipped retry. `<which>` uses explain's wording (002 §10.7). The remediation
 names `monitor explain <id>` (carrying `--workspace`/`--dir` like the retained-work remediations) and
 `monitor history <id>` (carrying `--workspace` when it differs from the invoking directory; `monitor history` has no `--dir`), says the drop cannot be retried, and says
 when the check clears: `A dropped observation cannot be retried. This check clears once a later

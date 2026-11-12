@@ -1250,11 +1250,12 @@ export class RuntimeStore {
 
   /**
    * Give up terminal retained work for good (002 §2.7): record its observation
-   * as an outstanding loss through {@link RuntimeStore.recordObservationLoss}
-   * and remove the retry row, in one immediate transaction, so the loss is
-   * never recorded without the removal or the removal without the loss.
+   * as an outstanding loss through {@link RuntimeStore.recordObservationLoss},
+   * like every other drop, and remove the retry row, in one immediate
+   * transaction, so the loss is never recorded without the removal or the
+   * removal without the loss.
    *
-   * The loss is superseded like an admission drop, measured from the retry's
+   * The loss is superseded like any other drop, measured from the retry's
    * own admission position: a later event for the same object key, including
    * a younger retained retry that completes, clears it. A row queued before
    * positions were reserved uses the current high-water mark instead, so only
@@ -2166,11 +2167,12 @@ export class RuntimeStore {
   /**
    * Record that the runtime lost one observation it could not keep (002 §2):
    * admission dropped it because the retry outbox could not retain its ordered
-   * suffix, or a debounce/rollup hold refused it because its envelope cannot
-   * be serialized (002 §4.7). This is the one place a loss gets its drop
-   * identity, so every kind of loss is tracked as outstanding the same way.
-   * Called inside the admitting span's transaction, so the loss commits or
-   * rolls back with that span.
+   * suffix, a debounce/rollup hold refused it because its envelope cannot
+   * be serialized (002 §4.7), or an operator skipped its terminal retry
+   * (002 §2.7). This is the one place a loss gets its drop identity, so every
+   * kind of loss is tracked as outstanding the same way. Called inside the
+   * transaction that loses the observation (the admitting span's, or the
+   * skip's), so the loss commits or rolls back with it.
    *
    * Besides the `errored` history row, it stores what supersedes the loss
    * later: the observation's raw `objectKey` (only a string counts) and the
@@ -2271,8 +2273,9 @@ export class RuntimeStore {
 
   /**
    * The outstanding observations of one workspace/monitor that the runtime
-   * could not keep (002 §2): drops the retry outbox could not retain and
-   * observations a hold refused (002 §4.7). `undefined` when there are none.
+   * could not keep (002 §2): drops the retry outbox could not retain,
+   * observations a hold refused (002 §4.7) and terminal retries an operator
+   * skipped (002 §2.7). `undefined` when there are none.
    *
    * A drop row is an `errored` history row written by
    * {@link RuntimeStore.recordObservationLoss}. It stays outstanding
