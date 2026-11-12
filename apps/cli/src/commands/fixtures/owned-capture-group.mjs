@@ -7,6 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { readProcessTable, sendVerifiedSignal } from '@agentmonitors/core';
+import { ownedWorkerTerminated } from '../../../../../scripts/owned-worker-terminated.mjs';
 
 /** @typedef {import('@agentmonitors/core').ProcessIdentityRecord} Identity */
 /** @typedef {{group:number, records:Identity[]}} Receipt */
@@ -60,9 +61,10 @@ export function parseOwnedCaptureGroup(text) {
 
 /**
  * Refuse cleanup unless an initial owned incarnation still confirms current group
- * continuity. Empty groups need no signal; all actual signals recheck each PID.
+ * continuity. Empty groups and positively terminal remnants need no signal;
+ * terminal evidence failures remain errors. All actual signals recheck each PID.
  * @param {Receipt} receipt
- * @param {{readTable?:typeof readProcessTable, signal?:(record:Identity)=>Promise<import('@agentmonitors/core').SignalOutcome>}} [options]
+ * @param {{readTable?:typeof readProcessTable, signal?:(record:Identity)=>Promise<import('@agentmonitors/core').SignalOutcome>, isTerminated?:(pid:number)=>boolean}} [options]
  * @returns {Promise<number>}
  * @internal
  */
@@ -79,14 +81,21 @@ export async function cleanupOwnedCaptureGroup(receipt, options = {}) {
   const table = await (options.readTable ?? readProcessTable)();
   if (!table.supported) throw new Error(table.reason);
   const members = table.processes.filter((p) => p.pgid === receipt.group);
+  // Linux can retain orphan zombies after every recorded anchor has exited.
+  // They need no signal or live ownership authority. Read all terminal evidence
+  // before signalling anything, so unavailable evidence cannot produce a partial
+  // cleanup or turn a running, unverified member into an accepted empty group.
+  const isTerminated = options.isTerminated ?? ownedWorkerTerminated;
+  const activeMembers = members.filter((member) => !isTerminated(member.pid));
   // Keep ownership evidence auditable without exposing captured command output.
   console.log(
     JSON.stringify({
       ownedCaptureGroup: receipt.group,
       currentMemberPids: members.map((p) => p.pid),
+      activeMemberPids: activeMembers.map((p) => p.pid),
     }),
   );
-  if (members.length === 0) return receipt.group;
+  if (activeMembers.length === 0) return receipt.group;
   if (
     !members.some((p) =>
       receipt.records.some(
@@ -100,7 +109,7 @@ export async function cleanupOwnedCaptureGroup(receipt, options = {}) {
     throw new Error(
       'Owned capture group continuity cannot be confirmed; nothing signalled',
     );
-  for (const member of members) {
+  for (const member of activeMembers) {
     const outcome = await (
       options.signal ??
       ((record) =>

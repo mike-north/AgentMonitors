@@ -28,6 +28,7 @@ it('refuses a recycled group containing no matching recorded incarnation', async
         supported: true,
         processes: [{ pid: 100, pgid: 100, startTime: 'new' }],
       }),
+      isTerminated: () => false,
       signal,
     }),
   ).rejects.toThrow(/continuity/);
@@ -38,7 +39,40 @@ it('signals only individually verified members while a recorded owned anchor sti
   const signal = vi.fn(async () => ({ status: 'sent' }));
   await cleanupOwnedCaptureGroup(parseOwnedCaptureGroup(receipt), {
     readTable: async () => ({ supported: true, processes: [member] }),
+    isTerminated: () => false,
     signal,
   });
   expect(signal).toHaveBeenCalledExactlyOnceWith(member);
+});
+it('accepts a group containing only proven terminal remnants after its recorded anchor exits', async () => {
+  const remnant = { pid: 102, pgid: 100, startTime: 'later' };
+  const signal = vi.fn();
+  const isTerminated = vi.fn(() => true);
+  await cleanupOwnedCaptureGroup(parseOwnedCaptureGroup(receipt), {
+    readTable: async () => ({ supported: true, processes: [remnant] }),
+    isTerminated,
+    signal,
+  });
+  expect(isTerminated).toHaveBeenCalledExactlyOnceWith(remnant.pid);
+  expect(signal).not.toHaveBeenCalled();
+});
+it('withholds every signal when terminal evidence is unavailable', async () => {
+  const signal = vi.fn();
+  await expect(
+    cleanupOwnedCaptureGroup(parseOwnedCaptureGroup(receipt), {
+      readTable: async () => ({
+        supported: true,
+        processes: [
+          { pid: 101, pgid: 100, startTime: 'Thu Nov 12 10:00:01 2026' },
+          { pid: 102, pgid: 100, startTime: 'later' },
+        ],
+      }),
+      isTerminated: (pid: number) => {
+        if (pid === 102) throw new Error('terminal evidence unavailable');
+        return false;
+      },
+      signal,
+    }),
+  ).rejects.toThrow('terminal evidence unavailable');
+  expect(signal).not.toHaveBeenCalled();
 });
