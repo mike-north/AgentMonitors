@@ -274,7 +274,7 @@ describe('a notify-policy edit while a drop is outstanding', () => {
 });
 
 describe('an edit drain whose held envelope cannot be retained', () => {
-  it('rolls back with the outbox full, recording no drop and no retry, and keeps the hold until recovery', async () => {
+  it('waits behind a full outbox without draining or dropping, then rolls back a failing drain with no drop and no retry', async () => {
     const f = fixture();
     f.write(IMMEDIATE);
     // Fill this monitor's outbox exactly: the first observation fails and its
@@ -288,17 +288,46 @@ describe('an edit drain whose held envelope cannot be retained', () => {
     expect(f.retries()).toHaveLength(MATERIALIZATION_RETRY_MAX_RECORDS);
     expect(f.drops()).toEqual([]);
 
+    // Retained work drains before an edit is reconciled or the source is
+    // asked for more (002 §2.7). While its oldest retry keeps failing, the
+    // edit waits: nothing drains, drops or is queued, and the source is idle.
     f.write(DEBOUNCE);
-    f.control.next = [observation('held', 'h')];
-    await f.poll();
-    expect(f.held()).toEqual(['held']);
+    const polls = f.control.polls;
     const before = f.state();
+    f.control.next = [observation('held', 'h')];
+    const waiting = await f.poll();
+    expect(waiting.erroredObservations).toEqual([
+      {
+        monitorId: MONITOR_ID,
+        message: expect.stringContaining('native fault on r-0'),
+      },
+    ]);
+    expect(f.control.polls).toBe(polls);
+    expect(f.state()).toEqual(before);
+    expect(f.drops()).toEqual([]);
+    expect(f.retries()).toHaveLength(MATERIALIZATION_RETRY_MAX_RECORDS);
+    expect(f.loss()).toBeUndefined();
 
-    // Under ordinary admission this failure would be dropped: the outbox has
-    // no room. An edit drain is all-or-nothing instead (002 §4.6).
+    // Once the retained work drains, in order, the edit is reconciled and the
+    // newer observation is held under the edited policy.
+    f.clearFault('r-0');
+    clockTime += 10_000;
+    await f.poll();
+    expect(f.retries()).toEqual([]);
+    expect(f.events()).toEqual(
+      Array.from(
+        { length: MATERIALIZATION_RETRY_MAX_RECORDS },
+        (_, index) => `r-${String(index)}`,
+      ),
+    );
+    expect(f.held()).toEqual(['held']);
+    const held = f.state();
+
+    // An edit drain is all-or-nothing (002 §4.6): its failure rolls back,
+    // keeps the hold, and records no drop and no retry.
     f.abortOn('held');
     f.write(IMMEDIATE);
-    const polls = f.control.polls;
+    const blockedPolls = f.control.polls;
     f.control.next = [observation('after', 'a')];
     const blocked = await f.poll();
     expect(blocked.erroredObservations).toEqual([
@@ -307,12 +336,12 @@ describe('an edit drain whose held envelope cannot be retained', () => {
         message: expect.stringContaining('Notify edit blocked'),
       },
     ]);
-    expect(f.control.polls).toBe(polls);
+    expect(f.control.polls).toBe(blockedPolls);
     expect(f.drops()).toEqual([]);
-    expect(f.retries()).toHaveLength(MATERIALIZATION_RETRY_MAX_RECORDS);
+    expect(f.retries()).toEqual([]);
     expect(f.loss()).toBeUndefined();
     expect(f.held()).toEqual(['held']);
-    expect(f.state()).toEqual(before);
+    expect(f.state()).toEqual(held);
     expect(f.events()).not.toContain('held');
 
     f.clearFault('held');
@@ -320,7 +349,7 @@ describe('an edit drain whose held envelope cannot be retained', () => {
     expect(f.held()).toEqual([]);
     expect(f.events().slice(-2)).toEqual(['held', 'after']);
     expect(f.drops()).toEqual([]);
-    expect(f.retries()).toHaveLength(MATERIALIZATION_RETRY_MAX_RECORDS);
+    expect(f.retries()).toEqual([]);
   });
 });
 

@@ -1,3 +1,4 @@
+import type { Database as BetterSQLiteClient } from 'better-sqlite3';
 import {
   mkdtempSync,
   mkdirSync,
@@ -3899,7 +3900,7 @@ Handle it.
   // A FlakyStore subclass that throws on a sentinel observation title provides
   // a clean public seam to trigger ingest() failure without private mocking.
   // https://github.com/mike-north/AgentMonitors/issues/46
-  it('isolates an ingest() failure in consumeWatch() so the watcher survives and subsequent observations still flow', async () => {
+  it('isolates an ingest() failure in consumeWatch() so the watcher survives, drains it, and subsequent observations still flow', async () => {
     const rootDir = mkdtempSync(path.join(tmpdir(), 'agentmon-runtime-'));
     tempDirs.push(rootDir);
     const dbPath = path.join(rootDir, 'agentmon.db');
@@ -3911,16 +3912,20 @@ Handle it.
       'Handle it.',
     );
 
-    // Subclass RuntimeStore to throw on the sentinel observation so ingest()
-    // fails for that specific observation without patching private methods.
+    // Subclass RuntimeStore to throw once on the sentinel observation so
+    // ingest() fails for that specific observation without patching private
+    // methods. The failure is retained and drains from the outbox before the
+    // watcher pulls its next batch (002 §2.7).
     class FlakyStore extends RuntimeStore {
+      failures = 1;
       override insertEvent(
         input: Omit<MonitorEventRecord, 'id'>,
       ): MonitorEventRecord {
         // Keyed on `summary`: the materialized `title` is the monitor's
         // authored name since issue #449, so the source's sentinel text — which
         // this fault injection targets — now arrives as `summary`.
-        if (input.summary === 'boom') {
+        if (input.summary === 'boom' && this.failures > 0) {
+          this.failures -= 1;
           throw new Error('simulated insert failure');
         }
         return super.insertEvent(input);
@@ -3967,12 +3972,29 @@ Handle it.
     const handle = await runtime.watchMonitors(monitorsDir, rootDir);
     expect(handle.monitorIds).toEqual(['test-monitor']);
 
-    // give the watcher enough time to consume both observations
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The retained 'boom' becomes due after its first backoff (at least one
+    // second), drains, and only then is 'ok' pulled.
+    await vi.waitFor(
+      () =>
+        expect(
+          runtime.listEvents({ sessionId: session.id }).map((e) => e.summary),
+        ).toContain('ok'),
+      { timeout: 5_000, interval: 50 },
+    );
 
-    // (a) watcher survived 'boom' — handle still active and 'ok' produced an event
-    const events = runtime.listEvents({ sessionId: session.id });
-    expect(events.some((e) => e.summary === 'ok')).toBe(true);
+    // (a) watcher survived 'boom' — handle still active, 'boom' drained, and
+    // 'ok' produced an event after it
+    // Materialization order (the private AUTOINCREMENT key), not listEvents
+    // order, which follows observedAt: 'boom' must commit before 'ok'.
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    expect(
+      client
+        .prepare<[], { summary: string }>(
+          'SELECT summary FROM monitor_events ORDER BY sequence',
+        )
+        .all()
+        .map(({ summary }) => summary),
+    ).toEqual(['boom', 'ok']);
 
     // (b) 'ok' produced a triggered history row
     const history = runtime.listObservationHistory({
