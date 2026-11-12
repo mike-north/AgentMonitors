@@ -481,8 +481,9 @@ When a previously seen file's hash changes, the source emits one `Observation` p
 
 The fingerprint, binary classification and textual snapshot MUST use the same byte sample.
 The source checks file identity, size and nanosecond modification/change timestamps before and
-after reading. A detected change or a byte-count mismatch fails the entire observation without
-advancing its checkpoint; the next scheduled call uses the prior baseline. There is no internal
+after reading. A detected metadata change fails the entire observation without advancing its
+checkpoint; the next scheduled call uses the prior baseline. Reported size need not equal the
+readable byte count (virtual files may report zero while returning contents). There is no internal
 retry or settling timer. A stable empty or partial file is legitimate input: this check cannot
 infer a writer's future intent, and does not promise atomicity against undetectable concurrent
 writes. Verified: `plugins/source-file-fingerprint/src/read-consistency.test.ts`.

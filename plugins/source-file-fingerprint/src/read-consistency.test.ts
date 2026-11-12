@@ -5,7 +5,7 @@
  */
 import { createHash } from 'node:crypto';
 import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -13,12 +13,17 @@ import source from './index.js';
 
 vi.mock('node:fs/promises', async (original) => {
   const actual = await original<typeof import('node:fs/promises')>();
-  return { ...actual, readFile: vi.fn(actual.readFile) };
+  return {
+    ...actual,
+    readFile: vi.fn(actual.readFile),
+    stat: vi.fn(actual.stat),
+  };
 });
 
 const roots: string[] = [];
 afterEach(() => {
-  vi.mocked(readFile).mockClear();
+  vi.mocked(readFile).mockReset();
+  vi.mocked(stat).mockReset();
   for (const root of roots) rmSync(root, { recursive: true, force: true });
   roots.length = 0;
 });
@@ -83,6 +88,24 @@ it('preserves a stable empty file as a legitimate change, without repeating it',
   writeFileSync(f.file, '');
   const batch = await source.observe(f.config, f.context);
   expect(batch.observations.map((o) => o.snapshotText)).toEqual(['']);
+  const repeated = await source.observe(f.config, {
+    now: new Date(),
+    previousState: batch.nextState,
+  });
+  expect(repeated.observations).toEqual([]);
+});
+
+/** Virtual files can have stable metadata without reporting their readable byte count. */
+it('accepts coherent contents when stat reports an advisory size of zero', async () => {
+  const f = await fixture();
+  writeFileSync(f.file, 'two');
+  const metadata = await stat(f.file, { bigint: true });
+  metadata.size = 0n;
+  vi.mocked(stat).mockResolvedValue(metadata);
+  const batch = await source.observe(f.config, f.context);
+  expect(batch.observations.map((o) => o.snapshotText)).toEqual(['two']);
+  const hash = createHash('sha256').update('two').digest('hex');
+  expect(batch.nextState).toEqual({ fingerprints: { [f.file]: hash } });
   const repeated = await source.observe(f.config, {
     now: new Date(),
     previousState: batch.nextState,

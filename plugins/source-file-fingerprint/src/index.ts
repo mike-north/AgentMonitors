@@ -87,6 +87,8 @@ function parseScopeConfig(config: Record<string, unknown>): ScopeConfig {
  * Sample once so a concurrent save cannot pair one version's checkpoint with
  * another version's snapshot. Metadata changes or replacement during the read
  * refuse the whole observation; the runtime keeps its prior source checkpoint.
+ * Reported size is compared across the read, not to the byte count: virtual
+ * files may report zero while returning content.
  * This is a consistency check, not a writer-completion protocol: a stable empty
  * or partial file is still valid input, and no settling delay or retry is added.
  */
@@ -101,8 +103,7 @@ async function sampleFile(
     before.ino !== after.ino ||
     before.size !== after.size ||
     before.mtimeNs !== after.mtimeNs ||
-    before.ctimeNs !== after.ctimeNs ||
-    BigInt(content.length) !== after.size
+    before.ctimeNs !== after.ctimeNs
   ) {
     throw new Error(`File changed while reading: ${filePath}`);
   }
