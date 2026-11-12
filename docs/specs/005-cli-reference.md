@@ -812,7 +812,7 @@ agentmonitors monitor retry skip  <monitorId> <retryId> [--reason <text>] [--wor
 | -------------------- | ------------------- | ---------------------------------------------------------------------------------- |
 | `<monitorId>`        | —                   | Monitor whose retry outbox holds the retry                                         |
 | `<retryId>`          | —                   | The retry's record id, as `monitor explain` and `doctor` list it                   |
-| `--reason <text>`    | none                | `skip` only: why the observation is given up, recorded with the loss               |
+| `--reason <text>`    | none                | `skip` only: why the observation is given up, recorded with the loss (≤ 200 chars) |
 | `--workspace <path>` | current working dir | The workspace the retry was admitted in; also which workspace's daemon/db to reach |
 | `--socket <path>`    | resolved default    | Unix domain socket path for the daemon (resolved like `monitor explain`, §1)       |
 | `--format`           | auto (see §1)       | `toon`, `text`, or `json`                                                          |
@@ -827,8 +827,10 @@ agentmonitors monitor retry skip  <monitorId> <retryId> [--reason <text>] [--wor
   fails the monitor's check and `monitor explain` reports a materialization failure until a later
   event for the same object key supersedes it, with the wording and clearing rule of §15. Its
   error is the retry's last error followed by
-  `Retry skipped after <n> failed attempts[: <reason>].` The monitor takes newer
-  input on its next tick, once no other retained work is ahead of it.
+  `Retry skipped after <n> failed attempts[: <reason>].` The reason is trimmed and may be at most
+  200 characters, so the note and the reason always appear in full; when the whole error would
+  pass the 1,024-character diagnostic cap, the last error is shortened and ends in `…`. The
+  monitor takes newer input on its next tick, once no other retained work is ahead of it.
 
 Both commands refuse, exit 1, and change nothing when:
 
@@ -838,15 +840,29 @@ Both commands refuse, exit 1, and change nothing when:
 - the retry is not terminal. A pending retry is still attempted automatically, so neither repair
   applies: `… Materialization retry record is pending, not terminal, so it cannot be
 <re-armed|skipped>. It is still retried automatically (<n> of 5 attempts failed; next attempt at
-<iso8601>): <id>`.
+<iso8601>): <id>`;
+- `skip` only: the trimmed reason is longer than 200 characters: `Skip failed for retry <id> of
+monitor <monitorId> in workspace <path>: Skip reason is <n> characters; at most 200 are allowed.`
 
 The command asks the workspace's daemon (`retry.rearm` / `retry.skip`, Zod-validated params
-`{ monitorId, retryId, workspacePath, reason? }`). A daemon re-arm also wakes a watcher of that
-monitor that is paused on the retry, instead of leaving it to its one-minute recheck. When no daemon
-is reachable (a genuine connection failure), the command applies the same core transaction to the
-workspace-resolved database (§1 "Database path resolution") and prints `No daemon running — applied
-to the persisted store; it takes effect on the next tick.` first. A refusal from a live daemon is
-reported, never retried in-process.
+`{ monitorId, retryId, workspacePath, reason? }`), waiting up to 10 seconds for its reply: longer
+than the 5 seconds the daemon's store write may wait for another writer's lock. A daemon repair
+(re-arm or skip) also wakes a watcher of that monitor that is paused on the retry, instead of
+leaving it to its one-minute recheck. Which path applies depends on how far the request got:
+
+- **No daemon accepted the connection** (no socket, connection refused): no daemon has the
+  request, so the command applies the same core transaction to the workspace-resolved database
+  (§1 "Database path resolution") and prints `No daemon running — applied to the persisted store;
+it takes effect on the next tick.` first.
+- **A daemon accepted the request but no reply arrived** (the wait above ran out, or the
+  connection closed first): the daemon may already have applied the repair, so the outcome is
+  unknown. The command writes nothing, exits 1 and prints
+  ``<Re-arm|Skip> outcome unknown for retry <id> of monitor <monitorId> in workspace <path>: the
+daemon received the request but no reply arrived (<cause>). The <re-arm|skip> may already have
+been applied; nothing was written to the store from here. Check with `<explain command>` or
+`<doctor command>` before running it again.`` (the commands are quoted and scoped as below).
+- **The daemon answered with an error** (a refusal, or a daemon too old to know the method): the
+  error is reported, never retried in-process.
 
 Text output, after a re-arm:
 
@@ -858,9 +874,15 @@ The monitor stays paused until this retry completes, then takes newer input in o
 After a skip:
 
 ```
-Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see `agentmonitors monitor explain <monitorId>`.
+Skipped retry <id> of monitor <monitorId>. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see `agentmonitors monitor explain <monitorId> [--workspace <path> --dir <path>]`.
 The monitor takes newer input on its next tick unless other retained work is still ahead of it.
 ```
+
+The suggested `monitor explain` (and, for an unknown outcome, `doctor`) runs verbatim from the
+directory the repair ran in, quoted and scoped the way `doctor` scopes its remediation commands:
+an argument that is not shell-safe is single-quoted, and when `--workspace` names another directory
+than the current one the command carries `--workspace <path>` and that workspace's own definitions
+(`--dir <workspace>/.claude/monitors` for `explain`; `doctor` reads them by default).
 
 JSON/TOON output is `{ action: "rearm"|"skip", monitorId, workspacePath, via: "daemon"|"in-process",
 retry }`, where `retry` is the record's safe metadata (`id`, `status`, `attemptCount`,

@@ -27,6 +27,13 @@ position, so younger retained work for the same key clears it.
 A repair wakes a watcher of that monitor paused in the same process. The tick report, the explain
 materialization reason and the `doctor` remediation for a stopped monitor now name both commands;
 `doctor` previously said the CLI had no retry action. Attempt limit and backoff are unchanged.
+The CLI falls back in-process only when no daemon accepted the connection; once a daemon has the
+request, a missing reply (a 10-second wait that outlasts the store's 5-second lock wait, or a
+dropped connection) is reported as an unknown outcome with nothing written, since the daemon may
+already have applied it. A skip's `--reason` is at most 200 characters after trimming (a longer one
+is refused), so the skip note and reason always survive the diagnostic cap and only a long last
+error is shortened, with `…`. The skip's `monitor explain` hint is quoted and `--workspace`-scoped
+like `doctor`'s remediation commands.
 
 ## 2026-11-12 — A hold refusal is outstanding loss, under one rule for every drop (002 §2, §4.6, §4.7, §10.7, §`observation_history`; 005 doctor; 004 §3.3) — Refs #575
 

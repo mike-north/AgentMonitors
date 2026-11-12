@@ -740,9 +740,11 @@ the counter at the time of the skip. The observation was admitted when the retry
 retained work admitted after it, which carries newer state for the key, supersedes the loss when
 it completes; a retry queued before positions were reserved uses the counter at the skip instead.
 Its `observationData` is `{ error, skipped: true, retryId, objectKey?, title? }`: `error` is the
-retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`, shortened
-like an outbox drop's so the note always fits, and `objectKey`/`title` follow the same safe-text
-rule. It has no `position` or `spanSize`, since the retry outlived the span that admitted it.
+retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`. The reason
+is at most 200 characters after trimming (a longer one refuses the skip, [005](./005-cli-reference.md)
+`monitor retry`), so the note always fits the 1,024-character cap in full; the last error takes
+the rest and, when it does not fit, is shortened and ends in `…`. `objectKey`/`title` follow the
+same safe-text rule. It has no `position` or `spanSize`, since the retry outlived the span that admitted it.
 
 Nothing else clears a drop: not a `no-change` (or `no-files-matched`) tick, not a debounce or
 rollup hold (`suppressed`), not an observe failure, not a later span whose only failure was
