@@ -49,6 +49,17 @@ export const agentSessions = sqliteTable('agent_sessions', {
   dormantAt: integer('dormant_at', { mode: 'timestamp' }),
   createdAt: integer('created_at', { mode: 'timestamp' }).notNull(),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
+  /**
+   * The position this session took in the `monitor_events` materialization
+   * order when it was first registered: reserved from that table's
+   * AUTOINCREMENT counter, the same counter a retained observation reserves
+   * its `admission_sequence` from. A retry completed later projects only into
+   * sessions registered before the observation was admitted (002 §2.7), and
+   * this comparison does not depend on second-resolution timestamps. Resuming
+   * a session keeps its original position. NULL on sessions registered before
+   * positions were reserved.
+   */
+  registrationSequence: integer('registration_sequence'),
 });
 
 /**
