@@ -25,6 +25,7 @@ import {
   parsePsIdentityOutput,
   readLinuxProcessTable,
   readProcessTable,
+  type ProcFileHandle,
   type ProcFs,
   type ProcessIdentityRecord,
   type ProcessTableReading,
@@ -514,24 +515,53 @@ describe('readLinuxProcessTable error handling', () => {
     return error;
   }
 
+  /** An open handle over `content`, serving at most `readSize` bytes per read. */
+  function fakeHandle(content: string, readSize: number): ProcFileHandle {
+    const bytes = new TextEncoder().encode(content);
+    return {
+      read: (buffer, position) => {
+        const n = Math.min(buffer.length, readSize, bytes.length - position);
+        buffer.set(bytes.subarray(position, position + n));
+        return Promise.resolve(Math.max(n, 0));
+      },
+      close: () => Promise.resolve(),
+    };
+  }
+
   function fakeProc(
     pids: number[],
     failures: Record<number, string> = {},
-  ): ProcFs & { maxInFlight: number } {
+    readSize = 4096,
+  ): ProcFs & { maxInFlight: number; openHandles: number } {
     let inFlight = 0;
     const fs = {
       maxInFlight: 0,
+      openHandles: 0,
       readdir: () =>
         Promise.resolve(['self', 'net', ...pids.map((p) => String(p))]),
-      readFile: async (path: string) => {
+      open: async (path: string) => {
         inFlight++;
+        fs.openHandles++;
         fs.maxInFlight = Math.max(fs.maxInFlight, inFlight);
+        const release = (): void => {
+          inFlight--;
+          fs.openHandles--;
+        };
         await new Promise((r) => setTimeout(r, 1));
-        inFlight--;
         const pid = Number(/^\/proc\/(\d+)\/stat$/.exec(path)?.[1]);
         const code = failures[pid];
-        if (code !== undefined) throw errnoError(code);
-        return stat(pid, 100);
+        if (code !== undefined) {
+          release();
+          throw errnoError(code);
+        }
+        const handle = fakeHandle(stat(pid, 100), readSize);
+        return {
+          read: handle.read,
+          close: async () => {
+            await handle.close();
+            release();
+          },
+        };
       },
     };
     return fs;
@@ -571,10 +601,55 @@ describe('readLinuxProcessTable error handling', () => {
     expect(fs.maxInFlight).toBeLessThanOrEqual(32);
   });
 
+  // A stat line longer than the first read must be read to EOF, not truncated
+  // (a truncated line would lose the start-time field and drop the process).
+  it('reads a stat line longer than a single read to EOF', async () => {
+    const fs = fakeProc([100, 101], {}, 7);
+    const reading = await readLinuxProcessTable(fs);
+    expect(reading).toEqual({
+      supported: true,
+      processes: [
+        { pid: 100, pgid: 100, startTime: '5000' },
+        { pid: 101, pgid: 100, startTime: '5000' },
+      ],
+    });
+    expect(fs.openHandles).toBe(0);
+  });
+
+  it('reads a stat line longer than the reader chunk across several reads', async () => {
+    const longComm = 'x'.repeat(5000);
+    const content = `100 (${longComm}) S 1 100 100 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0`;
+    const reading = await readLinuxProcessTable({
+      readdir: () => Promise.resolve(['100']),
+      open: () => Promise.resolve(fakeHandle(content, Infinity)),
+    });
+    expect(reading).toEqual({
+      supported: true,
+      processes: [{ pid: 100, pgid: 100, startTime: '5000' }],
+    });
+  });
+
+  it('closes the handle and reports unsupported when a read fails mid-file', async () => {
+    let closed = false;
+    const reading = await readLinuxProcessTable({
+      readdir: () => Promise.resolve(['100']),
+      open: () =>
+        Promise.resolve({
+          read: () => Promise.reject(errnoError('EIO')),
+          close: () => {
+            closed = true;
+            return Promise.resolve();
+          },
+        }),
+    });
+    expect(reading.supported).toBe(false);
+    expect(closed).toBe(true);
+  });
+
   it('reports an unlistable /proc as unsupported', async () => {
     const reading = await readLinuxProcessTable({
       readdir: () => Promise.reject(errnoError('EACCES')),
-      readFile: () => Promise.reject(errnoError('ENOENT')),
+      open: () => Promise.reject(errnoError('ENOENT')),
     });
     expect(reading.supported).toBe(false);
   });

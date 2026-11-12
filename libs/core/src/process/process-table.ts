@@ -25,7 +25,7 @@
  * This module only reads; it never signals anything.
  */
 import { execFile } from 'node:child_process';
-import { readdir, readFile } from 'node:fs/promises';
+import { open, readdir } from 'node:fs/promises';
 
 /**
  * Identity evidence for one live process as the platform reports it.
@@ -129,6 +129,19 @@ export function parseProcStat(
 }
 
 /**
+ * An open `/proc` file, read in caller-sized pieces. `/proc` files report a
+ * size of 0, so whole-file helpers such as `readFile` allocate a fixed 64 KiB
+ * buffer per call; reading into a small caller-owned buffer avoids that.
+ *
+ * @internal
+ */
+export interface ProcFileHandle {
+  /** Reads up to `buffer.length` bytes at `position`; resolves 0 at EOF. */
+  read(buffer: Uint8Array, position: number): Promise<number>;
+  close(): Promise<void>;
+}
+
+/**
  * The filesystem calls the Linux reader makes. Injectable so error handling
  * (descriptor exhaustion, permission errors) can be unit-tested without a real
  * `/proc`.
@@ -137,10 +150,50 @@ export function parseProcStat(
  */
 export interface ProcFs {
   readdir(path: string): Promise<string[]>;
-  readFile(path: string, encoding: 'utf8'): Promise<string>;
+  open(path: string): Promise<ProcFileHandle>;
 }
 
-const nodeProcFs: ProcFs = { readdir, readFile };
+const nodeProcFs: ProcFs = {
+  readdir,
+  open: async (path) => {
+    const handle = await open(path, 'r');
+    return {
+      read: async (buffer, position) =>
+        (await handle.read(buffer, 0, buffer.length, position)).bytesRead,
+      close: () => handle.close(),
+    };
+  },
+};
+
+/**
+ * First-read size for a `/proc/<pid>/stat` file. A typical line is well under
+ * 1 KiB; a longer one (a long `comm` is capped by the kernel at 16 bytes, but
+ * the numeric tail can grow) is read by continuing until EOF.
+ */
+const PROC_STAT_READ_CHUNK_BYTES = 2048;
+
+/**
+ * Read a whole `/proc` file as UTF-8 through a small reusable chunk, never
+ * allocating more than the file's own length plus one chunk.
+ */
+async function readProcFile(fs: ProcFs, path: string): Promise<string> {
+  const handle = await fs.open(path);
+  try {
+    const chunk = new Uint8Array(PROC_STAT_READ_CHUNK_BYTES);
+    const decoder = new TextDecoder('utf-8');
+    let text = '';
+    let position = 0;
+    for (;;) {
+      const bytesRead = await handle.read(chunk, position);
+      if (bytesRead === 0) break;
+      text += decoder.decode(chunk.subarray(0, bytesRead), { stream: true });
+      position += bytesRead;
+    }
+    return text + decoder.decode();
+  } finally {
+    await handle.close();
+  }
+}
 
 /**
  * Most `/proc/<pid>/stat` files read at once. Opening every entry together can
@@ -188,7 +241,7 @@ export async function readLinuxProcessTable(
       if (pid === undefined) return;
       const path = `/proc/${pid}/stat`;
       try {
-        const record = parseProcStat(await fs.readFile(path, 'utf8'));
+        const record = parseProcStat(await readProcFile(fs, path));
         if (record !== undefined) processes.push(record);
       } catch (error) {
         if (isExitedError(error)) continue;
