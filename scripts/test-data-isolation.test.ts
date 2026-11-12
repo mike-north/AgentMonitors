@@ -12,6 +12,7 @@ import {
   readFileSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -57,6 +58,7 @@ async function runFixture(body: string, linked = false) {
   const home = join(dir, 'real-home');
   const installation = join(home, '.local/share/agentmonitors');
   const receipt = join(dir, 'receipt.json');
+  const summaryPath = join(dir, 'summary.json');
   if (linked) {
     const target = join(dir, 'installation-target');
     mkdirSync(target, { recursive: true });
@@ -66,6 +68,9 @@ async function runFixture(body: string, linked = false) {
     mkdirSync(installation, { recursive: true });
   }
   writeFileSync(join(installation, 'existing'), 'original');
+  // Whole-second mtime survives the Date/utimes round trip exactly, so the
+  // same-size edit's rejection must rely on the small-file content hash.
+  utimesSync(join(installation, 'existing'), 946_684_800, 946_684_800);
   const config = join(dir, 'vitest.config.mts');
   writeFileSync(
     config,
@@ -87,7 +92,15 @@ ${body}`,
     // the environment probe below is also synchronous and separately bounded.
     const result = spawnSync(
       process.execPath,
-      [join(repo, 'node_modules/vitest/vitest.mjs'), 'run', '--config', config],
+      [
+        join(repo, 'node_modules/vitest/vitest.mjs'),
+        'run',
+        '--config',
+        config,
+        '--reporter=default',
+        '--reporter=json',
+        `--outputFile=${summaryPath}`,
+      ],
       {
         cwd: repo,
         encoding: 'utf8',
@@ -110,6 +123,10 @@ ${body}`,
     return {
       ...result,
       installation,
+      // Runner metrics prove a poison case passed before teardown rejected its mutation.
+      testSummary: existsSync(summaryPath)
+        ? JSON.parse(readFileSync(summaryPath, 'utf8'))
+        : undefined,
       receipt: existsSync(receipt)
         ? JSON.parse(readFileSync(receipt, 'utf8'))
         : undefined,
@@ -130,10 +147,13 @@ it('fails the suite when a new file appears in the real data root', async () => 
 
 it('detects same-size content changes even with the original mtime restored', async () => {
   const result = await runFixture(`import {statSync,utimesSync} from 'node:fs';
-it('poison',()=>{const file=installation+'/existing'; const stat=statSync(file);writeFileSync(file,'modified');utimesSync(file,stat.atime,stat.mtime);});`);
+it('poison',()=>{const file=installation+'/existing'; const stat=statSync(file);const ns=statSync(file,{bigint:true}).mtimeNs;writeFileSync(file,'modified');utimesSync(file,stat.atime,stat.mtime);expect(statSync(file,{bigint:true}).mtimeNs).toBe(ns);});`);
   expect(result.status, result.stdout + result.stderr).not.toBe(0);
   expect(result.stdout + result.stderr).toContain('Real user paths changed');
   expect(result.stdout + result.stderr).toContain('existing');
+  expect(result.testSummary.numPassedTests, result.stdout + result.stderr).toBe(
+    1,
+  );
 }, 20_000);
 
 for (const outcome of ['pass', 'fail', 'timeout']) {
