@@ -1267,6 +1267,56 @@ export class RuntimeStore {
   }
 
   /**
+   * Remove retained work whose observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8, issue #562). Such a row was admitted before
+   * authority took effect; materializing it now would deliver the run's scratch
+   * work to a later session. Authority is re-checked inside the same immediate
+   * transaction as the delete, so the decision and the removal commit together.
+   * The row is removed whatever its status — pending, backing off or terminal —
+   * and nothing is recorded in its place: no event, no history row, no loss
+   * record. Dropping it is the cleanup the owner asked for, not lost work.
+   *
+   * Returns `true` when the row was removed. `false` means the row is gone or
+   * its observation has no cleanup authority, and it is left untouched. Because
+   * authority is never withdrawn once in effect, a caller that saw authority
+   * and receives `false` can rely on the row no longer existing.
+   *
+   * @internal
+   */
+  discardRetiredVerifyArtifactRetry(id: string): boolean {
+    const db = asInternalDb(this.db);
+    return db.$client
+      .transaction(() => {
+        const row = db
+          .select()
+          .from(materializationRetryOutbox)
+          .where(eq(materializationRetryOutbox.id, id))
+          .get();
+        // A missing row, or a global monitor's row, has no artifact to retire.
+        if (row?.workspacePath == null) return false;
+        const retry = rowToMaterializationRetry(row);
+        const objectKey =
+          retry.envelope.observation.objectKey ?? retry.monitorId;
+        if (
+          !this.isVerifyArtifactCleanupEffective({
+            workspacePath: row.workspacePath,
+            monitorId: retry.monitorId,
+            objectKey,
+          })
+        ) {
+          return false;
+        }
+        return (
+          db
+            .delete(materializationRetryOutbox)
+            .where(eq(materializationRetryOutbox.id, id))
+            .run().changes === 1
+        );
+      })
+      .immediate();
+  }
+
+  /**
    * Consume pending retained work only by committing its event, projections,
    * cursor seeds and snapshot together with removal of the retry row.
    * Terminal work requires explicit re-arm. Scheduling/due selection belongs

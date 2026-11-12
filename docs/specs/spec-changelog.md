@@ -9,7 +9,7 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2.0/§2.8/§10.5/§15; 004 §2.5/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418
+## 2026-11-12 — Durable verify-artifact ownership keeps scratch work out of later sessions (002 §2.0/§2.7/§2.8/§10.5/§15; 004 §2.5/§3.4/§3.5.1; 005 §16 step 9) — Closes #562, Refs #561, #414, #418
 
 Replace finite, time-limited scratch cleanup with durable exact ownership, as accepted in #561.
 `verify --use-workspace-daemon` registers its synthetic scratch key with the daemon before creating
@@ -23,6 +23,13 @@ rollup, escalation flushes, the flush while the source fails of 002 §2.6, and t
 drain). A held flush whose only items are dropped clears the hold and writes no history row of its
 own, so a failing source's `errored` row stays the newest. Source plugins and their state are
 unchanged.
+
+With 002 §2.7's retained-work drain, the drain is a held-emission boundary too. A retry row queued
+before authority took effect is dropped rather than drained, on ticks and before watcher pulls: it
+is removed from the outbox in one immediate transaction that re-checks authority, before the
+drain's terminal and backoff checks, and it writes no event, no `errored` row and no history row.
+A dropped row, even a terminal one, never pauses newer legitimate work for its monitor. Previously
+such a retry would have materialized after cleanup and reached a later lead session.
 
 This restores the no-later-scratch-event guarantee for registered runs, including retained baseline
 deletions, held deletions and held-only creates after arbitrary delay, restart and config repair.

@@ -4385,6 +4385,23 @@ export class AgentMonitorRuntime {
         workspacePath,
       );
       if (!retry) return result;
+      // A retained observation of a verify artifact whose cleanup authority
+      // took effect after it was queued is dropped, not drained (002 §2.8).
+      // This runs before the terminal and backoff checks, so a dropped row
+      // never holds back newer legitimate work, even when it is terminal.
+      // Authority is never withdrawn, so a refused discard means the row is
+      // already gone; either way the loop re-reads the oldest row.
+      if (
+        this.withoutRetiredVerifyArtifacts(
+          monitorId,
+          workspacePath,
+          [retry],
+          (r) => r.envelope.observation.objectKey,
+        ).length === 0
+      ) {
+        this.store.discardRetiredVerifyArtifactRetry(retry.id);
+        continue;
+      }
       if (retry.status === 'terminal') {
         return {
           ...result,

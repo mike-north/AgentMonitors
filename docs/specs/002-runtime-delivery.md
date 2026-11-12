@@ -1130,6 +1130,12 @@ rollup window flush (§4.4), the due check or `observe()`, the runtime drains th
    and the drain stops: a younger row never completes ahead of an older one.
 4. A `pending` row that is not yet due, or a `terminal` row, stops the drain without an attempt.
 
+Before steps 2–4 apply to a row, a row whose observation is a verify artifact with cleanup
+authority in effect (§2.8) is dropped rather than drained: it is removed from the outbox, whatever
+its status, and the drain continues with the next row. A dropped row is never materialized, never
+stops the drain and is not reported, so a retired artifact's retry, even a `terminal` one, never
+pauses its monitor.
+
 While any row remains, the monitor's source is not called, and nothing else that would put newer
 work ahead of the retained work runs: no edit reconciliation, no deferred poll result, no rollup
 window flush, and no debounce flush (a held debounce batch flushes only on a tick that reaches
@@ -1241,11 +1247,15 @@ registered key, for the registered monitor and workspace only, at two boundaries
    a throttle window that a later legitimate change needs. Poll results and watcher batches pass
    through the same boundary.
 2. **Held emission** — when held work materializes: debounce settle, rollup window and escalation
-   flushes, the flush while the source fails (§2.6), and the notify-policy edit drain (§4.6).
-   Legitimate items in the same held batch materialize unchanged. A flush whose only held items
-   are dropped still clears the hold (a rollup window also commits its minute marker), so the
-   dropped work is never retried; it materializes nothing and writes no `observation_history` row
-   of its own, so on the failing-source path the source's `errored` row stays the newest.
+   flushes, the flush while the source fails (§2.6), the notify-policy edit drain (§4.6), and the
+   retained-work drain (§2.7) on ticks and before watcher pulls. Legitimate items in the same held
+   batch materialize unchanged. A flush whose only held items are dropped still clears the hold (a
+   rollup window also commits its minute marker), so the dropped work is never retried; it
+   materializes nothing and writes no `observation_history` row of its own, so on the
+   failing-source path the source's `errored` row stays the newest. A retained retry row admitted
+   before authority took effect is removed from the outbox in one immediate transaction that
+   re-checks authority, before the drain's terminal and backoff checks. Its removal writes no
+   event, no `errored` row and no history row: dropping it is the cleanup, not lost work.
 
 Authority has **no wall-clock expiry**, and no successful poll, empty observation or other source
 outcome retires it. Source plugins are unaware of ownership: their opaque state, baselines and
@@ -1269,7 +1279,8 @@ roughly five runs per page.
 
 **Guarantee and its limits.** For a run that registered its artifact, no observation of the exact
 scratch key from the verified monitor reaches a lead session other than the owner once cleanup
-authority is in effect, across arbitrary delay, daemon restart, held-work flushes and config repair.
+authority is in effect, across arbitrary delay, daemon restart, held-work flushes, retained
+materialization retries and config repair.
 Sibling monitors whose globs happen to match the scratch file are not filtered, and their events
 for it are neither dropped nor retracted. Before authority takes effect,
 a run that was killed is still in its proof phase: its events stay visible until the daemon reaps
@@ -1278,7 +1289,9 @@ against a daemon that predates it, falls back to the legacy `events.suppressObje
 finite lifetime (005 §16 step 9), which does not carry this guarantee.
 
 Verified: `libs/core/src/runtime/verify-artifact-ownership.test.ts` (real file-fingerprint
-observations, SQLite close/reopen, an actual later-lead claim) and
+observations, SQLite close/reopen, an actual later-lead claim),
+`libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts` (retained retries dropped on
+the tick and watcher drains, including a terminal one, with exactness controls) and
 `libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in
 `libs/core/src/inbox/schema.ts` (`verify_artifacts`).
 

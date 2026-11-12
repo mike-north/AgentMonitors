@@ -1333,6 +1333,8 @@ export class RuntimeStore {
     }, options?: {
         restrictToSessionId?: string;
     }): MonitorEventRecord;
+    // @internal
+    discardRetiredVerifyArtifactRetry(id: string): boolean;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;

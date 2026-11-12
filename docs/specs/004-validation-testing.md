@@ -175,6 +175,13 @@ far beyond any former suppression lifetime), and assert both the durable event t
 - **Incoming boundary:** a filtered observation does not consume a throttle window that a later
   legitimate change needs; a watcher batch admitted after restart, before any tick has recorded
   the owner's inactivity, is already filtered.
+- **Retained retries:** in `libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts`, a
+  retry for a registered artifact, queued before cleanup authority took effect, is dropped by the
+  tick drain and by the watcher drain before its next pull (002 §2.7): no event, the row is gone,
+  nothing is reported, and the monitor's later legitimate input materializes. A `terminal` retry
+  for such an artifact no longer pauses its monitor. Controls: a retry for an unregistered
+  scratch-looking key, for a key retired only in a foreign workspace, for a real path beside a
+  retired artifact, and for an artifact still in its proof phase each still materializes.
 - **No expiry:** cleanup authority survives arbitrary wall-clock time and repeated successful polls.
 - **Exactness controls:** a foreign workspace with the same monitor id and key keeps delivering; an
   unregistered scratch-looking path (even under a reaped verify-named session) is ordinary work; a
@@ -770,6 +777,7 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | A retry that keeps failing stays isolated and visible every tick _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — eight ticks: one `erroredObservations` entry and one `errored` history row per tick through the terminal state, the failing source called once, and a healthy sibling monitor emitting every tick). |
 | Retained work from before a restart drains first, in order, exactly once _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — three retained retries reopened from the database by a new runtime complete as A, B, C before D is observed, each once; a restarted watcher keeps its gate closed until a tick drains its batch, then pulls the next one). |
 | Held work waits behind retained work while the source fails _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — a debounce flush whose write fails leaves A as a retry while C is held; with the source rejecting and both due, a failing retry and a terminal one each keep C held and no event written, report only the retry failure, and never call the source; once the failing retry completes, the next tick writes A then C through the source-error flush (002 §2.6, §2.7)). |
+| A retired verify artifact's retained retry is dropped, not drained _(current)_ | Covered (`libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts` — a retry queued before cleanup authority took effect is removed by the tick drain and by the watcher drain without an event or an `errored` row, and newer input proceeds; a terminal one no longer pauses the monitor; retries for an unregistered scratch-looking key, a foreign workspace, a real path, and an artifact still in its proof phase materialize (002 §2.7, §2.8)). |
 | A session registered after an observation never receives its retry _(current)_ | Covered (`libs/core/src/runtime/retry-drain.test.ts` — a session opened 500 ms after admission, in the same second, gets no projection or cursor while an earlier session does; a retry without a position reaches no positioned session; a session without a position falls back to time; a resumed session keeps its position. `libs/core/src/inbox/db.released-shapes.test.ts` opens every released `agent_sessions` shape, keeps its rows with no position, and reserves new positions after existing events). |
 
 | Concurrent admission decisions preserve newer durable work | Covered (`poll-admission.test.ts` — independent notify writer commits immediately before BEGIN and its held envelope is materialized; mutation of observation context cannot alter the captured source token; `watch-batch-admission.test.ts` refuses a stale later batch without changing the winning source/notify state). |
