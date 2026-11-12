@@ -321,6 +321,34 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
     )
   `);
 
+  // Durable verify-artifact ownership (issue #562). Additive: a brand-new table
+  // and indexes, so a database written by any released version gains them on
+  // the next open without touching existing rows. The unique key backs the
+  // exact-key filter and refuses a second owner for one artifact; the partial
+  // index finds the few rows still awaiting cleanup without scanning retired
+  // ones, which are retained indefinitely.
+  db.run(sql`
+    CREATE TABLE IF NOT EXISTS verify_artifacts (
+      run_id TEXT PRIMARY KEY NOT NULL,
+      owner_session_id TEXT NOT NULL,
+      workspace_path TEXT NOT NULL,
+      monitor_id TEXT NOT NULL,
+      object_key TEXT NOT NULL,
+      registered_at INTEGER NOT NULL,
+      cleanup_requested_at INTEGER,
+      cleanup_cause TEXT
+    )
+  `);
+  db.run(sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_verify_artifacts_object
+      ON verify_artifacts (workspace_path, monitor_id, object_key)
+  `);
+  db.run(sql`
+    CREATE INDEX IF NOT EXISTS idx_verify_artifacts_awaiting_cleanup
+      ON verify_artifacts (workspace_path, owner_session_id)
+      WHERE cleanup_requested_at IS NULL
+  `);
+
   // Additive migration (issue #345 / #307): an `observation_history` table created
   // before workspace namespacing lacks `workspace_path`. Add it if missing so
   // post-upgrade rows are scoped; legacy rows keep NULL and simply fall out of any

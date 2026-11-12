@@ -311,6 +311,42 @@ function rowsByRowid(
     .all();
 }
 
+/**
+ * The additive verify-artifact ownership table (002 §2.6, issue #562): its
+ * columns, its unique exact-key index and its partial awaiting-cleanup index.
+ * Released versions never wrote it, so it must exist and be empty after open.
+ */
+function expectVerifyArtifactSchema(client: Database.Database): void {
+  expect(
+    client
+      .prepare<
+        [],
+        { name: string; type: string; notnull: number; pk: number }
+      >(`SELECT name, type, "notnull", pk FROM pragma_table_info('verify_artifacts')`)
+      .all(),
+  ).toEqual([
+    { name: 'run_id', type: 'TEXT', notnull: 1, pk: 1 },
+    { name: 'owner_session_id', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'workspace_path', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'monitor_id', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'object_key', type: 'TEXT', notnull: 1, pk: 0 },
+    { name: 'registered_at', type: 'INTEGER', notnull: 1, pk: 0 },
+    { name: 'cleanup_requested_at', type: 'INTEGER', notnull: 0, pk: 0 },
+    { name: 'cleanup_cause', type: 'TEXT', notnull: 0, pk: 0 },
+  ]);
+  expect(
+    client
+      .prepare<[], { name: string; unique: number; partial: number }>(
+        `SELECT name, "unique", partial FROM pragma_index_list('verify_artifacts')
+         WHERE origin = 'c' ORDER BY name`,
+      )
+      .all(),
+  ).toEqual([
+    { name: 'idx_verify_artifacts_awaiting_cleanup', unique: 0, partial: 1 },
+    { name: 'idx_verify_artifacts_object', unique: 1, partial: 0 },
+  ]);
+}
+
 describe('opening a database written by a released version (#569)', () => {
   it.each(SHAPES)('opens $name and keeps every row and value', (shape) => {
     const dbPath = tempDbPath();
@@ -343,6 +379,10 @@ describe('opening a database written by a released version (#569)', () => {
     expectObjectsSurvive(objectsBefore, explicitSchemaObjects(migrated));
     expect(migrated.pragma('integrity_check', { simple: true })).toBe('ok');
 
+    // Every released shape also gains the verify-artifact ownership table and
+    // its indexes (issue #562), empty, without disturbing the seeded tables.
+    expectVerifyArtifactSchema(migrated);
+
     // The current writer can still insert: a carried legacy column never keeps
     // a NOT NULL it has no default for (the current code does not write it).
     migrated
@@ -365,6 +405,7 @@ describe('opening a database written by a released version (#569)', () => {
       shape.events.length + 1,
     );
     expectObjectsSurvive(objectsBefore, explicitSchemaObjects(reopened));
+    expectVerifyArtifactSchema(reopened);
   });
 
   it('carries a legacy-only column with its declared type and default, relaxing a NOT NULL that has no default', () => {

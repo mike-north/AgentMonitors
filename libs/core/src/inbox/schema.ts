@@ -341,6 +341,44 @@ export const objectEventSuppressions = sqliteTable(
   },
 );
 
+/** Why a verify artifact's cleanup authority took effect. */
+export const verifyArtifactCleanupCauses = [
+  'owner-request',
+  'owner-inactive',
+] as const;
+
+/**
+ * Durable, exact ownership of one synthetic artifact a `verify` run creates
+ * against a persistent workspace daemon (issue #562). The run registers the row
+ * **before** creating its scratch file, so the daemon knows the file is
+ * verify's own even if the run is killed before any event projects.
+ *
+ * While the owner session is active and has not asked for cleanup, events for
+ * the key flow normally: that is verify's proof delivery. Once cleanup takes
+ * effect (`cleanup_requested_at` set, or the owner session is no longer
+ * active), the runtime filters this exact `(workspace_path, monitor_id,
+ * object_key)` at the incoming-observation and held-emission boundaries, so no
+ * later session receives the artifact.
+ *
+ * Rows have no expiry and are never retired automatically: recovery can be
+ * delayed arbitrarily and no source signal proves it has finished. Only verify
+ * registration creates rows, one per run (`run_id` is the run's random token,
+ * which the scratch file name also carries), so growth is bounded by the
+ * number of `--use-workspace-daemon` runs. Retaining retired keys is also what
+ * prevents another run from reusing one.
+ */
+export const verifyArtifacts = sqliteTable('verify_artifacts', {
+  runId: text('run_id').primaryKey(),
+  ownerSessionId: text('owner_session_id').notNull(),
+  workspacePath: text('workspace_path').notNull(),
+  monitorId: text('monitor_id').notNull(),
+  objectKey: text('object_key').notNull(),
+  registeredAt: integer('registered_at', { mode: 'timestamp' }).notNull(),
+  /** First moment cleanup authority was recorded; never cleared. */
+  cleanupRequestedAt: integer('cleanup_requested_at', { mode: 'timestamp' }),
+  cleanupCause: text('cleanup_cause', { enum: verifyArtifactCleanupCauses }),
+});
+
 export const observationHistory = sqliteTable('observation_history', {
   id: text('id').primaryKey(),
   monitorId: text('monitor_id').notNull(),
