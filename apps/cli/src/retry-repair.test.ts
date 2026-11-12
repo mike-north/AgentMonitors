@@ -35,6 +35,7 @@ import {
   SourceRegistry,
 } from '@agentmonitors/core';
 import type { Database } from 'better-sqlite3';
+import { RETRY_REPAIR_TIMEOUT_MS } from './runtime-client.js';
 import fileFingerprintSource from '@agentmonitors/source-file-fingerprint';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -65,9 +66,14 @@ beforeEach(() => {
     AGENTMONITORS_DB: dbPath,
     AGENTMONITORS_SOCKET: socketPath,
   };
-  mkdirSync(path.join(monitors, MONITOR), { recursive: true });
+  writeMonitor(monitors, MONITOR);
+});
+
+/** A file-fingerprint monitor `id` under `dir` watching this test's file. */
+function writeMonitor(dir: string, id: string): void {
+  mkdirSync(path.join(dir, id), { recursive: true });
   writeFileSync(
-    path.join(monitors, MONITOR, 'MONITOR.md'),
+    path.join(dir, id, 'MONITOR.md'),
     [
       '---',
       'watch:',
@@ -82,7 +88,7 @@ beforeEach(() => {
       '',
     ].join('\n'),
   );
-});
+}
 
 afterEach(async () => {
   for (const stop of daemons.splice(0)) await stop();
@@ -106,7 +112,13 @@ function openStore(): { store: RuntimeStore; client: Database } {
 async function seedRetry(options: {
   exhaust?: boolean;
   keepFault?: boolean;
+  /** Another monitor and workspace than the suite's own `watcher` in `root`. */
+  target?: { monitorId: string; monitorsDir: string; workspace: string };
 }): Promise<string> {
+  const monitorId = options.target?.monitorId ?? MONITOR;
+  const monitorsDir = options.target?.monitorsDir ?? monitors;
+  const workspace = options.target?.workspace ?? root;
+  const sqlMonitorId = monitorId.replaceAll("'", "''");
   writeFileSync(watched, 'v1');
   const { store, client } = openStore();
   try {
@@ -115,16 +127,16 @@ async function seedRetry(options: {
     const runtime = new AgentMonitorRuntime(store, registry, [
       claudeCodeAdapter,
     ]);
-    await runtime.tick(monitors, root);
+    await runtime.tick(monitorsDir, workspace);
     writeFileSync(watched, 'v2');
     client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
-      WHEN NEW.monitor_id = '${MONITOR}'
-      BEGIN SELECT RAISE(ABORT, 'native fault on ${MONITOR}'); END;`);
+      WHEN NEW.monitor_id = '${sqlMonitorId}'
+      BEGIN SELECT RAISE(ABORT, 'native fault on ${sqlMonitorId}'); END;`);
     // The file's mtime must move past the baseline's whole second.
     await new Promise((resolve) => setTimeout(resolve, 1_100));
-    const retained = await runtime.tick(monitors, root);
+    const retained = await runtime.tick(monitorsDir, workspace);
     expect(retained.erroredObservations).toHaveLength(1);
-    const [retry] = store.listMaterializationRetries({ monitorId: MONITOR });
+    const [retry] = store.listMaterializationRetries({ monitorId });
     if (!retry) throw new Error('no retained retry');
     if (options.exhaust !== false) {
       for (let n = 0; n < MATERIALIZATION_RETRY_MAX_ATTEMPTS; n += 1) {
@@ -295,6 +307,46 @@ function repairArgs(
     socketPath,
     ...extra,
   ];
+}
+
+/**
+ * Listen on the suite's socket as a stand-in daemon: `onRequest` gets each
+ * connection once its first request line has arrived. Returns a closer.
+ */
+async function fakeDaemon(
+  onRequest: (
+    socket: net.Socket,
+    request: { id: string; method: string },
+  ) => void,
+): Promise<() => Promise<void>> {
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+    // The CLI may hang up first; a late write must not fail the suite.
+    socket.on('error', () => undefined);
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', (chunk: string) => {
+      buffer += chunk;
+      if (!buffer.includes('\n')) return;
+      onRequest(
+        socket,
+        JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as {
+          id: string;
+          method: string;
+        },
+      );
+    });
+  });
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(socketPath, resolve);
+  });
+  return async () => {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  };
 }
 
 async function doctorJson(): Promise<{
@@ -514,23 +566,10 @@ describe('monitor retry refusals', () => {
     const id = await seedRetry({});
     // A reachable daemon that answers every request with an error, as an
     // older or failing daemon would.
-    const server = net.createServer((socket) => {
-      socket.setEncoding('utf8');
-      let buffer = '';
-      socket.on('data', (chunk: string) => {
-        buffer += chunk;
-        if (!buffer.includes('\n')) return;
-        const request = JSON.parse(buffer.slice(0, buffer.indexOf('\n'))) as {
-          id: string;
-        };
-        socket.end(
-          JSON.stringify({ id: request.id, error: 'daemon is busy' }) + '\n',
-        );
-      });
-    });
-    await new Promise<void>((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(socketPath, resolve);
+    const close = await fakeDaemon((socket, request) => {
+      socket.end(
+        JSON.stringify({ id: request.id, error: 'daemon is busy' }) + '\n',
+      );
     });
     try {
       for (const verb of ['rearm', 'skip'] as const) {
@@ -540,9 +579,23 @@ describe('monitor retry refusals', () => {
         expect(refused.stdout).not.toContain('applied to the persisted store');
       }
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await close();
     }
     expect(retryRow(id)?.status).toBe('terminal');
+  }, 30_000);
+
+  it('refuses a skip reason over 200 characters and changes nothing', async () => {
+    const id = await seedRetry({});
+    const lossesBefore = erroredMessages().length;
+    const refused = await run(
+      repairArgs('skip', id, '--reason', 'r'.repeat(201), '--format', 'text'),
+    );
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toBe(
+      `Error: Skip failed for retry ${id} of monitor ${MONITOR} in workspace ${root}: Skip reason is 201 characters; at most 200 are allowed.\n`,
+    );
+    expect(retryRow(id)?.status).toBe('terminal');
+    expect(erroredMessages()).toHaveLength(lossesBefore);
   }, 30_000);
 
   it('reports an unknown retry id as not found, in JSON', async () => {
@@ -554,6 +607,94 @@ describe('monitor retry refusals', () => {
     expect(JSON.parse(refused.stdout)).toEqual({
       error: `Skip failed for retry 01KUNKNOWNRETRY000000000000 of monitor ${MONITOR} in workspace ${root}: Materialization retry record not found: 01KUNKNOWNRETRY000000000000`,
     });
+  }, 30_000);
+});
+
+/**
+ * 005 `monitor retry`: once a daemon has accepted the request, a missing reply
+ * leaves the repair's outcome unknown. The daemon may have applied it (its
+ * store write can wait out another writer's lock), so the CLI reports that,
+ * points at the read-only commands that tell, and never writes the store.
+ */
+describe('monitor retry behind a daemon that received the request but did not answer', () => {
+  /** The unknown-outcome report for `label`, with its scoped follow-ups. */
+  function expectOutcomeUnknown(
+    result: { stdout: string; stderr: string; code: number },
+    label: 'Re-arm' | 'Skip',
+    id: string,
+  ): void {
+    expect(result.code).toBe(1);
+    expect(result.stdout).not.toContain('applied to the persisted store');
+    expect(result.stderr).toContain(
+      `Error: ${label} outcome unknown for retry ${id} of monitor ${MONITOR} in workspace ${root}: the daemon received the request but no reply arrived (`,
+    );
+    expect(result.stderr).toContain(
+      'may already have been applied; nothing was written to the store from here. Check with `agentmonitors monitor explain watcher` or `agentmonitors doctor` before running it again.',
+    );
+  }
+
+  it('reports a skip whose reply comes after the client timeout as unknown, and writes nothing', async () => {
+    const id = await seedRetry({});
+    const lossesBefore = erroredMessages().length;
+    // Past the repairs' 10-second client timeout (RETRY_REPAIR_TIMEOUT_MS),
+    // as a daemon still waiting on another writer's lock would answer.
+    const LATE_REPLY_MS = 11_000;
+    const methods: string[] = [];
+    const close = await fakeDaemon((socket, request) => {
+      methods.push(request.method);
+      setTimeout(() => {
+        socket.end(
+          JSON.stringify({ id: request.id, result: retryRow(id) }) + '\n',
+        );
+      }, LATE_REPLY_MS);
+    });
+    let result: { stdout: string; stderr: string; code: number };
+    try {
+      result = await run(repairArgs('skip', id, '--format', 'text'));
+    } finally {
+      await close();
+    }
+    expect(methods).toEqual(['retry.skip']);
+    expectOutcomeUnknown(result, 'Skip', id);
+    expect(result.stderr).toContain(
+      `(Timed out waiting for AgentMon daemon at ${socketPath})`,
+    );
+    // The CLI did not skip it behind the daemon.
+    expect(retryRow(id)?.status).toBe('terminal');
+    expect(erroredMessages()).toHaveLength(lossesBefore);
+    expect(RETRY_REPAIR_TIMEOUT_MS).toBeLessThan(LATE_REPLY_MS);
+  }, 30_000);
+
+  it('reports a repair whose connection drops after the request as unknown, and writes nothing', async () => {
+    const id = await seedRetry({});
+    const lossesBefore = erroredMessages().length;
+    const methods: string[] = [];
+    const close = await fakeDaemon((socket, request) => {
+      methods.push(request.method);
+      socket.destroy();
+    });
+    try {
+      for (const [verb, label] of [
+        ['rearm', 'Re-arm'],
+        ['skip', 'Skip'],
+      ] as const) {
+        const result = await run(repairArgs(verb, id, '--format', 'text'));
+        expectOutcomeUnknown(result, label, id);
+      }
+      const json = await run(repairArgs('skip', id, '--format', 'json'));
+      expect(json.code).toBe(1);
+      expect((JSON.parse(json.stdout) as { error: string }).error).toMatch(
+        /^Skip outcome unknown for retry /u,
+      );
+    } finally {
+      await close();
+    }
+    expect(methods).toEqual(['retry.rearm', 'retry.skip', 'retry.skip']);
+    expect(retryRow(id)).toMatchObject({
+      status: 'terminal',
+      attemptCount: 5,
+    });
+    expect(erroredMessages()).toHaveLength(lossesBefore);
   }, 30_000);
 });
 
@@ -662,5 +803,71 @@ describe('monitor retry without a daemon', () => {
     expect(materialization.reason).toMatch(
       /Retry skipped after 5 failed attempts\.$/u,
     );
+  }, 30_000);
+
+  it('prints a skip hint that runs verbatim from another directory, quoted and scoped to the workspace', async () => {
+    // A workspace path with spaces whose definitions sit in its own
+    // `.claude/monitors`, and a monitor id with a single quote.
+    const workspace = path.join(root, 'my work');
+    const workspaceMonitors = path.join(workspace, '.claude', 'monitors');
+    const monitorId = "it's mine";
+    writeMonitor(workspaceMonitors, monitorId);
+    const id = await seedRetry({
+      target: { monitorId, monitorsDir: workspaceMonitors, workspace },
+    });
+    const elsewhere = path.join(root, 'elsewhere');
+    mkdirSync(elsewhere);
+
+    const skipped = await run(
+      [
+        'monitor',
+        'retry',
+        'skip',
+        monitorId,
+        id,
+        '--workspace',
+        workspace,
+        '--socket',
+        socketPath,
+        '--format',
+        'text',
+      ],
+      elsewhere,
+    );
+    expect(skipped.code).toBe(0);
+    const hint = `agentmonitors monitor explain 'it'\\''s mine' --workspace '${workspace}' --dir '${workspaceMonitors}'`;
+    expect(skipped.stdout).toContain(`; see \`${hint}\`.`);
+
+    // Run it through `sh` exactly as printed, from the same directory.
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      path.join(bin, 'agentmonitors'),
+      `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(cli)} "$@"\n`,
+      { mode: 0o755 },
+    );
+    const printed = /; see `([^`]+)`\./u.exec(skipped.stdout)?.[1] ?? '';
+    const explained = await execute(
+      '/bin/sh',
+      ['-c', `${printed} --format json`],
+      {
+        cwd: elsewhere,
+        env: { ...env, PATH: `${bin}:${env['PATH'] ?? ''}` },
+        timeout: 15_000,
+      },
+    );
+    const report = JSON.parse(explained.stdout) as {
+      monitorId: string;
+      stages: { id: string; status: string; reason: string }[];
+    };
+    expect(report.monitorId).toBe(monitorId);
+    // It read that workspace's definition and the loss the skip recorded.
+    expect(
+      report.stages.find(({ id: stage }) => stage === 'definition')?.status,
+    ).toBe('ok');
+    expect(
+      report.stages.find(({ id: stage }) => stage === 'materialization')
+        ?.reason,
+    ).toMatch(/Retry skipped after 5 failed attempts\.$/u);
   }, 30_000);
 });

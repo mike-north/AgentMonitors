@@ -365,6 +365,16 @@ export async function cancelWatchClient(
 }
 
 /**
+ * Client timeout for the two retry repairs. The daemon runs each repair as one
+ * immediate SQLite transaction, which waits up to the store's 5-second busy
+ * timeout for another writer's lock before it fails. The default 2-second
+ * client timeout would give up on a daemon that is still waiting and about to
+ * apply the repair; this one outlasts that wait, so a daemon that is merely
+ * busy still gets to answer.
+ */
+export const RETRY_REPAIR_TIMEOUT_MS = 10_000;
+
+/**
  * Re-arm one terminal retry on the live daemon (005 `monitor retry rearm`),
  * so a watcher paused on it in that process wakes at once. The returned
  * record is safe metadata with its Dates revived.
@@ -377,7 +387,10 @@ export async function rearmRetryClient(
     await callDaemon<MaterializationRetryDiagnostic>(
       'retry.rearm',
       { ...input },
-      socketPath ? { socketPath } : {},
+      {
+        timeoutMs: RETRY_REPAIR_TIMEOUT_MS,
+        ...(socketPath ? { socketPath } : {}),
+      },
     ),
   );
 }
@@ -391,7 +404,10 @@ export async function skipRetryClient(
     await callDaemon<MaterializationRetryDiagnostic>(
       'retry.skip',
       { ...input },
-      socketPath ? { socketPath } : {},
+      {
+        timeoutMs: RETRY_REPAIR_TIMEOUT_MS,
+        ...(socketPath ? { socketPath } : {}),
+      },
     ),
   );
 }

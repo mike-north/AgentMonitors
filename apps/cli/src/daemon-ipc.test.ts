@@ -104,6 +104,100 @@ describe('callDaemon', () => {
       },
     ).catch((error: unknown) => error);
     expect(rejection).toBeInstanceOf(DaemonConnectionError);
+    // No daemon received anything, so a writing caller may fall back.
+    expect((rejection as DaemonConnectionError).requestSent).toBe(false);
+  });
+
+  /**
+   * Once the request is written, a missing reply leaves the daemon's outcome
+   * unknown: the error still classifies as a connection failure (read-only
+   * fallbacks are unchanged) but says the request was sent, so a writing
+   * caller (`monitor retry`) does not also apply it in-process.
+   */
+  describe('after the request reached a daemon', () => {
+    async function listen(
+      name: string,
+      onRequest: (socket: net.Socket) => void,
+    ): Promise<{ socketPath: string; close: () => Promise<void> }> {
+      const socketPath = tempSocketPath(name);
+      const sockets = new Set<net.Socket>();
+      const server = net.createServer((socket) => {
+        sockets.add(socket);
+        socket.on('error', () => undefined);
+        socket.setEncoding('utf-8');
+        let buffer = '';
+        socket.on('data', (chunk) => {
+          buffer += chunk;
+          if (buffer.includes('\n')) onRequest(socket);
+        });
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(socketPath, resolve);
+      });
+      return {
+        socketPath,
+        close: async () => {
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve) => server.close(() => resolve()));
+        },
+      };
+    }
+
+    it('marks a timeout with no reply as sent', async () => {
+      const daemon = await listen('silent', () => undefined);
+      try {
+        const rejection = await callDaemon(
+          'status',
+          {},
+          { socketPath: daemon.socketPath, timeoutMs: 200 },
+        ).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(DaemonConnectionError);
+        expect((rejection as DaemonConnectionError).requestSent).toBe(true);
+        expect((rejection as Error).message).toBe(
+          `Timed out waiting for AgentMon daemon at ${daemon.socketPath}`,
+        );
+      } finally {
+        await daemon.close();
+      }
+    });
+
+    it('marks a connection dropped before the reply as sent, without waiting for the timeout', async () => {
+      const daemon = await listen('drop', (socket) => socket.destroy());
+      try {
+        const started = Date.now();
+        const rejection = await callDaemon(
+          'status',
+          {},
+          { socketPath: daemon.socketPath, timeoutMs: 5_000 },
+        ).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(DaemonConnectionError);
+        expect((rejection as DaemonConnectionError).requestSent).toBe(true);
+        expect(Date.now() - started).toBeLessThan(4_000);
+      } finally {
+        await daemon.close();
+      }
+    });
+
+    it('marks a half-written reply followed by a close as sent', async () => {
+      const daemon = await listen('partial', (socket) => {
+        socket.end('{"id":"1","res');
+      });
+      try {
+        const rejection = await callDaemon(
+          'status',
+          {},
+          { socketPath: daemon.socketPath, timeoutMs: 5_000 },
+        ).catch((error: unknown) => error);
+        expect(rejection).toBeInstanceOf(DaemonConnectionError);
+        expect((rejection as DaemonConnectionError).requestSent).toBe(true);
+        expect((rejection as Error).message).toBe(
+          `AgentMon daemon at ${daemon.socketPath} closed the connection without a reply`,
+        );
+      } finally {
+        await daemon.close();
+      }
+    });
   });
 
   // Issue #382: an old, still-running daemon build predates a method the

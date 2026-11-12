@@ -5,19 +5,31 @@
  * `monitor explain` and `doctor` list it: its monitor id and record id.
  *
  * Both commands go to the workspace's live daemon when one is reachable, so a
- * watcher paused on the retry there wakes at once, and otherwise apply the
- * same core transaction to the workspace's persisted store. The core decides
- * what each repair does and refuses; this module only routes and renders.
+ * watcher paused on the retry there wakes at once. Only when no daemon
+ * accepted the connection do they apply the same core transaction to the
+ * workspace's persisted store. Once a daemon has the request, a missing reply
+ * is reported as an unknown outcome and the store is never written from here:
+ * the daemon may already have applied the repair. The core decides what each
+ * repair does and refuses; this module only routes and renders.
  */
 import path from 'node:path';
 import { Command, Option } from 'commander';
-import type { MaterializationRetryDiagnostic } from '@agentmonitors/core';
+import {
+  MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
+  type MaterializationRetryDiagnostic,
+} from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
 import { readLocalState } from '../local-state.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
+import {
+  doctorCommandLine,
+  explainCommand,
+  workspaceMonitorsDir,
+  type SuggestionScope,
+} from '../suggested-commands.js';
 import {
   rearmRetryClient,
   rearmRetryInProcess,
@@ -42,9 +54,38 @@ interface RetryRepairOptions {
 /** Where a repair was applied: the live daemon, or the store directly. */
 type AppliedVia = 'daemon' | 'in-process';
 
+/**
+ * The workspace the repair was applied in, with that workspace's own monitor
+ * definitions: the repairs take no `--dir`, so a suggested `explain` or
+ * `doctor` reads the definitions where the workspace keeps them.
+ */
+function suggestionScope(workspacePath: string): SuggestionScope {
+  return { workspacePath, monitorsDir: workspaceMonitorsDir(workspacePath) };
+}
+
+/**
+ * The report for a request a daemon accepted but never answered (a timeout,
+ * or the connection dropping after the request was written). The daemon may
+ * have applied the repair, so the CLI neither claims an outcome nor applies it
+ * itself; it points at the read-only commands that show which it was.
+ */
+function outcomeUnknownMessage(
+  repair: RetryRepair,
+  monitorId: string,
+  retryId: string,
+  workspacePath: string,
+  error: DaemonConnectionError,
+): string {
+  const label = repair === 'rearm' ? 'Re-arm' : 'Skip';
+  const noun = repair === 'rearm' ? 're-arm' : 'skip';
+  const scope = suggestionScope(workspacePath);
+  return `${label} outcome unknown for retry ${retryId} of monitor ${monitorId} in workspace ${workspacePath}: the daemon received the request but no reply arrived (${error.message}). The ${noun} may already have been applied; nothing was written to the store from here. Check with \`${explainCommand(scope, monitorId)}\` or \`${doctorCommandLine(scope)}\` before running it again.`;
+}
+
 function successLines(
   repair: RetryRepair,
   monitorId: string,
+  workspacePath: string,
   retry: MaterializationRetryDiagnostic,
 ): string[] {
   if (repair === 'rearm') {
@@ -54,7 +95,7 @@ function successLines(
     ];
   }
   return [
-    `Skipped retry ${retry.id} of monitor ${monitorId}. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see \`agentmonitors monitor explain ${monitorId}\`.`,
+    `Skipped retry ${retry.id} of monitor ${monitorId}. Its observation is recorded as an outstanding loss until a later event for the same object supersedes it; see \`${explainCommand(suggestionScope(workspacePath), monitorId)}\`.`,
     'The monitor takes newer input on its next tick unless other retained work is still ahead of it.',
   ];
 }
@@ -91,9 +132,23 @@ async function runRepair(
           ? await rearmRetryClient(input, socketPath)
           : await skipRetryClient(input, socketPath);
     } catch (error) {
-      // Only an unreachable daemon falls back; a refusal from a live daemon
-      // is the answer, not a reason to write the store behind its back.
+      // Only a daemon that never accepted the request falls back; a refusal
+      // from a live daemon is the answer, not a reason to write the store
+      // behind its back.
       if (!(error instanceof DaemonConnectionError)) throw error;
+      if (error.requestSent) {
+        reportError(
+          outcomeUnknownMessage(
+            repair,
+            monitorId,
+            retryId,
+            workspacePath,
+            error,
+          ),
+          json,
+        );
+        return;
+      }
       via = 'in-process';
       const dbPath = resolveWorkspaceDbPath(
         workspacePath,
@@ -129,7 +184,9 @@ async function runRepair(
     return;
   }
   if (via === 'in-process') console.log(NO_DAEMON_NOTICE);
-  for (const line of successLines(repair, monitorId, retry)) console.log(line);
+  for (const line of successLines(repair, monitorId, workspacePath, retry)) {
+    console.log(line);
+  }
 }
 
 function formatOption(): Option {
@@ -172,7 +229,7 @@ monitorRetryCommand
   )
   .option(
     '--reason <text>',
-    'Why the observation is given up (recorded with the loss)',
+    `Why the observation is given up (recorded with the loss; at most ${String(MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH)} characters)`,
   )
   .option('--workspace <path>', 'Workspace path used by the daemon')
   .option('--socket <path>', 'Unix domain socket path for the daemon')

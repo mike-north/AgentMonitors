@@ -1,4 +1,3 @@
-import { realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { Command, Option } from 'commander';
@@ -29,6 +28,14 @@ import {
   doctorReportInProcess,
 } from '../runtime-client.js';
 import { resolveWorkspaceDbPath } from '../workspace-db-path.js';
+import {
+  explainCommand,
+  historyCommand,
+  shellArg,
+  shellSingleQuote,
+  workspaceFlags,
+  workspaceMonitorsDir,
+} from '../suggested-commands.js';
 import { resolveDataRoot } from '../workspace-paths.js';
 import { getCliVersion } from '../cli-version.js';
 import {
@@ -102,14 +109,6 @@ const DAEMON_REMEDIATION =
 // home directory) — so the payload itself can. `shellSingleQuote` closes the
 // quote, escapes the embedded `'`, and reopens it (the standard POSIX idiom)
 // so the printed command stays runnable verbatim regardless of the path.
-function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-/** Quote only when the value is not already shell-safe, keeping ordinary ids readable. */
-function shellArg(value: string): string {
-  return /^[\w./@:+-]+$/.test(value) ? value : shellSingleQuote(value);
-}
 
 function leadSessionRemediation(workspacePath: string): string {
   // Build the manual stdin payload with JSON.stringify so the embedded path is
@@ -155,55 +154,10 @@ function orphanedWorkFor(
   );
 }
 
-/** Path equality that tolerates symlinked spellings (e.g. macOS /tmp vs /private/tmp). */
-function samePath(a: string, b: string): boolean {
-  // Resolve symlinks through the nearest existing ancestor so not-yet-created
-  // directories still compare equal.
-  const canonical = (value: string): string => {
-    const resolved = path.resolve(value);
-    try {
-      return realpathSync(resolved);
-    } catch {
-      const parent = path.dirname(resolved);
-      return parent === resolved
-        ? resolved
-        : path.join(canonical(parent), path.basename(resolved));
-    }
-  };
-  return canonical(a) === canonical(b);
-}
-
-/**
- * `monitor history <id>` scoped like `explainCommand`. History scopes by
- * `--workspace` only (it has no `--dir`), so only that flag is carried.
- */
-function historyCommand(report: MonitorDoctorReport, id: string): string {
-  const flags: string[] = [];
-  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
-    flags.push('--workspace', shellArg(report.workspacePath));
-  }
-  return ['agentmonitors monitor history', shellArg(id), ...flags].join(' ');
-}
-
-/** `monitor explain <id>` carrying the scope doctor was given, so it reads the same workspace. */
-function explainCommand(report: MonitorDoctorReport, id: string): string {
-  const flags: string[] = [];
-  // Workspace keys are the `path.resolve()` spelling and `monitor explain` uses
-  // `process.cwd()` (already a real path), so a symlinked spelling is a different
-  // workspace and must be carried. `--dir` is only read as files, so realpath is fine.
-  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
-    flags.push('--workspace', shellArg(report.workspacePath));
-  }
-  if (!samePath(report.monitorsDir, '.claude/monitors')) {
-    flags.push('--dir', shellArg(report.monitorsDir));
-  }
-  return ['agentmonitors monitor explain', shellArg(id), ...flags].join(' ');
-}
-
 /**
  * `monitor retry rearm|skip <id> <retryId>` for the oldest terminal retry of
  * an outbox, the one that keeps its monitor paused, carrying `--workspace`
- * like {@link historyCommand} (the repairs have no `--dir`). `undefined` when
+ * like `historyCommand` (the repairs have no `--dir`). `undefined` when
  * the outbox holds no terminal record.
  */
 function retryRepairCommands(
@@ -213,11 +167,11 @@ function retryRepairCommands(
 ): { rearm: string; skip: string } | undefined {
   const oldest = summary?.records.find(({ status }) => status === 'terminal');
   if (!oldest) return undefined;
-  const flags: string[] = [];
-  if (path.resolve(report.workspacePath) !== path.resolve(process.cwd())) {
-    flags.push('--workspace', shellArg(report.workspacePath));
-  }
-  const target = [shellArg(id), shellArg(oldest.id), ...flags].join(' ');
+  const target = [
+    shellArg(id),
+    shellArg(oldest.id),
+    ...workspaceFlags(report.workspacePath),
+  ].join(' ');
   return {
     rearm: `agentmonitors monitor retry rearm ${target}`,
     skip: `agentmonitors monitor retry skip ${target}`,
@@ -1168,7 +1122,7 @@ export const doctorCommand = new Command('doctor')
       const workspace = path.resolve(options.workspace);
       const monitorsDir = options.dir
         ? path.resolve(options.dir)
-        : path.join(workspace, '.claude', 'monitors');
+        : workspaceMonitorsDir(workspace);
 
       try {
         const state = readLocalState(workspace);

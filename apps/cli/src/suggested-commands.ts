@@ -1,0 +1,132 @@
+/**
+ * Follow-up commands the CLI prints for a user to run next (`doctor`
+ * remediations, the `monitor retry` hints). Each one must run verbatim when
+ * pasted into a POSIX shell from the directory the printing command ran in:
+ * arguments are quoted only when they need it, and a command carries
+ * `--workspace` (and, for commands that read definitions, `--dir`) whenever its
+ * own default would resolve to a different workspace or directory than the one
+ * the printing command was given.
+ *
+ * One module owns this so every suggestion quotes and scopes the same way.
+ */
+import { realpathSync } from 'node:fs';
+import path from 'node:path';
+
+/**
+ * The workspace and monitor definitions a suggestion should read: the same
+ * ones the printing command was pointed at.
+ */
+export interface SuggestionScope {
+  /** Workspace the printing command was given (`--workspace` or the cwd). */
+  workspacePath: string;
+  /** Monitor definitions directory the printing command read, when it read one. */
+  monitorsDir: string;
+}
+
+/**
+ * POSIX single-quote `value`: close the quote, escape an embedded `'`, and
+ * reopen it, so any text (a workspace path such as "Mike's Mac", a JSON
+ * payload) stays one literal argument.
+ */
+export function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+/** Quote only when the value is not already shell-safe, keeping ordinary ids readable. */
+export function shellArg(value: string): string {
+  return /^[\w./@:+-]+$/.test(value) ? value : shellSingleQuote(value);
+}
+
+/** Path equality that tolerates symlinked spellings (e.g. macOS /tmp vs /private/tmp). */
+function samePath(a: string, b: string): boolean {
+  // Resolve symlinks through the nearest existing ancestor so not-yet-created
+  // directories still compare equal.
+  const canonical = (value: string): string => {
+    const resolved = path.resolve(value);
+    try {
+      return realpathSync(resolved);
+    } catch {
+      const parent = path.dirname(resolved);
+      return parent === resolved
+        ? resolved
+        : path.join(canonical(parent), path.basename(resolved));
+    }
+  };
+  return canonical(a) === canonical(b);
+}
+
+/**
+ * `--workspace <path>` when the workspace is not the current directory, which
+ * every workspace-scoped command defaults to.
+ *
+ * Workspace keys are the `path.resolve()` spelling and commands default to
+ * `process.cwd()` (already a real path), so a symlinked spelling is a
+ * different workspace and must be carried.
+ */
+export function workspaceFlags(workspacePath: string): string[] {
+  return path.resolve(workspacePath) === path.resolve(process.cwd())
+    ? []
+    : ['--workspace', shellArg(workspacePath)];
+}
+
+/**
+ * `--workspace` as {@link workspaceFlags}, plus `--dir <path>` when the
+ * definitions are not at the `.claude/monitors` a command reads by default
+ * (relative to the cwd). `--dir` is only read as files, so realpath equality
+ * is enough.
+ */
+function scopeFlags(scope: SuggestionScope): string[] {
+  const flags = workspaceFlags(scope.workspacePath);
+  if (!samePath(scope.monitorsDir, '.claude/monitors')) {
+    flags.push('--dir', shellArg(scope.monitorsDir));
+  }
+  return flags;
+}
+
+/** `monitor explain <id>` reading the same workspace and definitions. */
+export function explainCommand(scope: SuggestionScope, id: string): string {
+  return [
+    'agentmonitors monitor explain',
+    shellArg(id),
+    ...scopeFlags(scope),
+  ].join(' ');
+}
+
+/**
+ * `monitor history <id>` scoped like {@link explainCommand}. History scopes by
+ * `--workspace` only (it has no `--dir`), so only that flag is carried.
+ */
+export function historyCommand(
+  scope: Pick<SuggestionScope, 'workspacePath'>,
+  id: string,
+): string {
+  return [
+    'agentmonitors monitor history',
+    shellArg(id),
+    ...workspaceFlags(scope.workspacePath),
+  ].join(' ');
+}
+
+/**
+ * `doctor` reading the same workspace and definitions. Unlike `monitor
+ * explain`, doctor defaults `--dir` to the workspace's own definitions
+ * ({@link workspaceMonitorsDir}), so `--dir` is carried only when the
+ * definitions are elsewhere.
+ */
+export function doctorCommandLine(scope: SuggestionScope): string {
+  const flags = workspaceFlags(scope.workspacePath);
+  if (!samePath(scope.monitorsDir, workspaceMonitorsDir(scope.workspacePath))) {
+    flags.push('--dir', shellArg(scope.monitorsDir));
+  }
+  return ['agentmonitors doctor', ...flags].join(' ');
+}
+
+/**
+ * Where a workspace's monitor definitions live when nothing else names them:
+ * the workspace's own `.claude/monitors`, which `doctor` and session-booted
+ * daemons read by default. Used by commands that are scoped by workspace but
+ * take no `--dir` of their own.
+ */
+export function workspaceMonitorsDir(workspacePath: string): string {
+  return path.join(path.resolve(workspacePath), '.claude', 'monitors');
+}
