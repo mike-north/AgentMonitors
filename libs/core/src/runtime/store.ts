@@ -152,6 +152,7 @@ function rowToEvent(
     queryScope: parseJson(row.queryScope, {}),
     tags: parseJson(row.tags, []),
     createdAt: row.createdAt,
+    definitionFingerprint: row.definitionFingerprint ?? null,
   };
 }
 
@@ -1229,6 +1230,7 @@ export class RuntimeStore {
             queryScope: JSON.stringify(input.queryScope),
             tags: JSON.stringify(input.tags),
             createdAt: input.createdAt,
+            definitionFingerprint: input.definitionFingerprint,
           })
           .run();
 
@@ -1864,6 +1866,53 @@ export class RuntimeStore {
       result: row.result,
       createdAt: row.createdAt,
     }));
+  }
+
+  /**
+   * Ids of every pending event of a monitor, in one workspace, that was
+   * materialized under a definition other than `currentFingerprint` (issue #451).
+   *
+   * "Pending" means at least one recipient projection has not acknowledged the
+   * event AND can still be delivered: net-collapsed intermediates and
+   * Interpret-suppressed projections never deliver and ack-all never
+   * acknowledges them, so they are excluded by the same rule the unread and
+   * reminder paths use. A row with a NULL fingerprint (materialized before the column existed)
+   * never matches: SQL `<>` against NULL is not true, which is the intended
+   * "unknown, never flagged" reading. Unlike `listEvents`, this is not bounded by
+   * a display limit, so the answer is a total.
+   */
+  pendingEventIdsOutsideDefinition(
+    monitorId: string,
+    workspacePath: string | null,
+    currentFingerprint: string,
+  ): string[] {
+    const workspaceCondition =
+      workspacePath === null
+        ? isNull(monitorEvents.workspacePath)
+        : or(
+            eq(monitorEvents.workspacePath, workspacePath),
+            isNull(monitorEvents.workspacePath),
+          );
+    return asInternalDb(this.db)
+      .selectDistinct({ id: monitorEvents.id })
+      .from(monitorEvents)
+      .innerJoin(
+        sessionEventState,
+        eq(sessionEventState.eventId, monitorEvents.id),
+      )
+      .where(
+        and(
+          eq(monitorEvents.monitorId, monitorId),
+          workspaceCondition,
+          ne(monitorEvents.definitionFingerprint, currentFingerprint),
+          isNull(sessionEventState.acknowledgedAt),
+          notInterpretSuppressed(),
+          notNetSuppressed(),
+        ),
+      )
+      .orderBy(asc(monitorEvents.id))
+      .all()
+      .map((row) => row.id);
   }
 
   listDeliveryProjectionsForMonitor(
