@@ -96,10 +96,20 @@ kill after the grace period as a defensive retry. A descendant that remains in t
 process group — e.g. one holding stdio open or surviving its parent — MUST NOT outlive that
 hard upper bound. Descendants that leave the original process group/session are **not**
 covered by this current guarantee; they enter the deferred-reconciliation state (§2.2,
-§3.2). Both escalation steps are identity-verified (§5): the SIGKILL follow-up reaches a
-group-resident descendant whenever a process recorded when the group was last confirmed is
-still in the group, and otherwise abstains (§2.2 state 4) rather than signal a group id that
-may have been reused.
+§3.2).
+
+Both escalation steps are identity-verified (§5) before they signal. A descendant still in the
+original group is confirmed through the group's continuity (§5.1), including one forked after
+the SIGTERM step, so verification does not exempt it from the bound. The step abstains (§2.2
+state 4) only when continuity cannot be shown: the process table cannot be read, or the group
+holds none of the processes confirmed as its members (its id may have been reused).
+Verification reads the process table, which adds latency to each step. The SIGKILL goes out
+after the later of the grace expiry and the end of the SIGTERM step's read, and after the
+SIGKILL step's own read (and, if the leader exited, the read taken at its exit). Normally that
+adds tens of milliseconds to timeout + 5 s. On macOS each read is capped by a 5-second `ps`
+timeout, so even a pathologically slow table delays the SIGKILL to at most timeout + 15 s; a
+read that times out is unreadable, and that step abstains. On Linux the reads are `/proc` file
+reads, which do not wait on other processes.
 
 **Current** — implemented by `@agentmonitors/source-command-poll` per
 [003 §11](./003-source-plugins.md) (escalation targeting fixed in #303). Verified: the
@@ -216,12 +226,24 @@ pid or pgid any other way. Identity evidence:
   number now: a reaped single process is treated as gone and never signalled by pid.
 - **Recorded identity `(pid, pgid, start time)`**, read from the platform process table
   (`libs/core/src/process/process-table.ts`). A pid paired with its start time names one
-  process for that process's whole life. A process group whose leader has been reaped is
-  confirmed only if at least one current member is a process recorded when the group was last
-  confirmed: a group id can be reused only after every member has gone, so one surviving known
-  member proves continuity, and every current member is then within the boundary (§2.1). A
-  recorded single process is confirmed only if the pid's current start time equals the
-  recorded one.
+  process for that process's whole life. A recorded single process is confirmed only if the
+  pid's current start time equals the recorded one.
+- **Group continuity.** A process-group id cannot be reused while any member of the group
+  exists, so a membership reading taken while the group is provably ours confirms every member
+  in it, and every such member is within the boundary (§2.1). A reading is taken while the group
+  is provably ours when it:
+  - **started** while the leader was still unreaped, even if the leader is reaped before it
+    completes;
+  - started in the leader's `exit` event, which Node emits in the callback that reaps it (once
+    a signal has been aimed at the group, the gate starts this read synchronously from that
+    event, which confirms processes forked after the previous step, such as work a SIGTERM
+    trap starts before exiting); or
+  - finds a member confirmed by an earlier reading still in the group.
+
+  Confirmed members accumulate across the escalation. After the leader is reaped, a step
+  signals the group if any confirmed member is still in it; an empty group needs no signal.
+  Only a group none of whose current members was ever confirmed (continuity lost, so the id
+  may have been reused) or an unreadable table makes the step abstain.
 
 Platform evidence comes from what the platform ships, plus Node: on **Linux**,
 `/proc/<pid>/stat` (`pgrp` and `starttime`); on **macOS**, `/bin/ps -A -o pid=,pgid=,lstart=`
@@ -230,24 +252,27 @@ environment of platform binaries such as `/bin/sh` from other processes. On any 
 including Windows, the table is reported as unsupported: signals rest on the live child handle
 alone, and anything needing recorded identity abstains.
 
-**Residual window:** verification and `kill(2)` are separate system calls. A target replaced in
-between is not detected; replacement requires the pid space to wrap within that window, and no
-portable POSIX primitive closes it for process groups.
+**Residual window:** the evidence is a process-table read, which takes time (tens of
+milliseconds normally; on macOS up to its 5-second `ps` timeout), and `kill(2)` follows it as a
+separate system call. A target that empties and is replaced during that read, or between the
+read and the signal, is not detected. Replacement requires the pid space to wrap within that
+window, and no portable POSIX primitive closes it for process groups. The same window applies
+to the reading that starts while the leader is unreaped and to the one started at its exit.
 
 ### 5.2 Live signal-send inventory (current)
 
 Every place shipped code (`libs/`, `apps/`, `plugins/`) sends a signal, and its disposition.
 Keep this table current when a signal site is added.
 
-| Site                                                                                                                                                                                                                                     | Signal and target                                         | Identity evidence                                                                                   | Disposition                                                              |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                  | live child handle (the timeout only fires while the command runs); the group's members are recorded | verified                                                                 |
-| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later                  | a member recorded at the `SIGTERM` step is still in the group                                       | verified; an empty group needs no signal; otherwise abstains (§6.1)      |
-| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                               | live child handle                                                                                   | verified; the follow-up is skipped once the direct child has been reaped |
-| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned | live child handle                                                                                   | verified; a child that has already exited is never signalled by pid      |
-| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child            | live child handle                                                                                   | verified                                                                 |
-| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running          | Node signals through its own child before reaping it                                                | identity-safe by construction; not routed through the gate               |
-| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself        | —                                                                                                   | not a signal site                                                        |
+| Site                                                                                                                                                                                                                                     | Signal and target                                                          | Identity evidence                                                                                                                                                                      | Disposition                                                                                                                  |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                                   | the read starts while the leader is unreaped (the timeout only fires while the command runs); the members it lists are confirmed, and a read at the leader's exit confirms later forks | verified; if the leader exits during the read, the reading's members still confirm the group; an empty group needs no signal |
+| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later (after the `SIGTERM` step's read) | the leader is unreaped, or a member confirmed earlier (at the `SIGTERM` step or the leader's exit) is still in the group                                                               | verified; an empty group needs no signal; abstains (§6.1) only when continuity is lost or the table is unreadable            |
+| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                                                | live child handle                                                                                                                                                                      | verified; the follow-up is skipped once the direct child has been reaped                                                     |
+| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned                  | live child handle                                                                                                                                                                      | verified; a child that has already exited is never signalled by pid                                                          |
+| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child                             | live child handle                                                                                                                                                                      | verified                                                                                                                     |
+| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                           | Node signals through its own child before reaping it                                                                                                                                   | identity-safe by construction; not routed through the gate                                                                   |
+| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                         | —                                                                                                                                                                                      | not a signal site                                                                                                            |
 
 Classified as not signal sends: `process.kill(pid, 0)` liveness probes (the startup-lock check
 in `apps/cli/src/daemon-ipc.ts`; signal 0 delivers nothing), `process.on('SIGTERM' | 'SIGINT')`
@@ -255,11 +280,16 @@ handlers (receiving, not sending), and test fixtures under `apps/cli/src/command
 (test support, not shipped behavior). The restart sweep (#478) and `gc` (#426) do not exist yet;
 when they land they MUST use the same gate, with the recorded-identity target.
 
-**Verified:** gate unit cases (match, recycled pid, missing process, recycled group id,
-unreadable/unsupported table) in `libs/core/src/process/process-identity.test.ts`; the
-`command-poll` recycled-group abstention, TERM → KILL escalation and clean-exit cases in
-`plugins/source-command-poll/src/identity-verified-cleanup.test.ts`; the reaped-child/recycled-pid
-case for detach cleanup in `apps/cli/src/commands/daemon.test.ts`.
+**Verified:** gate unit cases (match, recycled pid, missing process, recycled group id with
+continuity lost, unreadable/unsupported table, leader reaped during a read, a late fork confirmed
+by the read at the leader's exit, Linux `/proc` read errors and bounded concurrency) in
+`libs/core/src/process/process-identity.test.ts`; the `command-poll` TERM-trap late-fork SIGKILL,
+TERM → KILL escalation and clean-exit cases in
+`plugins/source-command-poll/src/identity-verified-cleanup.test.ts`; the command exiting during the
+SIGTERM step's read in `plugins/source-command-poll/src/identity-verified-cleanup.read-window.test.ts`;
+the reaped-child/recycled-pid case for detach cleanup in `apps/cli/src/commands/daemon.test.ts`. A
+recycled group id cannot be produced with real processes without wrapping the pid space, so the
+continuity-lost abstention is proven against a fabricated process table only.
 
 **Test implication (per #479's acceptance criteria):** a recycled-identifier fixture MUST
 produce abstention, not a signal; every live signal path (not only the sweep) MUST route

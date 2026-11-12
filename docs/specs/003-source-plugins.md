@@ -1608,13 +1608,18 @@ no orphan). Platform-specific mechanism:
   from on this platform.
 
 **Every escalation step is identity-verified at signal time** (issue #479,
-[008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step runs while the direct child is
-still unreaped, so the live child handle confirms the group, and the group's members (pid and start
-time) are recorded. The SIGKILL follow-up usually runs after the direct child has been reaped; it
-is sent only if a process recorded at the SIGTERM step is still in the group. An empty group needs
-no signal. A group none of whose current members was recorded is left alone: its id may have been
-reused, so the step abstains and writes a warning to the daemon's stderr (the daemon log) naming
-the group, the members it saw and why identity could not be confirmed. On Windows the follow-up
+[008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step's process-table read starts while
+the direct child is still unreaped, so the members that read lists (pid and start time) are
+confirmed as the command's group even if the command exits before the read completes; the step then
+signals the group (or, if that read found the group already empty, needs no signal). The gate reads the group's membership again the moment the direct child is
+reaped, which confirms processes forked after the SIGTERM step (for example a worker started by a
+TERM trap just before the command exits). The SIGKILL follow-up usually runs after the direct child
+has been reaped; it is sent if any confirmed member is still in the group, and an empty group needs
+no signal. Only when continuity is lost (the group holds none of the processes ever confirmed, so
+its id may have been reused) or the process table cannot be read is the group left alone: the step
+abstains and writes a warning to the daemon's stderr (the daemon log) naming the group, the members
+it saw and why identity could not be confirmed. The reads add latency to each step; the bound this
+gives is stated in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
 `taskkill` runs only while the direct child is still unreaped.
 
 Resolution on timeout is driven by the direct child's own `exit` event, never by waiting for its

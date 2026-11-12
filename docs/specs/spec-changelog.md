@@ -13,14 +13,18 @@ Agent Monitors spec set in `docs/specs/`.
 
 Moves 008 §5 to _current_ for live signal paths. Every cleanup or enforcement signal goes through
 one shared gate in core that verifies the target at signal time, then signals or abstains. Evidence
-is the live child handle while Node holds the child unreaped, or a recorded `(pid, pgid, start
-time)` read from `/proc` on Linux or `/bin/ps` on macOS. A process group whose leader has been
-reaped is confirmed only through a surviving member recorded when the group was last confirmed;
-otherwise the `command-poll` SIGKILL follow-up abstains instead of signalling a possibly reused
-group id. Environment-variable marks were rejected because macOS hides the environment of platform
-binaries. Adds the live signal-send inventory (§5.2), narrows §3.1 to name the abstention case, and
-records the interim abstention surface: a warning line on the daemon's stderr. The durable,
-deduplicated warning surface stays target under #507, and the restart sweep under #478.
+is the live child handle while Node holds the child unreaped, a recorded `(pid, pgid, start time)`
+read from `/proc` on Linux or `/bin/ps` on macOS, and process-group continuity: a group id cannot be
+reused while any member exists, so a membership reading that started while the leader was unreaped,
+started at the leader's exit, or still contains an earlier-confirmed member confirms every member it
+lists. This keeps 008 §3.1's bound for group-resident descendants, including ones forked after the
+SIGTERM step; the step abstains only when continuity is lost (a possibly reused group id) or the
+process table cannot be read. §3.1 now states the latency the verification reads add to each step,
+and §5.1 states the residual as the duration of the read. The Linux reader treats only ENOENT/ESRCH
+as an exited process; any other read error makes the reading unsupported. Environment-variable marks
+were rejected because macOS hides the environment of platform binaries. Adds the live signal-send
+inventory (§5.2) and records the interim abstention surface: a warning line on the daemon's stderr.
+The durable, deduplicated warning surface stays target under #507, and the restart sweep under #478.
 
 ## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
 
