@@ -9,7 +9,8 @@
  *
  * Every case uses a real runtime over an on-disk SQLite database. Write
  * failures are real SQLite triggers on `monitor_events`, which leave the
- * observation in the retry outbox exactly as a production failure does.
+ * observation in the retry outbox exactly as a production failure does; a
+ * trigger on `materialization_retry_outbox` makes the drop itself fail.
  *
  * @see ../../../../docs/specs/002-runtime-delivery.md §2.7, §2.8, §15 `materialization_retry_outbox`
  * @see https://www.sqlite.org/lang_createtrigger.html#raise
@@ -89,12 +90,16 @@ function observation(item: Item) {
   };
 }
 
-function writeMonitor(monitorsDir: string, type: string): void {
-  mkdirSync(path.join(monitorsDir, MONITOR_ID), { recursive: true });
+function writeMonitor(
+  monitorsDir: string,
+  type: string,
+  monitorId = MONITOR_ID,
+): void {
+  mkdirSync(path.join(monitorsDir, monitorId), { recursive: true });
   writeFileSync(
-    path.join(monitorsDir, MONITOR_ID, 'MONITOR.md'),
+    path.join(monitorsDir, monitorId, 'MONITOR.md'),
     md`---
-name: ${MONITOR_ID}
+name: ${monitorId}
 watch:
   type: ${type}
   interval: 1s
@@ -147,6 +152,7 @@ function pollSetup(spansFor: (root: string) => Item[][]) {
     monitorsDir,
     client,
     store,
+    registry,
     runtime,
     observeCalls: () => observeCalls,
   };
@@ -164,6 +170,19 @@ function eventSummaries(client: BetterSQLiteClient): string[] {
       'SELECT summary FROM monitor_events ORDER BY sequence',
     )
     .all()
+    .map(({ summary }) => summary);
+}
+
+/** Summaries of one monitor's events, in commit order. */
+function monitorEventSummaries(
+  client: BetterSQLiteClient,
+  monitorId: string,
+): string[] {
+  return client
+    .prepare<[string], { summary: string }>(
+      'SELECT summary FROM monitor_events WHERE monitor_id = ? ORDER BY sequence',
+    )
+    .all(monitorId)
     .map(({ summary }) => summary);
 }
 
@@ -212,6 +231,17 @@ function failSummary(client: BetterSQLiteClient, summary: string): void {
 
 function repair(client: BetterSQLiteClient, summary: string): void {
   client.exec(`DROP TRIGGER fail_${summary}`);
+}
+
+/** Make every removal of a retained retry row fail, as a storage fault would. */
+function failOutboxDelete(client: BetterSQLiteClient): void {
+  client.exec(`CREATE TRIGGER fail_outbox_delete
+    BEFORE DELETE ON materialization_retry_outbox BEGIN
+    SELECT RAISE(ABORT, 'outbox delete failed'); END;`);
+}
+
+function repairOutboxDelete(client: BetterSQLiteClient): void {
+  client.exec('DROP TRIGGER fail_outbox_delete');
 }
 
 function openSession(
@@ -314,6 +344,91 @@ describe('the tick drain drops retained work for a retired verify artifact', () 
     expect(eventSummaries(f.client)).toEqual(['B']);
     expect(result.erroredObservations).toEqual([]);
     expect(erroredHistoryCount(f.client)).toBe(erroredBefore);
+    expect(f.observeCalls()).toBe(2);
+  });
+
+  it('continues with the next retained row after a drop: the legitimate suffix drains before newer input', async () => {
+    const f = pollSetup((root) => [
+      [
+        { summary: 'S', objectKey: scratchKey(root, RUN) },
+        { summary: 'L', objectKey: 'L' },
+      ],
+      [{ summary: 'B', objectKey: 'B' }],
+    ]);
+    registerArtifact(f.runtime, f.root, RUN, scratchKey(f.root, RUN));
+    failSummary(f.client, 'S');
+
+    // S's write fails, so S and the legitimate L behind it are both retained.
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retryCount(f.client)).toBe(2);
+
+    f.runtime.requestVerifyArtifactCleanup({ runId: RUN });
+    repair(f.client, 'S');
+    clock.advance(2_000);
+    await f.runtime.tick(f.monitorsDir, f.root);
+
+    // S is dropped, L completes from the outbox, and only then is the source
+    // asked for B (002 §2.7: the drain continues with the next row).
+    expect(eventSummaries(f.client)).toEqual(['L', 'B']);
+    expect(retryCount(f.client)).toBe(0);
+    expect(f.observeCalls()).toBe(2);
+  });
+
+  it('reports a failed discard as a blocked drain, keeps the row, and lets other monitors run', async () => {
+    const f = pollSetup((root) => [
+      [{ summary: 'S', objectKey: scratchKey(root, RUN) }],
+      [{ summary: 'B', objectKey: 'B' }],
+    ]);
+    // A sibling monitor in the same tick, emitting one new item per call.
+    const SIBLING = 'z-sibling';
+    let siblingCalls = 0;
+    f.registry.register({
+      name: 'sibling-poll',
+      scopeSchema: { type: 'object' },
+      observe(): Promise<ObservationResult> {
+        siblingCalls += 1;
+        const summary = `N${String(siblingCalls)}`;
+        return Promise.resolve({
+          observations: [observation({ summary, objectKey: summary })],
+        });
+      },
+    });
+    writeMonitor(f.monitorsDir, 'sibling-poll', SIBLING);
+    registerArtifact(f.runtime, f.root, RUN, scratchKey(f.root, RUN));
+    failSummary(f.client, 'S');
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retryCount(f.client)).toBe(1);
+    expect(siblingCalls).toBe(1);
+
+    // Authority takes effect and the event fault is repaired, but removing
+    // the outbox row fails: the discard itself cannot commit.
+    f.runtime.requestVerifyArtifactCleanup({ runId: RUN });
+    repair(f.client, 'S');
+    failOutboxDelete(f.client);
+    const erroredBefore = erroredHistoryCount(f.client);
+    clock.advance(2_000);
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+
+    // The failure is contained to this monitor, as a failed drain attempt is.
+    expect(result.erroredObservations).toEqual([
+      {
+        monitorId: MONITOR_ID,
+        message: expect.stringContaining('outbox delete failed') as string,
+      },
+    ]);
+    expect(erroredHistoryCount(f.client)).toBe(erroredBefore + 1);
+    expect(siblingCalls).toBe(2);
+    // The row stays in place, and nothing newer passes it.
+    expect(retryCount(f.client)).toBe(1);
+    expect(f.observeCalls()).toBe(1);
+    expect(monitorEventSummaries(f.client, MONITOR_ID)).toEqual([]);
+
+    // Once the fault clears, the next drain discards it and newer input follows.
+    repairOutboxDelete(f.client);
+    clock.advance(2_000);
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retryCount(f.client)).toBe(0);
+    expect(monitorEventSummaries(f.client, MONITOR_ID)).toEqual(['B']);
     expect(f.observeCalls()).toBe(2);
   });
 
@@ -443,6 +558,63 @@ describe('the watcher drain drops retained work for a retired verify artifact', 
     }
     expect(eventSummaries(client)).toEqual(['B']);
   }, 20_000);
+});
+
+describe('retry completion re-checks authority under the writer lock', () => {
+  it('never materializes a retired artifact whose cleanup a second writer records after the drain read it', async () => {
+    const clock = stubClock(T0);
+    const f = pollSetup((root) => [
+      [{ summary: 'S', objectKey: scratchKey(root, RUN) }],
+      [{ summary: 'B', objectKey: 'B' }],
+    ]);
+    const early = openSession(f.runtime, f.root, 'early');
+    const owner = registerArtifact(
+      f.runtime,
+      f.root,
+      RUN,
+      scratchKey(f.root, RUN),
+    );
+    failSummary(f.client, 'S');
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retryCount(f.client)).toBe(1);
+    repair(f.client, 'S');
+    const later = openSession(f.runtime, f.root, 'later');
+
+    // A second runtime over its own connection to the same database file
+    // (another process, or an in-process CLI path) records cleanup after the
+    // drain decided to keep the row and before its completion commits.
+    const second = openDb(f.root);
+    const otherWriter = new AgentMonitorRuntime(
+      second.store,
+      new SourceRegistry(),
+      [claudeCodeAdapter],
+    );
+    const complete = f.store.completeMaterializationRetry.bind(f.store);
+    let interleaved = false;
+    vi.spyOn(f.store, 'completeMaterializationRetry').mockImplementation(
+      (...args) => {
+        if (!interleaved) {
+          interleaved = true;
+          otherWriter.requestVerifyArtifactCleanup({ runId: RUN });
+        }
+        return complete(...args);
+      },
+    );
+    clock.advance(2_000);
+    const result = await f.runtime.tick(f.monitorsDir, f.root);
+
+    expect(interleaved).toBe(true);
+    expect(f.runtime.listVerifyArtifacts(f.root)[0]?.cleanupCause).toBe(
+      'owner-request',
+    );
+    // S never materializes, so it reaches no lead session.
+    expect(eventSummaries(f.client)).toEqual(['B']);
+    for (const session of [early, owner, later]) {
+      expect(projectedSummaries(f.client, session.id)).not.toContain('S');
+    }
+    expect(retryCount(f.client)).toBe(0);
+    expect(result.erroredObservations).toEqual([]);
+  });
 });
 
 describe('the outbox discard re-checks authority itself', () => {

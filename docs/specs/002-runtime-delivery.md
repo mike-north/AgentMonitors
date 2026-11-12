@@ -1162,7 +1162,11 @@ Before steps 2–4 apply to a row, a row whose observation is a verify artifact 
 authority in effect (§2.8) is dropped rather than drained: it is removed from the outbox, whatever
 its status, and the drain continues with the next row. A dropped row is never materialized, never
 stops the drain and is not reported, so a retired artifact's retry, even a `terminal` one, never
-pauses its monitor.
+pauses its monitor. Step 2's completion re-checks that authority under its own writer lock; when
+another writer recorded cleanup after the drain read the row, the completion writes nothing and the
+row is dropped the same way. If the removal itself cannot commit (a storage failure), the drain
+stops as it does after a failed attempt: the row stays in place with its backoff unchanged, and the
+next drain tries the removal again.
 
 While any row remains, the monitor's source is not called, and nothing else that would put newer
 work ahead of the retained work runs: no edit reconciliation, no deferred poll result, no rollup
@@ -1177,7 +1181,8 @@ does not call its source that tick. A consequence is that a span is only ever ad
 
 Each tick that leaves retained work in place reports it:
 
-- a failed attempt: one `erroredObservations` entry with the error, beside its `errored` row;
+- a failed attempt, or a failed removal of a retired artifact's row: one `erroredObservations`
+  entry with the error, beside its `errored` row;
 - a `terminal` row: one `erroredObservations` entry and one `errored` row on every tick it keeps
   the monitor paused, naming the retry and its last error. A terminal row is never attempted
   automatically; it stays until an operator re-arms it, and the monitor stays paused until then;
@@ -1283,7 +1288,10 @@ registered key, for the registered monitor and workspace only, at two boundaries
    failing-source path the source's `errored` row stays the newest. A retained retry row admitted
    before authority took effect is removed from the outbox in one immediate transaction that
    re-checks authority, before the drain's terminal and backoff checks. Its removal writes no
-   event, no `errored` row and no history row: dropping it is the cleanup, not lost work. A hold
+   event, no `errored` row and no history row: dropping it is the cleanup, not lost work. Retry
+   completion re-checks authority in its own immediate transaction, so cleanup that another writer
+   records after the drain read the row still drops it. A removal that cannot commit leaves the
+   row in place and is reported as a failed drain step (§2.7). A hold
    refusal in the same dispatch (§4.7) is placed among the envelopes that survive this filter, not
    all dispatched ones (§2), so a dropped artifact never moves a refusal after a newer event of its
    key.
@@ -1322,7 +1330,9 @@ finite lifetime (005 §16 step 9), which does not carry this guarantee.
 Verified: `libs/core/src/runtime/verify-artifact-ownership.test.ts` (real file-fingerprint
 observations, SQLite close/reopen, an actual later-lead claim),
 `libs/core/src/runtime/verify-artifact-ownership-retry-drain.test.ts` (retained retries dropped on
-the tick and watcher drains, including a terminal one, with exactness controls),
+the tick and watcher drains, including a terminal one, a legitimate row behind a dropped one,
+cleanup recorded by a second writer before completion commits, and a removal that cannot commit,
+with exactness controls),
 `libs/core/src/runtime/verify-artifact-ownership-refusal-position.test.ts` (a hold refusal behind a
 dropped artifact keeps its place among the kept envelopes, with an unfiltered control) and
 `libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in

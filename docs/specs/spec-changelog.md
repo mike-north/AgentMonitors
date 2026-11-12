@@ -28,8 +28,12 @@ With 002 §2.7's retained-work drain, the drain is a held-emission boundary too.
 before authority took effect is dropped rather than drained, on ticks and before watcher pulls: it
 is removed from the outbox in one immediate transaction that re-checks authority, before the
 drain's terminal and backoff checks, and it writes no event, no `errored` row and no history row.
-A dropped row, even a terminal one, never pauses newer legitimate work for its monitor. Previously
-such a retry would have materialized after cleanup and reached a later lead session.
+A dropped row, even a terminal one, never pauses newer legitimate work for its monitor. Retry
+completion re-checks authority under its own writer lock, so cleanup recorded by another writer
+after the drain read the row still drops it. A removal that cannot commit is a failed drain step:
+the row stays, one `errored` row and one `erroredObservations` entry are recorded, and other
+monitors in the tick are unaffected. Previously such a retry would have materialized after cleanup
+and reached a later lead session.
 
 With 002 §2's rule that a hold refusal is outstanding loss recorded at its place in the span's
 order, that place counts only the dispatched envelopes that survive the ownership filter. A held

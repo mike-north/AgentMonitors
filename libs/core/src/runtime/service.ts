@@ -45,6 +45,7 @@ import {
   type HookDeliveryHold,
 } from './hook-delivery-diagnosis.js';
 import {
+  RetiredVerifyArtifactRetryError,
   RuntimeStore,
   computeNetCollapseView,
   netCollapseGroupKey,
@@ -84,6 +85,7 @@ import type {
   DoctorParseError,
   DoctorReportInput,
   EventQuery,
+  MaterializationRetryRecord,
   MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
@@ -4456,8 +4458,9 @@ export class AgentMonitorRuntime {
       // took effect after it was queued is dropped, not drained (002 §2.8).
       // This runs before the terminal and backoff checks, so a dropped row
       // never holds back newer legitimate work, even when it is terminal.
-      // Authority is never withdrawn, so a refused discard means the row is
-      // already gone; either way the loop re-reads the oldest row.
+      // The discard evaluates the same predicate on the same row under its
+      // writer lock, so a refused discard means the row is gone or no longer
+      // retired (authority can lapse before it is recorded); the re-read decides.
       if (
         this.withoutRetiredVerifyArtifacts(
           monitorId,
@@ -4466,7 +4469,12 @@ export class AgentMonitorRuntime {
           (r) => r.envelope.observation.objectKey,
         ).length === 0
       ) {
-        this.store.discardRetiredVerifyArtifactRetry(retry.id);
+        const blocked = this.discardRetiredRetry(
+          monitorId,
+          workspacePath,
+          retry,
+        );
+        if (blocked) return { ...result, blocked };
         continue;
       }
       if (retry.status === 'terminal') {
@@ -4520,6 +4528,18 @@ export class AgentMonitorRuntime {
           projectedSessionIds: this.store.projectedSessionIdsForLastEvent(),
         };
       } catch (retryError) {
+        // Another writer recorded the artifact's cleanup after this drain
+        // read the row. Completion refused under its writer lock and wrote
+        // nothing; the row is dropped as if the read had seen the authority.
+        if (retryError instanceof RetiredVerifyArtifactRetryError) {
+          const blocked = this.discardRetiredRetry(
+            monitorId,
+            workspacePath,
+            retry,
+          );
+          if (blocked) return { ...result, blocked };
+          continue;
+        }
         const cause = errorMessage(retryError);
         let message = `Materialization retry ${retry.id} failed: ${cause}`;
         try {
@@ -4539,6 +4559,36 @@ export class AgentMonitorRuntime {
       result.emittedEventIds.push(materialized.event.id);
       // Interpret follows the committed completion, as it does for a span.
       await this.interpretMaterializedObservation(materialized, workspacePath);
+    }
+  }
+
+  /**
+   * Drop one retained row whose observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8), for {@link drainMaterializationRetries}.
+   * The store re-evaluates authority on the same row under its writer lock, so
+   * a refused discard means the row is gone or no longer retired: the caller
+   * re-reads the oldest row and that read decides. A discard that cannot
+   * commit is a failed drain step, reported like a failed completion: the row
+   * stays in place, an `errored` history row is recorded, and the returned
+   * block holds the monitor behind it.
+   */
+  private discardRetiredRetry(
+    monitorId: string,
+    workspacePath: string,
+    retry: MaterializationRetryRecord,
+  ): RetryDrainBlock | undefined {
+    try {
+      this.store.discardRetiredVerifyArtifactRetry(retry.id);
+      return undefined;
+    } catch (discardError) {
+      const message = `Materialization retry ${retry.id} could not be discarded after its verify artifact's cleanup took effect: ${errorMessage(discardError)}`;
+      this.recordErroredHistory(
+        monitorId,
+        workspacePath,
+        retry.sourceName,
+        message,
+      );
+      return { kind: 'failed', message };
     }
   }
 

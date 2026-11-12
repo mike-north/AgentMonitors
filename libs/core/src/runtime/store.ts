@@ -281,6 +281,23 @@ export class MaterializationRetryTransitionError extends Error {
   }
 }
 
+/**
+ * Retry completion refused because the retained observation is a verify
+ * artifact whose cleanup authority is in effect (002 §2.8, issue #562). The
+ * check runs inside completion's own writer lock, so authority recorded by
+ * another writer after the caller decided to complete is still honored. Like
+ * every transition rejection, nothing was written: the row stays in the
+ * outbox for the drain to discard on its next read.
+ *
+ * @internal
+ */
+export class RetiredVerifyArtifactRetryError extends MaterializationRetryTransitionError {
+  constructor(retryId: string) {
+    super(retryId, 'is a verify artifact whose cleanup authority is in effect');
+    this.name = 'RetiredVerifyArtifactRetryError';
+  }
+}
+
 /** Raised when a workspace/monitor retry outbox has reached its bound. @public */
 export class MaterializationRetryCapacityError extends Error {
   /** Stable machine-readable error code. */
@@ -1277,9 +1294,10 @@ export class RuntimeStore {
    * record. Dropping it is the cleanup the owner asked for, not lost work.
    *
    * Returns `true` when the row was removed. `false` means the row is gone or
-   * its observation has no cleanup authority, and it is left untouched. Because
-   * authority is never withdrawn once in effect, a caller that saw authority
-   * and receives `false` can rely on the row no longer existing.
+   * its observation has no cleanup authority now, and it is left untouched.
+   * Authority can lapse: an owner's inactivity is derived, not recorded, until
+   * cleanup reconciliation records it, and reopening the owner session makes
+   * it active again. So `false` tells the caller only to re-read the outbox.
    *
    * @internal
    */
@@ -1287,22 +1305,14 @@ export class RuntimeStore {
     const db = asInternalDb(this.db);
     return db.$client
       .transaction(() => {
-        const row = db
+        const current = db
           .select()
           .from(materializationRetryOutbox)
           .where(eq(materializationRetryOutbox.id, id))
           .get();
-        // A missing row, or a global monitor's row, has no artifact to retire.
-        if (row?.workspacePath == null) return false;
-        const retry = rowToMaterializationRetry(row);
-        const objectKey =
-          retry.envelope.observation.objectKey ?? retry.monitorId;
         if (
-          !this.isVerifyArtifactCleanupEffective({
-            workspacePath: row.workspacePath,
-            monitorId: retry.monitorId,
-            objectKey,
-          })
+          current === undefined ||
+          !this.isRetiredVerifyArtifactRetry(rowToMaterializationRetry(current))
         ) {
           return false;
         }
@@ -1314,6 +1324,30 @@ export class RuntimeStore {
         );
       })
       .immediate();
+  }
+
+  /**
+   * Whether a retained row's observation is a verify artifact with cleanup
+   * authority in effect (002 §2.8). It is the predicate the runtime's drain
+   * filter applies to the row: a row with no workspace, or an observation with
+   * no object key, has no artifact to retire. (The filter also skips keys that
+   * are not verify scratch paths, which registration never accepts.) Callers
+   * evaluate it inside their own immediate transaction, so the answer and
+   * their write commit together.
+   */
+  private isRetiredVerifyArtifactRetry(
+    retry: MaterializationRetryRecord,
+  ): boolean {
+    const { objectKey } = retry.envelope.observation;
+    return (
+      retry.workspacePath !== null &&
+      objectKey !== undefined &&
+      this.isVerifyArtifactCleanupEffective({
+        workspacePath: retry.workspacePath,
+        monitorId: retry.monitorId,
+        objectKey,
+      })
+    );
   }
 
   /**
@@ -1333,6 +1367,11 @@ export class RuntimeStore {
    * remains the runtime's responsibility. This seam accepts event data, never
    * a callback: arbitrary asynchronous effects cannot be rolled back by SQLite.
    * Interpret and other external work belong after this method returns.
+   *
+   * Cleanup authority is re-checked under the same writer lock as the write:
+   * a retained verify artifact whose authority is in effect at commit time is
+   * refused with {@link RetiredVerifyArtifactRetryError}, even when the caller
+   * read the row before another writer recorded cleanup (002 §2.8).
    *
    * @internal
    */
@@ -1374,6 +1413,9 @@ export class RuntimeStore {
               id,
               'does not match the retained observation route',
             );
+          }
+          if (this.isRetiredVerifyArtifactRetry(current)) {
+            throw new RetiredVerifyArtifactRetryError(id);
           }
           // The event commits now but its observation was admitted when the
           // retry was queued; supersession of a drop compares admission (002 §2).
