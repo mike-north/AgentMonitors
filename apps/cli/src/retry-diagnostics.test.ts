@@ -205,6 +205,42 @@ async function serve(fixture: ReturnType<typeof reports>): Promise<void> {
   });
 }
 
+/**
+ * Runs the built CLI with an arbitrary argv from an arbitrary cwd, with the
+ * same isolated environment as `run`, so a doctor-suggested command can be
+ * executed exactly as written.
+ */
+async function runFrom(
+  args: string[],
+  cwd: string,
+  db: string,
+): Promise<{ stdout: string; code: number }> {
+  try {
+    const result = await execute(process.execPath, [cli, ...args], {
+      cwd,
+      timeout: 15000,
+      env: {
+        ...process.env,
+        HOME: root,
+        XDG_DATA_HOME: path.join(root, 'data'),
+        AGENTMONITORS_DB: db,
+        AGENTMONITORS_SOCKET: socketPath,
+      },
+    });
+    return { stdout: result.stdout, code: 0 };
+  } catch (error) {
+    const failure = error as { stdout?: string; code?: number };
+    return { stdout: failure.stdout ?? '', code: failure.code ?? 1 };
+  }
+}
+
+/** The `monitor explain` command a doctor remediation suggests, as argv after `agentmonitors`. */
+function suggestedExplainArgs(remediation: string): string[] {
+  const match = /`agentmonitors (monitor explain [^`]+)`/.exec(remediation);
+  if (!match?.[1]) throw new Error(`no explain command in: ${remediation}`);
+  return match[1].split(' ');
+}
+
 /** Execute asynchronously so the in-process static socket can answer the CLI. */
 async function run(
   command: 'explain' | 'doctor',
@@ -1902,14 +1938,13 @@ it('attributes a live ephemeral drop to its monitor and reports a cancelled one 
 }, 30_000);
 
 /**
- * Regression for #497 review: the retained-work remediation of an ephemeral
- * monitor claimed `monitor explain` cannot serve it and pointed at a heading
- * that exists only in text output. `monitor explain <id>` fails its
- * definition stage for an ephemeral id but still lists the retained record
- * IDs, in text and JSON, so the remediation must name it.
+ * Seeds a live ephemeral watch whose second of three observations hits a
+ * native fault, retaining it and its successor, and returns its id and store.
  */
-it('points ephemeral retained-work remediation at a `monitor explain` that lists the record ids, in text and JSON', async () => {
-  mkdirSync(path.join(root, 'monitors'), { recursive: true });
+async function seedRetainedEphemeralWatch(
+  workspace: string,
+): Promise<{ monitorId: string; dbPath: string }> {
+  mkdirSync(path.join(workspace, 'monitors'), { recursive: true });
   const dbPath = path.join(root, 'state.db');
   const db = createDb(dbPath);
   const client = (db as unknown as { $client: Database }).$client;
@@ -1936,7 +1971,7 @@ it('points ephemeral retained-work remediation at a `monitor explain` that lists
     const session = runtime.openSession(
       claudeCodeAdapter.createSessionInput({
         hostSessionId: 'lead-ephemeral-retained',
-        workspacePath: root,
+        workspacePath: workspace,
       }),
     );
     const watch = runtime.declareEphemeralMonitor({
@@ -1950,38 +1985,114 @@ it('points ephemeral retained-work remediation at a `monitor explain` that lists
     client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
       WHEN NEW.summary = 'r-1'
       BEGIN SELECT RAISE(ABORT, 'native fault on r-1'); END;`);
-    await runtime.tick(path.join(root, 'monitors'), root);
+    await runtime.tick(path.join(workspace, 'monitors'), workspace);
   } finally {
     client.close();
   }
+  return { monitorId, dbPath };
+}
 
-  const checkName = `retry-outbox:${monitorId}`;
-  const doctor = JSON.parse((await run('doctor', 'json', dbPath)).stdout);
+/**
+ * Runs doctor from `cwd` for `workspace`, then executes the exact `monitor
+ * explain` command its remediation suggests from that same cwd.
+ */
+async function doctorThenSuggestedExplain(
+  workspace: string,
+  cwd: string,
+): Promise<{
+  remediation: string;
+  recordIds: string[];
+  suggested: string[];
+  text: string;
+  json: { materializationRetries: { records: { id: string }[] } };
+  doctor: {
+    ephemeralMonitorWork: {
+      materializationRetries: { records: { id: string }[] };
+    }[];
+  };
+}> {
+  const { monitorId, dbPath } = await seedRetainedEphemeralWatch(workspace);
+  const common = [
+    '--dir',
+    path.join(workspace, 'monitors'),
+    '--socket',
+    socketPath,
+  ];
+  const doctorRun = await runFrom(
+    ['doctor', ...common, '--workspace', workspace, '--format', 'json'],
+    cwd,
+    dbPath,
+  );
+  const doctor = JSON.parse(doctorRun.stdout);
   const check = doctor.checks.find(
-    (candidate: { name: string }) => candidate.name === checkName,
+    (candidate: { name: string }) =>
+      candidate.name === `retry-outbox:${monitorId}`,
   );
   expect(check.status).toBe('fail');
-  expect(check.remediation).toContain(
-    `\`agentmonitors monitor explain ${monitorId} --workspace ${root} --dir ${path.join(root, 'monitors')}\``,
-  );
   expect(check.remediation).not.toContain('Retry outbox');
-  const recordIds: string[] =
-    doctor.ephemeralMonitorWork[0].materializationRetries.records.map(
-      (record: { id: string }) => record.id,
-    );
-  expect(recordIds.length).toBeGreaterThan(0);
-
-  // The suggested command (same flags, via the run helper) shows the retained record ids.
-  const json = JSON.parse(
-    (await run('explain', 'json', dbPath, monitorId)).stdout,
+  const suggested = suggestedExplainArgs(check.remediation);
+  expect(suggested.slice(0, 3)).toEqual(['monitor', 'explain', monitorId]);
+  // Verbatim: only the output format is appended.
+  const jsonRun = await runFrom(
+    [...suggested, '--format', 'json'],
+    cwd,
+    dbPath,
   );
+  const textRun = await runFrom(
+    [...suggested, '--format', 'text'],
+    cwd,
+    dbPath,
+  );
+  return {
+    remediation: check.remediation,
+    recordIds:
+      doctor.ephemeralMonitorWork[0].materializationRetries.records.map(
+        (record: { id: string }) => record.id,
+      ),
+    suggested,
+    text: textRun.stdout,
+    json: JSON.parse(jsonRun.stdout),
+    doctor,
+  };
+}
+
+/**
+ * Regression for #497 review: the retained-work remediation of an ephemeral
+ * monitor claimed `monitor explain` cannot serve it and pointed at a heading
+ * that exists only in text output. `monitor explain <id>` fails its
+ * definition stage for an ephemeral id but still lists the retained record
+ * IDs, in text and JSON, so the remediation must name it. The suggested
+ * command is executed verbatim, not re-spelled with the test's own flags.
+ *
+ * The cwd is not the workspace, so `--workspace` is required on every platform.
+ */
+it('points ephemeral retained-work remediation at a `monitor explain` that lists the record ids, when run from outside the workspace', async () => {
+  const elsewhere = path.join(root, 'elsewhere');
+  mkdirSync(elsewhere);
+  const result = await doctorThenSuggestedExplain(root, elsewhere);
+  expect(result.suggested).toContain('--workspace');
+  expect(result.suggested).toContain(path.join(root, 'monitors'));
+  expect(result.recordIds.length).toBeGreaterThan(0);
   expect(
-    json.materializationRetries.records.map(
-      (record: { id: string }) => record.id,
-    ),
-  ).toEqual(recordIds);
-  const text = (await run('explain', 'text', dbPath, monitorId)).stdout;
-  for (const id of recordIds) expect(text).toContain(id);
+    result.json.materializationRetries.records.map((record) => record.id),
+  ).toEqual(result.recordIds);
+  for (const id of result.recordIds) expect(result.text).toContain(id);
+}, 30_000);
+
+/**
+ * The suggestion omits `--workspace` when doctor's cwd already is the
+ * workspace (the real path, so this holds with or without a `/tmp` symlink),
+ * and the omitted-flag command still resolves the same workspace.
+ */
+it('omits --workspace from the suggested `monitor explain` when run from the workspace itself, and that command still lists the record ids', async () => {
+  const workspace = realpathSync(root);
+  const result = await doctorThenSuggestedExplain(workspace, workspace);
+  expect(result.suggested).not.toContain('--workspace');
+  expect(result.recordIds.length).toBeGreaterThan(0);
+  expect(
+    result.json.materializationRetries.records.map((record) => record.id),
+  ).toEqual(result.recordIds);
+  for (const id of result.recordIds) expect(result.text).toContain(id);
 }, 30_000);
 
 /**

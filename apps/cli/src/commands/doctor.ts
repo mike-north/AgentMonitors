@@ -566,8 +566,9 @@ const RETIRED_EPHEMERAL =
 
 /**
  * A live ephemeral watch whose persisted scope its source now rejects: every
- * tick skips it and a scope cannot be edited, so nothing it owes can clear
- * until it is cancelled and declared again.
+ * tick skips it and a scope cannot be edited, so nothing it owes can clear.
+ * Cancelling and declaring it again restores observation under a new id, but
+ * the old id's outstanding drop and retained work stay reported under it.
  */
 function rejectedScopeRemediation(validationError: string): string {
   return `Its persisted scope is now rejected by its source (${validationError}), so every tick skips it and no later event can clear this. An ephemeral scope cannot be edited. Cancelling the watch and declaring it again with a valid scope restores observation, but the new declaration gets a new id: this id's outstanding drop and retained work stay reported under its retired id, and this check keeps failing.`;
