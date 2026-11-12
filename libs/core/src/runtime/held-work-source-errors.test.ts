@@ -94,6 +94,7 @@ function fixture(workspaces: Record<string, MonitorSpec[]>) {
       );
       modes.set(modeKey(workspace, spec.id), 'quiet');
     }
+    mkdirSync(monitors, { recursive: true });
     paths[name] = { workspace, monitors };
   }
 
@@ -234,6 +235,17 @@ function fixture(workspaces: Record<string, MonitorSpec[]>) {
         force: true,
       });
     },
+    /** Declare an ephemeral monitor on the controlled source for the workspace's lead session. */
+    declareEphemeral(name: string, label: string, urgency: string) {
+      return current.runtime.declareEphemeralMonitor({
+        sessionId: sessions[name] ?? '',
+        source: 'controlled',
+        scope: { label, interval: '1s' },
+        urgency,
+      });
+    },
+    cancelEphemeral: (name: string, ephemeralId: string) =>
+      current.runtime.cancelEphemeralMonitor(sessions[name] ?? '', ephemeralId),
     exec: (sql: string) => current.client.exec(sql),
     reopen() {
       current.client.close();
@@ -630,6 +642,43 @@ describe('held notify work despite source observation failures (#558)', () => {
       ]);
       expect(f.state('a', 'held')).toEqual(held);
       expect(f.events('a', 'held')).toEqual([]);
+    });
+
+    it('a monitor retired while observe() is in flight flushes nothing when the failure arrives', async () => {
+      // An ephemeral monitor of `high` urgency holds a debounce batch by default
+      // (15s settle, 002 §4.3). Its next due tick is in flight when the declaring
+      // session cancels it; the reaped declaration is retired (002 §2.2, §10.7),
+      // so the failure that follows must not flush the hold into an event for it
+      // (002 §2.6: the flush runs only while the admission gate is open).
+      const f = fixture({ a: [] });
+      const record = f.declareEphemeral('a', 'eph', 'high');
+      await f.tick('a'); // 08:00:00 baseline `ref: A`
+      f.set('a', 'eph', 'change');
+      f.at('2026-03-20T08:00:01.000Z');
+      expect((await f.tick('a')).emittedEventIds).toEqual([]);
+      const held = f.state('a', record.id);
+      expect(heldTitles(held)).toEqual(['Captured eph']);
+
+      f.set('a', 'eph', 'stall');
+      f.at('2026-03-20T08:00:16.000Z'); // dueAt = 08:00:01 + 15s
+      const stalled = f.nextStall();
+      const inFlight = f.tick('a');
+      await stalled;
+      f.cancelEphemeral('a', record.id);
+      f.failStalled('eph');
+      const failed = await inFlight;
+
+      expect(failed.emittedEventIds).toEqual([]);
+      expect(f.events('a', record.id)).toEqual([]);
+      expect(f.sessionEvents('a')).toEqual([]);
+      expect(f.state('a', record.id)).toEqual(held); // the hold was not flushed
+      expect(
+        f.history('a', record.id).some((row) => row.result === 'triggered'),
+      ).toBe(false);
+      // The source failure is still recorded as for any failing poll (002 §10.7).
+      expect(failed.erroredObservations).toEqual([
+        { monitorId: record.id, message: 'repository unavailable for eph' },
+      ]);
     });
 
     it('a missing definition never flushes held work, even past its deadline', async () => {

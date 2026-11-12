@@ -754,9 +754,11 @@ and is outside the outbox domain: that one observation is `errored` and its sibl
 
 The same rule applies to the poll path (`ingest()`), the watch path (one yielded batch is one
 span, §2.4), and the held-work flush (`flushHeldNotifyWork()`): the not-due rollup window check
-(§4.4) and a flush while the source fails (§2.6). For that flush, the notify state that clears `pendingRollup` commits in the same transaction as the
-flushed span. A flush that rolls back leaves the whole batch held, records a best-effort
-`errored` row, and reports the error on the tick result. The next window check retries it.
+(§4.4) and a flush while the source fails (§2.6). For that flush, the notify state that clears
+the hold (`pendingRollup` or `pendingDebounce`) commits in the same transaction as the flushed
+span. A flush that rolls back leaves the whole batch held, records a best-effort `errored` row,
+and reports the error on the tick result. The next tick that reaches the hold retries it: the
+next window check for a rollup batch, the next due tick for a debounce batch (§2.6).
 
 Verified by `libs/core/src/runtime/unretainable-suffix-admission.test.ts`: a capacity overflow on
 the poll path, with its drop row, batch-row count, explain verdict and doctor rollup, kept
