@@ -1094,3 +1094,76 @@ describe('monitor retry on a retired verify artifact', () => {
     30_000,
   );
 });
+
+/** Explain's repairs must address the reported retry when pasted from another workspace. */
+it.each(['rearm', 'skip'] as const)(
+  'regression: explain %s preserves workspace scope through a POSIX shell',
+  async (verb) => {
+    const workspace = path.join(root, "Mike's workspace; $literal");
+    mkdirSync(workspace);
+    const id = await seedRetry({
+      target: { monitorId: MONITOR, monitorsDir: monitors, workspace },
+    });
+    const caller = path.join(root, 'caller');
+    mkdirSync(caller);
+    // Only the executable lookup is supplied by the harness: the printed
+    // command and all its arguments are handed unchanged to the shell.
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin);
+    writeFileSync(
+      path.join(bin, 'agentmonitors'),
+      `#!/bin/sh\nexec '${process.execPath}' '${cli}' "$@"\n`,
+      { mode: 0o700 },
+    );
+    const explained = await run(
+      [
+        'monitor',
+        'explain',
+        MONITOR,
+        '--workspace',
+        workspace,
+        '--dir',
+        monitors,
+        '--format',
+        'json',
+      ],
+      caller,
+    );
+    expect(explained.code).toBe(0);
+    const report = JSON.parse(explained.stdout) as {
+      stages: { id: string; reason: string }[];
+    };
+    const reason = report.stages.find(
+      ({ id }) => id === 'materialization',
+    )?.reason;
+    const command = reason?.match(
+      new RegExp('`(agentmonitors monitor retry ' + verb + ' [^`]+)`'),
+    )?.[1];
+    expect(command).toBeDefined();
+    const result = await execute('sh', ['-c', command ?? 'exit 99'], {
+      cwd: caller,
+      env: { ...env, PATH: `${bin}${path.delimiter}${env['PATH'] ?? ''}` },
+      timeout: 30_000,
+    });
+    expect(result.stdout).toContain(verb === 'rearm' ? 'rearmed' : 'skipped');
+    const { store, client } = openStore();
+    try {
+      if (verb === 'rearm') {
+        expect(store.getMaterializationRetry(id)).toMatchObject({
+          workspacePath: workspace,
+          status: 'pending',
+          attemptCount: 0,
+        });
+      } else {
+        expect(
+          store.listMaterializationRetries({ workspacePath: workspace }),
+        ).toEqual([]);
+        expect(
+          store.outstandingUnretainedObservationLoss(MONITOR, workspace),
+        ).toBeDefined();
+      }
+    } finally {
+      client.close();
+    }
+  },
+);

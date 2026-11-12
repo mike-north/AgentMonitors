@@ -230,12 +230,12 @@ describe('a terminal retry pauses its monitor until it is repaired', () => {
       {
         monitorId: 'm',
         message: expect.stringContaining(
-          `\`agentmonitors monitor retry rearm m ${id}\``,
+          `\`agentmonitors monitor retry rearm m ${id} --workspace ${f.root}\``,
         ),
       },
     ]);
     expect(tick.erroredObservations[0]?.message).toContain(
-      `\`agentmonitors monitor retry skip m ${id}\``,
+      `\`agentmonitors monitor retry skip m ${id} --workspace ${f.root}\``,
     );
 
     const explain = await opened.runtime.explainMonitor({
@@ -246,10 +246,10 @@ describe('a terminal retry pauses its monitor until it is repaired', () => {
     const stage = explain.stages.find(({ id: s }) => s === 'materialization');
     expect(stage?.status).toBe('failure');
     expect(stage?.reason).toContain(
-      `\`agentmonitors monitor retry rearm m ${id}\``,
+      `\`agentmonitors monitor retry rearm m ${id} --workspace ${f.root}\``,
     );
     expect(stage?.reason).toContain(
-      `\`agentmonitors monitor retry skip m ${id}\``,
+      `\`agentmonitors monitor retry skip m ${id} --workspace ${f.root}\``,
     );
   });
 });

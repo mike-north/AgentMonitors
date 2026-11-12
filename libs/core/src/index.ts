@@ -1,3 +1,6 @@
+// Shell arguments shared by runtime diagnostics and CLI suggestions.
+export { shellArg, shellSingleQuote } from './commands/shell-arguments.js';
+
 // Schema
 export {
   monitorFrontmatterSchema,

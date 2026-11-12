@@ -1692,6 +1692,12 @@ export interface ShapeStageConfig {
 }
 
 // @public
+export function shellArg(value: string): string;
+
+// @public
+export function shellSingleQuote(value: string): string;
+
+// @public
 export type SkippedMonitor = {
     monitorId: string;
     nextDueAt: Date;

@@ -11,6 +11,7 @@ import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { ulid } from 'ulid';
+import { shellArg } from '../commands/shell-arguments.js';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import {
@@ -1023,19 +1024,19 @@ function observationLossRecord(
   };
 }
 
-/** One shell word: plain ids stay bare, anything else is single-quoted. */
-function shellWord(value: string): string {
-  return /^[\w.:/@%+=,-]+$/u.test(value)
-    ? value
-    : `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
 /** The CLI repairs for one terminal retry, as named in reports (005 `monitor retry`). */
 function retryRepairCommands(
   monitorId: string,
   retryId: string,
+  workspacePath: string | null,
 ): { rearm: string; skip: string } {
-  const target = `${shellWord(monitorId)} ${shellWord(retryId)}`;
+  // Always pin a known route: diagnostics can be consumed outside the
+  // process/workspace that produced them, including a daemon response.
+  const target = [
+    shellArg(monitorId),
+    shellArg(retryId),
+    ...(workspacePath === null ? [] : ['--workspace', shellArg(workspacePath)]),
+  ].join(' ');
   return {
     rearm: `agentmonitors monitor retry rearm ${target}`,
     skip: `agentmonitors monitor retry skip ${target}`,
@@ -1050,7 +1051,11 @@ function terminalRetryMessage(
   monitorId: string,
   retry: MaterializationRetryRecord,
 ): string {
-  const { rearm, skip } = retryRepairCommands(monitorId, retry.id);
+  const { rearm, skip } = retryRepairCommands(
+    monitorId,
+    retry.id,
+    retry.workspacePath,
+  );
   return `Materialization retry ${retry.id} stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed or skipped. Retry it with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`. Last error: ${retry.lastError ?? 'unknown'}`;
 }
 
@@ -1061,11 +1066,16 @@ function terminalRetryMessage(
 function terminalRetriesReason(
   monitorId: string,
   summary: MaterializationRetrySummary,
+  workspacePath: string,
 ): string {
   const head = `${String(summary.terminal)} observation(s) exhausted automatic materialization retries and require operator repair.`;
   const oldest = summary.records.find(({ status }) => status === 'terminal');
   if (!oldest) return head;
-  const { rearm, skip } = retryRepairCommands(monitorId, oldest.id);
+  const { rearm, skip } = retryRepairCommands(
+    monitorId,
+    oldest.id,
+    workspacePath,
+  );
   return `${head} Retry ${oldest.id} with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`.`;
 }
 
@@ -2330,7 +2340,11 @@ export class AgentMonitorRuntime {
         explainStage(
           'materialization',
           'failure',
-          terminalRetriesReason(input.monitorId, materializationRetries),
+          terminalRetriesReason(
+            input.monitorId,
+            materializationRetries,
+            workspacePath,
+          ),
           { ...materializationRetries },
         ),
       );

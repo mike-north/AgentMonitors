@@ -9,6 +9,8 @@
  *
  * One module owns this so every suggestion quotes and scopes the same way.
  */
+import { shellArg } from '@agentmonitors/core';
+export { shellArg, shellSingleQuote } from '@agentmonitors/core';
 import { realpathSync } from 'node:fs';
 import path from 'node:path';
 
@@ -21,20 +23,6 @@ export interface SuggestionScope {
   workspacePath: string;
   /** Monitor definitions directory the printing command read, when it read one. */
   monitorsDir: string;
-}
-
-/**
- * POSIX single-quote `value`: close the quote, escape an embedded `'`, and
- * reopen it, so any text (a workspace path such as "Mike's Mac", a JSON
- * payload) stays one literal argument.
- */
-export function shellSingleQuote(value: string): string {
-  return `'${value.replaceAll("'", `'\\''`)}'`;
-}
-
-/** Quote only when the value is not already shell-safe, keeping ordinary ids readable. */
-export function shellArg(value: string): string {
-  return /^[\w./@:+-]+$/.test(value) ? value : shellSingleQuote(value);
 }
 
 /** Path equality that tolerates symlinked spellings (e.g. macOS /tmp vs /private/tmp). */
