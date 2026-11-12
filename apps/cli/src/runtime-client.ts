@@ -10,6 +10,9 @@ import type {
   EphemeralMonitorRecord,
   EventQuery,
   HookDeliveryDiagnosis,
+  MaterializationRetryRepairInput,
+  MaterializationRetryRepairResult,
+  MaterializationRetrySkipInput,
   MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorExplainInput,
@@ -23,6 +26,7 @@ import type {
 } from '@agentmonitors/core';
 import {
   isMaterializationRetrySummary,
+  normalizeRetryRecord,
   normalizeRetrySummary,
   normalizeUnretainedObservationLoss,
 } from './retry-diagnostics.js';
@@ -401,6 +405,95 @@ export async function cancelWatchClient(
     'watch.cancel',
     { sessionId, ephemeralId },
     socketPath ? { socketPath } : {},
+  );
+}
+
+/**
+ * Client timeout for the two retry repairs. The daemon runs each repair as one
+ * immediate SQLite transaction, which waits up to the store's 5-second busy
+ * timeout for another writer's lock before it fails. That wait can come twice:
+ * the store's busy wait is synchronous, so while another process holds the
+ * lock the daemon's own tick can block its event loop for up to 5 seconds
+ * before it even reads the request, and the repair's transaction may then wait
+ * up to 5 seconds more. This covers both waits with a margin, where the
+ * default 2-second client timeout would give up on a daemon about to apply the
+ * repair.
+ *
+ * It is not a bound on the daemon: a daemon blocked on a lock for longer still
+ * answers too late, the CLI reports the outcome as unknown, and the daemon may
+ * apply the repair after the CLI has given up.
+ */
+export const RETRY_REPAIR_TIMEOUT_MS = 15_000;
+
+/**
+ * A repair result with its retry's Dates revived and its last error
+ * normalized for display, whether it came over the socket or in-process.
+ */
+function normalizeRepairResult(
+  result: MaterializationRetryRepairResult,
+): MaterializationRetryRepairResult {
+  return { outcome: result.outcome, retry: normalizeRetryRecord(result.retry) };
+}
+
+/**
+ * Re-arm one terminal retry on the live daemon (005 `monitor retry rearm`),
+ * so a watcher paused on it in that process wakes at once. The returned
+ * record is safe metadata with its Dates revived.
+ */
+export async function rearmRetryClient(
+  input: MaterializationRetryRepairInput,
+  socketPath?: string,
+): Promise<MaterializationRetryRepairResult> {
+  return normalizeRepairResult(
+    await callDaemon<MaterializationRetryRepairResult>(
+      'retry.rearm',
+      { ...input },
+      {
+        timeoutMs: RETRY_REPAIR_TIMEOUT_MS,
+        ...(socketPath ? { socketPath } : {}),
+      },
+    ),
+  );
+}
+
+/** Skip one terminal retry on the live daemon (005 `monitor retry skip`). */
+export async function skipRetryClient(
+  input: MaterializationRetrySkipInput,
+  socketPath?: string,
+): Promise<MaterializationRetryRepairResult> {
+  return normalizeRepairResult(
+    await callDaemon<MaterializationRetryRepairResult>(
+      'retry.skip',
+      { ...input },
+      {
+        timeoutMs: RETRY_REPAIR_TIMEOUT_MS,
+        ...(socketPath ? { socketPath } : {}),
+      },
+    ),
+  );
+}
+
+/**
+ * Re-arm one terminal retry directly in the workspace's persisted store, for
+ * when no daemon is reachable. The store transaction is the same one the
+ * daemon would run; a daemon started later finds the retry pending.
+ */
+export function rearmRetryInProcess(
+  input: MaterializationRetryRepairInput,
+  dbPath: string,
+): MaterializationRetryRepairResult {
+  return normalizeRepairResult(
+    createRuntime(dbPath).rearmMaterializationRetry(input),
+  );
+}
+
+/** Skip one terminal retry directly in the persisted store (no daemon reachable). */
+export function skipRetryInProcess(
+  input: MaterializationRetrySkipInput,
+  dbPath: string,
+): MaterializationRetryRepairResult {
+  return normalizeRepairResult(
+    createRuntime(dbPath).skipMaterializationRetry(input),
   );
 }
 

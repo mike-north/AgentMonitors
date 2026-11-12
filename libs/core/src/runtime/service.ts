@@ -11,6 +11,7 @@ import { existsSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import { ulid } from 'ulid';
+import { _monitorCommandLine } from '../commands/shell-arguments.js';
 import { writePrivateFileAtomic } from '../security/local-permissions.js';
 import { scanMonitors } from '../parser/scan-monitors.js';
 import {
@@ -45,6 +46,8 @@ import {
   type HookDeliveryHold,
 } from './hook-delivery-diagnosis.js';
 import {
+  MaterializationRetryNotFoundError,
+  MaterializationRetryTransitionError,
   RetiredVerifyArtifactRetryError,
   RuntimeStore,
   computeNetCollapseView,
@@ -89,7 +92,12 @@ import type {
   DoctorParseError,
   DoctorReportInput,
   EventQuery,
+  MaterializationRetryDiagnostic,
   MaterializationRetryRecord,
+  MaterializationRetryRepairInput,
+  MaterializationRetryRepairResult,
+  MaterializationRetrySkipInput,
+  MaterializationRetrySummary,
   MonitorDoctorReport,
   MonitorEventRecord,
   MonitorExplainInput,
@@ -118,6 +126,8 @@ import {
   defaultNotifyConfigForUrgency,
   EPHEMERAL_MONITOR_ID_PREFIX,
   MATERIALIZATION_RETRY_DELAYS_MS,
+  MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+  MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
   type NotifyDispatchResult,
   type NotHeldObservation,
   type NotifyRuntimeState,
@@ -952,6 +962,137 @@ function heldRefusalData(refusal: NotHeldObservation): {
 }
 
 /**
+ * The durable outcome of a terminal retry an operator skipped (002 §2.7),
+ * recorded as loss (002 §2). `error` is the retry's last error followed by
+ * `Retry skipped after <n> failed attempts.`, with the operator's reason when
+ * one was given; `skipped` marks the row for diagnostics, `retryId` names the
+ * removed retry, and the identity names which observation was lost. It has no
+ * span position, since the retry outlived the span that admitted it.
+ *
+ * The reason is already bounded ({@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH}),
+ * so the skip note always fits the diagnostic cap in full; the last error
+ * takes the rest and, when it does not fit, is shortened and ends in `…`.
+ */
+function skippedRetryObservationData(
+  retry: MaterializationRetryRecord,
+  reason: string | undefined,
+): {
+  error: string;
+  skipped: true;
+  retryId: string;
+  objectKey?: string;
+  title?: string;
+} {
+  const note = reason?.trim() ? `: ${reason.trim()}` : '';
+  const suffix = safeDiagnosticText(
+    ` Retry skipped after ${String(retry.attemptCount)} failed attempts${note}.`,
+  );
+  const lastError = safeDiagnosticText(
+    retry.lastError ?? 'Materialization failed.',
+  );
+  const budget = SAFE_DIAGNOSTIC_TEXT_MAX - suffix.length;
+  const error =
+    (lastError.length <= budget
+      ? lastError
+      : `${lastError.slice(0, Math.max(0, budget - 1))}…`) + suffix;
+  return {
+    error,
+    skipped: true,
+    retryId: retry.id,
+    ...lostObservationIdentity(retry.envelope.observation),
+  };
+}
+
+/**
+ * What the store keeps for one lost observation (002 §2), whatever the kind of
+ * loss: the observation's raw `objectKey`, which is what supersedes the loss
+ * (a later event for exactly this key), and the display-safe outcome row.
+ * Only a string key counts; the display-safe copy in `observationData` is
+ * never used for matching.
+ */
+function observationLossRecord(
+  observation: Observation,
+  observationData: Record<string, unknown> & { error: string },
+): {
+  objectKey: string | undefined;
+  observationData: Record<string, unknown> & { error: string };
+} {
+  const { objectKey } = observation as { objectKey?: unknown };
+  return {
+    objectKey: typeof objectKey === 'string' ? objectKey : undefined,
+    observationData,
+  };
+}
+
+/** The CLI repairs for one terminal retry, as named in reports (005 `monitor retry`). */
+function retryRepairCommands(
+  monitorId: string,
+  retryId: string,
+  workspacePath: string | null,
+): { rearm: string; skip: string } {
+  // Always pin a known route: diagnostics can be consumed outside the
+  // process/workspace that produced them, including a daemon response.
+  const flags = workspacePath === null ? [] : ['--workspace', workspacePath];
+  const ids = [monitorId, retryId];
+  return {
+    rearm: _monitorCommandLine(['retry', 'rearm'], flags, ids),
+    skip: _monitorCommandLine(['retry', 'skip'], flags, ids),
+  };
+}
+
+/**
+ * The report for a terminal retry that keeps its monitor paused (002 §2.7):
+ * which retry, why, and the two ways out.
+ */
+function terminalRetryMessage(
+  monitorId: string,
+  retry: MaterializationRetryRecord,
+): string {
+  const { rearm, skip } = retryRepairCommands(
+    monitorId,
+    retry.id,
+    retry.workspacePath,
+  );
+  return `Materialization retry ${retry.id} stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed or skipped. Retry it with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`. Last error: ${retry.lastError ?? 'unknown'}`;
+}
+
+/**
+ * Explain's reason for an outbox holding terminal work: how many retries
+ * stopped, and the repairs for the oldest one, which pauses the monitor.
+ */
+function terminalRetriesReason(
+  monitorId: string,
+  summary: MaterializationRetrySummary,
+  workspacePath: string,
+): string {
+  const head = `${String(summary.terminal)} observation(s) exhausted automatic materialization retries and require operator repair.`;
+  const oldest = summary.records.find(({ status }) => status === 'terminal');
+  if (!oldest) return head;
+  const { rearm, skip } = retryRepairCommands(
+    monitorId,
+    oldest.id,
+    workspacePath,
+  );
+  return `${head} Retry ${oldest.id} with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`.`;
+}
+
+/** A retry's operator-safe metadata: never its envelope or payload. */
+function retryDiagnostic(
+  retry: MaterializationRetryRecord,
+): MaterializationRetryDiagnostic {
+  return {
+    id: retry.id,
+    status: retry.status,
+    attemptCount: retry.attemptCount,
+    nextAttemptAt: retry.nextAttemptAt,
+    lastError:
+      retry.lastError === null ? null : safeDiagnosticText(retry.lastError),
+    createdAt: retry.createdAt,
+    updatedAt: retry.updatedAt,
+  };
+}
+
+/**
  * Hold refusals placed among the envelopes admission keeps (002 §2, §2.8).
  * Dispatch counts each refusal's `emittedBefore` in the full dispatched list;
  * once the ownership filter drops retired verify artifacts, a refusal belongs
@@ -1646,6 +1787,109 @@ export class AgentMonitorRuntime {
     return this.store.listObservationHistory(query);
   }
 
+  /**
+   * Return a terminal materialization retry to automatic retry (002 §2.7):
+   * its attempts and last error reset and its first retry delay starts again,
+   * with its identity, envelope and admission position unchanged. The monitor
+   * stays paused until the retry completes; once it does, the monitor takes
+   * newer input in order. A watcher paused on the retry is woken at once.
+   *
+   * A retry whose observation is a verify artifact with cleanup authority in
+   * effect (002 §2.8) is removed instead, with nothing recorded, and the
+   * outcome is `verify-artifact-cleanup`: retrying it would only materialize
+   * scratch work its owner asked to be cleaned up.
+   *
+   * @throws {@link MaterializationRetryNotFoundError} when no retry of this
+   *   monitor in this workspace has the id.
+   * @throws {@link MaterializationRetryTransitionError} when the retry is not
+   *   terminal; a pending retry is still attempted automatically.
+   */
+  rearmMaterializationRetry(
+    input: MaterializationRetryRepairInput,
+  ): MaterializationRetryRepairResult {
+    this.terminalRetryFor(input, 're-armed');
+    const { outcome, retry } = this.store.rearmTerminalMaterializationRetry(
+      input.retryId,
+      { monitorId: input.monitorId, workspacePath: input.workspacePath },
+    );
+    this.wakeRetryRepairWaiters(input.workspacePath, input.monitorId);
+    return { outcome, retry: retryDiagnostic(retry) };
+  }
+
+  /**
+   * Give up a terminal materialization retry (002 §2.7): its observation is
+   * recorded as an outstanding loss, with the retry's last error and the
+   * optional reason, through the same loss record admission drops use (002
+   * §2), and the retry is removed in the same transaction. The loss stays
+   * reported by `doctorReport` and `explainMonitor` until a later event for
+   * the observation's object key supersedes it. The monitor takes newer input
+   * on its next tick once no other retained work remains ahead of it.
+   *
+   * A retry whose observation is a verify artifact with cleanup authority in
+   * effect (002 §2.8) is removed with no loss recorded, and the outcome is
+   * `verify-artifact-cleanup`: dropping it is the cleanup, not lost work, and
+   * no later event could supersede a loss for that key. The store decides
+   * this under the skip's own writer lock.
+   *
+   * Returns the retry as it was when it was removed.
+   *
+   * @throws {@link MaterializationRetryNotFoundError} when no retry of this
+   *   monitor in this workspace has the id.
+   * @throws {@link MaterializationRetryTransitionError} when the retry is not
+   *   terminal; a pending retry is still attempted automatically.
+   * @throws `RangeError` when the trimmed reason is longer than
+   *   {@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH} characters.
+   */
+  skipMaterializationRetry(
+    input: MaterializationRetrySkipInput,
+  ): MaterializationRetryRepairResult {
+    const reasonLength = input.reason?.trim().length ?? 0;
+    if (reasonLength > MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH) {
+      throw new RangeError(
+        `Skip reason is ${String(reasonLength)} characters; at most ${String(MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH)} are allowed.`,
+      );
+    }
+    const current = this.terminalRetryFor(input, 'skipped');
+    // The same loss record every other drop gets (002 §2); the store writes it
+    // inside the skip's own transaction, at the retry's admission position.
+    const { outcome, retry } = this.store.skipMaterializationRetry(
+      input.retryId,
+      { monitorId: input.monitorId, workspacePath: input.workspacePath },
+      observationLossRecord(
+        current.envelope.observation,
+        skippedRetryObservationData(current, input.reason),
+      ),
+    );
+    this.wakeRetryRepairWaiters(input.workspacePath, input.monitorId);
+    return { outcome, retry: retryDiagnostic(retry) };
+  }
+
+  /**
+   * The retry an operator repair names, refused unless it belongs to the
+   * given workspace/monitor and is terminal. The store re-checks both inside
+   * its own transaction; this read exists to give a refusal its explanation.
+   */
+  private terminalRetryFor(
+    input: MaterializationRetryRepairInput,
+    verb: string,
+  ): MaterializationRetryRecord {
+    const current = this.store.getMaterializationRetry(input.retryId);
+    if (
+      current.monitorId !== input.monitorId ||
+      current.workspacePath !== input.workspacePath
+    ) {
+      throw new MaterializationRetryNotFoundError(input.retryId);
+    }
+    if (current.status !== 'terminal') {
+      const next = current.nextAttemptAt?.toISOString() ?? 'not scheduled';
+      throw new MaterializationRetryTransitionError(
+        input.retryId,
+        `is ${current.status}, not terminal, so it cannot be ${verb}. It is still retried automatically (${String(current.attemptCount)} of ${String(MATERIALIZATION_RETRY_MAX_ATTEMPTS)} attempts failed; next attempt at ${next})`,
+      );
+    }
+    return current;
+  }
+
   async explainMonitor(
     input: MonitorExplainInput,
   ): Promise<MonitorExplainReport> {
@@ -2093,7 +2337,11 @@ export class AgentMonitorRuntime {
         explainStage(
           'materialization',
           'failure',
-          `${String(materializationRetries.terminal)} observation(s) exhausted automatic materialization retries and require operator repair.`,
+          terminalRetriesReason(
+            input.monitorId,
+            materializationRetries,
+            workspacePath,
+          ),
           { ...materializationRetries },
         ),
       );
@@ -3711,6 +3959,47 @@ export class AgentMonitorRuntime {
   private readonly watchPolicyWaiters = new Map<string, Set<() => void>>();
 
   /**
+   * Watchers paused on a terminal retry, by workspace/monitor key. A re-arm or
+   * skip in this process wakes them so the watcher drains again at once
+   * instead of at its next periodic recheck (002 §2.7).
+   */
+  private readonly retryRepairWaiters = new Map<string, Set<() => void>>();
+
+  private wakeRetryRepairWaiters(workspacePath: string, monitorId: string) {
+    const key = JSON.stringify([workspacePath, monitorId]);
+    for (const wake of this.retryRepairWaiters.get(key) ?? []) wake();
+  }
+
+  /**
+   * Subscribe synchronously before a host is told about terminal work. The
+   * cancellable wait releases its timer, abort listener and route membership
+   * on wake, deadline or teardown; cancellation also covers a throwing host.
+   */
+  private waitForRetryRepair(
+    workspacePath: string,
+    monitorId: string,
+    ms: number,
+    signal: AbortSignal,
+  ): { done: Promise<void>; cancel: () => void } {
+    const woken = new AbortController();
+    const wake = () => {
+      woken.abort();
+    };
+    if (signal.aborted) return { done: Promise.resolve(), cancel: wake };
+    const key = JSON.stringify([workspacePath, monitorId]);
+    const waiters = this.retryRepairWaiters.get(key) ?? new Set();
+    this.retryRepairWaiters.set(key, waiters);
+    waiters.add(wake);
+    signal.addEventListener('abort', wake, { once: true });
+    const done = abortableDelay(ms, woken.signal).finally(() => {
+      signal.removeEventListener('abort', wake);
+      waiters.delete(wake);
+      if (waiters.size === 0) this.retryRepairWaiters.delete(key);
+    });
+    return { done, cancel: wake };
+  }
+
+  /**
    * Publish permission and current location within existing ownership. A blocked
    * definition may identify a new location before it ever reconciles successfully.
    * Closing without a new location preserves the latest authority, including
@@ -4460,7 +4749,7 @@ export class AgentMonitorRuntime {
           ...result,
           blocked: {
             kind: 'terminal',
-            message: `Materialization retry ${retry.id} stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed. Last error: ${retry.lastError ?? 'unknown'}`,
+            message: terminalRetryMessage(monitorId, retry),
           },
         };
       }
@@ -4645,20 +4934,36 @@ export class AgentMonitorRuntime {
         onError?.(monitorId, new Error(blocked.message));
         waitMs = this.failedAttemptWaitMs(monitorId, workspacePath);
       } else {
-        if (blocked.message !== reportedTerminal) {
-          reportedTerminal = blocked.message;
-          const sourceName =
-            this.store.oldestMaterializationRetry(monitorId, workspacePath)
-              ?.sourceName ?? 'unknown';
-          this.recordErroredHistory(
-            monitorId,
-            workspacePath,
-            sourceName,
-            blocked.message,
-          );
-          onError?.(monitorId, new Error(blocked.message));
+        // A host may synchronously re-arm or skip in onError. Subscribe
+        // first so that repair cannot be lost before the watcher waits.
+        const repairWait = this.waitForRetryRepair(
+          workspacePath,
+          monitorId,
+          TERMINAL_RETRY_RECHECK_MS,
+          signal,
+        );
+        try {
+          if (blocked.message !== reportedTerminal) {
+            reportedTerminal = blocked.message;
+            const sourceName =
+              this.store.oldestMaterializationRetry(monitorId, workspacePath)
+                ?.sourceName ?? 'unknown';
+            this.recordErroredHistory(
+              monitorId,
+              workspacePath,
+              sourceName,
+              blocked.message,
+            );
+            onError?.(monitorId, new Error(blocked.message));
+          }
+          await repairWait.done;
+        } finally {
+          // A callback/history failure must not leave a timer or subscription
+          // behind after this watcher exits. The wait itself never rejects.
+          repairWait.cancel();
+          await repairWait.done;
         }
-        waitMs = TERMINAL_RETRY_RECHECK_MS;
+        continue;
       }
       await abortableDelay(waitMs, signal);
     }
@@ -4994,12 +5299,14 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Record one observation the runtime could not keep as outstanding loss
+   * Record one observation admission could not keep as outstanding loss
    * (002 §2), whatever the reason: the retry outbox could not retain it, or a
-   * hold refused it (002 §4.7). Every kind of loss goes through here, so each
-   * gets the same drop identity and the same supersession rule. Must run
-   * inside the admitting span's transaction, at the lost observation's place
-   * in the span's order (see {@link RuntimeStore.recordObservationLoss}).
+   * hold refused it (002 §4.7). Every admission loss goes through here, and
+   * this and a skipped retry's loss ({@link AgentMonitorRuntime.skipMaterializationRetry})
+   * both build their record with `observationLossRecord`, so each gets the
+   * same drop identity and the same supersession rule. Must run inside the
+   * admitting span's transaction, at the lost observation's place in the
+   * span's order (see {@link RuntimeStore.recordObservationLoss}).
    */
   private recordObservationLoss(
     monitorId: string,
@@ -5008,15 +5315,11 @@ export class AgentMonitorRuntime {
     observation: Observation,
     observationData: Record<string, unknown> & { error: string },
   ): void {
-    // The raw key, not the display-safe copy: a later event for exactly this
-    // key is what supersedes the loss (002 §2).
-    const { objectKey } = observation as { objectKey?: unknown };
     this.store.recordObservationLoss({
       monitorId,
       workspacePath,
       sourceName,
-      objectKey: typeof objectKey === 'string' ? objectKey : undefined,
-      observationData,
+      ...observationLossRecord(observation, observationData),
     });
   }
 
