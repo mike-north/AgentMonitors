@@ -300,6 +300,7 @@ export interface DoctorMonitorRollup {
     id: string;
     lastEventAt?: Date;
     lastObservedAt?: Date;
+    materializationRetries?: MaterializationRetrySummary;
     neverObserved: boolean;
     nextDueAt?: Date;
     // (undocumented)
@@ -629,6 +630,17 @@ export class MaterializationRetryCapacityError extends Error {
 }
 
 // @public
+export interface MaterializationRetryDiagnostic {
+    attemptCount: number;
+    createdAt: Date;
+    id: string;
+    lastError: string | null;
+    nextAttemptAt: Date | null;
+    status: MaterializationRetryStatus;
+    updatedAt: Date;
+}
+
+// @public
 export class MaterializationRetryNotFoundError extends Error {
     constructor(retryId: string);
     readonly code = "materialization_retry_not_found";
@@ -674,6 +686,7 @@ export type MaterializationRetryStatus = 'pending' | 'terminal';
 export interface MaterializationRetrySummary {
     bytes: number;
     pending: number;
+    records: MaterializationRetryDiagnostic[];
     terminal: number;
 }
 
@@ -742,6 +755,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     monitorsDir: string;
     monitorsDirExists: boolean;
+    orphanedMaterializationRetries?: OrphanedMaterializationRetrySummary[];
     parseErrors: DoctorParseError[];
     workspacePath: string;
 }
@@ -809,6 +823,7 @@ export interface MonitorExplainReport {
     generatedAt: Date;
     // (undocumented)
     leadSessions: AgentSessionRecord[];
+    materializationRetries?: MaterializationRetrySummary;
     // (undocumented)
     monitor?: {
         id: string;
@@ -1128,6 +1143,12 @@ export interface OpenSessionInput {
 export const OPERATION_TIMEOUT_PATTERN: string;
 
 // @public
+export interface OrphanedMaterializationRetrySummary {
+    monitorId: string;
+    summary: MaterializationRetrySummary;
+}
+
+// @public
 export function parseDuration(duration: string): number;
 
 // @public (undocumented)
@@ -1328,6 +1349,7 @@ export class RuntimeStore {
     // (undocumented)
     markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void;
     markMaterializationRetryFailed(id: string, error: string, now?: Date): MaterializationRetryRecord;
+    materializationRetryMonitorIds(workspacePath: string | null): string[];
     materializationRetrySummary(monitorId: string, workspacePath: string | null): MaterializationRetrySummary;
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;

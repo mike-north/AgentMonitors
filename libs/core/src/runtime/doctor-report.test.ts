@@ -21,6 +21,10 @@ import type {
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import { RuntimeStore } from './store.js';
 import { AgentMonitorRuntime } from './service.js';
+import {
+  MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+  type StoredObservationEnvelope,
+} from './types.js';
 
 const NOW = new Date('2026-07-12T12:00:00.000Z');
 
@@ -122,6 +126,120 @@ describe('AgentMonitorRuntime.doctorReport', () => {
       claimed: 0,
       acknowledged: 0,
     });
+    expect(monitor?.materializationRetries).toEqual({
+      pending: 0,
+      terminal: 0,
+      bytes: 0,
+      records: [],
+    });
+  });
+
+  it('reports safe pending and terminal retry metadata through explain and doctor', async () => {
+    const root = scratch();
+    const monitorsDir = path.join(root, '.claude', 'monitors');
+    for (const id of ['pending-retry', 'terminal-retry']) {
+      writeMonitor(monitorsDir, id, [
+        `name: ${id}`,
+        'watch:',
+        '  type: test-firing',
+        'urgency: normal',
+      ]);
+    }
+
+    const dbPath = path.join(root, 'agentmon.db');
+    const store = new RuntimeStore(createDb(dbPath));
+    const enqueue = (monitorId: string) => {
+      const envelope: StoredObservationEnvelope = {
+        monitor: {
+          id: monitorId,
+          displayName: monitorId,
+          filePath: path.join(monitorsDir, monitorId, 'MONITOR.md'),
+          instructions: 'Handle it.',
+          frontmatter: {
+            watch: { type: 'test-firing' },
+            urgency: 'normal',
+            urgencyMax: 'normal',
+            baselineStrategy: 'incremental',
+          },
+        },
+        observation: {
+          title: 'private retry title',
+          payload: { secret: 'private retry payload' },
+        },
+        observedAt: NOW,
+        effectiveUrgency: 'normal',
+      };
+      const record = store.enqueueMaterializationRetries(
+        [
+          {
+            workspacePath: root,
+            monitorId,
+            sourceName: 'test-firing',
+            envelope,
+            error: `${monitorId} failed`,
+          },
+        ],
+        NOW,
+      )[0];
+      if (!record) throw new Error('expected a retry record');
+      return record;
+    };
+    const pending = enqueue('pending-retry');
+    let terminal = enqueue('terminal-retry');
+    for (
+      let attempt = 0;
+      attempt < MATERIALIZATION_RETRY_MAX_ATTEMPTS;
+      attempt += 1
+    )
+      terminal = store.markMaterializationRetryFailed(
+        terminal.id,
+        'terminal retry failed',
+        new Date(NOW.getTime() + attempt + 1),
+      );
+
+    const runtime = makeRuntime(dbPath);
+    const pendingExplain = await runtime.explainMonitor({
+      monitorId: 'pending-retry',
+      monitorsDir,
+      workspacePath: root,
+      now: NOW,
+    });
+    const terminalExplain = await runtime.explainMonitor({
+      monitorId: 'terminal-retry',
+      monitorsDir,
+      workspacePath: root,
+      now: NOW,
+    });
+    expect(
+      pendingExplain.stages.find((stage) => stage.id === 'materialization'),
+    ).toMatchObject({ status: 'pending' });
+    expect(
+      terminalExplain.stages.find((stage) => stage.id === 'materialization'),
+    ).toMatchObject({ status: 'failure' });
+    expect(pendingExplain.materializationRetries?.records[0]?.id).toBe(
+      pending.id,
+    );
+    expect(terminalExplain.materializationRetries?.records[0]).toMatchObject({
+      id: terminal.id,
+      status: 'terminal',
+      attemptCount: MATERIALIZATION_RETRY_MAX_ATTEMPTS,
+      lastError: 'terminal retry failed',
+    });
+
+    const doctor = await runtime.doctorReport({
+      monitorsDir,
+      workspacePath: root,
+      now: NOW,
+    });
+    expect(
+      doctor.monitors.find((monitor) => monitor.id === 'pending-retry')
+        ?.materializationRetries,
+    ).toMatchObject({ pending: 1, terminal: 0 });
+    expect(
+      doctor.monitors.find((monitor) => monitor.id === 'terminal-retry')
+        ?.materializationRetries,
+    ).toMatchObject({ pending: 0, terminal: 1 });
+    expect(JSON.stringify(doctor)).not.toContain('private retry payload');
   });
 
   it('marks a never-ticked monitor as never observed with next-due = now when due (spec 005 §14)', async () => {
