@@ -5296,6 +5296,11 @@ export class AgentMonitorRuntime {
   ): NotifyDispatchResult {
     const emitted: StoredObservationEnvelope[] = [];
     const notHeld: NotHeldObservation[] = [];
+    // Refusals made while a debounce batch was held, each with how many held
+    // observations preceded it. Those held observations are older than the
+    // refusal, so if an escalation later in this dispatch flushes the batch,
+    // the refusal's place moves to just after them (002 §2).
+    let refusedBehindHeld: { refusal: NotHeldObservation; held: number }[] = [];
     const nextState: NotifyRuntimeState = { ...state };
 
     // Scheduled-rollup Pace mode (002 §4.4). A `rollup` monitor accumulates
@@ -5346,6 +5351,13 @@ export class AgentMonitorRuntime {
       // batch (splitting risks ordering confusion). This is the only path that
       // can short-circuit a settling debounce window before its `dueAt`.
       if (isEscalated && nextState.pendingDebounce) {
+        // The flushed batch keeps arrival order, so a refusal made while `held`
+        // observations were waiting belongs right after those `held` flushed
+        // envelopes and before the newer ones held after it.
+        for (const { refusal, held } of refusedBehindHeld) {
+          refusal.emittedBefore = emitted.length + held;
+        }
+        refusedBehindHeld = [];
         emitted.push(
           ...nextState.pendingDebounce.observations.map(
             hydrateStoredObservationEnvelope,
@@ -5390,11 +5402,14 @@ export class AgentMonitorRuntime {
       // batch's other observations are unaffected.
       const notHeldMessage = notHeldReason(envelope, 'debounce');
       if (notHeldMessage !== undefined) {
-        notHeld.push({
+        const refusal: NotHeldObservation = {
           observation,
           message: notHeldMessage,
           emittedBefore: emitted.length,
-        });
+        };
+        notHeld.push(refusal);
+        const held = nextState.pendingDebounce?.observations.length ?? 0;
+        if (held > 0) refusedBehindHeld.push({ refusal, held });
         continue;
       }
 

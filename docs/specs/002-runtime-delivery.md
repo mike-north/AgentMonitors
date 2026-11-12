@@ -694,8 +694,11 @@ internal), inside the admitting span's transaction, with the same drop identity 
 [`observation_history`](#observation_history)). Each row is written at the lost observation's
 place in the span's order. An outbox drop is recorded where its materialization failed. A refusal
 is recorded after the dispatched events of observations older than it: held work flushed in the
-same dispatch and siblings that arrived before it and went straight to materialization. It is
-recorded before the events of siblings that arrived after it. If a retained suffix began before a
+same dispatch and siblings that arrived before it and went straight to materialization. That
+includes the observations a debounce batch held when the refusal was made, if an escalation later in
+the same dispatch flushes the batch (§4.1): the flushed batch keeps arrival order, so the refusal is
+recorded after those held observations and before the ones held after it. It is recorded before the
+events of siblings that arrived after it. If a retained suffix began before a
 refusal's place, the refusal is recorded after that suffix is queued, so that no retry of an older
 sibling counts as later than it. A later sibling inside that suffix then does not supersede it
 either; that errs toward reporting. A drop stays _outstanding_ until it is _superseded_, and only

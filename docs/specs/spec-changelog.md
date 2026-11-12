@@ -18,7 +18,11 @@ same drop identity (`unretained_object_key`, `unretained_event_watermark`), and 
 report both as outstanding until superseded: by a later event of the same key, or, without a key,
 by a later span that materializes an event and drops nothing. Quiet ticks, holds and restarts do
 not clear either. A refusal is recorded at its place in the span's order: after the events of
-older observations dispatched with it, and before those of newer siblings. If a retained suffix
+older observations dispatched with it, and before those of newer siblings. That holds when an
+escalation later in the same dispatch flushes a debounce batch (002 §4.1): the observations the
+batch held when the refusal was made, whether from an earlier tick or earlier in the span, are
+older, so their events do not supersede it, while an observation held after the refusal does.
+If a retained suffix
 began before that place, it is recorded after the suffix is queued, so a retry of an older sibling
 never supersedes it. The refusal keeps its own report: its `errored` row (now
 `{ error, holdRefused: true, objectKey?, title? }`, with the §4.7 message unchanged) and its

@@ -464,6 +464,81 @@ describe('which spans supersede a debounce refusal (#575)', () => {
     await expectCleared(f);
   });
 
+  it('held work from an earlier tick, flushed by a later escalation in the refusing span, does not supersede it', async () => {
+    const f = fixture(
+      policies.debounce,
+      [
+        () => [obs('H', { key: 'K' })],
+        // Bad is refused while H is held; the escalated E then flushes [H, E]
+        // (002 §4.1). H is older than Bad, so its event is not a later one.
+        () => [
+          obs('Bad', { key: 'K', payload: bigint() }),
+          { ...obs('E'), salience: 'high' as const },
+        ],
+      ],
+      'normal..high',
+    );
+    await f.tick();
+    expect(f.heldTitles()).toEqual(['H']);
+    const span = await f.tick();
+    expect(span.erroredObservations).toEqual([
+      { monitorId: MONITOR_ID, message: refusalText('Bad', 'debounce') },
+    ]);
+    expect(f.eventSummaries()).toEqual(['H', 'E']);
+    await expectOutstanding(f, 'debounce', {
+      count: 1,
+      objectKey: 'K',
+      title: 'Bad',
+    });
+  });
+
+  it('an older sibling held in the refusing span and flushed by a later escalation does not supersede it', async () => {
+    const f = fixture(
+      policies.debounce,
+      [
+        () => [],
+        // A is held, Bad is refused, and the escalated E flushes [A, E]. A
+        // arrived before Bad, so its event is not a later one.
+        () => [
+          obs('A', { key: 'K' }),
+          obs('Bad', { key: 'K', payload: bigint() }),
+          { ...obs('E'), salience: 'high' as const },
+        ],
+      ],
+      'normal..high',
+    );
+    await f.tick();
+    await f.tick();
+    expect(f.eventSummaries()).toEqual(['A', 'E']);
+    await expectOutstanding(f, 'debounce', {
+      count: 1,
+      objectKey: 'K',
+      title: 'Bad',
+    });
+  });
+
+  it('a newer sibling held after the refusal and flushed by a later escalation supersedes it', async () => {
+    const f = fixture(
+      policies.debounce,
+      [
+        () => [],
+        // Bad is refused with nothing held; C is held after it, and the
+        // escalated E flushes [C, E]. C is newer than Bad and is the first
+        // envelope of the span, so this pins the refusal's place exactly.
+        () => [
+          obs('Bad', { key: 'K', payload: bigint() }),
+          obs('C', { key: 'K' }),
+          { ...obs('E'), salience: 'high' as const },
+        ],
+      ],
+      'normal..high',
+    );
+    await f.tick();
+    await f.tick();
+    expect(f.eventSummaries()).toEqual(['C', 'E']);
+    await expectCleared(f);
+  });
+
   it('a retry of an older sibling queued in the refusing span does not supersede it', async () => {
     const f = fixture(
       policies.debounce,

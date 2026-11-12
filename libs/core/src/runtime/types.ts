@@ -1044,11 +1044,21 @@ export interface NotHeldObservation {
   observation: Observation;
   message: string;
   /**
-   * How many of the same dispatch's `emitted` envelopes precede this
-   * observation in observation order: held work flushed before it and
-   * siblings that arrived before it and went straight to materialization.
-   * Admission records the loss after those and before the rest, so only an
-   * event of a newer observation of the same key supersedes it.
+   * The index in the same dispatch's `emitted` list at which this refusal is
+   * recorded: every envelope before it is of an observation older than the
+   * refusal, and every envelope from it on is of a newer one. Admission
+   * records the loss after the first `emittedBefore` envelopes and before the
+   * rest, so only an event of a newer observation of the same key supersedes
+   * it.
+   *
+   * The envelopes before it are held work flushed when its settle window had
+   * already elapsed, siblings that arrived before it and went straight to
+   * materialization, and, when an escalation later in the dispatch flushes the
+   * debounce batch (002 §4.1), the observations that batch held at the moment
+   * of refusal. A flushed batch keeps arrival order, so those held envelopes
+   * are the first ones of the flush, and observations held after the refusal
+   * follow them. A rollup refusal is always 0: rollup refuses only when its
+   * window does not fire, and then it emits nothing.
    */
   emittedBefore: number;
 }
