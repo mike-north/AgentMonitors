@@ -570,7 +570,7 @@ const RETIRED_EPHEMERAL =
  * until it is cancelled and declared again.
  */
 function rejectedScopeRemediation(validationError: string): string {
-  return `Its persisted scope is now rejected by its source (${validationError}), so every tick skips it and no later event can clear this. An ephemeral scope cannot be edited: cancel the watch and declare it again with a valid scope.`;
+  return `Its persisted scope is now rejected by its source (${validationError}), so every tick skips it and no later event can clear this. An ephemeral scope cannot be edited. Cancelling the watch and declaring it again with a valid scope restores observation, but the new declaration gets a new id: this id's outstanding drop and retained work stay reported under its retired id, and this check keeps failing.`;
 }
 
 /** When a drop stops failing doctor (002 §2): only a superseding outcome clears it. */

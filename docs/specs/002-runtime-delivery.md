@@ -730,10 +730,12 @@ explain` reports that drop as a `failure` materialization stage after the defini
   `ephemeralMonitorWork` (with its declaring `sessionId`), not reported as orphaned. If its
   persisted scope is now rejected by the source's preflight (the check every tick applies), the
   group also carries `validationError`: the tick skips the watch, and an ephemeral scope cannot be
-  edited, so nothing it owes can clear until it is cancelled and declared again. The field is
-  absent while the scope is accepted. Once it is
-  cancelled or reaped it is _retired_: its outstanding loss and retained work stay visible in
-  `orphanedMonitorWork` with `monitorKind: "ephemeral"`, as a removed definition's do. A retired
+  edited, so nothing it owes can clear. Cancelling the watch and declaring it again with a valid
+  scope restores observation, but the new declaration gets a new id: this id's outstanding loss
+  and retained work stay reported under its retired id, as below. The field is absent while the
+  scope is accepted. Once it is cancelled or reaped it is _retired_: its outstanding loss and
+  retained work stay visible in `orphanedMonitorWork` with `monitorKind: "ephemeral"`, as a
+  removed definition's do. A retired
   ephemeral monitor never observes again, so nothing supersedes its drop; it stays outstanding.
 - `doctor` fails a `dropped-observation:<id>` check for each of these cases, so the loss never
   disappears with its definition or its declaration.

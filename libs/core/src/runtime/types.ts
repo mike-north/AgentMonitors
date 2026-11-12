@@ -864,8 +864,10 @@ export interface EphemeralMonitorWork {
    * Present only while the monitor's persisted scope fails the source's scope
    * preflight, the same check every tick applies. The tick then skips the
    * watch, and an ephemeral scope cannot be edited, so the work above can
-   * never be superseded; the remedy is to cancel the watch and declare it
-   * again with a valid scope. Absent when the scope is accepted.
+   * never be superseded. Cancelling the watch and declaring it again with a
+   * valid scope restores observation, but the new declaration gets a new id,
+   * so this id's outstanding drop and retained work stay reported under its
+   * retired id. Absent when the scope is accepted.
    */
   validationError?: string;
 }

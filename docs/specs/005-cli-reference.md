@@ -2035,8 +2035,10 @@ and nothing to repair. While it is live, its drop and retained work are reported
 `ephemeral monitor of session <sessionId>; ` and say it has no MONITOR.md definition; the drop
 check keeps the clearing rule above. When the group carries `validationError` (its persisted
 scope is now rejected by its source, so every tick skips it), both checks instead state that
-reason and say no later event can clear the work: cancel the watch and declare it again with a
-valid scope, in text and JSON. After `watch cancel` or reaping it is a _retired_ ephemeral
+reason and say no later event can clear the work, in text and JSON. They say that cancelling the
+watch and declaring it again with a valid scope restores observation, but the new declaration gets
+a new id, so this id's outstanding drop and retained work stay reported under its retired id and
+the check keeps failing. After `watch cancel` or reaping it is a _retired_ ephemeral
 monitor in `orphanedMonitorWork` (`monitorKind: "ephemeral"`): its checks begin
 `retired ephemeral monitor; `, say it was cancelled or reaped, never had a definition and will not
 observe again, and that the drop check therefore keeps failing (002 §2). No command clears it.

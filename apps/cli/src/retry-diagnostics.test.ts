@@ -177,6 +177,7 @@ function reports(): {
           monitorId: 'ephemeral:session-1/01K0000000000000000000000',
           sessionId: 'session-1',
           materializationRetries: summary('ephemeral'),
+          validationError: 'wire scope rejected',
         },
       ],
     },
@@ -523,6 +524,10 @@ it('revives every attached and orphan retry date through real socket requests', 
   };
   const explain = await explainMonitorClient(input, socketPath);
   const doctor = await doctorReportClient(input, socketPath);
+  // A live ephemeral group's rejected-scope reason survives the socket.
+  expect(doctor.ephemeralMonitorWork?.[0]?.validationError).toBe(
+    'wire scope rejected',
+  );
   for (const value of [
     explain.materializationRetries,
     doctor.monitors[0]?.materializationRetries,
@@ -2054,7 +2059,10 @@ it('says why a live ephemeral watch with a rejected scope cannot clear its drop 
     expect(check.status).toBe('fail');
     expect(check.remediation).toContain(group.validationError);
     expect(check.remediation).toContain(
-      'cancel the watch and declare it again with a valid scope',
+      'declaring it again with a valid scope restores observation',
+    );
+    expect(check.remediation).toContain(
+      "this id's outstanding drop and retained work stay reported under its retired id, and this check keeps failing",
     );
     expect(check.remediation).toContain('no later event can clear');
     expect(check.remediation).not.toContain('repair the reported failure');
@@ -2062,8 +2070,9 @@ it('says why a live ephemeral watch with a rejected scope cannot clear its drop 
     expect(text).toContain(`✗ ${name}: `);
   }
   expect(text).toContain(
-    'cancel the watch and declare it again with a valid scope',
+    'declaring it again with a valid scope restores observation',
   );
+  expect(text).toContain('stay reported under its retired id');
   expect(text).toContain(group.validationError);
 }, 30_000);
 
