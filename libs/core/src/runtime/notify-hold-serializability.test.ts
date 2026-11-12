@@ -212,6 +212,18 @@ const observation = (title: string, payload?: Record<string, unknown>) => ({
   ...(payload ? { payload } : {}),
 });
 
+/**
+ * A refusal's loss row (002 §2, §4.7): the outcome text, the marker and the
+ * lost observation's identity. `observation()` keys every observation by its
+ * title, and every refused observation here is titled "Bad".
+ */
+const refusalRow = (error: unknown) => ({
+  error,
+  holdRefused: true,
+  objectKey: 'Bad',
+  title: 'Bad',
+});
+
 /** The documented outcome text: names the observation, the hold, and why. */
 const notHeldMessage = (strategy: HeldStrategy, reason: RegExp) =>
   expect.stringMatching(
@@ -241,9 +253,10 @@ for (const strategy of ['debounce', 'rollup'] as const) {
         expect(f.heldTitles()).toEqual(['A']);
         // The source baseline advanced: the batch is not observed again.
         expect(f.state().sourceState).toEqual({ cursor: 1 });
-        // History carries one durable `errored` row with the same message.
+        // History carries one durable `errored` loss row with the same
+        // message, naming the lost observation (#575).
         expect(f.errored().map((row) => row.observationData)).toEqual([
-          { error: first.erroredObservations[0]?.message },
+          refusalRow(first.erroredObservations[0]?.message),
         ]);
 
         if (restart) f.restart();
@@ -350,7 +363,7 @@ it('the watch path rejects an unserializable observation at hold acceptance, rep
   expect(f.heldTitles()).toEqual(['A']);
   expect(f.state().sourceState).toEqual({ cursor: 1 });
   expect(f.errored().map((row) => row.observationData)).toEqual([
-    { error: errors[0]?.message },
+    refusalRow(errors[0]?.message),
   ]);
 });
 
@@ -368,10 +381,10 @@ it('history gives a rejected observation its own errored row and counts it out o
   expect(f.history()).toEqual([
     // A span made only of a refused observation has no batch row: nothing
     // was held or emitted, so `suppressed` and `no-change` would both be false.
-    ['errored', { error: message }],
+    ['errored', refusalRow(message)],
     // A mixed span keeps its `suppressed` row for the held sibling and says
     // how many of its observations were refused.
-    ['errored', { error: message }],
+    ['errored', refusalRow(message)],
     ['suppressed', { observed: 2, emitted: 0, notHeld: 1 }],
   ]);
 });
@@ -496,9 +509,10 @@ it('a toJSON that throws a value whose toString throws still yields a refusal wi
  * an escalation band holds A, refuses Bad, then an escalated K flushes the
  * batch (§4.1); K's BigInt payload can neither persist as an event nor be
  * retained for retry, so span admission drops it. Each outcome is counted once
- * in the batch row, and only the drop is outstanding loss.
+ * in the batch row, and both the refusal and the drop are outstanding loss
+ * (#575).
  */
-it('a span mixing a refusal, an admitted observation and an unretainable drop counts each once, and only the drop is outstanding (#570, #497)', async () => {
+it('a span mixing a refusal, an admitted observation and an unretainable drop counts each once, and both losses are outstanding (#570, #497, #575)', async () => {
   const f = fixture(
     policies.debounce,
     [
@@ -525,8 +539,8 @@ it('a span mixing a refusal, an admitted observation and an unretainable drop co
   expect(f.heldTitles()).toEqual([]);
   expect(f.state().sourceState).toEqual({ cursor: 1 });
   expect(f.history()).toEqual([
-    // Refusal first: it is decided at dispatch, before any materialization.
-    ['errored', { error: refusal }],
+    // Refusal first: it arrived before K, whose escalation emitted [A, K].
+    ['errored', refusalRow(refusal)],
     [
       'errored',
       expect.objectContaining({
@@ -537,8 +551,8 @@ it('a span mixing a refusal, an admitted observation and an unretainable drop co
     ],
     ['triggered', { observed: 3, emitted: 1, notRetainedCount: 1, notHeld: 1 }],
   ]);
-  // The refusal is not a drop: loss counts K alone.
-  expect(f.loss()).toMatchObject({ count: 1, objectKey: 'K' });
+  // Both are loss; K is the newest.
+  expect(f.loss()).toMatchObject({ count: 2, objectKey: 'K' });
 
   // Nothing is re-observed; the monitor keeps accepting work.
   f.advance(2_000);

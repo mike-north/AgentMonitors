@@ -490,10 +490,12 @@ export interface DoctorDeliveryCounts {
 }
 
 /**
- * Observations of one monitor that admission dropped for good, because the
- * retry outbox could not retain their ordered suffix (002 §2, "Admission
- * outcomes when the outbox cannot retain a suffix"), and that are still
- * outstanding because nothing has superseded them. A drop with an object key
+ * Observations of one monitor that the runtime dropped for good, and that are
+ * still outstanding because nothing has superseded them (002 §2). One rule
+ * covers every kind of drop: an observation the retry outbox could not retain
+ * with its ordered suffix ("Admission outcomes when the outbox cannot retain a
+ * suffix"), and an observation a debounce or rollup hold refused because it
+ * cannot be serialized (002 §4.7). A drop with an object key
  * is superseded only by a later event of the same monitor, workspace and
  * object key; a drop without one, only by a later span of that monitor in that
  * workspace that materializes an event and drops nothing. Quiet ticks, notify
@@ -505,15 +507,19 @@ export interface DoctorDeliveryCounts {
  * row; the observation's payload is never part of it.
  */
 export interface UnretainedObservationLoss {
-  /** How many drops of this monitor in this workspace are still outstanding, across every span. */
+  /** How many drops of this monitor in this workspace are still outstanding, across every span and kind. */
   count: number;
   /** When the newest outstanding drop was recorded. */
   recordedAt: Date;
-  /** The materialization error followed by `Not retained for retry: <reason>`, for the newest drop. */
+  /**
+   * The newest drop's error: the materialization error followed by
+   * `Not retained for retry: <reason>` for an outbox drop, or the refusal
+   * message for a hold refusal (002 §4.7).
+   */
   error: string;
-  /** The newest dropped observation's 1-based position in its span, when recorded. */
+  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal). */
   position?: number;
-  /** How many observations that span dispatched, when recorded. */
+  /** How many observations that span dispatched, when recorded (never for a hold refusal). */
   spanSize?: number;
   /** The newest dropped observation's source `objectKey`, when it had one. */
   objectKey?: string;
@@ -572,8 +578,8 @@ export interface DoctorMonitorRollup {
    */
   materializationRetries?: MaterializationRetrySummary;
   /**
-   * Present while this monitor has an outstanding observation that admission
-   * dropped because the retry outbox could not retain it; absent once every
+   * Present while this monitor has an outstanding dropped observation (one the
+   * retry outbox could not retain, or one a hold refused); absent once every
    * drop is superseded (see {@link UnretainedObservationLoss}), and in reports
    * from older daemons. Duplicated ids omit it: their loss belongs to the
    * report's orphaned groups, like their retained work.
@@ -837,8 +843,8 @@ export interface OrphanedMonitorWork {
   /** Retained retry work, present only while the outbox holds records; never envelopes. */
   materializationRetries?: MaterializationRetrySummary;
   /**
-   * Present while the id has an outstanding observation that admission
-   * dropped because the retry outbox could not retain it.
+   * Present while the id has an outstanding dropped observation (one the
+   * retry outbox could not retain, or one a hold refused).
    */
   unretainedObservationLoss?: UnretainedObservationLoss;
 }
@@ -1012,7 +1018,7 @@ export interface WatchHandle {
  * persist, including any debounce/rollup hold. `notHeld` lists observations a
  * hold refused because their envelope cannot be serialized into
  * `monitor_state.notify_state` (002 §4.7): they are neither emitted nor held,
- * and the caller reports each as an `errored` outcome.
+ * and the caller records each as outstanding loss and reports it.
  *
  * @internal
  */
@@ -1028,11 +1034,33 @@ export interface NotifyDispatchResult {
  * single-line outcome text: it names the observation, the hold strategy and
  * the serializer's reason.
  *
+ * A refusal is loss (002 §2): admission records it with the same drop identity
+ * as an observation the retry outbox could not retain, at its place in the
+ * span's dispatched order.
+ *
  * @internal
  */
 export interface NotHeldObservation {
   observation: Observation;
   message: string;
+  /**
+   * The index in the same dispatch's `emitted` list at which this refusal is
+   * recorded: every envelope before it is of an observation older than the
+   * refusal, and every envelope from it on is of a newer one. Admission
+   * records the loss after the first `emittedBefore` envelopes and before the
+   * rest, so only an event of a newer observation of the same key supersedes
+   * it.
+   *
+   * The envelopes before it are held work flushed when its settle window had
+   * already elapsed, siblings that arrived before it and went straight to
+   * materialization, and, when an escalation later in the dispatch flushes the
+   * debounce batch (002 §4.1), the observations that batch held at the moment
+   * of refusal. A flushed batch keeps arrival order, so those held envelopes
+   * are the first ones of the flush, and observations held after the refusal
+   * follow them. A rollup refusal is always 0: rollup refuses only when its
+   * window does not fire, and then it emits nothing.
+   */
+  emittedBefore: number;
 }
 
 export interface RuntimeStatus {

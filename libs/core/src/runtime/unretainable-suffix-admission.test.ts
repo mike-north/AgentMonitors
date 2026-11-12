@@ -395,7 +395,7 @@ describe('poll admission when the outbox cannot take the suffix', () => {
     expect(explained.verdict).toEqual({
       status: 'failure',
       stage: 'materialization',
-      reason: `1 observation(s) were dropped because the retry outbox could not retain them; the newest, observation ${String(FAULT_INDEX + 1)} of ${String(spanSize)} (${faultedKey}, "${faulted}"), failed: ${String(drop?.['error'])}`,
+      reason: `1 observation(s) were dropped because the runtime could not keep them; the newest, observation ${String(FAULT_INDEX + 1)} of ${String(spanSize)} (${faultedKey}, "${faulted}"), failed: ${String(drop?.['error'])}`,
     });
     expect((await doctorRollup(f)).unretainedObservationLoss).toEqual({
       count: 1,
@@ -1217,7 +1217,7 @@ describe('an outstanding drop is cleared only by a superseding outcome', () => {
     // A monitor with retained work no longer admits a span (002 §2.7), so a
     // drop recorded after a still-pending retry exists only in a database
     // written before that rule. Record the drop directly, as admission would.
-    new RuntimeStore(f.writer.db).recordUnretainedObservation({
+    new RuntimeStore(f.writer.db).recordObservationLoss({
       monitorId: MONITOR_ID,
       workspacePath: f.root,
       sourceName: 'suffix-source',
@@ -1597,7 +1597,7 @@ describe('a drop on a monitor whose source config is now rejected', () => {
     const materialization = stage(report, 'materialization');
     expect(materialization?.status).toBe('failure');
     expect(materialization?.reason).toContain(
-      '1 observation(s) were dropped because the retry outbox could not retain them',
+      '1 observation(s) were dropped because the runtime could not keep them',
     );
     expect(materialization?.details).toMatchObject({
       unretainedObservationLoss: { count: 1, objectKey: 'object-1' },

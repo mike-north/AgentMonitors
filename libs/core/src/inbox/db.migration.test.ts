@@ -1003,7 +1003,7 @@ describe('unretained admission migration (#497)', () => {
       );
 
       const store = new RuntimeStore(db);
-      store.recordUnretainedObservation({
+      store.recordObservationLoss({
         monitorId: 'upgraded',
         workspacePath: WORKSPACE,
         sourceName: 'test-source',
@@ -1099,7 +1099,7 @@ describe('unretained admission migration (#497)', () => {
       )
       .run(retry.id);
 
-    store.recordUnretainedObservation({
+    store.recordObservationLoss({
       monitorId: 'upgraded',
       workspacePath: WORKSPACE,
       sourceName: 'test-source',

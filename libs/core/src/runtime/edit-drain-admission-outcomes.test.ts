@@ -468,7 +468,7 @@ describe('a rejected scope with held work and an outstanding drop', () => {
   });
 });
 
-describe('a refusal at hold acceptance is neither held work nor a drop', () => {
+describe('a refusal at hold acceptance is a drop, not held work', () => {
   it('leaves the admission gate open when a later definition is rejected, so the watcher keeps admitting (002 §2.0/§4.6/§4.7)', async () => {
     const f = fixture({ watch: true });
     f.write(DEBOUNCE);
@@ -478,7 +478,8 @@ describe('a refusal at hold acceptance is neither held work nor a drop', () => {
     });
     try {
       // The debounce hold refuses the only observation: nothing is held, the
-      // baseline advances, and the refusal is not recorded as a drop.
+      // baseline advances, and the refusal is outstanding loss (002 §2,
+      // #575), though not an outbox drop.
       f.push({
         observations: [observation('refused', 'r', true)],
         nextState: { cursor: 1 },
@@ -493,7 +494,11 @@ describe('a refusal at hold acceptance is neither held work nor a drop', () => {
         ),
       ]);
       expect(f.drops()).toEqual([]);
-      expect(f.loss()).toBeUndefined();
+      expect(f.loss()).toMatchObject({
+        count: 1,
+        objectKey: 'r',
+        title: 'refused',
+      });
 
       // A rejected definition closes the gate only for held work. The refusal
       // is not held work, so the running watcher keeps its startup config.
