@@ -1140,12 +1140,22 @@ it.each(['rearm', 'skip'] as const)(
       new RegExp('`(agentmonitors monitor retry ' + verb + ' [^`]+)`'),
     )?.[1];
     expect(command).toBeDefined();
-    const result = await execute('sh', ['-c', command ?? 'exit 99'], {
+    const result = await execute('/bin/sh', ['-c', command ?? 'exit 99'], {
       cwd: caller,
-      env: { ...env, PATH: `${bin}${path.delimiter}${env['PATH'] ?? ''}` },
+      // Keep format detection independent of the invoking terminal. The shim
+      // uses absolute paths, so no host executables belong on this PATH.
+      env: {
+        HOME: root,
+        XDG_DATA_HOME: env['XDG_DATA_HOME'],
+        AGENTMONITORS_DB: dbPath,
+        AGENTMONITORS_SOCKET: socketPath,
+        PATH: bin,
+      },
       timeout: 30_000,
     });
-    expect(result.stdout).toContain(verb === 'rearm' ? 'rearmed' : 'skipped');
+    expect(result.stdout).toContain(
+      `${verb === 'rearm' ? 'Re-armed' : 'Skipped'} retry ${id} of monitor ${MONITOR}`,
+    );
     const { store, client } = openStore();
     try {
       if (verb === 'rearm') {
