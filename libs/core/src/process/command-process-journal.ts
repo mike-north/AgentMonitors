@@ -32,7 +32,7 @@ export interface CommandProcessOwner {
   environment(): Promise<Readonly<Record<string, string>>>;
   /** Persist the directly spawned identifier as a suspicion, never proof of identity. */
   spawned(pid: number): void;
-  /** Forget a reaped direct PID; the life mark still attributes any surviving descendants. */
+  /** Retain an exited child's original-group suspicion; surviving members still need accounting. */
   exited(pid: number): void;
 }
 
@@ -159,11 +159,14 @@ export class CommandProcessJournal implements CommandProcessOwner {
       .prepare('INSERT OR IGNORE INTO command_pids VALUES(?,?)')
       .run(this.life, pid);
   }
-  /** A direct exit cannot retire the life: detached marked descendants may remain. */
+  /**
+   * A direct exit cannot prove its original group empty. Keep the numeric
+   * suspicion until reconciliation, so an environment-cleared group survivor
+   * gets an abstention even without a marked anchor. This never grants signal
+   * authority: only fresh mark or confirmed membership evidence can do that.
+   */
   exited(pid: number): void {
-    this.sql
-      .prepare('DELETE FROM command_pids WHERE life = ? AND pid = ?')
-      .run(this.life, pid);
+    this.spawned(pid);
   }
   /** Release persistence after the daemon has finished admitting command work. */
   close(): void {
@@ -571,7 +574,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
               pid,
               reason: nextMarks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON,
             });
-          break;
+          // Unrelated uncertainty cannot discard positively identified late
+          // forks. Persist it before the next round's identity queries, while
+          // keeping both this pass and its life incomplete and retryable.
+          save('running');
         }
         reading = next;
         ownership = nextMarks;

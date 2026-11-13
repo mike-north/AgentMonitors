@@ -190,14 +190,18 @@ created only when a command actually needs its mark. Opening a journal with no p
 lives records a complete empty sweep without boot, process-table or environment queries. Pending
 old lives are still reconciled before IPC readiness and the first tick; this is not deferred
 cleanup. No command timeout or test timeout is extended. A SIGKILL during spawn still leaves the precommitted nonce
-available for discovery. Normal direct-child exit removes only its numeric suspicion: it cannot
-discard attribution of detached descendants.
+available for discovery. Normal direct-child exit retains both the life nonce and the numeric
+original-group suspicion: it cannot discard accounting for surviving descendants.
 
 The sweep reads the platform process table and inherited ownership marks, independently of current
 parent, group or session membership. A marked live member also confirms the identities of its
 current process-group members, including children that cleared their environment while staying
 in that group; their recorded start times carry that confirmation after the marked anchor exits.
 A bare stored PGID never confirms a group, and a registered live daemon owner is never an anchor.
+An exited direct child's numeric identifier remains an original-group suspicion until
+reconciliation: an unmarked survivor in that group must receive an abstention and retain its
+life when no marked anchor can confirm membership. Direct-child exit alone cannot erase that
+accounting obligation, and numeric suspicion alone never authorizes a signal.
 Marker discovery is bracketed by process-table readings: a group anchor must keep its start time
 and group across the readings before it can confirm any members. A recycled PID cannot transfer
 a marker from its new process onto unrelated members of its former group. Changed anchors are
@@ -247,7 +251,11 @@ Abstained lives remain for later reconciliation. This is the input for #507; no 
 
 Discovery records ownership uncertainty once per PID instead of duplicating it for a numeric
 suspicion. When no signal was sent, it stops rather than rescanning that same uncertainty.
-After signalling, discovery takes another snapshot to catch late forks. It considers each PID
+After signalling, discovery takes another snapshot to catch late forks. It processes readable
+positive evidence even when unrelated unreadable ownership makes the snapshot
+incomplete; that uncertainty is saved before further identity queries and cannot discard the
+late fork's cleanup or outcome. The same boot, mark and start-time signal gates still apply.
+Discovery considers each PID
 only once per startup and takes at most eight discovery passes per old life; if work keeps
 appearing, the pass is incomplete and each still-discovered PID gets an abstention reason. This
 bounds startup work without guessing at identifiers or repeatedly signalling a disputed PID.

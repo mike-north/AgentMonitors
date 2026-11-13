@@ -877,6 +877,12 @@ the deterministic recording-order defect and repair, not that every historical C
 
 ### 3.5.1a Restart command containment (008 §4.2, issue #478)
 
+Journal regressions must retain an exited direct child's group suspicion: an unmarked original-group
+survivor receives an abstention, its life remains retryable, and no numeric group suspicion authorizes
+a signal. After a confirmed signal, a positively marked late fork must still pass the boot, mark
+and start-time gates and receive cleanup and an outcome when an unrelated unreadable PID makes the
+new snapshot incomplete; the unreadable PID's abstention and the retained life remain recorded.
+
 `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` belongs only to the serial
 restart-safety suite. Required Linux outcomes: SIGKILL/restart reaps the command and child with per-PID
 identity/daemon-life diagnostics; re-sessioned mark-kept descendants are reaped; detached
