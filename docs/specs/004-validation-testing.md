@@ -833,6 +833,99 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | Native rollback in a held not-due rollup flush | Covered (`rollup-admission.test.ts` — a later-sibling trigger first proves the new prefix, snapshot and both projections exist in the same transaction, then real ROLLBACK leaves no event/snapshot/projection/cursor/retry, checkpoint or cleared hold; prior rows and a nonempty recipient cache survive, the original error is reported with one errored history row, no Interpret runs, and a forced-due reopen replays the whole held span once. Real ABORT retains prefix and ordered suffix. A hold captured before a parsed source/instructions/urgency edit keeps its captured route, content and urgency, and the opaque source baseline, through an ABORT flush and reopen). |
 | A notify-policy edit drains held rollup work through the flush's owned transaction | Covered (`rollup-admission.test.ts` — an edit that moves the rollup window drains, outside any window, the hold read under the writer lock, including an envelope another writer committed immediately before BEGIN; the source baseline and its clock are unchanged. A real ROLLBACK or ABORT on the second held envelope, at a minute the edited window matches, rolls the whole drain back: no event, snapshot, projection, cursor, retry, drop or metadata change, the prior recipient cache survives, the edit is reported blocked, and no window flush, poll or Interpret runs. After the fault clears the next tick drains every captured envelope once). |
 
+### 3.4.2 Process-level ingress interruption acceptance (Refs #568)
+
+`apps/cli/src/commands/daemon-ingress-kill-fault.integration.test.ts` is required in
+`test:serial`, shared by CI and `pnpm verify`. It starts the already-built CLI as a real
+owned child, with an isolated on-disk SQLite database, Unix socket and loopback HTTP stub.
+The poll fixture uses bundled `api-poll`. The watch fixture adds a **test-only** `fs.watch`
+wrapper around bundled `file-fingerprint.observe()` and exercises the runtime's actual
+watch ingestion; this does not claim shipped file-source watch support (003 §3.8 remains
+target). Each fixture watch round waits for both a native notification and the parent's
+completed file write before sampling; repeated callbacks do not create additional rounds.
+A flush requests a state-only pull over IPC and never rewrites the input file. This isolates
+runtime interruption from concurrent input mutation without claiming shipped watch settling.
+Deterministic source-level read-race tests separately require checkpoint/snapshot consistency
+and refusal of detected concurrent writes (003 §3.2).
+
+For immediate, debounce and rollup pacing, tests MUST interrupt every SQL write occurrence
+observed during acceptance, held release, retry admission and retry completion. Immediate
+pacing has no held-release phase. Discovery traces the entire asynchronous tick and
+watch-consumption lifecycle at the SQLite driver, including `RETURNING` statements and repeated writes for two recipients. Each discovered
+occurrence receives both a fault before execution and a SIGKILL immediately after execution,
+then an independent process restart. No source data, runtime result or transaction is mocked.
+Fixed wall clocks govern deadlines/windows; IPC messages and actual filesystem notifications
+synchronize the test. Timeout timers only fail stalled waits. Owned children are reaped, with
+POSIX group termination confirmed by the shared helper, before fixture files are removed.
+
+Every case MUST assert exactly one event per distinct source change, persisted monitor order,
+complete snapshots/cursors/projections, unread delivery to both registered lead sessions across
+restart, and no projection to a subagent session. Failed ingest writes MUST identify the monitor
+in the original `erroredObservations` tick result or watch `onError` callback and persist an
+`errored` history row. History MUST never claim `triggered` when no event committed. The extra
+post-commit history-write cases retain 002 §15's existing best-effort audit semantics: a failed
+audit write cannot undo a committed event and is not itself an ingestion error.
+
+The independent reader MUST compare each shared snapshot's content against the expected
+source value, and its workspace/monitor/object/event identity against the corresponding
+event. Comparing only row counts or the event's separate inline snapshot is insufficient.
+Each recipient cursor MUST retain the expected baseline content and baseline event identity
+under the exact session/workspace/monitor/object key, including after restart.
+
+The four admission operations (`ingest`, held flush, retry drain and notify reconciliation)
+automatically contribute every executed prepared write to the interruption inventory. Every
+other lifecycle write MUST match an explicit named exclusion or fail with its SQL and call
+site, even if runtime error handling catches the failure. Current exclusions are unarmed
+startup/restart setup, the exact expired-object-suppression DELETE from its maintenance
+method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
+is checked separately). Delivery refresh reaches no additional durable writes in these
+fixtures; it has no blanket exclusion. Direct SQL and deferred iterator writes are refused
+with the same diagnostic until they have deliberate interruption support. Writable
+iterators MUST be wrapped whenever created: creation and every supported `next`,
+`return` or `throw` inside a traced lifecycle are refused with SQL and call-site
+evidence, even if the iterator predates lifecycle entry. Outside lifecycle ownership,
+native iterator behavior is preserved. Both `exec()`
+and the native `pragma()` entrypoint MUST require an explicit read-only PRAGMA
+allowlist, no assignment (including parenthesized setting writes), and SQLite
+statement `readonly` metadata. Only schema-inspection PRAGMAs accept object-name
+arguments. Unknown PRAGMAs and state-changing operations such as `optimize`,
+`analysis_limit`, `wal_checkpoint`, `incremental_vacuum`, `auto_vacuum` and even a
+`journal_mode` query MUST fail with their exact SQL, regardless of `readonly`.
+Direct `ANALYZE`, `VACUUM`, `REINDEX`, `ATTACH` and `DETACH` are likewise refused.
+Other direct SQL requires one preparable read-only statement; a readable prefix
+cannot conceal another statement. Database-file changes, including statistics and
+maintenance, require deliberate interruption support or a named exclusion.
+Prepared read statements MUST apply the same admission at execution, including
+handles prepared before lifecycle entry, through `run`, `get`, `all` and iterator
+advancement/finalization. Table-valued `pragma_*` functions outside the query
+allowlist MUST be refused even inside a read-only outer `SELECT`.
+The allowlist is the first line of admission; a SQL-independent comparison of the
+complete main-file and WAL bytes around each synchronous admitted read is the
+file-effect guarantee. It detects statistics writes, maintenance, truncation and
+same-size WAL frame reuse. A changed file MUST fail with `unclassified-write`,
+SQL and call-site evidence, including after an execution throws. Shared-memory
+reader-lock changes are excluded. Fixtures own private database paths and one
+writable runtime connection; sources never receive the database path, IPC uses
+the same connection, and parent assertions only read at completed command
+barriers or after writer exit. Synchronous sampling permits no interleaved runtime
+callback. A separate-process WAL-reader regression MUST remain admitted, and
+unknown same-size main/WAL effects MUST be refused independently of SQL patterns.
+`ingress-preload.test.ts` independently exercises asynchronous tick/watch discovery and
+classification failures. The acquisition-path extra-write, corrupted shared-snapshot-content,
+and corrupted recipient-baseline mutations MUST all fail the suite.
+
+This is executed-path discovery, not proof that every possible branch in arbitrary source/Interpret
+code was reached; invalid-envelope/loss-capacity and policy-edit branches retain their separate
+runtime regression obligations. A scratch-copy mutation removing a durable snapshot write must
+fail the invariant assertions even though that removed write no longer appears in discovery.
+Retry re-arm and skip interruption cases remain an explicit linked TODO for #615 in the test
+file, rather than skipped tests. The repair commands themselves are already on main.
+
+Verification launched with an isolated home/data root MUST retain 002 §10.3's socket
+normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resolved socket,
+including an explicitly overlong derived path, rather than assuming the raw workspace path
+always fits the Unix socket limit.
+
 ### 3.5 CLI behavior
 
 | Scenario                                                                                                                                                                           | Coverage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

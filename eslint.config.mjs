@@ -54,7 +54,11 @@ export default tseslint.config(
   {
     // Owned child-process fixtures are native Node JavaScript outside the
     // TypeScript project, like repository scripts, but still receive lint checks.
-    files: ['scripts/**/*.mjs', 'libs/core/src/runtime/test-fixtures/**/*.mjs'],
+    files: [
+      'scripts/**/*.mjs',
+      'libs/core/src/runtime/test-fixtures/**/*.mjs',
+      'apps/cli/src/commands/fixtures/ingress-preload.mjs',
+    ],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: {
@@ -63,6 +67,8 @@ export default tseslint.config(
       globals: {
         console: 'readonly',
         process: 'readonly',
+        Atomics: 'readonly',
+        SharedArrayBuffer: 'readonly',
       },
     },
   },

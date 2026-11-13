@@ -9,6 +9,83 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Refuse pre-existing deferred writers during ingress (004 §3.4.2) — Refs #568
+
+Writable iterators are wrapped at creation regardless of lifecycle ownership.
+Their supported advance/finalization methods refuse execution inside tick/watch
+lifecycles with SQL and call-site evidence, including iterators created earlier.
+Regressions verify both lifecycle boundaries, durable absence of the refused row,
+continued in-lifecycle creation refusal, admitted read iterators and native writable
+execution outside ownership. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Verify admitted SQLite reads preserve database files (004 §3.4.2) — Refs #568
+
+Prepared statements now apply query admission at execution, including pre-existing
+handles and iterator advancement/finalization. Table-valued PRAGMAs outside the
+query allowlist are refused inside SELECTs. Every admitted read compares complete
+main-file/WAL bytes around synchronous execution; unexpected effects fail with
+SQL and call-site diagnostics. Same-size overwrite regressions exercise every
+entrypoint, and a separate-process WAL reader verifies the fixture ownership and
+reader-lock boundary. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Require explicit direct-SQL query admission (004 §3.4.2) — Refs #568
+
+Direct `exec()` and native `pragma()` calls now require a named query-PRAGMA allowlist,
+no assignment and driver read-only metadata. Other PRAGMAs and direct maintenance
+statements are refused even when SQLite reports `readonly=true`: a single-table
+`optimize` can persist statistics under that flag. Tick/watch regressions exercise
+both optimizer entrypoints, unknown and setting PRAGMAs, maintenance and admitted
+queries. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Classify direct SQLite PRAGMA writes (004 §3.4.2) — Refs #568
+
+Ingress discovery now guards both direct SQL execution and the native PRAGMA entrypoint
+using the driver's statement read-only metadata. Writable PRAGMAs must fail with SQL
+and call-site diagnostics; read-only queries remain allowed. Direct SQL without a single
+preparable statement fails closed rather than admitting an unclassified trailing write.
+Independent tick/watch regressions cover both PRAGMA entrypoints and a write-effect
+checkpoint PRAGMA without an assignment.
+
+## 2026-11-12 — Complete ingress write classification and artifact checks (004 §3.4.2) — Refs #568
+
+Interruption discovery now observes the full asynchronous tick and watch-consumption
+lifecycles. Writes outside the admission inventory must match a named setup, exact
+maintenance or injected-fault diagnostic exclusion; otherwise the suite fails with SQL
+and call-site evidence. Shared snapshots are checked against source values and exact
+workspace/monitor/object/event identities, and recipient cursors against baseline contents,
+provenance and session identity. Extra acquisition writes, corrupted snapshot contents and
+corrupted cursor baselines must fail acceptance. Retry re-arm/skip interruptions remain
+tracked separately as #615.
+
+## 2026-11-12 — Consistent file samples under concurrent writes (003 §3.2; 004 §3.4.2) — Refs #568
+
+File fingerprints and snapshots now share one byte sample. Identity, size and high-resolution
+metadata validation refuses detected concurrent writes without advancing the source checkpoint.
+Reported size remains advisory for virtual files. A stable empty or partial file remains valid;
+no writer-completion guarantee or retry is added.
+The ingress fixture orders non-atomic input completion before each native-watch round and uses
+state-only pulls for held-work flushes, avoiding synthetic truncate/write observations during
+flush. Dedicated deterministic source tests cover read races and unchanged-content deduplication.
+
+## 2026-11-12 — Real-process ingress kill/fault acceptance (004 §3.4.2) — Refs #568
+
+Require real bundled CLI processes, on-disk SQLite, loopback `api-poll` input and filesystem-backed
+watch ingestion under immediate, debounce and rollup pacing. Driver discovery enumerates SQL
+write occurrences during acceptance, held release, retry admission and retry drain; each is
+faulted before execution and killed after execution, with restart assertions for exactly-once
+ordered events, complete persistence and unread recipient projections. Fixed clocks and event
+barriers replace synchronization sleeps, and cleanup confirms owned-process termination.
+
+The file source has no shipped `watch()` yet, so the fixture explicitly adds a test-only native
+filesystem watcher around its real observation implementation. Watch faults use their existing
+`onError` surface; tick faults use `erroredObservations`. Extra audit-write cases preserve the
+existing best-effort contract. Discovery covers executed paths, not all possible plugin branches;
+existing invalid-envelope, capacity/loss and policy-edit regressions remain required. Retry
+re-arm/skip cases are a linked TODO for #584 and do not block this suite.
+The manual socket regression also checks the canonical resolved socket, with an explicit
+overlong data root, so an isolated verification home exercises the existing fallback contract
+instead of failing on an unnormalized test expectation. Published behavior is unchanged.
+
 ## 2026-11-12 — Keep follow-up inspection IDs positional (005 §6, §15) — Refs #584
 
 Every suggested `monitor explain` and `monitor history` command puts flags before `--` and the
