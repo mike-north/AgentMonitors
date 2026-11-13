@@ -933,7 +933,7 @@ uncommitted observation recovery, power-loss durability, or the pending material
 | Native rollback in a held not-due rollup flush | Covered (`rollup-admission.test.ts` — a later-sibling trigger first proves the new prefix, snapshot and both projections exist in the same transaction, then real ROLLBACK leaves no event/snapshot/projection/cursor/retry, checkpoint or cleared hold; prior rows and a nonempty recipient cache survive, the original error is reported with one errored history row, no Interpret runs, and a forced-due reopen replays the whole held span once. Real ABORT retains prefix and ordered suffix. A hold captured before a parsed source/instructions/urgency edit keeps its captured route, content and urgency, and the opaque source baseline, through an ABORT flush and reopen). |
 | A notify-policy edit drains held rollup work through the flush's owned transaction | Covered (`rollup-admission.test.ts` — an edit that moves the rollup window drains, outside any window, the hold read under the writer lock, including an envelope another writer committed immediately before BEGIN; the source baseline and its clock are unchanged. A real ROLLBACK or ABORT on the second held envelope, at a minute the edited window matches, rolls the whole drain back: no event, snapshot, projection, cursor, retry, drop or metadata change, the prior recipient cache survives, the edit is reported blocked, and no window flush, poll or Interpret runs. After the fault clears the next tick drains every captured envelope once). |
 
-### 3.4.2 Process-level ingress interruption acceptance (Refs #568)
+### 3.4.2 Process-level ingress interruption acceptance (Refs #568, #615)
 
 `apps/cli/src/commands/daemon-ingress-kill-fault.integration.test.ts` is required in
 `test:serial`, shared by CI and `pnpm verify`. It starts the already-built CLI as a real
@@ -1018,8 +1018,48 @@ This is executed-path discovery, not proof that every possible branch in arbitra
 code was reached; invalid-envelope/loss-capacity and policy-edit branches retain their separate
 runtime regression obligations. A scratch-copy mutation removing a durable snapshot write must
 fail the invariant assertions even though that removed write no longer appears in discovery.
-Retry re-arm and skip interruption cases remain an explicit linked TODO for #615 in the test
-file, rather than skipped tests. The repair commands themselves are already on main.
+`daemon-retry-kill-fault.integration.test.ts` extends the same owned-process harness and
+preload to `monitor retry rearm` and `monitor retry skip`, and runs alongside ingress in
+`test:serial` on Linux CI and in `pnpm verify`. Repair requests are synchronous lifecycle
+and admission boundaries; the wrapper MUST preserve their return values and exceptions.
+Every prepared write executed by a repair is discovered at the driver, without a table or
+SQL inventory in the test. Direct SQL retains the existing fail-closed policy. Unit probes
+MUST verify both repair boundaries discover writes and reject direct SQL.
+
+For each command under immediate, debounce and rollup pacing, a real bundled API-poll
+observation is retained by an event write fault, then exhausted through the store's normal
+failed-attempt transition. Every discovered repair write receives a SIGKILL after execution
+and a fault before execution. Each scenario MUST name command, pacing, interruption mode,
+SQL and occurrence; a CLI repair failure MUST exit nonzero with a diagnostic (including
+unknown-outcome guidance after an accepted request loses its daemon).
+
+After writer exit, an independent reader MUST find either the original terminal retry
+unchanged, or exactly the requested outcome: one pending retry preserving its envelope,
+route, identity and admission position with attempts/error reset, or no retry and exactly
+one skip loss identifying that retry. No event may materialize during the repair. After
+restart and repeated completed ticks, an armed retry MUST produce exactly one event and
+snapshot and leave no retry or loss; terminal work MUST remain terminal and skipped work
+MUST retain one loss. Doctor MUST report that single terminal retry or single outstanding
+loss, respectively. Successful discovery controls MUST also exercise the committed rearm
+and skip branches, since kills within a transaction ordinarily exercise rollback. A
+scratch-bundle mutation separating the skip loss receipt from retry deletion MUST fail
+these assertions; restoring the original bytes MUST return the scenario to green.
+
+Both commands MUST also discover the retired verify-artifact branch under each pacing
+policy: register an active owner and its exact verify scratch key, retain and exhaust
+its retry through the store, then request cleanup before tracing the repair. Every
+executed write receives both interruption modes, with `retired-artifact` in the scenario
+name. Before restart, only the unchanged terminal retry or completed cleanup is valid;
+cleanup MUST leave no event, snapshot, skip loss or `errored` row. Startup and repeated
+completed ticks MUST finish any rolled-back cleanup without materializing the artifact,
+and doctor MUST report no remaining retry or loss. Successful controls MUST report
+`verify-artifact-cleanup`. A scratch-bundle mutation throwing before the cleanup DELETE
+MUST fail a retired-artifact scenario; restoring identical bytes MUST pass. Repair
+rejections (missing, already rearmed or skipped, or wrong-route retries) write nothing
+and have no interruption inventory. Skip MUST also trace an upgraded retry without
+an admission position: its loss INSERT uses the current event high-water mark instead
+of a bound position (002 §2.7). Both interruption modes and the ordinary skip/restart
+assertions apply under each pacing policy.
 
 Verification launched with an isolated home/data root MUST retain 002 §10.3's socket
 normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resolved socket,

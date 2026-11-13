@@ -37,6 +37,7 @@ export default defineConfig({
       '**/daemon-crash-recovery.integration.test.ts',
       '**/daemon-restart-sweep.integration.test.ts',
       '**/daemon-ingress-kill-fault.integration.test.ts',
+      '**/daemon-retry-kill-fault.integration.test.ts',
       '**/verify.integration.test.ts',
       '**/cli.docker.test.ts',
       // Spawns a real `channel serve` subprocess and waits for it to exit on
