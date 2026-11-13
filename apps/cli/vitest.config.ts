@@ -44,6 +44,11 @@ export default defineConfig({
       // its own, so it belongs with the other process-spawning suites.
       '**/channel-shutdown.integration.test.ts',
       '**/transport-health.integration.test.ts',
+      // Real preset captures start multiple Node helpers before a short command
+      // deadline; CPU contention must not turn fixture startup into a timeout.
+      '**/pr-alerting-presets.test.ts',
+      // Caller-exit timing is measured in a real subprocess without runner contention.
+      '**/source-command-lifetime.test.ts',
       '**/daemon-reaper-lease.integration.test.ts',
     ],
   },

@@ -297,7 +297,12 @@ appearing, the pass is incomplete and each still-discovered PID gets an abstenti
 bounds startup work without guessing at identifiers or repeatedly signalling a disputed PID.
 
 The launcher preserves the recorded command PID and group; the watchdog and authored descendants
-inherit the same life mark. The sweep is reconciliation, not the live lifetime bound of #470. Commands from releases before
+inherit the same life mark. A leftover watchdog is owned work: Linux reconciliation records
+and reaps its exact PID/start-time/group identity through the same inherited-mark gate as
+the command and marked descendants. A command, one descendant and its watchdog therefore
+produce three reaped outcomes, including terminal evidence for the watchdog. It never
+changes group and cannot survive the group’s self-directed SIGKILL; restart cleanup can end
+it sooner. The sweep is reconciliation, not the live lifetime bound of #470. Commands from releases before
 ownership journaling cannot be safely attributed and are not heuristically collected. Windows
 currently records unavailable discovery rather than claiming a successful sweep. Stray daemons,
 channel servers and stale sockets remain the separate #426 scope.

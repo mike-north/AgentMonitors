@@ -1583,14 +1583,21 @@ validation note in §11.7).
 **POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
 An asynchronous launcher starts an in-group watchdog and waits for its timer-armed
 acknowledgement before replacing itself with the authored command. The command retains its
-PID, process group and inherited ownership mark; argv remains literal. Arming failure is an
+PID, process group and inherited ownership mark; argv remains literal. The launcher uses direct
+`execve`, preserving kernel symlink traversal and authored environment values without an
+interposed shell. Internal Node helpers explicitly select CommonJS mode; authored
+`NODE_OPTIONS` still reach the command unchanged. A native exec failure (including a missing
+shebang interpreter, which Node reports by aborting the launcher) is an execution failure,
+never an authored nonzero result, and preserves the prior successful baseline (§11.5). Arming failure is an
 execution failure and no authored work runs. No synchronous subprocess, FIFO or blocking open
 runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute deadline
 and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
 continued membership supplies identity safety, independent of daemon liveness and command
 stdio. Once a normally completed finite observation has captured its output, it releases
 the whole original group through the watchdog, including any remaining background work.
-Timeout failures retain the full kill grace; daemon EOF alone never releases the bound. This
+Timeout failures retain the full kill grace; after observation settlement the caller-side
+control channel is unreferenced so a finished consumer can exit during that grace. The
+watchdog retains its own referenced timers. Daemon EOF alone never releases the bound. This
 also covers background descendants that close every inherited descriptor. Re-sessioned descendants
 remain restart-sweep work; the Windows path retains its existing daemon-resident tree kill.
 

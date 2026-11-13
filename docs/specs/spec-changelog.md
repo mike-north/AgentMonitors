@@ -9,6 +9,17 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-13 — Preserve command admission semantics and account for watchdog cleanup (003 §11; 008 §4.2) — Refs #470
+
+Clarify current direct-exec behavior: kernel path traversal and authored environment values
+survive admission, helper module mode does not change authored Node options, and native exec
+failures retain failing health and the prior successful baseline. Settled callers release their
+control-channel event-loop reference while the watchdog retains its independent kill grace.
+Restart reconciliation includes the marked watchdog as an independently identified process;
+a command with one descendant yields three Linux reaped outcomes. The existing identity gate
+and terminal-evidence requirement apply to all three. Verified by source admission regressions,
+the standalone consumer lifetime test and the restart-sweep integration suite.
+
 ## 2026-11-13 — Bound POSIX commands independently of daemon lifetime (003 §11; 008 §3–§5) — Refs #470
 
 Require a timer-armed in-group watchdog before authored command execution. Preserve the command

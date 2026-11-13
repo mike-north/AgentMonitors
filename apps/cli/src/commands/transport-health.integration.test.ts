@@ -8,6 +8,7 @@ import {
   mkdirSync,
   mkdtempSync,
   rmSync,
+  renameSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -706,8 +707,15 @@ This monitor fires on a schedule.
         expect(result.exitCode, result.stderr).toBe(0);
       };
 
+      // This scenario publishes two complete versions. In-place truncation can
+      // legitimately become a third source sample while another process reads.
+      const replaceWatchedContent = (content: string): void => {
+        const staged = `${watchedFile}.next`;
+        writeFileSync(staged, content, 'utf-8');
+        renameSync(staged, watchedFile);
+      };
       expect(unreadIds()).toEqual([]);
-      writeFileSync(watchedFile, 'first changed content', 'utf-8');
+      replaceWatchedContent('first changed content');
       const [a] = await waitForUnread(1);
       if (!a) throw new Error('First event missing');
       expect(claim()).toMatchObject({ mode: 'delivery', urgency: 'normal' });
@@ -723,7 +731,7 @@ This monitor fires on a schedule.
       assertHealthy();
 
       // No acknowledgment of A occurs before B is observed and delivered.
-      writeFileSync(watchedFile, 'second changed content', 'utf-8');
+      replaceWatchedContent('second changed content');
       const both = await waitForUnread(2);
       expect(both).toContain(a);
       const b = both.find((id) => id !== a);

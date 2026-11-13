@@ -62,15 +62,14 @@ process.disconnect();
 
 /**
  * Wait for the watchdog's armed acknowledgement before replacing this process.
- * The fixed shell trampoline preserves execvp's script/PATH behavior while
- * passing each authored argument literally; it never interprets authored text.
+ * Direct exec preserves authored argv and environment without a shell rewriting
+ * either. Native exec failures remain execution failures, never command results.
  * All work here runs in the asynchronous child, never synchronously on observe.
  * @internal
  */
 export const LAUNCHER_PROGRAM = String.raw`
 const {spawn} = require('node:child_process');
 const {write, promises: fs, constants} = require('node:fs');
-const path = require('node:path');
 const {command, deadline, grace, watchdog} = JSON.parse(process.argv[1]);
 let armed = false;
 function fail(error) {
@@ -79,23 +78,23 @@ function fail(error) {
 }
 async function launch() {
   if (typeof process.execve !== 'function') throw new Error('POSIX execve is unavailable');
-  // Resolve to an absolute executable before entering the fixed shell, so a
-  // filename beginning with a dash cannot become an exec option. Preserve
-  // ordinary spawn-failure health semantics on missing/inaccessible commands.
-  // Lookups are asynchronous and use the command's effective cwd/environment.
+  // Preserve every path component for kernel symlink/.. traversal; lexical
+  // normalization can silently select a different executable. Prefixing cwd
+  // makes relative/dash-prefixed names unambiguous without rewriting them.
+  // Lookups stay asynchronous and use the command's effective cwd/environment.
   const file = command[0];
-  const candidates = file.includes('/') ? [file] : (process.env.PATH ?? '/usr/bin:/bin').split(':').map(dir => path.join(dir || '.', file));
+  const candidates = file.includes('/') ? [file] : (process.env.PATH ?? '/usr/bin:/bin').split(':').map(dir => (dir || '.') + '/' + file);
   let executable;
   for (const candidate of candidates) {
     try {
       await fs.access(candidate, constants.X_OK);
-      if ((await fs.stat(candidate)).isFile()) { executable = path.resolve(candidate); break; }
+      if ((await fs.stat(candidate)).isFile()) { executable = candidate.startsWith('/') ? candidate : process.cwd() + '/' + candidate; break; }
     } catch (error) {
       if (!['ENOENT', 'ENOTDIR', 'EACCES'].includes(error.code)) throw error;
     }
   }
   if (!executable) throw new Error('Executable not found or not executable: ' + file);
-  const child = spawn(process.execPath, ['-e', watchdog, JSON.stringify({deadline, grace})], {
+  const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
     detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
   });
   child.once('error', fail);
@@ -109,7 +108,9 @@ async function launch() {
       if (Number(process.hrtime.bigint() / 1000000n) >= deadline) { fail(new Error('Deadline elapsed before command admission')); return; }
       // execve closes nonstandard descriptors. The watchdog owns its independent
       // duplicate of fd 3, and its referenced timers survive this replacement.
-      try { process.execve('/bin/sh', ['sh', '-c', 'exec "$@"', 'command-poll', executable, ...command.slice(1)], process.env); }
+      // Node aborts on a native exec failure (e.g. a missing shebang interpreter),
+      // so it cannot masquerade as an authored nonzero exit or replace a baseline.
+      try { process.execve(executable, [command[0], ...command.slice(1)], process.env); }
       catch (error) { fail(error); }
     });
   });

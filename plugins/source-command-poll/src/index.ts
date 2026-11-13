@@ -1,5 +1,6 @@
 /** Execute finite, self-bounding command observations with optional durable ownership and shutdown cancellation. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { Socket } from 'node:net';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
 import type {
@@ -365,6 +366,7 @@ async function runCommand(
       ? args
       : [
           '--disable-warning=ExperimentalWarning',
+          '--input-type=commonjs',
           '-e',
           LAUNCHER_PROGRAM,
           JSON.stringify({
@@ -542,6 +544,9 @@ async function runCommand(
       ) {
         control.write('complete\n');
       }
+      // The independent watchdog keeps its own timers referenced. A settled
+      // caller may exit immediately even while timeout descendants use the grace.
+      if (control instanceof Socket) control.unref();
       resolve(outcome);
     }
 

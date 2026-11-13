@@ -213,18 +213,31 @@ function monitor(
     child.on('message',(message)=>{if(message==='ready')child.send('arm');else if(message==='armed'){fs.writeFileSync('ready','ready');if(${exitLeader})process.exit(0)}});
     setInterval(()=>{},1000);
   `;
+  // The watchdog remains a marked member of this command life. Capture its
+  // identity before admission so the sweep must account for that exact process.
+  const preload = path.join(workspace, 'watchdog.cjs');
+  writeFileSync(
+    preload,
+    `
+    let admission;
+    try { admission=JSON.parse(process.argv[1]); } catch {}
+    if (admission && admission.deadline && !admission.command) {
+      require('node:fs').writeFileSync('watchdog.json', JSON.stringify({pid:process.pid,mark:process.env.AGENTMONITORS_COMMAND_LIFE}));
+    }
+  `,
+  );
   const dir = path.join(monitors, 'command');
   mkdirSync(dir);
   writeFileSync(
     path.join(dir, 'MONITOR.md'),
-    `---\nname: Restart cleanup\nwatch:\n  type: command-poll\n  command: ${JSON.stringify([process.execPath, '-e', fixture])}\n  timeout: ${timeout}\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
+    `---\nname: Restart cleanup\nwatch:\n  type: command-poll\n  command: ${JSON.stringify([process.execPath, '-e', fixture])}\n  timeout: ${timeout}\n  env:\n    NODE_OPTIONS: ${JSON.stringify('--require=' + preload)}\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
   );
 }
 
 /** Crash only after process readiness, then disable new work so a restart cannot mask leftovers. */
 async function orphan(
   mode: 'tree' | 'detached' | 'escaped' | 'group-unmarked',
-): Promise<{ parent: number; child: number }> {
+): Promise<{ parent: number; child: number; watchdog: number; life: string }> {
   monitor(mode);
   const daemon = await start();
   await expect
@@ -239,7 +252,10 @@ async function orphan(
   rmSync(path.join(monitors, 'command'), { recursive: true });
   expect(ownedWorkerTerminated(pids.parent)).toBe(false);
   expect(ownedWorkerTerminated(pids.child)).toBe(false);
-  return pids;
+  const watchdog: { pid: number; mark: string } = JSON.parse(
+    readFileSync(path.join(workspace, 'watchdog.json'), 'utf8'),
+  );
+  return { ...pids, watchdog: watchdog.pid, life: watchdog.mark };
 }
 
 describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
@@ -357,18 +373,31 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
               diagnostics()?.outcomes.filter((o) => o.status === 'reaped')
                 .length,
           )
-          .toBe(2);
-        for (const pid of [pids.parent, pids.child]) {
+          .toBe(3);
+        // Command, descendant and watchdog are three independently identified
+        // processes. The watchdog's inherited mark uses the unchanged gate.
+        for (const pid of [pids.parent, pids.child, pids.watchdog]) {
           await expect.poll(() => ownedWorkerTerminated(pid)).toBe(true);
           expect(diagnostics()?.outcomes).toContainEqual(
             expect.objectContaining({
               pid,
               status: 'reaped',
-              life: expect.any(String),
-              evidence: expect.any(Object),
+              life: pids.life,
+              evidence: expect.objectContaining({ mark: pids.life }),
             }),
           );
         }
+        expect(diagnostics()?.outcomes).toContainEqual(
+          expect.objectContaining({
+            pid: pids.watchdog,
+            status: 'reaped',
+            evidence: expect.objectContaining({
+              pgid: pids.parent,
+              via: 'inherited-mark',
+            }),
+          }),
+        );
+        await waitForOwnedGroupTermination(pids.parent, Date.now() + 1000);
       }, 30_000);
     }
 

@@ -41,6 +41,9 @@ export default defineConfig({
       'src/commands/cli.docker.test.ts',
       'src/channel-shutdown.integration.test.ts',
       'src/commands/transport-health.integration.test.ts',
+      // Preset subprocess captures share the daemon suites' CPU-isolation need.
+      'src/commands/pr-alerting-presets.test.ts',
+      'src/commands/source-command-lifetime.test.ts',
       'src/commands/daemon-reaper-lease.integration.test.ts',
     ],
     // No file-level parallelism — each file must complete before the next

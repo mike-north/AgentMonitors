@@ -1,5 +1,12 @@
 /** Self-bounding admission is asynchronous, ordered before user work, and fails closed. */
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -64,6 +71,122 @@ describe.skipIf(process.platform === 'win32')(
         stdout: 'literal',
         exitCode: 0,
       });
+    });
+
+    // Kernel traversal of symlink/.. must choose the same executable as spawn.
+    it.each(['explicit', 'PATH'])(
+      'preserves symlink traversal in %s executable names',
+      async (lookup) => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'bound-link-'));
+        mkdirSync(path.join(dir, 'target', 'nested'), { recursive: true });
+        symlinkSync('target/nested', path.join(dir, 'alias'));
+        writeFileSync(path.join(dir, 'probe'), '#!/bin/sh\nprintf wrong', {
+          mode: 0o700,
+        });
+        writeFileSync(
+          path.join(dir, 'target', 'probe'),
+          '#!/bin/sh\nprintf intended',
+          { mode: 0o700 },
+        );
+        const result = await source.observe(
+          {
+            command: [lookup === 'explicit' ? './alias/../probe' : 'probe'],
+            cwd: dir,
+            env: { PATH: './alias/..' },
+            timeout: '2s',
+          },
+          { now: new Date() },
+        );
+        expect(result.nextState).toMatchObject({
+          health: 'ok',
+          stdout: 'intended',
+          exitCode: 0,
+        });
+      },
+    );
+
+    it('preserves the good baseline when the executable has a missing shebang interpreter', async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'bound-exec-'));
+      const file = path.join(dir, 'probe');
+      writeFileSync(file, '#!/missing-review-624-interpreter\n', {
+        mode: 0o700,
+      });
+      const previousState = {
+        stdout: 'good-baseline',
+        exitCode: 7,
+        truncated: false,
+        health: 'ok',
+        baselined: true,
+      };
+      const result = await source.observe(
+        { command: [file], cwd: dir, timeout: '2s' },
+        { now: new Date(), previousState },
+      );
+      expect(result.nextState).toMatchObject({
+        ...previousState,
+        health: 'failing',
+      });
+      expect(result.observations[0]?.payload).toMatchObject({
+        error: expect.stringContaining('SIGABRT'),
+      });
+    });
+
+    it.each(['authored', 'inherited'])(
+      'pins helper module mode with %s NODE_OPTIONS while retaining command mode',
+      async (origin) => {
+        if (origin === 'inherited')
+          process.env.NODE_OPTIONS = '--input-type=module';
+        const env =
+          origin === 'authored' ? { NODE_OPTIONS: '--input-type=module' } : {};
+        for (const command of [
+          [
+            process.execPath,
+            '-e',
+            'export {}; process.stdout.write("module-ok")',
+          ],
+          ['/bin/echo', 'native-ok'],
+        ]) {
+          const result = await source.observe(
+            { command, env, timeout: '2s' },
+            { now: new Date() },
+          );
+          expect(result.nextState).toMatchObject({
+            health: 'ok',
+            stdout:
+              command[0] === process.execPath ? 'module-ok' : 'native-ok\n',
+            exitCode: 0,
+          });
+        }
+      },
+    );
+
+    it('passes every authored environment value through without shell rewrites', async () => {
+      const env = {
+        PWD: 'authored-value',
+        OLDPWD: 'old-value',
+        SHLVL: '47',
+        IFS: 'literal-ifs',
+        PS1: 'literal-prompt',
+        _: 'literal-underscore',
+        'fixture-key': 'literal-value',
+      };
+      const result = await source.observe(
+        {
+          command: [
+            process.execPath,
+            '-e',
+            'process.stdout.write(JSON.stringify(Object.fromEntries(JSON.parse(process.argv[1]).map(key => [key, process.env[key]]))))',
+            JSON.stringify(Object.keys(env)),
+          ],
+          env,
+          timeout: '2s',
+        },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({ health: 'ok', exitCode: 0 });
+      expect(
+        JSON.parse((result.nextState as { stdout: string }).stdout),
+      ).toEqual(env);
     });
 
     it('keeps the native execution clock when a host virtualizes its scheduling clock', async () => {
