@@ -614,6 +614,17 @@ describe('resolved dependency versions clear known advisories (lockfile regressi
 // advisory's `paths` (via `resolvedVersionsUnderAncestor`'s ancestor-scoped
 // search of the `pnpm why --json` tree).
 const PATCHED_MINIMUMS_UNDER_ANCESTOR = [
+  // Production glob cancellation and minimatch globparts amplification fixes
+  // must reach every direct consumer, including published unbundled paths.
+  // GHSA-3g3m-2fjr-6pw4 and GHSA-g3hv-75wg-m249.
+  ...[
+    '@agentmonitors/core',
+    '@agentmonitors/cli',
+    '@agentmonitors/source-file-fingerprint',
+  ].flatMap((ancestor) => [
+    { package: 'glob', ancestor, minVersion: '14.0.2' },
+    { package: 'minimatch', ancestor, minVersion: '11.0.1' },
+  ]),
   // GHSA-68fv-2mgg-jv7q, GHSA-jqcg-44mw-7w3h, GHSA-27r3-jxmh-p828:
   // check the affected production paths independently of development tools.
   { package: 'source-map-js', ancestor: 'next', minVersion: '1.2.2' },
@@ -637,7 +648,7 @@ const PATCHED_MINIMUMS_UNDER_ANCESTOR = [
   // 4.x line — same two advisories, patched >=4.3.1.
   { package: 'js-yaml', ancestor: '@markdoc/next.js', minVersion: '4.3.1' },
   // Our own `glob` dependency (libs/core, apps/cli,
-  // plugins/source-file-fingerprint) resolves minimatch@10.x, which pulls
+  // plugins/source-file-fingerprint) resolves minimatch, which pulls
   // brace-expansion — GHSA-3jxr-9vmj-r5cp, GHSA-mh99-v99m-4gvg,
   // GHSA-rgw5-rvv9-x895 and later fixes, enforced floor >=5.0.12. Scoped to the `@agentmonitors/core`
   // ancestor (rather than `glob` or `minimatch`, whose names are also used,
