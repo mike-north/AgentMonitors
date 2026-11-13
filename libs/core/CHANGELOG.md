@@ -1,5 +1,49 @@
 # @agentmonitors/core
 
+## 0.15.0
+
+### Minor Changes
+
+- 17e29aa: Add `agentmonitors monitor retry rearm <monitorId> <retryId>` and `agentmonitors monitor retry skip <monitorId> <retryId> [--reason <text>]` to get a monitor stopped by a terminal materialization retry moving again. Re-arm returns the retry to automatic retry; once it completes, the monitor takes newer input in order. Skip records the retry's observation as an outstanding loss, like any other dropped observation, with the retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`; `doctor` and `monitor explain` report it until a later event for the same object supersedes it, and the monitor resumes. Both name the retry as `monitor explain` and `doctor` list it, refuse a retry that is not terminal, and work through the daemon or, with no daemon running, directly against the workspace's store. A daemon that received the request but did not reply is reported as an unknown outcome, never repaired a second time from the CLI. A skip's `--reason` is at most 200 characters.
+
+  When the retry's observation is a `verify` scratch artifact whose cleanup has taken effect, either command removes the retry as verify-artifact cleanup instead: no loss is recorded, `rearm` does not re-arm it, and the monitor resumes. The command says so, and its JSON output carries `outcome: "verify-artifact-cleanup"` (otherwise `"rearmed"` or `"skipped"`).
+
+  The tick report, the `monitor explain` materialization reason and the `doctor` remediation for a stopped monitor now name both commands.
+
+  Core adds `AgentMonitorRuntime.rearmMaterializationRetry()` and `skipMaterializationRetry()`, which return a `MaterializationRetryRepairResult` (`outcome`, a `MaterializationRetryRepairOutcome`, and the retry's safe metadata), with the `MaterializationRetryRepairInput` and `MaterializationRetrySkipInput` input types and the `MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH` bound.
+
+- 74543ad: Reconcile orphaned command-poll processes when the daemon starts on Linux, and record conservative ownership abstentions on macOS. Persist command ownership before spawning, verify boot and process identity before cleanup, and retain diagnostics for reaped processes and conservative abstentions, including detached descendants that keep their ownership marks.
+
+  Identify unreadable ownership marks by PID without attributing those processes to a command, and preserve those discovery abstentions before later identity queries.
+  Do not reclassify an already confirmed terminal incarnation as new unreadable work; reused identifiers with different process identities remain subject to discovery.
+
+  Require actual environment evidence for ownership: macOS system process listings mix argv and environment, so the shipped reader leaves same-user processes untouched with an explicit unproven-ownership reason. Linux retains environment-only ownership checks. A zombie/dead owner no longer suppresses reconciliation, and unavailable owner-state evidence withholds cleanup. Ownership queries are restricted to requested PIDs without per-survivor host-wide environment scans.
+
+  Record unchanged per-PID ownership uncertainty once and stop discovery when no signal was sent and no target was observed vanishing.
+
+  Apply one disappearance rule during initial discovery, gone batching, anchor confirmation, the signal gate and delivery ESRCH: retain the life and group suspicion and allow bounded rediscovery for marked late forks through the existing boot, mark and start-time gates. Remember a marked anchor's group before confirmation can lose it. Retire ownership only after fresh readable absence of its nonce, recorded group members and occupied recorded PIDs. Keep PID-only occupancy as a numeric suspicion during admission and restart, including reuse in another group, with no signal authority.
+
+  Retain original-group suspicion after direct-child exit so unmarked survivors receive conservative abstentions without numeric group signal authority. Continue verified late-fork cleanup despite unrelated unreadable ownership, preserving incomplete receipts and retryable lives.
+
+  Deduplicate unchanged unreadable-PID abstentions across post-signal snapshots. Retain original-group suspicion after a confirmed parent reap across journal reopenings, and retire the life only after no group member remains.
+
+  Batch gone-PID restart accounting and retire empty group hints at subsequent command admissions so completed commands do not accumulate unbounded restart work. Preserve possible-survivor suspicions and the life nonce for detached marked work when retiring empty hints. A hint refreshed during an admission read remains retained until a later snapshot confirms it empty; unrelated bookkeeping does not block empty-hint retirement. Persist newly discovered marked groups before signalling their anchors, retaining unmarked-survivor abstentions across journal reopenings. Keep distinct unreadable PIDs and changed uncertainty reasons as separate diagnostic outcomes.
+
+- 17e29aa: Preserve the retry workspace in repair commands printed by explain and runtime diagnostics so pasted commands address the reported retry from any directory. Share the POSIX shell argument helpers between core diagnostics and CLI suggestions, including paths with quotes and shell metacharacters.
+
+  Place repair flags before `--` and monitor/retry IDs after it in explain, runtime diagnostics, and doctor suggestions so monitors whose names begin with `-` can be repaired by pasting the printed commands.
+
+  Apply the same option terminator to every follow-up explain/history hint printed by retry repairs and doctor, including dropped observations, pending retries and orphan retained work. Core and CLI share an internal monitor command builder that owns shell quoting and flag/ID ordering without adding a public API or changing runtime repair diagnostic text.
+
+### Patch Changes
+
+- f071830: Bundle the CEL parser and its dependencies into the published build instead of installing them separately. A fresh install of `@agentmonitors/core` no longer pulls in `lodash-es@4.17.21` (GHSA-r5fr-rjxr-66jc) through `cel-js` and `chevrotain`. The bundled packages' license notices ship in `THIRD_PARTY_NOTICES.md`. CEL behavior is unchanged.
+
+  Keep live advisory coverage for the exact bundled package versions by deriving actual bundled inputs from fresh build metafiles and checking their exact versions against the workspace lockfile, including default-inlined imports and injected shims. Production and bundled code share the same scoped, expiring advisory exceptions.
+
+- 85cce73: Upgrade glob to 14.0.6 to fix moderate glob cancellation and minimatch pattern amplification advisories. Preserve monitor discovery and file-fingerprint matching for existing patterns, including directory filtering and default dotfile exclusion.
+- 17e29aa: Wake a paused watcher when its host synchronously re-arms or skips terminal work from onError. Release the repair wait when the host callback throws, as well as on wake, timeout and watcher shutdown.
+
 ## 0.14.0
 
 ### Minor Changes

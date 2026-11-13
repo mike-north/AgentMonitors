@@ -1,5 +1,19 @@
 # @agentmonitors/source-file-fingerprint
 
+## 0.5.1
+
+### Patch Changes
+
+- 85cce73: Upgrade glob to 14.0.6 to fix moderate glob cancellation and minimatch pattern amplification advisories. Preserve monitor discovery and file-fingerprint matching for existing patterns, including directory filtering and default dotfile exclusion.
+- 55b96cf: Keep file fingerprints, snapshots and checkpoints consistent during concurrent saves. Sample contents once and reject reads whose file metadata changes, preserving the previous baseline for the next observation.
+- Updated dependencies [f071830]
+- Updated dependencies [85cce73]
+- Updated dependencies [17e29aa]
+- Updated dependencies [74543ad]
+- Updated dependencies [17e29aa]
+- Updated dependencies [17e29aa]
+  - @agentmonitors/core@0.15.0
+
 ## 0.5.0
 
 ### Minor Changes

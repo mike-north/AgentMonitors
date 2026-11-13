@@ -1,5 +1,17 @@
 # @agentmonitors/source-incoming-changes
 
+## 0.4.1
+
+### Patch Changes
+
+- Updated dependencies [f071830]
+- Updated dependencies [85cce73]
+- Updated dependencies [17e29aa]
+- Updated dependencies [74543ad]
+- Updated dependencies [17e29aa]
+- Updated dependencies [17e29aa]
+  - @agentmonitors/core@0.15.0
+
 ## 0.4.0
 
 ### Minor Changes
