@@ -216,25 +216,6 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
       it(`reconciles a killed daemon's ${mode} command and descendant with honest identity diagnostics`, async () => {
         const pids = await orphan(mode);
         await start();
-        if (process.platform === 'darwin') {
-          // The shipped macOS reader has no environment-only evidence. Preserve
-          // both owned fixtures and require honest abstentions at readiness.
-          expect(diagnostics()?.status).toBe('incomplete');
-          for (const pid of [pids.parent, pids.child]) {
-            expect(ownedWorkerTerminated(pid)).toBe(false);
-            expect(diagnostics()?.outcomes).toContainEqual(
-              expect.objectContaining({
-                pid,
-                status: 'abstained',
-                reason: expect.stringMatching(/environments.*argv.*unproven/),
-              }),
-            );
-          }
-          expect(
-            diagnostics()?.outcomes.some((o) => o.status === 'reaped'),
-          ).toBe(false);
-          return;
-        }
         await expect
           .poll(
             () =>
