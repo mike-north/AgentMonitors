@@ -131,15 +131,13 @@ export function installSocketNamespace(providedScope) {
   }
 
   const guardedFunctions = new WeakMap();
-  /** Preserve native/custom-promisify call forms as well as ordinary callbacks. */
-  function guardedFileFunction(name, original, count) {
+  /** Function metadata preserves native and custom-promisify API contracts. */
+  function guardedFunction(original, checkArguments) {
     if (guardedFunctions.has(original)) {
       return guardedFunctions.get(original);
     }
     const guarded = function (...args) {
-      for (const value of args.slice(0, count)) {
-        check(`fs.${name}`, value);
-      }
+      checkArguments(args);
       return Reflect.apply(original, this, args);
     };
     // Promisify metadata can point back to the function itself.
@@ -154,7 +152,7 @@ export function installSocketNamespace(providedScope) {
       }
       const descriptor = Object.getOwnPropertyDescriptor(original, key);
       if (typeof descriptor?.value === 'function') {
-        descriptor.value = guardedFileFunction(name, descriptor.value, count);
+        descriptor.value = guardedFunction(descriptor.value, checkArguments);
       }
       if (descriptor) {
         Object.defineProperty(guarded, key, descriptor);
@@ -206,19 +204,19 @@ export function installSocketNamespace(providedScope) {
   for (const name of operations) {
     for (const variant of [name, name + 'Sync']) {
       if (typeof fs[variant] === 'function') {
-        fs[variant] = guardedFileFunction(
-          variant,
-          fs[variant],
-          pairs.has(name) ? 2 : 1,
-        );
+        fs[variant] = guardedFunction(fs[variant], (args) => {
+          for (const value of args.slice(0, pairs.has(name) ? 2 : 1)) {
+            check(`fs.${variant}`, value);
+          }
+        });
       }
     }
     if (typeof fs.promises[name] === 'function') {
-      fs.promises[name] = guardedFileFunction(
-        `promises.${name}`,
-        fs.promises[name],
-        pairs.has(name) ? 2 : 1,
-      );
+      fs.promises[name] = guardedFunction(fs.promises[name], (args) => {
+        for (const value of args.slice(0, pairs.has(name) ? 2 : 1)) {
+          check(`fs.promises.${name}`, value);
+        }
+      });
     }
   }
   for (const [prototype, method] of [
@@ -251,7 +249,7 @@ export function installSocketNamespace(providedScope) {
     'execSync',
   ]) {
     const original = childProcess[name];
-    childProcess[name] = function (...args) {
+    childProcess[name] = guardedFunction(original, (args) => {
       check(`child_process.${name}`, args[0]);
       for (const arg of args) {
         if (Array.isArray(arg)) {
@@ -264,8 +262,7 @@ export function installSocketNamespace(providedScope) {
           check(`child_process.${name} cwd`, arg.cwd);
         }
       }
-      return Reflect.apply(original, this, args);
-    };
+    });
   }
   const originalChdir = process.chdir;
   process.chdir = function (directory) {

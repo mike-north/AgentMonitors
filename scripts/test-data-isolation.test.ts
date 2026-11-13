@@ -688,3 +688,11 @@ const child=spawnSync(process.execPath,['-e',code],{env:{NODE_OPTIONS:process.en
   expect(result.status, result.stdout + result.stderr).not.toBe(0);
   expect(result.stdout + result.stderr).toContain('minimal.sock');
 }, 20000);
+
+/** Function metadata is part of Node's process API, including its result shape. */
+it('preserves custom-promisified process stdout and stderr', async () => {
+  const result = await runFixture(`import {execFile} from 'node:child_process';
+import {promisify} from 'node:util';
+it('process output',async()=>{const execute=promisify(execFile);const result=await execute(process.execPath,['-e',"process.stdout.write('out');process.stderr.write('err')"],{encoding:'utf8',timeout:3000});expect(result).toMatchObject({stdout:'out',stderr:'err'});});`);
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+}, 20000);
