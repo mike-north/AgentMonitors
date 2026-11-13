@@ -12,12 +12,12 @@
 
   Core adds `AgentMonitorRuntime.rearmMaterializationRetry()` and `skipMaterializationRetry()`, which return a `MaterializationRetryRepairResult` (`outcome`, a `MaterializationRetryRepairOutcome`, and the retry's safe metadata), with the `MaterializationRetryRepairInput` and `MaterializationRetrySkipInput` input types and the `MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH` bound.
 
-- 74543ad: Reconcile orphaned command-poll processes when the daemon starts on Linux, and record conservative ownership abstentions on macOS. Persist command ownership before spawning, verify boot and process identity before cleanup, and retain diagnostics for reaped processes and conservative abstentions, including detached descendants that keep their ownership marks.
+- 74543ad: Reconcile orphaned command-poll processes when the daemon starts on Linux and macOS, retaining conservative abstentions when environment evidence is unavailable. Persist command ownership before spawning, verify boot and process identity before cleanup, and retain diagnostics for reaped processes and conservative abstentions, including detached descendants that keep their ownership marks.
 
   Identify unreadable ownership marks by PID without attributing those processes to a command, and preserve those discovery abstentions before later identity queries.
   Do not reclassify an already confirmed terminal incarnation as new unreadable work; reused identifiers with different process identities remain subject to discovery.
 
-  Require actual environment evidence for ownership: macOS system process listings mix argv and environment, so the shipped reader leaves same-user processes untouched with an explicit unproven-ownership reason. Linux retains environment-only ownership checks. A zombie/dead owner no longer suppresses reconciliation, and unavailable owner-state evidence withholds cleanup. Ownership queries are restricted to requested PIDs without per-survivor host-wide environment scans.
+  Require actual environment evidence for ownership: Linux reads `/proc` and macOS reads kernel `KERN_PROCARGS2` through the system Python interpreter after checking for Command Line Tools or Xcode. The macOS reader skips argv by argc, batches PID requests through one helper per sweep, and abstains with a reason when tools or process environments are unavailable. Without developer tools it never invokes the Python shim. A zombie/dead owner no longer suppresses reconciliation, and unavailable owner-state evidence withholds cleanup. Ownership queries are restricted to requested PIDs without per-survivor host-wide environment scans.
 
   Record unchanged per-PID ownership uncertainty once and stop discovery when no signal was sent and no target was observed vanishing.
 

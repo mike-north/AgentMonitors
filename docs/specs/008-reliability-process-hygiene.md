@@ -178,7 +178,7 @@ daemon present. The close-on-exec residual is exercised as a sweep-reconciliatio
 Same mechanism as §3.3, stated as the crash-survival guarantee: cleanup of in-flight spawned
 work MUST NOT depend on the daemon being alive to perform it.
 
-### 4.2 The restart sweep (current Linux cleanup and macOS conservative abstentions for command-poll; adjacent hygiene remains target — #426)
+### 4.2 The restart sweep (current Linux and macOS cleanup for command-poll; adjacent hygiene remains target — #426)
 
 Before its first tick, the daemon reconciles command work from dead previous lives in its
 workspace. A separate owner-only SQLite journal beside the runtime database
@@ -228,17 +228,31 @@ target. Inside that gate, fresh process identity and boot are checked again, alo
 mark for a candidate discovered through that mark. A group-confirmed candidate instead carries
 its positively observed membership and immutable process identity. A changed/missing boot, changed
 start time, missing/unreadable required mark or unavailable process table withholds cleanup. The
-process-identity reading is the final asynchronous query inside the gate, after boot and mark
-checks, so identifier recycling during either earlier query cannot leave stale identity evidence. Stored numeric PIDs are suspicions only; the sweep never signals a stored PGID.
+process-identity reading follows boot and mark checks, so identifier recycling during either
+earlier query cannot leave stale identity evidence. Linux performs those queries separately
+for each candidate. macOS batches the fresh boot, required environment marks and final identity
+reading for each pass, then invokes the same per-PID signal gates in one microtask turn, before
+terminal queries or later discovery can age that snapshot. Stored numeric PIDs are suspicions
+only; the sweep never signals a stored PGID.
 Ownership MUST come from the actual process environment, never matching argv text. Linux reads
-`/proc/<pid>/environ` for exactly the requested identifiers. The shipped macOS system `ps` output
-mixes argv and environment without an unambiguous boundary, so it cannot prove ownership:
-macOS records same-user PIDs as unproven abstentions and does not signal them. Automatic macOS
-cleanup remains unavailable until an environment-only reader exists. Its identity/boot reads use
-bounded system `ps`/`sysctl` calls; ownership-uncertainty queries request only the supplied PIDs,
-in batches of at most 2048, and never read argv or environments. Signal-time ownership queries
-never scan all host environments; Linux queries only the candidate PID. Discovery remains bounded
-by the pass limit below rather than repeating a host-wide environment scan for each survivor.
+`/proc/<pid>/environ` for exactly the requested identifiers. macOS reads kernel
+`KERN_PROCARGS2`: argc determines exactly how many NUL-terminated argv entries to skip,
+then only envp supplies ownership. Empty and nonce-shaped arguments never become ownership.
+One asynchronous `/usr/bin/python3 -I -u` helper is owned by the entire sweep, accepts
+batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
+Discovery and fresh signal-time checks reuse that helper; no subprocess starts per survivor.
+The helper uses only standard-library ctypes and system libc, with no shipped native binary
+or Homebrew dependency. The daemon checks for the standalone Command Line Tools directory or
+a successful `/usr/bin/xcode-select -p` before invoking Python: without either, it records
+reader unavailability and never launches the CLT shim or its installation dialog. An interpreter
+that cannot run or returns invalid evidence also makes the sweep incomplete with a reason.
+An unreadable process environment (including protected executables, another user's processes
+and exit races) records a PID-specific abstention with a reason, never an unmarked/owned guess.
+Boot and identity still use bounded system `sysctl` and `ps` calls. macOS terminal evidence
+is also batched, and synchronous receipt writes are committed together before the next
+asynchronous discovery query. Signal-time ownership queries read only the requested candidate
+PIDs; neither platform scans all host environments separately for each survivor. Discovery
+remains bounded by the pass limit below.
 Neither platform persists or prints process environments. These marks are reliability evidence
 within the same-user trust boundary, not protection against deliberate impersonation by code
 running as that user.
@@ -290,10 +304,14 @@ currently records unavailable discovery rather than claiming a successful sweep.
 channel servers and stale sockets remain the separate #426 scope.
 
 **Verified:** `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` runs real daemon
-SIGKILL/restarts and asserts Linux direct/descendant cleanup, detached mark-kept cleanup, mark-erased
-escape silence, macOS unproven-environment abstentions, argv-only nonce survival, responsive unrelated PID/PGID survival with diagnostic abstention, previous-boot
+SIGKILL/restarts and asserts Linux and macOS direct/descendant cleanup, detached mark-kept cleanup, Linux mark-erased
+escape silence, argv-only nonce survival, responsive unrelated PID/PGID survival with diagnostic abstention, previous-boot
 recycling despite a retained nonce, and an empty-start receipt. Every owned process is stopped in
-cleanup, including assertion failures. `libs/core/src/process/command-process-journal.test.ts`
+cleanup, including assertion failures. `libs/core/src/process/darwin-command-marks.integration.test.ts`
+proves envp-only reads with empty/marker-shaped argv and Homebrew off PATH. The marker-reader
+suites cover unavailable tools, malformed/partial responses, per-process unreadability, bounded
+helper lifetime, batch reuse and the fresh boot/mark/start-time gates.
+`libs/core/src/process/command-process-journal.test.ts`
 asserts discovery without a recorded child PID, signal-time mark loss/start-time reuse, unavailable
 evidence, live-owner exclusion, group membership, late forks, malformed records, bounded discovery
 the distinction between signal acceptance and proven termination, anchor-PID recycling between
@@ -420,6 +438,7 @@ Keep this table current when a signal site is added.
 | Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                            | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
 | Restart command sweep (`libs/core/src/process/command-process-journal.ts`, `CommandProcessJournal.sweep`)                                                                                                                                | `SIGKILL` to each confirmed process PID                                     | committed daemon-life nonce (or group membership observed beside a marked anchor), matching boot, dead owner and fresh start-time identity; required nonce and boot checked again inside the gate                                                                   | verified; uncertainty is a durable abstention, never a group signal                                                                                               |
 | Ownership readers (`libs/core/src/process/command-process-marks.ts`, `systemRead`)                                                                                                                                                       | Node's `execFile` timeout sends `SIGKILL` to its own `ps` or `sysctl` child | unreaped child handle held internally by Node                                                                                                                                                                                                                       | identity-safe by construction; not a cleanup of stored identifiers                                                                                                |
+| macOS environment helper (`libs/core/src/process/darwin-command-marks.ts`, `DarwinCommandMarkReader.close`)                                                                                                                              | `SIGKILL` to its own Python child on completion, failure or timeout         | unreaped spawned child handle                                                                                                                                                                                                                                       | verified through the shared gate; a reaped helper is never signalled                                                                                              |
 | `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                          | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
 
 Classified as not signal sends: `process.kill(pid, 0)` liveness probes (the startup-lock check

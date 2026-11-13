@@ -9,6 +9,19 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-13 — macOS environment-only restart cleanup (008 §4.2) — Refs #618
+
+macOS ownership now comes from kernel `KERN_PROCARGS2` envp, after counting argv by
+argc. One asynchronous system Python helper serves each sweep's discovery batches
+and fresh signal-time checks. Check CLT/Xcode availability before launching the
+Python shim; unavailable tools or unreadable process environments retain explicit
+abstentions. Batch macOS final identity checks, individual signal gates, terminal
+evidence and receipt writes without weakening boot, mark or start-time verification.
+Helper completion, failure and timeout cleanup also uses the shared live-child
+signal gate; an already reaped helper receives no cleanup signal.
+Real restart tests require macOS command/descendant reaps. Reader tests cover argv-only
+marks, empty arguments, Homebrew-free PATH, optional tools and malformed evidence.
+
 ## 2026-11-13 — Retired verify-artifact repair interruption acceptance (#615)
 
 - **004 §3.4.2:** include the registered retired-artifact branch of both retry
