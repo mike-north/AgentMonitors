@@ -616,18 +616,36 @@ it('reports foreign runtime churn without failing the fixture', async () => {
   console.info('Runtime churn receipt:', line);
 }, 20000);
 
-it('rejects a net runtime entry even when a foreign process creates it', async () => {
+it('reports a foreign process net runtime entry without failing the fixture', async () => {
   const result = await runFixture(foreignWrite, false, {
     runtime: true,
     foreign: true,
     foreignRuntime: 'leave',
   });
   expect(result.testSummary.numPassedTests).toBe(1);
-  expect(result.status, result.stdout + result.stderr).not.toBe(0);
-  expect(result.stdout + result.stderr).toContain(
-    'Runtime namespace net change',
-  );
-  expect(result.stdout + result.stderr).toContain('outside.sock');
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+  const line = (result.stdout + result.stderr)
+    .split('\n')
+    .find((value) => value.startsWith('Runtime namespace churn:'));
+  if (!line) {
+    throw new Error('Missing runtime endpoint diagnostic');
+  }
+  const report = JSON.parse(line.slice('Runtime namespace churn: '.length));
+  expect(report.netChanges).toEqual([
+    {
+      path: result.runtime + '/outside.sock',
+      direction: 'added',
+      before: null,
+      after: {
+        type: 'file',
+        device: expect.any(String),
+        inode: expect.any(String),
+        target: null,
+      },
+    },
+  ]);
+  expect(report.observationErrors).toEqual([]);
+  console.info('Foreign runtime endpoint receipt:', line);
 }, 20000);
 
 /** The same boundary applies to path math, filesystem overloads, and IPC APIs. */

@@ -1,9 +1,10 @@
 /**
- * Primary runtime-namespace boundary for Node test code and preloaded children.
+ * Attributable runtime-namespace boundary for Node tests and preloaded children.
  * Known fallback joins still relocate into owned roots. Any resulting real
  * per-user/legacy path, including an explicit IO path, is a fatal run violation.
  * Synchronous receipts retain caught errors and transient accesses; the host
  * observer uses separately captured read-only primitives rather than this API.
+ * Its shared-directory diff is report-only: unrelated processes use it too.
  */
 import fs from 'node:fs';
 import childProcess from 'node:child_process';

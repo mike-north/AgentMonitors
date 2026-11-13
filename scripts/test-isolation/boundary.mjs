@@ -3,6 +3,8 @@ import { setImmediate } from 'node:timers';
  * Filesystem ownership shared by Vitest coordinators and standalone test
  * scripts. Guard failures are observable even on an early process.exit();
  * cleanup never removes or repairs any path belonging to the installation.
+ * Runtime access assertions come from the adapter; its shared endpoint observer
+ * reports differences without attributing them to tests or failing the run.
  */
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

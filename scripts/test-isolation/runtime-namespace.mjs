@@ -1,9 +1,9 @@
 /**
- * Net-only observer of the user's shared fixed runtime namespace. The adapter is
- * the primary check for test accesses, including transient accesses. Other
- * worktrees/daemons may churn this directory, so endpoint metadata and observed
- * transient entries are diagnostics; only added, removed, or replaced entries
- * fail this diff. Data/config/state snapshots retain their separate strict rule.
+ * Read-only reporting for the user's shared fixed runtime namespace. The adapter
+ * is the attributable fatal check for Node test accesses and preloaded children.
+ * Daemons and other worktrees use the same namespace, so endpoint differences
+ * cannot identify our writes and never fail the run. Reports retain direction
+ * and both endpoint identities. Data/config/state/cache keep their strict guard.
  */
 import { inspection } from './native-inspection.mjs';
 import { legacyRuntimeName, runtimeNamespaces } from './runtime-paths.mjs';
@@ -78,30 +78,50 @@ export function snapshotRuntimeNamespaces(namespaces) {
   return result;
 }
 
-/** Only directory-entry identity participates in the runtime failure decision. @param {object | undefined} entry */
+/**
+ * Identity excludes mutable metadata and retains explicit absence in JSON reports.
+ * @param {object | undefined} entry
+ */
 function identity(entry) {
-  if (!entry) {
-    return undefined;
-  }
-  return JSON.stringify({
-    type: entry.type,
-    device: entry.device,
-    inode: entry.inode,
-    target: entry.target,
-  });
+  return entry
+    ? {
+        type: entry.type,
+        device: entry.device,
+        inode: entry.inode,
+        target: entry.target ?? null,
+      }
+    : null;
 }
 
-/** @param {Record<string,object>} before @param {Record<string,object>} after @returns {string[]} @internal */
+/**
+ * Describe endpoint differences without attributing them to any process.
+ * @param {Record<string,object>} before @param {Record<string,object>} after
+ * @returns {{path: string, direction: 'added'|'removed'|'replaced', before: object|null, after: object|null}[]} @internal
+ */
 export function runtimeNetChanges(before, after) {
-  return [...new Set([...Object.keys(before), ...Object.keys(after)])]
-    .sort()
-    .filter((file) => identity(before[file]) !== identity(after[file]));
+  const changes = [];
+  for (const file of [
+    ...new Set([...Object.keys(before), ...Object.keys(after)]),
+  ].sort()) {
+    const first = identity(before[file]);
+    const last = identity(after[file]);
+    if (JSON.stringify(first) !== JSON.stringify(last)) {
+      changes.push({
+        path: file,
+        direction:
+          first === null ? 'added' : last === null ? 'removed' : 'replaced',
+        before: first,
+        after: last,
+      });
+    }
+  }
+  return changes;
 }
 
 /**
  * Watchers provide best-effort names of mid-run activity; final native snapshots
- * are authoritative for net changes. Observation errors are visible diagnostics,
- * never permission to suppress a net difference. Watchers do not keep Node alive.
+ * describe net changes. Neither endpoint differences nor watcher errors attribute
+ * writes to tests; both remain visible diagnostics. Watchers do not keep Node alive.
  * @returns {{namespaces: import('./runtime-paths.mjs').RuntimeNamespace[], finish: () => void, close: () => void}} @internal
  */
 export function observeRuntimeNamespace() {
@@ -212,13 +232,10 @@ export function observeRuntimeNamespace() {
           beforeMode: before[file].mode,
           afterMode: after[file].mode,
         }));
-      if (events.size || metadata.length || errors.length) {
+      if (changes.length || events.size || metadata.length || errors.length) {
         console.warn(
           `Runtime namespace churn: ${JSON.stringify({ entriesSeen: [...events].sort(), metadataChanged: metadata, observationErrors: errors, netChanges: changes })}`,
         );
-      }
-      if (changes.length) {
-        throw new Error(`Runtime namespace net change:\n${changes.join('\n')}`);
       }
     },
   };

@@ -686,15 +686,29 @@ Trusted host inventory uses read-only inspection primitives, never these guarded
 application APIs. User teardown keeps the owned environment until its work ends.
 
 The real per-user runtime directory is shared by unrelated daemons and worktrees.
-Its secondary diff MUST fail only on net additions, removals, or replacements
-(type/device/inode or symlink-target identity), including legacy flat socket/lock
-entries. Changes only to existing runtime metadata and transient entries MUST be
-reported without failure. Diagnostics include before/after mtimes and names seen
-by native observation; name observation is best-effort, while endpoint snapshots
-are authoritative for net changes. The adapter is the primary check for test
-accesses, including transient accesses; the runtime diff is not write tracing.
-Other data/config/state roots retain the strict rule and per-file attribution above.
-The runtime observer MUST remain read-only and close its watchers on every exit.
+Its endpoint diff MUST be report-only, including net additions, removals, and
+replacements in the per-uid directory and legacy flat socket/lock namespace.
+An endpoint difference cannot distinguish test writes from those other processes.
+The adapter is the attributable fatal guard for runtime access in test processes
+and preloaded Node children, including transient or caught accesses. The shared
+directory's diff MUST NOT set a failing exit status.
+
+Net-change reports MUST name the path and direction (`added`, `removed`, or
+`replaced`) and retain both before/after type/device/inode/symlink-target identities;
+an absent endpoint is `null`. Metadata changes and native observation remain
+reported too, with before/after mtimes and best-effort observed names. Neither
+observation is write tracing or PID attribution. Other data/config/state/cache
+roots retain the strict rule and foreign-holder policy above. The runtime observer
+MUST remain read-only and close its watchers on every exit.
+
+The adapter covers the maintained Node path/filesystem/IPC surfaces, not every
+possible route to the filesystem. Non-preloaded shell/external children (including
+embedded command strings), captured pre-install native functions, direct native
+bindings, pre-opened descriptor/handle operations, and unrecognized symlink aliases
+remain outside its path checks. NODE_OPTIONS-only Node children retain the preload;
+children or worker contexts that explicitly discard it do not acquire that guard.
+These limits MUST be reported; a report-only endpoint diff is not a fatal backstop
+for access that bypasses the adapter.
 
 **Verified by:** `scripts/test-data-isolation.test.ts` checks every maintained
 config, child inheritance, cache invalidation, initially absent XDG roots,
