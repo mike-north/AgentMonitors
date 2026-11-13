@@ -1045,6 +1045,22 @@ and skip branches, since kills within a transaction ordinarily exercise rollback
 scratch-bundle mutation separating the skip loss receipt from retry deletion MUST fail
 these assertions; restoring the original bytes MUST return the scenario to green.
 
+Both commands MUST also discover the retired verify-artifact branch under each pacing
+policy: register an active owner and its exact verify scratch key, retain and exhaust
+its retry through the store, then request cleanup before tracing the repair. Every
+executed write receives both interruption modes, with `retired-artifact` in the scenario
+name. Before restart, only the unchanged terminal retry or completed cleanup is valid;
+cleanup MUST leave no event, snapshot, skip loss or `errored` row. Startup and repeated
+completed ticks MUST finish any rolled-back cleanup without materializing the artifact,
+and doctor MUST report no remaining retry or loss. Successful controls MUST report
+`verify-artifact-cleanup`. A scratch-bundle mutation throwing before the cleanup DELETE
+MUST fail a retired-artifact scenario; restoring identical bytes MUST pass. Repair
+rejections (missing, already rearmed or skipped, or wrong-route retries) write nothing
+and have no interruption inventory. Skip MUST also trace an upgraded retry without
+an admission position: its loss INSERT uses the current event high-water mark instead
+of a bound position (002 §2.7). Both interruption modes and the ordinary skip/restart
+assertions apply under each pacing policy.
+
 Verification launched with an isolated home/data root MUST retain 002 §10.3's socket
 normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resolved socket,
 including an explicitly overlong derived path, rather than assuming the raw workspace path
