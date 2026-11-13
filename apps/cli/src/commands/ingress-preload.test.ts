@@ -23,6 +23,7 @@ function probe(
     `
     const Database = require('better-sqlite3');
     const db = new Database(${JSON.stringify(path.join(root, 'probe.db'))});
+    db.pragma('journal_mode = WAL');
     db.exec('CREATE TABLE probe (value TEXT); CREATE TABLE object_event_suppressions (expires_at INTEGER)');
     ${setup}
     process.send = value => console.log(JSON.stringify(value));
@@ -244,5 +245,148 @@ for (const boundary of ['tick', 'consumeWatch'] as const) {
     );
     expect(output).toContain('ALLOWLIST_QUERIES_PASSED');
     expect(output).not.toContain('Unclassified ingress write');
+  });
+}
+
+// Prepared handles can predate lifecycle ownership; admission belongs to execution.
+for (const boundary of ['tick', 'consumeWatch'] as const) {
+  for (const method of ['run', 'get', 'all', 'iterate'] as const) {
+    for (const preprepared of [false, true]) {
+      it(`refuses prepared optimize ${method} in ${boundary}, preprepared=${String(preprepared)}`, () => {
+        const execute = `statement.${method}()`;
+        const output = probe(
+          boundary,
+          `${preprepared ? '' : "const statement = db.prepare('PRAGMA optimize');"}
+           ${method === 'iterate' ? `[...${execute}]` : execute};`,
+          undefined,
+          `db.exec('CREATE INDEX probe_value ON probe(value); INSERT INTO probe VALUES (1),(2),(3)');
+           ${preprepared ? "const statement = db.prepare('PRAGMA optimize');" : ''}`,
+        );
+        expect(output).toContain('Unclassified ingress write: PRAGMA optimize');
+        expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+      });
+    }
+  }
+  for (const api of ['exec', 'prepare'] as const) {
+    it(`refuses table-valued optimize through ${api} in ${boundary}`, () => {
+      const output = probe(
+        boundary,
+        `db.${api}('SELECT * FROM pragma_optimize')${api === 'prepare' ? '.all()' : ''};`,
+        undefined,
+        "db.exec('CREATE INDEX probe_value ON probe(value); INSERT INTO probe VALUES (1),(2),(3)');",
+      );
+      expect(output).toContain(
+        'Unclassified ingress write: SELECT * FROM pragma_optimize',
+      );
+      expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+    });
+  }
+
+  // A user function simulates an unknown native effect without a SQL write verb
+  // or PRAGMA name. Changing existing bytes also defeats size-only WAL probes.
+  for (const target of ['main', 'wal'] as const) {
+    for (const api of [
+      'exec',
+      'pragma',
+      'run',
+      'get',
+      'all',
+      'iterate',
+    ] as const) {
+      it(`detects an unrecognized ${target} file effect through ${api} in ${boundary}`, () => {
+        const output = probe(
+          boundary,
+          api === 'exec'
+            ? "db.exec('SELECT hidden_effect()');"
+            : api === 'pragma'
+              ? "db.pragma('user_version');"
+              : `${api === 'iterate' ? '[...' : ''}db.prepare('SELECT hidden_effect()').${api}()${api === 'iterate' ? ']' : ''};`,
+          undefined,
+          `const fs = require('node:fs');
+           const mutate = () => {
+             const file = db.name + ${JSON.stringify(target === 'wal' ? '-wal' : '')};
+             const bytes = require('node:fs').readFileSync(file);
+             bytes[bytes.length - 1] ^= 1;
+             fs.writeFileSync(file, bytes);
+             return 1;
+           };
+           db.function('hidden_effect', mutate);
+           ${
+             api === 'pragma'
+               ? `
+           // Exercise the native-pragma effect seam with a real file mutation.
+           // Simulate an unrecognized native effect immediately after the
+           // baseline bytes are sampled, independent of SQL admission patterns.
+           const read = fs.readFileSync;
+           let sampled = false;
+           fs.readFileSync = function(file, ...args) {
+             const result = read.call(this, file, ...args);
+             if (file === db.name + ${JSON.stringify(target === 'wal' ? '-wal' : '')} && !sampled) {
+               sampled = true;
+               mutate();
+             }
+             return result;
+           };
+           require('node:module').syncBuiltinESMExports();`
+               : ''
+           }`,
+        );
+        expect(output).toContain('Unclassified ingress write:');
+        expect(output).toContain(
+          api === 'pragma' ? 'PRAGMA user_version' : 'SELECT hidden_effect()',
+        );
+        expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+      });
+    }
+  }
+
+  it(`allows reads with a separate process reading the same WAL database in ${boundary}`, () => {
+    const output = probe(
+      boundary,
+      `db.exec('SELECT external_reader()');
+       db.pragma('user_version');
+       for (const method of ['run', 'get', 'all', 'iterate']) {
+         const result = db.prepare('SELECT value FROM probe')[method]();
+         if (method === 'iterate') [...result];
+       }
+       console.log('ISOLATED_READS_PASSED');`,
+      undefined,
+      `db.function('external_reader', () => {
+         const script = "const Database = require('better-sqlite3'); const reader = new Database(process.argv[1], {readonly: true}); reader.prepare('SELECT * FROM probe').all(); reader.close();";
+         require('node:child_process').execFileSync(process.execPath, ['-e', script, db.name], { env: process.env });
+         return 1;
+       });`,
+    );
+    expect(output).toContain('ISOLATED_READS_PASSED');
+    expect(output).not.toContain('Unclassified ingress write');
+  });
+}
+
+for (const boundary of ['tick', 'consumeWatch'] as const) {
+  it(`admits pre-existing read handles and allowlisted table functions in ${boundary}`, () => {
+    const output = probe(
+      boundary,
+      `for (const method of ['run', 'get', 'all', 'iterate']) {
+         const result = statement[method]();
+         if (method === 'iterate') [...result];
+       }
+       db.exec("SELECT * FROM pragma_table_info('probe')");
+       console.log('PREPARED_READS_PASSED');`,
+      undefined,
+      "const statement = db.prepare('SELECT * FROM probe');",
+    );
+    expect(output).toContain('PREPARED_READS_PASSED');
+    expect(output).not.toContain('Unclassified ingress write');
+  });
+
+  it(`refuses optimize iterators created before ${boundary} on their first advance`, () => {
+    const output = probe(
+      boundary,
+      'iterator.next();',
+      undefined,
+      "const iterator = db.prepare('PRAGMA optimize').iterate();",
+    );
+    expect(output).toContain('Unclassified ingress write: PRAGMA optimize');
+    expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
   });
 }

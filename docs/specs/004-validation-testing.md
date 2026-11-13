@@ -891,6 +891,21 @@ Direct `ANALYZE`, `VACUUM`, `REINDEX`, `ATTACH` and `DETACH` are likewise refuse
 Other direct SQL requires one preparable read-only statement; a readable prefix
 cannot conceal another statement. Database-file changes, including statistics and
 maintenance, require deliberate interruption support or a named exclusion.
+Prepared read statements MUST apply the same admission at execution, including
+handles prepared before lifecycle entry, through `run`, `get`, `all` and iterator
+advancement/finalization. Table-valued `pragma_*` functions outside the query
+allowlist MUST be refused even inside a read-only outer `SELECT`.
+The allowlist is the first line of admission; a SQL-independent comparison of the
+complete main-file and WAL bytes around each synchronous admitted read is the
+file-effect guarantee. It detects statistics writes, maintenance, truncation and
+same-size WAL frame reuse. A changed file MUST fail with `unclassified-write`,
+SQL and call-site evidence, including after an execution throws. Shared-memory
+reader-lock changes are excluded. Fixtures own private database paths and one
+writable runtime connection; sources never receive the database path, IPC uses
+the same connection, and parent assertions only read at completed command
+barriers or after writer exit. Synchronous sampling permits no interleaved runtime
+callback. A separate-process WAL-reader regression MUST remain admitted, and
+unknown same-size main/WAL effects MUST be refused independently of SQL patterns.
 `ingress-preload.test.ts` independently exercises asynchronous tick/watch discovery and
 classification failures. The acquisition-path extra-write, corrupted shared-snapshot-content,
 and corrupted recipient-baseline mutations MUST all fail the suite.

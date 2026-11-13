@@ -6,12 +6,26 @@
  * Direct SQL in a traced lifecycle must be a plain read-only statement or an
  * allowlisted read-only PRAGMA. Database-file changes, including statistics and
  * maintenance, need an interruption point or a named exclusion; driver readonly
- * metadata alone does not prove the absence of durable effects.
+ * metadata alone does not prove the absence of durable effects. The allowlist
+ * is the first line of admission; byte-for-byte main/WAL equality around each
+ * admitted synchronous execution is the file-effect guarantee. WAL statistics
+ * and maintenance writes change frames even if the main file or WAL size stays
+ * fixed. Shared-memory lock/read-mark changes are deliberately not data effects.
+ *
+ * These fixtures own fresh private database paths, with one writable runtime
+ * connection. Sources receive input paths/URLs, never the database path; IPC
+ * uses that same connection. Parent assertions only issue reads at completed
+ * command barriers or after reaping the writer. They cannot append/checkpoint a
+ * live writer's WAL. No await separates either file sample from native execution,
+ * so another tick/watch/IPC callback on this process cannot interleave a write.
+ * A separate-process read regression covers WAL reader locks without false
+ * positives. This guarantee requires that ownership: arbitrary external writers
+ * to the private fixture database are outside the harness contract.
  * Work invoked through an explicitly external AsyncResource is outside this
  * lifecycle ownership boundary, as are unexecuted source/plugin branches.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { watch } from 'node:fs';
+import { readFileSync, watch } from 'node:fs';
 import { createRequire, registerHooks } from 'node:module';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -105,11 +119,50 @@ function classify(sql, args, site) {
   throw new Error(message);
 }
 
-/** Discover synchronous prepared writes, including RETURNING through get/all. */
+/** Discover prepared execution, even for handles created before lifecycle entry. */
 const prepare = Database.prototype.prepare;
 Database.prototype.prepare = function (sql) {
   const statement = prepare.call(this, sql);
-  if (statement.readonly) return statement;
+  const db = statement.database;
+  if (statement.readonly) {
+    for (const method of ['run', 'get', 'all', 'iterate']) {
+      const execute = statement[method];
+      statement[method] = function (...args) {
+        const site = callSite();
+        guardDirectSql(db, sql, site);
+        if (method !== 'iterate')
+          return observeRead(db, sql, site, () => execute.apply(this, args));
+        const iterator = observeRead(db, sql, site, () =>
+          execute.apply(this, args),
+        );
+        // Sampling each synchronous advance/finalization avoids attributing
+        // unrelated work between yielded rows to a deferred read. It also guards
+        // iterators created outside ownership but advanced within a lifecycle.
+        const finish = iterator.return;
+        for (const advance of ['next', 'return', 'throw']) {
+          if (typeof iterator[advance] !== 'function') continue;
+          const original = iterator[advance];
+          iterator[advance] = function (...values) {
+            const site = callSite();
+            try {
+              guardDirectSql(db, sql, site);
+              return observeRead(db, sql, site, () =>
+                original.apply(this, values),
+              );
+            } catch (error) {
+              // A refused row must release the native cursor just as a consumer
+              // breaking its loop would; otherwise the connection stays busy.
+              if (finish)
+                observeRead(db, sql, site, () => finish.call(iterator));
+              throw error;
+            }
+          };
+        }
+        return iterator;
+      };
+    }
+    return statement;
+  }
   // Iteration defers execution until next(); treating iterate() as the write
   // would park a kill before durability. Refuse a new deferred writer explicitly.
   const iterate = statement.iterate;
@@ -209,6 +262,22 @@ function permitsDirectSql(sql) {
       /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[a-z_]\w*|[^\s]/gi,
     ) ?? []
   ).filter((token) => !token.startsWith('--') && !token.startsWith('/*'));
+  // Table-valued PRAGMAs run inside an outer SELECT whose readonly metadata
+  // does not describe their effects. Inspect identifiers, including quoted table
+  // names, rather than relying on the outer verb. String values are not names
+  // unless SQLite accepts them as a FROM/JOIN table identifier.
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (
+      token.startsWith("'") &&
+      !/^(from|join|\.)$/i.test(tokens[index - 1] ?? '') &&
+      tokens[index + 1] !== '('
+    )
+      continue;
+    const name = token.replace(/^["'`[]|["'`\]]$/g, '').toLowerCase();
+    if (name.startsWith('pragma_') && !readOnlyPragmas.has(name.slice(7)))
+      return false;
+  }
   // SQLite accepts leading empty statements before the one executable statement.
   while (tokens[0] === ';') tokens.shift();
   const verb = tokens.shift()?.toLowerCase();
@@ -239,7 +308,7 @@ function permitsDirectSql(sql) {
  * explicit query policy and driver readonly metadata; refuse unpreparable SQL,
  * including programs whose readable prefix could conceal a later write.
  */
-function guardDirectSql(db, sql) {
+function guardDirectSql(db, sql, site = callSite()) {
   if (!lifecycle.getStore()) return;
   let readonly = false;
   try {
@@ -248,24 +317,70 @@ function guardDirectSql(db, sql) {
     // No statement means no proof of read-only execution. Fail closed below.
   }
   if (readonly) return;
-  const site = callSite();
   const message = `Unclassified ingress write: ${sql}\n${site}`;
   process.send?.({ kind: 'unclassified-write', message, sql, site });
   throw new Error(message);
 }
 
+/**
+ * Full bytes catch growth, truncation, main-header changes and same-size WAL
+ * frame reuse; sizes/change counters alone miss valid WAL maintenance effects.
+ * Absence is part of the signal. Ignore only ENOENT; unreadable files fail closed.
+ */
+function fileBytes(file) {
+  try {
+    return readFileSync(file);
+  } catch (error) {
+    if (error.code === 'ENOENT') return undefined;
+    throw error;
+  }
+}
+
+/** Every admitted read must preserve both durable files, even when it throws. */
+function observeRead(db, sql, site, execute) {
+  if (!lifecycle.getStore()) return execute();
+  const files = [db.name, `${db.name}-wal`];
+  const before = files.map(fileBytes);
+  let result;
+  let failure;
+  try {
+    result = execute();
+  } catch (error) {
+    // Preserve the driver's error unless file effects prove an unclassified
+    // write; throwing must not let a side effect escape the post-execution bar.
+    failure = { error };
+  }
+  if (
+    files.some((file, index) => {
+      const after = fileBytes(file);
+      return before[index] === undefined
+        ? after !== undefined
+        : after === undefined || !before[index].equals(after);
+    })
+  ) {
+    const message = `Unclassified ingress write: ${sql} (database file effect)\n${site}`;
+    process.send?.({ kind: 'unclassified-write', message, sql, site });
+    throw new Error(message);
+  }
+  if (failure) throw failure.error;
+  return result;
+}
+
 /** exec accepts whole SQL programs, so only a proven read-only statement passes. */
 const exec = Database.prototype.exec;
 Database.prototype.exec = function (sql) {
-  guardDirectSql(this, sql);
-  return exec.call(this, sql);
+  const site = callSite();
+  guardDirectSql(this, sql, site);
+  return observeRead(this, sql, site, () => exec.call(this, sql));
 };
 
 /** pragma prepares through the native handle, bypassing the public prepare hook. */
 const pragma = Database.prototype.pragma;
 Database.prototype.pragma = function (source, options) {
-  guardDirectSql(this, `PRAGMA ${source}`);
-  return pragma.call(this, source, options);
+  const sql = `PRAGMA ${source}`;
+  const site = callSite();
+  guardDirectSql(this, sql, site);
+  return observeRead(this, sql, site, () => pragma.call(this, source, options));
 };
 
 /**
