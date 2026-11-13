@@ -264,10 +264,17 @@ Abstained lives remain for later reconciliation. This is the input for #507; no 
 
 Discovery records unchanged ownership uncertainty once per PID and reason per sweep, including across
 post-signal snapshots, instead of duplicating it for a numeric suspicion or later snapshot.
-When no signal was sent and no target vanished at the signal gate, it stops rather than
-rescanning that same uncertainty. A target that exits before signalling retains its life and
-group suspicion and triggers fresh discovery: natural exit cannot erase a marked late fork.
-The life remains until a later readable snapshot finds neither its marks nor recorded group members.
+When no signal was sent and no target was observed vanishing, it stops rather than
+rescanning that same uncertainty. Every observed disappearance follows one rule: preserve the
+life and its numeric group suspicion and allow bounded rediscovery from a fresh snapshot.
+This includes absence during initial discovery or gone batching, disappearance during anchor
+confirmation, absence at the signal gate, and ESRCH during delivery. Record a discovered marked
+anchor's group suspicion before confirmation can lose the anchor; that suspicion supplies no
+signal authority. Natural exit cannot erase a marked late fork. Retire the life only when a
+fresh readable snapshot contains neither its nonce nor a member of its recorded groups, and
+no recorded PID remains occupied (including reuse by an unmarked process in another group).
+One observation of absence earns rediscovery, not repeated scans of an unchanged occupied
+hint. Identity disagreement and unavailable ownership still withhold signals.
 After signalling or observing a target vanish, discovery takes another snapshot to catch late forks. It processes readable
 positive evidence even when unrelated unreadable ownership makes the snapshot
 incomplete; that uncertainty is saved before further identity queries and cannot discard the

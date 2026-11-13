@@ -13,7 +13,7 @@ Require actual environment evidence for ownership: macOS system process listings
 
 Record unchanged per-PID ownership uncertainty once and stop discovery when no signal was sent and no target was observed vanishing.
 
-If a target exits naturally before signalling, retain its life and group suspicion and continue bounded discovery for marked late forks through the existing boot, mark and start-time gates. Keep PID-only occupancy as a numeric suspicion during admission, with conservative restart abstentions and no signal authority.
+Apply one disappearance rule during initial discovery, gone batching, anchor confirmation, the signal gate and delivery ESRCH: retain the life and group suspicion and allow bounded rediscovery for marked late forks through the existing boot, mark and start-time gates. Remember a marked anchor's group before confirmation can lose it. Retire ownership only after fresh readable absence of its nonce, recorded group members and occupied recorded PIDs. Keep PID-only occupancy as a numeric suspicion during admission and restart, including reuse in another group, with no signal authority.
 
 Retain original-group suspicion after direct-child exit so unmarked survivors receive conservative abstentions without numeric group signal authority. Continue verified late-fork cleanup despite unrelated unreadable ownership, preserving incomplete receipts and retryable lives.
 

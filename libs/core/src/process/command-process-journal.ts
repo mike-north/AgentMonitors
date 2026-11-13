@@ -384,6 +384,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
       let reading = table;
       let ownership = marks;
       let retained = !complete;
+      // A disappearance is provisional emptiness: enumeration can miss both a
+      // parent and its last fork. Only a later readable, vacant snapshot can
+      // discharge this retention; an occupied numeric hint grants no authority.
+      const disappearance = { pending: false };
       // Once an identifier is considered, never retry it during this sweep.
       // In particular, start-time disagreement cannot later become permission.
       const visited = new Set<number>();
@@ -391,12 +395,38 @@ export class CommandProcessJournal implements CommandProcessOwner {
       // Retain their full identity so a recycled PID is still discovered normally.
       const reaped = new Map<number, ProcessIdentityRecord>();
       for (let round = 0; round < MAX_DISCOVERY_PASSES; round++) {
+        const progress = { observed: false };
+        /** Every observed exit preserves attribution and earns bounded rediscovery. */
+        const observeVanish = (pid: number, reason?: string): void => {
+          disappearance.pending = true;
+          progress.observed = true;
+          visited.add(pid);
+          outcomes.push({
+            status: 'gone',
+            life: previous.life,
+            pid,
+            ...(reason === undefined ? {} : { reason }),
+          });
+        };
         const markedMembers = reading.processes.filter(
           (member) =>
             ownership.marks.get(member.pid) === previous.life &&
             !liveOwners.has(member.pid) &&
             member.pid !== process.pid,
         );
+        // A marked anchor can disappear during confirmation. Remember its group
+        // as suspicion before that await, without granting membership authority.
+        this.sql.transaction(() => {
+          const remember = this.sql.prepare(
+            'INSERT OR IGNORE INTO command_pids VALUES(?,?)',
+          );
+          for (const member of sameBoot ? markedMembers : []) {
+            if (member.pgid > 0 && !recorded.has(member.pgid)) {
+              remember.run(previous.life, member.pgid);
+              recorded.add(member.pgid);
+            }
+          }
+        })();
         const confirmed = await confirmGroupAnchors(
           sameBoot ? markedMembers : [],
         );
@@ -410,6 +440,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
           });
           break;
         }
+        for (const pid of confirmed.gone) {
+          if (!visited.has(pid)) observeVanish(pid);
+        }
+        if (confirmed.gone.length > 0) save('running');
         for (const pid of confirmed.changed) {
           visited.add(pid);
           retained = true;
@@ -423,21 +457,6 @@ export class CommandProcessJournal implements CommandProcessOwner {
           save('running');
         }
         const anchors = confirmed.anchors;
-        // A detached or unrecorded marked anchor can be the only evidence of
-        // its group. Commit that numeric suspicion before any signal removes
-        // it, so a later unmarked survivor remains accountable after a reopen.
-        // This records suspicion only; authority still comes from fresh evidence.
-        this.sql.transaction(() => {
-          const remember = this.sql.prepare(
-            'INSERT OR IGNORE INTO command_pids VALUES(?,?)',
-          );
-          for (const pgid of anchors.keys()) {
-            if (pgid > 0 && !recorded.has(pgid)) {
-              remember.run(previous.life, pgid);
-              recorded.add(pgid);
-            }
-          }
-        })();
         const candidates = new Set([
           ...recorded,
           ...reading.processes
@@ -450,30 +469,18 @@ export class CommandProcessJournal implements CommandProcessOwner {
             .map((p) => p.pid),
         ]);
         const pending = [...candidates].filter((pid) => !visited.has(pid));
-        if (pending.length === 0) break;
+        if (pending.length === 0 && !progress.observed) break;
         const byPid = new Map(reading.processes.map((p) => [p.pid, p]));
-        const groups = new Set(reading.processes.map((p) => p.pgid));
         // Absence decisions use one immutable snapshot and involve no awaits.
-        // Batch their receipt and hint retirement before further identity reads,
+        // Batch their receipt before further identity reads,
         // instead of FULL-sync rewriting an ever-growing receipt per gone PID.
         const gone = pending.filter((pid) => !byPid.has(pid));
         if (gone.length > 0) {
           this.sql.transaction(() => {
-            const retire = this.sql.prepare(
-              'DELETE FROM command_pids WHERE life = ? AND pid = ?',
-            );
-            for (const pid of gone) {
-              visited.add(pid);
-              outcomes.push({ status: 'gone', life: previous.life, pid });
-              if (!groups.has(pid)) {
-                retire.run(previous.life, pid);
-                recorded.delete(pid);
-              }
-            }
+            for (const pid of gone) observeVanish(pid);
             save('running');
           })();
         }
-        let discoveryProgress = false;
         for (const pid of pending) {
           const record = byPid.get(pid);
           if (record === undefined) continue;
@@ -555,7 +562,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
             },
           );
           if (outcome.status === 'sent') {
-            discoveryProgress = true;
+            progress.observed = true;
             const terminal = await readCommandTerminal(record);
             outcomes.push({
               status: terminal === 'terminated' ? 'reaped' : 'failed',
@@ -594,14 +601,13 @@ export class CommandProcessJournal implements CommandProcessOwner {
               pid,
               reason: outcome.abstention.reason,
             });
+          } else if (outcome.status === 'not-needed') {
+            // Includes disappearance in the final table and ESRCH at delivery.
+            observeVanish(pid, outcome.detail);
           } else {
-            // A vanished target may have forked after discovery. Its absence
-            // ends only that incarnation, never the life or group accounting.
-            // Retain attribution and discover again through the usual gates.
             retained = true;
-            discoveryProgress ||= outcome.status === 'not-needed';
             outcomes.push({
-              status: outcome.status === 'not-needed' ? 'gone' : 'failed',
+              status: 'failed',
               life: previous.life,
               pid,
               reason: outcome.detail,
@@ -611,7 +617,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
         }
         // Signals and observed exits can expose late forks. Withheld signals
         // alone do not justify rescanning unchanged ownership uncertainty.
-        if (!discoveryProgress) break;
+        if (!progress.observed) break;
         // Re-read after cleanup or natural exits to discover late forks.
         // This is bounded discovery, not a timer or a retry of failed kills.
         const next = await readProcessTable();
@@ -678,6 +684,26 @@ export class CommandProcessJournal implements CommandProcessOwner {
         }
         reading = next;
         ownership = nextMarks;
+        // Only fresh, readable emptiness can discharge a vanished target's
+        // suspicion. PID occupancy also preserves it after reuse in a new group.
+        // Other retaining outcomes (reaps, abstentions, failures) stay retryable.
+        const occupied = new Set(
+          next.processes.flatMap((p) => [p.pid, p.pgid]),
+        );
+        if (
+          disappearance.pending &&
+          (nextMarks.unreadable?.length ?? 0) === 0 &&
+          ![...nextMarks.marks.values()].includes(previous.life) &&
+          ![...recorded].some((pid) => occupied.has(pid))
+        ) {
+          disappearance.pending = false;
+          this.sql.transaction(() => {
+            this.sql
+              .prepare('DELETE FROM command_pids WHERE life = ?')
+              .run(previous.life);
+            recorded.clear();
+          })();
+        }
         if (round === MAX_DISCOVERY_PASSES - 1) {
           const markedGroups = new Set(
             reading.processes
@@ -710,7 +736,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
           }
         }
       }
-      if (!retained)
+      if (!retained && !disappearance.pending)
         this.sql.transaction(() => {
           this.sql
             .prepare('DELETE FROM command_pids WHERE life = ?')
@@ -738,6 +764,8 @@ type GroupAnchorConfirmation =
       readonly supported: true;
       readonly anchors: ReadonlyMap<number, ProcessIdentityRecord>;
       readonly changed: readonly number[];
+      /** Absence can hide late forks; it is not identity disagreement. */
+      readonly gone: readonly number[];
     }
   | { readonly supported: false; readonly reason: string };
 
@@ -752,15 +780,21 @@ async function confirmGroupAnchors(
   marked: readonly ProcessIdentityRecord[],
 ): Promise<GroupAnchorConfirmation> {
   const anchors = new Map<number, ProcessIdentityRecord>();
-  if (marked.length === 0) return { supported: true, anchors, changed: [] };
+  if (marked.length === 0)
+    return { supported: true, anchors, changed: [], gone: [] };
   const confirmation = await readProcessTable();
   if (!confirmation.supported) return confirmation;
   const changed: number[] = [];
+  const gone: number[] = [];
   for (const member of marked) {
     const current = confirmation.processes.find((p) => p.pid === member.pid);
-    if (current?.startTime !== member.startTime || current.pgid !== member.pgid)
+    if (current === undefined) gone.push(member.pid);
+    else if (
+      current.startTime !== member.startTime ||
+      current.pgid !== member.pgid
+    )
       changed.push(member.pid);
     else anchors.set(member.pgid, member);
   }
-  return { supported: true, anchors, changed };
+  return { supported: true, anchors, changed, gone };
 }

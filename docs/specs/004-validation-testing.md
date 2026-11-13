@@ -1118,8 +1118,18 @@ Unreadable-mark controls require per-PID abstentions durable before later identi
 an unrelated unreadable environment may make discovery incomplete without producing an outcome
 for a readable detached mark-erased escape. Escape coverage must still prove the parent's reap,
 the child's survival, and no diagnostic for that child.
-A parent that exits between discovery and the signal gate must trigger fresh discovery without
-losing its life or group suspicion. Its marked late fork must be cleaned through the normal gates,
+A target absent during initial discovery, anchor confirmation, the signal gate or ESRCH at
+delivery must follow one rule: keep its life/group suspicion and allow bounded rediscovery
+before fresh readable emptiness can retire ownership. Include an unmarked group member's
+disappearance and an unrecorded anchor that vanishes before its group can be confirmed.
+Simulate Linux enumeration followed by the parent's missing stat and find its marked late fork
+on the next snapshot. For each disappearance path, isolate vanished-target retention as the
+only retaining outcome: a fresh snapshot has an unmarked replacement occupying the recorded
+PID in another group, no signal succeeds, and the life and numeric hint remain. Removing
+vanish retention or restoring failed-only retention must fail these boundary regressions.
+A continuously vanishing marked lineage must stop after eight discovery passes with an
+incomplete receipt and an abstention for still-discovered work.
+Its marked late fork must be cleaned through the normal gates,
 or receive an abstention on changed boot, lost mark or recycled start time, with every signal a spy.
 Returned and durable receipts must agree, and a later empty snapshot must retire the life and hints.
 A pass with no signals and no target observed vanishing must not repeat ownership discovery or duplicate an existing per-PID
