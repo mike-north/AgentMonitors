@@ -15,6 +15,8 @@ function probe(
   body: string,
   ingress = "db.prepare('INSERT INTO probe VALUES (?)').run('classified');",
   setup = '',
+  inspectDurability = false,
+  cleanup = '',
 ): string {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'ingress-guard-')));
   const entry = path.join(root, 'probe.cjs');
@@ -41,7 +43,20 @@ function probe(
       process.emit('message', { stage: 'accept', trace: true });
       try { await new AgentMonitorRuntime().${boundary}(); }
       catch (error) { console.log(String(error)); }
-      finally { db.close(); }
+      finally {
+        // A refused writable cursor stays untouched until ownership has ended.
+        ${cleanup}
+        db.close();
+        ${
+          inspectDurability
+            ? `
+        // A fresh connection distinguishes durable rows from a yielded RETURNING row.
+        const reader = new Database(${JSON.stringify(path.join(root, 'probe.db'))}, { readonly: true });
+        console.log('DURABLE_ROWS=' + JSON.stringify(reader.prepare('SELECT * FROM probe').all()));
+        reader.close();`
+            : ''
+        }
+      }
     }};
     program2.parseAsync();
   `,
@@ -125,6 +140,72 @@ it('refuses deferred iterator writes rather than claiming a pre-execution kill p
   expect(output).toContain('Unclassified ingress write');
   expect(output).toContain('INSERT INTO probe VALUES (?) RETURNING value');
   expect(output).toContain('AgentMonitorRuntime.ingest');
+});
+
+// Iterator ownership belongs to each advance/finalization, even when the cursor
+// was created before lifecycle entry. Finalizing RETURNING completes its write.
+for (const boundary of ['tick', 'consumeWatch'] as const) {
+  for (const method of ['next', 'return'] as const) {
+    it(`refuses a pre-existing writable iterator ${method} in ${boundary}`, () => {
+      const sql = "INSERT INTO probe VALUES ('escaped') RETURNING value";
+      const output = probe(
+        boundary,
+        `await Promise.resolve(); iterator.${method}();
+         ${method === 'next' ? 'iterator.return();' : ''}`,
+        undefined,
+        `const iterator = db.prepare(${JSON.stringify(sql)}).iterate();`,
+        true,
+        'iterator.return();',
+      );
+      expect(output).toContain(`Unclassified ingress write: ${sql}`);
+      expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+      expect(output).toContain('"kind":"unclassified-write"');
+      expect(output).not.toContain('"kind":"write"');
+      expect(output).toContain('DURABLE_ROWS=[]');
+    });
+  }
+
+  it(`refuses writable iterator creation in ${boundary}`, () => {
+    const sql = "INSERT INTO probe VALUES ('escaped') RETURNING value";
+    const output = probe(
+      boundary,
+      `db.prepare(${JSON.stringify(sql)}).iterate();`,
+      undefined,
+      '',
+      true,
+    );
+    expect(output).toContain(`Unclassified ingress write: ${sql}`);
+    expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+    expect(output).toContain('DURABLE_ROWS=[]');
+  });
+
+  it(`preserves a pre-existing read iterator in ${boundary}`, () => {
+    const output = probe(
+      boundary,
+      `console.log(JSON.stringify(iterator.next())); iterator.return();`,
+      undefined,
+      `db.prepare('INSERT INTO probe VALUES (?)').run('readable');
+       const iterator = db.prepare('SELECT value FROM probe').iterate();`,
+      true,
+    );
+    expect(output).toContain('"value":{"value":"readable"}');
+    expect(output).not.toContain('Unclassified ingress write');
+    expect(output).toContain('DURABLE_ROWS=[{"value":"readable"}]');
+  });
+}
+
+it('preserves writable iterator execution outside a traced lifecycle', () => {
+  const output = probe(
+    'tick',
+    '',
+    undefined,
+    `const iterator = db.prepare("INSERT INTO probe VALUES ('outside') RETURNING value").iterate();
+     console.log(JSON.stringify(iterator.next())); iterator.return();`,
+    true,
+  );
+  expect(output).toContain('"value":{"value":"outside"}');
+  expect(output).not.toContain('Unclassified ingress write');
+  expect(output).toContain('DURABLE_ROWS=[{"value":"outside"}]');
 });
 
 // PRAGMAs have both direct-SQL and native-driver entrypoints; neither may hide

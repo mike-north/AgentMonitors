@@ -880,7 +880,11 @@ startup/restart setup, the exact expired-object-suppression DELETE from its main
 method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
 is checked separately). Delivery refresh reaches no additional durable writes in these
 fixtures; it has no blanket exclusion. Direct SQL and deferred iterator writes are refused
-with the same diagnostic until they have deliberate interruption support. Both `exec()`
+with the same diagnostic until they have deliberate interruption support. Writable
+iterators MUST be wrapped whenever created: creation and every supported `next`,
+`return` or `throw` inside a traced lifecycle are refused with SQL and call-site
+evidence, even if the iterator predates lifecycle entry. Outside lifecycle ownership,
+native iterator behavior is preserved. Both `exec()`
 and the native `pragma()` entrypoint MUST require an explicit read-only PRAGMA
 allowlist, no assignment (including parenthesized setting writes), and SQLite
 statement `readonly` metadata. Only schema-inspection PRAGMAs accept object-name

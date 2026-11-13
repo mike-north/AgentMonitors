@@ -164,16 +164,21 @@ Database.prototype.prepare = function (sql) {
     return statement;
   }
   // Iteration defers execution until next(); treating iterate() as the write
-  // would park a kill before durability. Refuse a new deferred writer explicitly.
+  // would park a kill before durability. Ownership must be checked on creation
+  // and every advance/finalization, since a cursor can predate the lifecycle.
   const iterate = statement.iterate;
   statement.iterate = function (...args) {
-    if (lifecycle.getStore()) {
-      const site = callSite();
-      const message = `Unclassified ingress write: ${sql}\n${site}`;
-      process.send?.({ kind: 'unclassified-write', message, sql, site });
-      throw new Error(message);
+    guardDeferredWrite(sql);
+    const iterator = iterate.apply(this, args);
+    for (const method of ['next', 'return', 'throw']) {
+      if (typeof iterator[method] !== 'function') continue;
+      const execute = iterator[method];
+      iterator[method] = function (...values) {
+        guardDeferredWrite(sql);
+        return execute.apply(this, values);
+      };
     }
-    return iterate.apply(this, args);
+    return iterator;
   };
   for (const method of ['run', 'get', 'all']) {
     const execute = statement[method];
@@ -210,6 +215,17 @@ Database.prototype.prepare = function (sql) {
   }
   return statement;
 };
+
+/** Deferred writers have no safe kill point; refuse before any native cursor effect. */
+function guardDeferredWrite(sql) {
+  if (!lifecycle.getStore()) return;
+  const site = callSite();
+  const message = `Unclassified ingress write: ${sql}\n${site}`;
+  process.send?.({ kind: 'unclassified-write', message, sql, site });
+  // Unlike read cursors, even finalizing a writer can commit. Leave it untouched
+  // on refusal; cleanup outside lifecycle ownership remains the caller's task.
+  throw new Error(message);
+}
 
 /**
  * Query-only PRAGMAs admitted by the direct-SQL boundary. Keep this list explicit:
