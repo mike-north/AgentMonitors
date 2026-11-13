@@ -187,6 +187,23 @@ export interface ClaudeInterpretAdapterOptions {
 }
 
 // @public
+export class CommandProcessJournal implements CommandProcessOwner {
+    close(): void;
+    environment(): Promise<Readonly<Record<string, string>>>;
+    exited(pid: number): void;
+    static open(dbPath: string, workspace: string): CommandProcessJournal;
+    spawned(pid: number): void;
+    sweep(): Promise<RestartSweepResult>;
+}
+
+// @public
+export interface CommandProcessOwner {
+    environment(): Promise<Readonly<Record<string, string>>>;
+    exited(pid: number): void;
+    spawned(pid: number): void;
+}
+
+// @public
 export function computeDerivedFacts(snapshot: unknown, now: number, rules: readonly DerivedFactRule[]): DerivedFact[];
 
 // @public
@@ -1377,6 +1394,27 @@ export function reportSignalAbstention(abstention: SignalAbstention): void;
 
 // @public
 export function resolveDottedPath(root: unknown, path: string): unknown;
+
+// @public
+export interface RestartSweepOutcome {
+    readonly evidence?: ProcessIdentityRecord & {
+        readonly boot: string;
+        readonly mark: string;
+        readonly via: 'inherited-mark' | 'group-continuity';
+        readonly groupAnchor?: ProcessIdentityRecord;
+    };
+    readonly life: string;
+    readonly pid?: number;
+    readonly reason?: string;
+    readonly status: 'reaped' | 'abstained' | 'gone' | 'failed' | 'owner-alive';
+}
+
+// @public
+export interface RestartSweepResult {
+    readonly outcomes: readonly RestartSweepOutcome[];
+    readonly startedAt: string;
+    readonly status: 'running' | 'complete' | 'incomplete';
+}
 
 // @public
 export function restrictExistingPathMode(targetPath: string, mode: number): void;

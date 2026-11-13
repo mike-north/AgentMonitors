@@ -9,6 +9,62 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Preserve ownership across every observed disappearance (008 §4.2; 004 §3.5.1a) — Refs #478
+
+Use one disappearance rule for initial discovery/gone batching, anchor confirmation, signal-time
+absence and delivery ESRCH: preserve the life and numeric group suspicion, then allow bounded
+rediscovery. Remember a marked anchor's group before confirmation can lose it. Only fresh readable
+absence of the nonce, recorded group members and occupied recorded PIDs can retire ownership;
+numeric suspicion never authorizes a signal. Regressions reproduce the discovery-time fork/exit,
+isolate each path's retention from all other outcomes, reject both retention mutations, and bound
+a continuously vanishing lineage to eight passes while preserving batched empty-hint performance.
+
+## 2026-11-12 — Preserve late forks after natural parent exit (008 §4.2; 004 §3.5.1a) — Refs #478
+
+A target that vanishes before signalling retains its life and group suspicion and triggers
+fresh bounded discovery, just as a sent signal does. Marked late forks still require fresh boot,
+mark and start-time evidence; unavailable identity produces an abstention. A later empty snapshot
+can retire the life. Regressions compare durable and returned receipts, cover each late-fork gate,
+and protect PID-only admission occupancy with a guard mutation failure.
+
+## 2026-11-12 — Bound restart hint accounting and preserve discovered groups (008 §4.2; 004 §3.5.1a) — Refs #478
+
+Batch gone-PID decisions before further asynchronous work instead of rewriting the receipt per
+hint. Awaited admissions retire empty numeric group suspicions while preserving possible
+survivors, unavailable discovery and the life nonce for marked detached work. Per-hint bookkeeping
+changes protect refreshed work from older admission snapshots while unrelated empty hints still retire. Newly discovered
+marked groups gain durable suspicion before any anchor signal, preserving later unmarked
+survivor accounting across reopenings without granting numeric signal authority. Regressions
+cover 12,001 gone hints under two seconds, bounded admission retention, discovered-group reopen
+accounting, and both PID and reason dedupe boundaries with mutation failures.
+
+## 2026-11-12 — Keep restart uncertainty and group retention stable (008 §4.2; 004 §3.5.1a) — Refs #478
+
+Post-signal snapshots record unchanged unreadable-PID uncertainty once per sweep while continuing
+verified late-fork cleanup. A confirmed parent reap retains its original-group numeric suspicion
+across journal reopenings until no group member remains. Regressions assert the uncertainty count
+and 100 reopen/sweep cycles with exactly one life and one suspicion, no unmarked-survivor signal,
+and retirement once the group disappears. Numeric hints still provide no signal authority.
+
+## 2026-11-12 — Preserve restart survivor accounting (008 §4.2; 004 §3.5.1a) — Refs #478
+
+Direct-child exit retains the original-group numeric suspicion so an unmarked survivor without
+a confirmed anchor receives an abstention and keeps the life retryable, without gaining signal
+authority. Post-signal discovery saves unreadable-PID abstentions and continues processing readable
+positive late-fork evidence through the existing boot, mark and start-time gates, while keeping the
+pass incomplete. Journal regressions assert both outcomes and life retention.
+
+## 2026-11-12 — Require environment-only restart ownership (008 §4.2; 004 §3.5.1a) — Refs #478
+
+Only actual inherited environment evidence may authorize command cleanup. The macOS system
+reader cannot distinguish argv from environment, so it records same-user PID abstentions and
+leaves them untouched; automatic cleanup is currently available on Linux. Ownership queries
+request only the supplied PIDs, with no host-wide environment scan at signal time. A matching
+zombie/dead owner no longer counts as live or protects a cleanup anchor; unavailable owner
+terminal evidence produces an abstention. Regressions cover argv-only nonces, zombie owners,
+PID-scoped queries and a bounded scan count with 100 survivors. Unchanged ownership uncertainty is recorded once, and a pass with no signals does not rescan it.
+Linux cleanup and macOS abstentions are asserted separately without extending readiness or command deadlines.
+
 ## 2026-11-12 — Runtime snapshot races remain report-only (004 §2.13; Refs #611)
 
 Clarify that disappearance and replacement during directory or symlink reads are
@@ -222,6 +278,28 @@ Moving bundled code to development dependencies does not remove advisory coverag
 Both inventories use the existing scoped, expiring allowlist and fail closed on audit
 failures. Loopback registry fixtures cover synthetic bundled advisories and automatic
 coverage when `noExternal` gains another package.
+
+## 2026-11-12 — Restart command cleanup records crash-safe ownership and conservative outcomes (008 §2.2/§4.2–4.3/§5; 004 §3.5.1a) — Closes #478
+
+The macOS/Linux daemon commits an inherited random life mark in a workspace-scoped journal before
+commands spawn. Startup finds marked survivors regardless of re-sessioning, excludes live owners,
+and rechecks boot, mark and start-time identity inside the existing recorded-process signal gate.
+Unconfirmed candidates survive with durable abstention reasons; detached mark-erased escapes remain
+unattributed. Receipts distinguish empty, completed, incomplete and interrupted passes. This makes
+POSIX command restart reconciliation current; #470's daemon-independent deadline bounds, #480's
+full-boundary deadline reporting, #507's active warnings and #426's adjacent hygiene remain target.
+
+Integration coverage proves killed-daemon tree cleanup, detached retained/erased marks, responsive
+unrelated identifier survival, boot-scale reuse and empty passes. Core coverage exercises missing
+spawn-PID records and signal-time evidence changes. The new signal site is inventoried in 008 §5.2. Empty-journal startup performs no host identity
+queries; the first command awaits its durable admission mark, while actual previous lives are
+still swept before readiness. Capture fixtures record their own wrapper identities and use
+verified per-process cleanup instead of signalling a PGID guessed from a PPID.
+Unreadable ownership marks retain their affected PIDs as discovery abstentions, without attributing
+those processes to a command. Escape silence is per process: unrelated unreadable marks can make
+the overall pass incomplete while positively confirmed work is reaped.
+Later discovery skips ownership reads for positively terminal incarnations while still inspecting
+reused PIDs whose process identities differ.
 
 ## 2026-11-12 — Spec 004 gap markers reconciled with shipped coverage; gap-drift check (004 §3.0/§3.1/§3.5/§5.1; roadmap) — Closes #287
 

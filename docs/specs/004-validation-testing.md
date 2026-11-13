@@ -1068,6 +1068,75 @@ that waits for its durable `triggered` history row before returning; verificatio
 Run the daemon suite serially with retries disabled when accepting this boundary repair. This proves
 the deterministic recording-order defect and repair, not that every historical CI failure had that cause.
 
+### 3.5.1a Restart command containment (008 §4.2, issue #478)
+
+Journal regressions must retain an exited direct child's group suspicion: an unmarked original-group
+survivor receives an abstention, its life remains retryable, and no numeric group suspicion authorizes
+a signal. After a confirmed signal, a positively marked late fork must still pass the boot, mark
+and start-time gates and receive cleanup and an outcome when an unrelated unreadable PID makes the
+new snapshot incomplete; the unreadable PID's abstention and the retained life remain recorded.
+Repeated post-signal snapshots must record exactly one unchanged unreadable-PID abstention.
+A different unreadable PID and a changed uncertainty reason for the same PID must each remain
+recorded, with equality between returned and durable receipts; removing either dedupe comparison
+must fail its boundary regression. A snapshot with at least 12,000 gone hints must finish well
+inside detached startup's 15-second deadline (under 2 seconds on the acceptance machine), preserve
+every gone outcome, and retire the empty life without signals. Repeated admissions in one life
+must retire empty group hints while retaining groups with possible survivors and unavailable
+discovery. A hint refreshed while the admission read is in flight must survive that earlier empty
+snapshot. PID-only occupancy by an unmarked reused process in a different group must also retain
+the hint; reopening must record a conservative abstention and keep the life without signalling.
+Removing PID occupancy from admission retirement must fail that regression. A later fresh empty
+snapshot can retire it. Unrelated bookkeeping during every admission
+read must not block retirement of older empty hints: 100 such admissions retain only newly recorded
+work until its own fresh empty reading. A newly discovered marked group without a direct-PID hint must persist its numeric
+suspicion before signalling, abstain from a later unmarked survivor across a journal reopen,
+never signal from the hint alone, and retire once the group disappears.
+A confirmed parent reap must retain the original-group suspicion across journal reopenings:
+100 successive sweeps with an unmarked group survivor keep exactly one life and one suspicion,
+never signal that survivor, and retire the life and suspicion once the group disappears.
+
+`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` belongs only to the serial
+restart-safety suite. Required Linux outcomes: SIGKILL/restart reaps the command and child with per-PID
+identity/daemon-life diagnostics; re-sessioned mark-kept descendants are reaped; detached
+mark-erased escapes survive without warnings; simulated reused PID/PGID and previous-boot state
+abstain with reasons and the unrelated process answers a fresh IPC ping; an empty startup records
+a completed empty pass. On macOS, the current reader cannot obtain environment-only evidence:
+the command and descendant survive with per-PID unproven-ownership abstentions, and the pass is
+incomplete. An argv-only nonce must never authorize a signal on either platform. Readiness is condition-based; every daemon and orphan has failure-safe,
+owned-process cleanup. Record five consecutive suite timings when accepting changes here.
+
+Core journal tests cover pre-spawn durability attribution without a recorded child PID, live-owner
+exclusion, signal-time mark loss, changed process start time, unavailable identity evidence,
+group-confirmed unmarked children, late forks, malformed records, bounded discovery and termination
+confirmation, zero host queries for empty-journal readiness, recycled anchor PIDs between discovery readings, an old owner PID reused by the new
+daemon, PID reuse during the last marker read, zombie-owner reconciliation (including the live-owner
+anchor exclusion), and unavailable owner terminal state. Marker-reader coverage asserts no argv-only
+ownership, requested-PID queries and at most two host-wide environment scans with 100 survivors
+(zero for macOS's conservative reader). Source tests prove optional PID bookkeeping
+failures cannot abandon live supervision.
+Unreadable-mark controls require per-PID abstentions durable before later identity queries;
+an unrelated unreadable environment may make discovery incomplete without producing an outcome
+for a readable detached mark-erased escape. Escape coverage must still prove the parent's reap,
+the child's survival, and no diagnostic for that child.
+A target absent during initial discovery, anchor confirmation, the signal gate or ESRCH at
+delivery must follow one rule: keep its life/group suspicion and allow bounded rediscovery
+before fresh readable emptiness can retire ownership. Include an unmarked group member's
+disappearance and an unrecorded anchor that vanishes before its group can be confirmed.
+Simulate Linux enumeration followed by the parent's missing stat and find its marked late fork
+on the next snapshot. For each disappearance path, isolate vanished-target retention as the
+only retaining outcome: a fresh snapshot has an unmarked replacement occupying the recorded
+PID in another group, no signal succeeds, and the life and numeric hint remain. Removing
+vanish retention or restoring failed-only retention must fail these boundary regressions.
+A continuously vanishing marked lineage must stop after eight discovery passes with an
+incomplete receipt and an abstention for still-discovered work.
+Its marked late fork must be cleaned through the normal gates,
+or receive an abstention on changed boot, lost mark or recycled start time, with every signal a spy.
+Returned and durable receipts must agree, and a later empty snapshot must retire the life and hints.
+A pass with no signals and no target observed vanishing must not repeat ownership discovery or duplicate an existing per-PID
+uncertainty just because that PID is also a numeric suspicion.
+Confirmed terminal incarnations must not become new unreadable candidates in a later snapshot;
+a different incarnation using the same PID must still receive normal discovery.
+
 ### 3.5.2 Literal-path verify cleanup and first-attempt acceptance
 
 The literal-glob integration scenario must prove that verify removes the file it created and its

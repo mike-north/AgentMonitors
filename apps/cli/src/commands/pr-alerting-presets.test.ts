@@ -30,6 +30,11 @@ import { parseMonitor } from '@agentmonitors/core';
 import commandPoll from '@agentmonitors/source-command-poll';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { assertPresetOutput } from './fixtures/assert-preset-output.js';
+import {
+  cleanupOwnedCaptureGroup,
+  parseOwnedCaptureGroup,
+} from './fixtures/owned-capture-group.mjs';
+import { waitForOwnedGroupTermination } from '../../../../scripts/owned-test-group.mjs';
 import { PRESET_CAPTURE_COMMAND } from './fixtures/preset-capture-command.js';
 import { TEMPLATES } from './init.js';
 
@@ -220,6 +225,7 @@ async function observe(
   stubDir: string,
   fixture: string,
   previousState?: unknown,
+  ownedGroupFile?: string,
 ): Promise<ObserveResult> {
   const fixtureFile = path.join(tempDir('fixture'), 'fixture.json');
   writeFileSync(fixtureFile, fixture, 'utf-8');
@@ -240,6 +246,15 @@ async function observe(
       ...scope,
       command: ['sh', '-c', PRESET_CAPTURE_COMMAND, 'preset-jq', ...command],
       env: {
+        ...(ownedGroupFile
+          ? {
+              AM475_OWNED_GROUP_FILE: ownedGroupFile,
+              AM475_OWNED_SIGNAL: path.join(
+                import.meta.dirname,
+                'fixtures/owned-capture-group.mjs',
+              ),
+            }
+          : {}),
         PATH: pathWith(stubDir),
         AM444_FIXTURE: fixtureFile,
         AM475_STDERR: stderrFile,
@@ -2258,18 +2273,12 @@ it('rejects real jq partial stdout at the helper while preserving source nonzero
   expect(failure).not.toContain('PRIVATE_FILTER_PAYLOAD');
 });
 
-/** Remove only a group recorded by the timeout fixture; source cleanup may win. */
-function killOwnedCaptureGroup(group: number): void {
-  try {
-    process.kill(-group, 'SIGKILL');
-  } catch (error) {
-    if (
-      !(error instanceof Error) ||
-      !('code' in error) ||
-      error.code !== 'ESRCH'
-    )
-      throw error;
-  }
+/** A receipt written by the wrapper's own PID, not a PPID, authorizes cleanup. */
+async function killOwnedCaptureGroup(filename: string): Promise<void> {
+  if (!existsSync(filename)) return;
+  const receipt = parseOwnedCaptureGroup(readFileSync(filename, 'utf8'));
+  const group = await cleanupOwnedCaptureGroup(receipt);
+  await waitForOwnedGroupTermination(group, Date.now() + 5000);
 }
 describe('interrupted capture metadata', () => {
   it.each([100, 4097])(
@@ -2277,7 +2286,8 @@ describe('interrupted capture metadata', () => {
     async (size) => {
       const dir = tempDir('interrupted-capture');
       const marker = path.join(dir, 'written.json');
-      const script = `const fs = require('node:fs'); setInterval(() => {}, 1000); process.stdout.write('[]'); process.stderr.write(Buffer.alloc(${size}, 'x'), () => fs.writeFileSync(process.argv[1], JSON.stringify({ pid: process.pid, group: process.ppid })));`;
+      const ownedGroupFile = path.join(dir, 'owned-group');
+      const script = `const fs = require('node:fs'); setInterval(() => {}, 1000); process.stdout.write('[]'); process.stderr.write(Buffer.alloc(${size}, 'x'), () => fs.writeFileSync(process.argv[1], JSON.stringify({ pid: process.pid })));`;
       let failure = '';
       try {
         try {
@@ -2288,6 +2298,8 @@ describe('interrupted capture metadata', () => {
             },
             tempDir('timeout-command'),
             '[]',
+            undefined,
+            ownedGroupFile,
           );
         } catch (error) {
           failure = String(error);
@@ -2301,14 +2313,7 @@ describe('interrupted capture metadata', () => {
         expect(failure).not.toContain(marker);
         expect(failure.length).toBeLessThan(600);
       } finally {
-        if (existsSync(marker)) {
-          const owned = JSON.parse(readFileSync(marker, 'utf8')) as {
-            pid: number;
-            group: number;
-          };
-          // This fixture records only the detached wrapper group which owns it.
-          killOwnedCaptureGroup(owned.group);
-        }
+        await killOwnedCaptureGroup(ownedGroupFile);
       }
     },
   );
@@ -2381,12 +2386,13 @@ describe('consecutive source failures with surviving capture (003 §11.5)', () =
       const previousState = await failingPresetBaseline();
       const start = createdTempDirs.length;
       const marker = path.join(tempDir('repeated-write'), 'written.json');
-      const producer = `const fs=require('node:fs'); const bytes=Buffer.alloc(4097,'x'); bytes.write('PRIVATE_CAPTURE_TAIL',4065); process.stderr.write(bytes,()=>fs.writeFileSync(process.argv[1],JSON.stringify({writtenBytes:4097,group:Number(process.argv[2])})));`;
-      const script = `"$1" -e "$2" "$3" "$PPID"
+      const ownedGroupFile = `${marker}.owned-group`;
+      const producer = `const fs=require('node:fs'); const bytes=Buffer.alloc(4097,'x'); bytes.write('PRIVATE_CAPTURE_TAIL',4065); process.stderr.write(bytes,()=>fs.writeFileSync(process.argv[1],JSON.stringify({writtenBytes:4097})));`;
+      const script = `"$1" -e "$2" "$3"
 exec 2>/dev/null
 while [ ! -f "$AM475_TOTAL" ]; do sleep 0.01; done
 printf '[]'
-if [ "$4" = signal ]; then kill -TERM "$PPID"; else sleep 60; fi`;
+if [ "$4" = signal ]; then "$AM475_NODE" "$AM475_OWNED_SIGNAL" "$AM475_OWNED_GROUP_FILE"; else sleep 60; fi`;
       const scope = {
         command: [
           'sh',
@@ -2409,6 +2415,7 @@ if [ "$4" = signal ]; then kill -TERM "$PPID"; else sleep 60; fi`;
             tempDir('repeated-command'),
             '[]',
             previousState,
+            ownedGroupFile,
           );
         } catch (error) {
           failure = String(error);
@@ -2451,12 +2458,7 @@ if [ "$4" = signal ]; then kill -TERM "$PPID"; else sleep 60; fi`;
         expect(failure.length).toBeLessThan(600);
       } finally {
         observed.mockRestore();
-        if (existsSync(marker)) {
-          const owned = JSON.parse(readFileSync(marker, 'utf8')) as {
-            group: number;
-          };
-          killOwnedCaptureGroup(owned.group);
-        }
+        await killOwnedCaptureGroup(ownedGroupFile);
       }
     },
   );
