@@ -15,10 +15,11 @@ import { SourceRegistry } from '@agentmonitors/core';
 export function createRuntime(
   dbPath = resolveDbPath(),
   commandOwner?: CommandProcessOwner,
+  shutdownSignal?: AbortSignal,
 ): AgentMonitorRuntime {
   const db = createDb(dbPath);
   const registry = new SourceRegistry();
-  registerCoreSources(registry, commandOwner);
+  registerCoreSources(registry, commandOwner, shutdownSignal);
   return new AgentMonitorRuntime(new RuntimeStore(db), registry, [
     claudeCodeAdapter,
   ]);

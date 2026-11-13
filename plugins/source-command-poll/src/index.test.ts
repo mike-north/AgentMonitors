@@ -59,6 +59,10 @@ function nodeArgv(program: string): string[] {
 }
 
 describe('source-command-poll', () => {
+  // Instrumentation is process-global and must also be restored after timeout.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
   it('has the correct name, is stateful, and exposes a scopeSchema (003 §11)', () => {
     expect(source.name).toBe('command-poll');
     expect(source.stateful).toBe(true);

@@ -13,7 +13,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { readProcessTable } from '@agentmonitors/core';
+import {
+  readProcessTable,
+  sendVerifiedSignal,
+  type ProcessIdentityRecord,
+} from '@agentmonitors/core';
 import { waitForOwnedGroupTermination } from '../../../../scripts/owned-test-group.mjs';
 import { ownedWorkerTerminated } from '../../../../scripts/owned-worker-terminated.mjs';
 
@@ -44,12 +48,33 @@ async function bounded<T>(operation: Promise<T>, label: string): Promise<T> {
 
 /** Every subprocess and orphan is exclusively owned by this test, including on assertion failure. */
 afterEach(async () => {
+  const anchors = new Set(
+    children
+      .filter((child) => child.exitCode === null && child.signalCode === null)
+      .flatMap((child) => (child.pid === undefined ? [] : [child.pid])),
+  );
   const file = path.join(workspace, 'pids.json');
   if (existsSync(file)) {
     const pids: { parent: number; child: number; detached: boolean } =
       JSON.parse(readFileSync(file, 'utf8'));
+    for (const pid of [pids.parent, pids.child]) {
+      if (!ownedWorkerTerminated(pid)) anchors.add(pid);
+    }
     groups.add(pids.parent);
     if (pids.detached) groups.add(pids.child);
+  }
+  // A completed watchdog may already have ended its group. Capture live,
+  // fixture-anchored membership before cleanup, then verify each recorded
+  // incarnation at delivery. Never signal a bare, possibly reaped group ID.
+  const owned: ProcessIdentityRecord[] = [];
+  const snapshot = await readProcessTable();
+  if (!snapshot.supported) throw new Error(snapshot.reason);
+  for (const group of groups) {
+    const members = snapshot.processes.filter(
+      (member) => member.pgid === group,
+    );
+    if (members.some((member) => anchors.has(member.pid)))
+      owned.push(...members);
   }
   for (const child of children.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) {
@@ -58,15 +83,12 @@ afterEach(async () => {
       await bounded(exited, 'owned child exit');
     }
   }
+  for (const record of owned) {
+    await sendVerifiedSignal({ kind: 'recorded-process', record }, 'SIGKILL', {
+      action: 'owned command fixture teardown',
+    });
+  }
   for (const group of groups) {
-    try {
-      process.kill(-group, 'SIGKILL');
-    } catch (error) {
-      if (
-        !(error instanceof Error && 'code' in error && error.code === 'ESRCH')
-      )
-        throw error;
-    }
     await waitForOwnedGroupTermination(group, Date.now() + 5_000);
   }
   groups.clear();
@@ -136,6 +158,11 @@ async function start(): Promise<ChildProcess> {
         ...process.env,
         AGENTMONITORS_DB: db,
         XDG_DATA_HOME: path.join(workspace, 'data'),
+        HOME: workspace,
+        XDG_CONFIG_HOME: path.join(workspace, 'config'),
+        XDG_STATE_HOME: path.join(workspace, 'state'),
+        XDG_CACHE_HOME: path.join(workspace, 'cache'),
+        TMPDIR: workspace,
       },
       stdio: ['ignore', 'pipe', 'pipe'],
     },
@@ -164,27 +191,33 @@ async function start(): Promise<ChildProcess> {
 /** A real orphan tree; independent sessions either preserve or deliberately erase the inherited mark. */
 function monitor(
   mode: 'tree' | 'detached' | 'escaped' | 'group-unmarked',
+  timeout = '5m',
+  closeStreams = false,
+  exitLeader = false,
+  inheritLeafStreams = false,
 ): void {
   const leaf = `
     let armed=false;
     process.on('disconnect',()=>{if(!armed)process.exit(0)});
     process.on('message',()=>{armed=true;process.send('armed');process.disconnect()});
+    process.on('SIGTERM',()=>{});
     setInterval(()=>{},1000);process.send('ready');
   `;
   const fixture = `
     const fs=require('node:fs');
+    if (${closeStreams}) { process.stdout.destroy(); process.stderr.destroy(); }
     const env={...process.env};
     if (${JSON.stringify(mode)}==='escaped'||${JSON.stringify(mode)}==='group-unmarked') delete env.AGENTMONITORS_COMMAND_LIFE;
-    const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(leaf)}],{env,detached:${mode === 'detached' || mode === 'escaped'},stdio:['ignore','ignore','ignore','ipc']});
+    const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(leaf)}],{env,detached:${mode === 'detached' || mode === 'escaped'},stdio:['ignore',${inheritLeafStreams ? "'inherit','inherit'" : "'ignore','ignore'"},'ipc']});
     fs.writeFileSync('pids.json',JSON.stringify({parent:process.pid,child:child.pid,detached:${mode === 'detached' || mode === 'escaped'}}));
-    child.on('message',(message)=>{if(message==='ready')child.send('arm');else if(message==='armed')fs.writeFileSync('ready','ready')});
+    child.on('message',(message)=>{if(message==='ready')child.send('arm');else if(message==='armed'){fs.writeFileSync('ready','ready');if(${exitLeader})process.exit(0)}});
     setInterval(()=>{},1000);
   `;
   const dir = path.join(monitors, 'command');
   mkdirSync(dir);
   writeFileSync(
     path.join(dir, 'MONITOR.md'),
-    `---\nname: Restart cleanup\nwatch:\n  type: command-poll\n  command: ${JSON.stringify([process.execPath, '-e', fixture])}\n  timeout: 5m\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
+    `---\nname: Restart cleanup\nwatch:\n  type: command-poll\n  command: ${JSON.stringify([process.execPath, '-e', fixture])}\n  timeout: ${timeout}\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
   );
 }
 
@@ -212,6 +245,89 @@ async function orphan(
 describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
   'restart sweep',
   () => {
+    // Deadline enforcement must survive loss of the daemon and of inherited stdio.
+    for (const closeStreams of [false, true]) {
+      it(`bounds a real command group after SIGKILL (closed stdio: ${String(closeStreams)})`, async () => {
+        monitor('tree', '1s', closeStreams);
+        const daemon = await start();
+        await expect
+          .poll(() => existsSync(path.join(workspace, 'ready')), {
+            timeout: 5_000,
+          })
+          .toBe(true);
+        const pids: { parent: number; child: number } = JSON.parse(
+          readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
+        );
+        const exit = once(daemon, 'exit');
+        daemon.kill('SIGKILL');
+        await bounded(exit, 'owned daemon crash');
+        expect(daemon.signalCode).toBe('SIGKILL');
+        // The timeout starts before readiness; the grace is the production 5 seconds.
+        await waitForOwnedGroupTermination(pids.parent, Date.now() + 6_000);
+        expect(ownedWorkerTerminated(pids.parent)).toBe(true);
+        expect(ownedWorkerTerminated(pids.child)).toBe(true);
+      }, 15_000);
+    }
+
+    for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+      it(`ends in-flight command groups before graceful ${signal} shutdown`, async () => {
+        monitor('tree', '30s');
+        const daemon = await start();
+        await expect
+          .poll(() => existsSync(path.join(workspace, 'ready')), {
+            timeout: 5_000,
+          })
+          .toBe(true);
+        const pids: { parent: number; child: number } = JSON.parse(
+          readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
+        );
+        const exit = once(daemon, 'exit');
+        daemon.kill(signal);
+        await bounded(exit, 'graceful daemon exit');
+        expect(ownedWorkerTerminated(pids.parent)).toBe(true);
+        expect(ownedWorkerTerminated(pids.child)).toBe(true);
+        await waitForOwnedGroupTermination(pids.parent, Date.now() + 1_000);
+      }, 15_000);
+    }
+
+    it('cleans a still-live group on shutdown after its command leader exits during output capture', async () => {
+      monitor('tree', '30s', false, true, true);
+      const daemon = await start();
+      await expect
+        .poll(() => existsSync(path.join(workspace, 'ready')), {
+          timeout: 5000,
+        })
+        .toBe(true);
+      const pids: { parent: number; child: number } = JSON.parse(
+        readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
+      );
+      await expect.poll(() => ownedWorkerTerminated(pids.parent)).toBe(true);
+      // Allow the completed observation to settle while its child remains alive.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      expect(ownedWorkerTerminated(pids.child)).toBe(false);
+      const exit = once(daemon, 'exit');
+      daemon.kill('SIGTERM');
+      await bounded(exit, 'graceful completed-group cleanup');
+      expect(ownedWorkerTerminated(pids.child)).toBe(true);
+      await waitForOwnedGroupTermination(pids.parent, Date.now() + 1000);
+    }, 15000);
+
+    it('ends background work when a completed observation releases its group', async () => {
+      monitor('tree', '30s', true, true);
+      await start();
+      await expect
+        .poll(() => existsSync(path.join(workspace, 'ready')), {
+          timeout: 5000,
+        })
+        .toBe(true);
+      const pids: { parent: number; child: number } = JSON.parse(
+        readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
+      );
+      await waitForOwnedGroupTermination(pids.parent, Date.now() + 3000);
+      expect(ownedWorkerTerminated(pids.parent)).toBe(true);
+      expect(ownedWorkerTerminated(pids.child)).toBe(true);
+    }, 15000);
+
     for (const mode of ['tree', 'detached', 'group-unmarked'] as const) {
       it(`reconciles a killed daemon's ${mode} command and descendant with honest identity diagnostics`, async () => {
         const pids = await orphan(mode);

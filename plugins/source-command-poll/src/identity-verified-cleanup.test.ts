@@ -36,6 +36,20 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import source from './index.js';
 
+// Exercise the daemon's identity gate even when the independent watchdog is
+// scheduled late and loses its TERM protection. Original signal and no-survivor assertions remain active;
+// the real watchdog deadline is covered separately by hard-daemon-death tests.
+vi.mock('./self-bound.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./self-bound.js')>();
+  return {
+    ...actual,
+    WATCHDOG_PROGRAM:
+      'const setTimeout = (fn, ms) => global.setTimeout(fn, ms + 2000);\n' +
+      actual.WATCHDOG_PROGRAM +
+      '\nprocess.removeAllListeners("SIGTERM");',
+  };
+});
+
 const NOW = new Date('2026-06-12T00:00:00.000Z');
 /** Escalation grace from 003 §11.2, plus slack for the verification read. */
 const KILL_STEP_DEADLINE_MS = 1_000 + 5_000 + 3_000;

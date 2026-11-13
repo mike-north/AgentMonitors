@@ -86,52 +86,31 @@ the system, and the only one the system does not claim to account for.)
 
 ### 3.1 Time-bounded execution with platform tree termination (current)
 
-A monitored command MUST run only within its configured window: **escalation begins at the
-configured timeout, and the hard upper bound on the command's lifetime is the configured
-timeout plus the fixed 5-second forceful-kill grace period** (a SIGTERM-ignoring child runs
-until the grace expires — empirically, a `timeout: 1s` command resolves in ~6s). On POSIX
-the runtime sends SIGTERM and, after the grace, SIGKILL to the command's **original process
-group**; on Windows it invokes `taskkill /PID <pid> /T /F` and repeats that forceful tree
-kill after the grace period as a defensive retry. A descendant that remains in the original
-process group — e.g. one holding stdio open or surviving its parent — MUST NOT outlive that
-hard upper bound. Descendants that leave the original process group/session are **not**
-covered by this current guarantee; they enter the deferred-reconciliation state (§2.2,
-§3.2).
+A monitored command MUST run only within its configured window. Escalation begins at the
+configured timeout; the hard bound is that timeout plus the fixed **5-second kill grace**,
+subject to ordinary OS scheduling. On POSIX, an independent in-group watchdog enforces that
+bound even if the command ignores SIGTERM, exits before a descendant, closes inherited
+stdio, or the daemon disappears (§3.3). Descendants that leave the original process group
+are outside this deadline mechanism and require §4.2 reconciliation (§3.2).
 
-Both escalation steps are identity-verified (§5) before they signal. A descendant still in the
-original group is confirmed through the group's continuity (§5.1), including one forked after
-the SIGTERM step: by the command's leader before it exits (the read at the leader's exit), or by
-any confirmed member that is still alive at one of the membership readings taken every 250 ms
-through the grace period. Verification therefore does not exempt such descendants from the
-bound. The SIGKILL step abstains (§2.2 state 4) only when continuity cannot be shown: the
-process table cannot be read, or the group holds none of the processes confirmed as its members.
+The daemon also retains its identity-verified SIGTERM → SIGKILL escalation (§5). Its readings
+at leader exit and every 250 ms during the grace confirm late forks. Those daemon-origin
+steps may abstain when the process table is unreadable or continuity cannot be established
+across a hand-off between readings. That conservative abstention does not cancel the
+watchdog: its own continued group membership supplies uninterrupted identity evidence and
+its self-group signals require no process-table read. The daemon's table-read latency no
+longer extends the POSIX watchdog deadline.
 
-**Exception to the bound above (the hand-off residual).** Continuity is re-established only at
-a reading. After the command's leader has exited, a group member that forks a process and exits
-between two consecutive readings (within one 250 ms interval plus one read; the read time grows under load, up to the 5 s `ps` cap), while no other
-confirmed member is alive, hands the group to a process no reading saw beside a confirmed
-member. That process, and anything it forks, cannot be told apart from unrelated work that
-reused an emptied group id, so the SIGKILL step abstains and they MAY outlive the hard upper
-bound. The abstention is reported (§6.1). While the process table is readable, this is the only
-way a process that stays in the original group escapes the bound. (A group that truly empties
-and whose id is then reused also makes the step abstain, but nothing of ours is left in it; see
-§5.1's residual window.)
+On Windows, Node invokes `taskkill /PID <pid> /T /F` at timeout and repeats the forceful tree
+kill after the grace as a defensive retry, only while the direct child remains unreaped.
+The independent POSIX watchdog does not provide a Windows daemon-death guarantee.
 
-Verification reads the process table, which adds latency to each step. The SIGKILL goes out
-after the later of the grace expiry and the end of the SIGTERM step's read, and after the
-SIGKILL step's own read, once any grace-period reading still in flight and (if the leader
-exited) the read taken at its exit have landed. Normally that adds tens of milliseconds to
-timeout + 5 s. On macOS each read is capped by a 5-second `ps` timeout, and the in-flight and
-exit reads both started before the SIGKILL step, so even a pathologically slow table delays the
-SIGKILL to at most timeout + 15 s; a read that times out is unreadable, and that step abstains.
-On Linux the reads are `/proc` file reads, which do not wait on other processes.
-
-**Current** — implemented by `@agentmonitors/source-command-poll` per
-[003 §11](./003-source-plugins.md) (escalation targeting fixed in #303). Verified: the
-no-orphan-on-timeout guards in `plugins/source-command-poll/src/index.test.ts` (direct child
-**and** a backgrounded `sh -c` descendant that remains in the original process group) and
-the live daemon-run/daemon-stop no-orphan check in
-`apps/cli/src/commands/cli.integration.test.ts`.
+**Verified:** timeout/no-orphan cases in `plugins/source-command-poll/src/index.test.ts`;
+`identity-verified-cleanup.test.ts` and `identity-verified-cleanup.read-window.test.ts` in that
+directory retain all daemon-gate assertions while injecting late watchdog scheduling and loss
+of its SIGTERM protection, so the
+independent deadline cannot mask a broken identity gate. Unmodified real watchdogs are
+exercised by `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`.
 
 ### 3.2 Full-boundary bounds (target — #480, with #478 as reconciliation)
 
@@ -154,29 +133,62 @@ on a kernel-containment rung — see that child terminated at the deadline; on t
 rung, the child MUST be reaped by the next daemon start (regression for the
 detached-descendant survival reproduced during this spec's review).
 
-### 3.3 Bounds must not require a live daemon (target — #470, narrowed by PR #472)
+### 3.3 Bounds must not require a live daemon (current on macOS/Linux — #470)
 
-The lifetime bound of §3.1 MUST hold even if the daemon dies before the timeout fires.
-**Current behavior falls short:** bounds live only in daemon-resident timers, so a hard-killed
-daemon can orphan the command and its descendants (a detached child reparents to the OS
-supervisor and keeps running). **Target:** spawned work is self-bounding — the mechanism
-enforcing the window survives daemon death (PR #472's self-bounding watchdog is the intended
-narrowing). Its residual close-on-exec-descendant gap **remains open under #470**: such a
-survivor is genuinely unbounded once the daemon is gone, until a future daemon start
-reconciles it. §4.2's sweep is complementary reconciliation, never a substitute for this
-lifetime bound.
+Every POSIX command admission starts a detached launcher and an in-group watchdog using the
+running Node executable. The watchdog registers referenced timers for the absolute timeout
+and timeout-plus-grace, then acknowledges arming. Only after that acknowledgement does the
+launcher replace itself with the authored command. The command retains the recorded PID,
+original group and inherited life mark. Missing launcher support, failed watchdog startup,
+failed timer registration or an elapsed admission deadline fails closed: authored work does
+not run, and observation health reports an execution failure.
 
-**Test implication:** kill the daemon (SIGKILL) mid-command with a timeout pending; the
-command's covered tree (§3.1's mechanism class) MUST still terminate at its deadline with no
-daemon present. The close-on-exec residual is exercised as a sweep-reconciliation case
-(§4.2), not a deadline case, until #470 closes it.
+Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
+blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals
+its **current group** with `kill(0, SIGTERM)` and `kill(0, SIGKILL)`. It never changes group;
+its continued membership prevents that group ID being recycled. Neither daemon EOF, command
+exit, nor closure of inherited command descriptors cancels its timers. No Linux-only
+parent-death facility or PATH utility is required.
+
+After direct-command output has settled, a normally completed finite observation sends an
+explicit completion request over a private descriptor. The watchdog ends its entire current
+group, including itself and any remaining background work. It never cancels the deadline on
+an apparently empty process-table snapshot: a fork-and-exit hand-off can evade such a read.
+Timeout failures instead retain the full kill grace. EOF alone leaves both referenced timers
+armed. This uses no additional process-table subprocess or idle polling. A shutdown request
+can also end the group after the leader has exited while output capture remains in flight.
+
+Deadlines use the shared OS monotonic clock: launcher startup consumes the configured window,
+and wall-clock corrections cannot extend it. Capturing that native clock keeps host scheduling
+clock virtualization from changing the execution epoch. Timer segments are capped at Node's maximum
+delay, including the maximum configured timeout plus the grace, without integer overflow.
+
+**Verified:** `plugins/source-command-poll/src/self-bound.test.ts` covers ordering, injected
+arming failure, restricted PATH, literal argv, preserved PID/mark, event-loop progress and
+absence of synchronous arming APIs. `watchdog-program.test.ts` covers self-group targeting,
+referenced timers after EOF, completion/shutdown self-group termination, clock correction and
+maximum-delay arithmetic. `global-state.test.ts` forces an actual nested test timeout and
+proves that the successor sees the original PATH and instrumentation.
+`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` SIGKILLs a real daemon running
+a hanging command and descendant, with both ordinary and closed command stdio, and proves
+the whole original group terminates without another daemon.
+
+Re-sessioned descendants remain §3.2/§4.2 reconciliation work. Windows daemon-death bounds
+remain unimplemented; this guarantee is specifically for macOS/Linux.
 
 ## 4. Crash Survival — "it survives its own death without leaving a mess"
 
-### 4.1 In-flight work stays bounded across daemon death (target — #470)
+### 4.1 In-flight work stays bounded across daemon death (current on macOS/Linux — #470)
 
-Same mechanism as §3.3, stated as the crash-survival guarantee: cleanup of in-flight spawned
-work MUST NOT depend on the daemon being alive to perform it.
+§3.3 enforces the original-group bound independently of daemon liveness. Graceful SIGTERM,
+SIGINT and IPC stop additionally abort new command admissions and actively SIGKILL each
+in-flight command group through the daemon's existing identity gate before the observation
+settles and the daemon exits. If the command leader has already exited, its still-live
+watchdog accepts a shutdown request on the private channel and kills its own group; command
+output capture does not discard this remaining cleanup responsibility. Shutdown does not wait for a long command timeout. Real SIGTERM
+and SIGINT cases in `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` assert
+both parent and descendant termination at daemon exit. A late ownership admission cannot
+spawn after cancellation (`plugins/source-command-poll/src/self-bound.test.ts`).
 
 ### 4.2 The restart sweep (current Linux cleanup and macOS conservative abstentions for command-poll; adjacent hygiene remains target — #426)
 
@@ -284,7 +296,8 @@ only once per startup and takes at most eight discovery passes per old life; if 
 appearing, the pass is incomplete and each still-discovered PID gets an abstention reason. This
 bounds startup work without guessing at identifiers or repeatedly signalling a disputed PID.
 
-The sweep is reconciliation, not the live lifetime bound of #470. Commands from releases before
+The launcher preserves the recorded command PID and group; the watchdog and authored descendants
+inherit the same life mark. The sweep is reconciliation, not the live lifetime bound of #470. Commands from releases before
 ownership journaling cannot be safely attributed and are not heuristically collected. Windows
 currently records unavailable discovery rather than claiming a successful sweep. Stray daemons,
 channel servers and stale sockets remain the separate #426 scope.
@@ -332,10 +345,12 @@ never collateral damage.
 
 ### 5.1 The verification gate (current)
 
-Every cleanup or enforcement signal goes through one shared gate,
+Every daemon-origin cleanup or enforcement signal goes through one shared gate,
 `sendVerifiedSignal` in `libs/core/src/process/process-identity.ts`, which verifies and then
 signals, or withholds the signal and reports an abstention. No shipped code signals a stored
-pid or pgid any other way. Identity evidence:
+pid or pgid any other way. The standalone watchdog instead signals only its own current group
+with literal target `0`: its uninterrupted membership is identity evidence by construction,
+without a recorded numeric target or a process-table race. Identity evidence for daemon signals:
 
 - **Live child handle.** While Node still holds an unreaped `ChildProcess` for a pid, the OS
   cannot reuse that pid, nor the process-group id of a group that child leads (a POSIX
@@ -410,17 +425,19 @@ the window is the whole gap between steps.
 Every place shipped code (`libs/`, `apps/`, `plugins/`) sends a signal, and its disposition.
 Keep this table current when a signal site is added.
 
-| Site                                                                                                                                                                                                                                     | Signal and target                                                           | Identity evidence                                                                                                                                                                                                                                                   | Disposition                                                                                                                                                       |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                                    | the read starts while the leader is unreaped (the timeout only fires while the command runs); the members it lists are confirmed, a read at the leader's exit confirms later forks, and readings every 250 ms until the follow-up confirm hand-offs between members | verified; if the leader exits during the read, the reading's members still confirm the group; an empty group needs no signal                                      |
-| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later (after the `SIGTERM` step's read)  | the leader is unreaped, or a member confirmed earlier (at the `SIGTERM` step, the leader's exit or a grace-period reading) is still in the group                                                                                                                    | verified; an empty group needs no signal; abstains (§6.1) only when continuity is lost (a reused id, or the hand-off residual of §5.1) or the table is unreadable |
-| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                                                 | live child handle                                                                                                                                                                                                                                                   | verified; the follow-up is skipped once the direct child has been reaped                                                                                          |
-| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned                   | live child handle                                                                                                                                                                                                                                                   | verified; a child that has already exited is never signalled by pid                                                                                               |
-| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child                              | live child handle                                                                                                                                                                                                                                                   | verified                                                                                                                                                          |
-| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                            | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
-| Restart command sweep (`libs/core/src/process/command-process-journal.ts`, `CommandProcessJournal.sweep`)                                                                                                                                | `SIGKILL` to each confirmed process PID                                     | committed daemon-life nonce (or group membership observed beside a marked anchor), matching boot, dead owner and fresh start-time identity; required nonce and boot checked again inside the gate                                                                   | verified; uncertainty is a durable abstention, never a group signal                                                                                               |
-| Ownership readers (`libs/core/src/process/command-process-marks.ts`, `systemRead`)                                                                                                                                                       | Node's `execFile` timeout sends `SIGKILL` to its own `ps` or `sysctl` child | unreaped child handle held internally by Node                                                                                                                                                                                                                       | identity-safe by construction; not a cleanup of stored identifiers                                                                                                |
-| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                          | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
+| Site                                                                                                                                                                                                                                     | Signal and target                                                                               | Identity evidence                                                                                                                                                                                                                                                   | Disposition                                                                                                                                                       |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                                                        | the read starts while the leader is unreaped (the timeout only fires while the command runs); the members it lists are confirmed, a read at the leader's exit confirms later forks, and readings every 250 ms until the follow-up confirm hand-offs between members | verified; if the leader exits during the read, the reading's members still confirm the group; an empty group needs no signal                                      |
+| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later (after the `SIGTERM` step's read)                      | the leader is unreaped, or a member confirmed earlier (at the `SIGTERM` step, the leader's exit or a grace-period reading) is still in the group                                                                                                                    | verified; an empty group needs no signal; abstains (§6.1) only when continuity is lost (a reused id, or the hand-off residual of §5.1) or the table is unreadable |
+| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                                                                     | live child handle                                                                                                                                                                                                                                                   | verified; the follow-up is skipped once the direct child has been reaped                                                                                          |
+| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned                                       | live child handle                                                                                                                                                                                                                                                   | verified; a child that has already exited is never signalled by pid                                                                                               |
+| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child                                                  | live child handle                                                                                                                                                                                                                                                   | verified                                                                                                                                                          |
+| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                                                | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
+| Restart command sweep (`libs/core/src/process/command-process-journal.ts`, `CommandProcessJournal.sweep`)                                                                                                                                | `SIGKILL` to each confirmed process PID                                                         | committed daemon-life nonce (or group membership observed beside a marked anchor), matching boot, dead owner and fresh start-time identity; required nonce and boot checked again inside the gate                                                                   | verified; uncertainty is a durable abstention, never a group signal                                                                                               |
+| Ownership readers (`libs/core/src/process/command-process-marks.ts`, `systemRead`)                                                                                                                                                       | Node's `execFile` timeout sends `SIGKILL` to its own `ps` or `sysctl` child                     | unreaped child handle held internally by Node                                                                                                                                                                                                                       | identity-safe by construction; not a cleanup of stored identifiers                                                                                                |
+| Self-bounding POSIX watchdog (`plugins/source-command-poll/src/self-bound.ts`, `WATCHDOG_PROGRAM`)                                                                                                                                       | `SIGTERM`, then `SIGKILL`, or immediate shutdown `SIGKILL`, to its current group (`kill(0, …)`) | own uninterrupted group membership; the program never changes group                                                                                                                                                                                                 | identity-safe by construction; no stored PID/PGID target                                                                                                          |
+| Command shutdown (`plugins/source-command-poll/src/index.ts`, `cancel`)                                                                                                                                                                  | `SIGKILL` to each in-flight group (Windows: `taskkill /T /F`)                                   | live command target through the existing verification gate                                                                                                                                                                                                          | verified; no unverified numeric kill                                                                                                                              |
+| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                                              | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
 
 Classified as not signal sends: `process.kill(pid, 0)` liveness probes (the startup-lock check
 in `apps/cli/src/daemon-ipc.ts`; signal 0 delivers nothing), `process.on('SIGTERM' | 'SIGINT')`

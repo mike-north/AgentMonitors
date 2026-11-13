@@ -1580,6 +1580,25 @@ SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyon
 discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
 validation note in §11.7).
 
+**POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
+An asynchronous launcher starts an in-group watchdog and waits for its timer-armed
+acknowledgement before replacing itself with the authored command. The command retains its
+PID, process group and inherited ownership mark; argv remains literal. Arming failure is an
+execution failure and no authored work runs. No synchronous subprocess, FIFO or blocking open
+runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute deadline
+and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
+continued membership supplies identity safety, independent of daemon liveness and command
+stdio. Once a normally completed finite observation has captured its output, it releases
+the whole original group through the watchdog, including any remaining background work.
+Timeout failures retain the full kill grace; daemon EOF alone never releases the bound. This
+also covers background descendants that close every inherited descriptor. Re-sessioned descendants
+remain restart-sweep work; the Windows path retains its existing daemon-resident tree kill.
+
+The source factory accepts an optional shutdown signal. Aborting it refuses pending/new
+admissions and forcefully terminates in-flight groups through the identity gate (or their still-live
+watchdog after leader exit), allowing the
+daemon to finish SIGTERM/SIGINT/IPC shutdown without waiting for authored command timeouts.
+
 **Excess output is drained, never a reason to kill the command** (issue #302). Both `stdout` and
 `stderr` are consumed as they stream, not buffered to completion: `stdout` retains only its leading
 **1 MiB** (`STDOUT_CAP_BYTES`) — the same leading bytes on every capture, so two truncated captures
@@ -1608,7 +1627,7 @@ no orphan). Platform-specific mechanism:
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
   from on this platform.
 
-**Every escalation step is identity-verified at signal time** (issue #479,
+**Every daemon-origin escalation step is identity-verified at signal time** (issue #479,
 [008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step's process-table read starts while
 the direct child is still unreaped, so the members that read lists (pid and start time) are
 confirmed as the command's group even if the command exits before the read completes; the step then
@@ -1626,7 +1645,8 @@ members it saw and why identity could not be confirmed. Continuity is lost when 
 and its id was reused, or when, after the direct child has exited, a member forks and exits
 between two consecutive readings (within one 250 ms interval plus one read; the read time grows
 under load, up to the 5 s `ps` cap) while no other confirmed member is alive; in that second case
-the forked process escapes the bound. That residual, and the latency the reads add to each step, are stated
+the daemon step abstains. The independent watchdog still bounds the original group. The
+daemon-gate residual, and the latency the reads add to each step, are stated
 in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
 `taskkill` runs only while the direct child is still unreaped.
 
@@ -1696,7 +1716,7 @@ Mirrors `api-poll` (§4.4–4.5):
 
 ### 11.5 Failure semantics (fail-open as a health signal)
 
-An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …) or `timeout` expiry. Per #81's
+An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …), lifetime-bound arming failure, shutdown cancellation, or `timeout` expiry. Per #81's
 framing, a failure is information, not something to silently swallow — but it must not spam.
 
 - On failure, prior state is **kept** (no re-baseline, no state loss) — identical in spirit to how
@@ -1785,6 +1805,15 @@ issue #86's AC1–AC7):
   (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
   sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
   not just per-call but across the daemon's own shutdown.
+- A real SIGKILLed daemon leaves no live original-group command or descendant past timeout
+  plus grace, including closed command stdio. SIGTERM and SIGINT shutdown leave no in-flight
+  child alive (`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`).
+- Watchdog timer registration precedes authored work; launcher/timer failure prevents authored
+  side effects and produces failing health. Restricted PATH requires no timeout/mkfifo utility,
+  arming yields to the event loop, and PID/argv/mark/exit status remain intact
+  (`plugins/source-command-poll/src/self-bound.test.ts`).
+- Process-global test instrumentation and environment changes restore from teardown hooks even
+  if an awaited observation times out; in-test `finally` is not the sole restoration path.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

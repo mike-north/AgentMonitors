@@ -5,18 +5,9 @@ mkfifo "$fifo" || exit 125
 # Drain to completion while retaining a bounded tail before the parent reads it.
 "$AM475_NODE" "$AM475_READER" "$AM475_STDERR" "$AM475_TOTAL" <"$fifo" &
 reader=$!
-# Capture the newly created wrapper group before delegated commands can exit it.
+# Record all initial group members, including the watchdog, before fixture work.
 if [ -n "\${AM475_OWNED_GROUP_FILE:-}" ]; then
-  {
-    printf '%s\\n' "$$"
-    if [ -r "/proc/$$/stat" ]; then
-      printf 'proc\\n'
-      cat "/proc/$$/stat" "/proc/$reader/stat"
-    else
-      printf 'ps\\n'
-      LC_ALL=C /bin/ps -p "$$,$reader" -o pid=,pgid=,lstart=
-    fi
-  } >"$AM475_OWNED_GROUP_FILE" || exit 125
+  "$AM475_NODE" "$AM475_OWNED_SIGNAL" record "$AM475_OWNED_GROUP_FILE" "$$" || exit 125
 fi
 trap 'if [ -n "$reader" ]; then kill "$reader" 2>/dev/null || :; fi; rm -f "$fifo"' EXIT
 # Keep the FIFO writer descriptor out of the waiting parent shell. Some POSIX

@@ -1,6 +1,7 @@
-/** Execute finite command observations; optional ownership tracks daemon crash survivors without changing live deadlines. */
+/** Execute finite, self-bounding command observations with optional durable ownership and shutdown cancellation. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import path from 'node:path';
+import { Duplex } from 'node:stream';
 import type {
   CommandProcessOwner,
   JsonSchema,
@@ -21,6 +22,12 @@ import {
   sendVerifiedSignal,
   spawnedProcessGroup,
 } from '@agentmonitors/core';
+
+import {
+  LAUNCHER_PROGRAM,
+  WATCHDOG_PROGRAM,
+  monotonicNowMs,
+} from './self-bound.js';
 
 // Re-exported so API Extractor can resolve the default export's type — and
 // the core types its interface shape transitively references — from this
@@ -316,7 +323,8 @@ function resolveCwd(
 }
 
 /**
- * Spawn `command` directly (never a shell — `spawn` with `shell: false`), draining
+ * Execute authored argv literally, using an armed POSIX launcher or a direct
+ * Windows spawn (`shell: false`), draining
  * stdout and stderr as they stream rather than buffering to completion, enforcing
  * `timeout` with a SIGTERM→SIGKILL escalation targeted at the command's **entire
  * process tree**, not just the direct child (003 §11.2/§11.7, issue #303). A nonzero
@@ -331,22 +339,46 @@ async function runCommand(
   scope: ScopeConfig,
   effectiveCwd: string | undefined,
   owner?: CommandProcessOwner,
+  shutdownSignal?: AbortSignal,
 ): Promise<ExecOutcome> {
   // Admission is durable before spawn; ordinary in-process execution retains
   // its original inherited-environment path and creates no ownership work.
   const ownershipEnv =
     owner === undefined ? undefined : await owner.environment();
+  if (shutdownSignal?.aborted) {
+    return {
+      kind: 'failure',
+      error: 'Command cancelled during shutdown',
+      stderrTail: '',
+    };
+  }
   const inheritedEnv = scope.env
     ? { ...process.env, ...scope.env }
     : process.env;
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
+    const deadline = monotonicNowMs() + scope.timeoutMs;
+    // The POSIX launcher keeps its PID when it becomes the command. Its in-group
+    // watchdog has acknowledged a referenced timer before that replacement.
+    const launchArgs = isWindows
+      ? args
+      : [
+          '--disable-warning=ExperimentalWarning',
+          '-e',
+          LAUNCHER_PROGRAM,
+          JSON.stringify({
+            command: scope.command,
+            deadline,
+            grace: SIGKILL_GRACE_MS,
+            watchdog: WATCHDOG_PROGRAM,
+          }),
+        ];
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      file!,
-      args,
+      isWindows ? file! : process.execPath,
+      launchArgs,
       {
         cwd: effectiveCwd,
         // `env` is merged over the inherited daemon environment (003 §11.1).
@@ -361,12 +393,49 @@ async function runCommand(
         // its tree-kill goes through `taskkill /T` instead, which does not depend on
         // process-group membership.
         detached: !isWindows,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: isWindows
+          ? ['ignore', 'pipe', 'pipe']
+          : ['ignore', 'pipe', 'pipe', 'pipe'],
       },
     );
 
     let settled = false;
     let timedOut = false;
+    let cancelled = false;
+    let armed = isWindows;
+    let armingError: string | undefined;
+    const control = child.stdio[3];
+    let controlInput = '';
+    if (control instanceof Duplex) {
+      control.on('error', () => {
+        /* A vanished daemon/worker cannot revoke the bound. */
+      });
+      control.on('data', (chunk: Buffer) => {
+        controlInput += chunk.toString();
+        const lines = controlInput.split('\n');
+        controlInput = lines.pop() ?? '';
+        for (const line of lines) {
+          try {
+            const message: unknown = JSON.parse(line);
+            if (
+              typeof message !== 'object' ||
+              message === null ||
+              !('kind' in message)
+            )
+              continue;
+            if (message.kind === 'armed') armed = true;
+            if (
+              message.kind === 'error' &&
+              'error' in message &&
+              typeof message.error === 'string'
+            )
+              armingError = message.error;
+          } catch {
+            armingError = 'Invalid command lifetime-bound acknowledgement';
+          }
+        }
+      });
+    }
     let truncated = false;
     // Post-timeout SIGKILL escalation timer (003 §11.2/§11.7, issue #303). Deliberately
     // NOT cleared by `finish()`/`clearTimers()` below — see the comment there.
@@ -384,7 +453,7 @@ async function runCommand(
     // Bound stdout capture at the 1 MiB cap (003 §11.2): once the cap is reached,
     // further bytes are discarded but the stream is never paused, so a chatty child
     // is always drained and can never block on a full pipe buffer (issue #302).
-    child.stdout.on('data', (chunk: Buffer) => {
+    child.stdout?.on('data', (chunk: Buffer) => {
       if (stdoutBytes >= STDOUT_CAP_BYTES) {
         if (chunk.length > 0) truncated = true;
         return;
@@ -405,7 +474,7 @@ async function runCommand(
     // process's own memory unbounded, and — like stdout — never pauses the pipe or
     // kills the child. Only the trailing bytes survive; older chunks are dropped
     // once the retention cap is exceeded.
-    child.stderr.on('data', (chunk: Buffer) => {
+    child.stderr?.on('data', (chunk: Buffer) => {
       // Concat-then-slice keeps the retained buffer truly bounded at
       // STDERR_RETENTION_CAP_BYTES on every chunk — including a single chunk
       // larger than the cap — rather than only evicting whole chunks (which
@@ -440,6 +509,11 @@ async function runCommand(
     function clearTimers(): void {
       clearTimeout(wallClockTimer);
       clearTimeout(closeFallbackTimer);
+      // A completed leader can leave a live group behind. Keep shutdown
+      // cancellation until the watchdog closes its private control channel.
+      if (!(control instanceof Duplex) || control.destroyed) {
+        shutdownSignal?.removeEventListener('abort', cancel);
+      }
       // `sigkillTimer` is deliberately NOT cleared here. It targets the whole
       // process GROUP with SIGKILL after the SIGTERM grace period, and must run to
       // completion even once this promise has already settled: a direct child can
@@ -457,6 +531,17 @@ async function runCommand(
       if (settled) return;
       settled = true;
       clearTimers();
+      // Once direct-command output has settled, normal completion releases the
+      // entire finite observation group. Timeout failures retain the full grace.
+      // EOF never means completion, so daemon death cannot remove the backstop.
+      if (
+        !timedOut &&
+        !cancelled &&
+        control instanceof Duplex &&
+        !control.destroyed
+      ) {
+        control.write('complete\n');
+      }
       resolve(outcome);
     }
 
@@ -474,6 +559,17 @@ async function runCommand(
       code: number | null,
       signal: NodeJS.Signals | null,
     ): void {
+      if (cancelled || !armed || armingError !== undefined) {
+        finish({
+          kind: 'failure',
+          error: cancelled
+            ? 'Command cancelled during shutdown'
+            : (armingError ??
+              'Could not arm command lifetime bound: launcher exited before acknowledgement'),
+          stderrTail: stderrTailString(),
+        });
+        return;
+      }
       // Only decode/concat the retained stderr when it's actually needed (the
       // failure branches below) — the success path never reads it, so
       // computing it unconditionally would allocate on every successful tick.
@@ -514,6 +610,9 @@ async function runCommand(
     });
 
     child.once('exit', (code, signal) => {
+      // The independent watchdog may win the timer race. Classify the result
+      // by the same absolute deadline even when its signal precedes our callback.
+      if (armed && monotonicNowMs() >= deadline) timedOut = true;
       if (settled) return;
       if (timedOut) {
         // Resolve from the direct child's own exit — never wait on stdio stream
@@ -543,7 +642,24 @@ async function runCommand(
         resolveFromExit(code, signal);
       }, CLOSE_FALLBACK_MS);
       closeFallbackTimer.unref();
+      streamsClosed();
     });
+
+    // The private watchdog descriptor may outlive the command. Ordinary stream
+    // completion still reports the direct command's output promptly.
+    function streamsClosed(): void {
+      if (
+        (child.stdout?.readableEnded || child.stdout?.destroyed) &&
+        (child.stderr?.readableEnded || child.stderr?.destroyed) &&
+        (child.exitCode !== null || child.signalCode !== null)
+      ) {
+        resolveFromExit(child.exitCode, child.signalCode);
+      }
+    }
+    child.stdout?.once('end', streamsClosed);
+    child.stderr?.once('end', streamsClosed);
+    child.stdout?.once('close', streamsClosed);
+    child.stderr?.once('close', streamsClosed);
 
     child.once('close', (code, signal) => {
       if (settled) return;
@@ -556,33 +672,63 @@ async function runCommand(
     // re-verify the group's identity at signal time (008 §5).
     const cleanupTarget = cleanupTargetFor(child, isWindows);
     const cleanupAction = `command-poll timeout escalation for ${displayObjectKey(scope.objectKey)}`;
-    const wallClockTimer = setTimeout(() => {
-      timedOut = true;
-      if (cleanupTarget === undefined) return;
-      const termStep = killProcessTree(
-        cleanupTarget,
-        'SIGTERM',
-        isWindows,
-        cleanupAction,
-      );
-      // Unconditional: this must run to completion and SIGKILL the process group
-      // even if the direct child has already exited and `finish()` has already
-      // settled the promise (see the comment in `clearTimers` above) — a
-      // descendant that ignores SIGTERM while the direct child dies from it is
-      // otherwise never reaped (003 §11.7, issue #303). It waits for the SIGTERM
-      // step to finish so it can rely on the group membership confirmed so far
-      // (by that step, at the leader's exit and through the grace period); an
-      // emptied group is a no-op, and one whose continuity was lost is an
-      // abstention, never a signal (008 §5).
-      sigkillTimer = setTimeout(() => {
-        void termStep.then(() =>
-          killProcessTree(cleanupTarget, 'SIGKILL', isWindows, cleanupAction),
+    /** Shutdown bypasses the timeout grace but retains the ordinary identity gate. */
+    function cancel(): void {
+      cancelled = true;
+      if (
+        control instanceof Duplex &&
+        !control.destroyed &&
+        (child.exitCode !== null || child.signalCode !== null)
+      ) {
+        // The live watchdog supplies uninterrupted self-group identity even
+        // when the already-reaped command no longer supplies a live handle.
+        control.write('cancel\n');
+      } else if (cleanupTarget !== undefined) {
+        void killProcessTree(
+          cleanupTarget,
+          'SIGKILL',
+          isWindows,
+          'command-poll daemon shutdown',
         );
-      }, SIGKILL_GRACE_MS);
-      // sigkillTimer must not keep the event loop alive on its own.
-      sigkillTimer.unref();
-    }, scope.timeoutMs);
+      }
+    }
+    const wallClockTimer = setTimeout(
+      () => {
+        timedOut = true;
+        if (cleanupTarget === undefined) return;
+        const termStep = killProcessTree(
+          cleanupTarget,
+          'SIGTERM',
+          isWindows,
+          cleanupAction,
+        );
+        // Unconditional: this must run to completion and SIGKILL the process group
+        // even if the direct child has already exited and `finish()` has already
+        // settled the promise (see the comment in `clearTimers` above) — a
+        // descendant that ignores SIGTERM while the direct child dies from it is
+        // otherwise never reaped (003 §11.7, issue #303). It waits for the SIGTERM
+        // step to finish so it can rely on the group membership confirmed so far
+        // (by that step, at the leader's exit and through the grace period); an
+        // emptied group is a no-op, and one whose continuity was lost is an
+        // abstention, never a signal (008 §5).
+        sigkillTimer = setTimeout(() => {
+          void termStep.then(() =>
+            killProcessTree(cleanupTarget, 'SIGKILL', isWindows, cleanupAction),
+          );
+        }, SIGKILL_GRACE_MS);
+        // sigkillTimer must not keep the event loop alive on its own.
+        sigkillTimer.unref();
+      },
+      Math.max(1, deadline - monotonicNowMs()),
+    );
     wallClockTimer.unref();
+    if (control instanceof Duplex) {
+      control.once('close', () =>
+        shutdownSignal?.removeEventListener('abort', cancel),
+      );
+    }
+    shutdownSignal?.addEventListener('abort', cancel, { once: true });
+    if (shutdownSignal?.aborted) cancel();
 
     // The mandatory life record already precedes spawn. Numeric hints are
     // recorded before returning to the event loop, with live supervision fully
@@ -877,12 +1023,15 @@ const scopeSchema: JsonSchema = {
 };
 
 /**
- * Compose crash ownership with the ordinary command source. In-process users
- * retain their existing behavior; daemon users supply a precommitted owner.
+ * Compose finite command bounds with optional durable crash ownership. Daemon
+ * users supply a precommitted owner; in-process users need no ownership journal.
+ * An optional shutdown signal rejects new admissions and forcefully terminates
+ * in-flight command groups through the identity gate before their observers settle.
  * @public
  */
 export function createCommandPollSource(
   owner?: CommandProcessOwner,
+  shutdownSignal?: AbortSignal,
 ): ObservationSource {
   return {
     name: 'command-poll',
@@ -892,7 +1041,7 @@ export function createCommandPollSource(
       config: Record<string, unknown>,
       context: ObservationContext = { now: new Date() },
     ): Promise<ObservationResult> {
-      return observeCommand(config, context, owner);
+      return observeCommand(config, context, owner, shutdownSignal);
     },
   };
 }
@@ -902,6 +1051,7 @@ async function observeCommand(
   config: Record<string, unknown>,
   context: ObservationContext,
   owner?: CommandProcessOwner,
+  shutdownSignal?: AbortSignal,
 ): Promise<ObservationResult> {
   const scope = parseScopeConfig(config);
   const prev = isCommandState(context.previousState)
@@ -909,7 +1059,7 @@ async function observeCommand(
     : undefined;
   const effectiveCwd = resolveCwd(scope.cwd, context.workspacePath);
 
-  const outcome = await runCommand(scope, effectiveCwd, owner);
+  const outcome = await runCommand(scope, effectiveCwd, owner, shutdownSignal);
 
   // ---- Execution failure path (003 §11.5) -------------------------------------
   if (outcome.kind === 'failure') {
