@@ -1,3 +1,10 @@
+// Shell arguments and command boundaries shared by runtime diagnostics and CLI suggestions.
+export {
+  _monitorCommandLine,
+  shellArg,
+  shellSingleQuote,
+} from './commands/shell-arguments.js';
+
 // Schema
 export {
   monitorFrontmatterSchema,
@@ -233,6 +240,10 @@ export type {
   MonitorDeliveryState,
   MaterializationRetryQuery,
   MaterializationRetryDiagnostic,
+  MaterializationRetryRepairInput,
+  MaterializationRetryRepairOutcome,
+  MaterializationRetryRepairResult,
+  MaterializationRetrySkipInput,
   OrphanedMonitorWork,
   MaterializationRetryRecord,
   MaterializationRetryStatus,
@@ -271,6 +282,7 @@ export {
   MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
   MATERIALIZATION_RETRY_MAX_RECORDS,
+  MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
 } from './runtime/types.js';
 
 // Adapters

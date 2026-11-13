@@ -35,7 +35,7 @@
   },
   "dependencies": {
     "@agentmonitors/core": "workspace:*",
-    "glob": "^11.0.1"
+    "glob": "^14.0.6"
   },
   "license": "MIT",
   "devDependencies": {

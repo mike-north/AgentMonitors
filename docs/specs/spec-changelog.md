@@ -62,6 +62,147 @@ uncached full-suite installation hashes establish the validation obligation;
 the attribution refinement above supersedes this entry's original unconditional
 concurrent-writer failure rule.
 
+## 2026-11-12 — Refuse pre-existing deferred writers during ingress (004 §3.4.2) — Refs #568
+
+Writable iterators are wrapped at creation regardless of lifecycle ownership.
+Their supported advance/finalization methods refuse execution inside tick/watch
+lifecycles with SQL and call-site evidence, including iterators created earlier.
+Regressions verify both lifecycle boundaries, durable absence of the refused row,
+continued in-lifecycle creation refusal, admitted read iterators and native writable
+execution outside ownership. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Verify admitted SQLite reads preserve database files (004 §3.4.2) — Refs #568
+
+Prepared statements now apply query admission at execution, including pre-existing
+handles and iterator advancement/finalization. Table-valued PRAGMAs outside the
+query allowlist are refused inside SELECTs. Every admitted read compares complete
+main-file/WAL bytes around synchronous execution; unexpected effects fail with
+SQL and call-site diagnostics. Same-size overwrite regressions exercise every
+entrypoint, and a separate-process WAL reader verifies the fixture ownership and
+reader-lock boundary. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Require explicit direct-SQL query admission (004 §3.4.2) — Refs #568
+
+Direct `exec()` and native `pragma()` calls now require a named query-PRAGMA allowlist,
+no assignment and driver read-only metadata. Other PRAGMAs and direct maintenance
+statements are refused even when SQLite reports `readonly=true`: a single-table
+`optimize` can persist statistics under that flag. Tick/watch regressions exercise
+both optimizer entrypoints, unknown and setting PRAGMAs, maintenance and admitted
+queries. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Classify direct SQLite PRAGMA writes (004 §3.4.2) — Refs #568
+
+Ingress discovery now guards both direct SQL execution and the native PRAGMA entrypoint
+using the driver's statement read-only metadata. Writable PRAGMAs must fail with SQL
+and call-site diagnostics; read-only queries remain allowed. Direct SQL without a single
+preparable statement fails closed rather than admitting an unclassified trailing write.
+Independent tick/watch regressions cover both PRAGMA entrypoints and a write-effect
+checkpoint PRAGMA without an assignment.
+
+## 2026-11-12 — Complete ingress write classification and artifact checks (004 §3.4.2) — Refs #568
+
+Interruption discovery now observes the full asynchronous tick and watch-consumption
+lifecycles. Writes outside the admission inventory must match a named setup, exact
+maintenance or injected-fault diagnostic exclusion; otherwise the suite fails with SQL
+and call-site evidence. Shared snapshots are checked against source values and exact
+workspace/monitor/object/event identities, and recipient cursors against baseline contents,
+provenance and session identity. Extra acquisition writes, corrupted snapshot contents and
+corrupted cursor baselines must fail acceptance. Retry re-arm/skip interruptions remain
+tracked separately as #615.
+
+## 2026-11-12 — Consistent file samples under concurrent writes (003 §3.2; 004 §3.4.2) — Refs #568
+
+File fingerprints and snapshots now share one byte sample. Identity, size and high-resolution
+metadata validation refuses detected concurrent writes without advancing the source checkpoint.
+Reported size remains advisory for virtual files. A stable empty or partial file remains valid;
+no writer-completion guarantee or retry is added.
+The ingress fixture orders non-atomic input completion before each native-watch round and uses
+state-only pulls for held-work flushes, avoiding synthetic truncate/write observations during
+flush. Dedicated deterministic source tests cover read races and unchanged-content deduplication.
+
+## 2026-11-12 — Real-process ingress kill/fault acceptance (004 §3.4.2) — Refs #568
+
+Require real bundled CLI processes, on-disk SQLite, loopback `api-poll` input and filesystem-backed
+watch ingestion under immediate, debounce and rollup pacing. Driver discovery enumerates SQL
+write occurrences during acceptance, held release, retry admission and retry drain; each is
+faulted before execution and killed after execution, with restart assertions for exactly-once
+ordered events, complete persistence and unread recipient projections. Fixed clocks and event
+barriers replace synchronization sleeps, and cleanup confirms owned-process termination.
+
+The file source has no shipped `watch()` yet, so the fixture explicitly adds a test-only native
+filesystem watcher around its real observation implementation. Watch faults use their existing
+`onError` surface; tick faults use `erroredObservations`. Extra audit-write cases preserve the
+existing best-effort contract. Discovery covers executed paths, not all possible plugin branches;
+existing invalid-envelope, capacity/loss and policy-edit regressions remain required. Retry
+re-arm/skip cases are a linked TODO for #584 and do not block this suite.
+The manual socket regression also checks the canonical resolved socket, with an explicit
+overlong data root, so an isolated verification home exercises the existing fallback contract
+instead of failing on an unnormalized test expectation. Published behavior is unchanged.
+
+## 2026-11-12 — Keep follow-up inspection IDs positional (005 §6, §15) — Refs #584
+
+Every suggested `monitor explain` and `monitor history` command puts flags before `--` and the
+monitor ID after it, matching the existing repair suggestions. A legal leading-hyphen ID now
+survives verbatim execution of skip-success and unknown-outcome hints, and doctor hints for
+attached drops, pending/terminal retries, orphan drops and orphan retained work. A shared internal
+builder owns quoting and the option/ID boundary for inspection and repair suggestions; runtime
+repair diagnostic text stays byte-identical. Nine shell-executed regressions verify the intended
+retry or loss is inspected and remains intact.
+
+## 2026-11-12 — Keep retry repair IDs positional (002 §2.7; 005 §6, §15) — Refs #584
+
+Repair suggestions from the tick report, explain and doctor put all flags before `--` and the
+monitor/retry IDs after it. This current contract makes valid leading-hyphen monitor names such as
+`-watcher` repairable without changing workspace scoping or shell quoting. Extra flags such as
+`--format` and `--reason` also precede `--`. The CLI accepts the terminator through Commander.
+Four regressions execute both repairs printed by explain and doctor verbatim through `/bin/sh`
+from another directory, with a real terminal retry and persisted-state assertions. Previously these
+suggestions failed with `unknown option '-watcher'`.
+
+## 2026-11-12 — Re-arm or skip a terminal retry from the CLI (002 §2/§2.7/§2.8/§15; 004 §3.4; 005 §6 `monitor retry`, §15) — Refs #584
+
+A terminal materialization retry pauses its monitor (§2.7), and until now the only way out was
+editing the store by hand. Add two operator repairs, `agentmonitors monitor retry rearm
+<monitorId> <retryId>` and `agentmonitors monitor retry skip <monitorId> <retryId> [--reason]`,
+backed by `AgentMonitorRuntime.rearmMaterializationRetry` / `skipMaterializationRetry` and the
+daemon methods `retry.rearm` / `retry.skip`, with an in-process fallback when no daemon is
+reachable. They name a retry as retry diagnostics list it and refuse, unchanged, a retry that is
+not terminal or does not belong to the named workspace/monitor. Re-arm returns the row to
+`pending` with its attempts reset (the existing store transition). Skip records the observation as
+an outstanding loss through the one loss record every drop uses (§2), with its own `skipped: true`
+marker and an error of the retry's last error followed by
+`Retry skipped after <n> failed attempts[: <reason>].`, and deletes the row in the same
+transaction. The loss is superseded like any drop, measured from the retry's own admission
+position, so younger retained work for the same key clears it.
+A repair wakes a watcher of that monitor paused in the same process. The tick report, the explain
+materialization reason and the `doctor` remediation for a stopped monitor now name both commands;
+`doctor` previously said the CLI had no retry action. Attempt limit and backoff are unchanged.
+The CLI falls back in-process only when no daemon accepted the connection; once a daemon has the
+request, a missing reply (a 15-second wait, which covers both the daemon's own tick and the repair
+each waiting up to the store's 5-second lock timeout, or a dropped connection) is reported as an
+unknown outcome with nothing written, since the daemon may already have applied it or may still
+apply it. A daemon blocked on a lock for longer than the wait can apply the repair after the CLI has
+given up. A skip's `--reason` is at most 200 characters after trimming (a longer one
+is refused), so the skip note and reason always survive the diagnostic cap and only a long last
+error is shortened, with `…`. The skip's `monitor explain` hint is quoted and `--workspace`-scoped
+like `doctor`'s remediation commands.
+
+With 002 §2.8's verify-artifact ownership, a terminal retry whose observation is a verify artifact
+with cleanup authority in effect is not lost work: either repair removes it through the ownership
+discard (the same predicate, inside the repair's own immediate transaction) and records no loss and
+no `errored` row, re-arm never re-arms it, and the command reports the outcome
+`verify-artifact-cleanup` (002 §2.7 "Operator repair", §2.8 boundary 3; 005 `monitor retry`).
+Recording a loss there would have left `doctor` and `explain` reporting it forever, since every
+later observation of the scratch key is dropped and none could supersede it. Both repairs now return
+`MaterializationRetryRepairResult` (`outcome` plus the retry's safe metadata), and the CLI's JSON
+output carries `outcome`.
+
+The daemon client now settles when a daemon closes the connection without replying, for every
+daemon-backed command. Before, such a command was left waiting and exited 0 with no output. Now
+`monitor history`, `session list`, `events list` and `daemon stop` exit 1 with an error, `doctor`
+exits 1 and reports `daemon-unreachable`, and `monitor explain` falls back in-process as it does
+when no daemon is reachable.
+
 ## 2026-11-12 — Bundled advisory coverage follows actual build inputs (004 §2.10)
 
 Replace selector/closure inventory with fresh esbuild metafiles for every published

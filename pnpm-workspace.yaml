@@ -9,6 +9,7 @@ allowBuilds:
   sharp: true
 minimumReleaseAgeExclude:
   - js-yaml@3.15.2 || 4.3.2
+  - glob@14.0.6
 # Keep security floors on the affected parent/major only. These overrides
 # protect this workspace; published unbundled paths still depend on upstream
 # ranges and direct package manifests, not on these consumer-local settings.
@@ -26,10 +27,6 @@ overrides:
   '@hono/node-server@2>hono': ^4.13.11
   # express-rate-limit 8 accepts the patched 10.x address parser.
   express-rate-limit@8>ip-address: ^10.7.4
-  # glob 11 uses minimatch 10. Older minimatch/brace-expansion majors in build
-  # tooling have different APIs and must not be replaced by this override.
-  # GHSA-qhr7-859c-m2p7, GHSA-6j4f-fj2g-mc7p, GHSA-q2hr-2g5m-vwhr.
-  minimatch@10>brace-expansion: ^5.0.12
   # gray-matter requires js-yaml 3; Markdoc requires 4. Keep both compatible
   # security floors for GHSA-52cp-r559-cp3m and GHSA-5p4m-2wfm-xmqj.
   gray-matter@4>js-yaml: ^3.15.2
