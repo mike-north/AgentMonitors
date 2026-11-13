@@ -1,3 +1,4 @@
+import { setImmediate } from 'node:timers';
 /**
  * Filesystem ownership shared by Vitest coordinators and standalone test
  * scripts. Guard failures are observable even on an early process.exit();
@@ -10,7 +11,13 @@ import {
   assertAttributedPathsUnchanged,
   inspectOpenFiles,
 } from './attribution.mjs';
-import { installSocketNamespace } from './socket-namespace.mjs';
+import {
+  installSocketNamespace,
+  assertNoRuntimeAccess,
+} from './socket-namespace.mjs';
+import { initializeNamespaceScope } from './namespace-scope.mjs';
+import { observeRuntimeNamespace } from './runtime-namespace.mjs';
+import { isRuntimePath } from './runtime-paths.mjs';
 import {
   applyEnvironment,
   createEnvironmentDirectories,
@@ -26,20 +33,27 @@ import {
  * @returns {{root: string, finish: () => void}} @internal
  */
 export function createTestBoundary() {
-  const roots = realUserPaths(process.env);
+  const runtime = observeRuntimeNamespace();
+  const roots = realUserPaths(process.env).filter(
+    (root) => !isRuntimePath(root, runtime.namespaces),
+  );
   const startedAt = Date.now();
   const first = inspectOpenFiles();
   const before = snapshotPaths(roots);
   const root = mkdtempSync(
     path.join(process.platform === 'win32' ? tmpdir() : '/tmp', 'am-'),
   );
+  initializeNamespaceScope(root);
   let finished = false;
   /** Check once and release the owned tree even when the check throws. */
   const finish = () => {
-    if (finished) return;
+    if (finished) {
+      return;
+    }
     finished = true;
     process.removeListener('exit', onExit);
     try {
+      assertNoRuntimeAccess(root);
       const after = snapshotPaths(roots);
       assertAttributedPathsUnchanged(
         before,
@@ -48,7 +62,9 @@ export function createTestBoundary() {
         inspectOpenFiles(),
         startedAt,
       );
+      runtime.finish();
     } finally {
+      runtime.close();
       rmSync(root, { recursive: true, force: true });
     }
   };
@@ -81,9 +97,11 @@ export async function withIsolatedTestEnvironment(run) {
   applyEnvironment(env);
   installSocketNamespace();
   try {
+    await new Promise(setImmediate);
     await run();
   } finally {
     try {
+      await new Promise(setImmediate);
       boundary.finish();
     } finally {
       applyEnvironment(inherited);

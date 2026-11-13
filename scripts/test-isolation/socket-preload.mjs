@@ -1,3 +1,5 @@
-/** Apply the test-only OS namespace before a spawned Node CLI/tool imports it. */
+import { URL } from 'node:url';
+/** Install the exact runtime boundary before a child loads any product modules. */
 import { installSocketNamespace } from './socket-namespace.mjs';
-installSocketNamespace();
+const scope = new URL(import.meta.url).searchParams.get('scope');
+installSocketNamespace(scope ? JSON.parse(scope) : undefined);

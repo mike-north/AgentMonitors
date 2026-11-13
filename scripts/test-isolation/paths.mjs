@@ -4,37 +4,27 @@
  * owned HOME/XDG roots. Keep this inventory aligned with the CLI resolvers.
  */
 import { createHash } from 'node:crypto';
-import {
-  lstatSync,
-  mkdirSync,
-  readFileSync,
-  readdirSync,
-  readlinkSync,
-  realpathSync,
-} from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
-import { URL } from 'node:url';
+import { inspection } from './native-inspection.mjs';
+import { namespaceEnvironment } from './namespace-scope.mjs';
 
 // Node's native temp/home resolvers consult the original environment backing
 // object. Tests that replace process.env with a plain object must not sever
 // updates to that backing object for subsequent cases.
 const nativeEnvironment = process.env;
 
-// A file URL remains one NODE_OPTIONS token even in a checkout with spaces.
-const socketPreload = `--import=${new URL('./socket-preload.mjs', import.meta.url).href}`;
-
 /**
  * The environment inputs that may select storage, config, temp files, or a
  * running installation. Removing product overrides preserves tests of default
  * resolution instead of forcing every workspace onto one global database.
  * @param {string} root - Exclusively owned, short temporary directory.
- * @param {string} [toolRoot] - Run-owned tool caches, shared to avoid repeated
- * package-manager downloads without sharing application state between cases.
+ * @param {string} [toolRoot] - Run-owned tool caches and namespace receipts, shared without sharing
+ * application state between cases.
  * @returns {Record<string, string | undefined>} @internal
  */
 export function isolatedEnvironment(root, toolRoot = root) {
-  const options = process.env.NODE_OPTIONS ?? '';
   return {
     HOME: root,
     USERPROFILE: root,
@@ -53,9 +43,7 @@ export function isolatedEnvironment(root, toolRoot = root) {
     COREPACK_HOME: path.join(toolRoot, 'p'),
     npm_config_cache: path.join(toolRoot, 'n'),
     AGENTMONITORS_TEST_SOCKET_ROOT: root,
-    NODE_OPTIONS: options.includes(socketPreload)
-      ? options
-      : `${options} ${socketPreload}`.trim(),
+    ...namespaceEnvironment(toolRoot),
     AGENTMONITORS_DB: undefined,
     AGENTMONITORS_SOCKET: undefined,
     CLAUDE_PROJECT_DIR: undefined,
@@ -111,6 +99,7 @@ export function createEnvironmentDirectories(env) {
  * @returns {string[]} @internal
  */
 export function realUserPaths(env) {
+  const path = inspection.path;
   const home = homedir();
   const roots = [
     path.join(home, '.local/share/agentmonitors'),
@@ -155,6 +144,9 @@ export function realUserPaths(env) {
  * @returns {Record<string, string>} @internal
  */
 export function snapshotPaths(roots) {
+  const { lstatSync, readFileSync, readdirSync, readlinkSync, realpathSync } =
+    inspection.fs;
+  const path = inspection.path;
   /** @type {Record<string, string>} */
   const result = {};
   const directories = new Set();

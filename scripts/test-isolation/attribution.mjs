@@ -8,7 +8,9 @@
  * non-descendant holder at both snapshots may be reported without failure.
  * Descriptor device/inode must match the snapshot too: a stale open descriptor
  * may retain a replaced file's pathname on macOS. Creation/removal, replacement,
- * directories, and unknown inspection stay strict.
+ * directories outside the shared runtime namespace, and unknown inspection stay
+ * strict. Runtime accesses are checked by the adapter; its shared namespace has
+ * a separate net-only observer so unrelated transient activity is diagnostic.
  * ps start times have second precision: the entire reported birth second must
  * precede the run. This deliberately refuses ambiguous, very recent peers.
  */

@@ -655,8 +655,8 @@ and compare existence, mtime, size, permissions, symlink targets, and SHA-256 co
 hashes for regular files up to 1 MiB at teardown. Default locations MUST be watched
 even when absent. This includes the legacy HOME data root, XDG/config/state/cache/
 runtime roots, macOS Library equivalents, inherited DB/socket overrides, and the
-fixed per-uid `/tmp` socket fallback (002 §10.3). Creation, removal, replacement,
-and non-file metadata changes MUST fail. An existing regular file's content or
+fixed per-uid `/tmp` socket fallback (002 §10.3). Outside that shared runtime
+namespace, creation, removal, replacement, and non-file metadata changes MUST fail. An existing regular file's content or
 metadata change MAY be reported without failure only when read-only `ps`/`lsof`
 inspection proves that the same process held that file open at both snapshots,
 started before the run, and is neither the coordinator nor its descendant at either
@@ -673,13 +673,28 @@ This attribution is not write tracing: a test writing a file held by such a fore
 process cannot be distinguished by the diff. HOME/XDG/TMPDIR isolation is the first
 line of protection against that path; the guard is the second line.
 
-Fixed-path socket tests MUST relocate the OS namespace at a test-only boundary;
-they may not bind, chmod, delete, or probe an installation's real fallback sockets.
-Shared setup installs that narrow path boundary in workers and carries it through
-`NODE_OPTIONS --import` into built CLI children. Guard snapshots MUST still observe
-the actual unrelocated per-user namespace.
-For example, a test of legacy-socket migration runs real IPC in an owned temp root
-while preserving the resolver's original fixed-base/per-uid/hash path arguments.
+Fixed-path socket tests MUST relocate the OS namespace at the test-only adapter;
+product resolvers and paths remain unchanged. In test processes, path resolution,
+filesystem IO, IPC listen/connect, and child cwd/explicit path arguments MUST fail
+on real per-uid or legacy-hash namespace paths, naming the path and call stack.
+Normal fixed fallback joins resolve into owned roots. This applies in workers and
+Node children through the preload. A caught error, ignored child exit, or explicit
+`process.exit(0)` MUST NOT erase the violation: run-owned synchronous receipts make
+the coordinator fail before cleanup. The preload URL carries the run capability
+so child environment allowlists retaining NODE_OPTIONS retain the receipt scope.
+Trusted host inventory uses read-only inspection primitives, never these guarded
+application APIs. User teardown keeps the owned environment until its work ends.
+
+The real per-user runtime directory is shared by unrelated daemons and worktrees.
+Its secondary diff MUST fail only on net additions, removals, or replacements
+(type/device/inode or symlink-target identity), including legacy flat socket/lock
+entries. Changes only to existing runtime metadata and transient entries MUST be
+reported without failure. Diagnostics include before/after mtimes and names seen
+by native observation; name observation is best-effort, while endpoint snapshots
+are authoritative for net changes. The adapter is the primary check for test
+accesses, including transient accesses; the runtime diff is not write tracing.
+Other data/config/state roots retain the strict rule and per-file attribution above.
+The runtime observer MUST remain read-only and close its watchers on every exit.
 
 **Verified by:** `scripts/test-data-isolation.test.ts` checks every maintained
 config, child inheritance, cache invalidation, initially absent XDG roots,

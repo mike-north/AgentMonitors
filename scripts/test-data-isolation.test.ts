@@ -62,6 +62,8 @@ async function runFixture(
     readonly foreign?: boolean;
     readonly unavailable?: true | 'lsof';
     readonly predecessor?: boolean;
+    readonly runtime?: boolean;
+    readonly foreignRuntime?: 'churn' | 'leave';
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), 'isolation-proof-'));
@@ -71,6 +73,15 @@ async function runFixture(
   const summaryPath = join(dir, 'summary.json');
   const trigger = join(dir, 'foreign-trigger');
   const written = join(dir, 'foreign-written');
+  const runtimeBase = join(dir, 'rt');
+  const runtime = join(
+    runtimeBase,
+    `agentmonitors-${String(process.getuid?.() ?? 0)}`,
+  );
+  if (options.runtime) {
+    mkdirSync(runtime, { recursive: true });
+    writeFileSync(join(runtime, 'probe.sock'), 'fixture');
+  }
   if (options.unavailable === 'lsof') {
     mkdirSync(join(dir, 'no-tools'));
     symlinkSync('/bin/ps', join(dir, 'no-tools/ps'));
@@ -103,6 +114,8 @@ const receipt=${JSON.stringify(receipt)};
 const installation=${JSON.stringify(installation)};
 const trigger=${JSON.stringify(trigger)};
 const written=${JSON.stringify(written)};
+const runtimeBase=${JSON.stringify(runtimeBase)};
+const runtime=${JSON.stringify(runtime)};
 ${body}`,
   );
   // This leaf is a sibling of the fixture coordinator, never its descendant.
@@ -116,11 +129,19 @@ ${body}`,
           `
 const fs=require('node:fs');
 const fd=fs.openSync(${JSON.stringify(join(installation, 'existing'))},'r+');
-process.once('disconnect',()=>{fs.closeSync(fd);process.exit(0);});
+let pending=false;
+const runtimeFile=${JSON.stringify(runtime)}+'/outside.sock';
+// Wait for the peer's own native notification before deleting the entry. This
+// makes observation part of the handshake, not a guess about FSEvents latency.
+const runtimeWatcher=${JSON.stringify(options.foreignRuntime)}==='churn'?fs.watch(${JSON.stringify(runtime)},()=>{
+ if(pending&&fs.existsSync(runtimeFile)){pending=false;runtimeWatcher.close();fs.unlinkSync(runtimeFile);fs.writeFileSync(${JSON.stringify(written)},'done');}
+}):undefined;
+process.once('disconnect',()=>{runtimeWatcher?.close();fs.closeSync(fd);process.exit(0);});
 setInterval(()=>{
-  if(fs.existsSync(${JSON.stringify(trigger)})&&!fs.existsSync(${JSON.stringify(written)})){
-    fs.writeSync(fd,'external');fs.fsyncSync(fd);
-    fs.writeFileSync(${JSON.stringify(written)},'done');
+  if(fs.existsSync(${JSON.stringify(trigger)})&&!fs.existsSync(${JSON.stringify(written)})&&!pending){
+    if(${JSON.stringify(options.foreignRuntime ?? 'file')}==='file'){fs.writeSync(fd,'external');fs.fsyncSync(fd);}
+    else {pending=${JSON.stringify(options.foreignRuntime)}==='churn';fs.writeFileSync(runtimeFile,'peer');}
+    if(!pending)fs.writeFileSync(${JSON.stringify(written)},'done');
   }
 },20);
 process.send('ready');`,
@@ -184,7 +205,12 @@ process.send('ready');`,
           XDG_CACHE_HOME: join(dir, 'real-cache'),
           XDG_RUNTIME_DIR: join(dir, 'real-runtime'),
           AGENTMONITORS_DB: join(installation, 'existing'),
-          AGENTMONITORS_SOCKET: join(dir, 'real.sock'),
+          AGENTMONITORS_SOCKET: options.runtime
+            ? runtime
+            : join(dir, 'real.sock'),
+          AGENTMONITORS_TEST_EXTRA_RUNTIME_BASE: options.runtime
+            ? runtimeBase
+            : undefined,
           ...(options.unavailable ? { PATH: join(dir, 'no-tools') } : {}),
         },
         timeout: 15_000,
@@ -195,6 +221,7 @@ process.send('ready');`,
       ...result,
       installation,
       foreignPid: foreign?.pid,
+      runtime,
       // Runner metrics prove a poison case passed before teardown rejected its mutation.
       testSummary: existsSync(summaryPath)
         ? JSON.parse(readFileSync(summaryPath, 'utf8'))
@@ -204,7 +231,9 @@ process.send('ready');`,
         : undefined,
     };
   } finally {
-    if (foreign?.connected) foreign.disconnect();
+    if (foreign?.connected) {
+      foreign.disconnect();
+    }
     await stopped;
     rmSync(dir, { recursive: true, force: true });
   }
@@ -499,7 +528,7 @@ it.skipIf(process.platform === 'win32')(
   () => {
     const roots = realUserPaths(process.env);
     const dirname = `agentmonitors-${String(process.getuid?.() ?? 0)}`;
-    expect(roots).toContain(resolve('/tmp', dirname));
+    expect(roots).toContain(`/tmp/${dirname}`);
     expect(roots).not.toContain(join(process.env.TMPDIR ?? '', dirname));
   },
 );
@@ -513,4 +542,149 @@ it('rejects an edit when a foreign descriptor holds only a replaced predecessor'
   expect(result.testSummary.numPassedTests).toBe(2);
   expect(result.status, result.stdout + result.stderr).not.toBe(0);
   expect(result.stdout + result.stderr).toContain('Real user paths changed');
+}, 20000);
+
+/** Product fallback resolution must reject an unsafe namespace target before any IO. */
+it('rejects transient test access through the product socket resolver', async () => {
+  const result = await runFixture(
+    `import {resolveSocketPath} from ${JSON.stringify(pathToFileURL(join(repo, 'apps/cli/src/daemon-ipc.ts')).href)};
+import {mkdirSync,unlinkSync} from 'node:fs';
+it('poison',()=>{process.env.AGENTMONITORS_TEST_SOCKET_ROOT=runtimeBase;let completed=false;
+try{const socket=resolveSocketPath('x'.repeat(150));mkdirSync(runtime,{recursive:true});writeFileSync(socket,'test');unlinkSync(socket);completed=true;}catch{}
+writeFileSync(receipt,JSON.stringify({completed}));});`,
+    false,
+    { runtime: true },
+  );
+  expect(result.testSummary.numPassedTests).toBe(1);
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.receipt.completed).toBe(false);
+  expect(result.stdout + result.stderr).toContain('Runtime namespace access');
+  expect(result.stdout + result.stderr).toContain(result.runtime);
+  expect(result.stdout + result.stderr).toContain('resolveSocketPath');
+}, 20000);
+
+it('rejects a test trying to leave a real runtime entry behind', async () => {
+  const result = await runFixture(
+    `it('poison',()=>{try{writeFileSync(runtime+'/left.sock','test');}catch{}});`,
+    false,
+    { runtime: true },
+  );
+  expect(result.testSummary.numPassedTests).toBe(1);
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('Runtime namespace access');
+  expect(result.stdout + result.stderr).toContain('left.sock');
+}, 20000);
+
+it('keeps a child namespace violation fatal when the test catches its exit', async () => {
+  const result = await runFixture(
+    `it('poison',()=>{const code="const fs=require('node:fs');const file="+JSON.stringify(runtime+'/child.sock')+";try{fs.writeFileSync(file,'test');fs.unlinkSync(file);}catch{}";
+const child=spawnSync(process.execPath,['-e',code],{env:{...process.env},encoding:'utf8',timeout:3000});expect(child.status,child.stdout+child.stderr).not.toBe(0);});`,
+    false,
+    { runtime: true },
+  );
+  expect(result.testSummary.numPassedTests, result.stdout + result.stderr).toBe(
+    1,
+  );
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('Runtime namespace access');
+  expect(result.stdout + result.stderr).toContain('child.sock');
+}, 20000);
+
+it('reports foreign runtime churn without failing the fixture', async () => {
+  const result = await runFixture(foreignWrite, false, {
+    runtime: true,
+    foreign: true,
+    foreignRuntime: 'churn',
+  });
+  expect(result.testSummary.numPassedTests).toBe(1);
+  expect(result.status, result.stdout + result.stderr).toBe(0);
+  expect(result.stdout + result.stderr).toContain('Runtime namespace churn');
+  const line = (result.stdout + result.stderr)
+    .split('\n')
+    .find((value) => value.startsWith('Runtime namespace churn:'));
+  if (!line) {
+    throw new Error('Missing runtime churn diagnostic');
+  }
+  const churn = JSON.parse(line.slice('Runtime namespace churn: '.length));
+  // Native filename notifications are best-effort. Endpoint directory metadata
+  // must still report this known transient write when no name is delivered.
+  expect(churn.metadataChanged).toContainEqual(
+    expect.objectContaining({ path: result.runtime }),
+  );
+  expect(churn.netChanges).toEqual([]);
+  expect(churn.observationErrors).toEqual([]);
+  console.info('Runtime churn receipt:', line);
+}, 20000);
+
+it('rejects a net runtime entry even when a foreign process creates it', async () => {
+  const result = await runFixture(foreignWrite, false, {
+    runtime: true,
+    foreign: true,
+    foreignRuntime: 'leave',
+  });
+  expect(result.testSummary.numPassedTests).toBe(1);
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain(
+    'Runtime namespace net change',
+  );
+  expect(result.stdout + result.stderr).toContain('outside.sock');
+}, 20000);
+
+/** The same boundary applies to path math, filesystem overloads, and IPC APIs. */
+for (const [operation, body] of [
+  ['path resolution', "try{path.resolve(runtime,'probe.sock');}catch{}"],
+  [
+    'buffer open',
+    "try{const fd=fs.openSync(Buffer.from(runtime+'/probe.sock'),'r');fs.closeSync(fd);}catch{}",
+  ],
+  [
+    'file URL promises',
+    "try{await fs.promises.readFile(pathToFileURL(runtime+'/probe.sock'));}catch{}",
+  ],
+  [
+    'native realpath',
+    "try{fs.realpathSync.native(runtime+'/probe.sock');}catch{}",
+  ],
+  [
+    'net server',
+    "await new Promise(done=>{const server=net.createServer();server.once('error',()=>done(undefined));try{server.listen(runtime+'/live.sock',()=>server.close(()=>done(undefined)));}catch{done(undefined);}});",
+  ],
+  [
+    'net client',
+    "await new Promise(done=>{try{const socket=net.createConnection(runtime+'/probe.sock');socket.once('error',()=>done(undefined));socket.once('connect',()=>socket.end(()=>done(undefined)));}catch{done(undefined);}});",
+  ],
+  [
+    'child cwd',
+    "try{spawnSync('pwd',[],{cwd:runtime,encoding:'utf8',timeout:3000});}catch{}",
+  ],
+] as const) {
+  it(`rejects real runtime ${operation} even when the caller catches the error`, async () => {
+    const result = await runFixture(
+      `import fs from 'node:fs';import path from 'node:path';import net from 'node:net';import {pathToFileURL} from 'node:url';
+it('poison',async()=>{${body}});`,
+      false,
+      { runtime: true },
+    );
+    expect(
+      result.testSummary.numPassedTests,
+      result.stdout + result.stderr,
+    ).toBe(1);
+    expect(result.status, result.stdout + result.stderr).not.toBe(0);
+    expect(result.stdout + result.stderr).toContain('Runtime namespace access');
+    expect(result.stdout + result.stderr).toContain(result.runtime);
+  }, 20000);
+}
+
+it('retains a child violation receipt with only the preload in its environment', async () => {
+  const result = await runFixture(
+    `it('poison',()=>{const code="try{require('node:fs').writeFileSync("+JSON.stringify(runtime+'/minimal.sock')+",'test');}catch{};process.exit(0);";
+const child=spawnSync(process.execPath,['-e',code],{env:{NODE_OPTIONS:process.env.NODE_OPTIONS},encoding:'utf8',timeout:3000});expect(child.status,child.stdout+child.stderr).not.toBe(0);});`,
+    false,
+    { runtime: true },
+  );
+  expect(result.testSummary.numPassedTests, result.stdout + result.stderr).toBe(
+    1,
+  );
+  expect(result.status, result.stdout + result.stderr).not.toBe(0);
+  expect(result.stdout + result.stderr).toContain('minimal.sock');
 }, 20000);
