@@ -213,9 +213,28 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
   'restart sweep',
   () => {
     for (const mode of ['tree', 'detached', 'group-unmarked'] as const) {
-      it(`reaps a killed daemon's ${mode} command and descendant with identity diagnostics`, async () => {
+      it(`reconciles a killed daemon's ${mode} command and descendant with honest identity diagnostics`, async () => {
         const pids = await orphan(mode);
         await start();
+        if (process.platform === 'darwin') {
+          // The shipped macOS reader has no environment-only evidence. Preserve
+          // both owned fixtures and require honest abstentions at readiness.
+          expect(diagnostics()?.status).toBe('incomplete');
+          for (const pid of [pids.parent, pids.child]) {
+            expect(ownedWorkerTerminated(pid)).toBe(false);
+            expect(diagnostics()?.outcomes).toContainEqual(
+              expect.objectContaining({
+                pid,
+                status: 'abstained',
+                reason: expect.stringMatching(/environments.*argv.*unproven/),
+              }),
+            );
+          }
+          expect(
+            diagnostics()?.outcomes.some((o) => o.status === 'reaped'),
+          ).toBe(false);
+          return;
+        }
         await expect
           .poll(
             () =>
@@ -237,52 +256,61 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
       }, 30_000);
     }
 
-    it('leaves a detached mark-erased escape alone without a diagnostic warning', async () => {
-      const pids = await orphan('escaped');
-      await start();
-      await expect
-        .poll(() => diagnostics()?.status)
-        .toMatch(/^(complete|incomplete)$/);
-      const receipt = diagnostics();
-      if (receipt === undefined)
-        throw new Error('Missing finished sweep receipt');
-      const evidence = JSON.stringify(receipt);
-      expect(ownedWorkerTerminated(pids.parent), evidence).toBe(true);
-      expect(ownedWorkerTerminated(pids.child), evidence).toBe(false);
-      expect(receipt.outcomes, evidence).toContainEqual(
-        expect.objectContaining({ pid: pids.parent, status: 'reaped' }),
-      );
-      expect(
-        receipt.outcomes.some((o) => o.pid === pids.child),
-        evidence,
-      ).toBe(false);
-      expect(
-        receipt.outcomes.some((o) => o.status === 'failed'),
-        evidence,
-      ).toBe(false);
-      // A shared host may have other unreadable environments. Their explicitly
-      // named abstentions cannot turn a readable, mark-erased escape into owned
-      // work or require the entire host's discovery to be complete.
-      if (receipt.status === 'incomplete') {
-        const abstentions = receipt.outcomes.filter(
-          (o) => o.status === 'abstained',
+    it.skipIf(process.platform !== 'linux')(
+      'leaves a detached mark-erased escape alone without a diagnostic warning',
+      async () => {
+        const pids = await orphan('escaped');
+        await start();
+        await expect
+          .poll(() => diagnostics()?.status)
+          .toMatch(/^(complete|incomplete)$/);
+        const receipt = diagnostics();
+        if (receipt === undefined)
+          throw new Error('Missing finished sweep receipt');
+        const evidence = JSON.stringify(receipt);
+        expect(ownedWorkerTerminated(pids.parent), evidence).toBe(true);
+        expect(ownedWorkerTerminated(pids.child), evidence).toBe(false);
+        expect(receipt.outcomes, evidence).toContainEqual(
+          expect.objectContaining({ pid: pids.parent, status: 'reaped' }),
         );
-        expect(abstentions.length, evidence).toBeGreaterThan(0);
-        for (const outcome of abstentions) {
-          expect(outcome, evidence).toMatchObject({
-            pid: expect.any(Number),
-            reason:
-              'Same-user ownership mark could not be read; command attribution is unknown',
-          });
-          expect([pids.parent, pids.child], evidence).not.toContain(
-            outcome.pid,
+        expect(
+          receipt.outcomes.some((o) => o.pid === pids.child),
+          evidence,
+        ).toBe(false);
+        expect(
+          receipt.outcomes.some((o) => o.status === 'failed'),
+          evidence,
+        ).toBe(false);
+        // A shared host may have other unreadable environments. Their explicitly
+        // named abstentions cannot turn a readable, mark-erased escape into owned
+        // work or require the entire host's discovery to be complete.
+        if (receipt.status === 'incomplete') {
+          const abstentions = receipt.outcomes.filter(
+            (o) => o.status === 'abstained',
           );
+          expect(abstentions.length, evidence).toBeGreaterThan(0);
+          for (const outcome of abstentions) {
+            expect(outcome, evidence).toMatchObject({
+              pid: expect.any(Number),
+              reason:
+                'Same-user ownership mark could not be read; command attribution is unknown',
+            });
+            expect([pids.parent, pids.child], evidence).not.toContain(
+              outcome.pid,
+            );
+          }
         }
-      }
-    }, 30_000);
+      },
+      30_000,
+    );
 
-    for (const previousBoot of [false, true]) {
-      it(`abstains from an unrelated reused identifier${previousBoot ? ' across a previous boot' : ''}`, async () => {
+    for (const scenario of [
+      'unmarked',
+      'previous-boot',
+      'argv-only',
+    ] as const) {
+      const previousBoot = scenario === 'previous-boot';
+      it(`abstains from an unrelated identifier (${scenario})`, async () => {
         // Initialize through production startup, then simulate a stale dead-life record
         // pointing at an owned, responsive unrelated process. No OS PID churn is required.
         // A life is admitted only by actual command execution, not an idle startup.
@@ -304,6 +332,9 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
           [
             '-e',
             "process.on('message',()=>process.send('alive'));process.send('ready')",
+            ...(scenario === 'argv-only'
+              ? [`AGENTMONITORS_COMMAND_LIFE=${lifeRow.life}`]
+              : []),
           ],
           {
             env: {
@@ -354,9 +385,15 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
             ),
           )
           .toBe(true);
-        expect(
-          diagnostics()?.outcomes.find((o) => o.pid === unrelated.pid)?.reason,
-        ).toMatch(previousBoot ? /boot/i : /mark/i);
+        expect(diagnostics()?.outcomes).toContainEqual(
+          expect.objectContaining({
+            pid: unrelated.pid,
+            status: 'abstained',
+            reason: expect.stringMatching(
+              previousBoot ? /boot/i : /mark|environment/i,
+            ),
+          }),
+        );
         const response = once(unrelated, 'message');
         unrelated.send('ping');
         expect((await bounded(response, 'unrelated process response'))[0]).toBe(

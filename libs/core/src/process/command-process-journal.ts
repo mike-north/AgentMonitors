@@ -237,7 +237,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
         status: 'abstained',
         life: this.life,
         pid,
-        reason: UNREADABLE_OWNERSHIP_REASON,
+        reason: marks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON,
       });
     // A later identity query can block or the daemon can crash. The running
     // receipt must already retain the obstacles discovered by this reading.
@@ -245,21 +245,32 @@ export class CommandProcessJournal implements CommandProcessOwner {
     const lives = rows.map((raw) => lifeSchema.safeParse(raw));
     // A daemon can itself inherit an old command mark. A currently registered
     // live daemon owner is never cleanup work, including this very process.
-    const liveOwners = new Set(
-      lives.flatMap((parsed) => {
-        if (
-          !parsed.success ||
-          parsed.data.boot !== this.boot ||
-          parsed.data.owner === null
-        )
-          return [];
-        const owner = parsed.data.owner;
-        return table.processes.some(
+    // PID/start-time equality includes zombies. Only positive running evidence
+    // means an owner can still supervise work. Unknown terminal evidence protects
+    // its identity and withholds reconciliation rather than assuming death.
+    const ownerStates = new Map<
+      number,
+      Awaited<ReturnType<typeof readCommandTerminal>>
+    >();
+    for (const parsed of lives) {
+      if (
+        !parsed.success ||
+        parsed.data.boot !== this.boot ||
+        parsed.data.owner === null
+      )
+        continue;
+      const owner = parsed.data.owner;
+      if (
+        table.processes.some(
           (p) => p.pid === owner.pid && p.startTime === owner.startTime,
         )
-          ? [owner.pid]
-          : [];
-      }),
+      )
+        ownerStates.set(owner.pid, await readCommandTerminal(owner));
+    }
+    const liveOwners = new Set(
+      [...ownerStates]
+        .filter(([, state]) => state !== 'terminated')
+        .map(([pid]) => pid),
     );
     for (const parsed of lives) {
       if (!parsed.success) {
@@ -279,14 +290,22 @@ export class CommandProcessJournal implements CommandProcessOwner {
       if (
         sameBoot &&
         owner !== null &&
+        liveOwners.has(owner.pid) &&
         table.processes.some(
           (p) => p.pid === owner.pid && p.startTime === owner.startTime,
         )
       ) {
+        const running = ownerStates.get(owner.pid) === 'running';
         outcomes.push({
-          status: 'owner-alive',
+          status: running ? 'owner-alive' : 'abstained',
           life: previous.life,
           pid: owner.pid,
+          ...(!running
+            ? {
+                reason:
+                  'Previous daemon terminal state is unavailable; death cannot be confirmed',
+              }
+            : {}),
         });
         save('running');
         continue;
@@ -371,6 +390,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
         ]);
         const pending = [...candidates].filter((pid) => !visited.has(pid));
         if (pending.length === 0) break;
+        let signalled = false;
         for (const pid of pending) {
           visited.add(pid);
           const record = reading.processes.find((p) => p.pid === pid);
@@ -393,6 +413,17 @@ export class CommandProcessJournal implements CommandProcessOwner {
           }
           const inherited = ownership.marks.get(pid) === previous.life;
           const anchor = anchors.get(record.pgid);
+          if (
+            sameBoot &&
+            !inherited &&
+            anchor === undefined &&
+            ownership.unreadable?.includes(pid)
+          ) {
+            // Discovery already durably recorded this exact uncertainty. A stored
+            // numeric suspicion supplies no new evidence or decision to append.
+            retained = true;
+            continue;
+          }
           if (!sameBoot || (!inherited && anchor === undefined)) {
             outcomes.push({
               status: 'abstained',
@@ -445,6 +476,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
             },
           );
           if (outcome.status === 'sent') {
+            signalled = true;
             const terminal = await readCommandTerminal(record);
             outcomes.push({
               status: terminal === 'terminated' ? 'reaped' : 'failed',
@@ -493,6 +525,9 @@ export class CommandProcessJournal implements CommandProcessOwner {
           }
           save('running');
         }
+        // Withheld signals cannot create cleanup progress. Preserve the existing
+        // incomplete receipt instead of rescanning unchanged ownership uncertainty.
+        if (!signalled) break;
         // Re-read after signals to discover forks made during the first pass.
         // This is bounded discovery, not a timer or a retry of failed kills.
         const next = await readProcessTable();
@@ -534,7 +569,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
               status: 'abstained',
               life: previous.life,
               pid,
-              reason: UNREADABLE_OWNERSHIP_REASON,
+              reason: nextMarks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON,
             });
           break;
         }

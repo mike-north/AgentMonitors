@@ -9,6 +9,17 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Require environment-only restart ownership (008 §4.2; 004 §3.5.1a) — Refs #478
+
+Only actual inherited environment evidence may authorize command cleanup. The macOS system
+reader cannot distinguish argv from environment, so it records same-user PID abstentions and
+leaves them untouched; automatic cleanup is currently available on Linux. Ownership queries
+request only the supplied PIDs, with no host-wide environment scan at signal time. A matching
+zombie/dead owner no longer counts as live or protects a cleanup anchor; unavailable owner
+terminal evidence produces an abstention. Regressions cover argv-only nonces, zombie owners,
+PID-scoped queries and a bounded scan count with 100 survivors. Unchanged ownership uncertainty is recorded once, and a pass with no signals does not rescan it.
+Linux cleanup and macOS abstentions are asserted separately without extending readiness or command deadlines.
+
 ## 2026-11-12 — Keep follow-up inspection IDs positional (005 §6, §15) — Refs #584
 
 Every suggested `monitor explain` and `monitor history` command puts flags before `--` and the

@@ -178,7 +178,7 @@ daemon present. The close-on-exec residual is exercised as a sweep-reconciliatio
 Same mechanism as §3.3, stated as the crash-survival guarantee: cleanup of in-flight spawned
 work MUST NOT depend on the daemon being alive to perform it.
 
-### 4.2 The restart sweep (current on macOS/Linux for command-poll; adjacent hygiene remains target — #426)
+### 4.2 The restart sweep (current Linux cleanup and macOS conservative abstentions for command-poll; adjacent hygiene remains target — #426)
 
 Before its first tick, the daemon reconciles command work from dead previous lives in its
 workspace. A separate owner-only SQLite journal beside the runtime database
@@ -203,7 +203,10 @@ and group across the readings before it can confirm any members. A recycled PID 
 a marker from its new process onto unrelated members of its former group. Changed anchors are
 recorded as abstentions and are not retried during that startup. This includes a re-sessioned descendant that kept its mark.
 A process that detached and erased the mark before discovery is an escape: it is never guessed at
-or warned about. A positively live recorded daemon owner is left alone. Missing owner identity on
+or warned about. A positively running recorded daemon owner is left alone. PID/start-time equality alone does
+not prove liveness: a zombie/dead owner no longer supervises work and does not suppress
+reconciliation or enter the protected live-owner set. Unavailable terminal evidence withholds
+reconciliation with a recorded reason. Missing owner identity on
 the same boot is an abstention, not permission to assume the owner died.
 
 Every candidate is signalled individually through `sendVerifiedSignal` with a recorded-process
@@ -213,9 +216,18 @@ its positively observed membership and immutable process identity. A changed/mis
 start time, missing/unreadable required mark or unavailable process table withholds cleanup. The
 process-identity reading is the final asynchronous query inside the gate, after boot and mark
 checks, so identifier recycling during either earlier query cannot leave stale identity evidence. Stored numeric PIDs are suspicions only; the sweep never signals a stored PGID.
-The macOS reader uses bounded system `ps`/`sysctl` calls; Linux uses `/proc`. Neither persists or
-prints process environments. These marks are reliability evidence within the same-user trust
-boundary, not protection against deliberate impersonation by code running as that user.
+Ownership MUST come from the actual process environment, never matching argv text. Linux reads
+`/proc/<pid>/environ` for exactly the requested identifiers. The shipped macOS system `ps` output
+mixes argv and environment without an unambiguous boundary, so it cannot prove ownership:
+macOS records same-user PIDs as unproven abstentions and does not signal them. Automatic macOS
+cleanup remains unavailable until an environment-only reader exists. Its identity/boot reads use
+bounded system `ps`/`sysctl` calls; ownership-uncertainty queries request only the supplied PIDs,
+in batches of at most 2048, and never read argv or environments. Signal-time ownership queries
+never scan all host environments; Linux queries only the candidate PID. Discovery remains bounded
+by the pass limit below rather than repeating a host-wide environment scan for each survivor.
+Neither platform persists or prints process environments. These marks are reliability evidence
+within the same-user trust boundary, not protection against deliberate impersonation by code
+running as that user.
 
 Diagnostics are durable `restart_sweeps.result` receipts in the journal: `running`, `complete` or
 `incomplete`, start timestamp and per-life/per-PID `reaped`, `abstained`, `gone`, `failed` or
@@ -233,7 +245,9 @@ Later discovery omits ownership reads for the exact PID/group/start-time incarna
 confirmed terminal; a reused PID with a different identity remains subject to discovery.
 Abstained lives remain for later reconciliation. This is the input for #507; no new active warning surface ships here.
 
-Discovery takes another snapshot after signalling to catch late forks. It considers each PID
+Discovery records ownership uncertainty once per PID instead of duplicating it for a numeric
+suspicion. When no signal was sent, it stops rather than rescanning that same uncertainty.
+After signalling, discovery takes another snapshot to catch late forks. It considers each PID
 only once per startup and takes at most eight discovery passes per old life; if work keeps
 appearing, the pass is incomplete and each still-discovered PID gets an abstention reason. This
 bounds startup work without guessing at identifiers or repeatedly signalling a disputed PID.
@@ -244,15 +258,18 @@ currently records unavailable discovery rather than claiming a successful sweep.
 channel servers and stale sockets remain the separate #426 scope.
 
 **Verified:** `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` runs real daemon
-SIGKILL/restarts and asserts direct/descendant cleanup, detached mark-kept cleanup, mark-erased
-escape silence, responsive unrelated PID/PGID survival with diagnostic abstention, previous-boot
+SIGKILL/restarts and asserts Linux direct/descendant cleanup, detached mark-kept cleanup, mark-erased
+escape silence, macOS unproven-environment abstentions, argv-only nonce survival, responsive unrelated PID/PGID survival with diagnostic abstention, previous-boot
 recycling despite a retained nonce, and an empty-start receipt. Every owned process is stopped in
 cleanup, including assertion failures. `libs/core/src/process/command-process-journal.test.ts`
 asserts discovery without a recorded child PID, signal-time mark loss/start-time reuse, unavailable
 evidence, live-owner exclusion, group membership, late forks, malformed records, bounded discovery
 the distinction between signal acceptance and proven termination, anchor-PID recycling between
 discovery readings, reuse of an old daemon PID by the current daemon, and recycling during the
-signal-time marker query.
+signal-time marker query, zombie-owner reconciliation and unavailable owner-state abstention.
+`libs/core/src/process/command-process-marks.test.ts` rejects argv-only nonce ownership, records
+an abstention without signalling, bounds queries to requested PIDs, and asserts at most two
+host-wide environment scans for startup with 100 survivors (the macOS reader performs zero).
 `plugins/source-command-poll/src/command-ownership.test.ts` verifies that failed optional numeric
 bookkeeping cannot abandon live command supervision or override the mandatory inherited life mark.
 

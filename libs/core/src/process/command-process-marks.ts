@@ -15,12 +15,17 @@ import {
 /** Environment key reserved for daemon command ownership. @public */
 export const COMMAND_LIFE_ENV = 'AGENTMONITORS_COMMAND_LIFE';
 
+/** Amortize system-query cost while keeping PID arguments far below macOS ARG_MAX. */
+const DARWIN_PID_BATCH_SIZE = 2048;
+
 /** A missing mark is distinct from an unreadable mark. @internal */
 export type CommandMarks =
   | {
       readonly supported: true;
       readonly marks: ReadonlyMap<number, string>;
       readonly unreadable?: readonly number[];
+      /** Why environment evidence is unavailable; never substitute argv evidence. */
+      readonly unreadableReason?: string;
     }
   | { readonly supported: false; readonly reason: string };
 
@@ -72,23 +77,39 @@ export async function readCommandMarks(
   if (pids.length === 0) return { supported: true, marks };
   if (process.platform === 'darwin') {
     try {
-      const output = await systemRead('/bin/ps', [
-        'eww',
-        '-A',
-        '-o',
-        'pid=,command=',
-      ]);
-      const wanted = new Set(pids);
-      for (const line of output.split('\n')) {
-        const pid = Number(/^\s*(\d+)/.exec(line)?.[1]);
-        if (!wanted.has(pid)) continue;
-        const mark =
-          /(?:^|\s)AGENTMONITORS_COMMAND_LIFE=([a-f0-9-]{36})(?=\s|$)/.exec(
-            line,
-          )?.[1];
-        if (mark !== undefined) marks.set(pid, mark);
+      const unreadable: number[] = [];
+      // ps combines argv and environment with no unambiguous boundary. Even a
+      // nonce-shaped argument cannot prove inheritance. Until an environment-only
+      // reader is available, identify same-user uncertainty without reading argv
+      // or environments at all. Limit every query to the requested identifiers.
+      for (
+        let offset = 0;
+        offset < pids.length;
+        offset += DARWIN_PID_BATCH_SIZE
+      ) {
+        const output = await systemRead('/bin/ps', [
+          '-p',
+          pids.slice(offset, offset + DARWIN_PID_BATCH_SIZE).join(','),
+          '-o',
+          'pid=,uid=',
+        ]);
+        const wanted = new Set(
+          pids.slice(offset, offset + DARWIN_PID_BATCH_SIZE),
+        );
+        for (const line of output.split('\n')) {
+          const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
+          const pid = Number(match?.[1]);
+          if (wanted.has(pid) && Number(match?.[2]) === process.getuid?.())
+            unreadable.push(pid);
+        }
       }
-      return { supported: true, marks };
+      return {
+        supported: true,
+        marks,
+        unreadable,
+        unreadableReason:
+          'Actual process environments cannot be distinguished from argv by the macOS reader; ownership is unproven',
+      };
     } catch (error) {
       return {
         supported: false,

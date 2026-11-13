@@ -34,7 +34,9 @@ async function fixture() {
   directories.push(dir);
   const db = path.join(dir, 'inbox.db');
   vi.mocked(readBootIdentity).mockResolvedValue('boot');
-  vi.mocked(readCommandTerminal).mockResolvedValue('terminated');
+  vi.mocked(readCommandTerminal).mockImplementation(async (record) =>
+    record.pid === 99 ? 'running' : 'terminated',
+  );
   vi.mocked(readProcessTable).mockResolvedValue({
     supported: true,
     processes: [{ pid: process.pid, pgid: process.pid, startTime: 'owner' }],
@@ -526,4 +528,75 @@ it('still records unreadable discovery when a reaped PID has a different incarna
     }),
   );
   expect(kill).toHaveBeenCalledExactlyOnceWith(parent.pid, 'SIGKILL');
+});
+
+it('reconciles a zombie owner and does not protect it as a live group anchor', async () => {
+  const f = await fixture();
+  const owner = { pid: 99, pgid: 99, startTime: 'dead-owner' };
+  const child = { pid: 4242, pgid: 99, startTime: 'survivor' };
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [owner, child],
+  });
+  vi.mocked(readCommandMarks).mockResolvedValue({
+    supported: true,
+    marks: new Map([[owner.pid, f.token]]),
+  });
+  vi.mocked(readCommandTerminal).mockResolvedValue('terminated');
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const result = await f.journal.sweep();
+  expect(result.outcomes.some((o) => o.status === 'owner-alive')).toBe(false);
+  expect(kill).toHaveBeenCalledWith(child.pid, 'SIGKILL');
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({ pid: child.pid, status: 'reaped' }),
+  );
+});
+
+it('withholds cleanup when the matching owner terminal state is unavailable', async () => {
+  const f = await fixture();
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [
+      { pid: 99, pgid: 99, startTime: 'dead-owner' },
+      { pid: 4242, pgid: 4242, startTime: 'work' },
+    ],
+  });
+  vi.mocked(readCommandMarks).mockResolvedValue({
+    supported: true,
+    marks: new Map([[4242, f.token]]),
+  });
+  vi.mocked(readCommandTerminal).mockResolvedValue('unavailable');
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const result = await f.journal.sweep();
+  expect(kill).not.toHaveBeenCalled();
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: 99,
+      status: 'abstained',
+      reason: expect.stringMatching(/terminal state/),
+    }),
+  );
+  expect(result.outcomes.some((o) => o.status === 'owner-alive')).toBe(false);
+});
+
+it('does not repeat discovery when every candidate lacks readable ownership', async () => {
+  const f = await fixture();
+  const pids = Array.from({ length: 100 }, (_, i) => 4242 + i);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: pids.map((pid) => ({ pid, pgid: pid, startTime: 'unproven' })),
+  });
+  vi.mocked(readCommandMarks)
+    .mockClear()
+    .mockResolvedValue({ supported: true, marks: new Map(), unreadable: pids });
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const result = await f.journal.sweep();
+  expect(kill).not.toHaveBeenCalled();
+  expect(result.status).toBe('incomplete');
+  for (const pid of pids)
+    expect(result.outcomes).toContainEqual(
+      expect.objectContaining({ pid, status: 'abstained' }),
+    );
+  expect(readCommandMarks).toHaveBeenCalledTimes(1);
+  expect(result.outcomes).toHaveLength(pids.length);
 });
