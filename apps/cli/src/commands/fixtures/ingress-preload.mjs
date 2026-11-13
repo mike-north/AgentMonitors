@@ -477,7 +477,7 @@ function fileWatcher(source, config, context) {
   })();
 }
 
-/** Trace whole asynchronous tick/watch lifecycles, with nested admission classifications. */
+/** Trace tick/watch lifecycles and synchronous repair requests at the same driver seam. */
 globalThis.__ingressTestAttach = (Registry, Runtime) => {
   const register = Registry.prototype.register;
   Registry.prototype.register = function (source) {
@@ -515,6 +515,22 @@ globalThis.__ingressTestAttach = (Registry, Runtime) => {
         if (name === 'tick') process.send?.({ kind: 'tick', result });
         return result;
       });
+    };
+  }
+  // Repair requests originate in IPC, outside tick/watch ownership. Keep their
+  // synchronous return/throw behavior while classifying every nested store write,
+  // including loss receipts, rather than guessing their tables or SQL in tests.
+  for (const name of [
+    'rearmMaterializationRetry',
+    'skipMaterializationRetry',
+  ]) {
+    const original = Runtime.prototype[name];
+    if (typeof original !== 'function')
+      throw new Error(`Retry repair boundary disappeared: ${name}`);
+    Runtime.prototype[name] = function (...args) {
+      return lifecycle.run({ name, faulted: false }, () =>
+        admission.run(name, () => original.apply(this, args)),
+      );
     };
   }
   const watchMonitors = Runtime.prototype.watchMonitors;

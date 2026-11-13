@@ -11,7 +11,11 @@ import { expect, it } from 'vitest';
 
 /** Run the real preload with the same dispatch seam and SQLite driver as the CLI. */
 function probe(
-  boundary: 'tick' | 'consumeWatch',
+  boundary:
+    | 'tick'
+    | 'consumeWatch'
+    | 'rearmMaterializationRetry'
+    | 'skipMaterializationRetry',
   body: string,
   ingress = "db.prepare('INSERT INTO probe VALUES (?)').run('classified');",
   setup = '',
@@ -36,12 +40,18 @@ function probe(
       drainMaterializationRetries() {}
       reconcileNotifyEdit() {}
       watchMonitors() {}
+      rearmMaterializationRetry() { ${boundary === 'rearmMaterializationRetry' ? body : ''} }
+      skipMaterializationRetry() { ${boundary === 'skipMaterializationRetry' ? body : ''} }
       async tick() { ${boundary === 'tick' ? body : ''} }
       async consumeWatch() { ${boundary === 'consumeWatch' ? body : ''} }
     }
     const program2 = { async parseAsync() {
       process.emit('message', { stage: 'accept', trace: true });
-      try { await new AgentMonitorRuntime().${boundary}(); }
+      try {
+        const result = new AgentMonitorRuntime().${boundary}();
+        console.log('RETURN_KIND=' + (result instanceof Promise ? 'promise' : String(result)));
+        await result;
+      }
       catch (error) { console.log(String(error)); }
       finally {
         // A refused writable cursor stays untouched until ownership has ended.
@@ -468,6 +478,30 @@ for (const boundary of ['tick', 'consumeWatch'] as const) {
       "const iterator = db.prepare('PRAGMA optimize').iterate();",
     );
     expect(output).toContain('Unclassified ingress write: PRAGMA optimize');
+    expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+  });
+}
+
+for (const boundary of [
+  'rearmMaterializationRetry',
+  'skipMaterializationRetry',
+] as const) {
+  it(`discovers the synchronous ${boundary} request without changing its return value`, () => {
+    const output = probe(
+      boundary,
+      "db.prepare('INSERT INTO probe VALUES (?)').run('repair'); return 'synchronous-repair';",
+    );
+    expect(output).toContain('"kind":"write"');
+    expect(output).toContain('INSERT INTO probe VALUES (?) #1');
+    expect(output).toContain('RETURN_KIND=synchronous-repair');
+    expect(output).not.toContain('Unclassified ingress write');
+  });
+  it(`refuses direct SQL inside ${boundary}`, () => {
+    const output = probe(
+      boundary,
+      `db.exec("INSERT INTO probe VALUES ('unclassified')");`,
+    );
+    expect(output).toContain('Unclassified ingress write');
     expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
   });
 }
