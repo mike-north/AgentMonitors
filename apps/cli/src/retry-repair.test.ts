@@ -25,6 +25,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import {
@@ -54,8 +55,9 @@ let env: NodeJS.ProcessEnv;
 const daemons: (() => Promise<void>)[] = [];
 
 beforeEach(() => {
-  // A short owned path respects macOS's Unix socket pathname limit.
-  root = realpathSync(mkdtempSync('/tmp/am-repair-'));
+  // Inherit the coordinator's short owned parent so fixture writes stay in
+  // the operator's temp boundary while retaining macOS-compatible sockets.
+  root = realpathSync(mkdtempSync(path.join(tmpdir(), 'am-repair-')));
   monitors = path.join(root, 'monitors');
   watched = path.join(root, 'watched.txt');
   dbPath = path.join(root, 'state.db');

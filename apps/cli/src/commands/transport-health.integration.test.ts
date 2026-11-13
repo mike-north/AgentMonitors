@@ -264,7 +264,8 @@ This monitor fires on a schedule.
     mkdirSync(dataHome, { recursive: true });
     const socketPath = path.join(
       tmpdir(),
-      `agentmon-tr-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      // Keep the label bounded when an operator supplies an owned temp parent.
+      `tr-${label.slice(0, 8)}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     writeLocalState(dir, { enabled: true, socket: socketPath });
 
