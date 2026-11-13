@@ -9,6 +9,59 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Runtime snapshot races remain report-only (004 §2.13; Refs #611)
+
+Clarify that disappearance and replacement during directory or symlink reads are
+runtime observations, including same-type identity changes. They must not fail a
+suite or combine metadata from different entries. Strict installation-path and
+foreign-holder evidence rules remain unchanged.
+
+## 2026-11-12 — Shared runtime endpoint differences are report-only (004 §2.13; Refs #611)
+
+Keep runtime namespace access fatal at the attributable Node adapter. The real
+per-uid and legacy socket namespace is shared with daemons and other worktrees,
+so its endpoint diff cannot attribute writes and no longer fails a run. Report
+net-change paths, direction, and before/after identities as well as transient
+churn. This supersedes the prior net-change failure rule only for that namespace;
+data/config/state/cache guards and the foreign-holder policy remain strict.
+Document adapter bypass limits, including non-preloaded external children.
+
+## 2026-11-12 — Runtime namespace access is checked at the adapter (004 §2.13; Refs #611)
+
+Make real per-uid and legacy socket namespace access fatal at the test adapter,
+with path/stack diagnostics and synchronous run receipts that survive caught
+errors and child exits. Children carry the receipt capability in the preload URL.
+Use a read-only net-only observer for the shared real namespace: additions,
+removals, and replacements fail; directory metadata and observed transient churn
+are reported. Native observation has explicit run lifetime and best-effort names.
+This supersedes the prior unconditional runtime-directory metadata failure while
+preserving strict data/config/state and foreign-held regular-file rules.
+
+## 2026-11-12 — Attribute live installation writes conservatively (004 §2.13; Refs #611)
+
+Replace the unconditional-diff failure rule with a per-file exception for the same
+pre-run foreign process holding an existing regular file at both snapshots.
+Read-only process/open-file inspection must prove identity and outside lineage;
+unknown inspection stays strict. Descriptor identity must match the snapshot,
+including when macOS reports a replaced predecessor under the same name.
+Creation/removal/replacement and unheld changes
+still fail. Diagnostics name PID, command, and files. Document the shared-held-file
+blind spot and isolation's primary role. Acceptance now reports whole inventories
+and the comparison excluding exactly those diagnosed files, without claiming the
+whole installation stayed byte-identical while its daemon was active.
+
+## 2026-11-12 — Test suites own their filesystem roots (004 §2.13; Refs #611)
+
+Require shared default HOME/XDG/temp isolation for all maintained package/script
+suites and standalone install checks, with inherited storage/session overrides
+removed and child environments preserved. Add a coordinator guard for changed real
+installation files, including absent roots and small-file content hashes, plus
+case/file/run/exit cleanup. Fixed socket fallback tests relocate their namespace
+without changing production paths. Fake-installation subprocess regressions and
+uncached full-suite installation hashes establish the validation obligation;
+the attribution refinement above supersedes this entry's original unconditional
+concurrent-writer failure rule.
+
 ## 2026-11-12 — Refuse pre-existing deferred writers during ingress (004 §3.4.2) — Refs #568
 
 Writable iterators are wrapped at creation regardless of lifecycle ownership.

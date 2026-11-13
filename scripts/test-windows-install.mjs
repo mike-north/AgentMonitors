@@ -39,6 +39,7 @@
  * @see https://github.com/mike-north/AgentMonitors/issues/516
  * @see https://github.com/mike-north/AgentMonitors/issues/509
  */
+import { withIsolatedTestEnvironment } from './test-isolation/boundary.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -224,7 +225,7 @@ const isMainModule =
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (isMainModule) {
-  main().catch((error) => {
+  withIsolatedTestEnvironment(main).catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

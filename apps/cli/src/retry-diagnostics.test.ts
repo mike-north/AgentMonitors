@@ -14,6 +14,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import type {
@@ -63,7 +64,7 @@ let server: net.Server | undefined;
 
 beforeEach(() => {
   // A short owned path respects macOS's Unix socket pathname limit.
-  root = mkdtempSync('/tmp/am-retry-cli-');
+  root = mkdtempSync(path.join(tmpdir(), 'r-'));
   socketPath = path.join(root, 'daemon.sock');
   requests = [];
   writeLocalState(root, { enabled: true });

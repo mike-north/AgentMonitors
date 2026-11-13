@@ -263,7 +263,7 @@ This monitor fires on a schedule.
     const dataHome = path.join(dir, 'data-home');
     mkdirSync(dataHome, { recursive: true });
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-tr-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     writeLocalState(dir, { enabled: true, socket: socketPath });
@@ -300,7 +300,7 @@ This monitor fires on a schedule.
       cliPath: '/usr/local/bin/agentmonitors',
       execPath: process.execPath,
       version: CLI_VERSION,
-      home: process.env['HOME'] ?? '/tmp',
+      home: process.env['HOME'] ?? tmpdir(),
       dataRoot: fixture.dataHome,
       workspacePath: fixture.dir,
       socketPath: fixture.socketPath,
@@ -590,7 +590,7 @@ This monitor fires on a schedule.
     const dataHome = path.join(dir, 'data-home');
     mkdirSync(dataHome, { recursive: true });
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-tr-suppressed-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     writeLocalState(dir, { enabled: true, socket: socketPath });

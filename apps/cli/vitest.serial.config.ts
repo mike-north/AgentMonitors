@@ -1,3 +1,4 @@
+import { testIsolation } from '../../scripts/test-isolation/config.mjs';
 import { defineConfig } from 'vitest/config';
 
 /**
@@ -26,6 +27,7 @@ import { defineConfig } from 'vitest/config';
  */
 export default defineConfig({
   test: {
+    ...testIsolation,
     include: [
       'src/concurrent-spawn.test.ts',
       'src/input-limits.integration.test.ts',

@@ -625,6 +625,106 @@ Verified in `apps/cli/src/commands/validate-admission.test.ts` and
 `libs/core/src/schema/input-limits.test.ts`. Tests consume prebuilt artifacts under
 §2.9; narrow repair reversions must reproduce each admission failure independently.
 
+### 2.13 Test filesystem isolation (current)
+
+Every maintained package suite (core, CLI fast and serial, launcher, sources,
+website unit tests, and `scripts/`) MUST load the shared `scripts/test-isolation`
+boundary through Vitest `globalSetup` and `setupFiles`. Standalone consumer, fresh-install hook, and Windows
+install checks MUST enter the same boundary at their direct entrypoint. Importing
+their definitions MUST NOT change the caller's environment. Nx test inputs include
+the shared boundary, so cached results cannot hide changes to it.
+
+Before test modules load, the boundary MUST replace HOME and platform home/config
+inputs, all XDG data/config/state/cache/runtime inputs, and TMPDIR/TMP/TEMP with
+owned OS temporary paths. Inherited `AGENTMONITORS_DB`, `AGENTMONITORS_SOCKET`, and
+`CLAUDE_PROJECT_DIR` MUST be removed: ordinary production fallback resolution then
+uses the isolated roots without masking workspace-specific defaults. A test MAY
+supply its own explicit overrides only within directories it owns. Child processes
+MUST inherit the isolated environment; a custom allowlist MUST retain the path
+boundary. Product storage and path precedence do not change for this rule.
+
+Ordinary case roots MUST be removed in `afterEach`, including failures/timeouts.
+Package-manager caches MAY share a run-owned root to avoid repeated downloads;
+they MUST NOT point at host caches. Module/beforeAll fixtures have file lifetimes and MUST be removed in `afterAll`.
+Coordinator teardown and process-exit hooks MUST remove remaining run roots.
+Test subprocesses still require their existing owned-process teardown: removing a
+filesystem root does not terminate its processes.
+
+The coordinator MUST capture real installation locations before overriding paths
+and compare existence, mtime, size, permissions, symlink targets, and SHA-256 content
+hashes for regular files up to 1 MiB at teardown. Default locations MUST be watched
+even when absent. This includes the legacy HOME data root, XDG/config/state/cache/
+runtime roots, macOS Library equivalents, inherited DB/socket overrides, and the
+fixed per-uid `/tmp` socket fallback (002 §10.3). Outside that shared runtime
+namespace, creation, removal, replacement, and non-file metadata changes MUST fail. An existing regular file's content or
+metadata change MAY be reported without failure only when read-only `ps`/`lsof`
+inspection proves that the same process held that file open at both snapshots,
+started before the run, and is neither the coordinator nor its descendant at either
+snapshot. PID/start identity and file device/inode MUST agree across snapshots. Each open
+descriptor's device/inode MUST also match its file snapshot: on macOS an unlinked
+open predecessor can retain the same reported pathname as a replacement.
+Second-resolution process start times MUST be conservatively older than the run's
+start; ambiguous birth order grants no exception. The output MUST name each PID,
+command, and exact file. An unrelated held file grants no directory-wide exception.
+Missing, failed, partial, or unreadable inspection MUST remain strict. The guard
+MUST never signal inspected processes or repair/remove installation data.
+
+This attribution is not write tracing: a test writing a file held by such a foreign
+process cannot be distinguished by the diff. HOME/XDG/TMPDIR isolation is the first
+line of protection against that path; the guard is the second line.
+
+Fixed-path socket tests MUST relocate the OS namespace at the test-only adapter;
+product resolvers and paths remain unchanged. In test processes, path resolution,
+filesystem IO, IPC listen/connect, and child cwd/explicit path arguments MUST fail
+on real per-uid or legacy-hash namespace paths, naming the path and call stack.
+Normal fixed fallback joins resolve into owned roots. This applies in workers and
+Node children through the preload. A caught error, ignored child exit, or explicit
+`process.exit(0)` MUST NOT erase the violation: run-owned synchronous receipts make
+the coordinator fail before cleanup. The preload URL carries the run capability
+so child environment allowlists retaining NODE_OPTIONS retain the receipt scope.
+Trusted host inventory uses read-only inspection primitives, never these guarded
+application APIs. User teardown keeps the owned environment until its work ends.
+
+The real per-user runtime directory is shared by unrelated daemons and worktrees.
+Its endpoint diff MUST be report-only, including net additions, removals, and
+replacements in the per-uid directory and legacy flat socket/lock namespace.
+An endpoint difference cannot distinguish test writes from those other processes.
+The adapter is the attributable fatal guard for runtime access in test processes
+and preloaded Node children, including transient or caught accesses. The shared
+directory's diff MUST NOT set a failing exit status.
+
+Net-change reports MUST name the path and direction (`added`, `removed`, or
+`replaced`) and retain both before/after type/device/inode/symlink-target identities;
+an absent endpoint is `null`. Metadata changes and native observation remain
+reported too, with before/after mtimes and best-effort observed names. Neither
+observation is write tracing or PID attribution. Other data/config/state/cache
+roots retain the strict rule and foreign-holder policy above. The runtime observer
+MUST remain read-only and close its watchers on every exit.
+Disappearance or replacement between runtime snapshot reads, including directory
+enumeration and symlink-target reads, MUST be reported as an observation without
+failing the run or combining metadata from different entry identities.
+
+The adapter covers the maintained Node path/filesystem/IPC surfaces, not every
+possible route to the filesystem. Non-preloaded shell/external children (including
+embedded command strings), captured pre-install native functions, direct native
+bindings, pre-opened descriptor/handle operations, and unrecognized symlink aliases
+remain outside its path checks. NODE_OPTIONS-only Node children retain the preload;
+children or worker contexts that explicitly discard it do not acquire that guard.
+These limits MUST be reported; a report-only endpoint diff is not a fatal backstop
+for access that bypasses the adapter.
+
+**Verified by:** `scripts/test-data-isolation.test.ts` checks every maintained
+config, child inheritance, cache invalidation, initially absent XDG roots,
+same-size edits with restored mtime, and cleanup through pass/failure/timeout/
+beforeAll failure/explicit process exit. Deliberate installation mutations run in
+subprocesses with fake real roots, never against a user's installation. An acceptance
+run MUST hash every regular installation file before and after two complete suite
+runs. Report both whole-installation inventories and inventories excluding only
+files explicitly attributed by that run's guard diagnostics. The latter MUST be
+byte-identical to establish preservation with foreign-write exclusions; every
+excluded file and PID MUST be named. Whole-installation byte identity remains a
+separate reported outcome. A partial test run is insufficient.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.
