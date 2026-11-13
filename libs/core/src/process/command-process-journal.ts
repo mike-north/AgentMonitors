@@ -473,7 +473,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
             save('running');
           })();
         }
-        let signalled = false;
+        let discoveryProgress = false;
         for (const pid of pending) {
           const record = byPid.get(pid);
           if (record === undefined) continue;
@@ -555,7 +555,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
             },
           );
           if (outcome.status === 'sent') {
-            signalled = true;
+            discoveryProgress = true;
             const terminal = await readCommandTerminal(record);
             outcomes.push({
               status: terminal === 'terminated' ? 'reaped' : 'failed',
@@ -595,7 +595,11 @@ export class CommandProcessJournal implements CommandProcessOwner {
               reason: outcome.abstention.reason,
             });
           } else {
-            retained ||= outcome.status === 'failed';
+            // A vanished target may have forked after discovery. Its absence
+            // ends only that incarnation, never the life or group accounting.
+            // Retain attribution and discover again through the usual gates.
+            retained = true;
+            discoveryProgress ||= outcome.status === 'not-needed';
             outcomes.push({
               status: outcome.status === 'not-needed' ? 'gone' : 'failed',
               life: previous.life,
@@ -605,10 +609,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
           }
           save('running');
         }
-        // Withheld signals cannot create cleanup progress. Preserve the existing
-        // incomplete receipt instead of rescanning unchanged ownership uncertainty.
-        if (!signalled) break;
-        // Re-read after signals to discover forks made during the first pass.
+        // Signals and observed exits can expose late forks. Withheld signals
+        // alone do not justify rescanning unchanged ownership uncertainty.
+        if (!discoveryProgress) break;
+        // Re-read after cleanup or natural exits to discover late forks.
         // This is bounded discovery, not a timer or a retry of failed kills.
         const next = await readProcessTable();
         if (!next.supported) {

@@ -147,6 +147,162 @@ it('retires empty group hints during repeated admissions while preserving possib
   }
 });
 
+it('retains PID-only occupancy during admission and abstains after restart', async () => {
+  const f = await fixture();
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  // The direct child has exited and its group is empty, but a different
+  // incarnation occupies its PID. Admission cannot erase that suspicion.
+  f.admission.exited(4242);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [{ pid: 4242, pgid: 7000, startTime: 'unmarked-reuse' }],
+  });
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  try {
+    await f.admission.environment();
+    expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([
+      { pid: 4242 },
+    ]);
+    f.journal.close();
+    journals.splice(journals.indexOf(f.journal), 1);
+    const restarted = CommandProcessJournal.open(f.db, path.dirname(f.db));
+    journals.push(restarted);
+    const result = await restarted.sweep();
+    expect(result.outcomes).toContainEqual(
+      expect.objectContaining({
+        life: f.token,
+        pid: 4242,
+        status: 'abstained',
+        reason: expect.stringMatching(/group continuity is unconfirmed/),
+      }),
+    );
+    expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+      { life: f.token },
+    ]);
+    expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([
+      { pid: 4242 },
+    ]);
+    expect(
+      JSON.parse(
+        sql
+          .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+          .pluck()
+          .get(),
+      ),
+    ).toEqual(result);
+    expect(kill).not.toHaveBeenCalled();
+  } finally {
+    sql.close();
+  }
+});
+
+it.each(['verified', 'boot', 'mark', 'start-time'] as const)(
+  'accounts for a marked late fork when its parent vanishes before signalling (%s)',
+  async (gate) => {
+    const f = await fixture();
+    const parent = { pid: 4242, pgid: 4242, startTime: 'parent' };
+    const child = { pid: 4243, pgid: 4242, startTime: 'late-child' };
+    let reads = 0;
+    let present = true;
+    const sql = new Database(`${f.db}.commands.sqlite`);
+    // The parent survives anchor confirmation but exits naturally before the
+    // signal-time table. Its child was absent from the discovery snapshot.
+    vi.mocked(readProcessTable).mockImplementation(async () => ({
+      supported: true,
+      processes: !present ? [] : ++reads <= 2 ? [parent] : [child],
+    }));
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => {
+      const childGate =
+        reads >= 5 && pids.length === 1 && pids[0] === child.pid;
+      if (childGate && gate === 'start-time')
+        vi.mocked(readProcessTable).mockResolvedValue({
+          supported: true,
+          processes: [{ ...child, startTime: 'recycled' }],
+        });
+      return {
+        supported: true,
+        marks: new Map(
+          pids
+            .filter(
+              (pid) =>
+                !(childGate && gate === 'mark') &&
+                (pid === parent.pid || pid === child.pid),
+            )
+            .map((pid) => [pid, f.token]),
+        ),
+      };
+    });
+    // Boot is queried before the mark, so change it on the child's next
+    // signal-time read while preserving the sweep's original boot identity.
+    vi.mocked(readBootIdentity).mockImplementation(async () =>
+      gate === 'boot' && reads >= 5 ? 'changed-boot' : 'boot',
+    );
+    const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+      expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+        { life: f.token },
+      ]);
+      return true;
+    });
+    try {
+      const first = await f.journal.sweep();
+      expect(first.outcomes).toContainEqual(
+        expect.objectContaining({ pid: parent.pid, status: 'gone' }),
+      );
+      expect(first.outcomes).toContainEqual(
+        expect.objectContaining({
+          pid: child.pid,
+          status: gate === 'verified' ? 'reaped' : 'abstained',
+        }),
+      );
+      expect(kill.mock.calls).toEqual(
+        gate === 'verified' ? [[child.pid, 'SIGKILL']] : [],
+      );
+      expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+        { life: f.token },
+      ]);
+      expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([
+        { pid: parent.pgid },
+      ]);
+      expect(
+        JSON.parse(
+          sql
+            .prepare(
+              'SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1',
+            )
+            .pluck()
+            .get(),
+        ),
+      ).toEqual(first);
+      present = false;
+      vi.mocked(readProcessTable).mockResolvedValue({
+        supported: true,
+        processes: [],
+      });
+      vi.mocked(readCommandMarks).mockResolvedValue({
+        supported: true,
+        marks: new Map(),
+      });
+      vi.mocked(readBootIdentity).mockResolvedValue('boot');
+      const empty = await f.journal.sweep();
+      expect(empty.status).toBe('complete');
+      expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([]);
+      expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([]);
+      expect(
+        JSON.parse(
+          sql
+            .prepare(
+              'SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1',
+            )
+            .pluck()
+            .get(),
+        ),
+      ).toEqual(empty);
+    } finally {
+      sql.close();
+    }
+  },
+);
+
 it('keeps a hint refreshed while admission reads an earlier empty process snapshot', async () => {
   const f = await fixture();
   const kill = vi.spyOn(process, 'kill').mockReturnValue(true);

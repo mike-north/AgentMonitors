@@ -1083,7 +1083,10 @@ inside detached startup's 15-second deadline (under 2 seconds on the acceptance 
 every gone outcome, and retire the empty life without signals. Repeated admissions in one life
 must retire empty group hints while retaining groups with possible survivors and unavailable
 discovery. A hint refreshed while the admission read is in flight must survive that earlier empty
-snapshot; a later fresh empty snapshot can retire it. Unrelated bookkeeping during every admission
+snapshot. PID-only occupancy by an unmarked reused process in a different group must also retain
+the hint; reopening must record a conservative abstention and keep the life without signalling.
+Removing PID occupancy from admission retirement must fail that regression. A later fresh empty
+snapshot can retire it. Unrelated bookkeeping during every admission
 read must not block retirement of older empty hints: 100 such admissions retain only newly recorded
 work until its own fresh empty reading. A newly discovered marked group without a direct-PID hint must persist its numeric
 suspicion before signalling, abstain from a later unmarked survivor across a journal reopen,
@@ -1115,7 +1118,11 @@ Unreadable-mark controls require per-PID abstentions durable before later identi
 an unrelated unreadable environment may make discovery incomplete without producing an outcome
 for a readable detached mark-erased escape. Escape coverage must still prove the parent's reap,
 the child's survival, and no diagnostic for that child.
-A pass with no signals must not repeat ownership discovery or duplicate an existing per-PID
+A parent that exits between discovery and the signal gate must trigger fresh discovery without
+losing its life or group suspicion. Its marked late fork must be cleaned through the normal gates,
+or receive an abstention on changed boot, lost mark or recycled start time, with every signal a spy.
+Returned and durable receipts must agree, and a later empty snapshot must retire the life and hints.
+A pass with no signals and no target observed vanishing must not repeat ownership discovery or duplicate an existing per-PID
 uncertainty just because that PID is also a numeric suspicion.
 Confirmed terminal incarnations must not become new unreadable candidates in a later snapshot;
 a different incarnation using the same PID must still receive normal discovery.

@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Preserve late forks after natural parent exit (008 §4.2; 004 §3.5.1a) — Refs #478
+
+A target that vanishes before signalling retains its life and group suspicion and triggers
+fresh bounded discovery, just as a sent signal does. Marked late forks still require fresh boot,
+mark and start-time evidence; unavailable identity produces an abstention. A later empty snapshot
+can retire the life. Regressions compare durable and returned receipts, cover each late-fork gate,
+and protect PID-only admission occupancy with a guard mutation failure.
+
 ## 2026-11-12 — Bound restart hint accounting and preserve discovered groups (008 §4.2; 004 §3.5.1a) — Refs #478
 
 Batch gone-PID decisions before further asynchronous work instead of rewriting the receipt per
