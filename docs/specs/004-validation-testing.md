@@ -882,6 +882,10 @@ survivor receives an abstention, its life remains retryable, and no numeric grou
 a signal. After a confirmed signal, a positively marked late fork must still pass the boot, mark
 and start-time gates and receive cleanup and an outcome when an unrelated unreadable PID makes the
 new snapshot incomplete; the unreadable PID's abstention and the retained life remain recorded.
+Repeated post-signal snapshots must record exactly one unchanged unreadable-PID abstention.
+A confirmed parent reap must retain the original-group suspicion across journal reopenings:
+100 successive sweeps with an unmarked group survivor keep exactly one life and one suspicion,
+never signal that survivor, and retire the life and suspicion once the group disappears.
 
 `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` belongs only to the serial
 restart-safety suite. Required Linux outcomes: SIGKILL/restart reaps the command and child with per-PID

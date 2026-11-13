@@ -198,10 +198,12 @@ parent, group or session membership. A marked live member also confirms the iden
 current process-group members, including children that cleared their environment while staying
 in that group; their recorded start times carry that confirmation after the marked anchor exits.
 A bare stored PGID never confirms a group, and a registered live daemon owner is never an anchor.
-An exited direct child's numeric identifier remains an original-group suspicion until
+An exited or sweep-reaped direct child's numeric identifier remains an original-group suspicion until
 reconciliation: an unmarked survivor in that group must receive an abstention and retain its
 life when no marked anchor can confirm membership. Direct-child exit alone cannot erase that
-accounting obligation, and numeric suspicion alone never authorizes a signal.
+accounting obligation. A confirmed reap cannot erase it either: the suspicion survives journal
+reopenings until the group has no remaining members, when its life can retire. Numeric suspicion
+alone never authorizes a signal.
 Marker discovery is bracketed by process-table readings: a group anchor must keep its start time
 and group across the readings before it can confirm any members. A recycled PID cannot transfer
 a marker from its new process onto unrelated members of its former group. Changed anchors are
@@ -249,8 +251,9 @@ Later discovery omits ownership reads for the exact PID/group/start-time incarna
 confirmed terminal; a reused PID with a different identity remains subject to discovery.
 Abstained lives remain for later reconciliation. This is the input for #507; no new active warning surface ships here.
 
-Discovery records ownership uncertainty once per PID instead of duplicating it for a numeric
-suspicion. When no signal was sent, it stops rather than rescanning that same uncertainty.
+Discovery records unchanged ownership uncertainty once per PID per sweep, including across
+post-signal snapshots, instead of duplicating it for a numeric suspicion or later snapshot.
+When no signal was sent, it stops rather than rescanning that same uncertainty.
 After signalling, discovery takes another snapshot to catch late forks. It processes readable
 positive evidence even when unrelated unreadable ownership makes the snapshot
 incomplete; that uncertainty is saved before further identity queries and cannot discard the

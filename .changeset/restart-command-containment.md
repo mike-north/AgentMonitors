@@ -14,3 +14,5 @@ Require actual environment evidence for ownership: macOS system process listings
 Record unchanged per-PID ownership uncertainty once and stop discovery when no signal was sent.
 
 Retain original-group suspicion after direct-child exit so unmarked survivors receive conservative abstentions without numeric group signal authority. Continue verified late-fork cleanup despite unrelated unreadable ownership, preserving incomplete receipts and retryable lives.
+
+Deduplicate unchanged unreadable-PID abstentions across post-signal snapshots. Retain original-group suspicion after a confirmed parent reap across journal reopenings, and retire the life only after no group member remains.

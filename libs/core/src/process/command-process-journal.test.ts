@@ -139,6 +139,108 @@ it('reaps a positively marked late fork despite unrelated unreadable ownership',
   }
 });
 
+it('records unchanged unreadable ownership once while continuing late-fork cleanup', async () => {
+  const f = await fixture();
+  const parent = { pid: 4242, pgid: 4242, startTime: 'parent' };
+  const late = { pid: 4243, pgid: 4242, startTime: 'late' };
+  const unreadable = { pid: 4244, pgid: 7000, startTime: 'unrelated' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  // Each successful cleanup forces another discovery snapshot. The unchanged
+  // obstacle remains incomplete evidence, but represents only one uncertainty.
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length === 0 ? [parent] : [late, unreadable],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => pid === parent.pid || pid === late.pid)
+        .map((pid) => [pid, f.token]),
+    ),
+    unreadable: pids.includes(unreadable.pid) ? [unreadable.pid] : [],
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([
+    [parent.pid, 'SIGKILL'],
+    [late.pid, 'SIGKILL'],
+  ]);
+  expect(result.status).toBe('incomplete');
+  expect(
+    result.outcomes.filter(
+      (outcome) =>
+        outcome.pid === unreadable.pid && outcome.status === 'abstained',
+    ),
+  ).toHaveLength(1);
+});
+
+it('retains a reaped parent group across 100 journal reopens until its unmarked survivor is gone', async () => {
+  const f = await fixture();
+  const parent = { pid: 4242, pgid: 4242, startTime: 'parent' };
+  const child = { pid: 4243, pgid: 4242, startTime: 'unmarked-child' };
+  let present = true;
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  // The unmarked child first appears after the marked parent is confirmed
+  // terminal. No persisted numeric hint can grant authority over that child.
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length === 0 ? [parent] : present ? [child] : [],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: pids.includes(parent.pid)
+      ? new Map([[parent.pid, f.token]])
+      : new Map(),
+  }));
+  const first = await f.journal.sweep();
+  expect(first.outcomes).toContainEqual(
+    expect.objectContaining({ pid: parent.pid, status: 'reaped' }),
+  );
+  f.journal.close();
+  journals.splice(journals.indexOf(f.journal), 1);
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  try {
+    for (let cycle = 0; cycle < 100; cycle++) {
+      const reopened = CommandProcessJournal.open(f.db, path.dirname(f.db));
+      try {
+        const result = await reopened.sweep();
+        expect(result.outcomes).toContainEqual(
+          expect.objectContaining({
+            life: f.token,
+            pid: child.pid,
+            status: 'abstained',
+            reason: expect.stringMatching(/group continuity is unconfirmed/),
+          }),
+        );
+        expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+          { life: f.token },
+        ]);
+        expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([
+          { pid: parent.pid },
+        ]);
+        expect(sql.prepare('SELECT id FROM restart_sweeps').all()).toHaveLength(
+          Math.min(20, cycle + 2),
+        );
+        expect(kill).toHaveBeenCalledExactlyOnceWith(parent.pid, 'SIGKILL');
+      } finally {
+        reopened.close();
+      }
+    }
+    present = false;
+    const reopened = CommandProcessJournal.open(f.db, path.dirname(f.db));
+    try {
+      await reopened.sweep();
+      expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([]);
+      expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([]);
+      expect(kill).toHaveBeenCalledExactlyOnceWith(parent.pid, 'SIGKILL');
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    sql.close();
+  }
+});
+
 it('finds marked descendants even when a crash prevented recording the spawned PID', async () => {
   const f = await fixture();
   const victim = { pid: 4243, pgid: 4243, startTime: 'descendant' };

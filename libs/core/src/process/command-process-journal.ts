@@ -502,9 +502,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
             });
             if (terminal === 'terminated') {
               reaped.set(pid, record);
-              this.sql
-                .prepare('DELETE FROM command_pids WHERE life = ? AND pid = ?')
-                .run(previous.life, pid);
+              // A confirmed reap ends this incarnation, not its original group.
+              // Retain the durable numeric suspicion until no member remains,
+              // so unmarked late survivors stay accountable across restarts.
+              // The hint alone never grants signal authority.
             }
             // Keep the nonce until a later empty startup can retire it: a
             // kernel-delayed exit must never erase attribution of late forks.
@@ -567,13 +568,29 @@ export class CommandProcessJournal implements CommandProcessOwner {
         if ((nextMarks.unreadable?.length ?? 0) > 0) {
           complete = false;
           retained = true;
-          for (const pid of nextMarks.unreadable ?? [])
+          for (const pid of nextMarks.unreadable ?? []) {
+            const reason =
+              nextMarks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON;
+            // Repeated snapshots can preserve one unchanged obstacle while
+            // finding new marked work. Record equal uncertainty once per pass,
+            // including obstacles already found before selecting an old life.
+            if (
+              outcomes.some(
+                (outcome) =>
+                  outcome.pid === pid &&
+                  outcome.status === 'abstained' &&
+                  outcome.reason === reason,
+              )
+            ) {
+              continue;
+            }
             outcomes.push({
               status: 'abstained',
               life: previous.life,
               pid,
-              reason: nextMarks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON,
+              reason,
             });
+          }
           // Unrelated uncertainty cannot discard positively identified late
           // forks. Persist it before the next round's identity queries, while
           // keeping both this pass and its life incomplete and retryable.
