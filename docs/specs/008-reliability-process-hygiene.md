@@ -191,7 +191,12 @@ lives records a complete empty sweep without boot, process-table or environment 
 old lives are still reconciled before IPC readiness and the first tick; this is not deferred
 cleanup. No command timeout or test timeout is extended. A SIGKILL during spawn still leaves the precommitted nonce
 available for discovery. Normal direct-child exit retains both the life nonce and the numeric
-original-group suspicion: it cannot discard accounting for surviving descendants.
+original-group suspicion: it cannot discard accounting for surviving descendants. At subsequent
+awaited admissions, a readable process-table snapshot retires hints with neither a PID nor group
+member present, preventing completed empty groups from accumulating throughout a daemon life.
+Unavailable discovery retains hints. Spawn/exit bookkeeping during a read retains that refreshed
+hint; older unchanged empty hints can still retire under continuous unrelated admissions. An
+earlier snapshot cannot retire refreshed work. The life nonce remains available for marked detached work.
 
 The sweep reads the platform process table and inherited ownership marks, independently of current
 parent, group or session membership. A marked live member also confirms the identities of its
@@ -203,7 +208,10 @@ reconciliation: an unmarked survivor in that group must receive an abstention an
 life when no marked anchor can confirm membership. Direct-child exit alone cannot erase that
 accounting obligation. A confirmed reap cannot erase it either: the suspicion survives journal
 reopenings until the group has no remaining members, when its life can retire. Numeric suspicion
-alone never authorizes a signal.
+alone never authorizes a signal. Every newly confirmed marked group, including a detached group
+with no recorded direct child, gains a durable numeric suspicion before its anchor is signalled.
+An unmarked survivor discovered only after that signal receives an abstention and keeps the life
+retryable across journal reopenings. Empty recorded groups retire their hints in a batch.
 Marker discovery is bracketed by process-table readings: a group anchor must keep its start time
 and group across the readings before it can confirm any members. A recycled PID cannot transfer
 a marker from its new process onto unrelated members of its former group. Changed anchors are
@@ -243,15 +251,18 @@ unreadable discovery is incomplete, and an interrupted pass stays running. Each 
 same-user ownership mark records an abstention with its PID, without claiming that PID belongs to
 the command. An incomplete pass may still reap positively confirmed work. A readable detached
 mark-erased escape has no outcome even when an unrelated unreadable PID makes the pass incomplete.
-Decisions are saved incrementally, including discovery obstacles before later identity queries,
-and the most recent 20 receipts per workspace are retained. `reaped` additionally requires
+Decisions are saved incrementally, including discovery obstacles before later identity queries.
+Gone-PID decisions from one snapshot are committed as a batch before further asynchronous work;
+there is no per-gone-PID rewrite of the growing receipt. This keeps empty-hint reconciliation
+close to linear without extending startup deadlines. The most recent 20 receipts per workspace
+are retained. `reaped` additionally requires
 terminal evidence (absence, a different start-time incarnation, or a zombie/dead state), not just
 an accepted signal. A sent signal with unconfirmed termination is `failed` with a reason.
 Later discovery omits ownership reads for the exact PID/group/start-time incarnation already
 confirmed terminal; a reused PID with a different identity remains subject to discovery.
 Abstained lives remain for later reconciliation. This is the input for #507; no new active warning surface ships here.
 
-Discovery records unchanged ownership uncertainty once per PID per sweep, including across
+Discovery records unchanged ownership uncertainty once per PID and reason per sweep, including across
 post-signal snapshots, instead of duplicating it for a numeric suspicion or later snapshot.
 When no signal was sent, it stops rather than rescanning that same uncertainty.
 After signalling, discovery takes another snapshot to catch late forks. It processes readable

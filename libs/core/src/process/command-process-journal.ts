@@ -98,6 +98,8 @@ export class CommandProcessJournal implements CommandProcessOwner {
   private owner: ProcessIdentityRecord | undefined;
   private identityReady: Promise<void> | undefined;
   private registered = false;
+  /** Transient tokens invalidate only refreshed hints in concurrent admission snapshots. */
+  private readonly hintRevisions = new Map<number, symbol>();
   private constructor(
     private readonly sql: Database.Database,
     private readonly workspace: string,
@@ -128,6 +130,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
   /** Commit the nonce and owner identity before the source receives permission to spawn. */
   async environment(): Promise<Readonly<Record<string, string>>> {
     await this.initializeIdentity();
+    if (this.registered) await this.retireEmptyGroups();
     if (!this.registered) {
       this.sql
         .prepare('INSERT INTO command_lives VALUES(?,?,?,?)')
@@ -142,6 +145,42 @@ export class CommandProcessJournal implements CommandProcessOwner {
     return { [COMMAND_LIFE_ENV]: this.life };
   }
 
+  /**
+   * Admission is already awaited before spawn. Use that boundary to retire
+   * empty numeric suspicions from this life, so ordinary completed commands
+   * cannot grow the retained set until daemon restart. Keep the nonce for
+   * detached marked work, and keep every group that could still have a survivor.
+   * Unavailable discovery never proves emptiness and cannot discard a hint.
+   */
+  private async retireEmptyGroups(): Promise<void> {
+    const rows = this.sql
+      .prepare('SELECT pid FROM command_pids WHERE life = ?')
+      .all(this.life);
+    if (rows.length === 0) return;
+    const revisions = new Map<number, symbol | undefined>();
+    for (const raw of rows) {
+      const hint = pidSchema.safeParse(raw);
+      if (hint.success)
+        revisions.set(hint.data.pid, this.hintRevisions.get(hint.data.pid));
+    }
+    const table = await readProcessTable();
+    if (!table.supported) return;
+    const occupied = new Set(table.processes.flatMap((p) => [p.pid, p.pgid]));
+    const retire = this.sql.prepare(
+      'DELETE FROM command_pids WHERE life = ? AND pid = ?',
+    );
+    this.sql.transaction(() => {
+      for (const [pid, revision] of revisions) {
+        // A refreshed hint can describe work newer than this snapshot, while
+        // unrelated bookkeeping must not prevent older empty hints retiring.
+        if (!occupied.has(pid) && this.hintRevisions.get(pid) === revision) {
+          retire.run(this.life, pid);
+          this.hintRevisions.delete(pid);
+        }
+      }
+    })();
+  }
+
   /** No lifecycle row is published until a real command asks for its admission mark. */
   private initializeIdentity(): Promise<void> {
     this.identityReady ??= (async () => {
@@ -153,15 +192,19 @@ export class CommandProcessJournal implements CommandProcessOwner {
     })();
     return this.identityReady;
   }
-  /** Recording a numeric suspicion is synchronous before the spawn caller returns. */
+  /**
+   * Recording a numeric suspicion is synchronous before the spawn caller returns.
+   * A fresh token protects that work from older in-flight admission snapshots.
+   */
   spawned(pid: number): void {
+    this.hintRevisions.set(pid, Symbol());
     this.sql
       .prepare('INSERT OR IGNORE INTO command_pids VALUES(?,?)')
       .run(this.life, pid);
   }
   /**
    * A direct exit cannot prove its original group empty. Keep the numeric
-   * suspicion until reconciliation, so an environment-cleared group survivor
+   * suspicion until a readable snapshot proves the group empty, so an environment-cleared survivor
    * gets an abstention even without a marked anchor. This never grants signal
    * authority: only fresh mark or confirmed membership evidence can do that.
    */
@@ -183,7 +226,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
         this.workspace,
         JSON.stringify({ status: 'running', startedAt, outcomes }),
       );
-    /** Save after every decision so a later crash leaves an honest partial receipt. */
+    /** Save decisions before further asynchronous work can interrupt their accounting. */
     const save = (status: RestartSweepResult['status']): RestartSweepResult => {
       const result: RestartSweepResult = { status, startedAt, outcomes };
       this.sql
@@ -380,6 +423,21 @@ export class CommandProcessJournal implements CommandProcessOwner {
           save('running');
         }
         const anchors = confirmed.anchors;
+        // A detached or unrecorded marked anchor can be the only evidence of
+        // its group. Commit that numeric suspicion before any signal removes
+        // it, so a later unmarked survivor remains accountable after a reopen.
+        // This records suspicion only; authority still comes from fresh evidence.
+        this.sql.transaction(() => {
+          const remember = this.sql.prepare(
+            'INSERT OR IGNORE INTO command_pids VALUES(?,?)',
+          );
+          for (const pgid of anchors.keys()) {
+            if (pgid > 0 && !recorded.has(pgid)) {
+              remember.run(previous.life, pgid);
+              recorded.add(pgid);
+            }
+          }
+        })();
         const candidates = new Set([
           ...recorded,
           ...reading.processes
@@ -393,15 +451,33 @@ export class CommandProcessJournal implements CommandProcessOwner {
         ]);
         const pending = [...candidates].filter((pid) => !visited.has(pid));
         if (pending.length === 0) break;
+        const byPid = new Map(reading.processes.map((p) => [p.pid, p]));
+        const groups = new Set(reading.processes.map((p) => p.pgid));
+        // Absence decisions use one immutable snapshot and involve no awaits.
+        // Batch their receipt and hint retirement before further identity reads,
+        // instead of FULL-sync rewriting an ever-growing receipt per gone PID.
+        const gone = pending.filter((pid) => !byPid.has(pid));
+        if (gone.length > 0) {
+          this.sql.transaction(() => {
+            const retire = this.sql.prepare(
+              'DELETE FROM command_pids WHERE life = ? AND pid = ?',
+            );
+            for (const pid of gone) {
+              visited.add(pid);
+              outcomes.push({ status: 'gone', life: previous.life, pid });
+              if (!groups.has(pid)) {
+                retire.run(previous.life, pid);
+                recorded.delete(pid);
+              }
+            }
+            save('running');
+          })();
+        }
         let signalled = false;
         for (const pid of pending) {
+          const record = byPid.get(pid);
+          if (record === undefined) continue;
           visited.add(pid);
-          const record = reading.processes.find((p) => p.pid === pid);
-          if (record === undefined) {
-            outcomes.push({ status: 'gone', life: previous.life, pid });
-            save('running');
-            continue;
-          }
           if (liveOwners.has(pid) || pid === process.pid) {
             outcomes.push({
               status: 'abstained',

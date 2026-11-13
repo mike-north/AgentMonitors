@@ -1076,6 +1076,18 @@ a signal. After a confirmed signal, a positively marked late fork must still pas
 and start-time gates and receive cleanup and an outcome when an unrelated unreadable PID makes the
 new snapshot incomplete; the unreadable PID's abstention and the retained life remain recorded.
 Repeated post-signal snapshots must record exactly one unchanged unreadable-PID abstention.
+A different unreadable PID and a changed uncertainty reason for the same PID must each remain
+recorded, with equality between returned and durable receipts; removing either dedupe comparison
+must fail its boundary regression. A snapshot with at least 12,000 gone hints must finish well
+inside detached startup's 15-second deadline (under 2 seconds on the acceptance machine), preserve
+every gone outcome, and retire the empty life without signals. Repeated admissions in one life
+must retire empty group hints while retaining groups with possible survivors and unavailable
+discovery. A hint refreshed while the admission read is in flight must survive that earlier empty
+snapshot; a later fresh empty snapshot can retire it. Unrelated bookkeeping during every admission
+read must not block retirement of older empty hints: 100 such admissions retain only newly recorded
+work until its own fresh empty reading. A newly discovered marked group without a direct-PID hint must persist its numeric
+suspicion before signalling, abstain from a later unmarked survivor across a journal reopen,
+never signal from the hint alone, and retire once the group disappears.
 A confirmed parent reap must retain the original-group suspicion across journal reopenings:
 100 successive sweeps with an unmarked group survivor keep exactly one life and one suspicion,
 never signal that survivor, and retire the life and suspicion once the group disappears.
