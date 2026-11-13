@@ -1,3 +1,4 @@
+import { testIsolation } from '../../scripts/test-isolation/config.mjs';
 import { defineConfig } from 'vitest/config';
 
 /**
@@ -26,6 +27,7 @@ import { defineConfig } from 'vitest/config';
  */
 export default defineConfig({
   test: {
+    ...testIsolation,
     include: [
       'src/concurrent-spawn.test.ts',
       'src/input-limits.integration.test.ts',
@@ -33,6 +35,7 @@ export default defineConfig({
       'src/commands/daemon-detach.integration.test.ts',
       'src/commands/daemon-crash-recovery.integration.test.ts',
       'src/commands/daemon-restart-sweep.integration.test.ts',
+      'src/commands/daemon-ingress-kill-fault.integration.test.ts',
       'src/commands/verify.integration.test.ts',
       'src/commands/cli.docker.test.ts',
       'src/channel-shutdown.integration.test.ts',

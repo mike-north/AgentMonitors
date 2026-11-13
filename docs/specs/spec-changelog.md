@@ -36,6 +36,136 @@ terminal evidence produces an abstention. Regressions cover argv-only nonces, zo
 PID-scoped queries and a bounded scan count with 100 survivors. Unchanged ownership uncertainty is recorded once, and a pass with no signals does not rescan it.
 Linux cleanup and macOS abstentions are asserted separately without extending readiness or command deadlines.
 
+## 2026-11-12 — Runtime snapshot races remain report-only (004 §2.13; Refs #611)
+
+Clarify that disappearance and replacement during directory or symlink reads are
+runtime observations, including same-type identity changes. They must not fail a
+suite or combine metadata from different entries. Strict installation-path and
+foreign-holder evidence rules remain unchanged.
+
+## 2026-11-12 — Shared runtime endpoint differences are report-only (004 §2.13; Refs #611)
+
+Keep runtime namespace access fatal at the attributable Node adapter. The real
+per-uid and legacy socket namespace is shared with daemons and other worktrees,
+so its endpoint diff cannot attribute writes and no longer fails a run. Report
+net-change paths, direction, and before/after identities as well as transient
+churn. This supersedes the prior net-change failure rule only for that namespace;
+data/config/state/cache guards and the foreign-holder policy remain strict.
+Document adapter bypass limits, including non-preloaded external children.
+
+## 2026-11-12 — Runtime namespace access is checked at the adapter (004 §2.13; Refs #611)
+
+Make real per-uid and legacy socket namespace access fatal at the test adapter,
+with path/stack diagnostics and synchronous run receipts that survive caught
+errors and child exits. Children carry the receipt capability in the preload URL.
+Use a read-only net-only observer for the shared real namespace: additions,
+removals, and replacements fail; directory metadata and observed transient churn
+are reported. Native observation has explicit run lifetime and best-effort names.
+This supersedes the prior unconditional runtime-directory metadata failure while
+preserving strict data/config/state and foreign-held regular-file rules.
+
+## 2026-11-12 — Attribute live installation writes conservatively (004 §2.13; Refs #611)
+
+Replace the unconditional-diff failure rule with a per-file exception for the same
+pre-run foreign process holding an existing regular file at both snapshots.
+Read-only process/open-file inspection must prove identity and outside lineage;
+unknown inspection stays strict. Descriptor identity must match the snapshot,
+including when macOS reports a replaced predecessor under the same name.
+Creation/removal/replacement and unheld changes
+still fail. Diagnostics name PID, command, and files. Document the shared-held-file
+blind spot and isolation's primary role. Acceptance now reports whole inventories
+and the comparison excluding exactly those diagnosed files, without claiming the
+whole installation stayed byte-identical while its daemon was active.
+
+## 2026-11-12 — Test suites own their filesystem roots (004 §2.13; Refs #611)
+
+Require shared default HOME/XDG/temp isolation for all maintained package/script
+suites and standalone install checks, with inherited storage/session overrides
+removed and child environments preserved. Add a coordinator guard for changed real
+installation files, including absent roots and small-file content hashes, plus
+case/file/run/exit cleanup. Fixed socket fallback tests relocate their namespace
+without changing production paths. Fake-installation subprocess regressions and
+uncached full-suite installation hashes establish the validation obligation;
+the attribution refinement above supersedes this entry's original unconditional
+concurrent-writer failure rule.
+
+## 2026-11-12 — Refuse pre-existing deferred writers during ingress (004 §3.4.2) — Refs #568
+
+Writable iterators are wrapped at creation regardless of lifecycle ownership.
+Their supported advance/finalization methods refuse execution inside tick/watch
+lifecycles with SQL and call-site evidence, including iterators created earlier.
+Regressions verify both lifecycle boundaries, durable absence of the refused row,
+continued in-lifecycle creation refusal, admitted read iterators and native writable
+execution outside ownership. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Verify admitted SQLite reads preserve database files (004 §3.4.2) — Refs #568
+
+Prepared statements now apply query admission at execution, including pre-existing
+handles and iterator advancement/finalization. Table-valued PRAGMAs outside the
+query allowlist are refused inside SELECTs. Every admitted read compares complete
+main-file/WAL bytes around synchronous execution; unexpected effects fail with
+SQL and call-site diagnostics. Same-size overwrite regressions exercise every
+entrypoint, and a separate-process WAL reader verifies the fixture ownership and
+reader-lock boundary. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Require explicit direct-SQL query admission (004 §3.4.2) — Refs #568
+
+Direct `exec()` and native `pragma()` calls now require a named query-PRAGMA allowlist,
+no assignment and driver read-only metadata. Other PRAGMAs and direct maintenance
+statements are refused even when SQLite reports `readonly=true`: a single-table
+`optimize` can persist statistics under that flag. Tick/watch regressions exercise
+both optimizer entrypoints, unknown and setting PRAGMAs, maintenance and admitted
+queries. Published runtime behavior is unchanged.
+
+## 2026-11-12 — Classify direct SQLite PRAGMA writes (004 §3.4.2) — Refs #568
+
+Ingress discovery now guards both direct SQL execution and the native PRAGMA entrypoint
+using the driver's statement read-only metadata. Writable PRAGMAs must fail with SQL
+and call-site diagnostics; read-only queries remain allowed. Direct SQL without a single
+preparable statement fails closed rather than admitting an unclassified trailing write.
+Independent tick/watch regressions cover both PRAGMA entrypoints and a write-effect
+checkpoint PRAGMA without an assignment.
+
+## 2026-11-12 — Complete ingress write classification and artifact checks (004 §3.4.2) — Refs #568
+
+Interruption discovery now observes the full asynchronous tick and watch-consumption
+lifecycles. Writes outside the admission inventory must match a named setup, exact
+maintenance or injected-fault diagnostic exclusion; otherwise the suite fails with SQL
+and call-site evidence. Shared snapshots are checked against source values and exact
+workspace/monitor/object/event identities, and recipient cursors against baseline contents,
+provenance and session identity. Extra acquisition writes, corrupted snapshot contents and
+corrupted cursor baselines must fail acceptance. Retry re-arm/skip interruptions remain
+tracked separately as #615.
+
+## 2026-11-12 — Consistent file samples under concurrent writes (003 §3.2; 004 §3.4.2) — Refs #568
+
+File fingerprints and snapshots now share one byte sample. Identity, size and high-resolution
+metadata validation refuses detected concurrent writes without advancing the source checkpoint.
+Reported size remains advisory for virtual files. A stable empty or partial file remains valid;
+no writer-completion guarantee or retry is added.
+The ingress fixture orders non-atomic input completion before each native-watch round and uses
+state-only pulls for held-work flushes, avoiding synthetic truncate/write observations during
+flush. Dedicated deterministic source tests cover read races and unchanged-content deduplication.
+
+## 2026-11-12 — Real-process ingress kill/fault acceptance (004 §3.4.2) — Refs #568
+
+Require real bundled CLI processes, on-disk SQLite, loopback `api-poll` input and filesystem-backed
+watch ingestion under immediate, debounce and rollup pacing. Driver discovery enumerates SQL
+write occurrences during acceptance, held release, retry admission and retry drain; each is
+faulted before execution and killed after execution, with restart assertions for exactly-once
+ordered events, complete persistence and unread recipient projections. Fixed clocks and event
+barriers replace synchronization sleeps, and cleanup confirms owned-process termination.
+
+The file source has no shipped `watch()` yet, so the fixture explicitly adds a test-only native
+filesystem watcher around its real observation implementation. Watch faults use their existing
+`onError` surface; tick faults use `erroredObservations`. Extra audit-write cases preserve the
+existing best-effort contract. Discovery covers executed paths, not all possible plugin branches;
+existing invalid-envelope, capacity/loss and policy-edit regressions remain required. Retry
+re-arm/skip cases are a linked TODO for #584 and do not block this suite.
+The manual socket regression also checks the canonical resolved socket, with an explicit
+overlong data root, so an isolated verification home exercises the existing fallback contract
+instead of failing on an unnormalized test expectation. Published behavior is unchanged.
+
 ## 2026-11-12 — Keep follow-up inspection IDs positional (005 §6, §15) — Refs #584
 
 Every suggested `monitor explain` and `monitor history` command puts flags before `--` and the

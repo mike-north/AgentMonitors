@@ -8,7 +8,8 @@
       "!{projectRoot}/**/*.spec.ts",
       "!{projectRoot}/**/vitest.config.ts",
       "!{projectRoot}/**/__integration__/**"
-    ]
+    ],
+    "testIsolation": ["{workspaceRoot}/scripts/test-isolation/**/*"]
   },
   "targetDefaults": {
     "build": {
@@ -23,11 +24,13 @@
     },
     "test": {
       "dependsOn": ["^build"],
-      "cache": true
+      "cache": true,
+      "inputs": ["default", "^production", "testIsolation"]
     },
     "test:serial": {
       "dependsOn": ["^build"],
-      "cache": true
+      "cache": true,
+      "inputs": ["default", "^production", "testIsolation"]
     },
     "clean": {
       "cache": false

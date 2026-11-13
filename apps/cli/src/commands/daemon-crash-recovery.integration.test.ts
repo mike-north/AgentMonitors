@@ -106,7 +106,7 @@ async function until(
 it('preserves unread work across SIGKILL and serves it to the same resumed session', async () => {
   const workspace = mkdtempSync(path.join(tmpdir(), 'am-crash-recovery-'));
   directories.push(workspace);
-  const socket = path.join('/tmp', `am-crash-${randomUUID()}.sock`);
+  const socket = path.join(tmpdir(), `am-crash-${randomUUID()}.sock`);
   sockets.push(socket);
   const db = path.join(workspace, 'inbox.db');
   const monitors = path.join(workspace, '.claude', 'monitors');

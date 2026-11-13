@@ -1,7 +1,9 @@
+import { testIsolation } from '../../scripts/test-isolation/config.mjs';
 import { defineConfig, configDefaults } from 'vitest/config';
 
 export default defineConfig({
   test: {
+    ...testIsolation,
     // A suite that discovers zero test files MUST fail rather than report a
     // false green (issue #288) — see scripts/vitest-pass-with-no-tests.test.ts.
     passWithNoTests: false,
@@ -34,6 +36,7 @@ export default defineConfig({
       '**/daemon-detach.integration.test.ts',
       '**/daemon-crash-recovery.integration.test.ts',
       '**/daemon-restart-sweep.integration.test.ts',
+      '**/daemon-ingress-kill-fault.integration.test.ts',
       '**/verify.integration.test.ts',
       '**/cli.docker.test.ts',
       // Spawns a real `channel serve` subprocess and waits for it to exit on

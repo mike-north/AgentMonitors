@@ -58,6 +58,7 @@ export default tseslint.config(
       'scripts/**/*.mjs',
       'libs/core/src/runtime/test-fixtures/**/*.mjs',
       'apps/cli/src/commands/fixtures/owned-capture-group.mjs',
+      'apps/cli/src/commands/fixtures/ingress-preload.mjs',
     ],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
@@ -67,6 +68,8 @@ export default tseslint.config(
       globals: {
         console: 'readonly',
         process: 'readonly',
+        Atomics: 'readonly',
+        SharedArrayBuffer: 'readonly',
       },
     },
   },

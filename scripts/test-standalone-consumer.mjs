@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { withIsolatedTestEnvironment } from './test-isolation/boundary.mjs';
 import { spawnSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync } from 'node:fs';
 import os from 'node:os';
@@ -638,5 +639,5 @@ const isMainModule =
   process.argv[1] !== undefined &&
   import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (isMainModule) {
-  await main();
+  await withIsolatedTestEnvironment(main);
 }

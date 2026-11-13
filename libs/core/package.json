@@ -36,7 +36,7 @@
     "@cfworker/json-schema": "^4.1.1",
     "better-sqlite3": "^13.0.3",
     "drizzle-orm": "^0.45.2",
-    "glob": "^11.0.1",
+    "glob": "^14.0.6",
     "gray-matter": "^4.0.3",
     "jq-in-the-browser": "0.7.2",
     "ulid": "^2.3.0",
