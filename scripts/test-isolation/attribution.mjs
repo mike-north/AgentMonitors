@@ -71,7 +71,9 @@ export function inspectOpenFiles() {
     }
     if (!processes.has(process.pid))
       throw new Error('coordinator missing from ps');
-    const output = readTool('lsof', ['-nP', '-FpnDit']);
+    // f frames each descriptor. Only p is guaranteed without explicit field
+    // selection; relying on a dialect to include f rejects valid Linux output.
+    const output = readTool('lsof', ['-nP', '-FpfnDit']);
     /** @type {Map<string, OpenFileIdentity[]>} */
     const files = new Map();
     let pid;

@@ -1,6 +1,92 @@
 /** Attribution must prefer a false alarm whenever identity or ownership is uncertain. */
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { expect, it } from 'vitest';
 import { classifyPathChanges } from './attribution.mjs';
+
+/**
+ * Selected-field lsof streams omit unrequested fields. The reviewed Linux
+ * failure shape has no descriptor boundary unless the caller explicitly asks
+ * for f; macOS must use that same portable framing contract.
+ */
+it.each([
+  ['0x1', 'complete'],
+  ['0x1000017', 'complete'],
+  ['0x1', 'missing descriptor'],
+  ['0x1', 'missing inode'],
+])(
+  'requests descriptor framing and requires complete file identity (%s, %s)',
+  (device, evidence) => {
+    const root = mkdtempSync(join(tmpdir(), 'lsof-fields-'));
+    try {
+      writeFileSync(
+        join(root, 'ps'),
+        `#!${process.execPath}\nconsole.log(process.ppid+' 1 Wed Nov 11 00:00:00 2026 inspection-probe');`,
+        { mode: 0o700 },
+      );
+      // This retained selected-field sample follows the review reproducer.
+      // Filtering by the actual command arguments catches a command/parser
+      // mismatch that a direct parser-only test would miss.
+      let stream = `p123\nf0\ntREG\nD${device}\ni2\nn/held\nf1\ntREG\nD${device}\ni3\nn/other\n`;
+      if (evidence === 'missing descriptor')
+        stream = stream.replace(/^f.*\n/gm, '');
+      if (evidence === 'missing inode') stream = stream.replace(/^i.*\n/gm, '');
+      writeFileSync(
+        join(root, 'lsof'),
+        `#!${process.execPath}
+const fields=process.argv.find(arg=>arg.startsWith('-F'))?.slice(2)??'';
+const lines=${JSON.stringify(stream)}.split('\\n').filter(line=>line&&(line[0]==='p'||fields.includes(line[0])));
+process.stdout.write(lines.join('\\n')+'\\n');`,
+        { mode: 0o700 },
+      );
+      const module = pathToFileURL(
+        join(import.meta.dirname, 'attribution.mjs'),
+      );
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `import {inspectOpenFiles} from ${JSON.stringify(module.href)};
+const read=inspectOpenFiles();console.log(JSON.stringify('reason' in read?read:{files:[...read.files]}));`,
+        ],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, PATH: root },
+          timeout: 5000,
+        },
+      );
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.status, result.stderr).toBe(0);
+      if (evidence !== 'complete') {
+        expect(JSON.parse(result.stdout)).toEqual({
+          reason:
+            evidence === 'missing descriptor'
+              ? 'unreadable lsof record'
+              : 'unreadable lsof file identity',
+        });
+        return;
+      }
+      expect(JSON.parse(result.stdout)).toEqual({
+        files: [
+          [
+            '/held',
+            [{ pid: 123, device: BigInt(device).toString(), inode: '2' }],
+          ],
+          [
+            '/other',
+            [{ pid: 123, device: BigInt(device).toString(), inode: '3' }],
+          ],
+        ],
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 // These identities describe the contract: an old peer owns /held at both reads;
 // the coordinator and its descendants never provide foreign-write evidence.

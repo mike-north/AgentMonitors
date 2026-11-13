@@ -5,6 +5,15 @@
  * Synchronous receipts retain caught errors and transient accesses; the host
  * observer uses separately captured read-only primitives rather than this API.
  * Its shared-directory diff is report-only: unrelated processes use it too.
+ * Coverage is limited to the maintained Node path/filesystem/IPC entrypoints.
+ * Non-preloaded shell/external children (including embedded command strings),
+ * contexts discarding the preload, pre-opened descriptors/handles, captured
+ * pre-install functions, direct native bindings, and unrecognized symlink aliases
+ * bypass these checks. A report-only endpoint diff is not a fatal backstop for
+ * those routes. Parent child-process cwd and explicit path arguments are checked.
+ * Additional APIs without wrapper/regression contracts, such as fs.glob/globSync
+ * and URL/path construction helpers, are not claimed as directly intercepted;
+ * later ordinary IO on recognized paths or file URLs is guarded.
  */
 import fs from 'node:fs';
 import childProcess from 'node:child_process';

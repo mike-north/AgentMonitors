@@ -700,6 +700,9 @@ reported too, with before/after mtimes and best-effort observed names. Neither
 observation is write tracing or PID attribution. Other data/config/state/cache
 roots retain the strict rule and foreign-holder policy above. The runtime observer
 MUST remain read-only and close its watchers on every exit.
+Disappearance or replacement between runtime snapshot reads, including directory
+enumeration and symlink-target reads, MUST be reported as an observation without
+failing the run or combining metadata from different entry identities.
 
 The adapter covers the maintained Node path/filesystem/IPC surfaces, not every
 possible route to the filesystem. Non-preloaded shell/external children (including

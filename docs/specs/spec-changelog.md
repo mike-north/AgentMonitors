@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-12 — Runtime snapshot races remain report-only (004 §2.13; Refs #611)
+
+Clarify that disappearance and replacement during directory or symlink reads are
+runtime observations, including same-type identity changes. They must not fail a
+suite or combine metadata from different entries. Strict installation-path and
+foreign-holder evidence rules remain unchanged.
+
 ## 2026-11-12 — Shared runtime endpoint differences are report-only (004 §2.13; Refs #611)
 
 Keep runtime namespace access fatal at the attributable Node adapter. The real

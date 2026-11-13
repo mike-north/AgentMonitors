@@ -4,12 +4,29 @@
  * Daemons and other worktrees use the same namespace, so endpoint differences
  * cannot identify our writes and never fail the run. Reports retain direction
  * and both endpoint identities. Data/config/state/cache keep their strict guard.
+ * Entries may disappear or be replaced between native reads; those races are
+ * observations too, never authority to fail the suite or combine identities.
  */
 import { inspection } from './native-inspection.mjs';
 import { legacyRuntimeName, runtimeNamespaces } from './runtime-paths.mjs';
 
-/** @param {string} file @param {Record<string, object>} result */
-function captureEntry(file, result) {
+/** @param {unknown} error @returns {boolean} */
+function isSnapshotRace(error) {
+  return Boolean(
+    error &&
+    typeof error === 'object' &&
+    'code' in error &&
+    ['ENOENT', 'ENOTDIR', 'EINVAL'].includes(String(error.code)),
+  );
+}
+
+/**
+ * Dependent directory/symlink reads must belong to the lstat identity. A second
+ * identity read detects replacements that succeed without a native error.
+ * @param {string} file @param {Record<string, object>} result
+ * @param {string[]} observationErrors
+ */
+function captureEntry(file, result, observationErrors) {
   let stat;
   try {
     stat = inspection.fs.lstatSync(file, { bigint: true });
@@ -33,46 +50,69 @@ function captureEntry(file, result) {
         : stat.isSocket()
           ? 'socket'
           : 'other';
+  let target;
+  let names = [];
+  if (stat.isDirectory() || stat.isSymbolicLink()) {
+    try {
+      if (stat.isSymbolicLink()) target = inspection.fs.readlinkSync(file);
+      else names = inspection.fs.readdirSync(file).sort();
+      const current = inspection.fs.lstatSync(file, { bigint: true });
+      if (
+        current.dev !== stat.dev ||
+        current.ino !== stat.ino ||
+        (current.mode & 0o170000n) !== (stat.mode & 0o170000n)
+      ) {
+        observationErrors.push(`${file}: entry replaced during snapshot`);
+        return;
+      }
+    } catch (error) {
+      if (!isSnapshotRace(error)) throw error;
+      observationErrors.push(`${file}: ${String(error)}`);
+      return;
+    }
+  }
   result[file] = {
     type,
     device: String(stat.dev),
     inode: String(stat.ino),
-    target: stat.isSymbolicLink()
-      ? inspection.fs.readlinkSync(file)
-      : undefined,
+    target,
     mode: String(stat.mode),
     size: String(stat.size),
     mtime: String(stat.mtimeNs),
   };
   // Runtime entries are identities, not authority to traverse symlink targets.
   if (stat.isDirectory()) {
-    for (const name of inspection.fs.readdirSync(file).sort()) {
-      captureEntry(inspection.path.join(file, name), result);
+    for (const name of names) {
+      captureEntry(inspection.path.join(file, name), result, observationErrors);
     }
   }
 }
 
-/** @param {import('./runtime-paths.mjs').RuntimeNamespace[]} namespaces @returns {Record<string, object>} @internal */
-export function snapshotRuntimeNamespaces(namespaces) {
+/**
+ * Keep race diagnostics alongside the endpoint inventory, including at startup.
+ * @param {import('./runtime-paths.mjs').RuntimeNamespace[]} namespaces
+ * @param {string[]} [observationErrors] @returns {Record<string, object>} @internal
+ */
+export function snapshotRuntimeNamespaces(namespaces, observationErrors = []) {
   const result = {};
   for (const namespace of namespaces) {
-    captureEntry(namespace.directory, result);
+    captureEntry(namespace.directory, result, observationErrors);
     let names;
     try {
       names = inspection.fs.readdirSync(namespace.base);
     } catch (error) {
-      if (
-        error &&
-        typeof error === 'object' &&
-        'code' in error &&
-        error.code === 'ENOENT'
-      ) {
+      if (isSnapshotRace(error)) {
+        observationErrors.push(`${namespace.base}: ${String(error)}`);
         continue;
       }
       throw error;
     }
     for (const name of names.filter(legacyRuntimeName).sort()) {
-      captureEntry(inspection.path.join(namespace.base, name), result);
+      captureEntry(
+        inspection.path.join(namespace.base, name),
+        result,
+        observationErrors,
+      );
     }
   }
   return result;
@@ -126,9 +166,9 @@ export function runtimeNetChanges(before, after) {
  */
 export function observeRuntimeNamespace() {
   const namespaces = runtimeNamespaces();
-  const before = snapshotRuntimeNamespaces(namespaces);
-  const events = new Set();
   const errors = [];
+  const before = snapshotRuntimeNamespaces(namespaces, errors);
+  const events = new Set();
   const watchers = new Map();
   const attach = (directory, recursive, onEvent) => {
     if (watchers.has(directory)) {
@@ -216,7 +256,7 @@ export function observeRuntimeNamespace() {
     namespaces,
     close,
     finish() {
-      const after = snapshotRuntimeNamespaces(namespaces);
+      const after = snapshotRuntimeNamespaces(namespaces, errors);
       const changes = runtimeNetChanges(before, after);
       const metadata = Object.keys(before)
         .filter(
