@@ -3,6 +3,12 @@
  * in the published executable imports this file or reads its controls. The load
  * hook taps local classes before command dispatch; it preserves the actual CLI,
  * runtime, source observation and SQLite transaction implementations.
+ * Direct SQL in a traced lifecycle must be a plain read-only statement or an
+ * allowlisted read-only PRAGMA. Database-file changes, including statistics and
+ * maintenance, need an interruption point or a named exclusion; driver readonly
+ * metadata alone does not prove the absence of durable effects.
+ * Work invoked through an explicitly external AsyncResource is outside this
+ * lifecycle ownership boundary, as are unexecuted source/plugin branches.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { watch } from 'node:fs';
@@ -153,16 +159,91 @@ Database.prototype.prepare = function (sql) {
 };
 
 /**
- * Direct execution has no per-write interruption boundary. Ask SQLite rather
- * than guessing SQL verbs: PRAGMA, WITH and RETURNING can all perform writes.
- * Unpreparable SQL (including multiple statements) is refused conservatively;
- * allowing a readable prefix would hide a later write in the same exec call.
+ * Query-only PRAGMAs admitted by the direct-SQL boundary. Keep this list explicit:
+ * SQLite can label optimize and other state-changing PRAGMAs as readonly. These
+ * names inspect schema, versions, page counts or connection settings; assignment
+ * syntax is never admitted, including the parenthesized form of setting writes.
+ */
+const readOnlyPragmas = new Set([
+  'table_info',
+  'table_xinfo',
+  'table_list',
+  'index_list',
+  'index_info',
+  'index_xinfo',
+  'foreign_key_list',
+  'foreign_key_check',
+  'integrity_check',
+  'user_version',
+  'schema_version',
+  'data_version',
+  'application_id',
+  'page_count',
+  'freelist_count',
+  'page_size',
+  'foreign_keys',
+  'busy_timeout',
+  'legacy_alter_table',
+  'recursive_triggers',
+]);
+/** Only schema-inspection queries take an object-name argument, never a setting value. */
+const objectQueryPragmas = new Set([
+  'table_info',
+  'table_xinfo',
+  'table_list',
+  'index_list',
+  'index_info',
+  'index_xinfo',
+  'foreign_key_list',
+  'foreign_key_check',
+]);
+
+/**
+ * Recognize only the small admitted PRAGMA grammar, preserving quoted tokens so
+ * comments, schema qualifiers and quoted names cannot disguise maintenance or
+ * assignments. SQLite still validates the complete single statement separately.
+ */
+function permitsDirectSql(sql) {
+  const tokens = (
+    sql.match(
+      /--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/|'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]|[a-z_]\w*|[^\s]/gi,
+    ) ?? []
+  ).filter((token) => !token.startsWith('--') && !token.startsWith('/*'));
+  // SQLite accepts leading empty statements before the one executable statement.
+  while (tokens[0] === ';') tokens.shift();
+  const verb = tokens.shift()?.toLowerCase();
+  if (['analyze', 'vacuum', 'reindex', 'attach', 'detach'].includes(verb))
+    return false;
+  if (verb !== 'pragma') return true;
+  let name = tokens.shift();
+  if (tokens[0] === '.') {
+    tokens.shift();
+    name = tokens.shift();
+  }
+  // SQLite accepts identifier quoting for PRAGMA names, including single quotes.
+  name = name?.replace(/^["'`[]|["'`\]]$/g, '').toLowerCase();
+  if (!readOnlyPragmas.has(name)) return false;
+  if (tokens.at(-1) === ';') tokens.pop();
+  return (
+    tokens.length === 0 ||
+    (objectQueryPragmas.has(name) &&
+      tokens.length === 3 &&
+      tokens[0] === '(' &&
+      tokens[1] !== '=' &&
+      tokens[2] === ')')
+  );
+}
+
+/**
+ * Direct execution has no per-write interruption boundary. Require both the
+ * explicit query policy and driver readonly metadata; refuse unpreparable SQL,
+ * including programs whose readable prefix could conceal a later write.
  */
 function guardDirectSql(db, sql) {
   if (!lifecycle.getStore()) return;
   let readonly = false;
   try {
-    readonly = prepare.call(db, sql).readonly;
+    readonly = permitsDirectSql(sql) && prepare.call(db, sql).readonly;
   } catch {
     // No statement means no proof of read-only execution. Fail closed below.
   }

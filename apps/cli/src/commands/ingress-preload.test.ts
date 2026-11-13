@@ -14,6 +14,7 @@ function probe(
   boundary: 'tick' | 'consumeWatch',
   body: string,
   ingress = "db.prepare('INSERT INTO probe VALUES (?)').run('classified');",
+  setup = '',
 ): string {
   const root = realpathSync(mkdtempSync(path.join(tmpdir(), 'ingress-guard-')));
   const entry = path.join(root, 'probe.cjs');
@@ -21,8 +22,9 @@ function probe(
     entry,
     `
     const Database = require('better-sqlite3');
-    const db = new Database(':memory:');
+    const db = new Database(${JSON.stringify(path.join(root, 'probe.db'))});
     db.exec('CREATE TABLE probe (value TEXT); CREATE TABLE object_event_suppressions (expires_at INTEGER)');
+    ${setup}
     process.send = value => console.log(JSON.stringify(value));
     class SourceRegistry { register() {} }
     class AgentMonitorRuntime {
@@ -162,6 +164,85 @@ for (const boundary of ['tick', 'consumeWatch'] as const) {
     );
     // Machine-readable output keeps Node's forced numeric colors out of receipts.
     expect(output).toContain(JSON.stringify({ version: 0, columns: 1 }));
+    expect(output).not.toContain('Unclassified ingress write');
+  });
+}
+
+// One indexed table qualifies for optimize: SQLite can then persist ANALYZE
+// statistics even though the outer statement advertises readonly=true.
+for (const boundary of ['tick', 'consumeWatch'] as const) {
+  for (const api of ['exec', 'pragma'] as const) {
+    it(`refuses read-only-classified optimize through ${api} in ${boundary}`, () => {
+      const output = probe(
+        boundary,
+        `
+        console.log(JSON.stringify({ readonly: db.prepare('PRAGMA optimize').readonly }));
+        db.${api}('${api === 'exec' ? 'PRAGMA optimize' : 'optimize'}');
+        console.log(JSON.stringify({ stats: db.prepare('SELECT * FROM sqlite_stat1').all() }));
+        `,
+        undefined,
+        "db.exec('CREATE INDEX probe_value ON probe(value); INSERT INTO probe VALUES (1),(2),(3)');",
+      );
+      expect(output).toContain('"readonly":true');
+      expect(output).toContain('Unclassified ingress write: PRAGMA optimize');
+      expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+    });
+  }
+
+  for (const sql of [
+    '; /* empty statement */ PRAGMA analysis_limit',
+    '; REINDEX',
+    'PRAGMA analysis_limit',
+    'PRAGMA auto_vacuum',
+    'PRAGMA journal_mode',
+    'PRAGMA unknown_ingress_query',
+    'PRAGMA foreign_keys(OFF)',
+    '/* boundary */ PRAGMA main."analysis_limit"',
+    'ANALYZE',
+    'VACUUM',
+    'REINDEX',
+    "ATTACH ':memory:' AS extra",
+    'DETACH extra',
+  ]) {
+    it(`refuses direct maintenance or non-allowlisted SQL ${sql} in ${boundary}`, () => {
+      const output = probe(
+        boundary,
+        `
+        console.log(JSON.stringify({ readonly: db.prepare(${JSON.stringify(sql)}).readonly }));
+        db.exec(${JSON.stringify(sql)});
+        `,
+        undefined,
+        sql === 'DETACH extra' ? `db.exec("ATTACH ':memory:' AS extra");` : '',
+      );
+      if (sql === 'PRAGMA analysis_limit' || sql === 'REINDEX') {
+        expect(output).toContain('"readonly":true');
+      }
+      expect(output).toContain(`Unclassified ingress write: ${sql}`);
+      expect(output).toContain(`AgentMonitorRuntime.${boundary}`);
+    });
+  }
+
+  it(`preserves allowlisted queries and plain reads in ${boundary}`, () => {
+    const output = probe(
+      boundary,
+      `
+      db.exec('SELECT 1');
+      for (const sql of [
+        'table_info(probe)', 'table_xinfo(probe)', 'index_list(probe)',
+        'index_info(probe_value)', 'index_xinfo(probe_value)', 'foreign_key_list(probe)',
+        'user_version', 'schema_version', 'data_version', 'page_count', 'freelist_count',
+        'page_size', 'foreign_keys', 'busy_timeout',
+        'main."table_info"(probe)',
+      ]) {
+        db.exec('/* query */ PRAGMA ' + sql);
+        db.pragma(sql);
+      }
+      console.log('ALLOWLIST_QUERIES_PASSED');
+      `,
+      undefined,
+      "db.exec('CREATE INDEX probe_value ON probe(value)');",
+    );
+    expect(output).toContain('ALLOWLIST_QUERIES_PASSED');
     expect(output).not.toContain('Unclassified ingress write');
   });
 }

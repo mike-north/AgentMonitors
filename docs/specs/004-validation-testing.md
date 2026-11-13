@@ -881,10 +881,16 @@ method, and an `errored` audit INSERT reporting the selected injected fault (who
 is checked separately). Delivery refresh reaches no additional durable writes in these
 fixtures; it has no blanket exclusion. Direct SQL and deferred iterator writes are refused
 with the same diagnostic until they have deliberate interruption support. Both `exec()`
-and the native `pragma()` entrypoint MUST consult SQLite statement `readonly` metadata
-and reject writable PRAGMAs with their exact SQL. Read-only PRAGMA queries remain
-allowed. Direct SQL that cannot be prepared as one statement MUST fail closed, so
-a readable prefix cannot conceal another statement.
+and the native `pragma()` entrypoint MUST require an explicit read-only PRAGMA
+allowlist, no assignment (including parenthesized setting writes), and SQLite
+statement `readonly` metadata. Only schema-inspection PRAGMAs accept object-name
+arguments. Unknown PRAGMAs and state-changing operations such as `optimize`,
+`analysis_limit`, `wal_checkpoint`, `incremental_vacuum`, `auto_vacuum` and even a
+`journal_mode` query MUST fail with their exact SQL, regardless of `readonly`.
+Direct `ANALYZE`, `VACUUM`, `REINDEX`, `ATTACH` and `DETACH` are likewise refused.
+Other direct SQL requires one preparable read-only statement; a readable prefix
+cannot conceal another statement. Database-file changes, including statistics and
+maintenance, require deliberate interruption support or a named exclusion.
 `ingress-preload.test.ts` independently exercises asynchronous tick/watch discovery and
 classification failures. The acquisition-path extra-write, corrupted shared-snapshot-content,
 and corrupted recipient-baseline mutations MUST all fail the suite.
