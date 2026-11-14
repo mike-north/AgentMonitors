@@ -1,6 +1,5 @@
 /** Execute finite, self-bounding command observations with optional durable ownership and shutdown cancellation. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { Socket } from 'node:net';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
@@ -25,6 +24,7 @@ import {
   spawnedProcessGroup,
 } from '@agentmonitors/core';
 
+import { vendoredNativeLoader } from './native-binding.js';
 import {
   LAUNCHER_PROGRAM,
   WATCHDOG_PROGRAM,
@@ -328,8 +328,8 @@ function resolveCwd(
 }
 
 /**
- * Execute authored argv literally, using an armed POSIX launcher or a direct
- * Windows spawn (`shell: false`), draining
+ * Execute authored argv literally through an armed native launcher on supported
+ * POSIX hosts, refusing unsupported hosts before admission and draining
  * stdout and stderr as they stream rather than buffering to completion, enforcing
  * `timeout` with a SIGTERM→SIGKILL escalation targeted at the command's **entire
  * process tree**, not just the direct child (003 §11.2/§11.7, issue #303). A nonzero
@@ -346,6 +346,14 @@ async function runCommand(
   owner?: CommandProcessOwner,
   shutdownSignal?: AbortSignal,
 ): Promise<ExecOutcome> {
+  // Unsupported hosts cannot substitute an unbounded plain spawn for native admission.
+  if (!['darwin', 'linux'].includes(process.platform)) {
+    return {
+      kind: 'failure',
+      error: `Native exec support for ${process.platform}-${process.arch} is unsupported`,
+      stderrTail: '',
+    };
+  }
   // Admission is durable before spawn; ordinary in-process execution retains
   // its original inherited-environment path and creates no ownership work.
   const ownershipEnv =
@@ -383,13 +391,8 @@ async function runCommand(
           '-e',
           LAUNCHER_PROGRAM,
         ];
-    // Resolving the external native binding also works in packed ESM/CJS and
-    // the bundled CLI; only the isolated launcher loads it, never observe().
-    // ESM must prefer its own URL over globals exposed by CommonJS eval callers;
-    // the CJS bundle replaces import.meta with an empty object and uses its filename.
-    const native = isWindows
-      ? undefined
-      : createRequire(import.meta.url || __filename).resolve('koffi');
+    // The launcher alone loads native code, using our package-relative payload.
+    const native = vendoredNativeLoader();
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion

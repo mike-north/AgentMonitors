@@ -1,10 +1,19 @@
 #!/usr/bin/env node
+import { Buffer } from 'node:buffer';
 import { withIsolatedTestEnvironment } from './test-isolation/boundary.mjs';
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import assert from 'node:assert/strict';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { Project } from 'fixturify-project';
 import { packPackage } from './lib/pack-helpers.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
@@ -58,6 +67,7 @@ export const SOURCE_PLUGINS = [
 ];
 
 const PACKAGE_DEFS = [
+  { name: '@agentmonitors/cli', dir: 'apps/cli' },
   { name: CORE_PACKAGE_NAME, dir: 'libs/core' },
   ...SOURCE_PLUGINS.map(({ packageName, dir }) => ({
     name: packageName,
@@ -108,10 +118,14 @@ function run(command, args, cwd) {
  * be reached or returns anything other than a vulnerability summary.
  */
 function auditConsumerInstall(projectDir) {
-  const result = spawnSync(NPM_BIN, ['audit', '--omit=dev', '--json'], {
-    cwd: projectDir,
-    encoding: 'utf8',
-  });
+  const result = spawnSync(
+    NPM_BIN,
+    ['audit', '--omit=dev', '--json', '--registry=https://registry.npmjs.org'],
+    {
+      cwd: projectDir,
+      encoding: 'utf8',
+    },
+  );
   let report;
   try {
     report = JSON.parse(result.stdout);
@@ -541,6 +555,121 @@ void runtime;
 void urgency;
 `;
 
+/** Reject metadata and tarball routes, including npm's encoded scoped names. @internal */
+export function isBlockedNativeRequest(url) {
+  const pathname = decodeURIComponent(
+    new URL(url, 'http://registry.local').pathname,
+  );
+  return (
+    pathname === '/koffi' ||
+    pathname.startsWith('/koffi/') ||
+    pathname.startsWith('/@koromix/')
+  );
+}
+
+/**
+ * Async installs leave the local registry proxy responsive. Every metadata route
+ * goes through the barrier; unrelated packages use the public registry normally.
+ */
+function installConsumer(args, projectDir) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(NPM_BIN, ['install', ...args], {
+      cwd: projectDir,
+      stdio: 'inherit',
+    });
+    child.once('error', reject);
+    child.once('close', (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`Consumer install failed: ${code}`)),
+    );
+  });
+}
+
+/** Assert neither hoisted nor nested installations can mask a broken vendored loader. */
+function assertNoInstalledKoffi(projectDir) {
+  function inspect(dir) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (path.basename(dir) === 'node_modules') {
+        assert.notEqual(
+          entry.name,
+          'koffi',
+          'Consumer resolved node_modules/koffi',
+        );
+        assert.notEqual(
+          entry.name,
+          '@koromix',
+          'Consumer resolved node_modules/@koromix',
+        );
+      }
+      inspect(path.join(dir, entry.name));
+    }
+  }
+  inspect(path.join(projectDir, 'node_modules'));
+  assert.equal(existsSync(path.join(projectDir, 'node_modules/koffi')), false);
+  console.log(
+    'Consumer has no node_modules/koffi or @koromix installation (including nested copies).',
+  );
+}
+
+/** Real installed CLI ticks must baseline, observe changed command output, and fire. */
+function smokeInstalledCommandMonitor(projectDir) {
+  const workspace = path.join(projectDir, 'cli-workspace');
+  const monitors = path.join(workspace, '.claude/monitors');
+  const monitor = path.join(monitors, 'command-native');
+  mkdirSync(monitor, { recursive: true });
+  const watched = path.join(workspace, 'value.txt');
+  writeFileSync(watched, 'one');
+  writeFileSync(
+    path.join(monitor, 'MONITOR.md'),
+    `---
+name: Packaged native command
+watch:
+  type: command-poll
+  command: ${JSON.stringify([process.execPath, '-e', 'process.stdout.write(require("node:fs").readFileSync(process.argv[1], "utf8"))', watched])}
+  interval: 0s
+  timeout: 5s
+urgency: normal
+---
+Report command output changes.
+`,
+  );
+  const cli = path.join(
+    projectDir,
+    'node_modules/@agentmonitors/cli/dist/index.cjs',
+  );
+  function tick() {
+    const result = spawnSync(
+      process.execPath,
+      [
+        cli,
+        'daemon',
+        'once',
+        monitors,
+        '--workspace',
+        workspace,
+        '--format',
+        'json',
+      ],
+      { cwd: workspace, encoding: 'utf8' },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const tick = JSON.parse(result.stdout);
+    assert.deepEqual(tick.erroredObservations, [], result.stdout);
+    assert.deepEqual(tick.evaluatedMonitors, ['command-native'], result.stdout);
+    return tick;
+  }
+  const baseline = tick();
+  assert.equal(baseline.emittedEventIds.length, 0);
+  writeFileSync(watched, 'two');
+  const changed = tick();
+  assert.equal(changed.emittedEventIds.length, 1, JSON.stringify(changed));
+  console.log(
+    `Installed agentmonitors command-poll monitor fired on ${process.platform}-${process.arch}: ${JSON.stringify(changed)}`,
+  );
+}
+
 async function createStandaloneProject(projectDir) {
   const project = new Project({
     files: {
@@ -592,9 +721,7 @@ async function main() {
   console.log('Building published packages...');
   run(PNPM_BIN, ['build'], REPO_ROOT);
 
-  const projectDir = mkdtempSync(
-    path.join(os.tmpdir(), 'agentmonitors-standalone-consumer-'),
-  );
+  const projectDir = mkdtempSync(path.join(os.tmpdir(), 'sc-'));
   const packDir = path.join(projectDir, 'packed');
   mkdirSync(packDir, { recursive: true });
 
@@ -606,13 +733,67 @@ async function main() {
 
   await createStandaloneProject(projectDir);
 
-  console.log('Installing packed packages into standalone temp project...');
-  run(
-    NPM_BIN,
-    ['install', '--save-dev', 'typescript@5.9.3', '@types/node@22'],
-    projectDir,
+  // The test registry denies native names even when an npm cache could otherwise
+  // hide an accidental dependency. Its cache is empty inside this owned project.
+  const proxy = createServer(async (request, response) => {
+    try {
+      if (isBlockedNativeRequest(request.url)) {
+        response.writeHead(404, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            error: 'Koffi registry access is forbidden in this consumer',
+          }),
+        );
+        return;
+      }
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = Buffer.concat(chunks);
+      const upstream = await globalThis.fetch(
+        `https://registry.npmjs.org${request.url}`,
+        {
+          method: request.method,
+          headers: {
+            'content-type':
+              request.headers['content-type'] ?? 'application/json',
+          },
+          ...(body.length ? { body } : {}),
+        },
+      );
+      response.writeHead(upstream.status, {
+        'content-type':
+          upstream.headers.get('content-type') ?? 'application/json',
+      });
+      response.end(Buffer.from(await upstream.arrayBuffer()));
+    } catch (error) {
+      response.writeHead(502);
+      response.end(String(error));
+    }
+  });
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  const registry = `http://127.0.0.1:${proxy.address().port}`;
+  writeFileSync(
+    path.join(projectDir, '.npmrc'),
+    `registry=${registry}\n@koromix:registry=${registry}\ncache=${path.join(projectDir, 'npm-cache')}\n`,
   );
-  run(NPM_BIN, ['install', ...tarballs], projectDir);
+  try {
+    for (const route of ['/koffi', '/@koromix%2fkoffi-darwin-arm64']) {
+      assert.equal((await globalThis.fetch(`${registry}${route}`)).status, 404);
+    }
+    console.log(
+      'Installing packed packages with koffi and @koromix/* blocked by the consumer registry...',
+    );
+    await installConsumer(
+      ['--save-dev', 'typescript@5.9.3', '@types/node@22'],
+      projectDir,
+    );
+    await installConsumer(tarballs, projectDir);
+  } finally {
+    await new Promise((resolve, reject) =>
+      proxy.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  assertNoInstalledKoffi(projectDir);
 
   console.log('Auditing the standalone install (production dependencies)...');
   auditConsumerInstall(projectDir);
@@ -622,6 +803,8 @@ async function main() {
 
   console.log('Running standalone runtime smoke...');
   run(NPM_BIN, ['run', 'smoke'], projectDir);
+
+  smokeInstalledCommandMonitor(projectDir);
 
   console.log(
     `Standalone consumer smoke completed successfully in ${projectDir}`,

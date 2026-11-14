@@ -12,7 +12,7 @@ export default defineConfig({
   banner: {
     js: '#!/usr/bin/env node',
   },
-  // Native bindings must retain their package-relative binary lookup when packed.
-  noExternal: [/^(?!better-sqlite3|bindings|file-uri-to-path|koffi)/],
-  external: ['better-sqlite3', 'bindings', 'file-uri-to-path', 'koffi'],
+  // SQLite remains external; native command admission uses our vendored payload.
+  noExternal: [/^(?!better-sqlite3|bindings|file-uri-to-path)/],
+  external: ['better-sqlite3', 'bindings', 'file-uri-to-path'],
 });

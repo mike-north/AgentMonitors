@@ -101,7 +101,8 @@ watchdog: its own continued group membership supplies uninterrupted identity evi
 its self-group signals require no process-table read. The daemon's table-read latency no
 longer extends the POSIX watchdog deadline.
 
-On Windows, Node invokes `taskkill /PID <pid> /T /F` at timeout and repeats the forceful tree
+Windows admission is unsupported and fails closed before spawn. Its retained cleanup
+path invokes `taskkill /PID <pid> /T /F` at timeout and repeats the forceful tree
 kill after the grace as a defensive retry, only while the direct child remains unreaped.
 The independent POSIX watchdog does not provide a Windows daemon-death guarantee.
 
@@ -148,7 +149,7 @@ failed timer registration or an elapsed admission deadline fails closed: authore
 not run, and observation health reports an execution failure.
 
 The launcher uses the packaged native binding to retain the PID without Node's abort-on-exec-error
-path. Linux uses libc `execvpe`, matching glibc's ENOEXEC shell fallback and musl's ENOEXEC failure.
+path. Linux uses libc `execvpe`, matching glibc's ENOEXEC shell fallback; musl admission is unsupported.
 macOS uses `execve` with libuv's ordered search: retry EINTR, continue EACCES/ENOENT/ENOTDIR, stop
 on other errnos, and prefer EACCES at exhaustion, otherwise the last errno. Slash-containing names
 bypass search; empty PATH components use the bare filename. Authored relative paths and symlink/`..`
@@ -178,6 +179,31 @@ a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, reta
 without running authored work. Missing native binding support
 fails closed with a platform-support explanation and the underlying loader error. Other startup
 or native-initialization failures preserve their own detail without a module-loading label.
+
+Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
+`@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
+Each tarball carries the JavaScript wrapper, MIT license, integrity/hash manifest and
+unmodified prebuilt `koffi.node` files for `darwin-arm64`, `darwin-x64`, `linux-x64`
+and `linux-arm64` (glibc only). Refresh with `node scripts/vendor-koffi.mjs` (also
+`pnpm fix:vendor-koffi`). The single version constant controls all five downloads;
+the script verifies each registry `dist.integrity` SHA-512 before extraction and
+records each shipped file's SHA-256 and source. Offline script tests verify these
+bytes and reject tampering.
+
+Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
+filename, identically in the source package and CLI bundle. Only the asynchronous
+launcher loads it. The loader allowlists the platform/architecture, requires glibc
+on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+no explicit-native hook, so the refresh script makes a minimal checked shim: replace
+its detect/load stanza with a factory argument, return its exports and close the
+factory. This retains upstream wrapping/version checks while bypassing its native
+search. The watchdog and intermediate need no native binding; they inherit the
+launcher's group and already use embedded programs. Unsupported platforms or
+architectures (including Windows and musl), missing or corrupt binaries fail closed
+with the platform name and underlying error; no unbounded plain spawn or source
+build is attempted. Koffi's build-from-source fallback does not link on macOS 27.3
+with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
+we never trigger it.
 
 Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
 blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals

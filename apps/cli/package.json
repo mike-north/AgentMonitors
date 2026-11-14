@@ -15,7 +15,8 @@
     "agentmonitors": "./dist/index.cjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "vendor/koffi"
   ],
   "scripts": {
     "build": "tsup",
@@ -37,7 +38,6 @@
     "commander": "^14.0.3",
     "glob": "^14.0.6",
     "is-agentic-tui": "^0.2.0",
-    "koffi": "3.3.7",
     "zod": "^4.6.7"
   },
   "license": "MIT",

@@ -138,7 +138,7 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
   // libc execve returns errno; Node's process.execve aborts on ordinary failures.
   let koffi;
   try { koffi = require(native); }
-  catch (error) { throw new Error('Native exec support for this platform could not be loaded: ' + String(error.message || error)); }
+  catch (error) { throw new Error('Native exec support for ' + process.platform + '-' + process.arch + ' could not be loaded: ' + String(error.message || error)); }
   const libc = koffi.load(null);
   const execve = libc.func('int execve(const char *path, const char **argv, const char **envp)');
   // Linux libuv calls execvp after chdir and environment setup. execvpe uses

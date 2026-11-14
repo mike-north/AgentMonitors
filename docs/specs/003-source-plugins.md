@@ -1589,8 +1589,8 @@ authored command; commands that reap all children can finish normally. The comma
 inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
 rather than being truncated at the native string boundary. Executable paths retain their authored
 spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
-lookup. Linux calls libc `execvpe`: glibc's ENOEXEC fallback to `/bin/sh` and musl's ENOEXEC failure
-match plain spawn on the same libc. macOS retries EINTR, continues PATH search after
+lookup. Linux calls libc `execvpe`: glibc's ENOEXEC fallback to `/bin/sh`
+matches plain spawn on the same libc. macOS retries EINTR, continues PATH search after
 EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaustion, EACCES takes
 precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
 empty PATH components use the bare filename. The authored program starts with the default signal
@@ -1627,13 +1627,38 @@ group through the watchdog, including any remaining background work. Timeout fai
 full kill grace; after observation settlement the caller-side control channel is unreferenced so a
 finished consumer can exit during that grace. The watchdog retains its own referenced timers. Daemon
 EOF alone never releases the bound. This also covers background descendants that close every
-inherited descriptor. Re-sessioned descendants remain restart-sweep work; the Windows path retains
-its existing daemon-resident tree kill.
+inherited descriptor. Re-sessioned descendants remain restart-sweep work. Windows command admission is
+unsupported and refused before spawn; the retained Windows cleanup path is not an admission fallback.
 
 The source factory accepts an optional shutdown signal. Aborting it refuses pending/new
 admissions and forcefully terminates in-flight groups through the identity gate (or their still-live
 watchdog after leader exit), allowing the
 daemon to finish SIGTERM/SIGINT/IPC shutdown without waiting for authored command timeouts.
+
+Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
+`@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
+Each tarball carries the JavaScript wrapper, MIT license, integrity/hash manifest and
+unmodified prebuilt `koffi.node` files for `darwin-arm64`, `darwin-x64`, `linux-x64`
+and `linux-arm64` (glibc only). Refresh with `node scripts/vendor-koffi.mjs` (also
+`pnpm fix:vendor-koffi`). The single version constant controls all five downloads;
+the script verifies each registry `dist.integrity` SHA-512 before extraction and
+records each shipped file's SHA-256 and source. Offline script tests verify these
+bytes and reject tampering.
+
+Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
+filename, identically in the source package and CLI bundle. Only the asynchronous
+launcher loads it. The loader allowlists the platform/architecture, requires glibc
+on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+no explicit-native hook, so the refresh script makes a minimal checked shim: replace
+its detect/load stanza with a factory argument, return its exports and close the
+factory. This retains upstream wrapping/version checks while bypassing its native
+search. The watchdog and intermediate need no native binding; they inherit the
+launcher's group and already use embedded programs. Unsupported platforms or
+architectures (including Windows and musl), missing or corrupt binaries fail closed
+with the platform name and underlying error; no unbounded plain spawn or source
+build is attempted. Koffi's build-from-source fallback does not link on macOS 27.3
+with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
+we never trigger it.
 
 **Excess output is drained, never a reason to kill the command** (issue #302). Both `stdout` and
 `stderr` are consumed as they stream, not buffered to completion: `stdout` retains only its leading
@@ -1657,7 +1682,7 @@ no orphan). Platform-specific mechanism:
 - **POSIX:** each spawn runs as the leader of its own process group/session (`detached: true`); the
   timeout escalation signals the **negative PID** (`process.kill(-pid, 'SIGTERM')`, then
   `'SIGKILL'` after the grace), which targets the whole group at once.
-- **Windows:** there is no process-group-signal equivalent, and no reliable graceful signal for a
+- **Windows (retained cleanup path; command admission is refused):** there is no process-group-signal equivalent, and no reliable graceful signal for a
   non-console-attached spawned process (`taskkill` without `/F` frequently fails silently for this
   kind of child). The documented choice is `taskkill /PID <pid> /T /F` — forceful and tree-wide —
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate

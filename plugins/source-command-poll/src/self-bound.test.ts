@@ -288,7 +288,7 @@ describe.skipIf(process.platform === 'win32')(
       injected.launcher = `const originalLoad = require('node:module')._load;
         require('node:module')._load = function(id, ...args) {
           const loaded = originalLoad.call(this, id, ...args);
-          if (!id.includes('koffi')) return loaded;
+          if (!id.endsWith('/load.cjs')) return loaded;
           return {...loaded, load() {throw new RangeError('Maximum call stack size exceeded');}};
         };`;
       const previousState = {
@@ -316,7 +316,7 @@ describe.skipIf(process.platform === 'win32')(
       injected.launcher = `const originalLoad = require('node:module')._load;
         require('node:module')._load = function(id, ...args) {
           const loaded = originalLoad.call(this, id, ...args);
-          if (!id.includes('koffi')) return loaded;
+          if (!id.endsWith('/load.cjs')) return loaded;
           return {...loaded, load(...loadArgs) {
             const library = loaded.load(...loadArgs);
             const nativeFcntl = library.func('int fcntl(int fd, int cmd, ...)');
@@ -362,7 +362,7 @@ describe.skipIf(process.platform === 'win32')(
       injected.launcher = `const originalLoad = require('node:module')._load;
         require('node:module')._load = function(id, ...args) {
           const loaded = originalLoad.call(this, id, ...args);
-          if (!id.includes('koffi')) return loaded;
+          if (!id.endsWith('/load.cjs')) return loaded;
           return {...loaded, load(...args) {
             const library = loaded.load(...args);
             const fcntl = library.func('int fcntl(int fd, int cmd, ...)');
@@ -414,7 +414,7 @@ describe.skipIf(process.platform === 'win32')(
         injected.launcher = `const originalLoad = require('node:module')._load;
           require('node:module')._load = function(id, ...args) {
             const loaded = originalLoad.call(this, id, ...args);
-            if (!id.includes('koffi')) return loaded;
+            if (!id.endsWith('/load.cjs')) return loaded;
             return {...loaded, load(...loadArgs) {
               const library = loaded.load(...loadArgs);
               return {...library, func(declaration) {
@@ -606,7 +606,7 @@ describe.skipIf(process.platform === 'win32')(
     it('explains native support load failure and retains its underlying detail', async () => {
       injected.launcher = `const originalLoad = require('node:module')._load;
         require('node:module')._load = function(id, ...args) {
-          if (id.includes('koffi')) throw new Error('Cannot find the native Koffi module; did you bundle it correctly?');
+          if (id.endsWith('/load.cjs')) throw new Error('Cannot find the native Koffi module; did you bundle it correctly?');
           return originalLoad.call(this, id, ...args);
         };`;
       const result = await source.observe(
@@ -619,7 +619,7 @@ describe.skipIf(process.platform === 'win32')(
       });
       expect(result.observations[0]?.payload).toMatchObject({
         error: expect.stringContaining(
-          'Native exec support for this platform could not be loaded',
+          `Native exec support for ${process.platform}-${process.arch} could not be loaded`,
         ),
       });
       expect(result.observations[0]?.payload).toMatchObject({
