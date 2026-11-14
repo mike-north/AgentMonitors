@@ -1,5 +1,6 @@
 /** Plain-data refusal, traversal order and canonical bytes at the external boundary. */
-import { createSecretKey, webcrypto } from 'node:crypto';
+import { createSecretKey, generateKeyPairSync, webcrypto } from 'node:crypto';
+import { inspect, types } from 'node:util';
 import { describe, expect, it, vi } from 'vitest';
 import { assertExternalJsonValue, canonicalJsonStringify } from './json.js';
 import type { ExternalJsonValue } from './json.js';
@@ -658,7 +659,7 @@ const jsonEntryPoints = [
 const cryptoKeyType = Object.getOwnPropertySymbols(
   createSecretKey(new Uint8Array(16)),
 ).find((symbol) => symbol.description === 'kKeyType');
-if (!cryptoKeyType) throw new Error('Missing crypto fixture symbol.');
+// Newer Node keys use private slots; symbol-specific cases do not apply there.
 
 describe.each(jsonEntryPoints)('external JSON hook-free %s', (_entry, run) => {
   it.each([false, true])(
@@ -687,19 +688,26 @@ describe.each(jsonEntryPoints)('external JSON hook-free %s', (_entry, run) => {
   describe.each([null, Object.prototype])(
     'record prototype %s',
     (prototype) => {
-      it('refuses an own real crypto-symbol accessor without reading it', () => {
-        const hook = vi.fn(() => {
-          throw new Error('caller code ran');
-        });
-        const value: object = Object.create(prototype);
-        Object.defineProperty(value, cryptoKeyType, { get: hook });
-        expect(() => run(value)).toThrow(TypeError);
-        expect(hook).not.toHaveBeenCalled();
-      });
+      it.skipIf(!cryptoKeyType)(
+        'refuses an own real crypto-symbol accessor without reading it (symbol-backed runtimes only)',
+        () => {
+          if (!cryptoKeyType)
+            throw new Error('Symbol-backed fixture required.');
+          const hook = vi.fn(() => {
+            throw new Error('caller code ran');
+          });
+          const value: object = Object.create(prototype);
+          Object.defineProperty(value, cryptoKeyType, { get: hook });
+          expect(() => run(value)).toThrow(TypeError);
+          expect(hook).not.toHaveBeenCalled();
+        },
+      );
 
-      it.each(['KeyObject', 'CryptoKey'])(
+      it.skipIf(!cryptoKeyType).each(['KeyObject', 'CryptoKey'])(
         'refuses %s without reading its own crypto-symbol accessor',
         async (brand) => {
+          if (!cryptoKeyType)
+            throw new Error('Symbol-backed fixture required.');
           const value =
             brand === 'KeyObject'
               ? createSecretKey(new Uint8Array(16))
@@ -890,6 +898,273 @@ describe.each(jsonEntryPoints)(
         size: 2,
       };
       expect(() => run(value)).not.toThrow();
+    });
+  },
+);
+
+/** Genuine keys exercise native/private state independently of visible symbols. */
+const realKeyFixtures: readonly (readonly [string, () => Promise<object>])[] = [
+  ['secret KeyObject', async () => createSecretKey(new Uint8Array(16))],
+  ...(['rsa', 'ec', 'ed25519'] as const).flatMap((algorithm) =>
+    (['publicKey', 'privateKey'] as const).map(
+      (part) =>
+        [
+          `${algorithm} ${part} KeyObject`,
+          async () => {
+            const pair =
+              algorithm === 'rsa'
+                ? generateKeyPairSync('rsa', { modulusLength: 1024 })
+                : algorithm === 'ec'
+                  ? generateKeyPairSync('ec', { namedCurve: 'P-256' })
+                  : generateKeyPairSync('ed25519');
+            return pair[part];
+          },
+        ] as const,
+    ),
+  ),
+  [
+    'HMAC CryptoKey',
+    async () =>
+      webcrypto.subtle.importKey(
+        'raw',
+        new Uint8Array(16),
+        { name: 'HMAC', hash: 'SHA-256' },
+        true,
+        ['sign'],
+      ),
+  ],
+  ...(
+    [
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      { name: 'Ed25519' },
+      {
+        name: 'RSA-PSS',
+        hash: 'SHA-256',
+        modulusLength: 1024,
+        publicExponent: new Uint8Array([1, 0, 1]),
+      },
+    ] as const
+  ).flatMap((algorithm) =>
+    (['publicKey', 'privateKey'] as const).map(
+      (part) =>
+        [
+          `${algorithm.name} ${part} CryptoKey`,
+          async () => {
+            // Sign/verify generation always produces a pair for these algorithms.
+            const pair = await webcrypto.subtle.generateKey(algorithm, true, [
+              'sign',
+              'verify',
+            ]);
+            if (!('publicKey' in pair)) throw new Error('Key pair required.');
+            return pair[part];
+          },
+        ] as const,
+    ),
+  ),
+];
+
+describe.each(jsonEntryPoints)(
+  'external JSON genuine keys through %s',
+  (_entry, run) => {
+    describe.each([null, Object.prototype])(
+      'replacement prototype %s',
+      (prototype) => {
+        it.each(realKeyFixtures)(
+          'refuses %s on every runtime',
+          async (_name, create) => {
+            const key = await create();
+            const original = Object.getPrototypeOf(key) as unknown;
+            Object.setPrototypeOf(key, prototype);
+            try {
+              expect(() => run(key)).toThrow(TypeError);
+            } finally {
+              Object.setPrototypeOf(key, original);
+            }
+            if (types.isKeyObject(key)) {
+              const bytes =
+                key.type === 'secret'
+                  ? key.export()
+                  : key.export({
+                      format: 'der',
+                      type: key.type === 'private' ? 'pkcs8' : 'spki',
+                    });
+              expect(bytes.byteLength).toBeGreaterThan(0);
+            } else if (types.isCryptoKey(key)) {
+              const bytes = await webcrypto.subtle.exportKey(
+                key.type === 'secret'
+                  ? 'raw'
+                  : key.type === 'private'
+                    ? 'pkcs8'
+                    : 'spki',
+                key,
+              );
+              expect(bytes.byteLength).toBeGreaterThan(0);
+            } else {
+              throw new Error('Genuine crypto fixture required.');
+            }
+          },
+        );
+      },
+    );
+  },
+);
+
+/** Inspectors must not descend into caller-controlled values stored by FormData. */
+function formDataWithHostileFile(hook: () => never): FormData {
+  const file = new File(['secret'], 'secret.txt');
+  for (const key of [inspect.custom, 'name', 'size', Symbol.toStringTag]) {
+    Object.defineProperty(file, key, { get: hook });
+  }
+  const data = new FormData();
+  data.append('file', file);
+  data.append('file', file);
+  return data;
+}
+
+/** Each witness observes data and an already-started cursor after refusal. */
+const additionalIntrinsicFixtures: readonly (readonly [
+  string,
+  () => { value: object; witness: () => void },
+])[] = [
+  [
+    'Headers',
+    () => {
+      const value = new Headers([
+        ['a', 'one'],
+        ['b', 'two'],
+        ['c', 'three'],
+      ]);
+      const original = Object.getPrototypeOf(value) as unknown;
+      const cursor = value.entries();
+      expect(cursor.next().value).toEqual(['a', 'one']);
+      return {
+        value,
+        witness: () => {
+          Object.setPrototypeOf(value, original);
+          expect(value.get('b')).toBe('two');
+          expect(cursor.next().value).toEqual(['b', 'two']);
+          expect(cursor.next().value).toEqual(['c', 'three']);
+        },
+      };
+    },
+  ],
+  [
+    'FormData',
+    () => {
+      const value = new FormData();
+      value.append('a', 'one');
+      value.append('a', 'two');
+      value.append('b', 'three');
+      const original = Object.getPrototypeOf(value) as unknown;
+      const cursor = value.entries();
+      expect(cursor.next().value).toEqual(['a', 'one']);
+      return {
+        value,
+        witness: () => {
+          Object.setPrototypeOf(value, original);
+          expect(value.getAll('a')).toEqual(['one', 'two']);
+          expect(cursor.next().value).toEqual(['a', 'two']);
+          expect(cursor.next().value).toEqual(['b', 'three']);
+        },
+      };
+    },
+  ],
+  [
+    'Intl.Segments',
+    () => {
+      const value = new Intl.Segmenter('en', { granularity: 'word' }).segment(
+        'one two',
+      );
+      const original = Object.getPrototypeOf(value) as unknown;
+      const cursor = value[Symbol.iterator]();
+      const containing = value.containing.bind(value);
+      expect(cursor.next().value?.segment).toBe('one');
+      return {
+        value,
+        witness: () => {
+          Object.setPrototypeOf(value, original);
+          expect(containing(0)?.segment).toBe('one');
+          expect(cursor.next().value?.segment).toBe(' ');
+          expect(cursor.next().value?.segment).toBe('two');
+        },
+      };
+    },
+  ],
+];
+
+describe.each(jsonEntryPoints)(
+  'external JSON additional intrinsic refusal through %s',
+  (_entry, run) => {
+    describe.each([null, Object.prototype])(
+      'replacement prototype %s',
+      (prototype) => {
+        it.each(additionalIntrinsicFixtures)(
+          'refuses %s and preserves state and existing cursor',
+          (_name, create) => {
+            const { value, witness } = create();
+            Object.setPrototypeOf(value, prototype);
+            expect(() => run(value)).toThrow(TypeError);
+            witness();
+          },
+        );
+        it.each(additionalIntrinsicFixtures)(
+          'refuses %s without calling receiver hooks',
+          (_name, create) => {
+            const { value, witness } = create();
+            const hook = vi.fn(() => {
+              throw new Error('caller code ran');
+            });
+            Object.setPrototypeOf(value, prototype);
+            for (const key of [
+              inspect.custom,
+              Symbol.toStringTag,
+              Symbol.iterator,
+              'toJSON',
+              'constructor',
+              'containing',
+              'entries',
+            ]) {
+              Object.defineProperty(value, key, {
+                get: hook,
+                configurable: true,
+              });
+            }
+            expect(() => run(value)).toThrow(TypeError);
+            expect(hook).not.toHaveBeenCalled();
+            witness();
+          },
+        );
+        it('refuses FormData without inspecting stored File hooks', () => {
+          const hook = vi.fn((): never => {
+            throw new Error('stored caller code ran');
+          });
+          const value = formDataWithHostileFile(hook);
+          Object.setPrototypeOf(value, prototype);
+          expect(() => run(value)).toThrow(TypeError);
+          expect(hook).not.toHaveBeenCalled();
+        });
+      },
+    );
+
+    it('refuses a non-record prototype before invoking intrinsic-state probes', () => {
+      for (const make of [
+        () => new WeakRef({}),
+        () => new URL('https://example.test/'),
+        () => new Intl.Collator('en'),
+      ]) {
+        expect(() => run(Object.setPrototypeOf(make(), {}))).toThrow(
+          'Non-plain JSON object.',
+        );
+      }
+    });
+    it('rejects an own descriptor before crypto predicates can read it', () => {
+      const hook = vi.fn(() => {
+        throw new Error('caller code ran');
+      });
+      const value = {};
+      Object.defineProperty(value, Symbol('untrusted'), { get: hook });
+      expect(() => run(value)).toThrow('Non-JSON object key.');
+      expect(hook).not.toHaveBeenCalled();
     });
   },
 );
