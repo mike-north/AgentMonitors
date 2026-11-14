@@ -9,6 +9,8 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
+  realpathSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -650,7 +652,7 @@ Report command output changes.
     projectDir,
     'node_modules/@agentmonitors/cli/dist/index.cjs',
   );
-  function tick() {
+  function tick(requireHealthy = true) {
     const result = spawnSync(
       process.execPath,
       [
@@ -671,7 +673,8 @@ Report command output changes.
     );
     assert.equal(result.status, 0, result.stderr);
     const tick = JSON.parse(result.stdout);
-    assert.deepEqual(tick.erroredObservations, [], result.stdout);
+    if (requireHealthy)
+      assert.deepEqual(tick.erroredObservations, [], result.stdout);
     assert.deepEqual(tick.evaluatedMonitors, ['command-native'], result.stdout);
     return tick;
   }
@@ -701,6 +704,80 @@ Report command output changes.
   console.log(
     `Installed agentmonitors command-poll monitor fired on ${process.platform}-${process.arch}: ${JSON.stringify({ tick: changed, event })}`,
   );
+
+  // Corrupt only this install's selected binding, then run a fresh CLI process.
+  // A direct-spawn fallback would execute the marker and advance the baseline;
+  // successful output alone cannot distinguish it from native admission.
+  const binding = path.join(
+    projectDir,
+    'node_modules/@agentmonitors/cli/vendor/koffi',
+    `${process.platform}-${process.arch}`,
+    'koffi.node',
+  );
+  const original = readFileSync(binding);
+  const marker = path.join(workspace, 'must-not-run');
+  const definition = path.join(monitor, 'MONITOR.md');
+  const healthyDefinition = readFileSync(definition, 'utf8');
+  const refusedCommand = [
+    process.execPath,
+    '-e',
+    'require("node:fs").writeFileSync(process.argv[1], "ran"); process.stdout.write("three")',
+    marker,
+  ];
+  writeFileSync(
+    definition,
+    healthyDefinition.replace(
+      /^ {2}command: .*$/m,
+      `  command: ${JSON.stringify(refusedCommand)}`,
+    ),
+  );
+  try {
+    writeFileSync(binding, 'corrupt native bytes: this cannot load');
+    const refused = tick(false);
+    assert.equal(
+      existsSync(marker),
+      false,
+      'Unusable native binding must refuse authored side effects',
+    );
+    assert.equal(refused.emittedEventIds.length, 1, JSON.stringify(refused));
+    const refusal = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+      import { createDb, RuntimeStore } from '@agentmonitors/core';
+      const store = new RuntimeStore(createDb(${JSON.stringify(dbPath)}));
+      console.log(JSON.stringify({
+        event: store.getEventById(${JSON.stringify(refused.emittedEventIds[0])}),
+        state: store.getMonitorState('command-native', ${JSON.stringify(workspace)}).sourceState
+      }));
+    `,
+      ],
+      { cwd: projectDir, encoding: 'utf8' },
+    );
+    assert.equal(refusal.status, 0, refusal.stderr);
+    const { event: failure, state } = JSON.parse(refusal.stdout);
+    assert.match(failure.summary, /^Command failing: /);
+    assert.ok(
+      JSON.stringify(failure).includes(
+        `Native exec support for ${process.platform}-${process.arch} could not be loaded`,
+      ),
+      JSON.stringify(failure),
+    );
+    assert.equal(
+      state.stdout,
+      'two',
+      'Native refusal must preserve the successful comparison baseline',
+    );
+    assert.equal(state.baselined, true);
+    console.log(
+      `Installed CLI refused corrupt native binding, kept baseline, and exposed platform diagnostic: ${JSON.stringify(failure)}`,
+    );
+  } finally {
+    writeFileSync(binding, original);
+    writeFileSync(definition, healthyDefinition);
+  }
 }
 
 async function createStandaloneProject(projectDir) {
@@ -847,13 +924,15 @@ async function main() {
 // Only run when invoked directly (`node scripts/test-standalone-consumer.mjs`
 // / `pnpm test:standalone-consumer`), never as a side effect of another
 // script (e.g. the coverage-drift unit test) importing SOURCE_PLUGINS.
-// `argv[1]` is resolved to an absolute path first: `pathToFileURL` on a
-// relative path resolves against `process.cwd()` at call time rather than
-// throwing, so an unresolved relative `argv[1]` could silently mismatch
-// `import.meta.url`.
-const isMainModule =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+// Match Node's canonical module path even when invoked through a checkout alias.
+let isMainModule = false;
+try {
+  isMainModule =
+    process.argv[1] !== undefined &&
+    import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+} catch {
+  // Importers may supply a non-file argv entry; importing must remain inert.
+}
 if (isMainModule) {
   await withIsolatedTestEnvironment(main);
 }

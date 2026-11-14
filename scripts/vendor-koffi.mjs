@@ -7,7 +7,7 @@ import { Buffer } from 'node:buffer';
  * and subsequent offline byte verification independent of registry availability.
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL, URL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
@@ -166,8 +166,14 @@ export async function main() {
     );
   }
 }
-if (
-  process.argv[1] &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href
-)
-  await main();
+// Node canonicalizes the main module, including symlinked checkout paths.
+// A missing argv target means this is an import, not a refresh invocation.
+let isMainModule = false;
+try {
+  isMainModule =
+    Boolean(process.argv[1]) &&
+    import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+} catch {
+  // Importers may have an argv entry that is not a filesystem module.
+}
+if (isMainModule) await main();

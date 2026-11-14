@@ -1,6 +1,17 @@
 /** Offline provenance checks detect changed native bytes and corrupt registry downloads. */
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync } from 'node:fs';
+import {
+  copyFileSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { gzipSync } from 'node:zlib';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
@@ -72,4 +83,154 @@ describe('vendored Koffi provenance', () => {
     bytes[0] ^= 1;
     expect(() => verifyFile(bytes, file.sha256, file.path)).toThrow(/sha256/);
   });
+});
+
+/** Construct regular-file tar members so a missing integrity gate can really extract them. */
+function fixtureArchive(): Buffer {
+  const members = {
+    'package/src/koffi/indirect.cjs': Buffer.from(
+      'var [version, pkg, triplets] = detectPlatform2();\nvar native = loadDynamic2(__dirname, pkg, triplets);\nmodule.exports = {};',
+    ),
+    'package/LICENSE.txt': Buffer.from('fixture license'),
+    ...Object.fromEntries(
+      ['darwin_arm64', 'darwin_x64', 'linux_x64', 'linux_arm64'].map(
+        (platform) => [
+          `package/${platform}/koffi.node`,
+          Buffer.from('fixture native'),
+        ],
+      ),
+    ),
+  };
+  const blocks: Buffer[] = [];
+  for (const [name, bytes] of Object.entries(members)) {
+    const header = Buffer.alloc(512);
+    header.write(name);
+    header.write(`${bytes.length.toString(8).padStart(11, '0')}\0`, 124);
+    header[156] = 48;
+    blocks.push(
+      header,
+      bytes,
+      Buffer.alloc((512 - (bytes.length % 512)) % 512),
+    );
+  }
+  return gzipSync(Buffer.concat([...blocks, Buffer.alloc(1024)]));
+}
+
+/** A copied refresh entry point owns only fixture output, even if admission regresses. */
+function refreshFixture(): string {
+  const dir = mkdtempSync(path.join(tmpdir(), 'vk-'));
+  mkdirSync(path.join(dir, 'scripts/lib'), { recursive: true });
+  copyFileSync(
+    path.join(root, 'scripts/vendor-koffi.mjs'),
+    path.join(dir, 'scripts/vendor-koffi.mjs'),
+  );
+  copyFileSync(
+    path.join(root, 'scripts/lib/koffi-loader.cjs'),
+    path.join(dir, 'scripts/lib/koffi-loader.cjs'),
+  );
+  writeFileSync(path.join(dir, 'fixture.tgz'), fixtureArchive());
+  for (const pkg of ['apps/cli', 'plugins/source-command-poll']) {
+    const vendor = path.join(dir, pkg, 'vendor/koffi');
+    mkdirSync(vendor, { recursive: true });
+    writeFileSync(path.join(vendor, 'sentinel'), 'keep existing payload');
+  }
+  return dir;
+}
+
+describe('refresh entry point admission', () => {
+  it('rejects mismatched registry integrity through main before extracting or changing either output', () => {
+    const dir = refreshFixture();
+    // All downloads are valid fixture archives. Without main's integrity gate,
+    // the whole refresh completes and overwrites both output directories.
+    writeFileSync(
+      path.join(dir, 'probe.mjs'),
+      `
+      import assert from 'node:assert/strict';
+      import { readFileSync } from 'node:fs';
+      import { main } from './scripts/vendor-koffi.mjs';
+      const archive = readFileSync(new URL('./fixture.tgz', import.meta.url));
+      let requests = 0;
+      globalThis.fetch = async (url) => {
+        requests++;
+        const name = new URL(url).pathname.slice(1, -'/3.3.7'.length);
+        return { ok: true,
+          json: async () => ({ name, version: '3.3.7', dist: {
+            tarball: 'https://registry.npmjs.org/fixture.tgz',
+            integrity: 'sha512-' + Buffer.alloc(64).toString('base64')
+          }}),
+          arrayBuffer: async () => archive
+        };
+      };
+      await assert.rejects(main(), /Koffi tarball sha512 integrity mismatch/);
+      assert.equal(requests, 2, 'refuse the first archive before further downloads');
+    `,
+    );
+    const result = spawnSync(process.execPath, [path.join(dir, 'probe.mjs')], {
+      encoding: 'utf8',
+    });
+    for (const pkg of ['apps/cli', 'plugins/source-command-poll']) {
+      const vendor = path.join(dir, pkg, 'vendor/koffi');
+      expect(readdirSync(vendor, { recursive: true })).toEqual(['sentinel']);
+      expect(readFileSync(path.join(vendor, 'sentinel'), 'utf8')).toBe(
+        'keep existing payload',
+      );
+    }
+    expect(result.status, result.stderr).toBe(0);
+  });
+
+  it('runs main when invoked through a symlinked checkout path without network', () => {
+    const dir = refreshFixture();
+    const alias = path.join(dir, 'alias');
+    symlinkSync(path.join(dir, 'scripts'), alias, 'junction');
+    // The preload refuses every network attempt. Its diagnostic proves main ran;
+    // the broken direct-entry guard instead returns a silent successful no-op.
+    const preload = path.join(dir, 'offline.cjs');
+    writeFileSync(
+      preload,
+      "globalThis.fetch = async () => { throw new Error('offline refresh reached registry'); };\n",
+    );
+    const result = spawnSync(
+      process.execPath,
+      ['--require', preload, path.join(alias, 'vendor-koffi.mjs')],
+      { encoding: 'utf8' },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('offline refresh reached registry');
+    for (const pkg of ['apps/cli', 'plugins/source-command-poll']) {
+      expect(readdirSync(path.join(dir, pkg, 'vendor/koffi'))).toEqual([
+        'sentinel',
+      ]);
+    }
+  });
+});
+
+it('runs the standalone consumer through a symlinked script directory', () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'sc-link-'));
+  const alias = path.join(dir, 'scripts');
+  symlinkSync(path.join(root, 'scripts'), alias, 'junction');
+  const preload = path.join(dir, 'offline.cjs');
+  // Stop at the first build before any install or registry traffic. Other
+  // subprocesses remain available to the test-isolation boundary's inspection.
+  writeFileSync(
+    preload,
+    `
+    const cp = require('node:child_process');
+    const original = cp.spawnSync;
+    cp.spawnSync = (command, args, options) => {
+      if (args?.length === 1 && args[0] === 'build') {
+        throw new Error('offline consumer reached build');
+      }
+      return original(command, args, options);
+    };
+    require('node:module').syncBuiltinESMExports();
+  `,
+  );
+  const result = spawnSync(
+    process.execPath,
+    ['--require', preload, path.join(alias, 'test-standalone-consumer.mjs')],
+    { encoding: 'utf8' },
+  );
+  expect(result.status).toBe(1);
+  expect(result.stdout).toContain('Building published packages...');
+  expect(result.stderr).toContain('offline consumer reached build');
 });
