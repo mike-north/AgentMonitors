@@ -15,7 +15,7 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL, URL } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { Project } from 'fixturify-project';
 import { packPackage } from './lib/pack-helpers.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
@@ -924,12 +924,13 @@ async function main() {
 // Only run when invoked directly (`node scripts/test-standalone-consumer.mjs`
 // / `pnpm test:standalone-consumer`), never as a side effect of another
 // script (e.g. the coverage-drift unit test) importing SOURCE_PLUGINS.
-// Match Node's canonical module path even when invoked through a checkout alias.
+// Compare both canonical paths, including when Node preserves the main-module symlink.
 let isMainModule = false;
 try {
   isMainModule =
     process.argv[1] !== undefined &&
-    import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+    realpathSync(fileURLToPath(import.meta.url)) ===
+      realpathSync(process.argv[1]);
 } catch {
   // Importers may supply a non-file argv entry; importing must remain inert.
 }

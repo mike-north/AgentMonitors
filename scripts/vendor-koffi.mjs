@@ -9,7 +9,7 @@ import { Buffer } from 'node:buffer';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL, URL } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { gunzipSync } from 'node:zlib';
 
 const VERSION = '3.3.7';
@@ -166,13 +166,14 @@ export async function main() {
     );
   }
 }
-// Node canonicalizes the main module, including symlinked checkout paths.
+// Compare filesystem identities even when Node preserves the main-module symlink.
 // A missing argv target means this is an import, not a refresh invocation.
 let isMainModule = false;
 try {
   isMainModule =
     Boolean(process.argv[1]) &&
-    import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+    realpathSync(fileURLToPath(import.meta.url)) ===
+      realpathSync(process.argv[1]);
 } catch {
   // Importers may have an argv entry that is not a filesystem module.
 }

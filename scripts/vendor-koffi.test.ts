@@ -1,4 +1,4 @@
-/** Offline provenance checks detect changed native bytes and corrupt registry downloads. */
+/** Offline checks protect native provenance and direct-entry versus inert-import behavior. */
 import { createHash } from 'node:crypto';
 import {
   copyFileSync,
@@ -11,11 +11,26 @@ import {
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const root = path.resolve(import.meta.dirname, '..');
+/** Entry detection must work regardless of how Node preserves the main module's symlink. */
+const entryModes = [
+  { name: 'default resolution', flags: [], nodeOptions: '' },
+  {
+    name: '--preserve-symlinks-main flag',
+    flags: ['--preserve-symlinks-main'],
+    nodeOptions: '',
+  },
+  {
+    name: 'NODE_OPTIONS preservation',
+    flags: [],
+    nodeOptions: '--preserve-symlinks-main',
+  },
+];
 describe('vendored Koffi provenance', () => {
   it('matches every committed file and its hash in both packages without network', async () => {
     const { verifyFile } = await import('./vendor-koffi.mjs');
@@ -178,42 +193,55 @@ describe('refresh entry point admission', () => {
     expect(result.status, result.stderr).toBe(0);
   });
 
-  it('runs main when invoked through a symlinked checkout path without network', () => {
-    const dir = refreshFixture();
-    const alias = path.join(dir, 'alias');
-    symlinkSync(path.join(dir, 'scripts'), alias, 'junction');
-    // The preload refuses every network attempt. Its diagnostic proves main ran;
-    // the broken direct-entry guard instead returns a silent successful no-op.
-    const preload = path.join(dir, 'offline.cjs');
-    writeFileSync(
-      preload,
-      "globalThis.fetch = async () => { throw new Error('offline refresh reached registry'); };\n",
-    );
-    const result = spawnSync(
-      process.execPath,
-      ['--require', preload, path.join(alias, 'vendor-koffi.mjs')],
-      { encoding: 'utf8' },
-    );
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain('offline refresh reached registry');
-    for (const pkg of ['apps/cli', 'plugins/source-command-poll']) {
-      expect(readdirSync(path.join(dir, pkg, 'vendor/koffi'))).toEqual([
-        'sentinel',
-      ]);
-    }
-  });
+  it.each(entryModes)(
+    'runs refresh main through a checkout alias with spaces: $name',
+    ({ flags, nodeOptions }) => {
+      const dir = refreshFixture();
+      const alias = path.join(dir, 'checkout with spaces');
+      symlinkSync(dir, alias, 'junction');
+      // The preload refuses every network attempt. Its diagnostic proves main ran;
+      // the broken direct-entry guard instead returns a silent successful no-op.
+      const preload = path.join(dir, 'offline.cjs');
+      writeFileSync(
+        preload,
+        "globalThis.fetch = async () => { throw new Error('offline refresh reached registry'); };\n",
+      );
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--require',
+          preload,
+          ...flags,
+          path.join(alias, 'scripts/vendor-koffi.mjs'),
+        ],
+        {
+          encoding: 'utf8',
+          env: { ...process.env, NODE_OPTIONS: nodeOptions },
+        },
+      );
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('offline refresh reached registry');
+      for (const pkg of ['apps/cli', 'plugins/source-command-poll']) {
+        expect(readdirSync(path.join(dir, pkg, 'vendor/koffi'))).toEqual([
+          'sentinel',
+        ]);
+      }
+    },
+  );
 });
 
-it('runs the standalone consumer through a symlinked script directory', () => {
-  const dir = mkdtempSync(path.join(tmpdir(), 'sc-link-'));
-  const alias = path.join(dir, 'scripts');
-  symlinkSync(path.join(root, 'scripts'), alias, 'junction');
-  const preload = path.join(dir, 'offline.cjs');
-  // Stop at the first build before any install or registry traffic. Other
-  // subprocesses remain available to the test-isolation boundary's inspection.
-  writeFileSync(
-    preload,
-    `
+it.each(entryModes)(
+  'runs standalone main through a checkout alias with spaces: $name',
+  ({ flags, nodeOptions }) => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'sc-link-'));
+    const alias = path.join(dir, 'checkout with spaces');
+    symlinkSync(root, alias, 'junction');
+    const preload = path.join(dir, 'offline.cjs');
+    // Stop at the first build before any install or registry traffic. Other
+    // subprocesses remain available to the test-isolation boundary's inspection.
+    writeFileSync(
+      preload,
+      `
     const cp = require('node:child_process');
     const original = cp.spawnSync;
     cp.spawnSync = (command, args, options) => {
@@ -224,13 +252,65 @@ it('runs the standalone consumer through a symlinked script directory', () => {
     };
     require('node:module').syncBuiltinESMExports();
   `,
-  );
-  const result = spawnSync(
-    process.execPath,
-    ['--require', preload, path.join(alias, 'test-standalone-consumer.mjs')],
-    { encoding: 'utf8' },
-  );
-  expect(result.status).toBe(1);
-  expect(result.stdout).toContain('Building published packages...');
-  expect(result.stderr).toContain('offline consumer reached build');
-});
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        '--require',
+        preload,
+        ...flags,
+        path.join(alias, 'scripts/test-standalone-consumer.mjs'),
+      ],
+      { encoding: 'utf8', env: { ...process.env, NODE_OPTIONS: nodeOptions } },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain('Building published packages...');
+    expect(result.stderr).toContain('offline consumer reached build');
+  },
+);
+
+/** Imports must never run command work merely because an importer has a non-module argv. */
+describe.each(['vendor-koffi.mjs', 'test-standalone-consumer.mjs'])(
+  '%s inert imports',
+  (filename) => {
+    it.each(['absent', 'missing target', '-e'])(
+      'does not run main with argv[1] %s',
+      (argvCase) => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'entry-import-'));
+        const argv =
+          argvCase === 'absent'
+            ? undefined
+            : argvCase === 'missing target'
+              ? path.join(dir, 'missing.mjs')
+              : '-e';
+        // Accidental command work must fail offline before it can build packages
+        // or fetch a registry payload.
+        const result = spawnSync(
+          process.execPath,
+          [
+            '--input-type=module',
+            '-e',
+            `
+      import { syncBuiltinESMExports } from 'node:module';
+      import cp from 'node:child_process';
+      globalThis.fetch = async () => { throw new Error('unexpected refresh main'); };
+      const original = cp.spawnSync;
+      cp.spawnSync = (command, args, options) => {
+        if (args?.length === 1 && args[0] === 'build') throw new Error('unexpected consumer main');
+        return original(command, args, options);
+      };
+      syncBuiltinESMExports();
+      process.argv[1] = ${JSON.stringify(argv) ?? 'undefined'};
+      await import(${JSON.stringify(pathToFileURL(path.join(root, 'scripts', filename)).href)});
+      console.log('INERT_IMPORT');
+    `,
+          ],
+          { encoding: 'utf8' },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout.trim()).toBe('INERT_IMPORT');
+        expect(result.stderr).toBe('');
+      },
+    );
+  },
+);
