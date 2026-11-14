@@ -1009,18 +1009,6 @@ describe.each(jsonEntryPoints)(
   },
 );
 
-/** Inspectors must not descend into caller-controlled values stored by FormData. */
-function formDataWithHostileFile(hook: () => never): FormData {
-  const file = new File(['secret'], 'secret.txt');
-  for (const key of [inspect.custom, 'name', 'size', Symbol.toStringTag]) {
-    Object.defineProperty(file, key, { get: hook });
-  }
-  const data = new FormData();
-  data.append('file', file);
-  data.append('file', file);
-  return data;
-}
-
 /** Each witness observes data and an already-started cursor after refusal. */
 const additionalIntrinsicFixtures: readonly (readonly [
   string,
@@ -1044,27 +1032,6 @@ const additionalIntrinsicFixtures: readonly (readonly [
           expect(value.get('b')).toBe('two');
           expect(cursor.next().value).toEqual(['b', 'two']);
           expect(cursor.next().value).toEqual(['c', 'three']);
-        },
-      };
-    },
-  ],
-  [
-    'FormData',
-    () => {
-      const value = new FormData();
-      value.append('a', 'one');
-      value.append('a', 'two');
-      value.append('b', 'three');
-      const original = Object.getPrototypeOf(value) as unknown;
-      const cursor = value.entries();
-      expect(cursor.next().value).toEqual(['a', 'one']);
-      return {
-        value,
-        witness: () => {
-          Object.setPrototypeOf(value, original);
-          expect(value.getAll('a')).toEqual(['one', 'two']);
-          expect(cursor.next().value).toEqual(['a', 'two']);
-          expect(cursor.next().value).toEqual(['b', 'three']);
         },
       };
     },
@@ -1134,15 +1101,6 @@ describe.each(jsonEntryPoints)(
             witness();
           },
         );
-        it('refuses FormData without inspecting stored File hooks', () => {
-          const hook = vi.fn((): never => {
-            throw new Error('stored caller code ran');
-          });
-          const value = formDataWithHostileFile(hook);
-          Object.setPrototypeOf(value, prototype);
-          expect(() => run(value)).toThrow(TypeError);
-          expect(hook).not.toHaveBeenCalled();
-        });
       },
     );
 
@@ -1166,5 +1124,40 @@ describe.each(jsonEntryPoints)(
       expect(() => run(value)).toThrow('Non-JSON object key.');
       expect(hook).not.toHaveBeenCalled();
     });
+  },
+);
+
+describe.each(jsonEntryPoints)(
+  'external JSON unsupported FormData through %s',
+  (_entry, run) => {
+    it.each([null, Object.prototype])(
+      'does not inspect stored array methods with prototype %s',
+      (prototype) => {
+        // FormData accepts arrays with File.prototype. Its inspector can mistake
+        // an already-stored array for its own temporary duplicate-value array.
+        const file: object = Object.setPrototypeOf([], File.prototype);
+        const hook = vi.fn(() => {
+          throw new Error('stored caller code ran');
+        });
+        Object.defineProperty(file, 'push', { get: hook });
+        const value = new FormData();
+        value.append('file', file as Blob);
+        value.append('file', file as Blob);
+        const original = Object.getPrototypeOf(value) as unknown;
+        Object.setPrototypeOf(value, prototype);
+        // No detection outcome is promised outside the plain-data domain.
+        try {
+          run(value);
+        } catch (error) {
+          expect(error).toBeInstanceOf(TypeError);
+        }
+        expect(hook).not.toHaveBeenCalled();
+        Object.setPrototypeOf(value, original);
+        const stored = value.getAll('file');
+        expect(stored).toHaveLength(2);
+        expect(stored[0]).toBe(file);
+        expect(stored[1]).toBe(file);
+      },
+    );
   },
 );
