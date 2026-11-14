@@ -1602,8 +1602,12 @@ configuration pipe and reaches native exec as envp (apart from the ownership-mar
 helper program size does not reduce the environment budget accepted by plain spawn. Linux installs
 the authored PATH at the native boundary because libc `execvpe` searches its caller's PATH. The launcher calls libc
 through the packaged native binding, with a separate close-on-exec status pipe. Before execution,
-it clears close-on-exec on stdin/stdout/stderr using the platform's variadic `fcntl` ABI and reads
-each descriptor's flags back. A failed flag operation or surviving close-on-exec flag refuses
+it clears close-on-exec and nonblocking mode on stdin/stdout/stderr using the platform's
+variadic `fcntl` ABI. It reads both descriptor and status flags back, preserving access mode,
+append mode and all unrelated status flags. Authored native I/O has plain spawn's blocking
+semantics even when Node helper startup changed those flags; stdin remains `/dev/null`
+under the source's ordinary ignored-input configuration. A failed flag operation, failed
+read-back, surviving close-on-exec flag or surviving `O_NONBLOCK` refuses
 execution with `Could not retain command stdio` and preserves the prior baseline. Frames are written
 completely, retrying short writes. Missing frames, trailing partial bytes, unknown frame kinds and
 invalid schemas fail closed and retain the prior baseline; valid frames may span multiple reads. An
@@ -1844,6 +1848,11 @@ issue #86's AC1–AC7):
   side effects and produces failing health. Restricted PATH requires no timeout/mkfifo utility,
   arming yields to the event loop, and PID/argv/mark/exit status remain intact
   (`plugins/source-command-poll/src/self-bound.test.ts`).
+- Native stdout/stderr writers drain 8 MiB without EAGAIN, and a piped-stdin admission fixture
+  blocks until delayed input arrives (`stdio-semantics.test.ts`, Perl required). Real native
+  flag priming verifies restoration on all three descriptors without losing append mode;
+  failed status reads, writes, read-backs and retained nonblocking flags prevent authored
+  side effects and preserve the baseline (`self-bound.test.ts`).
 - Process-global test instrumentation and environment changes restore from teardown hooks even
   if an awaited observation times out; in-test `finally` is not the sole restoration path.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a

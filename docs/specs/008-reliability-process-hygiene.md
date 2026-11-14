@@ -169,7 +169,11 @@ asynchronous configuration pipe, with only the deliberate ownership-mark overrid
 receives it as envp; Linux installs the authored PATH just before `execvpe` for libc lookup.
 Helper argv does not consume the authored environment's plain-spawn admission budget. Private
 descriptors close at exec; only standard input/output/error survive. Admission clears their
-close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. Failed calls or
+close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. It also
+reads status with `F_GETFL`, clears only `O_NONBLOCK` through `F_SETFL`, and verifies blocking
+mode with another `F_GETFL`. Access mode, append mode and unrelated flags remain intact.
+This restores native spawn I/O semantics after Node helper startup; ordinary stdin is still
+`/dev/null`. Failed calls, failed read-backs, a remaining `O_NONBLOCK` or
 a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
 without running authored work. Missing native binding support
 fails closed with a platform-support explanation and the underlying loader error. Other startup
@@ -198,9 +202,12 @@ delay, including the maximum configured timeout plus the grace, without integer 
 **Verified:** `plugins/source-command-poll/src/self-bound.test.ts` covers ordering, injected
 arming failure, near-limit environment admission compared with plain spawn, helper environment
 isolation, child-reaping command compatibility, reparenting/group membership, intermediate-exit
-failures, native standard-stream close-on-exec clearing, flag-operation/read-back failures,
+failures, native standard-stream close-on-exec and nonblocking clearing, preservation of other
+status flags, flag-operation/read-back failures,
 restricted PATH, literal argv, preserved PID/mark, event-loop progress and
-absence of synchronous arming APIs. `exec-semantics.test.ts` compares all native signal
+absence of synchronous arming APIs. `stdio-semantics.test.ts` uses Perl native I/O to verify
+8 MiB stdout/stderr writes and a blocking stdin read with delayed input at the admission seam
+without a C compiler. `exec-semantics.test.ts` compares all native signal
 dispositions/mask bits with plain spawn on macOS/Linux, verifies errno diagnostics and absence
 of owned crash artifacts, and covers authored/inherited Node preload and module options. `watchdog-program.test.ts` covers self-group targeting,
 referenced timers after EOF, completion/shutdown self-group termination, clock correction and

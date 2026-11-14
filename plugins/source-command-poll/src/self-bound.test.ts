@@ -356,11 +356,61 @@ describe.skipIf(process.platform === 'win32')(
       });
     });
 
-    it.each(['set error', 'get error', 'flag retained'])(
+    it('restores blocking stdio while preserving other native status flags', async () => {
+      // A real variadic binding primes every standard descriptor. Inspect at
+      // exec so neither the launcher nor the authored interpreter can hide drift.
+      injected.launcher = `const originalLoad = require('node:module')._load;
+        require('node:module')._load = function(id, ...args) {
+          const loaded = originalLoad.call(this, id, ...args);
+          if (!id.includes('koffi')) return loaded;
+          return {...loaded, load(...args) {
+            const library = loaded.load(...args);
+            const fcntl = library.func('int fcntl(int fd, int cmd, ...)');
+            const nonblock = process.platform === 'darwin' ? 4 : 2048;
+            const append = process.platform === 'darwin' ? 8 : 1024;
+            return {...library, func(declaration) {
+              const native = library.func(declaration);
+              if (declaration.includes(' fcntl(')) return (fd, cmd, ...args) => {
+                if (fd <= 2 && cmd === 2 && fcntl(fd, 4, 'int', fcntl(fd, 3) | nonblock | append) === -1)
+                  throw new Error('fixture: could not prime status flags');
+                return native(fd, cmd, ...args);
+              };
+              if (!declaration.includes(' execve(') && !declaration.includes(' execvpe(')) return native;
+              return (...args) => {
+                for (const fd of [0, 1, 2]) {
+                  const flags = fcntl(fd, 3);
+                  if (flags === -1 || (flags & nonblock) !== 0 || (flags & append) === 0)
+                    throw new Error('fixture: wrong status flags for fd ' + fd);
+                }
+                return native(...args);
+              };
+            }};
+          }};
+        };`;
+      const result = await source.observe(
+        { command: ['/bin/echo', 'blocking'], timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'blocking\n',
+        exitCode: 0,
+      });
+    });
+
+    it.each([
+      'set error',
+      'get error',
+      'flag retained',
+      'status get error',
+      'status set error',
+      'status read-back error',
+      'nonblock retained',
+    ])(
       'retains the baseline and refuses execution after stdio %s',
       async (fault) => {
         // Fault only the admission binding. No authored work may run when the
-        // kernel rejects a flag operation or reports that exec would close stdio.
+        // kernel rejects a flag operation or stdio would close or stay nonblocking.
         injected.launcher = `const originalLoad = require('node:module')._load;
           require('node:module')._load = function(id, ...args) {
             const loaded = originalLoad.call(this, id, ...args);
@@ -370,8 +420,16 @@ describe.skipIf(process.platform === 'win32')(
               return {...library, func(declaration) {
                 const native = library.func(declaration);
                 if (!declaration.includes(' fcntl(')) return native;
+                let statusReads = 0;
                 return (fd, cmd, ...flags) => {
                   if (fd === 1) {
+                    if (cmd === 3) {
+                      statusReads++;
+                      if (${JSON.stringify(fault)} === 'status get error') return -1;
+                      if (${JSON.stringify(fault)} === 'status read-back error' && statusReads === 2) return -1;
+                      if (${JSON.stringify(fault)} === 'nonblock retained' && statusReads === 2) return process.platform === 'darwin' ? 4 : 2048;
+                    }
+                    if (cmd === 4 && ${JSON.stringify(fault)} === 'status set error') return -1;
                     if (cmd === 2 && ${JSON.stringify(fault)} === 'set error') return -1;
                     if (cmd === 1 && ${JSON.stringify(fault)} === 'get error') return -1;
                     if (cmd === 1 && ${JSON.stringify(fault)} === 'flag retained') return 1;
