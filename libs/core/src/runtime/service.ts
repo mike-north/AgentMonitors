@@ -67,6 +67,10 @@ import {
   type PolicyNotifyState,
 } from './notify-policy.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
+import {
+  describeHeldNotifyWork,
+  heldNotifyStage,
+} from './held-notify-diagnosis.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
   isVerifyScratchObjectKey,
@@ -1890,6 +1894,50 @@ export class AgentMonitorRuntime {
     return current;
   }
 
+  /**
+   * Determine only the definition prerequisite for held-work diagnosis, without
+   * changing admission or release. Persistent callers supply discovery health;
+   * live ephemeral declarations replace the file they never had by design.
+   */
+  private heldDefinitionBlocked(
+    monitorId: string,
+    workspacePath: string,
+    persistentValid: boolean,
+    now: Date,
+  ): boolean {
+    if (persistentValid) {
+      return false;
+    }
+    if (!monitorId.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
+      return true;
+    }
+    const declaration = this.store.findEphemeralMonitorById(monitorId);
+    if (
+      declaration?.status !== 'active' ||
+      declaration.workspacePath !== workspacePath
+    ) {
+      return true;
+    }
+    const source = this.registry.get(declaration.sourceName);
+    if (!source) {
+      return true;
+    }
+    try {
+      const monitor = this.ephemeralRecordToMonitor(declaration);
+      return (
+        validateWatchScope(
+          watchConfig(monitor.frontmatter.watch),
+          source.scopeSchema,
+        ).length > 0 ||
+        this.scheduleForMonitor(monitor, now, workspacePath).error !== undefined
+      );
+    } catch {
+      // An unrebuildable declaration cannot authorize release. Diagnosis still
+      // reports its accepted batch instead of throwing away the whole report.
+      return true;
+    }
+  }
+
   async explainMonitor(
     input: MonitorExplainInput,
   ): Promise<MonitorExplainReport> {
@@ -1919,6 +1967,21 @@ export class AgentMonitorRuntime {
       (candidate) => candidate.id === input.monitorId,
     );
 
+    // Definition rejection pauses release; accepted work remains diagnosable.
+    // Read through the same scoped state query used by notify reconciliation.
+    const runtimeState = this.store.getMonitorState(
+      input.monitorId,
+      workspacePath,
+    );
+    const rejectedHoldStage = heldNotifyStage(
+      describeHeldNotifyWork(
+        input.monitorId,
+        runtimeState.notifyState,
+        this.heldDefinitionBlocked(input.monitorId, workspacePath, false, now),
+        now,
+      ),
+    );
+
     if (parseError) {
       stages.push(
         explainStage(
@@ -1928,6 +1991,9 @@ export class AgentMonitorRuntime {
           { filePath: parseError.filePath },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -1949,6 +2015,9 @@ export class AgentMonitorRuntime {
           `Monitor "${input.monitorId}" was not found in ${input.monitorsDir}.`,
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -1971,6 +2040,9 @@ export class AgentMonitorRuntime {
           { filePaths: duplicate.filePaths },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -2008,6 +2080,9 @@ export class AgentMonitorRuntime {
           { filePath: monitor.filePath, sourceName },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       // The preflight stops a rejected config before admission, so it adds no
       // drop, but a drop admitted under the earlier config stays outstanding
       // until a later observation supersedes it (002 §2). Report it beside the
@@ -2054,10 +2129,6 @@ export class AgentMonitorRuntime {
       }),
     );
 
-    const runtimeState = this.store.getMonitorState(
-      input.monitorId,
-      workspacePath,
-    );
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
     if (schedule.error) {
       // Defensive isolation (issue #297): scheduleForMonitor() never throws —
@@ -2085,6 +2156,9 @@ export class AgentMonitorRuntime {
           { error: schedule.error },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -2210,84 +2284,32 @@ export class AgentMonitorRuntime {
       latestObservation?.result === 'rebaselined';
 
     const notifyState = runtimeState.notifyState;
-    const pendingDebounce = notifyState.pendingDebounce;
     const suppressedUntil = notifyState.suppressedUntil
       ? new Date(notifyState.suppressedUntil)
       : null;
-    // Track whether the notify layer has a queued batch (holding or overdue) so
-    // the materialization stage can reflect 'pending' rather than 'failure'
-    // (#149, Copilot review #155).
-    //
-    // IMPORTANT: pendingDebounce can be present even when dueAt <= now. That
-    // happens when the settle window has expired but the daemon tick has not
-    // yet run to flush and clear the batch. In that window the batch is still
-    // queued — it will materialize on the next tick — so materialization is
-    // still pending, not a failure. The notify stage distinguishes "actively
-    // settling" (dueAt > now) from "ready to flush on next tick" (dueAt <= now)
-    // with distinct text, but both are semantically pending.
+    const holds = describeHeldNotifyWork(
+      input.monitorId,
+      notifyState,
+      false,
+      now,
+    );
+    const holdStage = heldNotifyStage(holds);
+    // A quiet latest tick cannot erase accepted work from earlier ticks. Holds
+    // keep downstream stages pending until materialization actually occurs.
     let notifyPending = false;
-    // A debounce-held materialization message that describes the current hold
-    // state for the materialization stage reason (set when notifyPending is true
-    // due to a debounce batch, null when pending is due to throttle).
-    let debounceMaterializationReason: string | null = null;
-    if (pendingDebounce) {
+    const heldMaterializationReason =
+      holds.length > 1
+        ? `No monitor_events rows yet — ${holdStage?.reason ?? ''}`
+        : holds[0]?.strategy === 'debounce'
+          ? holds[0].overdue
+            ? 'No monitor_events rows yet — the debounce settle window has elapsed and the batch will flush on the next daemon tick.'
+            : 'No monitor_events rows yet — the notify layer is holding the batch until the debounce settle window elapses.'
+          : holds[0]?.strategy === 'rollup'
+            ? 'No monitor_events rows yet — the rollup notify layer is accumulating observations until the next window.'
+            : null;
+    if (holdStage) {
       notifyPending = true;
-      const dueAt = new Date(pendingDebounce.dueAt);
-      const isOverdue = dueAt <= now;
-      if (isOverdue) {
-        stages.push(
-          explainStage(
-            'notify',
-            'pending',
-            `debounce settle window has elapsed; ${String(pendingDebounce.observations.length)} observation(s) will be flushed on the next daemon tick.`,
-            {
-              dueAt: pendingDebounce.dueAt,
-              observations: pendingDebounce.observations.length,
-              overdue: true,
-            },
-          ),
-        );
-        debounceMaterializationReason =
-          'No monitor_events rows yet — the debounce settle window has elapsed and the batch will flush on the next daemon tick.';
-      } else {
-        stages.push(
-          explainStage(
-            'notify',
-            'pending',
-            `debounce is holding ${String(pendingDebounce.observations.length)} observation(s) until ${pendingDebounce.dueAt}.`,
-            {
-              dueAt: pendingDebounce.dueAt,
-              observations: pendingDebounce.observations.length,
-              overdue: false,
-            },
-          ),
-        );
-        debounceMaterializationReason =
-          'No monitor_events rows yet — the notify layer is holding the batch until the debounce settle window elapses.';
-      }
-    } else if (
-      notifyState.pendingRollup &&
-      notifyState.pendingRollup.observations.length > 0
-    ) {
-      // Rollup is accumulating: the notify layer is intentionally holding
-      // observations until the next delivery window fires (002 §4.4). This is
-      // expected `pending` — not a bug — consistent with the debounce branch.
-      notifyPending = true;
-      const count = notifyState.pendingRollup.observations.length;
-      const window =
-        monitor.frontmatter.notify?.strategy === 'rollup'
-          ? monitor.frontmatter.notify.window
-          : 'unknown';
-      stages.push(
-        explainStage(
-          'notify',
-          'pending',
-          `rollup is holding ${String(count)} observation(s) until the next window (${window}).`,
-          { window, observations: count },
-        ),
-      );
-      debounceMaterializationReason =
-        'No monitor_events rows yet — the rollup notify layer is accumulating observations until the next window.';
+      stages.push(holdStage);
     } else if (suppressedUntil && suppressedUntil > now) {
       notifyPending = true;
       stages.push(
@@ -2361,7 +2383,7 @@ export class AgentMonitorRuntime {
       // hasn't flushed it yet. Only treat it as failure when the notify layer is
       // clear and there is still nothing materialized (unexpected absence).
       stages.push(
-        observationHealthy
+        observationHealthy && holds.length === 0
           ? explainStage(
               'materialization',
               'healthy',
@@ -2371,7 +2393,7 @@ export class AgentMonitorRuntime {
             ? explainStage(
                 'materialization',
                 'pending',
-                debounceMaterializationReason ??
+                heldMaterializationReason ??
                   'No monitor_events rows yet — the notify layer is holding the batch until the throttle window elapses.',
               )
             : explainStage(
@@ -2528,7 +2550,7 @@ export class AgentMonitorRuntime {
       );
     } else {
       stages.push(
-        observationHealthy
+        observationHealthy && holds.length === 0
           ? explainStage(
               'delivery',
               'healthy',
@@ -2807,8 +2829,33 @@ export class AgentMonitorRuntime {
       }
     }
 
+    // Release discovery includes parse-failed, missing and duplicated ids. Use
+    // that same query, then the same scoped state read as runtime release, so a
+    // rejected definition cannot make its accepted batches disappear here.
+    const heldNotifyWork = [
+      ...new Set(heldMonitorIds(this.store, workspacePath)),
+    ]
+      .sort()
+      .flatMap((monitorId) =>
+        describeHeldNotifyWork(
+          monitorId,
+          this.store.getMonitorState(monitorId, workspacePath).notifyState,
+          this.heldDefinitionBlocked(
+            monitorId,
+            workspacePath,
+            !duplicateMonitorIds.has(monitorId) &&
+              monitors.some(
+                (monitor) => monitor.id === monitorId && monitor.valid,
+              ),
+            now,
+          ),
+          now,
+        ),
+      );
+
     return {
       generatedAt: now,
+      heldNotifyWork,
       monitorsDir,
       workspacePath,
       monitorsDirExists,

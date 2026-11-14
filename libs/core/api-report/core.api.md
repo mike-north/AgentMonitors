@@ -487,6 +487,19 @@ export interface GroupMembershipTracking {
 }
 
 // @public
+export interface HeldNotifyWork {
+    blockedByDefinition: boolean;
+    dueAt?: string;
+    monitorId: string;
+    observations: number;
+    overdue?: boolean;
+    reason: string;
+    strategy: 'debounce' | 'rollup';
+    timezone?: string;
+    window?: string;
+}
+
+// @public
 export interface HookDeliveryDiagnosis {
     // (undocumented)
     holds: HookDeliveryHold[];
@@ -841,6 +854,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
+    heldNotifyWork?: HeldNotifyWork[];
     invalidCount: number;
     leadSessions: AgentSessionRecord[];
     monitors: DoctorMonitorRollup[];

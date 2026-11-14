@@ -621,6 +621,12 @@ export interface DoctorReportInput {
  * top of it.
  */
 export interface MonitorDoctorReport {
+  /**
+   * Accepted notify batches, scoped to this workspace and independent of current
+   * definition validity or existence. Each strategy's batch appears once.
+   * Optional for compatibility with reports returned by older daemons.
+   */
+  heldNotifyWork?: HeldNotifyWork[];
   generatedAt: Date;
   monitorsDir: string;
   /**
@@ -678,6 +684,33 @@ export interface MonitorRuntimeState {
   lastObservationAt?: Date;
   sourceState?: unknown;
   notifyState: NotifyRuntimeState;
+}
+
+/**
+ * Accepted observations waiting for notify pacing, distinct from materialized
+ * events and retry outboxes. Counts and timing come from the persisted batch;
+ * definition repair permits release but does not bypass pacing or retry order.
+ * @public
+ */
+export interface HeldNotifyWork {
+  /** Monitor route within the report's workspace, even without a usable definition. */
+  monitorId: string;
+  /** The persisted batch's pacing strategy; throttle never retains observations. */
+  strategy: 'debounce' | 'rollup';
+  /** Accepted envelopes in this batch, not source observations in the latest tick. */
+  observations: number;
+  /** Whether a missing, ambiguous or rejected definition prevents release. */
+  blockedByDefinition: boolean;
+  /** Shared text/structured explanation of what permits release. */
+  reason: string;
+  /** Debounce settle deadline as stored, including elapsed deadlines awaiting a tick. */
+  dueAt?: string;
+  /** Whether the debounce deadline has elapsed at report generation. */
+  overdue?: boolean;
+  /** Rollup cron from the captured definition; `unknown` for unavailable legacy metadata. */
+  window?: string;
+  /** Captured rollup timezone, default UTC; `unknown` when legacy metadata is unavailable. */
+  timezone?: string;
 }
 
 export interface PendingDebounceState {

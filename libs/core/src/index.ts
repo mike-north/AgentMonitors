@@ -231,6 +231,7 @@ export type {
   VerifyArtifactRecord,
   DoctorMonitorKind,
   DoctorMonitorRollup,
+  HeldNotifyWork,
   DoctorParseError,
   DoctorReportInput,
   ErroredObservation,
