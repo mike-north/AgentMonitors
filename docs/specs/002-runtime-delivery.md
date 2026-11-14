@@ -3383,29 +3383,57 @@ It is independent of `runtime/retry-envelope.ts`: retained retries continue to u
 `serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
 `observedAt` Date. External JSON permits no Date values.
 
-Records with `Object.prototype` or a null prototype are accepted only after
-hook-free checks exclude detectable intrinsic state. Proxies MUST be refused
-before reflection; exact prototype identity MUST be established before intrinsic
-method probes. Native slot predicates refuse Date, RegExp, collections, boxed
-primitives, buffers/views, promises, native errors, Map/Set iterators, generators,
-arguments, module namespaces and native external values. Captured read-only
-intrinsics additionally refuse WeakRef, FinalizationRegistry, URL,
-URLSearchParams, and Intl Collator, DateTimeFormat, NumberFormat, PluralRules,
-RelativeTimeFormat, ListFormat, Locale, DisplayNames, Segmenter and DurationFormat,
-even with either accepted record prototype. Probes MUST NOT read caller properties,
-consult caller prototypes, advance iterators or change the receiver's state.
-Cryptographic keys are refused by the own-symbol gate; Node's property-reading
-`isKeyObject` and `isCryptoKey` wrappers MUST NOT be used.
+The input domain is primitives, ordinary records with `Object.prototype` or a
+null prototype, and dense ordinary arrays. The following tested built-in families
+are refused even after replacing their prototype with either accepted record
+prototype. This is a stated refusal list, not a proof that all hidden state can be
+detected. Probes are captured at module load and assume unmodified runtime
+built-ins, including `Object.prototype`, at that point.
 
-**Detection limit:** callers MUST NOT pass prototype-replaced array iterators,
-string iterators or Headers. Node 24 exposes no native slot predicate for these
-families. Array/string iterator `next` advances their cursor, and Headers methods
-require prototype identity before private-field access, so these operations cannot
-provide a hook-free, state-preserving brand test after prototype replacement.
-They can then be indistinguishable from an empty record and encode as `{}`.
-Other host/private-slot classes without suitable checks remain outside the
-plain-data input domain; the checks do not prove that arbitrary objects have no
-hidden state. This limit does not permit these built-ins as JSON input.
+| Refused family                                                                                                     | Captured check                                                                                                                     |
+| ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| All proxies, including revoked proxies                                                                             | `util.types.isProxy`, before reflection                                                                                            |
+| Date, RegExp, Map, Set, WeakMap, WeakSet                                                                           | Corresponding native `util.types.is*` slot predicates                                                                              |
+| Boxed primitives                                                                                                   | `util.types.isBoxedPrimitive`                                                                                                      |
+| ArrayBuffer/SharedArrayBuffer, typed arrays/DataView (including Buffer)                                            | `util.types.isAnyArrayBuffer` / `isArrayBufferView`                                                                                |
+| Promise, native errors, Map/Set iterators, generator objects, arguments, module namespaces, native external values | Corresponding native `util.types.is*` slot predicates                                                                              |
+| KeyObject and CryptoKey                                                                                            | Captured `util.types.isKeyObject` / `isCryptoKey`, only after full record descriptor/child validation                              |
+| WeakRef                                                                                                            | Captured `WeakRef.prototype.deref`                                                                                                 |
+| FinalizationRegistry                                                                                               | Captured `unregister` with a fresh unregistered token                                                                              |
+| URL / URLSearchParams                                                                                              | Captured `protocol` / `size` getters (no query synchronization)                                                                    |
+| Intl Collator, PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, Segmenter, DurationFormat                | Captured `resolvedOptions`                                                                                                         |
+| Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                   |
+| Intl Locale                                                                                                        | Captured `toString`                                                                                                                |
+| Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                             |
+| Headers / FormData                                                                                                 | Captured `util.inspect.custom` with depth -1 and fresh null-prototype options `{ depth: -1, customInspect: false, colors: false }` |
+
+The Headers/FormData inspectors read private fields into temporary presentation
+records. They do not consult receiver hooks, traverse stored caller-controlled
+File values, change stored entries, or advance existing cursors. Probes MUST NOT
+run caller code or mutate receiver state. WeakRef dereferencing retains its target
+for the current job; it does not alter the receiver.
+
+The deterministic first-violation order is: depth-bound configuration and scalar
+checks; proxy refusal; exact prototype identity; native/read-only intrinsic brands;
+ancestor-cycle refusal; then own keys, descriptors and children in own-key order
+(array length/indices for arrays). Record crypto predicates run after all of that
+record's descriptors and children pass, before canonical sorting. On older Node 24
+these wrappers read `kKeyType` / `kKeyObject` symbols; the preceding gates exclude
+own symbols and accessors, leaving only the trusted ordinary/null prototype.
+Newer Node 24 uses private/native brands. This ordering is required on both
+versions and preserves first-invalid-member refusal before later sibling
+descriptors or children are inspected.
+
+Any other object whose state is not held in its own enumerable data properties is
+outside the input domain. Callers MUST NOT pass it; the module makes no claim to
+detect it. **Non-exhaustive tested examples** that remain unrefused after prototype
+replacement include array/string/RegExp-string iterators, iterator helpers and
+wrappers, Intl SegmentIterator, Request, Response and AbortController. These are
+examples of unsupported inputs, not claims that no suitable detector could exist.
+The tested Request/Response methods require Web IDL prototype identity and their
+inspectors read receiver properties; the AbortController signal getter lazily
+creates state and its inspector reads a receiver property. These candidates do
+not meet this module's hook-free, non-mutating probe contract.
 
 Arrays MUST be dense ordinary arrays with exactly `Array.prototype`, enumerable
 data elements, and no own properties other than their indices and built-in data

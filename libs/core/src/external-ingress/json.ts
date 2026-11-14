@@ -9,16 +9,24 @@
  * accessor. All proxies (including revoked ones) are rejected before reflection,
  * so neither proxy traps, accessors nor custom toJSON hooks can run. Native slot
  * tests and captured read-only intrinsic methods refuse detectable hidden state
- * after prototype replacement. Cryptographic keys are refused by their own symbols,
- * without Node's property-reading isKeyObject/isCryptoKey wrappers.
+ * after prototype replacement, including keys, Headers, FormData and Intl Segments.
  *
- * Detection is not exhaustive: callers MUST NOT supply prototype-replaced array
- * iterators, string iterators or Headers. Node exposes no native slot predicates
- * for these families; iterator next advances state, while Headers methods require
- * prototype identity before reaching private fields. With a record prototype they
- * can be indistinguishable from an empty record under these hook-free, read-only
- * checks. Other host/private-slot classes without such checks are also outside the
- * plain-data input domain; prototype identity is not proof of a data-only value.
+ * The input domain is primitives, ordinary/null-prototype records and dense
+ * ordinary arrays. The tested refusal list and each check are specified in
+ * docs/specs/002-runtime-delivery.md §16. Other objects whose state is not their
+ * own enumerable data are outside this domain; callers MUST NOT pass them and
+ * detection is not promised. Non-exhaustive tested examples include array,
+ * string and RegExp-string iterators, iterator helpers/wrappers, SegmentIterator,
+ * Request, Response and AbortController. Probes are captured at module load and
+ * assume unmodified runtime built-ins, including Object.prototype, at that point.
+ *
+ * First-violation order: bounds/scalar checks, proxy refusal, exact prototype,
+ * native/read-only intrinsic brands, ancestor cycles, then own keys/descriptors
+ * and child values in own-key order (array length/indices for arrays). Record
+ * crypto predicates run only after all own descriptors and children pass, then
+ * canonical key sorting. On older Node they read symbols, so the earlier gates
+ * are required to exclude caller hooks. Child traversal still stops immediately
+ * on its first invalid member, before later sibling descriptors are inspected.
  *
  * Only containers consume depth: the root container is at initialDepth, each child
  * container adds one, and maxDepth is inclusive. Scalars below the last permitted
@@ -42,42 +50,50 @@
  * subtrees are never traversed, though key enumeration costs the container's width
  * and canonical sorting costs O(k log k) for k accepted object keys.
  */
-import { types } from 'node:util';
+import { inspect, types } from 'node:util';
 
 /** Inclusive supported container depth, shared by validation and encoding. */
 const MAX_SUPPORTED_DEPTH = 512;
 
 /**
- * Node 24 audit: lib/internal/util/types.js forwards isDate, isRegExp, isMap,
- * isSet, isWeakMap, isWeakSet, isBoxedPrimitive, isAnyArrayBuffer, isPromise,
- * isNativeError, isMapIterator, isSetIterator, isGeneratorObject,
- * isArgumentsObject, isModuleNamespaceObject, isExternal and isProxy directly
- * from internalBinding('types') (src/node_types.cc's V8 Value::Is* tests).
- * isArrayBufferView aliases the native ArrayBuffer.isView. None reads receiver
- * properties. isKeyObject/isCryptoKey instead delegate to internal/crypto/keys.js
- * and read symbol properties, so they are deliberately absent. The own-key gate
- * refuses real keys' symbols without invoking accessors.
+ * Captured native slot tests do not read receiver properties. Node's
+ * internal/util/types.js forwards these to internalBinding('types') and
+ * src/node_types.cc's V8 Value::Is* tests; isArrayBufferView uses ArrayBuffer.isView.
  */
+const nativeStatePredicates = [
+  types.isDate,
+  types.isRegExp,
+  types.isMap,
+  types.isSet,
+  types.isWeakMap,
+  types.isWeakSet,
+  types.isBoxedPrimitive,
+  types.isAnyArrayBuffer,
+  types.isArrayBufferView,
+  types.isPromise,
+  types.isNativeError,
+  types.isMapIterator,
+  types.isSetIterator,
+  types.isGeneratorObject,
+  types.isArgumentsObject,
+  types.isModuleNamespaceObject,
+  types.isExternal,
+] as const;
+
+/** Proxies must be excluded before any reflection, including prototype lookup. */
+const isProxy = types.isProxy;
+
+/**
+ * On older Node 24 these wrappers read kKeyType/kKeyObject symbol properties;
+ * newer Node 24 uses private/native brands (internal/crypto/keys.js). They are
+ * safe only after exact record prototypes and every own descriptor are checked:
+ * no own symbols/accessors remain, and Object.prototype was trusted at capture.
+ */
+const { isKeyObject, isCryptoKey } = types;
+
+/** Native hidden-state predicates are independent of visible prototype identity. */
 function hasUnsupportedIntrinsicState(value: object): boolean {
-  return (
-    types.isDate(value) ||
-    types.isRegExp(value) ||
-    types.isMap(value) ||
-    types.isSet(value) ||
-    types.isWeakMap(value) ||
-    types.isWeakSet(value) ||
-    types.isBoxedPrimitive(value) ||
-    types.isAnyArrayBuffer(value) ||
-    types.isArrayBufferView(value) ||
-    types.isPromise(value) ||
-    types.isNativeError(value) ||
-    types.isMapIterator(value) ||
-    types.isSetIterator(value) ||
-    types.isGeneratorObject(value) ||
-    types.isArgumentsObject(value) ||
-    types.isModuleNamespaceObject(value) ||
-    types.isExternal(value)
-  );
+  return nativeStatePredicates.some((predicate) => predicate(value));
 }
 
 /** Validate each captured callable once; invocation always supplies its receiver. */
@@ -124,6 +140,37 @@ function captureIntlProbe(
 }
 
 /**
+ * Undici's Headers/FormData inspectors enter private fields directly. A fresh
+ * null-prototype options record prevents inherited option hooks; depth -1 and
+ * customInspect:false prevent traversal into stored caller-controlled File data.
+ * Only the inspector's temporary presentation records/options can be changed.
+ * Request/Response inspectors read receiver properties and are unsuitable.
+ */
+function captureShallowInspector(
+  prototype: object,
+): (value: object) => unknown {
+  const method: unknown = Object.getOwnPropertyDescriptor(
+    prototype,
+    inspect.custom,
+  )?.value;
+  if (typeof method !== 'function') {
+    throw new TypeError('Missing intrinsic inspector.');
+  }
+  return (value) => {
+    const result: unknown = Reflect.apply(method, value, [
+      -1,
+      {
+        __proto__: null,
+        depth: -1,
+        customInspect: false,
+        colors: false,
+      },
+    ]);
+    return result;
+  };
+}
+
+/**
  * Captured methods test internal slots without property/prototype consultation.
  * Node 24 internal/url.js: protocol reads only #context and size reads only
  * #searchParams; href would synchronize pending query state and is unsuitable.
@@ -164,6 +211,16 @@ const readOnlyIntrinsicProbes = [
   captureIntlProbe('DisplayNames'),
   captureIntlProbe('Segmenter'),
   captureIntlProbe('DurationFormat'),
+  // Segments.containing uses a native brand and scalar index; no cursor advances.
+  captureIntrinsicProbe(
+    Object.getOwnPropertyDescriptor(
+      Object.getPrototypeOf(new Intl.Segmenter('en').segment('')) as object,
+      'containing',
+    )?.value,
+    [0],
+  ),
+  captureShallowInspector(Headers.prototype),
+  captureShallowInspector(FormData.prototype),
 ] as const;
 
 /** A successful intrinsic call proves a hidden brand; wrong receivers throw. */
@@ -218,7 +275,7 @@ function encodeCanonical(
     throw new TypeError('Non-JSON value or excessive nesting.');
   }
   // Descriptor and prototype inspection are safe only after excluding proxies.
-  if (types.isProxy(value)) {
+  if (isProxy(value)) {
     throw new TypeError('Proxy JSON value.');
   }
   const array = Array.isArray(value);
@@ -288,6 +345,11 @@ function encodeCanonical(
         key,
         encodeCanonical(descriptor.value, depth + 1, maxDepth, ancestors),
       ]);
+    }
+    // All own descriptors and children passed before property-reading crypto
+    // wrappers run. This preserves first-invalid-member order on older Node 24.
+    if (isKeyObject(value) || isCryptoKey(value)) {
+      throw new TypeError('Intrinsic object state is not plain JSON data.');
     }
     entries.sort(([left], [right]) =>
       left < right ? -1 : left > right ? 1 : 0,

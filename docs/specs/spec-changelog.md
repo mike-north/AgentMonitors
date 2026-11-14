@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-14 — Portable external JSON brands and explicit input domain (002 §16) — Refs #596
+
+Refuse genuine crypto keys across symbol-backed and private-slot Node 24 runtimes,
+using captured crypto predicates only after full record descriptor/child checks.
+Specify deterministic gate ordering and the trusted-runtime capture assumption.
+Refuse Headers, FormData and Intl Segments with hook-free, state-preserving probes.
+Replace the detection-limit claim with a tested refusal list and non-exhaustive
+examples outside the plain-data domain. Keep crypto-symbol accessor cases only on
+runtimes that expose that representation; always run the genuine-key matrix.
+
 ## 2026-11-14 — Hook-free external JSON brand checks and detection limits (002 §16) — Refs #596
 
 Remove property-reading crypto predicates and refuse real keys by their own symbols.
