@@ -3405,12 +3405,18 @@ built-ins, including `Object.prototype`, at that point.
 | Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                                                                       |
 | Intl Locale                                                                                                        | Captured `toString`                                                                                                                                                                    |
 | Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                                                                                 |
-| Headers                                                                                                            | Captured `util.inspect.custom` with depth -1 and fresh null-prototype options `{ depth: -1, customInspect: false, colors: false }`                                                     |
 
-The Headers inspector reads a private field into a temporary presentation
-record. It does not consult receiver hooks, change stored entries, or advance
-existing cursors. Probes MUST NOT run caller code or mutate receiver state. WeakRef dereferencing retains its target
-for the current job; it does not alter the receiver.
+Probes MUST NOT run caller code or mutate receiver state. A swallowed probe
+exception MUST mean a missing native slot or private field: a genuine supported
+member must not throw from caller hooks and then pass as an ordinary record.
+WeakRef dereferencing retains its target for the current job; it does not alter
+the receiver.
+
+Descriptor fields MUST be read only as own fields, using a captured
+`Object.hasOwn` check. In particular, inherited `value` cannot make an accessor
+look like a data property. Post-load `Object.prototype` data properties or getters
+for `value`, `enumerable`, `get` or `set` MUST NOT change validation or run hooks.
+Record and array accessors report `Accessor or hidden property.`.
 
 The deterministic first-violation order is: depth-bound configuration and scalar
 checks; proxy refusal; exact prototype identity; native/read-only intrinsic brands;
@@ -3434,9 +3440,14 @@ Any other object whose state is not held in its own enumerable data properties i
 outside the input domain. Callers MUST NOT pass it; the module makes no claim to
 detect it. **Non-exhaustive tested examples** that remain unrefused after prototype
 replacement include array/string/RegExp-string iterators, iterator helpers and
-wrappers, Intl SegmentIterator, FormData, Request, Response and AbortController.
+wrappers, Intl SegmentIterator, Headers, FormData, Request, Response and AbortController.
 These are examples of unsupported inputs, not claims that no suitable detector
 could exist.
+Headers' inspector builds an ordinary presentation object by assigning header
+names, which can invoke inherited setters even with null-prototype inspection
+options. Public Headers methods require Web IDL prototype identity, while direct
+private-field helpers are not exported. No captured Headers inspector is invoked;
+Headers therefore remains outside the domain after accepted prototype replacement.
 FormData's inspector can call a stored array's own `push` method and mutate that
 stored value: its API permits arrays with `File.prototype`, and duplicate field
 names take that path even with negative inspection depth. It therefore fails the probe

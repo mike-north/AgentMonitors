@@ -1343,7 +1343,7 @@ describe.each(jsonEntryPoints)(
         it.each([false, true])(
           'never invokes an inherited header setter throwing=%s',
           (throws) => {
-            const name = 'x-review-499';
+            const name = 'x-json-boundary';
             const value = new Headers([[name, 'one']]);
             const originalPrototype = Object.getPrototypeOf(value) as unknown;
             const original = Object.getOwnPropertyDescriptor(

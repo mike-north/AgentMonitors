@@ -9,7 +9,7 @@
  * accessor. All proxies (including revoked ones) are rejected before reflection,
  * so neither proxy traps, accessors nor custom toJSON hooks can run. Native slot
  * tests and captured read-only intrinsic methods refuse detectable hidden state
- * after prototype replacement, including keys, Headers and Intl Segments.
+ * after prototype replacement, including keys and Intl Segments.
  *
  * The input domain is primitives, ordinary/null-prototype records and dense
  * ordinary arrays. The tested refusal list and each check are specified in
@@ -17,8 +17,11 @@
  * own enumerable data are outside this domain; callers MUST NOT pass them and
  * detection is not promised. Non-exhaustive tested examples include array,
  * string and RegExp-string iterators, iterator helpers/wrappers, SegmentIterator,
- * FormData, Request, Response and AbortController. Probes are captured at module
- * load and assume unmodified runtime built-ins, including Object.prototype.
+ * Headers, FormData, Request, Response and AbortController. Probes are captured at
+ * module load and assume unmodified runtime built-ins, including Object.prototype.
+ *
+ * Descriptor fields are read only when owned by the reflected descriptor, so
+ * later Object.prototype changes cannot turn accessors into data or run hooks.
  *
  * First-violation order: bounds/scalar checks, proxy refusal, exact prototype,
  * native/read-only intrinsic brands, ancestor cycles, then own keys/descriptors
@@ -54,10 +57,23 @@
  * and canonical sorting costs O(k log k) for k accepted object keys.
  */
 import { createSecretKey } from 'node:crypto';
-import { inspect, types } from 'node:util';
+import { types } from 'node:util';
 
 /** Inclusive supported container depth, shared by validation and encoding. */
 const MAX_SUPPORTED_DEPTH = 512;
+
+/** Own-field checks remain stable after callers replace Object.hasOwn. */
+const hasOwn = Object.hasOwn;
+
+/** Missing descriptor fields must never consult Object.prototype. */
+function ownDescriptorField(
+  descriptor: PropertyDescriptor | undefined,
+  field: keyof PropertyDescriptor,
+): unknown {
+  return descriptor && hasOwn(descriptor, field)
+    ? descriptor[field]
+    : undefined;
+}
 
 /**
  * Captured native slot tests do not read receiver properties. Node's
@@ -130,54 +146,27 @@ function captureIntlProbe(
   method = 'resolvedOptions',
   args: readonly unknown[] = [],
 ): (value: object) => unknown {
-  const constructor: unknown = Object.getOwnPropertyDescriptor(
-    Intl,
-    family,
-  )?.value;
+  const constructor: unknown = ownDescriptorField(
+    Object.getOwnPropertyDescriptor(Intl, family),
+    'value',
+  );
   if (typeof constructor !== 'function') {
     throw new TypeError('Missing Intl constructor.');
   }
-  const prototype: unknown = Object.getOwnPropertyDescriptor(
-    constructor,
-    'prototype',
-  )?.value;
+  const prototype: unknown = ownDescriptorField(
+    Object.getOwnPropertyDescriptor(constructor, 'prototype'),
+    'value',
+  );
   if (typeof prototype !== 'object' || prototype === null) {
     throw new TypeError('Missing Intl prototype.');
   }
   return captureIntrinsicProbe(
-    Object.getOwnPropertyDescriptor(prototype, method)?.value,
+    ownDescriptorField(
+      Object.getOwnPropertyDescriptor(prototype, method),
+      'value',
+    ),
     args,
   );
-}
-
-/**
- * Undici's Headers inspector enters private fields directly. A fresh
- * null-prototype options record prevents inherited option hooks; depth -1 and
- * customInspect:false keep inspection confined to the temporary header record.
- * Only the inspector's temporary presentation records/options can be changed.
- * FormData inspects stored array methods and can mutate stored values;
- * Request/Response inspectors read receiver properties. Those are unsuitable.
- */
-function captureHeadersProbe(): (value: object) => unknown {
-  const method: unknown = Object.getOwnPropertyDescriptor(
-    Headers.prototype,
-    inspect.custom,
-  )?.value;
-  if (typeof method !== 'function') {
-    throw new TypeError('Missing intrinsic inspector.');
-  }
-  return (value) => {
-    const result: unknown = Reflect.apply(method, value, [
-      -1,
-      {
-        __proto__: null,
-        depth: -1,
-        customInspect: false,
-        colors: false,
-      },
-    ]);
-    return result;
-  };
 }
 
 /**
@@ -194,22 +183,32 @@ function captureHeadersProbe(): (value: object) => unknown {
  */
 const readOnlyIntrinsicProbes = [
   captureIntrinsicProbe(
-    Object.getOwnPropertyDescriptor(WeakRef.prototype, 'deref')?.value,
+    ownDescriptorField(
+      Object.getOwnPropertyDescriptor(WeakRef.prototype, 'deref'),
+      'value',
+    ),
   ),
   captureIntrinsicProbe(
-    Object.getOwnPropertyDescriptor(
-      FinalizationRegistry.prototype,
-      'unregister',
-    )?.value,
+    ownDescriptorField(
+      Object.getOwnPropertyDescriptor(
+        FinalizationRegistry.prototype,
+        'unregister',
+      ),
+      'value',
+    ),
     [{}],
   ),
   captureIntrinsicProbe(
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- Captured getter receives the candidate through Reflect.apply.
-    Object.getOwnPropertyDescriptor(URL.prototype, 'protocol')?.get,
+    ownDescriptorField(
+      Object.getOwnPropertyDescriptor(URL.prototype, 'protocol'),
+      'get',
+    ),
   ),
   captureIntrinsicProbe(
-    // eslint-disable-next-line @typescript-eslint/unbound-method -- Captured getter receives the candidate through Reflect.apply.
-    Object.getOwnPropertyDescriptor(URLSearchParams.prototype, 'size')?.get,
+    ownDescriptorField(
+      Object.getOwnPropertyDescriptor(URLSearchParams.prototype, 'size'),
+      'get',
+    ),
   ),
   captureIntlProbe('Collator'),
   captureIntlProbe('DateTimeFormat', 'formatToParts', [0]),
@@ -223,16 +222,22 @@ const readOnlyIntrinsicProbes = [
   captureIntlProbe('DurationFormat'),
   // Segments.containing uses a native brand and scalar index; no cursor advances.
   captureIntrinsicProbe(
-    Object.getOwnPropertyDescriptor(
-      Object.getPrototypeOf(new Intl.Segmenter('en').segment('')) as object,
-      'containing',
-    )?.value,
+    ownDescriptorField(
+      Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(new Intl.Segmenter('en').segment('')) as object,
+        'containing',
+      ),
+      'value',
+    ),
     [0],
   ),
-  captureHeadersProbe(),
 ] as const;
 
-/** A successful intrinsic call proves a hidden brand; wrong receivers throw. */
+/**
+ * A successful intrinsic call proves a hidden brand; wrong receivers throw.
+ * Only fixed-argument, hook-free probes belong here: an exception from caller
+ * code must never be mistaken for a missing slot and admit a genuine member.
+ */
 function hasReadOnlyIntrinsicState(value: object): boolean {
   for (const probe of readOnlyIntrinsicProbes) {
     try {
@@ -313,11 +318,11 @@ function encodeCanonical(
     if (array) {
       const ownKeys = Reflect.ownKeys(value);
       const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
-      const length: unknown = lengthDescriptor?.value;
+      const length = ownDescriptorField(lengthDescriptor, 'value');
       if (
         !lengthDescriptor ||
-        lengthDescriptor.enumerable ||
-        !('value' in lengthDescriptor) ||
+        ownDescriptorField(lengthDescriptor, 'enumerable') !== false ||
+        !hasOwn(lengthDescriptor, 'value') ||
         typeof length !== 'number' ||
         ownKeys.length !== length + 1
       ) {
@@ -330,11 +335,22 @@ function encodeCanonical(
           value,
           String(index),
         );
-        if (!descriptor?.enumerable || !('value' in descriptor)) {
+        if (!descriptor) {
           throw new TypeError('Sparse array or array accessor.');
         }
+        if (
+          ownDescriptorField(descriptor, 'enumerable') !== true ||
+          !hasOwn(descriptor, 'value')
+        ) {
+          throw new TypeError('Accessor or hidden property.');
+        }
         encoded.push(
-          encodeCanonical(descriptor.value, depth + 1, maxDepth, ancestors),
+          encodeCanonical(
+            ownDescriptorField(descriptor, 'value'),
+            depth + 1,
+            maxDepth,
+            ancestors,
+          ),
         );
       }
       return `[${encoded.join(',')}]`;
@@ -346,13 +362,22 @@ function encodeCanonical(
         throw new TypeError('Non-JSON object key.');
       }
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor?.enumerable || !('value' in descriptor)) {
+      if (
+        !descriptor ||
+        ownDescriptorField(descriptor, 'enumerable') !== true ||
+        !hasOwn(descriptor, 'value')
+      ) {
         throw new TypeError('Accessor or hidden property.');
       }
       // Validate before sorting: an early invalid value must not inspect siblings.
       entries.push([
         key,
-        encodeCanonical(descriptor.value, depth + 1, maxDepth, ancestors),
+        encodeCanonical(
+          ownDescriptorField(descriptor, 'value'),
+          depth + 1,
+          maxDepth,
+          ancestors,
+        ),
       ]);
     }
     // Symbol-backed keys already refused in own-key order. Private brands follow
