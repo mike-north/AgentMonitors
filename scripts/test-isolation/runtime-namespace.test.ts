@@ -1,10 +1,12 @@
-/** Runtime endpoint differences are observations with direction, never write attribution. */
+/** Runtime snapshots discard unstable identities and retain races as report-only diagnostics. */
 import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
 import { inspection } from './native-inspection.mjs';
+import * as runtimePaths from './runtime-paths.mjs';
 import {
+  observeRuntimeNamespace,
   runtimeNetChanges,
   snapshotRuntimeNamespaces,
 } from './runtime-namespace.mjs';
@@ -52,9 +54,58 @@ it.each([
         if (change === 'directory identity replaced')
           fs.renameSync(entry, entry + '.previous');
         else fs.rmSync(entry, { recursive: true, force: true });
-        if (change === 'directory identity replaced') fs.mkdirSync(entry);
-        else if (change.endsWith('replaced'))
+        if (change === 'directory identity replaced') {
+          fs.mkdirSync(entry);
+          fs.writeFileSync(join(entry, 'replacement-child'), 'new identity');
+        } else if (change.endsWith('replaced'))
           fs.writeFileSync(entry, 'replacement');
+      }
+      return read(file);
+    },
+  );
+  try {
+    let snapshot: Record<string, object> = {};
+    expect(() => {
+      snapshot = snapshotRuntimeNamespaces(
+        [{ base, directory, aliases: [base] }],
+        observationErrors,
+      );
+    }).not.toThrow();
+    expect(changed).toBe(true);
+    expect(observationErrors).toEqual([expect.stringContaining(entry)]);
+    // An unstable parent cannot lend its old identity to the replacement's
+    // children, even when the dependent directory read itself succeeds.
+    expect(snapshot).toHaveProperty(directory);
+    expect(Object.keys(snapshot)).not.toContain(entry);
+    expect(Object.keys(snapshot)).not.toContain(
+      join(entry, 'replacement-child'),
+    );
+    if (change === 'directory identity replaced') {
+      expect(fs.existsSync(join(entry, 'replacement-child'))).toBe(true);
+    }
+  } finally {
+    spy.mockRestore();
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+/** The base can change type after its namespace entry is captured. */
+it('reports a base directory replaced by a file before enumeration without failing the snapshot', () => {
+  const root = fs.mkdtempSync(join(tmpdir(), 'runtime-base-'));
+  const base = join(root, 'base');
+  const directory = join(base, 'runtime');
+  fs.mkdirSync(directory, { recursive: true });
+  const observationErrors: string[] = [];
+  let changed = false;
+  const read = inspection.fs.readdirSync;
+  const spy = vi.spyOn(inspection.fs, 'readdirSync').mockImplementation(
+    // Invoke the native enumeration on a real regular file, so the contract
+    // depends on handling Node's ENOTDIR rather than a synthetic exception.
+    (file: string) => {
+      if (file === base && !changed) {
+        changed = true;
+        fs.renameSync(base, join(root, 'previous'));
+        fs.writeFileSync(base, 'replacement');
       }
       return read(file);
     },
@@ -67,12 +118,70 @@ it.each([
       ),
     ).not.toThrow();
     expect(changed).toBe(true);
-    expect(observationErrors).toEqual([expect.stringContaining(entry)]);
+    expect(observationErrors).toEqual([
+      expect.stringContaining(`${base}: Error: ENOTDIR`),
+    ]);
   } finally {
     spy.mockRestore();
-    fs.rmSync(base, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+/** Snapshot races at either lifecycle boundary must survive into the final report. */
+it.each(['startup', 'teardown'] as const)(
+  'retains a %s snapshot race in the final observationErrors',
+  (boundary) => {
+    const base = fs.mkdtempSync(join(tmpdir(), 'runtime-lifecycle-'));
+    const directory = join(base, 'runtime');
+    const entry = join(directory, 'daemon.sock.lock.d');
+    fs.mkdirSync(entry, { recursive: true });
+    const namespaces = vi
+      .spyOn(runtimePaths, 'runtimeNamespaces')
+      .mockReturnValue([{ base, directory, aliases: [base] }]);
+    // Watcher callbacks are a separate diagnostic source. Keep them inert so
+    // only the selected snapshot can supply the report's observation error.
+    const watch = vi.spyOn(inspection.fs, 'watch').mockImplementation(() => ({
+      on: vi.fn(),
+      close: vi.fn(),
+    }));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(vi.fn());
+    const read = inspection.fs.readdirSync;
+    let armed = boundary === 'startup';
+    let changed = false;
+    const enumeration = vi
+      .spyOn(inspection.fs, 'readdirSync')
+      .mockImplementation((file: string) => {
+        if (file === entry && armed && !changed) {
+          changed = true;
+          fs.renameSync(entry, join(base, 'previous'));
+          fs.mkdirSync(entry);
+        }
+        return read(file);
+      });
+    let observer: ReturnType<typeof observeRuntimeNamespace> | undefined;
+    try {
+      observer = observeRuntimeNamespace();
+      expect(changed).toBe(boundary === 'startup');
+      armed = true;
+      observer.finish();
+      expect(changed).toBe(true);
+      expect(warning).toHaveBeenCalledTimes(1);
+      const prefix = 'Runtime namespace churn: ';
+      const message = String(warning.mock.calls[0]?.[0]);
+      expect(message.startsWith(prefix)).toBe(true);
+      expect(JSON.parse(message.slice(prefix.length))).toMatchObject({
+        observationErrors: [`${entry}: entry replaced during snapshot`],
+      });
+    } finally {
+      observer?.close();
+      enumeration.mockRestore();
+      warning.mockRestore();
+      watch.mockRestore();
+      namespaces.mockRestore();
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  },
+);
 
 /** Identity is separate from metadata, which may change on a shared socket. */
 const entry = {
