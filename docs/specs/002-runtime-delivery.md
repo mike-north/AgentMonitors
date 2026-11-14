@@ -3383,16 +3383,34 @@ It is independent of `runtime/retry-envelope.ts`: retained retries continue to u
 `serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
 `observedAt` Date. External JSON permits no Date values.
 
-Records with `Object.prototype` or a null prototype are accepted only after native
-brand checks exclude detectable intrinsic state. Replacing a Date, collection,
-boxed primitive, buffer/view, promise, error, iterator, generator, arguments,
-module namespace, cryptographic key or native external value's prototype MUST NOT
-make it a record: that would discard hidden state and produce false equality.
-These checks MUST NOT consult serialization or brand hooks. Arrays MUST be
-dense ordinary arrays with exactly `Array.prototype`, enumerable data elements,
-and no own properties other than their indices and built-in data `length`.
-Frozen arrays are allowed. Sparse, subclassed, custom-prototype and typed arrays
-are refused. Ordinary array `length` cannot be an accessor; proxy simulations
+Records with `Object.prototype` or a null prototype are accepted only after
+hook-free checks exclude detectable intrinsic state. Proxies MUST be refused
+before reflection; exact prototype identity MUST be established before intrinsic
+method probes. Native slot predicates refuse Date, RegExp, collections, boxed
+primitives, buffers/views, promises, native errors, Map/Set iterators, generators,
+arguments, module namespaces and native external values. Captured read-only
+intrinsics additionally refuse WeakRef, FinalizationRegistry, URL,
+URLSearchParams, and Intl Collator, DateTimeFormat, NumberFormat, PluralRules,
+RelativeTimeFormat, ListFormat, Locale, DisplayNames, Segmenter and DurationFormat,
+even with either accepted record prototype. Probes MUST NOT read caller properties,
+consult caller prototypes, advance iterators or change the receiver's state.
+Cryptographic keys are refused by the own-symbol gate; Node's property-reading
+`isKeyObject` and `isCryptoKey` wrappers MUST NOT be used.
+
+**Detection limit:** callers MUST NOT pass prototype-replaced array iterators,
+string iterators or Headers. Node 24 exposes no native slot predicate for these
+families. Array/string iterator `next` advances their cursor, and Headers methods
+require prototype identity before private-field access, so these operations cannot
+provide a hook-free, state-preserving brand test after prototype replacement.
+They can then be indistinguishable from an empty record and encode as `{}`.
+Other host/private-slot classes without suitable checks remain outside the
+plain-data input domain; the checks do not prove that arbitrary objects have no
+hidden state. This limit does not permit these built-ins as JSON input.
+
+Arrays MUST be dense ordinary arrays with exactly `Array.prototype`, enumerable
+data elements, and no own properties other than their indices and built-in data
+`length`. Frozen arrays are allowed. Sparse, subclassed, custom-prototype and typed
+arrays are refused. Ordinary array `length` cannot be an accessor; proxy simulations
 are refused before any trap runs. Accessors, hidden or symbol properties,
 undefined, functions, symbols, bigint, non-finite numbers, unsafe integers,
 non-plain prototypes and all proxies (including revoked ones) MUST be rejected
