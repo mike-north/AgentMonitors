@@ -3390,22 +3390,22 @@ prototype. This is a stated refusal list, not a proof that all hidden state can 
 detected. Probes are captured at module load and assume unmodified runtime
 built-ins, including `Object.prototype`, at that point.
 
-| Refused family                                                                                                     | Captured check                                                                                                                     |
-| ------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------- |
-| All proxies, including revoked proxies                                                                             | `util.types.isProxy`, before reflection                                                                                            |
-| Date, RegExp, Map, Set, WeakMap, WeakSet                                                                           | Corresponding native `util.types.is*` slot predicates                                                                              |
-| Boxed primitives                                                                                                   | `util.types.isBoxedPrimitive`                                                                                                      |
-| ArrayBuffer/SharedArrayBuffer, typed arrays/DataView (including Buffer)                                            | `util.types.isAnyArrayBuffer` / `isArrayBufferView`                                                                                |
-| Promise, native errors, Map/Set iterators, generator objects, arguments, module namespaces, native external values | Corresponding native `util.types.is*` slot predicates                                                                              |
-| KeyObject and CryptoKey                                                                                            | Captured `util.types.isKeyObject` / `isCryptoKey`, only after full record descriptor/child validation                              |
-| WeakRef                                                                                                            | Captured `WeakRef.prototype.deref`                                                                                                 |
-| FinalizationRegistry                                                                                               | Captured `unregister` with a fresh unregistered token                                                                              |
-| URL / URLSearchParams                                                                                              | Captured `protocol` / `size` getters (no query synchronization)                                                                    |
-| Intl Collator, PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, Segmenter, DurationFormat                | Captured `resolvedOptions`                                                                                                         |
-| Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                   |
-| Intl Locale                                                                                                        | Captured `toString`                                                                                                                |
-| Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                             |
-| Headers                                                                                                            | Captured `util.inspect.custom` with depth -1 and fresh null-prototype options `{ depth: -1, customInspect: false, colors: false }` |
+| Refused family                                                                                                     | Captured check                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| All proxies, including revoked proxies                                                                             | `util.types.isProxy`, before reflection                                                                                                                                                |
+| Date, RegExp, Map, Set, WeakMap, WeakSet                                                                           | Corresponding native `util.types.is*` slot predicates                                                                                                                                  |
+| Boxed primitives                                                                                                   | `util.types.isBoxedPrimitive`                                                                                                                                                          |
+| ArrayBuffer/SharedArrayBuffer, typed arrays/DataView (including Buffer)                                            | `util.types.isAnyArrayBuffer` / `isArrayBufferView`                                                                                                                                    |
+| Promise, native errors, Map/Set iterators, generator objects, arguments, module namespaces, native external values | Corresponding native `util.types.is*` slot predicates                                                                                                                                  |
+| KeyObject and CryptoKey                                                                                            | Own-symbol refusal on symbol-backed runtimes; captured private/native `util.types.isKeyObject` / `isCryptoKey` after full record descriptor/child validation on private-brand runtimes |
+| WeakRef                                                                                                            | Captured `WeakRef.prototype.deref`                                                                                                                                                     |
+| FinalizationRegistry                                                                                               | Captured `unregister` with a fresh unregistered token                                                                                                                                  |
+| URL / URLSearchParams                                                                                              | Captured `protocol` / `size` getters (no query synchronization)                                                                                                                        |
+| Intl Collator, PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, Segmenter, DurationFormat                | Captured `resolvedOptions`                                                                                                                                                             |
+| Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                                                                       |
+| Intl Locale                                                                                                        | Captured `toString`                                                                                                                                                                    |
+| Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                                                                                 |
+| Headers                                                                                                            | Captured `util.inspect.custom` with depth -1 and fresh null-prototype options `{ depth: -1, customInspect: false, colors: false }`                                                     |
 
 The Headers inspector reads a private field into a temporary presentation
 record. It does not consult receiver hooks, change stored entries, or advance
@@ -3415,13 +3415,20 @@ for the current job; it does not alter the receiver.
 The deterministic first-violation order is: depth-bound configuration and scalar
 checks; proxy refusal; exact prototype identity; native/read-only intrinsic brands;
 ancestor-cycle refusal; then own keys, descriptors and children in own-key order
-(array length/indices for arrays). Record crypto predicates run after all of that
-record's descriptors and children pass, before canonical sorting. On older Node 24
-these wrappers read `kKeyType` / `kKeyObject` symbols; the preceding gates exclude
-own symbols and accessors, leaving only the trusted ordinary/null prototype.
-Newer Node 24 uses private/native brands. This ordering is required on both
-versions and preserves first-invalid-member refusal before later sibling
-descriptors or children are inspected.
+(array length/indices for arrays). A genuine secret key created at module load
+selects the crypto representation without consulting caller input. On symbol-backed
+Node 24, genuine keys carry own symbols and MUST be refused at the own-symbol gate.
+The property-reading `isKeyObject` / `isCryptoKey` wrappers MUST NOT run there:
+post-load `Object.prototype` symbol getters could otherwise run on ordinary records.
+On private-brand Node 24, captured crypto predicates read no receiver properties
+and MUST run after all of that record's descriptors and children pass, before
+canonical sorting. Both paths preserve first-invalid-member refusal before later
+sibling descriptors or children are inspected. For example, a genuine KeyObject
+with `Object.prototype` and a first enumerable child of `NaN` reports
+`Invalid JSON number.`; a first enumerable accessor reports
+`Accessor or hidden property.` without calling it, before either crypto refusal.
+The JSON tests pin these outcomes through both entry points and require zero
+inherited crypto-symbol getter calls where those symbols exist.
 
 Any other object whose state is not held in its own enumerable data properties is
 outside the input domain. Callers MUST NOT pass it; the module makes no claim to

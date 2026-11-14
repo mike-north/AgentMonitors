@@ -23,10 +23,13 @@
  * First-violation order: bounds/scalar checks, proxy refusal, exact prototype,
  * native/read-only intrinsic brands, ancestor cycles, then own keys/descriptors
  * and child values in own-key order (array length/indices for arrays). Record
- * crypto predicates run only after all own descriptors and children pass, then
- * canonical key sorting. On older Node they read symbols, so the earlier gates
- * are required to exclude caller hooks. Child traversal still stops immediately
- * on its first invalid member, before later sibling descriptors are inspected.
+ * crypto refusal depends on a genuine key created at module load: symbol-backed
+ * runtimes refuse keys at the own-symbol gate and never run property-reading
+ * crypto predicates, so post-load inherited symbol getters cannot run. Private-
+ * brand runtimes run captured crypto predicates after all own descriptors and
+ * children pass, before canonical key sorting. Both paths preserve the first
+ * invalid string member before key refusal; child traversal stops before later
+ * sibling descriptors are inspected.
  *
  * Only containers consume depth: the root container is at initialDepth, each child
  * container adds one, and maxDepth is inclusive. Scalars below the last permitted
@@ -50,6 +53,7 @@
  * subtrees are never traversed, though key enumeration costs the container's width
  * and canonical sorting costs O(k log k) for k accepted object keys.
  */
+import { createSecretKey } from 'node:crypto';
 import { inspect, types } from 'node:util';
 
 /** Inclusive supported container depth, shared by validation and encoding. */
@@ -84,11 +88,18 @@ const nativeStatePredicates = [
 const isProxy = types.isProxy;
 
 /**
- * On older Node 24 these wrappers read kKeyType/kKeyObject symbol properties;
- * newer Node 24 uses private/native brands (internal/crypto/keys.js). They are
- * safe only after exact record prototypes and every own descriptor are checked:
- * no own symbols/accessors remain, and Object.prototype was trusted at capture.
+ * A fresh genuine key selects the runtime representation under the module-load
+ * built-in trust assumption; caller input cannot influence this decision. Older
+ * Node 24 keys carry own symbols and its crypto wrappers read symbol properties,
+ * including inherited properties on ordinary records. Never call those wrappers
+ * there: the own-symbol gate already refuses keys. Newer Node 24 keys use private/
+ * native brands (internal/crypto/keys.js), whose predicates read no properties.
  */
+const cryptoUsesPrivateBrands =
+  Object.getOwnPropertySymbols(createSecretKey(new Uint8Array(16))).length ===
+  0;
+
+/** Captured crypto predicates are invoked only on the private-brand runtime. */
 const { isKeyObject, isCryptoKey } = types;
 
 /** Native hidden-state predicates are independent of visible prototype identity. */
@@ -344,9 +355,9 @@ function encodeCanonical(
         encodeCanonical(descriptor.value, depth + 1, maxDepth, ancestors),
       ]);
     }
-    // All own descriptors and children passed before property-reading crypto
-    // wrappers run. This preserves first-invalid-member order on older Node 24.
-    if (isKeyObject(value) || isCryptoKey(value)) {
+    // Symbol-backed keys already refused in own-key order. Private brands follow
+    // descriptors and children so their first invalid member keeps precedence.
+    if (cryptoUsesPrivateBrands && (isKeyObject(value) || isCryptoKey(value))) {
       throw new TypeError('Intrinsic object state is not plain JSON data.');
     }
     entries.sort(([left], [right]) =>
