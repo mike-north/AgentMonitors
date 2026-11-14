@@ -613,12 +613,23 @@ function assertNoInstalledKoffi(projectDir) {
   );
 }
 
+/** Counted events must be successful output changes, never health transitions. @internal */
+export function assertInstalledCommandChange(event) {
+  assert.equal(event.monitorId, 'command-native');
+  assert.match(event.summary, /^Command output changed: /);
+  assert.equal(event.snapshotText, 'two');
+  assert.equal(event.payload.stdout, 'two');
+  assert.equal(event.payload.exitCode, 0);
+  assert.equal(event.payload.error, undefined);
+}
+
 /** Real installed CLI ticks must baseline, observe changed command output, and fire. */
 function smokeInstalledCommandMonitor(projectDir) {
   const workspace = path.join(projectDir, 'cli-workspace');
   const monitors = path.join(workspace, '.claude/monitors');
   const monitor = path.join(monitors, 'command-native');
   mkdirSync(monitor, { recursive: true });
+  const dbPath = path.join(workspace, 'runtime.sqlite');
   const watched = path.join(workspace, 'value.txt');
   writeFileSync(watched, 'one');
   writeFileSync(
@@ -652,7 +663,11 @@ Report command output changes.
         '--format',
         'json',
       ],
-      { cwd: workspace, encoding: 'utf8' },
+      {
+        cwd: workspace,
+        encoding: 'utf8',
+        env: { ...process.env, AGENTMONITORS_DB: dbPath },
+      },
     );
     assert.equal(result.status, 0, result.stderr);
     const tick = JSON.parse(result.stdout);
@@ -665,8 +680,26 @@ Report command output changes.
   writeFileSync(watched, 'two');
   const changed = tick();
   assert.equal(changed.emittedEventIds.length, 1, JSON.stringify(changed));
+  // Read the exact persisted event through the installed core's public API.
+  // A failing-health edge also emits one event: count alone cannot prove a fire.
+  const persisted = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
+    import { createDb, RuntimeStore } from '@agentmonitors/core';
+    const store = new RuntimeStore(createDb(${JSON.stringify(dbPath)}));
+    console.log(JSON.stringify(store.getEventById(${JSON.stringify(changed.emittedEventIds[0])})));
+  `,
+    ],
+    { cwd: projectDir, encoding: 'utf8' },
+  );
+  assert.equal(persisted.status, 0, persisted.stderr);
+  const event = JSON.parse(persisted.stdout);
+  assertInstalledCommandChange(event);
   console.log(
-    `Installed agentmonitors command-poll monitor fired on ${process.platform}-${process.arch}: ${JSON.stringify(changed)}`,
+    `Installed agentmonitors command-poll monitor fired on ${process.platform}-${process.arch}: ${JSON.stringify({ tick: changed, event })}`,
   );
 }
 
