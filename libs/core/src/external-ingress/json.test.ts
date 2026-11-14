@@ -1,3 +1,5 @@
+/** Plain-data refusal, traversal order and canonical bytes at the external boundary. */
+import { createSecretKey, webcrypto } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { assertExternalJsonValue, canonicalJsonStringify } from './json.js';
 import type { ExternalJsonValue } from './json.js';
@@ -416,6 +418,232 @@ describe('external JSON plain-data boundary', () => {
         'Non-JSON value or excessive nesting.',
       );
       expect(trap).not.toHaveBeenCalled();
+    },
+  );
+});
+
+/** Each factory creates fresh intrinsic state before its visible prototype changes. */
+const intrinsicFactories: readonly (readonly [string, () => object])[] = [
+  ['Date', () => new Date(0)],
+  ['RegExp', () => /value/u],
+  ['Map', () => new Map([['secret', 1]])],
+  ['Set', () => new Set([1])],
+  ['WeakMap', () => new WeakMap()],
+  ['WeakSet', () => new WeakSet()],
+  ['boxed number', () => Object(2)],
+  ['boxed boolean', () => Object(true)],
+  ['boxed string', () => Object('value')],
+  ['boxed bigint', () => Object(2n)],
+  ['boxed symbol', () => Object(Symbol('value'))],
+  ['typed array', () => new Uint8Array([1, 2])],
+  ['ArrayBuffer', () => new ArrayBuffer(2)],
+  ['SharedArrayBuffer', () => new SharedArrayBuffer(2)],
+  ['DataView', () => new DataView(new ArrayBuffer(2))],
+  ['Promise', () => Promise.resolve(1)],
+  ['Error', () => new Error('secret')],
+  ['Map iterator', () => new Map().entries()],
+  ['Set iterator', () => new Set().values()],
+  [
+    'generator',
+    () =>
+      (function* () {
+        yield 1;
+      })(),
+  ],
+  [
+    'arguments',
+    () =>
+      (function () {
+        // eslint-disable-next-line prefer-rest-params -- Needs a genuine arguments object to exercise its native brand.
+        return arguments;
+      })(),
+  ],
+  ['KeyObject', () => createSecretKey(new Uint8Array(16))],
+  ['array posing as a record', () => [1, 2]],
+];
+
+describe('external JSON intrinsic-state refusal', () => {
+  describe.each([
+    ['null', null],
+    ['Object.prototype', Object.prototype],
+  ] as const)('replacement prototype %s', (_name, prototype) => {
+    it.each(intrinsicFactories)(
+      'rejects %s through validation',
+      (_brand, create) => {
+        const value = Object.setPrototypeOf(create(), prototype);
+        expect(() => assertExternalJsonValue(value, 0, 512)).toThrow(TypeError);
+      },
+    );
+    it.each(intrinsicFactories)(
+      'rejects %s through encoding',
+      (_brand, create) => {
+        const value = Object.setPrototypeOf(create(), prototype);
+        expect(() => canonicalJsonStringify(value)).toThrow(TypeError);
+      },
+    );
+
+    it('rejects CryptoKey through both entry points', async () => {
+      const key = await webcrypto.subtle.importKey(
+        'raw',
+        new Uint8Array(16),
+        { name: 'HMAC', hash: 'SHA-256' },
+        true,
+        ['sign'],
+      );
+      Object.setPrototypeOf(key, prototype);
+      expect(() => assertExternalJsonValue(key, 0, 512)).toThrow(TypeError);
+      expect(() => canonicalJsonStringify(key)).toThrow(TypeError);
+    });
+  });
+
+  it('rejects intrinsic state without consulting serialization or brand hooks', () => {
+    const hook = vi.fn(() => {
+      throw new Error('caller code ran');
+    });
+    const value = Object.setPrototypeOf(new Date(0), null);
+    Object.defineProperty(value, Symbol.toStringTag, { get: hook });
+    Object.defineProperty(value, 'toJSON', { get: hook });
+    expect(() => assertExternalJsonValue(value, 0, 512)).toThrow(TypeError);
+    expect(() => canonicalJsonStringify(value)).toThrow(TypeError);
+    expect(hook).not.toHaveBeenCalled();
+  });
+});
+
+describe('external JSON supported depth range', () => {
+  it.each([false, true])(
+    'accepts exactly depth 512 and rejects depth 513 for arrays=%s',
+    (arrays) => {
+      expect(() =>
+        assertExternalJsonValue(nestedContainers(513, arrays), 0, 512),
+      ).not.toThrow();
+      expect(() =>
+        assertExternalJsonValue(nestedContainers(514, arrays), 0, 512),
+      ).toThrow(TypeError);
+      expect(() =>
+        assertExternalJsonValue(nestedContainers(2, arrays), 511, 512),
+      ).not.toThrow();
+      expect(() =>
+        assertExternalJsonValue(nestedContainers(3, arrays), 511, 512),
+      ).toThrow(TypeError);
+    },
+  );
+
+  it.each([513, 99_999, Number.MAX_SAFE_INTEGER])(
+    'refuses unsupported maximum %s before inspecting input',
+    (maxDepth) => {
+      const trap = vi.fn(() => {
+        throw new Error('input inspected');
+      });
+      expect(() =>
+        assertExternalJsonValue(new Proxy({}, { ownKeys: trap }), 0, maxDepth),
+      ).toThrow('Invalid JSON depth bounds.');
+      expect(() => assertExternalJsonValue('scalar', 0, maxDepth)).toThrow(
+        'Invalid JSON depth bounds.',
+      );
+      expect(trap).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([false, true])(
+    'refuses a 100,000-container chain with an unsupported maximum without RangeError for arrays=%s',
+    (arrays) => {
+      const value = nestedContainers(100_000, arrays);
+      expect(() => assertExternalJsonValue(value, 0, 99_999)).toThrow(
+        'Invalid JSON depth bounds.',
+      );
+      expect(() => assertExternalJsonValue(value, 0, 99_998)).toThrow(
+        'Invalid JSON depth bounds.',
+      );
+    },
+  );
+
+  it('supports envelope depth 34 and state depth 32', () => {
+    expect(() =>
+      assertExternalJsonValue(nestedContainers(35, false), 0, 32 + 2),
+    ).not.toThrow();
+    expect(() =>
+      assertExternalJsonValue(nestedContainers(36, false), 0, 32 + 2),
+    ).toThrow(TypeError);
+    expect(() =>
+      assertExternalJsonValue(nestedContainers(32, false), 1, 32),
+    ).not.toThrow();
+  });
+});
+
+describe('external JSON canonical byte vectors', () => {
+  it.each([
+    ['large positive exponent', 1e21],
+    ['large negative exponent', -1.5e300],
+  ])('refuses %s because it is an unsafe integer', (_name, value) => {
+    expect(Number.isInteger(value)).toBe(true);
+    expect(Number.isSafeInteger(value)).toBe(false);
+    expect(() => canonicalJsonStringify(value)).toThrow('Invalid JSON number.');
+    expect(() => assertExternalJsonValue(value, 0, 512)).toThrow(
+      'Invalid JSON number.',
+    );
+  });
+
+  it.each([
+    ['minimum safe integer', Number.MIN_SAFE_INTEGER, '-9007199254740991'],
+    ['maximum safe integer', Number.MAX_SAFE_INTEGER, '9007199254740991'],
+    ['positive fraction', 1.5, '1.5'],
+    ['negative fraction', -0.125, '-0.125'],
+    ['small exponent', 1e-7, '1e-7'],
+    ['smallest positive number', 5e-324, '5e-324'],
+    ['negative zero', -0, '0'],
+  ])('encodes %s with explicit numeric bytes', (_name, value, expected) => {
+    expect(canonicalJsonStringify(value)).toBe(expected);
+    expect(() => assertExternalJsonValue(value, 0, 512)).not.toThrow();
+  });
+
+  it.each([
+    ['quote', '"', '"\\""'],
+    ['backslash', '\\', '"\\\\"'],
+    ['nul', '\u0000', '"\\u0000"'],
+    ['start of heading', '\u0001', '"\\u0001"'],
+    ['start of text', '\u0002', '"\\u0002"'],
+    ['end of text', '\u0003', '"\\u0003"'],
+    ['end of transmission', '\u0004', '"\\u0004"'],
+    ['enquiry', '\u0005', '"\\u0005"'],
+    ['acknowledge', '\u0006', '"\\u0006"'],
+    ['bell', '\u0007', '"\\u0007"'],
+    ['backspace', '\b', '"\\b"'],
+    ['tab', '\t', '"\\t"'],
+    ['newline', '\n', '"\\n"'],
+    ['vertical tab', '\u000b', '"\\u000b"'],
+    ['form feed', '\f', '"\\f"'],
+    ['carriage return', '\r', '"\\r"'],
+    ['shift out', '\u000e', '"\\u000e"'],
+    ['shift in', '\u000f', '"\\u000f"'],
+    ['data link escape', '\u0010', '"\\u0010"'],
+    ['device control one', '\u0011', '"\\u0011"'],
+    ['device control two', '\u0012', '"\\u0012"'],
+    ['device control three', '\u0013', '"\\u0013"'],
+    ['device control four', '\u0014', '"\\u0014"'],
+    ['negative acknowledge', '\u0015', '"\\u0015"'],
+    ['synchronous idle', '\u0016', '"\\u0016"'],
+    ['end of transmission block', '\u0017', '"\\u0017"'],
+    ['cancel', '\u0018', '"\\u0018"'],
+    ['end of medium', '\u0019', '"\\u0019"'],
+    ['substitute', '\u001a', '"\\u001a"'],
+    ['escape', '\u001b', '"\\u001b"'],
+    ['file separator', '\u001c', '"\\u001c"'],
+    ['group separator', '\u001d', '"\\u001d"'],
+    ['record separator', '\u001e', '"\\u001e"'],
+    ['unit separator', '\u001f', '"\\u001f"'],
+    ['delete', '\u007f', '"\u007f"'],
+    ['non-ASCII Unicode', '雪éΩ', '"雪éΩ"'],
+    ['astral character', '😀', '"😀"'],
+    ['lone high surrogate', '\ud800', '"\\ud800"'],
+    ['lone low surrogate', '\udfff', '"\\udfff"'],
+    ['embedded lone surrogates', 'a\ud800b\udfffc', '"a\\ud800b\\udfffc"'],
+  ])(
+    'encodes %s with explicit string bytes and round-trips',
+    (_name, value, expected) => {
+      const encoded = canonicalJsonStringify(value);
+      expect(encoded).toBe(expected);
+      expect(JSON.parse(encoded)).toBe(value);
+      expect(() => assertExternalJsonValue(value, 0, 512)).not.toThrow();
     },
   );
 });
