@@ -1552,7 +1552,8 @@ directly (`execFile` semantics, `shell: false`): there is no word-splitting, glo
 injection surface, and what executes is exactly what the author wrote, token for token. This is the
 decision for #81's first open question; a bare-string `command` (which would imply implicit shell
 word-splitting) is rejected — an author who needs shell features writes them into a script and polls
-the script.
+the script. Like plain spawn, Linux glibc may run a shebang-less executable with `/bin/sh`
+(§11.2); argv elements remain separate literal arguments and are never joined as shell source.
 
 **Shell features are opt-in, not implicit.** An author who genuinely needs a pipeline or shell
 operator spawns a shell _explicitly_ in argv form — `command: ['sh', '-c', 'git status -sb | grep ahead']`
@@ -1580,6 +1581,85 @@ SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyon
 discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
 validation note in §11.7).
 
+**POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
+An asynchronous launcher starts an in-group watchdog through a short-lived intermediate. It waits
+for the timer-armed acknowledgement, reaps the intermediate and drains its IPC channel before replacing itself with the
+authored command. The watchdog is reparented within the same group, never a waitable child of the
+authored command; commands that reap all children can finish normally. The command retains its PID, process group and
+inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
+rather than being truncated at the native string boundary. Executable paths retain their authored
+spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
+lookup. Linux calls libc `execvpe`: glibc's ENOEXEC fallback to `/bin/sh`
+matches plain spawn on the same libc. macOS retries EINTR, continues PATH search after
+EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaustion, EACCES takes
+precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
+empty PATH components use the bare filename. The authored program starts with the default signal
+dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
+helpers use absolute Node and native-module paths and need only the command-life mark in their
+startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter
+helper startup environments. The complete intended command environment travels only over the
+configuration pipe and reaches native exec as envp (apart from the ownership-mark override), so
+helper program size does not reduce the environment budget accepted by plain spawn. Linux installs
+the authored PATH at the native boundary because libc `execvpe` searches its caller's PATH. The launcher calls libc
+through the packaged native binding, with a separate close-on-exec status pipe. Before execution,
+it clears close-on-exec and nonblocking mode on stdin/stdout/stderr using the platform's
+variadic `fcntl` ABI. It reads both descriptor and status flags back, preserving access mode,
+append mode and all unrelated status flags. Authored native I/O has plain spawn's blocking
+semantics even when Node helper startup changed those flags; stdin remains `/dev/null`
+under the source's ordinary ignored-input configuration. A failed flag operation, failed
+read-back, surviving close-on-exec flag or surviving `O_NONBLOCK` refuses
+execution with `Could not retain command stdio` and preserves the prior baseline. Frames are written
+completely, retrying short writes. Missing frames, trailing partial bytes, unknown frame kinds and
+invalid schemas fail closed and retain the prior baseline; valid frames may span multiple reads. An
+unwritable error status terminates the helper by signal so it cannot become an authored result. Both
+ESM and CJS consumers resolve that binding relative to the source package itself. Native-load
+failures explain that platform native exec support could not be loaded and retain the underlying
+error detail. Other startup/initialization failures retain their own error detail without that
+module-loading label. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG, and ENOEXEC where spawn
+reports it) report errno and a short message naming the program, without a native abort, core file
+or crash report. They preserve failing health and the prior successful baseline (§11.5). Arming
+failure is an execution failure and no authored work runs. No synchronous subprocess, FIFO or
+blocking open runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute
+deadline and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
+continued membership supplies identity safety, independent of daemon liveness and command stdio.
+Once a normally completed finite observation has captured its output, it releases the whole original
+group through the watchdog, including any remaining background work. Timeout failures retain the
+full kill grace; after observation settlement the caller-side control channel is unreferenced so a
+finished consumer can exit during that grace. The watchdog retains its own referenced timers. Daemon
+EOF alone never releases the bound. This also covers background descendants that close every
+inherited descriptor. Re-sessioned descendants remain restart-sweep work. Windows command admission is
+unsupported and refused before spawn; the retained Windows cleanup path is not an admission fallback.
+
+The source factory accepts an optional shutdown signal. Aborting it refuses pending/new
+admissions and forcefully terminates in-flight groups through the identity gate (or their still-live
+watchdog after leader exit), allowing the
+daemon to finish SIGTERM/SIGINT/IPC shutdown without waiting for authored command timeouts.
+
+Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
+`@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
+Each tarball carries the JavaScript wrapper, MIT license, integrity/hash manifest and
+unmodified prebuilt `koffi.node` files for `darwin-arm64`, `darwin-x64`, `linux-x64`
+and `linux-arm64` (glibc only). Refresh with `node scripts/vendor-koffi.mjs` (also
+`pnpm fix:vendor-koffi`). The single version constant controls all five downloads;
+the script verifies each registry `dist.integrity` SHA-512 before extraction and
+records each shipped file's SHA-256 and source. Offline script tests verify these
+bytes and reject tampering.
+
+Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
+filename, identically in the source package and CLI bundle. Only the asynchronous
+launcher loads it. The loader allowlists the platform/architecture, requires glibc
+on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+no explicit-native hook, so the refresh script makes a minimal checked shim: replace
+its detect/load stanza with a factory argument, return its exports and close the
+factory. This retains upstream wrapping/version checks while bypassing its native
+search. The watchdog and intermediate need no native binding; they inherit the
+launcher's group and already use embedded programs. Unsupported platforms or
+architectures (including Windows and musl), missing or corrupt binaries fail closed
+with the platform name and underlying error; no unbounded plain spawn or source
+build is attempted. Koffi's build-from-source fallback does not link on macOS 27.3
+with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
+we never trigger it.
+
 **Excess output is drained, never a reason to kill the command** (issue #302). Both `stdout` and
 `stderr` are consumed as they stream, not buffered to completion: `stdout` retains only its leading
 **1 MiB** (`STDOUT_CAP_BYTES`) — the same leading bytes on every capture, so two truncated captures
@@ -1602,13 +1682,13 @@ no orphan). Platform-specific mechanism:
 - **POSIX:** each spawn runs as the leader of its own process group/session (`detached: true`); the
   timeout escalation signals the **negative PID** (`process.kill(-pid, 'SIGTERM')`, then
   `'SIGKILL'` after the grace), which targets the whole group at once.
-- **Windows:** there is no process-group-signal equivalent, and no reliable graceful signal for a
+- **Windows (retained cleanup path; command admission is refused):** there is no process-group-signal equivalent, and no reliable graceful signal for a
   non-console-attached spawned process (`taskkill` without `/F` frequently fails silently for this
   kind of child). The documented choice is `taskkill /PID <pid> /T /F` — forceful and tree-wide —
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
   from on this platform.
 
-**Every escalation step is identity-verified at signal time** (issue #479,
+**Every daemon-origin escalation step is identity-verified at signal time** (issue #479,
 [008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step's process-table read starts while
 the direct child is still unreaped, so the members that read lists (pid and start time) are
 confirmed as the command's group even if the command exits before the read completes; the step then
@@ -1626,7 +1706,8 @@ members it saw and why identity could not be confirmed. Continuity is lost when 
 and its id was reused, or when, after the direct child has exited, a member forks and exits
 between two consecutive readings (within one 250 ms interval plus one read; the read time grows
 under load, up to the 5 s `ps` cap) while no other confirmed member is alive; in that second case
-the forked process escapes the bound. That residual, and the latency the reads add to each step, are stated
+the daemon step abstains. The independent watchdog still bounds the original group. The
+daemon-gate residual, and the latency the reads add to each step, are stated
 in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
 `taskkill` runs only while the direct child is still unreaped.
 
@@ -1696,7 +1777,7 @@ Mirrors `api-poll` (§4.4–4.5):
 
 ### 11.5 Failure semantics (fail-open as a health signal)
 
-An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …) or `timeout` expiry. Per #81's
+An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …), lifetime-bound arming failure, shutdown cancellation, or `timeout` expiry. Per #81's
 framing, a failure is information, not something to silently swallow — but it must not spam.
 
 - On failure, prior state is **kept** (no re-baseline, no state loss) — identical in spirit to how
@@ -1785,6 +1866,20 @@ issue #86's AC1–AC7):
   (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
   sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
   not just per-call but across the daemon's own shutdown.
+- A real SIGKILLed daemon leaves no live original-group command or descendant past timeout
+  plus grace, including closed command stdio. SIGTERM and SIGINT shutdown leave no in-flight
+  child alive (`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`).
+- Watchdog timer registration precedes authored work; launcher/timer failure prevents authored
+  side effects and produces failing health. Restricted PATH requires no timeout/mkfifo utility,
+  arming yields to the event loop, and PID/argv/mark/exit status remain intact
+  (`plugins/source-command-poll/src/self-bound.test.ts`).
+- Native stdout/stderr writers drain 8 MiB without EAGAIN, and a piped-stdin admission fixture
+  blocks until delayed input arrives (`stdio-semantics.test.ts`, Perl required). Real native
+  flag priming verifies restoration on all three descriptors without losing append mode;
+  failed status reads, writes, read-backs and retained nonblocking flags prevent authored
+  side effects and preserve the baseline (`self-bound.test.ts`).
+- Process-global test instrumentation and environment changes restore from teardown hooks even
+  if an awaited observation times out; in-test `finally` is not the sole restoration path.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

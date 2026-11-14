@@ -8,6 +8,7 @@ import { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { Writable } from 'node:stream';
 import { setImmediate as nextTurn } from 'node:timers/promises';
+import { stripVTControlCharacters } from 'node:util';
 import Database from 'better-sqlite3';
 import { expect, it } from 'vitest';
 import { createVitest } from 'vitest/node';
@@ -435,14 +436,16 @@ it('renders the retry failure cause and every cleanup SQL diagnostic', async () 
     );
     try {
       vitest.logger.printError(error);
-      expect(rendered).toContain('retry stage context');
+      // Terminal styling must not change the failure content required by this contract.
+      const text = stripVTControlCharacters(rendered);
+      expect(text).toContain('retry stage context');
       for (const sql of statements) {
-        expect(rendered).toContain(sql);
+        expect(text).toContain(sql);
       }
-      expect(rendered).toContain(
+      expect(text).toContain(
         'Caused by: Error: underlying scenario assertion failure',
       );
-      const causeOutput = rendered.split(
+      const causeOutput = text.split(
         'Caused by: Error: underlying scenario assertion failure',
       )[1];
       expect(causeOutput).toMatch(

@@ -48,6 +48,10 @@ type Scope = Record<string, unknown>;
  */
 const createdTempDirs: string[] = [];
 
+// Real captures keep a five-second case budget even when scheduled serially.
+vi.setConfig({ testTimeout: 5_000 });
+afterAll(() => vi.resetConfig());
+
 afterAll(() => {
   for (const dir of createdTempDirs) {
     rmSync(dir, { recursive: true, force: true });

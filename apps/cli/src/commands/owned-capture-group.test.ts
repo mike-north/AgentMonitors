@@ -1,8 +1,12 @@
 /** Test cleanup must require a group-creation receipt and current identity continuity. */
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { expect, it, vi } from 'vitest';
 import {
   parseOwnedCaptureGroup,
   cleanupOwnedCaptureGroup,
+  recordOwnedCaptureGroup,
 } from './fixtures/owned-capture-group.mjs';
 
 const receipt =
@@ -75,4 +79,48 @@ it('withholds every signal when terminal evidence is unavailable', async () => {
     }),
   ).rejects.toThrow('terminal evidence unavailable');
   expect(signal).not.toHaveBeenCalled();
+});
+
+it('records every initial member so a watchdog still authorizes cleanup after other anchors exit', async () => {
+  const filename = path.join(
+    mkdtempSync(path.join(tmpdir(), 'capture-receipt-')),
+    'owned',
+  );
+  const group = 424242;
+  const watchdog = { pid: 424243, pgid: group, startTime: 'watchdog-start' };
+  const records = [
+    { pid: group, pgid: group, startTime: 'leader-start' },
+    { pid: process.pid, pgid: group, startTime: 'recorder-start' },
+    watchdog,
+  ];
+  await recordOwnedCaptureGroup(filename, group, {
+    readTable: async () => ({ supported: true, processes: records }),
+  });
+  const recorded = parseOwnedCaptureGroup(readFileSync(filename, 'utf8'));
+  expect(recorded.records).toEqual(records);
+  const signal = vi.fn(async () => ({ status: 'sent' }));
+  await cleanupOwnedCaptureGroup(recorded, {
+    readTable: async () => ({ supported: true, processes: [watchdog] }),
+    isTerminated: () => false,
+    signal,
+  });
+  expect(signal).toHaveBeenCalledExactlyOnceWith(watchdog);
+});
+
+it('refuses a receipt when the recorder is not in the expected fixture group', async () => {
+  const filename = path.join(
+    mkdtempSync(path.join(tmpdir(), 'capture-unowned-')),
+    'owned',
+  );
+  await expect(
+    recordOwnedCaptureGroup(filename, 424242, {
+      readTable: async () => ({
+        supported: true,
+        processes: [
+          { pid: process.pid, pgid: 999, startTime: 'recorder-start' },
+        ],
+      }),
+    }),
+  ).rejects.toThrow(/exclusive|group/);
+  expect(existsSync(filename)).toBe(false);
 });
