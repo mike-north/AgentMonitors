@@ -1582,8 +1582,10 @@ discarded and the result is marked `truncated: true` (a truncated result still d
 validation note in §11.7).
 
 **POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
-An asynchronous launcher starts an in-group watchdog and waits for its timer-armed acknowledgement
-before replacing itself with the authored command. The command retains its PID, process group and
+An asynchronous launcher starts an in-group watchdog through a short-lived intermediate. It waits
+for the timer-armed acknowledgement, reaps the intermediate and drains its IPC channel before replacing itself with the
+authored command. The watchdog is reparented within the same group, never a waitable child of the
+authored command; commands that reap all children can finish normally. The command retains its PID, process group and
 inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
 rather than being truncated at the native string boundary. Executable paths retain their authored
 spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
@@ -1593,8 +1595,12 @@ EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaust
 precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
 empty PATH components use the bare filename. The authored program starts with the default signal
 dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
-helpers start without `NODE_OPTIONS`; the complete authored/inherited environment, including those
-options, reaches only the command (apart from the ownership-mark override). The launcher calls libc
+helpers use absolute Node and native-module paths and need only the command-life mark in their
+startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter
+helper startup environments. The complete intended command environment travels only over the
+configuration pipe and reaches native exec as envp (apart from the ownership-mark override), so
+helper program size does not reduce the environment budget accepted by plain spawn. Linux installs
+the authored PATH at the native boundary because libc `execvpe` searches its caller's PATH. The launcher calls libc
 through the packaged native binding, with a separate close-on-exec status pipe. Before execution,
 it clears close-on-exec on stdin/stdout/stderr using the platform's variadic `fcntl` ABI and reads
 each descriptor's flags back. A failed flag operation or surviving close-on-exec flag refuses
@@ -1604,7 +1610,8 @@ invalid schemas fail closed and retain the prior baseline; valid frames may span
 unwritable error status terminates the helper by signal so it cannot become an authored result. Both
 ESM and CJS consumers resolve that binding relative to the source package itself. Native-load
 failures explain that platform native exec support could not be loaded and retain the underlying
-error detail. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG, and ENOEXEC where spawn
+error detail. Other startup/initialization failures retain their own error detail without that
+module-loading label. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG, and ENOEXEC where spawn
 reports it) report errno and a short message naming the program, without a native abort, core file
 or crash report. They preserve failing health and the prior successful baseline (§11.5). Arming
 failure is an execution failure and no authored work runs. No synchronous subprocess, FIFO or

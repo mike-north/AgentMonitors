@@ -1,7 +1,8 @@
 /**
  * POSIX admission programs are embedded and use a packaged native exec binding,
  * requiring no separate helper executable or PATH utility. The launcher becomes the authored command with the same PID;
- * its watchdog is an ordinary member of that detached group. Keeping itself in
+ * its reparented watchdog is an ordinary member of that detached group, never
+ * a waitable child of authored work. Keeping itself in
  * the group makes kill(0) identity-safe even after every other member has exited:
  * this live member prevents group-ID reuse, with no remembered numeric target.
  */
@@ -76,6 +77,33 @@ const {write, readFile, close} = require('node:fs');
 const {getSystemErrorName} = require('node:util');
 let armed = false;
 let failing = false;
+// A short-lived parent leaves the watchdog in our group but reparents it before
+// authored exec. Reaping this intermediate is essential: a command may wait()
+// for every child, and must not inherit even a transient internal child to reap.
+function parentWatchdog() {
+  const {spawn} = require('node:child_process');
+  const {watchdog, deadline, grace} = JSON.parse(process.argv[1]);
+  let settled = false;
+  function finish(message, code) {
+    if (settled) return;
+    settled = true;
+    process.send(message, error => process.exit(error ? 1 : code));
+  }
+  const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
+    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
+  });
+  child.once('error', error => finish({kind: 'error', error: String(error.message || error)}, 1));
+  child.once('exit', () => finish({kind: 'error', error: 'Watchdog exited before arming'}, 1));
+  child.once('message', message => {
+    if (message !== 'armed') {
+      finish({kind: 'error', error: message && message.kind === 'error' ? message.error : 'Invalid watchdog acknowledgement'}, 1);
+      return;
+    }
+    // Flush the acknowledgement before exit. The launcher also waits for our
+    // reaped exit, so the watchdog cannot remain its child across native exec.
+    finish('armed', 0);
+  });
+}
 // A frame is a byte protocol: a successful write may consume only a prefix,
 // including part of a UTF-8 character. Admission/exit wait for the entire buffer.
 function writeFrame(message, callback) {
@@ -142,6 +170,10 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
     const argv = [...command, null];
     const envp = [...Object.entries(env).map(([key, value]) => key + '=' + value), null];
     if (execvpe) {
+      // execvpe searches the caller's PATH, not envp. Install only that search
+      // value at the native boundary, after every helper has already started.
+      if (env.PATH === undefined) delete process.env.PATH;
+      else process.env.PATH = env.PATH;
       execvpe(file, argv, envp);
       throw execError(koffi.errno());
     }
@@ -168,14 +200,24 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
     }
     throw execError(denied ? koffi.os.errno.EACCES : errno);
   }
-  const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
+  const child = spawn(process.execPath, ['--input-type=commonjs', '-e', '(' + parentWatchdog.toString() + ')()', JSON.stringify({watchdog, deadline, grace})], {
     detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
   });
+  let acknowledged = false;
   child.once('error', fail);
-  child.once('exit', () => { if (!armed) fail(new Error('Watchdog exited before arming')); });
   child.once('message', message => {
     if (message && message.kind === 'error') { fail(new Error(message.error)); return; }
     if (message !== 'armed') { fail(new Error('Invalid watchdog acknowledgement')); return; }
+    acknowledged = true;
+  });
+  // Channel closure follows reaping and drains IPC. waitpid can report exit
+  // before the arming message is delivered, so exit alone cannot decide admission.
+  child.once('close', (code, exitSignal) => {
+    if (failing) return;
+    if (code !== 0 || exitSignal !== null || !acknowledged) {
+      fail(new Error('Watchdog parent exited before acknowledged reparenting'));
+      return;
+    }
     armed = true;
     writeFrame({kind: 'armed'}, error => {
       if (error) { fail(error); return; }

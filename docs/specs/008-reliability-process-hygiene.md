@@ -137,8 +137,12 @@ detached-descendant survival reproduced during this spec's review).
 
 Every POSIX command admission starts a detached launcher and an in-group watchdog using the
 running Node executable. The watchdog registers referenced timers for the absolute timeout
-and timeout-plus-grace, then acknowledges arming. Only after that acknowledgement does the
-launcher replace itself with the authored command. The command retains the recorded PID,
+and timeout-plus-grace, then acknowledges arming through a short-lived intermediate. The launcher
+waits for that acknowledgement, reaps the intermediate's successful exit and drains its IPC
+channel before native exec, regardless of which readiness event arrives first.
+The watchdog is thereby reparented without changing its group, so it is never a waitable child
+of the authored command; a command may reap all its own children without waiting on the bound.
+Only then does the launcher replace itself with the authored command. The command retains the recorded PID,
 original group and inherited life mark. Missing launcher support, failed watchdog startup,
 failed timer registration or an elapsed admission deadline fails closed: authored work does
 not run, and observation health reports an execution failure.
@@ -157,14 +161,19 @@ exit. Writers retry short writes; missing frames, trailing incomplete bytes, unk
 invalid schemas fail closed, while fragmented valid frames are accepted. If error status cannot be
 written at all, the helper exits by signal rather than allowing a normal exit to masquerade as a
 command result. Ordinary exec errors name the program and errno, preserve failing health and the
-previous baseline, and create no abort/core/crash report. Both Node helpers start without authored
-or inherited `NODE_OPTIONS`; the command receives the complete intended environment through a
-separate asynchronous configuration pipe, with only the deliberate ownership-mark override. Private
+previous baseline, and create no abort/core/crash report. All Node helpers, including the
+intermediate, use absolute Node and native-module paths and need only the command-life mark in
+their startup environment. They exclude authored and inherited variables, including `PATH`,
+`HOME`, `TMPDIR` and `NODE_OPTIONS`. The command receives the complete intended environment through a separate
+asynchronous configuration pipe, with only the deliberate ownership-mark override. Native exec
+receives it as envp; Linux installs the authored PATH just before `execvpe` for libc lookup.
+Helper argv does not consume the authored environment's plain-spawn admission budget. Private
 descriptors close at exec; only standard input/output/error survive. Admission clears their
 close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. Failed calls or
 a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
 without running authored work. Missing native binding support
-fails closed with a platform-support explanation and the underlying loader error.
+fails closed with a platform-support explanation and the underlying loader error. Other startup
+or native-initialization failures preserve their own detail without a module-loading label.
 
 Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
 blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals
@@ -187,7 +196,9 @@ clock virtualization from changing the execution epoch. Timer segments are cappe
 delay, including the maximum configured timeout plus the grace, without integer overflow.
 
 **Verified:** `plugins/source-command-poll/src/self-bound.test.ts` covers ordering, injected
-arming failure, native standard-stream close-on-exec clearing, flag-operation/read-back failures,
+arming failure, near-limit environment admission compared with plain spawn, helper environment
+isolation, child-reaping command compatibility, reparenting/group membership, intermediate-exit
+failures, native standard-stream close-on-exec clearing, flag-operation/read-back failures,
 restricted PATH, literal argv, preserved PID/mark, event-loop progress and
 absence of synchronous arming APIs. `exec-semantics.test.ts` compares all native signal
 dispositions/mask bits with plain spawn on macOS/Linux, verifies errno diagnostics and absence

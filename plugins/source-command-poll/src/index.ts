@@ -55,6 +55,9 @@ type ChangeStrategy = 'text-diff' | 'json-diff' | 'exit-code';
 /** Grace period between SIGTERM and SIGKILL on timeout (003 §11.2). */
 const SIGKILL_GRACE_MS = 5_000;
 
+/** Reserved journal mark, retained before exec so restart discovery can identify helpers too. */
+const COMMAND_LIFE_ENV = 'AGENTMONITORS_COMMAND_LIFE';
+
 /** Maximum retained stdout, in bytes (003 §11.2). Excess is drained, not kept. */
 const STDOUT_CAP_BYTES = 1024 * 1024;
 
@@ -357,11 +360,15 @@ async function runCommand(
   const inheritedEnv = scope.env
     ? { ...process.env, ...scope.env }
     : process.env;
-  // Helpers cannot execute authored Node preloads. The full command environment
-  // travels over a private pipe, avoiding argv limits and preserving even NODE_OPTIONS.
+  // Helpers use absolute Node/native-module paths and no environment-based
+  // utilities, so POSIX startup needs only the journal mark. Even inherited
+  // PATH/HOME/TMPDIR can be large or command-specific: keep every other value,
+  // including NODE_OPTIONS, exclusively in the command's config pipe/envp.
   const commandEnv = { ...inheritedEnv, ...ownershipEnv };
-  const helperEnv = { ...commandEnv };
-  delete helperEnv['NODE_OPTIONS'];
+  const helperEnv: NodeJS.ProcessEnv = {};
+  if (commandEnv[COMMAND_LIFE_ENV] !== undefined) {
+    helperEnv[COMMAND_LIFE_ENV] = commandEnv[COMMAND_LIFE_ENV];
+  }
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';

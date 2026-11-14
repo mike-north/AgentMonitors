@@ -1,4 +1,5 @@
 /** Self-bounding admission is asynchronous, ordered before user work, and fails closed. */
+import { spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -48,6 +49,266 @@ afterEach(() => {
 describe.skipIf(process.platform === 'win32')(
   'self-bounding command admission',
   () => {
+    it('admits an environment near the plain-spawn byte limit', async () => {
+      // Darwin permits one near-ARG_MAX value; Linux also caps each string.
+      // Discover the local limit with the exact authored argv, then reserve only
+      // a small margin: embedded helper programs must not consume that budget.
+      const environment = (bytes: number): Record<string, string> => {
+        const env: Record<string, string> = {};
+        for (let i = 0; bytes > 0; i++) {
+          const length = Math.min(bytes, 60_000);
+          env[`BOUND_ENV_${i}`] = 'x'.repeat(length);
+          bytes -= length;
+        }
+        return env;
+      };
+      let low = 0;
+      let high = 3_000_000;
+      while (low + 1 < high) {
+        const bytes = Math.floor((low + high) / 2);
+        const direct = spawnSync('/bin/echo', ['okay'], {
+          env: { ...process.env, ...environment(bytes) },
+          encoding: 'utf8',
+        });
+        if (direct.status === 0) low = bytes;
+        else {
+          expect(direct.error).toMatchObject({ code: 'E2BIG' });
+          high = bytes;
+        }
+      }
+      const env = environment(low - 256);
+      expect(
+        spawnSync('/bin/echo', ['okay'], {
+          env: { ...process.env, ...env },
+          encoding: 'utf8',
+        }).stdout,
+      ).toBe('okay\n');
+      const result = await source.observe(
+        { command: ['/bin/echo', 'okay'], env, timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'okay\n',
+        exitCode: 0,
+      });
+    });
+
+    it('keeps authored and unrelated inherited values out of both helpers startup environments', async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'env-'));
+      const capture = (name: string) =>
+        `require('node:fs').writeFileSync(${JSON.stringify(path.join(dir, name))}, JSON.stringify(process.env));`;
+      injected.launcher = capture('launcher');
+      injected.watchdog = capture('watchdog');
+      process.env.BOUND_INHERITED = 'inherited-only';
+      const env = {
+        BOUND_AUTHORED: 'authored-only',
+        NODE_OPTIONS: '--input-type=commonjs',
+        PATH: '/authored-path',
+        HOME: '/authored-home',
+        TMPDIR: '/authored-tmp',
+      };
+      const owned = createCommandPollSource({
+        environment: async () => ({
+          AGENTMONITORS_COMMAND_LIFE: 'environment-test',
+        }),
+        spawned: () => {
+          /* This environment fixture does not persist numeric hints. */
+        },
+        exited: () => {
+          /* There are no persisted hints to retire in this fixture. */
+        },
+      });
+      const result = await owned.observe(
+        {
+          command: [
+            process.execPath,
+            '-e',
+            'process.stdout.write(JSON.stringify(process.env))',
+          ],
+          env,
+          timeout: '2s',
+        },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({ health: 'ok', exitCode: 0 });
+      expect(
+        JSON.parse((result.nextState as { stdout: string }).stdout),
+      ).toMatchObject({
+        ...env,
+        BOUND_INHERITED: 'inherited-only',
+        AGENTMONITORS_COMMAND_LIFE: 'environment-test',
+      });
+      for (const helper of ['launcher', 'watchdog']) {
+        const startup = JSON.parse(
+          readFileSync(path.join(dir, helper), 'utf8'),
+        );
+        // Darwin's runtime can synthesize this key even when spawn omits it.
+        if (process.platform === 'darwin')
+          delete startup.__CF_USER_TEXT_ENCODING;
+        // Reject unexpected keys before comparing values, so a regression never
+        // prints unrelated inherited environment contents into a test receipt.
+        expect(Object.keys(startup)).toEqual(['AGENTMONITORS_COMMAND_LIFE']);
+        expect(startup).toEqual({
+          AGENTMONITORS_COMMAND_LIFE: 'environment-test',
+        });
+      }
+    });
+
+    it('lets commands reap all their children without waiting for the watchdog', async (context) => {
+      // Perl provides POSIX wait() on both CI platforms without a C compiler.
+      const program = '1 while wait() != -1; print "done\\n"';
+      const direct = spawnSync('perl', ['-e', program], { encoding: 'utf8' });
+      if (
+        direct.error &&
+        'code' in direct.error &&
+        direct.error.code === 'ENOENT'
+      ) {
+        context.skip();
+        return;
+      }
+      expect(direct.status).toBe(0);
+      expect(direct.stdout).toBe('done\n');
+      const started = performance.now();
+      const result = await source.observe(
+        { command: ['perl', '-e', program], timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'done\n',
+        exitCode: 0,
+      });
+      expect(performance.now() - started).toBeLessThan(1000);
+    });
+
+    it('reparents the marked watchdog within the original group before authored exec', async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'parent-'));
+      const file = path.join(dir, 'watchdog');
+      injected.watchdog = `require('node:fs').writeFileSync(${JSON.stringify(file)}, JSON.stringify({pid: process.pid, ppid: process.ppid, mark: process.env.AGENTMONITORS_COMMAND_LIFE}));`;
+      const result = await source.observe(
+        {
+          command: [
+            process.execPath,
+            '-e',
+            `
+          const start = JSON.parse(require('node:fs').readFileSync(${JSON.stringify(file)}, 'utf8'));
+          const table = require('node:child_process').spawnSync('/bin/ps', ['-o', 'pid=,ppid=,pgid=', '-p', [process.pid, start.pid, start.ppid].join(',')], {encoding: 'utf8'});
+          process.stdout.write(JSON.stringify({pid:process.pid, start, table:table.stdout}));
+        `,
+          ],
+          env: { AGENTMONITORS_COMMAND_LIFE: 'reparent-test' },
+          timeout: '2s',
+        },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({ health: 'ok', exitCode: 0 });
+      const captured: {
+        pid: number;
+        start: { pid: number; ppid: number; mark: string };
+        table: string;
+      } = JSON.parse((result.nextState as { stdout: string }).stdout);
+      expect(captured.start.mark).toBe('reparent-test');
+      expect(captured.start.ppid).not.toBe(captured.pid);
+      const rows = captured.table
+        .trim()
+        .split('\n')
+        .map((row) => row.trim().split(/\s+/).map(Number));
+      // The intermediate was reaped; only the command and its reparented peer
+      // remain. Membership, rather than a parent-child edge, pins the group.
+      expect(rows.map((row) => row[0]).sort()).toEqual(
+        [captured.pid, captured.start.pid].sort(),
+      );
+      const watchdog = rows.find((row) => row[0] === captured.start.pid);
+      expect(watchdog?.[1]).not.toBe(captured.pid);
+      expect(watchdog?.[2]).toBe(captured.pid);
+    });
+
+    it.each(['missing acknowledgement', 'failed exit'])(
+      'refuses execution after watchdog parent %s',
+      async (fault) => {
+        // Replace only the intermediate. A message alone cannot authorize exec:
+        // the parent must also be reaped with a successful exit status.
+        injected.launcher = `const originalSpawn = require('node:child_process').spawn;
+          require('node:child_process').spawn = (file, args, options) => {
+            if (args[2].includes('parentWatchdog')) args[2] = ${JSON.stringify(fault === 'failed exit' ? 'process.send("armed", () => process.exit(1));' : 'process.exit(0);')};
+            return originalSpawn(file, args, options);
+          };`;
+        const previousState = {
+          stdout: 'baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'ok',
+          baselined: true,
+        };
+        const result = await source.observe(
+          { command: ['/bin/echo', 'must-not-run'], timeout: '2s' },
+          { now: new Date(), previousState },
+        );
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining(
+            'Watchdog parent exited before acknowledged reparenting',
+          ),
+        });
+      },
+    );
+
+    it('consumes the intermediate IPC acknowledgement even if its reaped exit arrives first', async () => {
+      // waitpid and IPC are independent readiness sources. Deliver their real
+      // events in the opposite order, retaining the eventual channel close.
+      injected.launcher = `const originalSpawn = require('node:child_process').spawn;
+        require('node:child_process').spawn = (...args) => {
+          const child = originalSpawn(...args);
+          const originalEmit = child.emit;
+          let message;
+          child.emit = function(event, ...values) {
+            if (event === 'message') { message = values; return true; }
+            const result = originalEmit.call(this, event, ...values);
+            if (event === 'exit' && message) originalEmit.call(this, 'message', ...message);
+            return result;
+          };
+          return child;
+        };`;
+      const result = await source.observe(
+        { command: ['/bin/echo', 'ordered'], timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'ordered\n',
+        exitCode: 0,
+      });
+    });
+
+    it('reports native initialization stack failures without mislabelling them as module loading failures', async () => {
+      injected.launcher = `const originalLoad = require('node:module')._load;
+        require('node:module')._load = function(id, ...args) {
+          const loaded = originalLoad.call(this, id, ...args);
+          if (!id.includes('koffi')) return loaded;
+          return {...loaded, load() {throw new RangeError('Maximum call stack size exceeded');}};
+        };`;
+      const previousState = {
+        stdout: 'baseline',
+        exitCode: 0,
+        truncated: false,
+        health: 'ok',
+        baselined: true,
+      };
+      const result = await source.observe(
+        { command: ['/bin/echo', 'unused'], timeout: '2s' },
+        { now: new Date(), previousState },
+      );
+      expect(result.nextState).toEqual({ ...previousState, health: 'failing' });
+      expect(result.observations[0]?.payload).toMatchObject({
+        error:
+          'Could not arm command lifetime bound: Maximum call stack size exceeded',
+      });
+    });
+
     it('clears native close-on-exec flags on every command standard stream', async () => {
       // Prime real helper descriptors, then inspect them at the native exec
       // boundary. A separate variadic binding makes this an ABI regression,
