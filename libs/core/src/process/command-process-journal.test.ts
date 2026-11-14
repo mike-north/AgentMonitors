@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CommandProcessJournal } from './command-process-journal.js';
 import { readProcessTable } from './process-table.js';
 import {
@@ -21,6 +21,14 @@ vi.mock('./command-process-marks.js', () => ({
 }));
 const directories: string[] = [];
 const journals: CommandProcessJournal[] = [];
+// Resolve the host native binding before selecting a simulated platform.
+const nativeBinding = new Database(':memory:');
+nativeBinding.close();
+// These injected-reader cases exercise the sequential /proc path independently
+// of the host. macOS batched signal gates have their own marker-reader suite.
+beforeEach(() => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+});
 afterEach(() => {
   for (const journal of journals.splice(0)) journal.close();
   for (const dir of directories.splice(0))
