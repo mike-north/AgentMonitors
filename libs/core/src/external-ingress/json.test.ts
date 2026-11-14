@@ -1127,6 +1127,89 @@ describe.each(jsonEntryPoints)(
   },
 );
 
+/** Post-import prototype changes must not make record validation execute hooks. */
+describe.each(jsonEntryPoints)(
+  'external JSON crypto representation through %s',
+  (_entry, run) => {
+    it('ignores post-load inherited crypto-symbol getters (symbol-backed runtimes only)', async ({
+      skip,
+    }) => {
+      const keys = [
+        createSecretKey(new Uint8Array(16)),
+        await webcrypto.subtle.importKey(
+          'raw',
+          new Uint8Array(16),
+          { name: 'HMAC', hash: 'SHA-256' },
+          true,
+          ['sign'],
+        ),
+      ];
+      const symbols = [
+        ...new Set(keys.flatMap(Object.getOwnPropertySymbols)),
+      ].filter((symbol) =>
+        ['kKeyType', 'kKeyObject'].includes(symbol.description ?? ''),
+      );
+      if (symbols.length === 0) {
+        skip(
+          'Private-brand runtimes expose no crypto symbols for inherited getters.',
+        );
+        return;
+      }
+      let calls = 0;
+      for (const symbol of symbols) {
+        const original = Object.getOwnPropertyDescriptor(
+          Object.prototype,
+          symbol,
+        );
+        Object.defineProperty(Object.prototype, symbol, {
+          configurable: true,
+          get() {
+            calls += 1;
+            return undefined;
+          },
+        });
+        try {
+          for (const prototype of [null, Object.prototype]) {
+            const value: object = Object.assign(Object.create(prototype), {
+              safe: 1,
+            });
+            run(value);
+          }
+        } finally {
+          if (original) {
+            Object.defineProperty(Object.prototype, symbol, original);
+          } else {
+            Reflect.deleteProperty(Object.prototype, symbol);
+          }
+        }
+      }
+      expect(calls).toBe(0);
+    });
+
+    it('refuses the first bad child before crypto key refusal', () => {
+      const key = Object.setPrototypeOf(
+        createSecretKey(new Uint8Array(16)),
+        Object.prototype,
+      );
+      Object.defineProperty(key, 'first', { enumerable: true, value: NaN });
+      expect(() => run(key)).toThrow('Invalid JSON number.');
+    });
+
+    it('refuses the first bad descriptor before crypto key refusal', () => {
+      const key = Object.setPrototypeOf(
+        createSecretKey(new Uint8Array(16)),
+        Object.prototype,
+      );
+      const hook = vi.fn(() => {
+        throw new Error('caller code ran');
+      });
+      Object.defineProperty(key, 'first', { enumerable: true, get: hook });
+      expect(() => run(key)).toThrow('Accessor or hidden property.');
+      expect(hook).not.toHaveBeenCalled();
+    });
+  },
+);
+
 describe.each(jsonEntryPoints)(
   'external JSON unsupported FormData through %s',
   (_entry, run) => {
