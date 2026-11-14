@@ -975,7 +975,10 @@ under the exact session/workspace/monitor/object key, including after restart.
 The four admission operations (`ingest`, held flush, retry drain and notify reconciliation)
 automatically contribute every executed prepared write to the interruption inventory. Every
 other lifecycle write MUST match an explicit named exclusion or fail with its SQL and call
-site, even if runtime error handling catches the failure. Current exclusions are unarmed
+site, even if runtime error handling catches the failure. Classification diagnostics
+MUST be drained and checked, including after the final tick and at cleanup, and
+after watch consumption. Cleanup MUST report both an existing scenario failure and
+any classification failure, preserving the SQL diagnostics. Current exclusions are unarmed
 startup/restart setup, the exact expired-object-suppression DELETE from its maintenance
 method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
 is checked separately). Delivery refresh reaches no additional durable writes in these

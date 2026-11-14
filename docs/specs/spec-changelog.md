@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-14 — Final ingress classification checks (004 §3.4.2) — Refs #619
+
+Require diagnostic drains after the final tick, after watch consumption and at
+cleanup, including child stop. A caught late audit write must fail with its SQL;
+cleanup must retain an existing scenario failure alongside classification errors.
+Validation coverage only; runtime behavior and public contracts are unchanged.
+
 ## 2026-11-13 — Exact macOS executable alignment and helper startup abstention (008 §4.2) — Refs #618
 
 Use XNU's eight-byte target-pointer alignment after the executable path, excluding
