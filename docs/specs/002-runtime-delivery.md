@@ -3374,3 +3374,45 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 | `updated_at`   | INTEGER NOT NULL |                                                                     |
 | `acked_at`     | INTEGER nullable |                                                                     |
 | `completed_at` | INTEGER nullable |                                                                     |
+
+## 16. External JSON foundation
+
+**Current internal contract.** `libs/core/src/external-ingress/json.ts` validates and
+canonically encodes external plain JSON data. It remains outside the package root.
+It is independent of `runtime/retry-envelope.ts`: retained retries continue to use
+`serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
+`observedAt` Date. External JSON permits no Date values.
+
+Records with `Object.prototype` or a null prototype are accepted. Arrays MUST be
+dense ordinary arrays with exactly `Array.prototype`, enumerable data elements,
+and no own properties other than their indices and built-in data `length`.
+Frozen arrays are allowed. Sparse, subclassed, custom-prototype and typed arrays
+are refused. Ordinary array `length` cannot be an accessor; proxy simulations
+are refused before any trap runs. Accessors, hidden or symbol properties,
+undefined, functions, symbols, bigint, non-finite numbers, unsafe integers,
+non-plain prototypes and all proxies (including revoked ones) MUST be rejected
+without calling accessors, proxy traps or custom serialization hooks.
+
+The caller selects inclusive container depth through
+`assertExternalJsonValue(value, initialDepth, maxDepth)`. Both bounds MUST be
+nonnegative safe integers with `initialDepth <= maxDepth`. The root container
+uses `initialDepth`; each child container adds one. Scalars consume no container
+level, so `{ child: { value: true } }` is accepted at initial depth 1 and maximum
+2, but `{ child: { child: {} } }` is refused. `canonicalJsonStringify` starts at
+0 with maximum 512 (513 containers). This preserves callers that count a state
+root as depth 1 and set maximum 32.
+
+Object keys MUST sort recursively by UTF-16 order; array order MUST remain
+unchanged. Negative zero canonicalizes to zero. Cycles MUST be refused; a shared
+acyclic child is serialized by value for each occurrence. Validation MUST stop
+at the first invalid member in own-key order before reading later descriptors
+or traversing later child values. It enumerates each container's own keys once;
+that enumeration costs the container's width. Accepted object entries are sorted
+only after encoding their children, at O(k log k) for k accepted keys.
+
+Validation: `libs/core/src/external-ingress/json.test.ts` covers descriptor and
+proxy non-execution, the array policy, exact and excessive object/array depth
+(including nonzero initial depth), invalid bounds, cycles/shared children,
+equivalence tables, deterministic generated key permutations, and early refusal
+in large inputs. Retained-retry, polled-source and watched-source suites continue
+to validate their existing independent contracts.
