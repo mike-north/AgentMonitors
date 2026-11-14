@@ -1583,7 +1583,8 @@ validation note in §11.7).
 **POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
 An asynchronous launcher starts an in-group watchdog and waits for its timer-armed
 acknowledgement before replacing itself with the authored command. The command retains its
-PID, process group and inherited ownership mark; argv remains literal. The launcher uses direct
+PID, process group and inherited ownership mark; argv remains literal. Values containing NUL
+bytes fail before execution rather than being truncated at the native string boundary. The launcher uses direct
 `execve`, preserving kernel symlink traversal and authored environment values without an
 interposed shell. The authored program starts with the default signal dispositions and empty
 signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node helpers start without

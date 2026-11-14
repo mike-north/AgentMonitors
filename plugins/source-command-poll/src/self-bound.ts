@@ -1,6 +1,6 @@
 /**
- * POSIX admission programs, embedded so packed consumers need no helper file or
- * PATH utility. The launcher becomes the authored command with the same PID;
+ * POSIX admission programs are embedded and use a packaged native exec binding,
+ * requiring no separate helper executable or PATH utility. The launcher becomes the authored command with the same PID;
  * its watchdog is an ordinary member of that detached group. Keeping itself in
  * the group makes kill(0) identity-safe even after every other member has exited:
  * this live member prevents group-ID reuse, with no remembered numeric target.
@@ -79,6 +79,10 @@ function fail(error) {
   write(5, message, () => process.exit(1));
 }
 async function launch({command, env, deadline, grace, watchdog, native}) {
+  // C strings cannot represent embedded NUL. Match spawn's rejection rather
+  // than letting the binding silently truncate literal argv or environment data.
+  if (command.some(value => value.includes('\0')) || Object.entries(env).some(([key, value]) => key.includes('\0') || value.includes('\0')))
+    throw new Error('Could not execute ' + command[0] + ': ERR_INVALID_ARG_VALUE: arguments and environment must be strings without null bytes');
   // All native work lives in this disposable helper, never on the observe path.
   // libc execve returns errno; Node's process.execve aborts on ordinary failures.
   const koffi = require(native);

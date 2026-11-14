@@ -144,7 +144,8 @@ failed timer registration or an elapsed admission deadline fails closed: authore
 not run, and observation health reports an execution failure.
 
 The launcher uses the packaged native binding to call libc `execve`, retaining the PID without
-a shell or Node's abort-on-exec-error path. It restores every catchable signal to its default
+a shell or Node's abort-on-exec-error path. Arguments and environment strings containing NUL
+are rejected before the native call, preserving normal spawn's failure semantics. It restores every catchable signal to its default
 and clears the signal mask before exec, matching normal spawn. A private close-on-exec status
 pipe carries arming/errno diagnostics and closes on successful replacement; settlement consumes
 its complete status before classifying an exit. Ordinary exec errors name the program and

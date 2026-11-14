@@ -149,6 +149,33 @@ describe.skipIf(process.platform === 'win32')(
       );
     });
 
+    it.each(['argument', 'environment'])(
+      'rejects a NUL in an %s without truncation or a new baseline',
+      async (location) => {
+        const command = [
+          '/bin/echo',
+          location === 'argument' ? 'a\0b' : 'would-run',
+        ];
+        const env = location === 'environment' ? { NODE_OPTIONS: 'a\0b' } : {};
+        expect(() =>
+          spawn(command[0] ?? '', command.slice(1), {
+            env: { ...process.env, ...env },
+          }),
+        ).toThrow(/null bytes/);
+        const result = await source.observe(
+          { command, env, timeout: '2s' },
+          { now: new Date(), previousState },
+        );
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining('null bytes'),
+        });
+      },
+    );
+
     it.each(['ENOENT', 'ENOEXEC', 'EACCES', 'E2BIG'])(
       'reports %s without abort artifacts and keeps the baseline',
       async (errno) => {
