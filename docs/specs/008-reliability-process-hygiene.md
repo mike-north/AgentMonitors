@@ -240,7 +240,13 @@ Ownership MUST come from the actual process environment, never matching argv tex
 then only envp supplies ownership. Nonce-shaped arguments never become ownership. Empty or
 padded argv entries, including process-title rewrites, and an unproven envp boundary are
 unreadable for that PID; they MUST NOT be reported as readable and unmarked. The reader
-requires a nonempty, structurally valid envp before accepting its terminator and rejects
+starts counting immediately after the executable path's terminator. Additional NULs
+cannot be distinguished from an empty `argv[0]`; it MUST abstain rather than skip them
+as presumed alignment padding, even when a padded layout could otherwise parse.
+Every counted argv entry must be nonempty. The helper parses only the byte count
+returned by each successful sysctl call, never the unused remainder of its reused
+allocation; a short reply or failed call cannot borrow an earlier PID's evidence.
+The reader requires a nonempty, structurally valid envp before accepting its terminator and rejects
 duplicate reserved keys and malformed/truncated buffers.
 One asynchronous `/usr/bin/osascript -l JavaScript` helper is owned by the entire sweep,
 accepts batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
@@ -313,6 +319,12 @@ escape silence, argv-only nonce survival, responsive unrelated PID/PGID survival
 recycling despite a retained nonce, and an empty-start receipt. Every owned process is stopped in
 cleanup, including assertion failures. `libs/core/src/process/darwin-command-marks.integration.test.ts`
 proves envp-only reads with empty/marker-shaped argv and Homebrew off PATH. The marker-reader
+integration suite also requires owned evidence or a durable discovery abstention for real
+empty-first-argument and retitled workers. `libs/core/src/process/darwin-procargs.test.ts`
+rejects initial padding with or without empty arguments and rewritten argv storage.
+`libs/core/src/process/darwin-command-marks.test.ts` executes the exact embedded bridge
+against full, shorter, failed and differently marked sysctl replies to reject stale-buffer evidence.
+The marker-reader
 suites cover unavailable tools, malformed/partial responses, per-process unreadability, bounded
 helper lifetime, batch reuse and the fresh boot/mark/start-time gates.
 `libs/core/src/process/command-process-journal.test.ts`

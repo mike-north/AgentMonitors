@@ -8,12 +8,14 @@ function layout(
   argv: readonly string[],
   env: readonly string[],
   argc = argv.length,
+  padding = '',
 ): string {
   const header = Buffer.alloc(4);
   header.writeInt32LE(argc);
   return (
     header.toString('latin1') +
-    '/node\0\0' +
+    '/node\0' +
+    padding +
     argv.join('\0') +
     '\0' +
     env.join('\0') +
@@ -54,6 +56,42 @@ it('uses only exact environment keys after all argc arguments', () => {
   ).toBeNull();
 });
 it.each([
+  // Initial NULs have no tag distinguishing exec-path padding from argv[0].
+  // The ownership entry is first so swallowing it cannot silently look unmarked.
+  ...['', '\0', '\0\0\0'].flatMap((padding) => [
+    layout(
+      ['', '-e', 'worker'],
+      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
+      3,
+      padding,
+    ),
+    layout(
+      ['', '', 'worker'],
+      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
+      3,
+      padding,
+    ),
+    layout(
+      ['', '/node', 'NAME=value'],
+      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
+      3,
+      padding,
+    ),
+    layout(
+      ['', 'worker', ''],
+      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
+      3,
+      padding,
+    ),
+  ]),
+  // Even plausible nonempty argv after padding cannot prove that argv[0] exists.
+  layout(
+    ['/node', 'worker'],
+    ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
+    2,
+    '\0',
+  ),
+  layout(['worker', '', ''], ['AGENTMONITORS_COMMAND_LIFE=owned'], 3, '\0\0'),
   layout(['/node', '', 'AGENTMONITORS_COMMAND_LIFE=argv'], ['OTHER=value']),
   layout(['worker', '', ''], ['AGENTMONITORS_COMMAND_LIFE=retained']),
   layout(['/node'], []),

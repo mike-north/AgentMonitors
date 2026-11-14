@@ -16,9 +16,11 @@ function parseDarwinProcargs(data) {
   for (var i = 3; i >= 0; i--) argc = argc * 256 + data.charCodeAt(i);
   if (argc <= 0 || argc > data.length) throw new Error('Invalid argc');
   var cursor = terminated(4) + 1;
-  // The executable path is followed by alignment NULs before argv[0]. Never
-  // search for a key to locate envp: even convincing marker text can be argv.
-  while (cursor < data.length && data.charCodeAt(cursor) === 0) cursor++;
+  // NULs after the executable terminator could be alignment padding, an empty
+  // argv[0], or a rewritten argv allocation. There is no boundary tag to tell
+  // them apart. Count from this exact position and reject every empty argument;
+  // skipping even one NUL could consume the first envp entry as the last argv.
+  // Never search for a key to locate envp: convincing marker text can be argv.
   for (var arg = 0; arg < argc; arg++) {
     var end = terminated(cursor);
     // Empty arguments and title-rewrite padding cannot be distinguished here.

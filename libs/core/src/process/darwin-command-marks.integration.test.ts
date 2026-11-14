@@ -64,9 +64,9 @@ it.skipIf(process.platform !== 'darwin').each([false, true])(
   },
 );
 
-it.skipIf(process.platform !== 'darwin')(
-  'accounts for a real retitled marked worker as owned or explicitly unreadable',
-  async () => {
+it.skipIf(process.platform !== 'darwin').each(['retitled', 'empty-argv0'])(
+  'accounts for a real %s marked worker as owned or explicitly unreadable',
+  async (layout) => {
     const root = mkdtempSync(path.join(tmpdir(), 'title-'));
     const db = path.join(root, 'db');
     const journal = CommandProcessJournal.open(db, root);
@@ -76,12 +76,14 @@ it.skipIf(process.platform !== 'darwin')(
         process.execPath,
         [
           '-e',
-          'process.title="worker";setInterval(()=>{},1000);process.send("ready")',
+          `${layout === 'retitled' ? 'process.title="worker";' : ''}setInterval(()=>{},1000);process.send("ready")`,
         ],
         {
           cwd: root,
+          ...(layout === 'empty-argv0' ? { argv0: '' } : {}),
           detached: true,
-          env: { ...process.env, ...env },
+          // A skipped empty argv[0] must not consume the ownership entry as argv.
+          env: { ...env, ...process.env, ...env },
           stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
         },
       );
@@ -96,7 +98,7 @@ it.skipIf(process.platform !== 'darwin')(
           reading.unreadable?.includes(child.pid),
       ).toBe(true);
       // Deliberately omit numeric hints: discovery itself must retain uncertainty
-      // rather than silently losing a worker whose title changed its argv layout.
+      // rather than silently losing a worker with an ambiguous argv layout.
       const sql = new Database(`${db}.commands.sqlite`);
       try {
         sql.prepare('UPDATE command_lives SET owner=?').run(

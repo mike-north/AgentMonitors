@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-13 — Ambiguous initial argv and reused native buffers (008 §4.2) — Refs #618
+
+Count argv immediately after the executable path's terminator, abstaining on any
+additional NUL rather than guessing whether it is padding or an empty first argument.
+Native empty-first-argument and crafted padded/title-rewrite layouts must preserve
+ownership or explicit uncertainty, including durable discovery abstentions. Exercise
+the exact embedded bridge with full, shorter, failed and differently marked replies;
+only sysctl's returned byte count may supply a PID's evidence.
+
 ## 2026-11-13 — macOS environment-only restart cleanup (008 §4.2) — Refs #618
 
 macOS ownership now comes from kernel `KERN_PROCARGS2` envp, after counting argv by
