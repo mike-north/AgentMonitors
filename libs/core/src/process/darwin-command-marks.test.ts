@@ -1,7 +1,5 @@
 /** The interpreter is an optional, bounded process boundary, never an ownership fallback. */
-import { ChildProcess, execFile, spawn } from 'node:child_process';
-import { statSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { ChildProcess, spawn } from 'node:child_process';
 import { PassThrough, Writable } from 'node:stream';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import {
@@ -12,16 +10,9 @@ import {
 vi.mock('node:child_process', async (original) => ({
   ...(await original<typeof import('node:child_process')>()),
   spawn: vi.fn(),
-  execFile: vi.fn(),
 }));
-vi.mock('node:fs/promises', async (original) => ({
-  ...(await original<typeof import('node:fs/promises')>()),
-  stat: vi.fn(),
-}));
-
 beforeEach(() => {
   vi.resetAllMocks();
-  vi.mocked(stat).mockResolvedValue(statSync(import.meta.dirname));
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -53,39 +44,7 @@ function helper(
   return { child, requests };
 }
 
-it('never launches the Python shim when neither CLT nor Xcode is installed', async () => {
-  vi.mocked(stat).mockRejectedValue(new Error('absent'));
-  vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => {
-    if (typeof callback !== 'function') throw new Error('Missing callback');
-    callback(new Error('no developer directory'), '', '');
-    return new ChildProcess();
-  });
-  const result = await readDarwinCommandMarks([4242]);
-  expect(result).toEqual({
-    supported: false,
-    reason: expect.stringMatching(/Command Line Tools.*not launched/),
-  });
-  expect(spawn).not.toHaveBeenCalled();
-  expect(execFile).toHaveBeenCalledExactlyOnceWith(
-    '/usr/bin/xcode-select',
-    ['-p'],
-    expect.objectContaining({ timeout: 5000 }),
-    expect.any(Function),
-  );
-});
-
-it('accepts full Xcode even without the standalone CLT directory', async () => {
-  vi.mocked(stat).mockRejectedValue(new Error('absent'));
-  vi.mocked(execFile).mockImplementation((_file, _args, _options, callback) => {
-    if (typeof callback !== 'function') throw new Error('Missing callback');
-    callback(null, '/Applications/Xcode.app/Contents/Developer\n', '');
-    return new ChildProcess();
-  });
-  helper();
-  expect((await readDarwinCommandMarks([4242])).supported).toBe(true);
-});
-
-it('uses one isolated system interpreter for discovery batches and fresh signal-time requests', async () => {
+it('uses one stock system interpreter for discovery batches and fresh signal-time requests', async () => {
   const { child, requests } = helper((pids) =>
     pids.map((pid) => [pid, pid === 4242 ? 'life' : null, pid === 4243]),
   );
@@ -99,8 +58,8 @@ it('uses one isolated system interpreter for discovery batches and fresh signal-
     expect(child.kill).not.toHaveBeenCalled();
   });
   expect(spawn).toHaveBeenCalledExactlyOnceWith(
-    '/usr/bin/python3',
-    ['-I', '-u', '-c', expect.any(String)],
+    '/usr/bin/osascript',
+    ['-l', 'JavaScript', '-e', expect.any(String)],
     expect.any(Object),
   );
   expect(child.kill).toHaveBeenCalledWith('SIGKILL');

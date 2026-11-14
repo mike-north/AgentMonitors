@@ -237,17 +237,21 @@ only; the sweep never signals a stored PGID.
 Ownership MUST come from the actual process environment, never matching argv text. Linux reads
 `/proc/<pid>/environ` for exactly the requested identifiers. macOS reads kernel
 `KERN_PROCARGS2`: argc determines exactly how many NUL-terminated argv entries to skip,
-then only envp supplies ownership. Empty and nonce-shaped arguments never become ownership.
-One asynchronous `/usr/bin/python3 -I -u` helper is owned by the entire sweep, accepts
-batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
+then only envp supplies ownership. Nonce-shaped arguments never become ownership. Empty or
+padded argv entries, including process-title rewrites, and an unproven envp boundary are
+unreadable for that PID; they MUST NOT be reported as readable and unmarked. The reader
+requires a nonempty, structurally valid envp before accepting its terminator and rejects
+duplicate reserved keys and malformed/truncated buffers.
+One asynchronous `/usr/bin/osascript -l JavaScript` helper is owned by the entire sweep,
+accepts batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
 Discovery and fresh signal-time checks reuse that helper; no subprocess starts per survivor.
-The helper uses only standard-library ctypes and system libc, with no shipped native binary
-or Homebrew dependency. The daemon checks for the standalone Command Line Tools directory or
-a successful `/usr/bin/xcode-select -p` before invoking Python: without either, it records
-reader unavailability and never launches the CLT shim or its installation dialog. An interpreter
-that cannot run or returns invalid evidence also makes the sweep incomplete with a reason.
-An unreadable process environment (including protected executables, another user's processes
-and exit races) records a PID-specific abstention with a reason, never an unmarked/owned guess.
+The helper calls system libc through JXA's Objective-C bridge with Foundation-owned MIB,
+output and size buffers. It needs only stock macOS, with no developer tools, Homebrew,
+native addon or shipped binary. The daemon never invokes Python or developer-tool probes.
+An interpreter that cannot run, times out or returns invalid evidence makes the sweep
+incomplete with a reason. An unreadable process environment (including protected executables,
+another user's processes, exit races and ambiguous argv/envp layouts) records a PID-specific
+abstention with a reason, never an unmarked/owned guess.
 Boot and identity still use bounded system `sysctl` and `ps` calls. macOS terminal evidence
 is also batched, and synchronous receipt writes are committed together before the next
 asynchronous discovery query. Signal-time ownership queries read only the requested candidate
@@ -438,7 +442,7 @@ Keep this table current when a signal site is added.
 | Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                            | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
 | Restart command sweep (`libs/core/src/process/command-process-journal.ts`, `CommandProcessJournal.sweep`)                                                                                                                                | `SIGKILL` to each confirmed process PID                                     | committed daemon-life nonce (or group membership observed beside a marked anchor), matching boot, dead owner and fresh start-time identity; required nonce and boot checked again inside the gate                                                                   | verified; uncertainty is a durable abstention, never a group signal                                                                                               |
 | Ownership readers (`libs/core/src/process/command-process-marks.ts`, `systemRead`)                                                                                                                                                       | Node's `execFile` timeout sends `SIGKILL` to its own `ps` or `sysctl` child | unreaped child handle held internally by Node                                                                                                                                                                                                                       | identity-safe by construction; not a cleanup of stored identifiers                                                                                                |
-| macOS environment helper (`libs/core/src/process/darwin-command-marks.ts`, `DarwinCommandMarkReader.close`)                                                                                                                              | `SIGKILL` to its own Python child on completion, failure or timeout         | unreaped spawned child handle                                                                                                                                                                                                                                       | verified through the shared gate; a reaped helper is never signalled                                                                                              |
+| macOS environment helper (`libs/core/src/process/darwin-command-marks.ts`, `DarwinCommandMarkReader.close`)                                                                                                                              | `SIGKILL` to its own JXA child on completion, failure or timeout            | unreaped spawned child handle                                                                                                                                                                                                                                       | verified through the shared gate; a reaped helper is never signalled                                                                                              |
 | `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                          | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
 
 Classified as not signal sends: `process.kill(pid, 0)` liveness probes (the startup-lock check

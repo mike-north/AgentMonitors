@@ -12,10 +12,11 @@ Agent Monitors spec set in `docs/specs/`.
 ## 2026-11-13 — macOS environment-only restart cleanup (008 §4.2) — Refs #618
 
 macOS ownership now comes from kernel `KERN_PROCARGS2` envp, after counting argv by
-argc. One asynchronous system Python helper serves each sweep's discovery batches
-and fresh signal-time checks. Check CLT/Xcode availability before launching the
-Python shim; unavailable tools or unreadable process environments retain explicit
-abstentions. Batch macOS final identity checks, individual signal gates, terminal
+argc. One asynchronous stock `/usr/bin/osascript -l JavaScript` helper calls sysctl
+through Foundation-owned buffers for discovery batches and fresh signal-time checks.
+No developer tools or Python shim are involved. Empty/padded argv entries, title rewrites
+and unproven envp boundaries are per-PID unreadability, never readable/unmarked evidence.
+Unavailable helpers and unreadable process environments retain explicit abstentions. Batch macOS final identity checks, individual signal gates, terminal
 evidence and receipt writes without weakening boot, mark or start-time verification.
 Helper completion, failure and timeout cleanup also uses the shared live-child
 signal gate; an already reaped helper receives no cleanup signal.

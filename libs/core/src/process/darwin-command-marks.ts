@@ -1,14 +1,14 @@
 /**
- * macOS envp-only ownership reader. A sweep owns one asynchronous system-Python
+ * macOS envp-only ownership reader. A sweep owns one asynchronous stock JXA
  * helper, reused for discovery batches and fresh signal-time checks. Kernel
  * argument buffers stay inside the helper; its protocol returns only the reserved
  * ownership value or explicit uncertainty. No shell, PATH lookup, or native addon
- * participates. Without developer tools the Python shim must never be launched.
+ * participates. Foundation owns the native buffers passed to the sysctl bridge.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { z } from 'zod';
+import { DARWIN_PROCARGS_PARSER } from './darwin-procargs.js';
 import type { CommandMarks } from './command-process-marks.js';
 import { sendVerifiedSignal } from './process-identity.js';
 
@@ -20,79 +20,78 @@ const responseSchema = z.array(
 const readers = new AsyncLocalStorage<DarwinCommandMarkReader>();
 
 /**
- * KERN_PROCARGS2 starts with argc, then the executable path and alignment NULs,
- * then exactly argc argv strings, then envp. Count argv, including empty strings:
- * searching the entire buffer for KEY= would let diagnostic argv authorize kills.
- * Python's isolated mode excludes user startup hooks and third-party modules.
+ * Foundation-owned buffers keep the JXA bridge independent of developer tools.
+ * Darwin's supported architectures use little-endian 32-bit MIB integers and an
+ * eight-byte size_t. Only the reserved value crosses the helper's output pipe.
  */
 const HELPER = String.raw`
-import ctypes, json, struct, sys
-libc = ctypes.CDLL(None, use_errno=True)
-libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
-libc.sysctl.restype = ctypes.c_int
-limit = ctypes.c_int()
-size = ctypes.c_size_t(ctypes.sizeof(limit))
-if libc.sysctl((ctypes.c_int * 2)(1, 8), 2, ctypes.byref(limit), ctypes.byref(size), None, 0) != 0 or not 0 < limit.value <= 32 * 1024 * 1024:
-    raise RuntimeError('Kernel argument limit unavailable')
-buffer = ctypes.create_string_buffer(limit.value)
-
-def mark(pid):
-    size = ctypes.c_size_t(len(buffer))
-    if libc.sysctl((ctypes.c_int * 3)(1, 49, pid), 3, buffer, ctypes.byref(size), None, 0) != 0:
-        raise ValueError('Process environment unavailable')
-    data = buffer.raw[:size.value]
-    if len(data) < 4:
-        raise ValueError('Missing argc')
-    argc = struct.unpack_from('=i', data)[0]
-    if argc <= 0 or argc > len(data):
-        raise ValueError('Invalid argc')
-    cursor = data.index(b'\0', 4) + 1
-    while cursor < len(data) and data[cursor] == 0:
-        cursor += 1
-    for _ in range(argc):
-        cursor = data.index(b'\0', cursor) + 1
-    found = None
-    while cursor < len(data):
-        end = data.index(b'\0', cursor)
-        entry = data[cursor:end]
-        if not entry:
-            return found
-        if entry.startswith(b'AGENTMONITORS_COMMAND_LIFE='):
-            if found is not None:
-                raise ValueError('Ambiguous duplicate mark')
-            found = entry.split(b'=', 1)[1].decode('utf-8', errors='strict')
-        cursor = end + 1
-    raise ValueError('Unterminated environment')
-
-for line in sys.stdin:
-    result = []
-    for pid in json.loads(line):
-        try:
-            result.append([pid, mark(pid), False])
-        except (ValueError, UnicodeError):
-            result.append([pid, None, True])
-    print(json.dumps(result), flush=True)
-`;
-
-/** CLT/Xcode absence is ordinary unavailability, never permission to invoke the shim. */
-async function hasDeveloperTools(): Promise<boolean> {
-  try {
-    if ((await stat('/Library/Developer/CommandLineTools')).isDirectory())
-      return true;
-  } catch {
-    /* Full Xcode can supply the interpreter without the standalone CLT directory. */
-  }
-  return new Promise((resolve) => {
-    execFile(
-      '/usr/bin/xcode-select',
-      ['-p'],
-      { timeout: 5_000, maxBuffer: 4096 },
-      (error) => {
-        resolve(error === null);
-      },
-    );
-  });
+ObjC.import('Foundation');
+ObjC.bindFunction('sysctl', ['int', ['void *', 'unsigned int', 'void *', 'void *', 'void *', 'unsigned long']]);
+${DARWIN_PROCARGS_PARSER}
+// Latin-1 preserves all kernel bytes, including NULs, without decoding argv/envp.
+function bytes(value) {
+  return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(value, $.NSISOLatin1StringEncoding));
 }
+// Native pointers always refer to Foundation-owned storage, kept alive for the
+// helper's lifetime. Reuse them instead of allocating bridge objects per PID.
+var mib = $.NSMutableData.dataWithLength(12);
+var size = $.NSMutableData.dataWithLength(8);
+var mibBytes = mib.mutableBytes;
+var sizeBytes = size.mutableBytes;
+// Write native little-endian integers into exclusively owned bridge storage.
+function writeInteger(pointer, offset, value, width) {
+  for (var i = 0; i < width; i++) {
+    pointer[offset + i] = value % 256;
+    value = Math.floor(value / 256);
+  }
+}
+// Read kernel sizes without allocating an Objective-C string per PID.
+function readInteger(pointer, width) {
+  var value = 0;
+  for (var i = width - 1; i >= 0; i--) value = value * 256 + pointer[i];
+  return value;
+}
+writeInteger(mibBytes, 0, 1, 4);
+writeInteger(mibBytes, 4, 8, 4);
+var limitBuffer = $.NSMutableData.dataWithLength(4);
+writeInteger(sizeBytes, 0, 4, 8);
+if ($.sysctl(mibBytes, 2, limitBuffer.mutableBytes, sizeBytes, null, 0) !== 0)
+  throw new Error('Kernel argument limit unavailable');
+var limit = readInteger(limitBuffer.bytes, 4);
+if (!(limit > 0 && limit <= 32 * 1024 * 1024)) throw new Error('Invalid argument limit');
+var output = $.NSMutableData.dataWithLength(limit);
+var outputBytes = output.mutableBytes;
+writeInteger(mibBytes, 4, 49, 4);
+// Only the returned byte count is parsed; stale bytes from earlier PIDs stay excluded.
+function query(pid) {
+  writeInteger(mibBytes, 8, pid, 4);
+  writeInteger(sizeBytes, 0, limit, 8);
+  if ($.sysctl(mibBytes, 3, outputBytes, sizeBytes, null, 0) !== 0)
+    throw new Error('Kernel environment unavailable');
+  var length = readInteger(sizeBytes, 8);
+  if (length > limit) throw new Error('Invalid kernel size');
+  return bytes(output.subdataWithRange($.NSMakeRange(0, length)));
+}
+var input = $.NSFileHandle.fileHandleWithStandardInput;
+var stdout = $.NSFileHandle.fileHandleWithStandardOutput;
+var pending = '';
+while (true) {
+  var chunk = input.availableData;
+  if (Number(chunk.length) === 0) break;
+  pending += bytes(chunk);
+  if (pending.length > 32 * 1024 * 1024) throw new Error('Request too large');
+  var newline;
+  while ((newline = pending.indexOf('\n')) >= 0) {
+    var pids = JSON.parse(pending.slice(0, newline));
+    pending = pending.slice(newline + 1);
+    var result = pids.map(function(pid) {
+      try { return [pid, parseDarwinProcargs(query(pid)), false]; }
+      catch (_) { return [pid, null, true]; }
+    });
+    stdout.writeData($.NSString.alloc.initWithString(JSON.stringify(result) + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+  }
+}
+`;
 
 /** Own one helper for the whole reconciliation, including exceptional exits. @internal */
 export async function withDarwinCommandMarkReader<T>(
@@ -143,22 +142,21 @@ class DarwinCommandMarkReader {
     this.close();
   }
 
-  /** Lazy startup leaves empty sweeps free of helper and developer-tool probes. */
-  private async start(): Promise<void> {
+  /** Lazy startup leaves empty sweeps free of helper processes. */
+  private start(): void {
     if (this.child || this.failure) return;
-    if (!(await hasDeveloperTools())) {
-      this.failure =
-        'macOS environment reader unavailable: Command Line Tools or Xcode required; Python shim was not launched';
-      return;
-    }
     // Reader infrastructure is not command work, even when a daemon was itself
     // launched by a marked command from an earlier life.
     const env = { ...process.env };
     delete env['AGENTMONITORS_COMMAND_LIFE'];
-    const child = spawn('/usr/bin/python3', ['-I', '-u', '-c', HELPER], {
-      env,
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
+    const child = spawn(
+      '/usr/bin/osascript',
+      ['-l', 'JavaScript', '-e', HELPER],
+      {
+        env,
+        stdio: ['pipe', 'pipe', 'ignore'],
+      },
+    );
     this.child = child;
     child.once('error', (error: NodeJS.ErrnoException) => {
       this.fail(`could not start (${error.code ?? 'unknown'})`);
@@ -196,7 +194,7 @@ class DarwinCommandMarkReader {
 
   /** Exactly one request owns the response handlers and deadline until it settles. */
   private async query(pids: readonly number[]): Promise<CommandMarks> {
-    await this.start();
+    this.start();
     if (this.failure) return { supported: false, reason: this.failure };
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -227,7 +225,7 @@ class DarwinCommandMarkReader {
         marks,
         unreadable,
         unreadableReason:
-          'macOS kernel process environment could not be read; ownership is unproven',
+          'macOS kernel process environment is unreadable or its argv/envp layout is ambiguous; ownership is unproven',
       };
     } catch {
       this.fail();
