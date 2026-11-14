@@ -22,3 +22,6 @@ apps/website/
 # would fight that check (and the bundled LICENSE has no Prettier parser).
 agent-plugins/
 .claude-plugin/
+
+# Integrity-checked upstream native payloads must retain their recorded bytes.
+**/vendor/koffi/

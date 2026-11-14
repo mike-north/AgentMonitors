@@ -975,7 +975,11 @@ under the exact session/workspace/monitor/object key, including after restart.
 The four admission operations (`ingest`, held flush, retry drain and notify reconciliation)
 automatically contribute every executed prepared write to the interruption inventory. Every
 other lifecycle write MUST match an explicit named exclusion or fail with its SQL and call
-site, even if runtime error handling catches the failure. Current exclusions are unarmed
+site, even if runtime error handling catches the failure. Classification diagnostics
+MUST be drained and checked, including after the final tick and at cleanup, and
+after watch consumption. Cleanup MUST report both an existing scenario failure and
+any classification failure, preserving the original cause chain and its stacks in normal
+test output alongside every SQL diagnostic. Current exclusions are unarmed
 startup/restart setup, the exact expired-object-suppression DELETE from its maintenance
 method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
 is checked separately). Delivery refresh reaches no additional durable writes in these
@@ -1192,6 +1196,10 @@ include the command report; the literal-path assertion also includes retained ob
 
 All rows below are covered by `apps/cli/src/commands/pr-alerting-presets.test.ts`, which drives the
 real `command-poll` source over the real scaffolded `watch:` block with only the `gh` binary stubbed
+and runs in the serial CLI configuration. Its interrupted-capture fixtures start real Node
+helpers within the authored command deadline; the spec does not promise CPU scheduling within
+that window when competing suites saturate the runner. Serial placement preserves the existing
+two-second command deadline and all capture/readiness assertions
 (see [003 §11.9](./003-source-plugins.md#119-pr-alerting-recipe-reviewer-and-author-roles)).
 
 | Scenario                                                                                                                                                                                                                                                                                                         | Coverage (describe block)                                                                                                                                                      |

@@ -15,7 +15,8 @@
     "agentmonitors": "./dist/index.cjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "vendor/koffi"
   ],
   "scripts": {
     "build": "tsup",

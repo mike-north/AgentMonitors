@@ -7,6 +7,7 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
+      '**/vendor/koffi/**',
       '**/temp/**',
       '**/node_modules/**',
       '**/.next/**',
@@ -81,7 +82,7 @@ export default tseslint.config(
   // languageOptions entry. `no-require-imports` is also disabled: this file is
   // intentionally CommonJS (the `require()` calls are its entire purpose).
   {
-    files: ['apps/agentmonitors/bin/**/*.cjs'],
+    files: ['apps/agentmonitors/bin/**/*.cjs', 'scripts/lib/koffi-loader.cjs'],
     ...tseslint.configs.disableTypeChecked,
     rules: {
       ...tseslint.configs.disableTypeChecked.rules,
@@ -89,7 +90,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['apps/agentmonitors/bin/**/*.cjs'],
+    files: ['apps/agentmonitors/bin/**/*.cjs', 'scripts/lib/koffi-loader.cjs'],
     languageOptions: {
       parserOptions: {
         projectService: false,

@@ -20,7 +20,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "vendor/koffi"
   ],
   "keywords": [
     "agentmonitor:observation-source"

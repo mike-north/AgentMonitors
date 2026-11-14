@@ -396,7 +396,10 @@ async function runOwnedLoop(
   dbPath: string,
   journal: CommandProcessJournal,
 ): Promise<void> {
-  const runtime = createRuntime(dbPath, journal);
+  // Source cancellation is independent of the tick await: shutdown must end
+  // in-flight command groups before the observation can hold the loop open.
+  const shutdown = new AbortController();
+  const runtime = createRuntime(dbPath, journal, shutdown.signal);
   let stopping = false;
   let wakeLoop: (() => void) | undefined;
   const server = createDaemonServer({
@@ -405,11 +408,13 @@ async function runOwnedLoop(
     reapAfterMs,
     onStop: () => {
       stopping = true;
+      shutdown.abort();
       wakeLoop?.();
     },
   });
   const stop = () => {
     stopping = true;
+    shutdown.abort();
     wakeLoop?.();
   };
   const isStoppingRequested = () => stopping;
@@ -582,6 +587,7 @@ async function runOwnedLoop(
         console.error(`AgentMon reaping check failed: ${message}`);
       }
 
+      if (isStoppingRequested()) break;
       await new Promise<void>((resolve) => {
         const timeout = setTimeout(() => {
           wakeLoop = undefined;
