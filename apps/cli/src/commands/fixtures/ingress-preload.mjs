@@ -512,6 +512,22 @@ globalThis.__ingressTestAttach = (Registry, Runtime) => {
     Runtime.prototype[name] = function (...args) {
       return lifecycle.run({ name, faulted: false }, async () => {
         const result = await original.apply(this, args);
+        // Model a future caught audit write after ingestion without adding a
+        // production branch. The driver must still diagnose this unowned SQL.
+        if (name === 'tick' && control.caughtWriteAfterTick) {
+          control = { ...control, caughtWriteAfterTick: false };
+          try {
+            this.store.recordObservationHistory({
+              monitorId: 'poll',
+              workspacePath: process.cwd(),
+              sourceName: 'api-poll',
+              result: 'errored',
+              observationData: { error: 'late caught audit probe' },
+            });
+          } catch {
+            // Best-effort audit handling must not conceal the driver's diagnostic.
+          }
+        }
         if (name === 'tick') process.send?.({ kind: 'tick', result });
         return result;
       });

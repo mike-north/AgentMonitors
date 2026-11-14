@@ -63,23 +63,41 @@ export async function bounded<T>(
   }
 }
 
-/** Consume a previously observed or future message without polling or sleeps. @internal */
-export async function message(
+/**
+ * Report every queued refusal, retaining all SQL diagnostics through cleanup.
+ * Refusals stay sticky so a caught helper rejection cannot make a scenario pass.
+ */
+function checkDiagnostics(owned: Owned): void {
+  const diagnostics = owned.messages.filter(
+    (value) => value.kind === 'unclassified-write',
+  );
+  if (diagnostics.length) {
+    throw new Error(
+      diagnostics
+        .map((value) => String(value['message'] ?? value['sql']))
+        .join('\n'),
+    );
+  }
+}
+
+/** A barrier must consume its acknowledgment before checking earlier diagnostics. */
+async function waitMessage(
   owned: Owned,
   predicate: (value: Message) => boolean,
+  checkQueuedDiagnostics: boolean,
 ): Promise<Message> {
   let release: (() => void) | undefined;
   try {
     return await bounded(
       new Promise<Message>((resolve, reject) => {
         const check = () => {
-          // A caught runtime error must not hide a missing inventory classification.
-          const unclassified = owned.messages.find(
-            (value) => value.kind === 'unclassified-write',
-          );
-          if (unclassified) {
-            reject(new Error(String(unclassified['message'])));
-            return;
+          if (checkQueuedDiagnostics) {
+            try {
+              checkDiagnostics(owned);
+            } catch (error) {
+              reject(new Error(String(error), { cause: error }));
+              return;
+            }
           }
           const index = owned.messages.findIndex(predicate);
           if (index >= 0) {
@@ -103,6 +121,14 @@ export async function message(
   }
 }
 
+/** Consume a previously observed or future message without polling or sleeps. @internal */
+export function message(
+  owned: Owned,
+  predicate: (value: Message) => boolean,
+): Promise<Message> {
+  return waitMessage(owned, predicate, true);
+}
+
 /** Always reap the exact child before unlinking its socket or database. @internal */
 export async function stop(owned: Owned): Promise<void> {
   owned.stopped ??= (async () => {
@@ -110,6 +136,9 @@ export async function stop(owned: Owned): Promise<void> {
     await bounded(owned.exit, 'Owned daemon exit');
   })();
   await owned.stopped;
+  // Child close follows the IPC channel drain, including diagnostics sent just
+  // before exit. Reaping remains unconditional even when classification fails.
+  checkDiagnostics(owned);
 }
 
 /** Real loopback HTTP, filesystem, socket, sessions and SQLite all belong to one case. @internal */
@@ -223,7 +252,8 @@ export async function fixture(source: Source, policy: Policy) {
   };
   const control = async (owned: Owned, command: Record<string, unknown>) => {
     owned.child.send(command);
-    await message(owned, (value) => value.kind === 'controlled');
+    await waitMessage(owned, (value) => value.kind === 'controlled', false);
+    checkDiagnostics(owned);
   };
   const tick = async (
     owned: Owned,
@@ -231,7 +261,7 @@ export async function fixture(source: Source, policy: Policy) {
   ): Promise<RuntimeTickResult> => {
     await control(owned, { now });
     // callDaemon has no close rejection; the owned exit bounds an abruptly closed request.
-    return bounded(
+    const result = await bounded(
       Promise.race([
         rpc<RuntimeTickResult>('daemon.tick', {
           monitorsDir: monitors,
@@ -243,6 +273,10 @@ export async function fixture(source: Source, policy: Policy) {
       ]),
       'Daemon tick',
     );
+    // Socket completion and child IPC are separate channels. A fresh control
+    // acknowledgment orders every diagnostic emitted before the completed tick.
+    await control(owned, {});
+    return result;
   };
   const open = (name: string, role = 'lead') =>
     rpc<{ id: string }>('session.open', {
@@ -267,7 +301,7 @@ export async function fixture(source: Source, policy: Policy) {
     // flush-only rounds never manufacture another filesystem transition.
     if (!flush) writeFileSync(watched, body);
     await control(owned, { writtenRound: currentRound });
-    return message(
+    const result = await message(
       owned,
       (value) =>
         value.kind === 'watch-error' ||
@@ -277,6 +311,10 @@ export async function fixture(source: Source, policy: Policy) {
             (Array.isArray(value['snapshots']) &&
               value['snapshots'].includes(expected)))),
     );
+    // watch-idle/watch-error is consumed before the final IPC drain, so queued
+    // diagnostics cannot hide behind the last successful watcher notification.
+    await control(owned, {});
+    return result;
   };
   const change = async (owned: Owned, value: string, now: number) => {
     body = value;
@@ -298,7 +336,8 @@ export async function fixture(source: Source, policy: Policy) {
     change,
     flush,
     open,
-    cleanup: async () => {
+    // Supply an existing scenario failure so cleanup reports both causes.
+    cleanup: async (failure?: { error: unknown }) => {
       const stopped = await Promise.allSettled(children.map(stop));
       // Direct exit is enough to restart; group confirmation is required before
       // unlinking fixtures. Check the two exclusively owned groups concurrently.
@@ -330,8 +369,15 @@ export async function fixture(source: Source, policy: Policy) {
       );
       if (failures.length)
         throw new AggregateError(
-          failures.map((result): unknown => result.reason),
-          'Owned process cleanup failed; fixture retained',
+          [
+            ...(failure ? [failure.error] : []),
+            ...failures.map((result): unknown => result.reason),
+          ],
+          [
+            'Owned process cleanup failed; fixture retained',
+            ...(failure ? [String(failure.error)] : []),
+            ...failures.map((result) => String(result.reason)),
+          ].join('\n'),
         );
       rmSync(root, { recursive: true, force: true });
     },

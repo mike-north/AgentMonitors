@@ -146,6 +146,7 @@ for (const source of ['poll', 'watch'] satisfies Source[])
       for (const stage of stages) {
         const discovery = await fixture(source, policy);
         let points: string[];
+        let discoveryFailure: { error: unknown } | undefined;
         try {
           const child = await discovery.start();
           await discovery.open('lead-a');
@@ -171,12 +172,16 @@ for (const source of ['poll', 'watch'] satisfies Source[])
           );
           if (process.env.INGRESS_TEST_INVENTORY === '1')
             console.log(JSON.stringify(points));
+        } catch (error) {
+          discoveryFailure = { error };
+          throw error;
         } finally {
-          await discovery.cleanup();
+          await discovery.cleanup(discoveryFailure);
         }
         for (const point of points)
           for (const mode of ['kill', 'fault']) {
             const f = await fixture(source, policy);
+            let scenarioFailure: { error: unknown } | undefined;
             try {
               const first = await f.start();
               const leadA = await f.open('lead-a');
@@ -243,10 +248,88 @@ for (const source of ['poll', 'watch'] satisfies Source[])
                 }),
               ).toEqual([]);
               assertDurableTruth(f, [leadA.id, leadB.id]);
+            } catch (error) {
+              scenarioFailure = { error };
+              throw error;
             } finally {
-              await f.cleanup();
+              await f.cleanup(scenarioFailure);
             }
           }
       }
     }, 180_000);
   }
+
+/** A successful RPC must not conceal a caught write after the last admission. */
+it('rejects a caught unclassified write after the final tick with its SQL', async () => {
+  const f = await fixture('poll', 'immediate');
+  let refused = false;
+  let failure: { error: unknown } | undefined;
+  try {
+    const child = await f.start();
+    await f.control(child, {
+      stage: 'accept',
+      trace: true,
+      caughtWriteAfterTick: true,
+    });
+    await expect(f.tick(child, epoch + 2000)).rejects.toThrow(
+      'Unclassified ingress write: insert into "observation_history"',
+    );
+    refused = true;
+  } catch (error) {
+    failure = { error };
+    throw error;
+  } finally {
+    // Expected refusals remain sticky even if the scenario catches tick's error.
+    if (refused) {
+      await expect(f.cleanup()).rejects.toThrow(
+        'Unclassified ingress write: insert into "observation_history"',
+      );
+    } else {
+      await f.cleanup(failure);
+    }
+  }
+});
+
+for (const boundary of ['stop', 'cleanup'] as const) {
+  it(`rejects queued classification diagnostics at ${boundary}`, async () => {
+    const f = await fixture('poll', 'immediate');
+    let cleaned = false;
+    try {
+      const child = await f.start();
+      // Model diagnostics already delivered after the last consumed message.
+      // Use two to require a full drain, with exact SQL retained for each.
+      for (const sql of [
+        'INSERT INTO late_a VALUES (1)',
+        'DELETE FROM late_b',
+      ]) {
+        child.messages.push({
+          kind: 'unclassified-write',
+          sql,
+          message: `Unclassified ingress write: ${sql}`,
+        });
+      }
+      const original = new Error('original scenario failure');
+      cleaned = boundary === 'cleanup';
+      const finished =
+        boundary === 'stop' ? stop(child) : f.cleanup({ error: original });
+      const error: unknown = await finished.catch(
+        (failure: unknown) => failure,
+      );
+      expect(String(error)).toContain('INSERT INTO late_a VALUES (1)');
+      expect(String(error)).toContain('DELETE FROM late_b');
+      if (boundary === 'cleanup') {
+        expect(error).toBeInstanceOf(AggregateError);
+        if (!(error instanceof AggregateError)) throw error;
+        expect(error.errors).toContain(original);
+        expect(String(error)).toContain('original scenario failure');
+      }
+    } finally {
+      if (!cleaned) {
+        await f.cleanup().catch((error: unknown) => {
+          expect(String(error)).toContain('INSERT INTO late_a VALUES (1)');
+          expect(String(error)).toContain('DELETE FROM late_b');
+        });
+      }
+    }
+  });
+}
