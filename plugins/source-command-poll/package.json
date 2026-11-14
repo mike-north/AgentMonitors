@@ -35,7 +35,7 @@
   },
   "dependencies": {
     "@agentmonitors/core": "workspace:*",
-    "koffi": "^3.3.8"
+    "koffi": "3.3.7"
   },
   "license": "MIT",
   "devDependencies": {

@@ -5,34 +5,13 @@ packages:
 allowBuilds:
   better-sqlite3: true
   esbuild: true
-  # Native exec returns errno without Node's process.execve abort path.
-  koffi: true
+  # Use the prebuilt platform package; never run the source build.
+  koffi: false
   nx: true
   sharp: true
 minimumReleaseAgeExclude:
   - js-yaml@3.15.2 || 4.3.2
   - glob@14.0.6
-  - '@koromix/koffi-android-arm64@3.3.8'
-  - '@koromix/koffi-android-x64@3.3.8'
-  - '@koromix/koffi-darwin-arm64@3.3.8'
-  - '@koromix/koffi-darwin-x64@3.3.8'
-  - '@koromix/koffi-freebsd-arm64@3.3.8'
-  - '@koromix/koffi-freebsd-ia32@3.3.8'
-  - '@koromix/koffi-freebsd-x64@3.3.8'
-  - '@koromix/koffi-linux-arm64@3.3.8'
-  - '@koromix/koffi-linux-arm@3.3.8'
-  - '@koromix/koffi-linux-ia32@3.3.8'
-  - '@koromix/koffi-linux-loong64@3.3.8'
-  - '@koromix/koffi-linux-ppc64@3.3.8'
-  - '@koromix/koffi-linux-riscv64@3.3.8'
-  - '@koromix/koffi-linux-x64@3.3.8'
-  - '@koromix/koffi-openbsd-arm64@3.3.8'
-  - '@koromix/koffi-openbsd-ia32@3.3.8'
-  - '@koromix/koffi-openbsd-x64@3.3.8'
-  - '@koromix/koffi-win32-arm64@3.3.8'
-  - '@koromix/koffi-win32-ia32@3.3.8'
-  - '@koromix/koffi-win32-x64@3.3.8'
-  - koffi@3.3.8
 # Keep security floors on the affected parent/major only. These overrides
 # protect this workspace; published unbundled paths still depend on upstream
 # ranges and direct package manifests, not on these consumer-local settings.
