@@ -6,6 +6,7 @@
  */
 import { execFile } from 'node:child_process';
 import { readFile, stat } from 'node:fs/promises';
+import { readDarwinCommandMarks } from './darwin-command-marks.js';
 import {
   parseProcStat,
   readProcessTable,
@@ -15,8 +16,8 @@ import {
 /** Environment key reserved for daemon command ownership. @public */
 export const COMMAND_LIFE_ENV = 'AGENTMONITORS_COMMAND_LIFE';
 
-/** Amortize system-query cost while keeping PID arguments far below macOS ARG_MAX. */
-const DARWIN_PID_BATCH_SIZE = 2048;
+/** Bound status-query argv below macOS ARG_MAX, independently of survivor count. */
+const DARWIN_STATUS_BATCH_SIZE = 2048;
 
 /** A missing mark is distinct from an unreadable mark. @internal */
 export type CommandMarks =
@@ -75,49 +76,7 @@ export async function readCommandMarks(
 ): Promise<CommandMarks> {
   const marks = new Map<number, string>();
   if (pids.length === 0) return { supported: true, marks };
-  if (process.platform === 'darwin') {
-    try {
-      const unreadable: number[] = [];
-      // ps combines argv and environment with no unambiguous boundary. Even a
-      // nonce-shaped argument cannot prove inheritance. Until an environment-only
-      // reader is available, identify same-user uncertainty without reading argv
-      // or environments at all. Limit every query to the requested identifiers.
-      for (
-        let offset = 0;
-        offset < pids.length;
-        offset += DARWIN_PID_BATCH_SIZE
-      ) {
-        const output = await systemRead('/bin/ps', [
-          '-p',
-          pids.slice(offset, offset + DARWIN_PID_BATCH_SIZE).join(','),
-          '-o',
-          'pid=,uid=',
-        ]);
-        const wanted = new Set(
-          pids.slice(offset, offset + DARWIN_PID_BATCH_SIZE),
-        );
-        for (const line of output.split('\n')) {
-          const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-          const pid = Number(match?.[1]);
-          if (wanted.has(pid) && Number(match?.[2]) === process.getuid?.())
-            unreadable.push(pid);
-        }
-      }
-      return {
-        supported: true,
-        marks,
-        unreadable,
-        unreadableReason:
-          'Actual process environments cannot be distinguished from argv by the macOS reader; ownership is unproven',
-      };
-    } catch (error) {
-      return {
-        supported: false,
-        reason:
-          error instanceof Error ? error.message : 'Ownership query failed',
-      };
-    }
-  }
+  if (process.platform === 'darwin') return readDarwinCommandMarks(pids);
   if (process.platform !== 'linux')
     return {
       supported: false,
@@ -160,6 +119,81 @@ export async function readCommandMarks(
 
 /** Whether the recorded incarnation has demonstrably stopped executing. @internal */
 export type CommandTerminalEvidence = 'terminated' | 'running' | 'unavailable';
+
+/**
+ * Confirm a macOS signal batch with one bounded status query. Missing ps rows
+ * are uncertainty until a fresh identity table proves absence or replacement;
+ * accepting SIGKILL alone never counts as termination. @internal
+ */
+export async function readDarwinCommandTerminals(
+  records: readonly ProcessIdentityRecord[],
+): Promise<ReadonlyMap<number, CommandTerminalEvidence>> {
+  const states = new Map<number, CommandTerminalEvidence>();
+  if (records.length === 0) return states;
+  const table = await readProcessTable();
+  if (table.supported) {
+    const current = new Map(
+      table.processes.map((record) => [record.pid, record]),
+    );
+    for (const record of records) {
+      if (current.get(record.pid)?.startTime !== record.startTime)
+        states.set(record.pid, 'terminated');
+    }
+  }
+  const remaining = records.filter((record) => !states.has(record.pid));
+  const byPid = new Map(records.map((record) => [record.pid, record]));
+  // Keep each native argv below ARG_MAX even on hosts with thousands of survivors.
+  for (
+    let offset = 0;
+    offset < remaining.length;
+    offset += DARWIN_STATUS_BATCH_SIZE
+  ) {
+    try {
+      const output = await systemRead('/bin/ps', [
+        '-p',
+        remaining
+          .slice(offset, offset + DARWIN_STATUS_BATCH_SIZE)
+          .map((record) => record.pid)
+          .join(','),
+        '-o',
+        'pid=,stat=,lstart=',
+      ]);
+      for (const line of output.split('\n')) {
+        const match = /^\s*(\d+)\s+(\S+)\s+(.+?)\s*$/.exec(line);
+        const record = byPid.get(Number(match?.[1]));
+        if (record && match?.[2] && match[3])
+          states.set(
+            record.pid,
+            match[3] !== record.startTime || /^[ZXx]/.test(match[2])
+              ? 'terminated'
+              : 'running',
+          );
+      }
+    } catch {
+      // ps exits nonzero when every requested process has already disappeared.
+      // A new identity reading below distinguishes that from a reader failure.
+    }
+  }
+  if (states.size < records.length) {
+    const fresh = await readProcessTable();
+    const current = new Map(
+      fresh.supported
+        ? fresh.processes.map((record) => [record.pid, record])
+        : [],
+    );
+    for (const record of records) {
+      if (!states.has(record.pid))
+        states.set(
+          record.pid,
+          fresh.supported &&
+            current.get(record.pid)?.startTime !== record.startTime
+            ? 'terminated'
+            : 'unavailable',
+        );
+    }
+  }
+  return states;
+}
 
 /**
  * A delivered SIGKILL alone is not a reap receipt: an uninterruptible process

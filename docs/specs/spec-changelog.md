@@ -9,6 +9,38 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-13 — Exact macOS executable alignment and helper startup abstention (008 §4.2) — Refs #618
+
+Use XNU's eight-byte target-pointer alignment after the executable path, excluding
+the separately returned argc. Require exactly the calculated NUL padding before
+counting nonempty argv entries; extra NULs, malformed padding and unproven envp
+remain unreadable. Native path residues must retain marks and be reaped on restart,
+while empty argv[0] at each residue retains an abstention. Synchronous helper spawn
+errors follow the same scope-wide unavailable-evidence path as emitted errors.
+
+## 2026-11-13 — Ambiguous initial argv and reused native buffers (008 §4.2) — Refs #618
+
+Count argv immediately after the executable path's terminator, abstaining on any
+additional NUL rather than guessing whether it is padding or an empty first argument.
+Native empty-first-argument and crafted padded/title-rewrite layouts must preserve
+ownership or explicit uncertainty, including durable discovery abstentions. Exercise
+the exact embedded bridge with full, shorter, failed and differently marked replies;
+only sysctl's returned byte count may supply a PID's evidence.
+
+## 2026-11-13 — macOS environment-only restart cleanup (008 §4.2) — Refs #618
+
+macOS ownership now comes from kernel `KERN_PROCARGS2` envp, after counting argv by
+argc. One asynchronous stock `/usr/bin/osascript -l JavaScript` helper calls sysctl
+through Foundation-owned buffers for discovery batches and fresh signal-time checks.
+No developer tools or Python shim are involved. Empty/padded argv entries, title rewrites
+and unproven envp boundaries are per-PID unreadability, never readable/unmarked evidence.
+Unavailable helpers and unreadable process environments retain explicit abstentions. Batch macOS final identity checks, individual signal gates, terminal
+evidence and receipt writes without weakening boot, mark or start-time verification.
+Helper completion, failure and timeout cleanup also uses the shared live-child
+signal gate; an already reaped helper receives no cleanup signal.
+Real restart tests require macOS command/descendant reaps. Reader tests cover argv-only
+marks, empty arguments, Homebrew-free PATH, optional tools and malformed evidence.
+
 ## 2026-11-13 — Retired verify-artifact repair interruption acceptance (#615)
 
 - **004 §3.4.2:** include the registered retired-artifact branch of both retry
