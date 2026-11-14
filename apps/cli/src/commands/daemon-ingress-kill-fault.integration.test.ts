@@ -4,14 +4,20 @@
  * recover work. Every discovered write occurrence gets a SIGKILL and a fault
  * scenario; clocks advance by command and readiness comes only from events.
  */
+import { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { Writable } from 'node:stream';
+import { setImmediate as nextTurn } from 'node:timers/promises';
 import Database from 'better-sqlite3';
 import { expect, it } from 'vitest';
+import { createVitest } from 'vitest/node';
 import type { MonitorEventRecord } from '@agentmonitors/core';
 import {
   epoch,
   fixture,
   message,
   stop,
+  type Message,
   type Owned,
   type Policy,
   type Source,
@@ -333,3 +339,121 @@ for (const boundary of ['stop', 'cleanup'] as const) {
     }
   });
 }
+
+/** Watch completion must wait for diagnostics ordered before the final IPC acknowledgment. */
+it('rejects a diagnostic after watch-idle before the final acknowledgment', async () => {
+  const f = await fixture('watch', 'immediate');
+  // This unspawned handle models IPC ordering only; it grants no process signal authority.
+  const child = new ChildProcess();
+  const owned: Owned = {
+    child,
+    messages: [],
+    changed: new EventEmitter(),
+    exit: Promise.resolve(),
+    dead: false,
+    output: '',
+  };
+  let round = 0;
+  const push = (value: Message): void => {
+    owned.messages.push(value);
+    owned.changed.emit('change');
+  };
+  child.send = (command) => {
+    if (typeof command !== 'object' || command === null) {
+      throw new Error('Expected an instrumentation control object');
+    }
+    if ('round' in command) {
+      round = Number(command.round);
+    }
+    if ('writtenRound' in command) {
+      queueMicrotask(() => {
+        push({ kind: 'controlled' });
+        push({ kind: 'watch-idle', round, snapshots: ['one'] });
+        // Separate turns force watch-idle to resolve before the diagnostic arrives.
+        setImmediate(() =>
+          push({
+            kind: 'unclassified-write',
+            sql: 'INSERT INTO late_watch VALUES (1)',
+            message:
+              'Unclassified ingress write: INSERT INTO late_watch VALUES (1)',
+          }),
+        );
+      });
+    } else if (Object.keys(command).length === 0) {
+      setImmediate(() => push({ kind: 'controlled' }));
+    } else {
+      queueMicrotask(() => push({ kind: 'controlled' }));
+    }
+    return true;
+  };
+  try {
+    await expect(f.change(owned, 'one', epoch + 2000)).rejects.toThrow(
+      'INSERT INTO late_watch VALUES (1)',
+    );
+  } finally {
+    await nextTurn();
+    await f.cleanup();
+  }
+});
+
+/** Cleanup must expose retry assertion causes through Vitest's normal error renderer. */
+it('renders the retry failure cause and every cleanup SQL diagnostic', async () => {
+  const f = await fixture('poll', 'immediate');
+  let cleaned = false;
+  try {
+    const child = await f.start();
+    const statements = [
+      'INSERT INTO display_probe VALUES (1)',
+      'DELETE FROM display_probe',
+    ];
+    for (const sql of statements) {
+      child.messages.push({
+        kind: 'unclassified-write',
+        sql,
+        message: `Unclassified ingress write: ${sql}`,
+      });
+    }
+    const assertion = new Error('underlying scenario assertion failure');
+    const original = new Error('retry stage context', { cause: assertion });
+    cleaned = true;
+    const error: unknown = await f
+      .cleanup({ error: original })
+      .catch((failure: unknown) => failure);
+    let rendered = '';
+    const output = new Writable({
+      write(chunk: Buffer, _encoding, done) {
+        rendered += chunk.toString();
+        done();
+      },
+    });
+    // Initialize a project for stack rendering, without collecting or running nested tests.
+    const vitest = await createVitest(
+      'test',
+      { config: false, root: f.root, watch: false },
+      {},
+      { stdout: output, stderr: output },
+    );
+    try {
+      vitest.logger.printError(error);
+      expect(rendered).toContain('retry stage context');
+      for (const sql of statements) {
+        expect(rendered).toContain(sql);
+      }
+      expect(rendered).toContain(
+        'Caused by: Error: underlying scenario assertion failure',
+      );
+      const causeOutput = rendered.split(
+        'Caused by: Error: underlying scenario assertion failure',
+      )[1];
+      expect(causeOutput).toMatch(
+        /daemon-ingress-kill-fault\.integration\.test\.ts:\d+:\d+/,
+      );
+    } finally {
+      await vitest.close();
+    }
+  } finally {
+    if (!cleaned) {
+      await f.cleanup();
+    }
+  }
+});

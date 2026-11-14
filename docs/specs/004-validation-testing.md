@@ -978,7 +978,8 @@ other lifecycle write MUST match an explicit named exclusion or fail with its SQ
 site, even if runtime error handling catches the failure. Classification diagnostics
 MUST be drained and checked, including after the final tick and at cleanup, and
 after watch consumption. Cleanup MUST report both an existing scenario failure and
-any classification failure, preserving the SQL diagnostics. Current exclusions are unarmed
+any classification failure, preserving the original cause chain and its stacks in normal
+test output alongside every SQL diagnostic. Current exclusions are unarmed
 startup/restart setup, the exact expired-object-suppression DELETE from its maintenance
 method, and an `errored` audit INSERT reporting the selected injected fault (whose outcome
 is checked separately). Delivery refresh reaches no additional durable writes in these

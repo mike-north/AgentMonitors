@@ -367,6 +367,8 @@ export async function fixture(source: Source, policy: Policy) {
       const failures = [...stopped, ...groups].filter(
         (result) => result.status === 'rejected',
       );
+      // Reporters traverse cause chains but may omit AggregateError.errors.
+      // Keep the original scenario and its nested assertion stacks renderable.
       if (failures.length)
         throw new AggregateError(
           [
@@ -378,6 +380,7 @@ export async function fixture(source: Source, policy: Policy) {
             ...(failure ? [String(failure.error)] : []),
             ...failures.map((result) => String(result.reason)),
           ].join('\n'),
+          failure ? { cause: failure.error } : undefined,
         );
       rmSync(root, { recursive: true, force: true });
     },
