@@ -1630,6 +1630,12 @@ EOF alone never releases the bound. This also covers background descendants that
 inherited descriptor. Re-sessioned descendants remain restart-sweep work. Windows command admission is
 unsupported and refused before spawn; the retained Windows cleanup path is not an admission fallback.
 
+Restart cleanup preserves the group's independent bound whenever it abstains on a member.
+The durable sweep receipt records why the remaining group members, including the watchdog,
+were left alone. The watchdog then enforces its original deadline and grace; fully verified
+groups are still reaped through the unchanged per-process identity gates
+([008 §4.2](./008-reliability-process-hygiene.md)).
+
 The source factory accepts an optional shutdown signal. Aborting it refuses pending/new
 admissions and forcefully terminates in-flight groups through the identity gate (or their still-live
 watchdog after leader exit), allowing the
