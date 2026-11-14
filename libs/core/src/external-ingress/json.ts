@@ -9,7 +9,7 @@
  * accessor. All proxies (including revoked ones) are rejected before reflection,
  * so neither proxy traps, accessors nor custom toJSON hooks can run. Native slot
  * tests and captured read-only intrinsic methods refuse detectable hidden state
- * after prototype replacement, including keys, Headers, FormData and Intl Segments.
+ * after prototype replacement, including keys, Headers and Intl Segments.
  *
  * The input domain is primitives, ordinary/null-prototype records and dense
  * ordinary arrays. The tested refusal list and each check are specified in
@@ -17,8 +17,8 @@
  * own enumerable data are outside this domain; callers MUST NOT pass them and
  * detection is not promised. Non-exhaustive tested examples include array,
  * string and RegExp-string iterators, iterator helpers/wrappers, SegmentIterator,
- * Request, Response and AbortController. Probes are captured at module load and
- * assume unmodified runtime built-ins, including Object.prototype, at that point.
+ * FormData, Request, Response and AbortController. Probes are captured at module
+ * load and assume unmodified runtime built-ins, including Object.prototype.
  *
  * First-violation order: bounds/scalar checks, proxy refusal, exact prototype,
  * native/read-only intrinsic brands, ancestor cycles, then own keys/descriptors
@@ -140,17 +140,16 @@ function captureIntlProbe(
 }
 
 /**
- * Undici's Headers/FormData inspectors enter private fields directly. A fresh
+ * Undici's Headers inspector enters private fields directly. A fresh
  * null-prototype options record prevents inherited option hooks; depth -1 and
- * customInspect:false prevent traversal into stored caller-controlled File data.
+ * customInspect:false keep inspection confined to the temporary header record.
  * Only the inspector's temporary presentation records/options can be changed.
- * Request/Response inspectors read receiver properties and are unsuitable.
+ * FormData inspects stored array methods and can mutate stored values;
+ * Request/Response inspectors read receiver properties. Those are unsuitable.
  */
-function captureShallowInspector(
-  prototype: object,
-): (value: object) => unknown {
+function captureHeadersProbe(): (value: object) => unknown {
   const method: unknown = Object.getOwnPropertyDescriptor(
-    prototype,
+    Headers.prototype,
     inspect.custom,
   )?.value;
   if (typeof method !== 'function') {
@@ -219,8 +218,7 @@ const readOnlyIntrinsicProbes = [
     )?.value,
     [0],
   ),
-  captureShallowInspector(Headers.prototype),
-  captureShallowInspector(FormData.prototype),
+  captureHeadersProbe(),
 ] as const;
 
 /** A successful intrinsic call proves a hidden brand; wrong receivers throw. */

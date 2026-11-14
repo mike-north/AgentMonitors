@@ -3405,12 +3405,11 @@ built-ins, including `Object.prototype`, at that point.
 | Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                   |
 | Intl Locale                                                                                                        | Captured `toString`                                                                                                                |
 | Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                             |
-| Headers / FormData                                                                                                 | Captured `util.inspect.custom` with depth -1 and fresh null-prototype options `{ depth: -1, customInspect: false, colors: false }` |
+| Headers                                                                                                            | Captured `util.inspect.custom` with depth -1 and fresh null-prototype options `{ depth: -1, customInspect: false, colors: false }` |
 
-The Headers/FormData inspectors read private fields into temporary presentation
-records. They do not consult receiver hooks, traverse stored caller-controlled
-File values, change stored entries, or advance existing cursors. Probes MUST NOT
-run caller code or mutate receiver state. WeakRef dereferencing retains its target
+The Headers inspector reads a private field into a temporary presentation
+record. It does not consult receiver hooks, change stored entries, or advance
+existing cursors. Probes MUST NOT run caller code or mutate receiver state. WeakRef dereferencing retains its target
 for the current job; it does not alter the receiver.
 
 The deterministic first-violation order is: depth-bound configuration and scalar
@@ -3428,10 +3427,14 @@ Any other object whose state is not held in its own enumerable data properties i
 outside the input domain. Callers MUST NOT pass it; the module makes no claim to
 detect it. **Non-exhaustive tested examples** that remain unrefused after prototype
 replacement include array/string/RegExp-string iterators, iterator helpers and
-wrappers, Intl SegmentIterator, Request, Response and AbortController. These are
-examples of unsupported inputs, not claims that no suitable detector could exist.
-The tested Request/Response methods require Web IDL prototype identity and their
-inspectors read receiver properties; the AbortController signal getter lazily
+wrappers, Intl SegmentIterator, FormData, Request, Response and AbortController.
+These are examples of unsupported inputs, not claims that no suitable detector
+could exist.
+FormData's inspector can call a stored array's own `push` method and mutate that
+stored value: its API permits arrays with `File.prototype`, and duplicate field
+names take that path even with negative inspection depth. It therefore fails the probe
+contract. The tested Request/Response methods require Web IDL prototype identity
+and their inspectors read receiver properties; the AbortController signal getter lazily
 creates state and its inspector reads a receiver property. These candidates do
 not meet this module's hook-free, non-mutating probe contract.
 
