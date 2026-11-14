@@ -2697,7 +2697,8 @@ monitor through the persisted pipeline state and returns stages for:
 1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
 3. Observation: recent `observation_history` rows and latest outcome
-4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
+4. Notify state: accepted debounce/rollup batches and active throttle suppression in
+   `monitor_state.notify_state`, including accepted batches beside definition failures
 5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
    `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
@@ -2710,13 +2711,15 @@ monitor through the persisted pipeline state and returns stages for:
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
 - `ok` — the stage produced the signal the next stage needs.
-- `pending` — the stage is intentionally holding (debounce/throttle) or has not run because an
+- `pending` — the stage is intentionally holding (debounce/rollup/throttle) or has not run because an
   upstream stage has not produced its input.
 - `healthy` — the stage ran successfully and the correct outcome was "no work to do": the watched
   target genuinely did not change. A `no-change` or `rebaselined` observation outcome is `healthy`,
-  **not** a `failure` — an idle monitor is not a bug. When the latest observation is `healthy`, the
-  downstream materialization and delivery stages report `healthy` rather than `failure` for the
-  expected absence of events/projections. The verdict for a genuinely idle monitor is therefore an
+  **not** a `failure` — an idle monitor is not a bug. When the latest observation is `healthy` and
+  no accepted notify batch remains, downstream materialization and delivery report `healthy`
+  rather than `failure` for the expected absence of events/projections. Accepted debounce/rollup
+  work from earlier ticks keeps those stages `pending` while no event has materialized; a quiet
+  latest tick cannot erase that work (005 §6, #574). The verdict for a genuinely idle monitor is therefore an
   affirmative `healthy` at the observation stage (e.g. "Source ran, observed 0 changes — your watched
   target genuinely hasn't changed (not a bug).").
 - `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, an outstanding dropped observation, terminal retained work, or a missing expected projection.
