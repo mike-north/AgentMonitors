@@ -4,7 +4,7 @@
  * PPIDs are never cleanup authority, and an emptied/recycled group is never
  * signalled numerically. Confirmed members go through the normal per-PID gate.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { readProcessTable, sendVerifiedSignal } from '@agentmonitors/core';
 import { ownedWorkerTerminated } from '../../../../../scripts/owned-worker-terminated.mjs';
@@ -123,6 +123,45 @@ export async function cleanupOwnedCaptureGroup(receipt, options = {}) {
   return receipt.group;
 }
 
+/**
+ * Capture the entire initial group while this recorder is itself a live member.
+ * A companion watchdog can outlive the wrapper and reader; recording it now
+ * preserves positive identity continuity for later fixture cleanup.
+ * @param {string} filename
+ * @param {number} group
+ * @param {{readTable?:typeof readProcessTable}} [options]
+ * @returns {Promise<void>}
+ * @internal
+ */
+export async function recordOwnedCaptureGroup(filename, group, options = {}) {
+  const table = await (options.readTable ?? readProcessTable)();
+  if (!table.supported) throw new Error(table.reason);
+  const self = table.processes.find((record) => record.pid === process.pid);
+  if (
+    !self ||
+    self.pgid !== group ||
+    !table.processes.some(
+      (record) => record.pid === group && record.pgid === group,
+    )
+  ) {
+    throw new Error(
+      'Capture recorder did not inherit the exclusive fixture group',
+    );
+  }
+  const records = table.processes.filter((record) => record.pgid === group);
+  writeFileSync(
+    filename,
+    [
+      String(group),
+      'ps',
+      ...records.map(
+        (record) => `${record.pid} ${record.pgid} ${record.startTime}`,
+      ),
+      '',
+    ].join('\n'),
+  );
+}
+
 /** The signal fixture can interrupt only its positively recorded wrapper, never a PPID guess. @param {string} filename @returns {Promise<void>} @internal */
 export async function signalOwnedCaptureRoot(filename) {
   const receipt = parseOwnedCaptureGroup(readFileSync(filename, 'utf8'));
@@ -139,5 +178,11 @@ export async function signalOwnedCaptureRoot(filename) {
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   if (!process.argv[2]) throw new Error('Missing owned capture receipt path');
-  await signalOwnedCaptureRoot(process.argv[2]);
+  if (process.argv[2] === 'record') {
+    if (!process.argv[3])
+      throw new Error('Missing capture receipt output path');
+    await recordOwnedCaptureGroup(process.argv[3], Number(process.argv[4]));
+  } else {
+    await signalOwnedCaptureRoot(process.argv[2]);
+  }
 }

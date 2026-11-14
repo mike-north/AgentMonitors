@@ -42,8 +42,14 @@ export function createTestBoundary() {
   const startedAt = Date.now();
   const first = inspectOpenFiles();
   const before = snapshotPaths(roots);
+  // Operators can restrict all coordinator/fixture writes to one owned temp tree.
+  // Keep the short POSIX default for ordinary macOS Unix-socket paths.
   const root = mkdtempSync(
-    path.join(process.platform === 'win32' ? tmpdir() : '/tmp', 'am-'),
+    path.join(
+      process.env.AGENTMONITORS_TEST_TEMP_ROOT ??
+        (process.platform === 'win32' ? tmpdir() : '/tmp'),
+      'am-',
+    ),
   );
   initializeNamespaceScope(root);
   let finished = false;
