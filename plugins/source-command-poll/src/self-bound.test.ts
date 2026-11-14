@@ -14,11 +14,28 @@ import source, { createCommandPollSource } from './index.js';
 
 import { restoreProcessGlobalsAfterEach } from './global-state.test-support.js';
 
+// Helper fault injection is a module seam: authored NODE_OPTIONS must never
+// instrument admission helpers or mutate their timers.
+const injected = vi.hoisted(() => ({ watchdog: '', launcher: '' }));
+vi.mock('./self-bound.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./self-bound.js')>();
+  return {
+    ...actual,
+    get WATCHDOG_PROGRAM() {
+      return injected.watchdog + actual.WATCHDOG_PROGRAM;
+    },
+    get LAUNCHER_PROGRAM() {
+      return injected.launcher + actual.LAUNCHER_PROGRAM;
+    },
+  };
+});
 restoreProcessGlobalsAfterEach();
 const intervalTimers = new Set<ReturnType<typeof setInterval>>();
 afterEach(() => {
   for (const timer of intervalTimers) clearInterval(timer);
   intervalTimers.clear();
+  injected.watchdog = '';
+  injected.launcher = '';
 });
 
 describe.skipIf(process.platform === 'win32')(
@@ -127,7 +144,7 @@ describe.skipIf(process.platform === 'win32')(
         health: 'failing',
       });
       expect(result.observations[0]?.payload).toMatchObject({
-        error: expect.stringContaining('SIGABRT'),
+        error: expect.stringContaining('ENOENT'),
       });
     });
 
@@ -267,24 +284,17 @@ describe.skipIf(process.platform === 'win32')(
     it('waits for watchdog timer registration before running authored work', async () => {
       const dir = mkdtempSync(path.join(tmpdir(), 'bound-order-'));
       const armed = path.join(dir, 'armed');
-      const preload = path.join(dir, 'timer-proof.cjs');
-      writeFileSync(
-        preload,
-        `
-      if (process.argv[1] && !JSON.parse(process.argv[1]).command) {
+      injected.watchdog = `
         const original = global.setTimeout;
         global.setTimeout = (...args) => {
           const timer = original(...args);
           require('node:fs').writeFileSync(${JSON.stringify(armed)}, 'armed');
           return timer;
         };
-      }
-    `,
-      );
+      `;
       const result = await source.observe(
         {
           command: ['/bin/sh', '-c', `test -f '${armed}' && printf ordered`],
-          env: { NODE_OPTIONS: '--require=' + preload },
           timeout: '2s',
         },
         { now: new Date() },
@@ -299,19 +309,10 @@ describe.skipIf(process.platform === 'win32')(
     it('fails closed when the watchdog cannot register its timer', async () => {
       const dir = mkdtempSync(path.join(tmpdir(), 'bound-arm-fail-'));
       const marker = path.join(dir, 'ran');
-      const preload = path.join(dir, 'break-timer.cjs');
-      writeFileSync(
-        preload,
-        `
-      if (process.argv[1] && !JSON.parse(process.argv[1]).command) {
-        global.setTimeout = () => { throw new Error('fixture: timer unavailable'); };
-      }
-    `,
-      );
+      injected.watchdog = `global.setTimeout = () => { throw new Error('fixture: timer unavailable'); };`;
       const result = await source.observe(
         {
           command: ['/bin/sh', '-c', `echo ran > '${marker}'`],
-          env: { NODE_OPTIONS: '--require=' + preload },
           timeout: '1s',
         },
         { now: new Date() },
@@ -367,10 +368,10 @@ describe.skipIf(process.platform === 'win32')(
     it('does not run an authored command when launcher startup fails', async () => {
       const dir = mkdtempSync(path.join(tmpdir(), 'bound-fail-'));
       const marker = path.join(dir, 'ran');
+      injected.launcher = `throw new Error('fixture: launcher unavailable');`;
       const result = await source.observe(
         {
           command: ['/bin/sh', '-c', `echo ran > '${marker}'`],
-          env: { NODE_OPTIONS: `--require=${path.join(dir, 'missing.cjs')}` },
           timeout: '1s',
         },
         { now: new Date() },

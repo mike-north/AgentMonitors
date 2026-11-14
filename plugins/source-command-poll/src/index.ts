@@ -1,5 +1,6 @@
 /** Execute finite, self-bounding command observations with optional durable ownership and shutdown cancellation. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { Socket } from 'node:net';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
@@ -356,6 +357,11 @@ async function runCommand(
   const inheritedEnv = scope.env
     ? { ...process.env, ...scope.env }
     : process.env;
+  // Helpers cannot execute authored Node preloads. The full command environment
+  // travels over a private pipe, avoiding argv limits and preserving even NODE_OPTIONS.
+  const commandEnv = { ...inheritedEnv, ...ownershipEnv };
+  const helperEnv = { ...commandEnv };
+  delete helperEnv['NODE_OPTIONS'];
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
@@ -369,13 +375,14 @@ async function runCommand(
           '--input-type=commonjs',
           '-e',
           LAUNCHER_PROGRAM,
-          JSON.stringify({
-            command: scope.command,
-            deadline,
-            grace: SIGKILL_GRACE_MS,
-            watchdog: WATCHDOG_PROGRAM,
-          }),
         ];
+    // Resolving the external native binding also works in packed ESM/CJS and
+    // the bundled CLI; only the isolated launcher loads it, never observe().
+    const native = isWindows
+      ? undefined
+      : createRequire(
+          typeof __filename === 'string' ? __filename : import.meta.url,
+        ).resolve('koffi');
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
@@ -384,10 +391,7 @@ async function runCommand(
       {
         cwd: effectiveCwd,
         // `env` is merged over the inherited daemon environment (003 §11.1).
-        env:
-          ownershipEnv === undefined
-            ? inheritedEnv
-            : { ...inheritedEnv, ...ownershipEnv },
+        env: isWindows ? commandEnv : helperEnv,
         shell: false,
         // POSIX: leader of its own process group/session, so the timeout escalation
         // can signal the whole tree at once (`killProcessTree` above) instead of only
@@ -397,9 +401,26 @@ async function runCommand(
         detached: !isWindows,
         stdio: isWindows
           ? ['ignore', 'pipe', 'pipe']
-          : ['ignore', 'pipe', 'pipe', 'pipe'],
+          : ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
       },
     );
+
+    const admission = child.stdio[4];
+    if (!isWindows && admission instanceof Duplex) {
+      admission.on('error', () => {
+        /* Child startup failure is reported by its exit. */
+      });
+      admission.end(
+        JSON.stringify({
+          command: scope.command,
+          env: commandEnv,
+          deadline,
+          grace: SIGKILL_GRACE_MS,
+          watchdog: WATCHDOG_PROGRAM,
+          native,
+        }),
+      );
+    }
 
     let settled = false;
     let timedOut = false;
@@ -407,12 +428,23 @@ async function runCommand(
     let armed = isWindows;
     let armingError: string | undefined;
     const control = child.stdio[3];
-    let controlInput = '';
-    if (control instanceof Duplex) {
+    if (control instanceof Duplex)
       control.on('error', () => {
+        /* Daemon loss cannot revoke the bound. */
+      });
+    // Node's type declaration names only the first five slots, but stdio is
+    // an ordinary array and this private protocol occupies the sixth descriptor.
+    const status = child.stdio.at(5);
+    let statusEnded = isWindows;
+    let pendingExit:
+      | { code: number | null; signal: NodeJS.Signals | null }
+      | undefined;
+    let controlInput = '';
+    if (status instanceof Duplex) {
+      status.on('error', () => {
         /* A vanished daemon/worker cannot revoke the bound. */
       });
-      control.on('data', (chunk: Buffer) => {
+      status.on('data', (chunk: Buffer) => {
         controlInput += chunk.toString();
         const lines = controlInput.split('\n');
         controlInput = lines.pop() ?? '';
@@ -436,6 +468,14 @@ async function runCommand(
             armingError = 'Invalid command lifetime-bound acknowledgement';
           }
         }
+      });
+    }
+    if (status instanceof Duplex) {
+      // EOF proves exec closed the launcher's private descriptor, or that its
+      // failure message has been fully consumed. Never race it with stdio exit.
+      status.once('end', () => {
+        statusEnded = true;
+        if (pendingExit) resolveFromExit(pendingExit.code, pendingExit.signal);
       });
     }
     let truncated = false;
@@ -564,6 +604,10 @@ async function runCommand(
       code: number | null,
       signal: NodeJS.Signals | null,
     ): void {
+      if (!statusEnded) {
+        pendingExit = { code, signal };
+        return;
+      }
       if (cancelled || !armed || armingError !== undefined) {
         finish({
           kind: 'failure',

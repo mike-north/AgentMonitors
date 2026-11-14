@@ -209,28 +209,15 @@ function monitor(
     const env={...process.env};
     if (${JSON.stringify(mode)}==='escaped'||${JSON.stringify(mode)}==='group-unmarked') delete env.AGENTMONITORS_COMMAND_LIFE;
     const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(leaf)}],{env,detached:${mode === 'detached' || mode === 'escaped'},stdio:['ignore',${inheritLeafStreams ? "'inherit','inherit'" : "'ignore','ignore'"},'ipc']});
-    fs.writeFileSync('pids.json',JSON.stringify({parent:process.pid,child:child.pid,detached:${mode === 'detached' || mode === 'escaped'}}));
+    fs.writeFileSync('pids.json',JSON.stringify({parent:process.pid,child:child.pid,life:process.env.AGENTMONITORS_COMMAND_LIFE,detached:${mode === 'detached' || mode === 'escaped'}}));
     child.on('message',(message)=>{if(message==='ready')child.send('arm');else if(message==='armed'){fs.writeFileSync('ready','ready');if(${exitLeader})process.exit(0)}});
     setInterval(()=>{},1000);
   `;
-  // The watchdog remains a marked member of this command life. Capture its
-  // identity before admission so the sweep must account for that exact process.
-  const preload = path.join(workspace, 'watchdog.cjs');
-  writeFileSync(
-    preload,
-    `
-    let admission;
-    try { admission=JSON.parse(process.argv[1]); } catch {}
-    if (admission && admission.deadline && !admission.command) {
-      require('node:fs').writeFileSync('watchdog.json', JSON.stringify({pid:process.pid,mark:process.env.AGENTMONITORS_COMMAND_LIFE}));
-    }
-  `,
-  );
   const dir = path.join(monitors, 'command');
   mkdirSync(dir);
   writeFileSync(
     path.join(dir, 'MONITOR.md'),
-    `---\nname: Restart cleanup\nwatch:\n  type: command-poll\n  command: ${JSON.stringify([process.execPath, '-e', fixture])}\n  timeout: ${timeout}\n  env:\n    NODE_OPTIONS: ${JSON.stringify('--require=' + preload)}\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
+    `---\nname: Restart cleanup\nwatch:\n  type: command-poll\n  command: ${JSON.stringify([process.execPath, '-e', fixture])}\n  timeout: ${timeout}\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
   );
 }
 
@@ -243,19 +230,29 @@ async function orphan(
   await expect
     .poll(() => existsSync(path.join(workspace, 'ready')), { timeout: 10_000 })
     .toBe(true);
-  const pids: { parent: number; child: number } = JSON.parse(
+  const pids: { parent: number; child: number; life: string } = JSON.parse(
     readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
   );
+  // Discover the one remaining member of this owned fixture's original group.
+  // Authored Node preloads cannot observe or instrument the isolated watchdog.
+  const table = await readProcessTable();
+  if (!table.supported) throw new Error(table.reason);
+  const watchdogs = table.processes.filter(
+    (member) =>
+      member.pgid === pids.parent &&
+      member.pid !== pids.parent &&
+      member.pid !== pids.child,
+  );
+  expect(watchdogs).toHaveLength(1);
+  const watchdog = watchdogs[0];
+  if (!watchdog) throw new Error('Owned watchdog is missing');
   const exit = once(daemon, 'exit');
   daemon.kill('SIGKILL');
   await bounded(exit, 'owned daemon crash');
   rmSync(path.join(monitors, 'command'), { recursive: true });
   expect(ownedWorkerTerminated(pids.parent)).toBe(false);
   expect(ownedWorkerTerminated(pids.child)).toBe(false);
-  const watchdog: { pid: number; mark: string } = JSON.parse(
-    readFileSync(path.join(workspace, 'watchdog.json'), 'utf8'),
-  );
-  return { ...pids, watchdog: watchdog.pid, life: watchdog.mark };
+  return { ...pids, watchdog: watchdog.pid };
 }
 
 describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
@@ -271,9 +268,8 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
             timeout: 5_000,
           })
           .toBe(true);
-        const pids: { parent: number; child: number } = JSON.parse(
-          readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
-        );
+        const pids: { parent: number; child: number; life: string } =
+          JSON.parse(readFileSync(path.join(workspace, 'pids.json'), 'utf8'));
         const exit = once(daemon, 'exit');
         daemon.kill('SIGKILL');
         await bounded(exit, 'owned daemon crash');
@@ -294,9 +290,8 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
             timeout: 5_000,
           })
           .toBe(true);
-        const pids: { parent: number; child: number } = JSON.parse(
-          readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
-        );
+        const pids: { parent: number; child: number; life: string } =
+          JSON.parse(readFileSync(path.join(workspace, 'pids.json'), 'utf8'));
         const exit = once(daemon, 'exit');
         daemon.kill(signal);
         await bounded(exit, 'graceful daemon exit');
@@ -314,7 +309,7 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
           timeout: 5000,
         })
         .toBe(true);
-      const pids: { parent: number; child: number } = JSON.parse(
+      const pids: { parent: number; child: number; life: string } = JSON.parse(
         readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
       );
       await expect.poll(() => ownedWorkerTerminated(pids.parent)).toBe(true);
@@ -336,7 +331,7 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
           timeout: 5000,
         })
         .toBe(true);
-      const pids: { parent: number; child: number } = JSON.parse(
+      const pids: { parent: number; child: number; life: string } = JSON.parse(
         readFileSync(path.join(workspace, 'pids.json'), 'utf8'),
       );
       await waitForOwnedGroupTermination(pids.parent, Date.now() + 3000);

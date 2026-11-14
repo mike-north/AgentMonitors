@@ -1585,10 +1585,14 @@ An asynchronous launcher starts an in-group watchdog and waits for its timer-arm
 acknowledgement before replacing itself with the authored command. The command retains its
 PID, process group and inherited ownership mark; argv remains literal. The launcher uses direct
 `execve`, preserving kernel symlink traversal and authored environment values without an
-interposed shell. Internal Node helpers explicitly select CommonJS mode; authored
-`NODE_OPTIONS` still reach the command unchanged. A native exec failure (including a missing
-shebang interpreter, which Node reports by aborting the launcher) is an execution failure,
-never an authored nonzero result, and preserves the prior successful baseline (§11.5). Arming failure is an
+interposed shell. The authored program starts with the default signal dispositions and empty
+signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node helpers start without
+`NODE_OPTIONS`; the complete authored/inherited environment, including those options, reaches
+only the command (apart from the ownership-mark override). The launcher calls libc `execve`
+through the packaged native binding, with a separate close-on-exec status pipe. Ordinary exec
+failures (ENOENT interpreter, ENOEXEC, EACCES, E2BIG) report errno and a short message naming
+the program, without a native abort, core file or crash report. They preserve failing health
+and the prior successful baseline (§11.5). Arming failure is an
 execution failure and no authored work runs. No synchronous subprocess, FIFO or blocking open
 runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute deadline
 and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its

@@ -143,6 +143,17 @@ original group and inherited life mark. Missing launcher support, failed watchdo
 failed timer registration or an elapsed admission deadline fails closed: authored work does
 not run, and observation health reports an execution failure.
 
+The launcher uses the packaged native binding to call libc `execve`, retaining the PID without
+a shell or Node's abort-on-exec-error path. It restores every catchable signal to its default
+and clears the signal mask before exec, matching normal spawn. A private close-on-exec status
+pipe carries arming/errno diagnostics and closes on successful replacement; settlement consumes
+its complete status before classifying an exit. Ordinary exec errors name the program and
+errno, preserve failing health and the previous baseline, and create no abort/core/crash report.
+Both Node helpers start without authored or inherited `NODE_OPTIONS`; the command receives
+the complete intended environment through a separate asynchronous configuration pipe, with
+only the deliberate ownership-mark override. Private descriptors close at exec; only standard
+input/output/error survive. Missing native binding support fails closed.
+
 Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
 blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals
 its **current group** with `kill(0, SIGTERM)` and `kill(0, SIGKILL)`. It never changes group;
@@ -165,7 +176,9 @@ delay, including the maximum configured timeout plus the grace, without integer 
 
 **Verified:** `plugins/source-command-poll/src/self-bound.test.ts` covers ordering, injected
 arming failure, restricted PATH, literal argv, preserved PID/mark, event-loop progress and
-absence of synchronous arming APIs. `watchdog-program.test.ts` covers self-group targeting,
+absence of synchronous arming APIs. `exec-semantics.test.ts` compares all native signal
+dispositions/mask bits with plain spawn on macOS/Linux, verifies errno diagnostics and absence
+of owned crash artifacts, and covers authored/inherited Node preload and module options. `watchdog-program.test.ts` covers self-group targeting,
 referenced timers after EOF, completion/shutdown self-group termination, clock correction and
 maximum-delay arithmetic. `global-state.test.ts` forces an actual nested test timeout and
 proves that the successor sees the original PATH and instrumentation.
