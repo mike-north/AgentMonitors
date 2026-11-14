@@ -1015,28 +1015,6 @@ const additionalIntrinsicFixtures: readonly (readonly [
   () => { value: object; witness: () => void },
 ])[] = [
   [
-    'Headers',
-    () => {
-      const value = new Headers([
-        ['a', 'one'],
-        ['b', 'two'],
-        ['c', 'three'],
-      ]);
-      const original = Object.getPrototypeOf(value) as unknown;
-      const cursor = value.entries();
-      expect(cursor.next().value).toEqual(['a', 'one']);
-      return {
-        value,
-        witness: () => {
-          Object.setPrototypeOf(value, original);
-          expect(value.get('b')).toBe('two');
-          expect(cursor.next().value).toEqual(['b', 'two']);
-          expect(cursor.next().value).toEqual(['c', 'three']);
-        },
-      };
-    },
-  ],
-  [
     'Intl.Segments',
     () => {
       const value = new Intl.Segmenter('en', { granularity: 'word' }).segment(
@@ -1240,6 +1218,167 @@ describe.each(jsonEntryPoints)(
         expect(stored).toHaveLength(2);
         expect(stored[0]).toBe(file);
         expect(stored[1]).toBe(file);
+      },
+    );
+  },
+);
+
+/** Prototype edits are confined to synchronous calls and always restored before assertions. */
+describe.each(jsonEntryPoints)(
+  'external JSON post-load descriptor fields through %s',
+  (_entry, run) => {
+    describe.each(['record', 'array'] as const)('container %s', (kind) => {
+      describe.each(['value', 'enumerable', 'get', 'set'] as const)(
+        'ignores inherited %s when refusing accessors',
+        (field) => {
+          it.each([false, true])('inherited getter=%s', (inheritedGetter) => {
+            let inputCalls = 0;
+            let inheritedCalls = 0;
+            const value = kind === 'record' ? {} : [];
+            const accessor = {
+              __proto__: null,
+              enumerable: true,
+              configurable: true,
+              get() {
+                inputCalls += 1;
+                return 123;
+              },
+              set(_value: unknown) {
+                inputCalls += 1;
+              },
+            };
+            Object.defineProperty(
+              value,
+              kind === 'record' ? 'x' : '0',
+              accessor,
+            );
+            const original = Object.getOwnPropertyDescriptor(
+              Object.prototype,
+              field,
+            );
+            // Null-prototype descriptor arguments remain valid even while the
+            // descriptor vocabulary itself is present on Object.prototype.
+            const poison = inheritedGetter
+              ? {
+                  __proto__: null,
+                  configurable: true,
+                  get() {
+                    inheritedCalls += 1;
+                    return 7;
+                  },
+                }
+              : { __proto__: null, configurable: true, value: 7 };
+            let error: unknown;
+            try {
+              Object.defineProperty(Object.prototype, field, poison);
+              try {
+                run(value);
+              } catch (caught) {
+                error = caught;
+              }
+            } finally {
+              Reflect.deleteProperty(Object.prototype, field);
+              if (original)
+                Object.defineProperty(Object.prototype, field, original);
+            }
+            expect(error).toBeInstanceOf(TypeError);
+            if (error instanceof Error) {
+              expect(error.message).toBe('Accessor or hidden property.');
+            }
+            expect(inputCalls).toBe(0);
+            expect(inheritedCalls).toBe(0);
+          });
+        },
+      );
+
+      it.each(['enumerable', 'get', 'set'] as const)(
+        'accepts data properties without reading inherited %s',
+        (field) => {
+          let calls = 0;
+          const value = kind === 'record' ? { x: 7 } : [7];
+          const original = Object.getOwnPropertyDescriptor(
+            Object.prototype,
+            field,
+          );
+          let error: unknown;
+          let result: unknown;
+          try {
+            const poison = {
+              __proto__: null,
+              configurable: true,
+              get() {
+                calls += 1;
+                throw new Error('inherited descriptor hook');
+              },
+            };
+            Object.defineProperty(Object.prototype, field, poison);
+            try {
+              result = run(value);
+            } catch (caught) {
+              error = caught;
+            }
+          } finally {
+            Reflect.deleteProperty(Object.prototype, field);
+            if (original)
+              Object.defineProperty(Object.prototype, field, original);
+          }
+          expect(error).toBeUndefined();
+          if (_entry === 'encoding') {
+            expect(result).toBe(kind === 'record' ? '{"x":7}' : '[7]');
+          }
+          expect(calls).toBe(0);
+        },
+      );
+    });
+  },
+);
+
+/** Headers is outside the plain-data domain; its inspector must never execute. */
+describe.each(jsonEntryPoints)(
+  'external JSON unsupported Headers through %s',
+  (_entry, run) => {
+    describe.each([null, Object.prototype])(
+      'record prototype %s',
+      (prototype) => {
+        it.each([false, true])(
+          'never invokes an inherited header setter throwing=%s',
+          (throws) => {
+            const name = 'x-review-499';
+            const value = new Headers([[name, 'one']]);
+            const originalPrototype = Object.getPrototypeOf(value) as unknown;
+            const original = Object.getOwnPropertyDescriptor(
+              Object.prototype,
+              name,
+            );
+            let calls = 0;
+            let error: unknown;
+            Object.setPrototypeOf(value, prototype);
+            try {
+              Object.defineProperty(Object.prototype, name, {
+                configurable: true,
+                set() {
+                  calls += 1;
+                  if (throws) throw new Error('inherited header setter');
+                },
+              });
+              // Unsupported inputs have no promised detection result, but probing
+              // them must not execute caller code or alter their stored contents.
+              try {
+                run(value);
+              } catch (caught) {
+                error = caught;
+              }
+            } finally {
+              Reflect.deleteProperty(Object.prototype, name);
+              if (original)
+                Object.defineProperty(Object.prototype, name, original);
+              Object.setPrototypeOf(value, originalPrototype);
+            }
+            if (error !== undefined) expect(error).toBeInstanceOf(TypeError);
+            expect(calls).toBe(0);
+            expect(value.get(name)).toBe('one');
+          },
+        );
       },
     );
   },
