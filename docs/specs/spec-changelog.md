@@ -9,6 +9,20 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-14 — Visible ingress cleanup failure causes (004 §3.4.2) — Refs #619
+
+Require cleanup to render the original scenario's cause chain and stacks in normal
+test output alongside every queued SQL diagnostic. Add deterministic coverage for
+watch-idle followed by a diagnostic before the final control acknowledgment.
+Validation coverage only; runtime behavior and public contracts are unchanged.
+
+## 2026-11-14 — Final ingress classification checks (004 §3.4.2) — Refs #619
+
+Require diagnostic drains after the final tick, after watch consumption and at
+cleanup, including child stop. A caught late audit write must fail with its SQL;
+cleanup must retain an existing scenario failure alongside classification errors.
+Validation coverage only; runtime behavior and public contracts are unchanged.
+
 ## 2026-11-14 — Ship native command admission inside published packages (003 §11; 008 §3.3) — Refs #470
 
 Vendor Koffi 3.3.7 JavaScript, MIT license and four unmodified prebuilds in the CLI and
