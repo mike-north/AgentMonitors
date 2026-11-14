@@ -1590,7 +1590,8 @@ interposed shell. The authored program starts with the default signal dispositio
 signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node helpers start without
 `NODE_OPTIONS`; the complete authored/inherited environment, including those options, reaches
 only the command (apart from the ownership-mark override). The launcher calls libc `execve`
-through the packaged native binding, with a separate close-on-exec status pipe. Ordinary exec
+through the packaged native binding, with a separate close-on-exec status pipe. Both ESM and
+CJS consumers resolve that binding relative to the source package itself. Ordinary exec
 failures (ENOENT interpreter, ENOEXEC, EACCES, E2BIG) report errno and a short message naming
 the program, without a native abort, core file or crash report. They preserve failing health
 and the prior successful baseline (§11.5). Arming failure is an

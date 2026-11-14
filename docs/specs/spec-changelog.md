@@ -14,7 +14,8 @@ Agent Monitors spec set in `docs/specs/`.
 Clarify current direct-exec behavior: default signal dispositions and an empty signal mask match
 normal spawn, helpers exclude authored/inherited Node options while the command retains them,
 and ordinary exec failures report errno and the program without a native abort or crash artifact.
-Unrepresentable NUL bytes in argv/environment fail closed instead of being truncated.
+Unrepresentable NUL bytes in argv/environment fail closed instead of being truncated. ESM/CJS
+consumers retain package-relative native binding resolution, including CommonJS eval callers.
 A packaged native binding calls libc execve; a separate close-on-exec status pipe orders errors
 before settlement. Native signal-state, preload-isolation and exec-error regressions verify both
 platforms. Existing guarantees remain: kernel path traversal and authored environment values

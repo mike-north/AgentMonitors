@@ -378,11 +378,11 @@ async function runCommand(
         ];
     // Resolving the external native binding also works in packed ESM/CJS and
     // the bundled CLI; only the isolated launcher loads it, never observe().
+    // ESM must prefer its own URL over globals exposed by CommonJS eval callers;
+    // the CJS bundle replaces import.meta with an empty object and uses its filename.
     const native = isWindows
       ? undefined
-      : createRequire(
-          typeof __filename === 'string' ? __filename : import.meta.url,
-        ).resolve('koffi');
+      : createRequire(import.meta.url || __filename).resolve('koffi');
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
