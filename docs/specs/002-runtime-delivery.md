@@ -3383,7 +3383,12 @@ It is independent of `runtime/retry-envelope.ts`: retained retries continue to u
 `serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
 `observedAt` Date. External JSON permits no Date values.
 
-Records with `Object.prototype` or a null prototype are accepted. Arrays MUST be
+Records with `Object.prototype` or a null prototype are accepted only after native
+brand checks exclude detectable intrinsic state. Replacing a Date, collection,
+boxed primitive, buffer/view, promise, error, iterator, generator, arguments,
+module namespace, cryptographic key or native external value's prototype MUST NOT
+make it a record: that would discard hidden state and produce false equality.
+These checks MUST NOT consult serialization or brand hooks. Arrays MUST be
 dense ordinary arrays with exactly `Array.prototype`, enumerable data elements,
 and no own properties other than their indices and built-in data `length`.
 Frozen arrays are allowed. Sparse, subclassed, custom-prototype and typed arrays
@@ -3395,7 +3400,11 @@ without calling accessors, proxy traps or custom serialization hooks.
 
 The caller selects inclusive container depth through
 `assertExternalJsonValue(value, initialDepth, maxDepth)`. Both bounds MUST be
-nonnegative safe integers with `initialDepth <= maxDepth`. The root container
+nonnegative safe integers with `initialDepth <= maxDepth <= 512`. Larger
+configurations MUST throw `TypeError` before inspecting the value. This supported
+maximum bounds recursive traversal; a 100,000-container input with maximum
+99,999 is an invalid configuration, rather than an accepted traversal that can
+exhaust the stack. The root container
 uses `initialDepth`; each child container adds one. Scalars consume no container
 level, so `{ child: { value: true } }` is accepted at initial depth 1 and maximum
 2, but `{ child: { child: {} } }` is refused. `canonicalJsonStringify` starts at
@@ -3403,7 +3412,15 @@ level, so `{ child: { value: true } }` is accepted at initial depth 1 and maximu
 root as depth 1 and set maximum 32.
 
 Object keys MUST sort recursively by UTF-16 order; array order MUST remain
-unchanged. Negative zero canonicalizes to zero. Cycles MUST be refused; a shared
+unchanged. Numbers MUST be finite and integer-valued numbers MUST be safe
+integers regardless of source notation: `1e21` and `-1.5e300` are refused as unsafe
+integers, while the fractions `1e-7` and `5e-324` encode as `1e-7` and `5e-324`.
+Negative zero canonicalizes to `0`. Strings use JSON escaping: quotes
+and backslashes are escaped, U+0000–U+001F use their short escapes or lowercase
+`\uXXXX` escapes, and U+007F, non-ASCII characters and paired astral characters
+remain literal. Lone surrogate code units MUST use lowercase `\uXXXX` escapes
+(for example, a lone high surrogate U+D800 encodes as `"\ud800"`), so parsing
+returns the same JavaScript string without replacing a code unit. Cycles MUST be refused; a shared
 acyclic child is serialized by value for each occurrence. Validation MUST stop
 at the first invalid member in own-key order before reading later descriptors
 or traversing later child values. It enumerates each container's own keys once;
@@ -3414,5 +3431,7 @@ Validation: `libs/core/src/external-ingress/json.test.ts` covers descriptor and
 proxy non-execution, the array policy, exact and excessive object/array depth
 (including nonzero initial depth), invalid bounds, cycles/shared children,
 equivalence tables, deterministic generated key permutations, and early refusal
-in large inputs. Retained-retry, polled-source and watched-source suites continue
+in large inputs. Intrinsic replacement-prototype matrices, the supported maximum,
+100,000-container configuration refusals and hand-written numeric/string byte
+vectors also enforce this boundary. Retained-retry, polled-source and watched-source suites continue
 to validate their existing independent contracts.

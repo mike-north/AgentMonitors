@@ -7,14 +7,23 @@
  * indices and built-in data length. Frozen arrays are accepted; sparse, subclassed,
  * custom-prototype and typed arrays are rejected. A real array cannot have a length
  * accessor. All proxies (including revoked ones) are rejected before reflection,
- * so neither proxy traps, accessors nor custom toJSON hooks can run.
+ * so neither proxy traps, accessors nor custom toJSON hooks can run. Native Node
+ * brand checks reject intrinsic state even after a built-in prototype is replaced;
+ * prototype identity alone does not establish that a value is a data record.
  *
  * Only containers consume depth: the root container is at initialDepth, each child
  * container adds one, and maxDepth is inclusive. Scalars below the last permitted
  * container remain valid. For example, initialDepth=1/maxDepth=2 permits two nested
  * containers; initialDepth=0/maxDepth=0 permits one. Stringification starts at zero
  * with maxDepth=512, permitting 513 containers. Bounds must be nonnegative safe
- * integers with initialDepth <= maxDepth.
+ * integers with initialDepth <= maxDepth <= 512. Larger configurations are refused
+ * before inspecting input, keeping recursive traversal within a supported bound.
+ *
+ * Numbers must be finite, and integer-valued numbers must be safe integers,
+ * including numbers written with exponents (so 1e21 and -1.5e300 are refused).
+ * Numeric and string bytes follow JSON.stringify for the accepted scalar domain;
+ * negative zero encodes as 0. Lone surrogate code units use lowercase Unicode
+ * escapes, preserving the original JavaScript string when parsed.
  *
  * Cycles are rejected, while shared acyclic children are encoded by value at each
  * occurrence. Members are validated and encoded in own-key order, stopping at the
@@ -25,6 +34,39 @@
  * and canonical sorting costs O(k log k) for k accepted object keys.
  */
 import { types } from 'node:util';
+
+/** Inclusive supported container depth, shared by validation and encoding. */
+const MAX_SUPPORTED_DEPTH = 512;
+
+/**
+ * Native internal-slot predicates do not consult properties, prototypes or hooks.
+ * Built-ins keep hidden state after prototype replacement; encoding them as records
+ * would discard that state and create false equality with unrelated JSON values.
+ * Arrays have their own brand and plain-array policy below, never the record path.
+ */
+function hasUnsupportedIntrinsicState(value: object): boolean {
+  return (
+    types.isDate(value) ||
+    types.isRegExp(value) ||
+    types.isMap(value) ||
+    types.isSet(value) ||
+    types.isWeakMap(value) ||
+    types.isWeakSet(value) ||
+    types.isBoxedPrimitive(value) ||
+    types.isAnyArrayBuffer(value) ||
+    types.isArrayBufferView(value) ||
+    types.isPromise(value) ||
+    types.isNativeError(value) ||
+    types.isMapIterator(value) ||
+    types.isSetIterator(value) ||
+    types.isGeneratorObject(value) ||
+    types.isArgumentsObject(value) ||
+    types.isModuleNamespaceObject(value) ||
+    types.isKeyObject(value) ||
+    types.isCryptoKey(value) ||
+    types.isExternal(value)
+  );
+}
 
 /** A plain-data JSON value; negative zero canonicalizes to zero. @internal */
 export type ExternalJsonValue =
@@ -67,6 +109,9 @@ function encodeCanonical(
   // Descriptor and prototype inspection are safe only after excluding proxies.
   if (types.isProxy(value)) {
     throw new TypeError('Proxy JSON value.');
+  }
+  if (hasUnsupportedIntrinsicState(value)) {
+    throw new TypeError('Intrinsic object state is not plain JSON data.');
   }
   if (ancestors.has(value)) {
     throw new TypeError('Cyclic JSON value.');
@@ -153,7 +198,8 @@ export function assertExternalJsonValue(
     !Number.isSafeInteger(initialDepth) ||
     !Number.isSafeInteger(maxDepth) ||
     initialDepth < 0 ||
-    maxDepth < initialDepth
+    maxDepth < initialDepth ||
+    maxDepth > MAX_SUPPORTED_DEPTH
   ) {
     throw new TypeError('Invalid JSON depth bounds.');
   }
@@ -170,5 +216,5 @@ export function assertExternalJsonValue(
  * @internal
  */
 export function canonicalJsonStringify(value: unknown): string {
-  return encodeCanonical(value, 0, 512, new Set());
+  return encodeCanonical(value, 0, MAX_SUPPORTED_DEPTH, new Set());
 }
