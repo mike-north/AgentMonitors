@@ -1,5 +1,12 @@
 # @agentmonitors/source-file-fingerprint
 
+## 0.5.2
+
+### Patch Changes
+
+- Updated dependencies [3a00022]
+  - @agentmonitors/core@0.15.1
+
 ## 0.5.1
 
 ### Patch Changes
