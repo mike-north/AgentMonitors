@@ -8,13 +8,15 @@ function layout(
   argv: readonly string[],
   env: readonly string[],
   argc = argv.length,
-  padding = '',
+  padding = '\0\0',
+  execPath = '/node',
 ): string {
   const header = Buffer.alloc(4);
   header.writeInt32LE(argc);
   return (
     header.toString('latin1') +
-    '/node\0' +
+    execPath +
+    '\0' +
     padding +
     argv.join('\0') +
     '\0' +
@@ -56,42 +58,17 @@ it('uses only exact environment keys after all argc arguments', () => {
   ).toBeNull();
 });
 it.each([
-  // Initial NULs have no tag distinguishing exec-path padding from argv[0].
-  // The ownership entry is first so swallowing it cannot silently look unmarked.
-  ...['', '\0', '\0\0\0'].flatMap((padding) => [
-    layout(
-      ['', '-e', 'worker'],
-      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
-      3,
-      padding,
-    ),
-    layout(
-      ['', '', 'worker'],
-      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
-      3,
-      padding,
-    ),
-    layout(
-      ['', '/node', 'NAME=value'],
-      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
-      3,
-      padding,
-    ),
-    layout(
-      ['', 'worker', ''],
-      ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
-      3,
-      padding,
-    ),
-  ]),
-  // Even plausible nonempty argv after padding cannot prove that argv[0] exists.
+  // Only the kernel's exact bounded alignment is admissible; empty argv stays uncertain.
   layout(
-    ['/node', 'worker'],
+    ['', '-e', 'worker'],
     ['AGENTMONITORS_COMMAND_LIFE=owned', 'OTHER=value'],
-    2,
-    '\0',
   ),
-  layout(['worker', '', ''], ['AGENTMONITORS_COMMAND_LIFE=owned'], 3, '\0\0'),
+  layout(['', '', 'worker'], ['AGENTMONITORS_COMMAND_LIFE=owned']),
+  layout(['', '/node', 'NAME=value'], ['AGENTMONITORS_COMMAND_LIFE=owned']),
+  layout(['', 'worker', ''], ['AGENTMONITORS_COMMAND_LIFE=owned']),
+  layout(['/node'], ['AGENTMONITORS_COMMAND_LIFE=owned'], 1, '\0x'),
+  layout(['/node'], ['AGENTMONITORS_COMMAND_LIFE=owned'], 1, '\0'),
+  layout(['/node'], ['AGENTMONITORS_COMMAND_LIFE=owned'], 1, '\0\0\0'),
   layout(['/node', '', 'AGENTMONITORS_COMMAND_LIFE=argv'], ['OTHER=value']),
   layout(['worker', '', ''], ['AGENTMONITORS_COMMAND_LIFE=retained']),
   layout(['/node'], []),
@@ -108,5 +85,38 @@ it.each([
   'withholds evidence for ambiguous, padded, duplicate or truncated layouts (%#)',
   (data) => {
     expect(() => parse(data)).toThrow();
+  },
+);
+
+// The executable path, excluding argc, determines 64-bit pointer alignment.
+it.each(Array.from({ length: 8 }, (_, residue) => residue))(
+  'accepts exact path alignment at residue %i and rejects an empty first argument',
+  (residue) => {
+    const execPath = '/node' + 'x'.repeat(residue);
+    const padding = '\0'.repeat(
+      (8 - ((Buffer.byteLength(execPath) + 1) % 8)) % 8,
+    );
+    expect(
+      parse(
+        layout(
+          [execPath, 'worker'],
+          ['AGENTMONITORS_COMMAND_LIFE=owned'],
+          2,
+          padding,
+          execPath,
+        ),
+      ),
+    ).toBe('owned');
+    expect(() =>
+      parse(
+        layout(
+          ['', 'worker'],
+          ['AGENTMONITORS_COMMAND_LIFE=owned'],
+          2,
+          padding,
+          execPath,
+        ),
+      ),
+    ).toThrow();
   },
 );

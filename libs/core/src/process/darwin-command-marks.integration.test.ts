@@ -1,7 +1,7 @@
 /** Kernel ownership evidence must never confuse diagnostic arguments with envp. */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtempSync } from 'node:fs';
+import { copyFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
@@ -133,4 +133,79 @@ it.skipIf(process.platform !== 'darwin').each(['retitled', 'empty-argv0'])(
       journal.close();
     }
   },
+);
+
+/** Every executable-path residue must retain ownership through durable restart discovery. */
+it.skipIf(process.platform !== 'darwin')(
+  'reaps aligned native paths at every residue and abstains on empty argv0',
+  async () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'align-'));
+    const db = path.join(root, 'db');
+    const journal = CommandProcessJournal.open(db, root);
+    try {
+      const life = await journal.environment();
+      const ordinary: number[] = [];
+      const empty: number[] = [];
+      for (let residue = 0; residue < 8; residue++) {
+        const executable = path.join(root, 'n' + 'x'.repeat(residue));
+        copyFileSync(process.execPath, executable);
+        for (const emptyFirst of [false, true]) {
+          const child = spawn(
+            executable,
+            ['-e', 'setInterval(()=>{},1000);process.send("ready")'],
+            {
+              cwd: root,
+              argv0: emptyFirst ? '' : executable,
+              detached: true,
+              env: { ...life, PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
+              stdio: ['ignore', 'ignore', 'ignore', 'ipc'],
+            },
+          );
+          children.push(child);
+          await once(child, 'message');
+          if (child.pid === undefined)
+            throw new Error('Missing aligned fixture PID');
+          (emptyFirst ? empty : ordinary).push(child.pid);
+        }
+      }
+      const reading = await readCommandMarks([...ordinary, ...empty]);
+      expect(reading.supported).toBe(true);
+      if (!reading.supported) throw new Error(reading.reason);
+      expect([...reading.marks.keys()].sort()).toEqual([...ordinary].sort());
+      expect(reading.unreadable?.sort()).toEqual([...empty].sort());
+      const sql = new Database(`${db}.commands.sqlite`);
+      try {
+        sql.prepare('UPDATE command_lives SET owner=?').run(
+          JSON.stringify({
+            pid: 2147483647,
+            pgid: 2147483647,
+            startTime: 'dead',
+          }),
+        );
+      } finally {
+        sql.close();
+      }
+      const restarted = CommandProcessJournal.open(db, root);
+      try {
+        const receipt = await restarted.sweep();
+        for (const pid of ordinary)
+          expect(receipt.outcomes).toContainEqual(
+            expect.objectContaining({ pid, status: 'reaped' }),
+          );
+        for (const pid of empty)
+          expect(receipt.outcomes).toContainEqual(
+            expect.objectContaining({
+              pid,
+              status: 'abstained',
+              reason: expect.stringMatching(/environment|ownership/i),
+            }),
+          );
+      } finally {
+        restarted.close();
+      }
+    } finally {
+      journal.close();
+    }
+  },
+  30_000,
 );

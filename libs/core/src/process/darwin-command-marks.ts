@@ -6,7 +6,12 @@
  * participates. Foundation owns the native buffers passed to the sysctl bridge.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  spawn,
+  type ChildProcess,
+  type ChildProcessByStdio,
+} from 'node:child_process';
+import type { Readable, Writable } from 'node:stream';
 import { z } from 'zod';
 import { DARWIN_PROCARGS_PARSER } from './darwin-procargs.js';
 import type { CommandMarks } from './command-process-marks.js';
@@ -149,14 +154,25 @@ class DarwinCommandMarkReader {
     // launched by a marked command from an earlier life.
     const env = { ...process.env };
     delete env['AGENTMONITORS_COMMAND_LIFE'];
-    const child = spawn(
-      '/usr/bin/osascript',
-      ['-l', 'JavaScript', '-e', HELPER],
-      {
+    let child: ChildProcessByStdio<Writable, Readable, null>;
+    try {
+      // Keep the fixed script in argv so startup needs no temporary executable
+      // file or competing stdin framing. ARG_MAX applies to env plus argv;
+      // exhaustion is unavailable evidence, just like an emitted spawn failure.
+      child = spawn('/usr/bin/osascript', ['-l', 'JavaScript', '-e', HELPER], {
         env,
         stdio: ['pipe', 'pipe', 'ignore'],
-      },
-    );
+      });
+    } catch (error) {
+      const code =
+        error instanceof Error &&
+        'code' in error &&
+        typeof error.code === 'string'
+          ? error.code
+          : 'unknown';
+      this.fail(`could not start (${code})`);
+      return;
+    }
     this.child = child;
     child.once('error', (error: NodeJS.ErrnoException) => {
       this.fail(`could not start (${error.code ?? 'unknown'})`);

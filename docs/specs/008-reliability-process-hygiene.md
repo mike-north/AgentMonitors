@@ -240,9 +240,13 @@ Ownership MUST come from the actual process environment, never matching argv tex
 then only envp supplies ownership. Nonce-shaped arguments never become ownership. Empty or
 padded argv entries, including process-title rewrites, and an unproven envp boundary are
 unreadable for that PID; they MUST NOT be reported as readable and unmarked. The reader
-starts counting immediately after the executable path's terminator. Additional NULs
-cannot be distinguished from an empty `argv[0]`; it MUST abstain rather than skip them
-as presumed alignment padding, even when a padded layout could otherwise parse.
+skips exactly `(8 - ((execPathByteLength + 1) % 8)) % 8` NUL bytes after the
+executable path terminator, as established by XNU's target-pointer alignment on
+64-bit Intel and Apple silicon. The separately returned four-byte argc is excluded
+from that calculation. Every expected padding byte MUST be NUL; missing/non-NUL
+padding or any extra NUL at argv[0] makes that PID unreadable. It MUST NOT scan for
+a mark or skip an unbounded NUL run. XNU copies the process's live string area;
+process-title rewrites do not update the saved argc or provide a new envp boundary.
 Every counted argv entry must be nonempty. The helper parses only the byte count
 returned by each successful sysctl call, never the unused remainder of its reused
 allocation; a short reply or failed call cannot borrow an earlier PID's evidence.
@@ -254,7 +258,7 @@ Discovery and fresh signal-time checks reuse that helper; no subprocess starts p
 The helper calls system libc through JXA's Objective-C bridge with Foundation-owned MIB,
 output and size buffers. It needs only stock macOS, with no developer tools, Homebrew,
 native addon or shipped binary. The daemon never invokes Python or developer-tool probes.
-An interpreter that cannot run, times out or returns invalid evidence makes the sweep
+A helper startup failure (synchronous or emitted), timeout or invalid evidence makes the sweep
 incomplete with a reason. An unreadable process environment (including protected executables,
 another user's processes, exit races and ambiguous argv/envp layouts) records a PID-specific
 abstention with a reason, never an unmarked/owned guess.

@@ -7,4 +7,4 @@ Reap orphaned command processes on macOS after a daemon restart using kernel env
 
 Use Foundation-owned buffers to call sysctl without developer tools. Record conservative abstentions with reasons when the helper is unavailable or a process environment cannot be read. Treat empty or padded argv entries, process-title rewrites and an unproven envp boundary as per-PID unreadability rather than silently reporting the process unmarked.
 
-Never skip NULs after the executable path as presumed alignment: they could be an empty first argument. Bound each parse to sysctl's returned byte count so shorter replies cannot inherit ownership evidence from a previous PID's buffer.
+Skip only the exact all-NUL executable-path alignment established by XNU for 64-bit macOS; any extra NUL still makes an empty first argument unreadable. Treat synchronous helper startup failures, including argument/environment size exhaustion, as unavailable evidence with a reason. Bound each parse to sysctl's returned byte count so shorter replies cannot inherit ownership evidence from a previous PID's buffer.

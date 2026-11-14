@@ -260,7 +260,7 @@ async function bridge(
 function kernelReply(mark: string): Buffer {
   return Buffer.concat([
     Buffer.from([1, 0, 0, 0]),
-    Buffer.from(`/node\0/node\0AGENTMONITORS_COMMAND_LIFE=${mark}\0\0`),
+    Buffer.from(`/node\0\0\0/node\0AGENTMONITORS_COMMAND_LIFE=${mark}\0\0`),
   ]);
 }
 
@@ -275,4 +275,19 @@ it('isolates each PID from stale buffer bytes after short successes and failed s
       [104, 'fourth', false],
     ],
   );
+});
+
+it('retains synchronous spawn failure as unavailable evidence for the entire sweep', async () => {
+  vi.mocked(spawn).mockImplementation(() => {
+    throw Object.assign(new Error('environment too large'), { code: 'E2BIG' });
+  });
+  await withDarwinCommandMarkReader(async () => {
+    for (const pid of [4242, 4243]) {
+      await expect(readDarwinCommandMarks([pid])).resolves.toEqual({
+        supported: false,
+        reason: expect.stringMatching(/could not start.*E2BIG/),
+      });
+    }
+  });
+  expect(spawn).toHaveBeenCalledTimes(1);
 });

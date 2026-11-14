@@ -16,10 +16,18 @@ function parseDarwinProcargs(data) {
   for (var i = 3; i >= 0; i--) argc = argc * 256 + data.charCodeAt(i);
   if (argc <= 0 || argc > data.length) throw new Error('Invalid argc');
   var cursor = terminated(4) + 1;
-  // NULs after the executable terminator could be alignment padding, an empty
-  // argv[0], or a rewritten argv allocation. There is no boundary tag to tell
-  // them apart. Count from this exact position and reject every empty argument;
-  // skipping even one NUL could consume the first envp entry as the last argv.
+  // XNU exec_extract_strings aligns the saved path (including its terminator)
+  // to the target pointer size before ip_startargv. On supported 64-bit macOS
+  // this is eight bytes on both Intel and Apple silicon. The 16-byte
+  // executable_path= prefix is stripped by sysctl; argc is added separately.
+  // Skip only that bounded, all-NUL padding: an additional NUL is empty argv[0],
+  // never evidence that the environment starts later. Rewritten argv remains
+  // subject to the same nonempty argc and structural envp checks below.
+  var padding = (8 - ((cursor - 4) % 8)) % 8;
+  for (var pad = 0; pad < padding; pad++) {
+    if (data.charCodeAt(cursor) !== 0) throw new Error('Invalid executable alignment');
+    cursor++;
+  }
   // Never search for a key to locate envp: convincing marker text can be argv.
   for (var arg = 0; arg < argc; arg++) {
     var end = terminated(cursor);
