@@ -67,6 +67,223 @@ async function fixture() {
   return { journal: next, admission: journal, token, db };
 }
 
+// The readable companion represents the independent watchdog. Enumeration order
+// must not let it lose its deadline before another member's uncertainty is known.
+for (const obstacle of [
+  'discovery-unreadable',
+  'signal-unreadable',
+  'identity',
+  'unsupported',
+  'table-unavailable',
+  'watchdog-mark',
+  'new-member',
+  'group-change',
+  'group-change-single-anchor',
+  'verified',
+] as const) {
+  it(`preserves the group bound unless every member is verified (${obstacle})`, async () => {
+    const f = await fixture();
+    const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+    const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+    const otherBound = { pid: 5001, pgid: 5000, startTime: 'other-bound' };
+    let markReads = 0;
+    let tableReads = 0;
+    const groupChange =
+      obstacle === 'group-change' || obstacle === 'group-change-single-anchor';
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    vi.mocked(readProcessTable).mockImplementation(async () => {
+      tableReads++;
+      if (obstacle === 'table-unavailable' && markReads > 1) {
+        return {
+          supported: false,
+          reason: 'injected identity reader unavailable',
+        };
+      }
+      return {
+        supported: true,
+        processes: [
+          watchdog,
+          obstacle === 'identity' && markReads > 1
+            ? { ...command, startTime: 'replacement' }
+            : groupChange && tableReads > 2
+              ? { ...command, pgid: otherBound.pgid, startTime: 'replacement' }
+              : command,
+          ...(groupChange ? [otherBound] : []),
+          ...(obstacle === 'new-member' && markReads > 1
+            ? [{ pid: 4244, pgid: 4242, startTime: 'late' }]
+            : []),
+        ],
+      };
+    });
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => {
+      markReads++;
+      if (obstacle === 'unsupported' && markReads > 1) {
+        return { supported: false, reason: 'injected reader unavailable' };
+      }
+      const unreadable =
+        obstacle === 'discovery-unreadable' ||
+        (obstacle === 'signal-unreadable' && markReads > 1);
+      return {
+        supported: true,
+        marks: new Map(
+          pids
+            .filter(
+              (pid) =>
+                (!unreadable || pid !== command.pid) &&
+                !(
+                  obstacle === 'group-change-single-anchor' &&
+                  pid === command.pid
+                ) &&
+                !(
+                  obstacle === 'watchdog-mark' &&
+                  markReads > 1 &&
+                  pid === watchdog.pid
+                ),
+            )
+            .map((pid) => [pid, f.token]),
+        ),
+        ...(unreadable ? { unreadable: [command.pid] } : {}),
+      };
+    });
+    const result = await f.journal.sweep();
+    if (obstacle === 'verified') {
+      expect(kill.mock.calls).toEqual(
+        expect.arrayContaining([
+          [command.pid, 'SIGKILL'],
+          [watchdog.pid, 'SIGKILL'],
+        ]),
+      );
+      expect(result.outcomes).toContainEqual(
+        expect.objectContaining({ pid: watchdog.pid, status: 'reaped' }),
+      );
+    } else {
+      expect(kill.mock.calls).toEqual([]);
+      expect(result.outcomes).toContainEqual(
+        expect.objectContaining({
+          pid: watchdog.pid,
+          status: 'abstained',
+          reason: expect.stringMatching(
+            /group.*bound.*(unreadable|identity|unavailable)/i,
+          ),
+        }),
+      );
+    }
+    if (groupChange) {
+      expect(result.outcomes).toContainEqual(
+        expect.objectContaining({
+          pid: otherBound.pid,
+          status: 'abstained',
+          reason: expect.stringMatching(/group.*bound.*identity/i),
+        }),
+      );
+    }
+    const sql = new Database(`${f.db}.commands.sqlite`);
+    try {
+      expect(
+        JSON.parse(
+          sql
+            .prepare(
+              'SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1',
+            )
+            .pluck()
+            .get(),
+        ),
+      ).toEqual(result);
+    } finally {
+      sql.close();
+    }
+  });
+}
+
+it('keeps a group veto when later discovery first finds its watchdog', async () => {
+  const f = await fixture();
+  const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+  const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+  const other = { pid: 5000, pgid: 5000, startTime: 'other-command' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes:
+      kill.mock.calls.length === 0 ? [command, other] : [command, watchdog],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => pid !== command.pid || kill.mock.calls.length > 0)
+        .map((pid) => [pid, f.token]),
+    ),
+    ...(kill.mock.calls.length === 0 ? { unreadable: [command.pid] } : {}),
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([[other.pid, 'SIGKILL']]);
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: watchdog.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/group.*bound.*unreadable/i),
+    }),
+  );
+});
+
+it('keeps a sole marked watchdog when the final table reveals another member', async () => {
+  const f = await fixture();
+  const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+  const late = { pid: 4244, pgid: 4242, startTime: 'late-command' };
+  let reads = 0;
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: ++reads <= 2 ? [watchdog] : [watchdog, late],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === watchdog.pid).map((pid) => [pid, f.token]),
+    ),
+    ...(pids.includes(late.pid) ? { unreadable: [late.pid] } : {}),
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([]);
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: watchdog.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/group.*bound.*identity/i),
+    }),
+  );
+});
+
+it('keeps a sole marked watchdog when a reaped member PID is reused', async () => {
+  const f = await fixture();
+  const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+  const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+  let reads = 0;
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: [
+      ++reads < 4 ? command : { ...command, startTime: 'replacement' },
+      watchdog,
+    ],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === watchdog.pid).map((pid) => [pid, f.token]),
+    ),
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([[command.pid, 'SIGKILL']]);
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: watchdog.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/group.*bound.*identity/i),
+    }),
+  );
+});
+
 it('sweeps 12,001 gone hints within the detached readiness budget', async () => {
   const f = await fixture();
   const sql = new Database(`${f.db}.commands.sqlite`);

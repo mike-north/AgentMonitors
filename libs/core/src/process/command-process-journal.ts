@@ -402,6 +402,9 @@ export class CommandProcessJournal implements CommandProcessOwner {
       // Terminal incarnations may remain visible without readable environments.
       // Retain their full identity so a recycled PID is still discovered normally.
       const reaped = new Map<number, ProcessIdentityRecord>();
+      // Once a group loses cleanup certainty, no later discovery in this sweep
+      // may remove its bound, including a watchdog discovered in a later pass.
+      const groupVetoes = new Map<number, string>();
       for (let round = 0; round < MAX_DISCOVERY_PASSES; round++) {
         const progress = { observed: false };
         /** Every observed exit preserves attribution and earns bounded rediscovery. */
@@ -477,6 +480,13 @@ export class CommandProcessJournal implements CommandProcessOwner {
             .map((p) => p.pid),
         ]);
         const pending = [...candidates].filter((pid) => !visited.has(pid));
+        // Readable mark-erased members use existing group continuity. Consider
+        // them before marked companions that could hold the group's bound.
+        pending.sort(
+          (a, b) =>
+            Number(ownership.marks.get(a) === previous.life) -
+            Number(ownership.marks.get(b) === previous.life),
+        );
         if (pending.length === 0 && !progress.observed) break;
         const byPid = new Map(reading.processes.map((p) => [p.pid, p]));
         // Absence decisions use one immutable snapshot and involve no awaits.
@@ -492,10 +502,37 @@ export class CommandProcessJournal implements CommandProcessOwner {
         // macOS system-reader startup must be amortized over the pass. All
         // eligible gates share a final fresh identity snapshot and signal in
         // one microtask turn, before terminal reads or later discovery can run.
-        // Linux retains its per-process /proc checks and sequential execution.
-        const darwinDecisions =
-          process.platform === 'darwin'
-            ? await signalDarwinBatch(
+        // Linux retains per-PID /proc checks; multiple marked companions share
+        // the final table so every veto is known before any loses its bound.
+        // No role guess can safely distinguish an old watchdog from authored
+        // members. Withhold the entire recorded group on uncertainty instead.
+        // This veto only removes signals; each remaining PID still needs its
+        // own unchanged mark/identity gate in the batch below.
+        for (const record of reading.processes) {
+          if (!recorded.has(record.pgid)) continue;
+          const reason = ownership.unreadable?.includes(record.pid)
+            ? 'ownership mark is unreadable'
+            : confirmed.changed.includes(record.pid)
+              ? 'process identity changed'
+              : liveOwners.has(record.pid) || record.pid === process.pid
+                ? 'member is a registered daemon owner'
+                : !sameBoot
+                  ? 'boot identity differs or is unavailable'
+                  : undefined;
+          if (reason !== undefined) groupVetoes.set(record.pgid, reason);
+        }
+        // A marked companion may be a watchdog. With only one mark, readable
+        // mark-erased members run first and can veto that last companion. More
+        // marks need one final table even across groups: PID reuse during mark
+        // reads can introduce an uncertain member into another recorded group.
+        const grouped =
+          pending.filter(
+            (pid) =>
+              byPid.has(pid) && ownership.marks.get(pid) === previous.life,
+          ).length > 1;
+        const batchDecisions =
+          process.platform === 'darwin' || grouped
+            ? await signalCandidateBatch(
                 pending.flatMap((pid) => {
                   const record = byPid.get(pid);
                   const inherited = ownership.marks.get(pid) === previous.life;
@@ -509,6 +546,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
                 }),
                 this.boot,
                 previous.life,
+                groupVetoes,
               )
             : undefined;
         for (const pid of pending) {
@@ -540,6 +578,18 @@ export class CommandProcessJournal implements CommandProcessOwner {
             retained = true;
             continue;
           }
+          const veto = groupVetoes.get(record.pgid);
+          if (veto !== undefined) {
+            outcomes.push({
+              status: 'abstained',
+              life: previous.life,
+              pid,
+              reason: `Preserved group ${String(record.pgid)} bound: ${veto}`,
+            });
+            retained = true;
+            save('running');
+            continue;
+          }
           if (!sameBoot || (!inherited && anchor === undefined)) {
             outcomes.push({
               status: 'abstained',
@@ -553,7 +603,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
             save('running');
             continue;
           }
-          const decision = darwinDecisions?.get(pid);
+          const decision = batchDecisions?.get(pid);
           const outcome =
             decision?.outcome ??
             (await sendVerifiedSignal(
@@ -587,6 +637,31 @@ export class CommandProcessJournal implements CommandProcessOwner {
                       reason:
                         'Boot or inherited ownership mark could not be confirmed at signal time',
                     };
+                  // The last marked companion may be the watchdog. A member
+                  // first seen in this final table has no ownership decision;
+                  // keep the bound until that uncertainty can be reconciled.
+                  // The shared per-process gate still owns the target's own comparison.
+                  for (const member of fresh.processes) {
+                    const known = byPid.get(member.pid);
+                    if (
+                      member.pid !== pid &&
+                      member.pgid === record.pgid &&
+                      (known?.pgid !== member.pgid ||
+                        known.startTime !== member.startTime)
+                    ) {
+                      groupVetoes.set(
+                        record.pgid,
+                        'new group member has unverified identity',
+                      );
+                    }
+                  }
+                  const veto = groupVetoes.get(record.pgid);
+                  if (veto !== undefined) {
+                    return {
+                      supported: false,
+                      reason: `Preserved group ${String(record.pgid)} bound: ${veto}`,
+                    };
+                  }
                   return fresh;
                 },
                 reportAbstention: () => {
@@ -628,6 +703,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
             // kernel-delayed exit must never erase attribution of late forks.
             retained = true;
           } else if (outcome.status === 'abstained') {
+            groupVetoes.set(record.pgid, outcome.abstention.reason);
             retained = true;
             outcomes.push({
               status: 'abstained',
@@ -647,12 +723,12 @@ export class CommandProcessJournal implements CommandProcessOwner {
               reason: outcome.detail,
             });
           }
-          // macOS decisions are already one uninterrupted batch. Commit them
+          // Shared decisions are already one uninterrupted batch. Commit them
           // together before the next asynchronous query instead of rewriting
           // an expanding receipt once per survivor with FULL synchronous I/O.
-          if (darwinDecisions === undefined) save('running');
+          if (batchDecisions === undefined) save('running');
         }
-        if (darwinDecisions !== undefined) save('running');
+        if (batchDecisions !== undefined) save('running');
         // Signals and observed exits can expose late forks. Withheld signals
         // alone do not justify rescanning unchanged ownership uncertainty.
         if (!progress.observed) break;
@@ -797,72 +873,137 @@ const UNREADABLE_OWNERSHIP_REASON =
   'Same-user ownership mark could not be read; command attribution is unknown';
 
 /** Per-PID gate and terminal evidence; batching never changes the durable outcome vocabulary. */
-interface DarwinSignalDecision {
+interface SweepSignalDecision {
   readonly outcome: SignalOutcome;
   readonly terminal?: CommandTerminalEvidence;
 }
 
 /**
- * Compose existing ownership and signal gates without a subprocess per survivor.
+ * Compose existing ownership and signal gates with a group-wide veto, never group authority.
  * Read boot and all required marks, then identity LAST. Every signal gate runs
  * from that final table in the same microtask turn: no terminal query, journal
  * await, or subsequent discovery can age the snapshot between these signals.
- * Each PID still passes sendVerifiedSignal individually; no stored PGID is sent.
+ * Each eligible PID still passes sendVerifiedSignal individually; no stored PGID is sent.
+ * Linux shares this batch when several marked candidates could include a watchdog.
  */
-async function signalDarwinBatch(
+async function signalCandidateBatch(
   candidates: readonly {
     readonly record: ProcessIdentityRecord;
     readonly inherited: boolean;
   }[],
   boot: string | undefined,
   life: string,
-): Promise<ReadonlyMap<number, DarwinSignalDecision>> {
+  groupVetoes: Map<number, string>,
+): Promise<ReadonlyMap<number, SweepSignalDecision>> {
   if (candidates.length === 0) return new Map();
   const freshBoot = await readBootIdentity();
-  const marks = await readCommandMarks(
-    candidates
-      .filter((candidate) => candidate.inherited)
-      .map((candidate) => candidate.record.pid),
-  );
+  const inheritedPids = candidates
+    .filter((candidate) => candidate.inherited)
+    .map((candidate) => candidate.record.pid);
+  const marks =
+    process.platform === 'darwin'
+      ? await readCommandMarks(inheritedPids)
+      : await readLinuxCandidateMarks(inheritedPids);
   const fresh = await readProcessTable();
+  // Evaluate every obstruction before invoking any signal gate. A readable
+  // watchdog cannot lend its evidence to another member, nor lose its timer
+  // because its own row happened to be enumerated first.
+  for (const { record, inherited } of candidates) {
+    const current = fresh.supported
+      ? fresh.processes.find((p) => p.pid === record.pid)
+      : undefined;
+    const reason = !fresh.supported
+      ? fresh.reason
+      : freshBoot !== boot
+        ? 'boot identity differs or is unavailable'
+        : current !== undefined &&
+            (current.startTime !== record.startTime ||
+              current.pgid !== record.pgid)
+          ? 'process identity changed'
+          : current !== undefined &&
+              inherited &&
+              (!marks.supported || marks.marks.get(record.pid) !== life)
+            ? marks.supported
+              ? 'ownership mark differs or is unreadable'
+              : marks.reason
+            : undefined;
+    if (reason !== undefined) groupVetoes.set(record.pgid, reason);
+  }
+  if (fresh.supported) {
+    // Reuse or a group change is unverified membership even at a known PID.
+    // A former incarnation cannot discharge the current group's bound.
+    const known = new Map(candidates.map(({ record }) => [record.pid, record]));
+    const groups = new Set(candidates.map(({ record }) => record.pgid));
+    for (const member of fresh.processes) {
+      const prior = known.get(member.pid);
+      if (
+        groups.has(member.pgid) &&
+        (prior?.pgid !== member.pgid || prior.startTime !== member.startTime)
+      ) {
+        groupVetoes.set(
+          member.pgid,
+          'new group member has unverified identity',
+        );
+      }
+    }
+  }
   const results = await Promise.all(
     candidates.map(async ({ record, inherited }) => ({
       record,
-      outcome: await sendVerifiedSignal(
-        { kind: 'recorded-process', record },
-        'SIGKILL',
-        {
-          action: 'restart command cleanup',
-          readProcessTable: () => {
-            if (
-              !fresh.supported ||
-              !fresh.processes.some((p) => p.pid === record.pid)
-            )
-              return Promise.resolve(fresh);
-            if (
-              freshBoot !== boot ||
-              (inherited &&
-                (!marks.supported || marks.marks.get(record.pid) !== life))
-            )
-              return Promise.resolve({
-                supported: false,
-                reason:
-                  'Boot or inherited ownership mark could not be confirmed at signal time',
-              });
-            return Promise.resolve(fresh);
-          },
-          reportAbstention: () => {
-            /* Persisted by the journal before subsequent discovery. */
-          },
-        },
-      ),
+      outcome: groupVetoes.has(record.pgid)
+        ? {
+            status: 'abstained' as const,
+            abstention: {
+              action: 'restart command cleanup',
+              signal: 'SIGKILL' as const,
+              target: { kind: 'process' as const, id: record.pid },
+              reason: `Preserved group ${String(record.pgid)} bound: ${String(groupVetoes.get(record.pgid))}`,
+              observed: [],
+            },
+          }
+        : await sendVerifiedSignal(
+            { kind: 'recorded-process', record },
+            'SIGKILL',
+            {
+              action: 'restart command cleanup',
+              readProcessTable: () => {
+                if (
+                  !fresh.supported ||
+                  !fresh.processes.some((p) => p.pid === record.pid)
+                )
+                  return Promise.resolve(fresh);
+                if (
+                  freshBoot !== boot ||
+                  (inherited &&
+                    (!marks.supported || marks.marks.get(record.pid) !== life))
+                )
+                  return Promise.resolve({
+                    supported: false,
+                    reason:
+                      'Boot or inherited ownership mark could not be confirmed at signal time',
+                  });
+                return Promise.resolve(fresh);
+              },
+              reportAbstention: () => {
+                /* Persisted by the journal before subsequent discovery. */
+              },
+            },
+          ),
     })),
   );
-  const terminals = await readDarwinCommandTerminals(
-    results
-      .filter((result) => result.outcome.status === 'sent')
-      .map((result) => result.record),
-  );
+  const sent = results.filter((result) => result.outcome.status === 'sent');
+  const terminals =
+    process.platform === 'darwin'
+      ? await readDarwinCommandTerminals(sent.map((result) => result.record))
+      : new Map(
+          await Promise.all(
+            sent.map(
+              async ({ record }) =>
+                [record.pid, await readCommandTerminal(record)] as const,
+            ),
+          ),
+        );
+
   return new Map(
     results.map(({ record, outcome }) => [
       record.pid,
@@ -874,6 +1015,20 @@ async function signalDarwinBatch(
       },
     ]),
   );
+}
+
+/** Retain Linux's per-PID ownership query; combining results grants no group authority. */
+async function readLinuxCandidateMarks(
+  pids: readonly number[],
+): Promise<Awaited<ReturnType<typeof readCommandMarks>>> {
+  const marks = new Map<number, string>();
+  for (const pid of pids) {
+    const reading = await readCommandMarks([pid]);
+    if (!reading.supported) return reading;
+    const mark = reading.marks.get(pid);
+    if (mark !== undefined) marks.set(pid, mark);
+  }
+  return { supported: true, marks };
 }
 
 /** A failed or changing anchor cannot lend its old group authority to unrelated work. */
