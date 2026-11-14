@@ -4,6 +4,7 @@ import {
   closeSync,
   existsSync,
   mkdtempSync,
+  mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -27,11 +28,26 @@ async function plain(command: string[], cwd?: string, env?: NodeJS.ProcessEnv) {
     error?: string;
   }>((resolve) => {
     let stdout = '';
-    const child = spawn(command[0] ?? '', command.slice(1), {
-      cwd,
-      env: { ...process.env, ...env },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    let child;
+    try {
+      child = spawn(command[0] ?? '', command.slice(1), {
+        cwd,
+        env: { ...process.env, ...env },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      // Node reports some lookup errnos synchronously, others via the error event.
+      resolve({
+        stdout,
+        code: null,
+        signal: null,
+        error:
+          error instanceof Error && 'code' in error
+            ? String(error.code)
+            : String(error),
+      });
+      return;
+    }
     child.stdout.on('data', (chunk: Buffer) => {
       stdout += chunk.toString();
     });
@@ -76,6 +92,175 @@ const previousState = {
 describe.skipIf(process.platform === 'win32')(
   'native command execution semantics',
   () => {
+    it.each(['ENOENT', 'ENOTDIR', 'EACCES'])(
+      'continues PATH lookup after %s from an earlier candidate',
+      async (errno) => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'lookup-'));
+        const first = path.join(dir, 'first');
+        const later = path.join(dir, 'later');
+        mkdirSync(later);
+        if (errno === 'ENOTDIR') writeFileSync(first, 'not a directory');
+        else {
+          mkdirSync(first);
+          writeFileSync(
+            path.join(first, 'probe'),
+            errno === 'ENOENT'
+              ? '#!/missing-review-624-interpreter\n'
+              : '#!/bin/sh\nprintf denied',
+            { mode: errno === 'EACCES' ? 0o600 : 0o700 },
+          );
+        }
+        writeFileSync(path.join(later, 'probe'), '#!/bin/sh\nprintf later', {
+          mode: 0o700,
+        });
+        const env = { PATH: `${first}:${later}` };
+        const control = await plain(['probe'], dir, env);
+        expect(control).toMatchObject({ stdout: 'later', code: 0 });
+        const result = await source.observe(
+          { command: ['probe'], cwd: dir, env, timeout: '2s' },
+          { now: new Date() },
+        );
+        expect(result.nextState).toMatchObject({
+          health: 'ok',
+          stdout: control.stdout,
+          exitCode: control.code,
+        });
+      },
+    );
+
+    it.each([
+      ['ENOTDIR'],
+      ['ENOENT', 'ENOTDIR'],
+      ['ENOTDIR', 'ENOENT'],
+      ['EACCES', 'ENOENT'],
+      ['ENOENT', 'EACCES'],
+    ])(
+      'matches the spawn errno when PATH candidates all fail: %j',
+      async (...errors) => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'errno-'));
+        const dirs = errors.map((errno, i) => {
+          const entry = path.join(dir, String(i));
+          if (errno === 'ENOTDIR') writeFileSync(entry, 'not a directory');
+          else if (errno === 'EACCES') {
+            mkdirSync(entry);
+            writeFileSync(
+              path.join(entry, 'probe'),
+              '#!/bin/sh\nprintf denied',
+              { mode: 0o600 },
+            );
+          }
+          return entry;
+        });
+        const env = { PATH: dirs.join(':') };
+        const control = await plain(['probe'], dir, env);
+        expect(control.error).toBe(
+          errors.includes('EACCES') ? 'EACCES' : errors.at(-1),
+        );
+        const result = await source.observe(
+          { command: ['probe'], cwd: dir, env, timeout: '2s' },
+          { now: new Date(), previousState },
+        );
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining(String(control.error)),
+        });
+      },
+    );
+
+    it.each([
+      '/bin/sh',
+      ...(existsSync('/usr/bin/python3') ? ['/usr/bin/python3'] : []),
+    ])(
+      'preserves an authored relative script path for %s',
+      async (interpreter) => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'argv0-'));
+        const body =
+          interpreter === '/bin/sh'
+            ? 'printf "%s" "$0"'
+            : 'import sys; sys.stdout.write(sys.argv[0])';
+        writeFileSync(
+          path.join(dir, 'relative-script'),
+          `#!${interpreter}\n${body}\n`,
+          { mode: 0o700 },
+        );
+        const command = ['./relative-script'];
+        const control = await plain(command, dir);
+        expect(control).toMatchObject({ stdout: './relative-script', code: 0 });
+        const result = await source.observe(
+          { command, cwd: dir, timeout: '2s' },
+          { now: new Date() },
+        );
+        expect(result.nextState).toMatchObject({
+          health: 'ok',
+          stdout: control.stdout,
+          exitCode: control.code,
+        });
+      },
+    );
+
+    it('keeps an empty PATH component relative without introducing dot-slash', async () => {
+      const dir = mkdtempSync(path.join(tmpdir(), 'empty-'));
+      writeFileSync(path.join(dir, 'probe'), '#!/bin/sh\nprintf "%s" "$0"', {
+        mode: 0o700,
+      });
+      const control = await plain(['probe'], dir, { PATH: '' });
+      const result = await source.observe(
+        { command: ['probe'], cwd: dir, env: { PATH: '' }, timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: control.stdout,
+        exitCode: control.code,
+      });
+    });
+
+    // libc's ENOEXEC handling is part of spawn compatibility: glibc invokes
+    // /bin/sh, while macOS and musl report the native error without a fallback.
+    it.each(['./program', 'program'])(
+      'matches spawn on ENOEXEC for %s before considering a later candidate',
+      async (file) => {
+        const dir = mkdtempSync(path.join(tmpdir(), 'format-'));
+        const later = path.join(dir, 'later');
+        mkdirSync(later);
+        writeFileSync(path.join(dir, 'program'), 'printf "%s|%s" "$0" "$1"\n', {
+          mode: 0o700,
+        });
+        writeFileSync(
+          path.join(later, 'program'),
+          '#!/bin/sh\nprintf wrong-candidate',
+          { mode: 0o700 },
+        );
+        const command = [file, '$(literal);*'];
+        const env = { PATH: `:${later}` };
+        const control = await plain(command, dir, env);
+        const result = await source.observe(
+          { command, cwd: dir, env, timeout: '2s' },
+          { now: new Date(), previousState },
+        );
+        if (control.error) {
+          expect(control.error).toBe('ENOEXEC');
+          expect(result.nextState).toEqual({
+            ...previousState,
+            health: 'failing',
+          });
+          expect(result.observations[0]?.payload).toMatchObject({
+            error: expect.stringContaining(control.error),
+          });
+        } else {
+          expect(control.stdout).toBe(`${file}|$(literal);*`);
+          expect(result.nextState).toMatchObject({
+            health: 'ok',
+            stdout: control.stdout,
+            exitCode: control.code,
+          });
+        }
+      },
+    );
+
     it.each(['PIPE', 'XFSZ'])(
       'retains native %s signal failure semantics',
       async (signal) => {
@@ -220,19 +405,31 @@ describe.skipIf(process.platform === 'win32')(
           },
           { now: new Date(), previousState },
         );
-        expect(result.nextState).toEqual({
-          ...previousState,
-          health: 'failing',
-        });
+        const control =
+          errno === 'ENOEXEC' ? await plain([file], dir) : undefined;
+        if (control && !control.error) {
+          expect(result.nextState).toMatchObject({
+            health: 'ok',
+            stdout: control.stdout,
+            exitCode: control.code,
+          });
+        } else {
+          expect(result.nextState).toEqual({
+            ...previousState,
+            health: 'failing',
+          });
+        }
         const diagnostic = result.observations[0]?.payload;
-        expect(diagnostic).toMatchObject({
-          error: expect.stringContaining(errno),
-        });
-        expect(diagnostic).toMatchObject({
-          error: expect.stringContaining(
-            errno === 'E2BIG' ? '/bin/echo' : file,
-          ),
-        });
+        if (!control || control.error)
+          expect(diagnostic).toMatchObject({
+            error: expect.stringContaining(errno),
+          });
+        if (!control || control.error)
+          expect(diagnostic).toMatchObject({
+            error: expect.stringContaining(
+              errno === 'E2BIG' ? '/bin/echo' : file,
+            ),
+          });
         expect(JSON.stringify(diagnostic)).not.toMatch(
           /SIGABRT|node::Execve|native stack/i,
         );

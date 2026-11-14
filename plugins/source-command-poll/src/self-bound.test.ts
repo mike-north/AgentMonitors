@@ -16,7 +16,11 @@ import { restoreProcessGlobalsAfterEach } from './global-state.test-support.js';
 
 // Helper fault injection is a module seam: authored NODE_OPTIONS must never
 // instrument admission helpers or mutate their timers.
-const injected = vi.hoisted(() => ({ watchdog: '', launcher: '' }));
+const injected = vi.hoisted(() => ({
+  watchdog: '',
+  launcher: '',
+  replacement: '',
+}));
 vi.mock('./self-bound.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./self-bound.js')>();
   return {
@@ -25,7 +29,9 @@ vi.mock('./self-bound.js', async (importOriginal) => {
       return injected.watchdog + actual.WATCHDOG_PROGRAM;
     },
     get LAUNCHER_PROGRAM() {
-      return injected.launcher + actual.LAUNCHER_PROGRAM;
+      return (
+        injected.replacement || injected.launcher + actual.LAUNCHER_PROGRAM
+      );
     },
   };
 });
@@ -36,11 +42,168 @@ afterEach(() => {
   intervalTimers.clear();
   injected.watchdog = '';
   injected.launcher = '';
+  injected.replacement = '';
 });
 
 describe.skipIf(process.platform === 'win32')(
   'self-bounding command admission',
   () => {
+    // Reuse the review's real fd-5 fault cases at the maintained helper seam.
+    // A prior successful result must survive every incomplete admission protocol.
+    it.each([
+      [
+        'truncated frame',
+        '{"kind":"armed"}\n{"kind":"error","error":"incomplete',
+      ],
+      [
+        'invalid error schema',
+        '{"kind":"armed"}\n{"kind":"error","error":42}\n',
+      ],
+      ['unknown frame', '{"kind":"armed"}\n{"kind":"unexpected"}\n'],
+      ['invalid armed schema', '{"kind":"armed","error":42}\n'],
+      ['null frame', '{"kind":"armed"}\nnull\n'],
+      ['missing frame', ''],
+    ])('retains the baseline after %s', async (_name, payload) => {
+      injected.replacement = `require('node:fs').readFile(4, () => {
+        require('node:fs').write(5, ${JSON.stringify(payload)}, () => process.exit(1));
+      });`;
+      const previousState = {
+        stdout: 'good-baseline',
+        exitCode: 7,
+        truncated: false,
+        health: 'ok',
+        baselined: true,
+      };
+      const result = await source.observe(
+        { command: ['/bin/echo', 'unused'], timeout: '2s' },
+        { now: new Date(), previousState },
+      );
+      expect(result.nextState).toEqual({ ...previousState, health: 'failing' });
+      expect(result.observations[0]?.payload).toMatchObject({
+        error: expect.stringMatching(/acknowledgement|status/),
+      });
+    });
+
+    it('accepts a valid armed frame split across separate reads', async () => {
+      injected.replacement = `require('node:fs').readFile(4, () => {
+        const fs = require('node:fs');
+        fs.write(5, '{"ki', () => setTimeout(() => fs.write(5, 'nd":"armed"}\\n', () => process.exit(7)), 20));
+      });`;
+      const result = await source.observe(
+        { command: ['/bin/echo', 'unused'], timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: '',
+        exitCode: 7,
+      });
+    });
+
+    it.each(['error', 'armed'])(
+      'writes the complete %s frame after short writes',
+      async (kind) => {
+        // The original review shortened the error to 24 bytes. Support both write
+        // overloads so this exercises actual partial I/O after the writer is fixed.
+        injected.launcher = `const originalWrite = require('node:fs').write;
+        require('node:fs').write = (fd, data, ...args) => {
+          const callback = args.at(-1);
+          const bytes = Buffer.isBuffer(data) ? data.subarray(args[0], args[0] + args[1]) : Buffer.from(data);
+          const short = fd === 5 && (${JSON.stringify(kind)} === 'armed' || bytes.includes(Buffer.from('"kind":"error"')));
+          return originalWrite(fd, short ? bytes.subarray(0, ${kind === 'error' ? 24 : 4}) : bytes, callback);
+        };`;
+        const dir = mkdtempSync(path.join(tmpdir(), 'short-'));
+        const file = path.join(dir, 'bad');
+        writeFileSync(file, '#!/missing-review-624-interpreter\n', {
+          mode: 0o700,
+        });
+        const previousState = {
+          stdout: 'good-baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'ok',
+          baselined: true,
+        };
+        const result = await source.observe(
+          {
+            command: kind === 'error' ? [file] : ['/bin/echo', 'complete'],
+            timeout: '2s',
+          },
+          { now: new Date(), previousState },
+        );
+        expect(result.nextState).toMatchObject(
+          kind === 'error'
+            ? { ...previousState, health: 'failing' }
+            : { stdout: 'complete\n', exitCode: 0, health: 'ok' },
+        );
+        if (kind === 'error')
+          expect(result.observations[0]?.payload).toMatchObject({
+            error: expect.stringContaining('ENOENT'),
+          });
+      },
+    );
+
+    it.each(['zero', 'error'])(
+      'retains the baseline when the error frame write makes %s progress',
+      async (fault) => {
+        // A completely lost error frame must not turn the helper's own exit into
+        // an authored exit-code result after a valid armed acknowledgement.
+        injected.launcher = `const originalWrite = require('node:fs').write;
+        require('node:fs').write = (fd, data, ...args) => {
+          if (fd === 5 && Buffer.from(data).includes(Buffer.from('"kind":"error"'))) {
+            const callback = args.at(-1);
+            process.nextTick(() => callback(${fault === 'error' ? "new Error('fixture: status unavailable')" : 'null'}, 0));
+            return;
+          }
+          return originalWrite(fd, data, ...args);
+        };`;
+        const dir = mkdtempSync(path.join(tmpdir(), 'lost-'));
+        const file = path.join(dir, 'bad');
+        writeFileSync(file, '#!/missing-review-624-interpreter\n', {
+          mode: 0o700,
+        });
+        const previousState = {
+          stdout: 'good-baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'ok',
+          baselined: true,
+        };
+        const result = await source.observe(
+          { command: [file], timeout: '2s' },
+          { now: new Date(), previousState },
+        );
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+      },
+    );
+
+    it('explains native support load failure and retains its underlying detail', async () => {
+      injected.launcher = `const originalLoad = require('node:module')._load;
+        require('node:module')._load = function(id, ...args) {
+          if (id.includes('koffi')) throw new Error('Cannot find the native Koffi module; did you bundle it correctly?');
+          return originalLoad.call(this, id, ...args);
+        };`;
+      const result = await source.observe(
+        { command: ['/bin/echo', 'unused'], timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'failing',
+        baselined: false,
+      });
+      expect(result.observations[0]?.payload).toMatchObject({
+        error: expect.stringContaining(
+          'Native exec support for this platform could not be loaded',
+        ),
+      });
+      expect(result.observations[0]?.payload).toMatchObject({
+        error: expect.stringContaining('Cannot find the native Koffi module'),
+      });
+    });
+
     it('arms without PATH utilities and preserves literal argv, exit status, and command PID', async () => {
       process.env.PATH = '/does-not-exist';
       let recorded: number | undefined;

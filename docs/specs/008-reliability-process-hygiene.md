@@ -143,17 +143,25 @@ original group and inherited life mark. Missing launcher support, failed watchdo
 failed timer registration or an elapsed admission deadline fails closed: authored work does
 not run, and observation health reports an execution failure.
 
-The launcher uses the packaged native binding to call libc `execve`, retaining the PID without
-a shell or Node's abort-on-exec-error path. Arguments and environment strings containing NUL
-are rejected before the native call, preserving normal spawn's failure semantics. It restores every catchable signal to its default
-and clears the signal mask before exec, matching normal spawn. A private close-on-exec status
-pipe carries arming/errno diagnostics and closes on successful replacement; settlement consumes
-its complete status before classifying an exit. Ordinary exec errors name the program and
-errno, preserve failing health and the previous baseline, and create no abort/core/crash report.
-Both Node helpers start without authored or inherited `NODE_OPTIONS`; the command receives
-the complete intended environment through a separate asynchronous configuration pipe, with
-only the deliberate ownership-mark override. Private descriptors close at exec; only standard
-input/output/error survive. Missing native binding support fails closed.
+The launcher uses the packaged native binding to retain the PID without Node's abort-on-exec-error
+path. Linux uses libc `execvpe`, matching glibc's ENOEXEC shell fallback and musl's ENOEXEC failure.
+macOS uses `execve` with libuv's ordered search: retry EINTR, continue EACCES/ENOENT/ENOTDIR, stop
+on other errnos, and prefer EACCES at exhaustion, otherwise the last errno. Slash-containing names
+bypass search; empty PATH components use the bare filename. Authored relative paths and symlink/`..`
+components stay intact, resolved by the command cwd set before exec. Arguments and environment
+strings containing NUL are rejected before the native call, preserving normal spawn's failure
+semantics. It restores every catchable signal to its default and clears the signal mask before exec,
+matching normal spawn. A private close-on-exec status pipe carries arming/errno diagnostics and
+closes on successful replacement; settlement consumes its complete status before classifying an
+exit. Writers retry short writes; missing frames, trailing incomplete bytes, unknown kinds and
+invalid schemas fail closed, while fragmented valid frames are accepted. If error status cannot be
+written at all, the helper exits by signal rather than allowing a normal exit to masquerade as a
+command result. Ordinary exec errors name the program and errno, preserve failing health and the
+previous baseline, and create no abort/core/crash report. Both Node helpers start without authored
+or inherited `NODE_OPTIONS`; the command receives the complete intended environment through a
+separate asynchronous configuration pipe, with only the deliberate ownership-mark override. Private
+descriptors close at exec; only standard input/output/error survive. Missing native binding support
+fails closed with a platform-support explanation and the underlying loader error.
 
 Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
 blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals

@@ -451,19 +451,29 @@ async function runCommand(
         for (const line of lines) {
           try {
             const message: unknown = JSON.parse(line);
+            // Only the two exact private schemas can authorize a result. A bad
+            // frame remains a failure even if a later valid frame arrives.
             if (
               typeof message !== 'object' ||
               message === null ||
               !('kind' in message)
-            )
-              continue;
-            if (message.kind === 'armed') armed = true;
-            if (
+            ) {
+              armingError = 'Invalid command lifetime-bound status schema';
+            } else if (
+              message.kind === 'armed' &&
+              Object.keys(message).length === 1
+            ) {
+              armed = true;
+            } else if (
               message.kind === 'error' &&
+              Object.keys(message).length === 2 &&
               'error' in message &&
               typeof message.error === 'string'
-            )
+            ) {
               armingError = message.error;
+            } else {
+              armingError = 'Invalid command lifetime-bound status schema';
+            }
           } catch {
             armingError = 'Invalid command lifetime-bound acknowledgement';
           }
@@ -474,6 +484,11 @@ async function runCommand(
       // EOF proves exec closed the launcher's private descriptor, or that its
       // failure message has been fully consumed. Never race it with stdio exit.
       status.once('end', () => {
+        // EOF is the frame boundary after exec, so even a valid armed frame
+        // cannot authorize an exit when an unfinished error follows it.
+        if (controlInput.length > 0) {
+          armingError = 'Incomplete command lifetime-bound status frame';
+        }
         statusEnded = true;
         if (pendingExit) resolveFromExit(pendingExit.code, pendingExit.signal);
       });

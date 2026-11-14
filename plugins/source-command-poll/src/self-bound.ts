@@ -62,8 +62,9 @@ process.disconnect();
 
 /**
  * Wait for the watchdog's armed acknowledgement before replacing this process.
- * Direct exec preserves authored argv and environment without a shell rewriting
- * either. Native exec failures remain execution failures, never command results.
+ * Native exec preserves authored argv and environment with the platform's
+ * normal spawn search and executable-format fallback. Native exec failures remain
+ * execution failures, never command results.
  * A private close-on-exec status pipe orders admission/error messages before EOF;
  * the watchdog owns only the separate lifetime-control descriptor. All work here
  * runs in the asynchronous child, never synchronously on observe.
@@ -71,12 +72,34 @@ process.disconnect();
  */
 export const LAUNCHER_PROGRAM = String.raw`
 const {spawn} = require('node:child_process');
-const {write, readFile, close, promises: fs, constants} = require('node:fs');
+const {write, readFile, close} = require('node:fs');
 const {getSystemErrorName} = require('node:util');
 let armed = false;
+let failing = false;
+// A frame is a byte protocol: a successful write may consume only a prefix,
+// including part of a UTF-8 character. Admission/exit wait for the entire buffer.
+function writeFrame(message, callback) {
+  const bytes = Buffer.from(JSON.stringify(message) + '\n');
+  function next(offset) {
+    write(5, bytes, offset, bytes.length - offset, (error, written) => {
+      if (error) { callback(error); return; }
+      if (written <= 0) { callback(new Error('Command status write made no progress')); return; }
+      const end = offset + written;
+      if (end < bytes.length) next(end);
+      else callback();
+    });
+  }
+  next(0);
+}
 function fail(error) {
-  const message = JSON.stringify({kind: 'error', error: 'Could not arm command lifetime bound: ' + String(error.message || error)}) + '\n';
-  write(5, message, () => process.exit(1));
+  if (failing) return;
+  failing = true;
+  writeFrame({kind: 'error', error: 'Could not arm command lifetime bound: ' + String(error.message || error)}, writeError => {
+    // If no error bytes reach the parent, an ordinary exit(1) could masquerade
+    // as an authored result after armed. A signal makes that failure unambiguous.
+    if (writeError) process.kill(process.pid, 'SIGKILL');
+    else process.exit(1);
+  });
 }
 async function launch({command, env, deadline, grace, watchdog, native}) {
   // C strings cannot represent embedded NUL. Match spawn's rejection rather
@@ -85,9 +108,17 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
     throw new Error('Could not execute ' + command[0] + ': ERR_INVALID_ARG_VALUE: arguments and environment must be strings without null bytes');
   // All native work lives in this disposable helper, never on the observe path.
   // libc execve returns errno; Node's process.execve aborts on ordinary failures.
-  const koffi = require(native);
+  let koffi;
+  try { koffi = require(native); }
+  catch (error) { throw new Error('Native exec support for this platform could not be loaded: ' + String(error.message || error)); }
   const libc = koffi.load(null);
   const execve = libc.func('int execve(const char *path, const char **argv, const char **envp)');
+  // Linux libuv calls execvp after chdir and environment setup. execvpe uses
+  // the same libc policy (including glibc's /bin/sh fallback on ENOEXEC), with
+  // explicit envp so authored NODE_OPTIONS never executes in a helper.
+  const execvpe = process.platform === 'linux'
+    ? libc.func('int execvpe(const char *file, const char **argv, const char **envp)')
+    : undefined;
   const signal = libc.func('void *signal(int sig, void *handler)');
   const sigemptyset = libc.func('int sigemptyset(void *set)');
   const sigprocmask = libc.func('int sigprocmask(int how, const void *set, void *oldset)');
@@ -96,24 +127,39 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
   function execError(errno) {
     return new Error('Could not execute ' + command[0] + ': ' + getSystemErrorName(-errno) + ': ' + strerror(errno));
   }
-  // Preserve every path component for kernel symlink/.. traversal; lexical
-  // normalization can silently select a different executable. Prefixing cwd
-  // makes relative/dash-prefixed names unambiguous without rewriting them.
-  // Lookups stay asynchronous and use the command's effective cwd/environment.
+  // cwd was set by spawn before helper startup. Never prefix or normalize a
+  // candidate: the kernel must retain symlink/.. traversal and script argv[0].
   const file = command[0];
-  const candidates = file.includes('/') ? [file] : (process.env.PATH ?? '/usr/bin:/bin').split(':').map(dir => (dir || '.') + '/' + file);
-  let executable;
-  let denied = false;
-  for (const candidate of candidates) {
-    try {
-      await fs.access(candidate, constants.X_OK);
-      if ((await fs.stat(candidate)).isFile()) { executable = candidate.startsWith('/') ? candidate : process.cwd() + '/' + candidate; break; }
-    } catch (error) {
-      if (error.code === 'EACCES') denied = true;
-      if (!['ENOENT', 'ENOTDIR', 'EACCES'].includes(error.code)) throw error;
+  function execute() {
+    const argv = [...command, null];
+    const envp = [...Object.entries(env).map(([key, value]) => key + '=' + value), null];
+    if (execvpe) {
+      execvpe(file, argv, envp);
+      throw execError(koffi.errno());
     }
+    // Match Darwin libuv's uv__spawn_resolve_and_spawn, including its byte
+    // limits and empty PATH components. An errno comes from exec, never access.
+    // https://github.com/libuv/libuv/blob/v1.51.0/src/unix/process.c#L633-L723
+    const searched = !file.includes('/');
+    const path = env.PATH ?? '/usr/bin:/bin';
+    if (searched && Buffer.byteLength(file) > 255) throw execError(koffi.os.errno.ENAMETOOLONG);
+    const pathLimit = Math.min(Buffer.byteLength(path), 1023) + 1;
+    const candidates = searched
+      ? path.split(':').filter(dir => Buffer.byteLength(dir) < pathLimit).map(dir => dir ? dir + '/' + file : file)
+      : [file];
+    let errno = koffi.os.errno.ENOENT;
+    let denied = false;
+    for (const candidate of candidates) {
+      do {
+        execve(candidate, argv, envp);
+        errno = koffi.errno();
+      } while (errno === koffi.os.errno.EINTR);
+      if (!searched) throw execError(errno);
+      if (errno === koffi.os.errno.EACCES) denied = true;
+      else if (errno !== koffi.os.errno.ENOENT && errno !== koffi.os.errno.ENOTDIR) throw execError(errno);
+    }
+    throw execError(denied ? koffi.os.errno.EACCES : errno);
   }
-  if (!executable) throw execError(denied ? koffi.os.errno.EACCES : koffi.os.errno.ENOENT);
   const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
     detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
   });
@@ -123,7 +169,7 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
     if (message && message.kind === 'error') { fail(new Error(message.error)); return; }
     if (message !== 'armed') { fail(new Error('Invalid watchdog acknowledgement')); return; }
     armed = true;
-    write(5, JSON.stringify({kind: 'armed'}) + '\n', error => {
+    writeFrame({kind: 'armed'}, error => {
       if (error) { fail(error); return; }
       if (Number(process.hrtime.bigint() / 1000000n) >= deadline) { fail(new Error('Deadline elapsed before command admission')); return; }
       // Node's spawn resets dispositions and clears the child mask. Direct exec
@@ -144,11 +190,9 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
         }
         // All other Node-created descriptors are close-on-exec. The watchdog retains its
         // independent control descriptor and timers across a successful replacement.
-        execve(executable, [command[0], ...command.slice(1), null], [...Object.entries(env).map(([key, value]) => key + '=' + value), null]);
-        // A return is exclusively failure. Report it on the private channel before
-        // exiting normally; stdout, stderr and successful baselines stay untouched.
-        const errno = koffi.errno();
-        fail(execError(errno));
+        // Every returning exec is a failure. Keep stdout, stderr and the prior
+        // baseline untouched while the complete private error frame is flushed.
+        execute();
       } catch (error) { fail(error); }
     });
   });

@@ -1552,7 +1552,8 @@ directly (`execFile` semantics, `shell: false`): there is no word-splitting, glo
 injection surface, and what executes is exactly what the author wrote, token for token. This is the
 decision for #81's first open question; a bare-string `command` (which would imply implicit shell
 word-splitting) is rejected — an author who needs shell features writes them into a script and polls
-the script.
+the script. Like plain spawn, Linux glibc may run a shebang-less executable with `/bin/sh`
+(§11.2); argv elements remain separate literal arguments and are never joined as shell source.
 
 **Shell features are opt-in, not implicit.** An author who genuinely needs a pipeline or shell
 operator spawns a shell _explicitly_ in argv form — `command: ['sh', '-c', 'git status -sb | grep ahead']`
@@ -1581,31 +1582,39 @@ discarded and the result is marked `truncated: true` (a truncated result still d
 validation note in §11.7).
 
 **POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
-An asynchronous launcher starts an in-group watchdog and waits for its timer-armed
-acknowledgement before replacing itself with the authored command. The command retains its
-PID, process group and inherited ownership mark; argv remains literal. Values containing NUL
-bytes fail before execution rather than being truncated at the native string boundary. The launcher uses direct
-`execve`, preserving kernel symlink traversal and authored environment values without an
-interposed shell. The authored program starts with the default signal dispositions and empty
-signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node helpers start without
-`NODE_OPTIONS`; the complete authored/inherited environment, including those options, reaches
-only the command (apart from the ownership-mark override). The launcher calls libc `execve`
-through the packaged native binding, with a separate close-on-exec status pipe. Both ESM and
-CJS consumers resolve that binding relative to the source package itself. Ordinary exec
-failures (ENOENT interpreter, ENOEXEC, EACCES, E2BIG) report errno and a short message naming
-the program, without a native abort, core file or crash report. They preserve failing health
-and the prior successful baseline (§11.5). Arming failure is an
-execution failure and no authored work runs. No synchronous subprocess, FIFO or blocking open
-runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute deadline
-and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
-continued membership supplies identity safety, independent of daemon liveness and command
-stdio. Once a normally completed finite observation has captured its output, it releases
-the whole original group through the watchdog, including any remaining background work.
-Timeout failures retain the full kill grace; after observation settlement the caller-side
-control channel is unreferenced so a finished consumer can exit during that grace. The
-watchdog retains its own referenced timers. Daemon EOF alone never releases the bound. This
-also covers background descendants that close every inherited descriptor. Re-sessioned descendants
-remain restart-sweep work; the Windows path retains its existing daemon-resident tree kill.
+An asynchronous launcher starts an in-group watchdog and waits for its timer-armed acknowledgement
+before replacing itself with the authored command. The command retains its PID, process group and
+inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
+rather than being truncated at the native string boundary. Executable paths retain their authored
+spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
+lookup. Linux calls libc `execvpe`: glibc's ENOEXEC fallback to `/bin/sh` and musl's ENOEXEC failure
+match plain spawn on the same libc. macOS retries EINTR, continues PATH search after
+EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaustion, EACCES takes
+precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
+empty PATH components use the bare filename. The authored program starts with the default signal
+dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
+helpers start without `NODE_OPTIONS`; the complete authored/inherited environment, including those
+options, reaches only the command (apart from the ownership-mark override). The launcher calls libc
+through the packaged native binding, with a separate close-on-exec status pipe. Frames are written
+completely, retrying short writes. Missing frames, trailing partial bytes, unknown frame kinds and
+invalid schemas fail closed and retain the prior baseline; valid frames may span multiple reads. An
+unwritable error status terminates the helper by signal so it cannot become an authored result. Both
+ESM and CJS consumers resolve that binding relative to the source package itself. Native-load
+failures explain that platform native exec support could not be loaded and retain the underlying
+error detail. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG, and ENOEXEC where spawn
+reports it) report errno and a short message naming the program, without a native abort, core file
+or crash report. They preserve failing health and the prior successful baseline (§11.5). Arming
+failure is an execution failure and no authored work runs. No synchronous subprocess, FIFO or
+blocking open runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute
+deadline and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
+continued membership supplies identity safety, independent of daemon liveness and command stdio.
+Once a normally completed finite observation has captured its output, it releases the whole original
+group through the watchdog, including any remaining background work. Timeout failures retain the
+full kill grace; after observation settlement the caller-side control channel is unreferenced so a
+finished consumer can exit during that grace. The watchdog retains its own referenced timers. Daemon
+EOF alone never releases the bound. This also covers background descendants that close every
+inherited descriptor. Re-sessioned descendants remain restart-sweep work; the Windows path retains
+its existing daemon-resident tree kill.
 
 The source factory accepts an optional shutdown signal. Aborting it refuses pending/new
 admissions and forcefully terminates in-flight groups through the identity gate (or their still-live
