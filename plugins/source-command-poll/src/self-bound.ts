@@ -123,7 +123,15 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
   const sigemptyset = libc.func('int sigemptyset(void *set)');
   const sigprocmask = libc.func('int sigprocmask(int how, const void *set, void *oldset)');
   const strerror = libc.func('const char *strerror(int errnum)');
-  const fcntl = libc.func('int fcntl(int fd, int cmd, int flags)');
+  // fcntl's optional argument is variadic: notably, Darwin arm64 passes it on
+  // the stack rather than in the register used by a fixed third parameter.
+  const fcntl = libc.func('int fcntl(int fd, int cmd, ...)');
+  // Darwin and Linux use these same descriptor-flag constants. Keep the native
+  // platform values explicit; they are distinct from open-file status flags.
+  const {F_GETFD, F_SETFD, FD_CLOEXEC} = {
+    darwin: {F_GETFD: 1, F_SETFD: 2, FD_CLOEXEC: 1},
+    linux: {F_GETFD: 1, F_SETFD: 2, FD_CLOEXEC: 1},
+  }[process.platform];
   function execError(errno) {
     return new Error('Could not execute ' + command[0] + ': ' + getSystemErrorName(-errno) + ': ' + strerror(errno));
   }
@@ -186,7 +194,11 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
         // libuv marks even the inherited stdio duplicates close-on-exec. Retain
         // exactly stdin/stdout/stderr; private control and Node internals stay closed.
         for (const fd of [0, 1, 2]) {
-          if (fcntl(fd, 2, 0) === -1) throw new Error('Could not retain command stdio');
+          if (fcntl(fd, F_SETFD, 'int', 0) === -1) throw new Error('Could not retain command stdio');
+          // A successful setter alone cannot prove that exec will retain stdio.
+          // Refuse admission on read failure or a surviving close-on-exec flag.
+          const flags = fcntl(fd, F_GETFD);
+          if (flags === -1 || (flags & FD_CLOEXEC) !== 0) throw new Error('Could not retain command stdio');
         }
         // All other Node-created descriptors are close-on-exec. The watchdog retains its
         // independent control descriptor and timers across a successful replacement.

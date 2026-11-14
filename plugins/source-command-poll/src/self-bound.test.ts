@@ -48,6 +48,110 @@ afterEach(() => {
 describe.skipIf(process.platform === 'win32')(
   'self-bounding command admission',
   () => {
+    it('clears native close-on-exec flags on every command standard stream', async () => {
+      // Prime real helper descriptors, then inspect them at the native exec
+      // boundary. A separate variadic binding makes this an ABI regression,
+      // rather than trusting the launcher's own declaration or return code.
+      injected.launcher = `const originalLoad = require('node:module')._load;
+        require('node:module')._load = function(id, ...args) {
+          const loaded = originalLoad.call(this, id, ...args);
+          if (!id.includes('koffi')) return loaded;
+          return {...loaded, load(...loadArgs) {
+            const library = loaded.load(...loadArgs);
+            const nativeFcntl = library.func('int fcntl(int fd, int cmd, ...)');
+            const F_GETFD = 1, F_SETFD = 2, FD_CLOEXEC = 1;
+            for (const fd of [0, 1, 2]) {
+              if (nativeFcntl(fd, F_SETFD, 'int', FD_CLOEXEC) !== 0 || nativeFcntl(fd, F_GETFD) !== FD_CLOEXEC)
+                throw new Error('fixture: could not prime close-on-exec');
+            }
+            return {...library, func(declaration) {
+              const native = library.func(declaration);
+              if (!declaration.includes(' execve(') && !declaration.includes(' execvpe(')) return native;
+              return (...execArgs) => {
+                for (const fd of [0, 1, 2]) {
+                  if (nativeFcntl(fd, F_GETFD) !== 0) throw new Error('fixture: close-on-exec survived for fd ' + fd);
+                }
+                return native(...execArgs);
+              };
+            }};
+          }};
+        };`;
+      const result = await source.observe(
+        {
+          command: [
+            process.execPath,
+            '-e',
+            'const fs = require("node:fs"); fs.writeSync(1, "stdout"); fs.writeSync(2, "stderr"); process.exit(7)',
+          ],
+          timeout: '2s',
+        },
+        { now: new Date() },
+      );
+      expect(result.observations).toEqual([]);
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'stdout',
+        exitCode: 7,
+      });
+    });
+
+    it.each(['set error', 'get error', 'flag retained'])(
+      'retains the baseline and refuses execution after stdio %s',
+      async (fault) => {
+        // Fault only the admission binding. No authored work may run when the
+        // kernel rejects a flag operation or reports that exec would close stdio.
+        injected.launcher = `const originalLoad = require('node:module')._load;
+          require('node:module')._load = function(id, ...args) {
+            const loaded = originalLoad.call(this, id, ...args);
+            if (!id.includes('koffi')) return loaded;
+            return {...loaded, load(...loadArgs) {
+              const library = loaded.load(...loadArgs);
+              return {...library, func(declaration) {
+                const native = library.func(declaration);
+                if (!declaration.includes(' fcntl(')) return native;
+                return (fd, cmd, ...flags) => {
+                  if (fd === 1) {
+                    if (cmd === 2 && ${JSON.stringify(fault)} === 'set error') return -1;
+                    if (cmd === 1 && ${JSON.stringify(fault)} === 'get error') return -1;
+                    if (cmd === 1 && ${JSON.stringify(fault)} === 'flag retained') return 1;
+                  }
+                  return native(fd, cmd, ...flags);
+                };
+              }};
+            }};
+          };`;
+        const dir = mkdtempSync(path.join(tmpdir(), 'stdio-'));
+        const marker = path.join(dir, 'ran');
+        const previousState = {
+          stdout: 'good-baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'ok',
+          baselined: true,
+        };
+        const result = await source.observe(
+          {
+            command: [
+              process.execPath,
+              '-e',
+              'require("node:fs").writeFileSync(process.argv[1], "ran")',
+              marker,
+            ],
+            timeout: '2s',
+          },
+          { now: new Date(), previousState },
+        );
+        expect(existsSync(marker)).toBe(false);
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining('Could not retain command stdio'),
+        });
+      },
+    );
+
     // Reuse the review's real fd-5 fault cases at the maintained helper seam.
     // A prior successful result must survive every incomplete admission protocol.
     it.each([

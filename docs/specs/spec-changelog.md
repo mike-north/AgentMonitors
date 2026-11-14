@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-13 — Verify standard-stream retention before native exec (003 §11; 008 §3.3) — Refs #470
+
+Clear close-on-exec on stdin/stdout/stderr with the platform's variadic `fcntl` ABI, then read
+each flag back. A failed setter/getter or retained `FD_CLOEXEC` refuses authored execution and
+keeps the prior successful baseline with failing health. Native descriptor and injected
+failure regressions verify the contract, including the Darwin arm64 variadic calling convention.
+
 ## 2026-11-13 — Validate complete admission status and match native executable lookup (003 §11; 008 §3.3) — Refs #470
 
 Require complete status writes and reject missing, truncated, unknown or invalid frames before

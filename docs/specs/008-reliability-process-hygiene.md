@@ -160,7 +160,10 @@ command result. Ordinary exec errors name the program and errno, preserve failin
 previous baseline, and create no abort/core/crash report. Both Node helpers start without authored
 or inherited `NODE_OPTIONS`; the command receives the complete intended environment through a
 separate asynchronous configuration pipe, with only the deliberate ownership-mark override. Private
-descriptors close at exec; only standard input/output/error survive. Missing native binding support
+descriptors close at exec; only standard input/output/error survive. Admission clears their
+close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. Failed calls or
+a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
+without running authored work. Missing native binding support
 fails closed with a platform-support explanation and the underlying loader error.
 
 Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
@@ -184,7 +187,8 @@ clock virtualization from changing the execution epoch. Timer segments are cappe
 delay, including the maximum configured timeout plus the grace, without integer overflow.
 
 **Verified:** `plugins/source-command-poll/src/self-bound.test.ts` covers ordering, injected
-arming failure, restricted PATH, literal argv, preserved PID/mark, event-loop progress and
+arming failure, native standard-stream close-on-exec clearing, flag-operation/read-back failures,
+restricted PATH, literal argv, preserved PID/mark, event-loop progress and
 absence of synchronous arming APIs. `exec-semantics.test.ts` compares all native signal
 dispositions/mask bits with plain spawn on macOS/Linux, verifies errno diagnostics and absence
 of owned crash artifacts, and covers authored/inherited Node preload and module options. `watchdog-program.test.ts` covers self-group targeting,

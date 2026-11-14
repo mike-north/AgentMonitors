@@ -1595,7 +1595,10 @@ empty PATH components use the bare filename. The authored program starts with th
 dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
 helpers start without `NODE_OPTIONS`; the complete authored/inherited environment, including those
 options, reaches only the command (apart from the ownership-mark override). The launcher calls libc
-through the packaged native binding, with a separate close-on-exec status pipe. Frames are written
+through the packaged native binding, with a separate close-on-exec status pipe. Before execution,
+it clears close-on-exec on stdin/stdout/stderr using the platform's variadic `fcntl` ABI and reads
+each descriptor's flags back. A failed flag operation or surviving close-on-exec flag refuses
+execution with `Could not retain command stdio` and preserves the prior baseline. Frames are written
 completely, retrying short writes. Missing frames, trailing partial bytes, unknown frame kinds and
 invalid schemas fail closed and retain the prior baseline; valid frames may span multiple reads. An
 unwritable error status terminates the helper by signal so it cannot become an authored result. Both
