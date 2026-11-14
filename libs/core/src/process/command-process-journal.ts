@@ -19,8 +19,11 @@ import {
   readBootIdentity,
   readCommandMarks,
   readCommandTerminal,
+  readDarwinCommandTerminals,
+  type CommandTerminalEvidence,
 } from './command-process-marks.js';
-import { sendVerifiedSignal } from './process-identity.js';
+import { withDarwinCommandMarkReader } from './darwin-command-marks.js';
+import { sendVerifiedSignal, type SignalOutcome } from './process-identity.js';
 import {
   readProcessTable,
   type ProcessIdentityRecord,
@@ -218,6 +221,11 @@ export class CommandProcessJournal implements CommandProcessOwner {
 
   /** Reconcile only dead lives in this workspace, never a numerically matching group. */
   async sweep(): Promise<RestartSweepResult> {
+    return withDarwinCommandMarkReader(() => this.reconcile());
+  }
+
+  /** One reconciliation scope retains a single helper while every gate still reads fresh evidence. */
+  private async reconcile(): Promise<RestartSweepResult> {
     const outcomes: RestartSweepOutcome[] = [];
     const startedAt = new Date().toISOString();
     const receipt = this.sql
@@ -481,6 +489,28 @@ export class CommandProcessJournal implements CommandProcessOwner {
             save('running');
           })();
         }
+        // macOS system-reader startup must be amortized over the pass. All
+        // eligible gates share a final fresh identity snapshot and signal in
+        // one microtask turn, before terminal reads or later discovery can run.
+        // Linux retains its per-process /proc checks and sequential execution.
+        const darwinDecisions =
+          process.platform === 'darwin'
+            ? await signalDarwinBatch(
+                pending.flatMap((pid) => {
+                  const record = byPid.get(pid);
+                  const inherited = ownership.marks.get(pid) === previous.life;
+                  return sameBoot &&
+                    record &&
+                    !liveOwners.has(pid) &&
+                    pid !== process.pid &&
+                    (inherited || anchors.has(record.pgid))
+                    ? [{ record, inherited }]
+                    : [];
+                }),
+                this.boot,
+                previous.life,
+              )
+            : undefined;
         for (const pid of pending) {
           const record = byPid.get(pid);
           if (record === undefined) continue;
@@ -523,47 +553,51 @@ export class CommandProcessJournal implements CommandProcessOwner {
             save('running');
             continue;
           }
-          const outcome = await sendVerifiedSignal(
-            { kind: 'recorded-process', record },
-            'SIGKILL',
-            {
-              action: 'restart command cleanup',
-              // Discovery positively records group membership while a marked
-              // anchor exists. That immutable process identity remains evidence
-              // after the anchor is killed; a bare PGID never grants authority.
-              readProcessTable: async () => {
-                const freshBoot = await readBootIdentity();
-                let markConfirmed = true;
-                if (inherited) {
-                  const freshMarks = await readCommandMarks([pid]);
-                  markConfirmed =
-                    freshMarks.supported &&
-                    freshMarks.marks.get(pid) === previous.life;
-                }
-                // Identity is the LAST asynchronous query. An environment read
-                // must not leave the gate comparing a pre-recycling snapshot.
-                const fresh = await readProcessTable();
-                if (
-                  !fresh.supported ||
-                  !fresh.processes.some((p) => p.pid === pid)
-                )
+          const decision = darwinDecisions?.get(pid);
+          const outcome =
+            decision?.outcome ??
+            (await sendVerifiedSignal(
+              { kind: 'recorded-process', record },
+              'SIGKILL',
+              {
+                action: 'restart command cleanup',
+                // Discovery positively records group membership while a marked
+                // anchor exists. That immutable process identity remains evidence
+                // after the anchor is killed; a bare PGID never grants authority.
+                readProcessTable: async () => {
+                  const freshBoot = await readBootIdentity();
+                  let markConfirmed = true;
+                  if (inherited) {
+                    const freshMarks = await readCommandMarks([pid]);
+                    markConfirmed =
+                      freshMarks.supported &&
+                      freshMarks.marks.get(pid) === previous.life;
+                  }
+                  // Identity is the LAST asynchronous query. An environment read
+                  // must not leave the gate comparing a pre-recycling snapshot.
+                  const fresh = await readProcessTable();
+                  if (
+                    !fresh.supported ||
+                    !fresh.processes.some((p) => p.pid === pid)
+                  )
+                    return fresh;
+                  if (freshBoot !== this.boot || !markConfirmed)
+                    return {
+                      supported: false,
+                      reason:
+                        'Boot or inherited ownership mark could not be confirmed at signal time',
+                    };
                   return fresh;
-                if (freshBoot !== this.boot || !markConfirmed)
-                  return {
-                    supported: false,
-                    reason:
-                      'Boot or inherited ownership mark could not be confirmed at signal time',
-                  };
-                return fresh;
+                },
+                reportAbstention: () => {
+                  /* Durable outcomes are the future active-warning input. */
+                },
               },
-              reportAbstention: () => {
-                /* Durable outcomes are the future active-warning input. */
-              },
-            },
-          );
+            ));
           if (outcome.status === 'sent') {
             progress.observed = true;
-            const terminal = await readCommandTerminal(record);
+            const terminal =
+              decision?.terminal ?? (await readCommandTerminal(record));
             outcomes.push({
               status: terminal === 'terminated' ? 'reaped' : 'failed',
               ...(terminal !== 'terminated'
@@ -613,8 +647,12 @@ export class CommandProcessJournal implements CommandProcessOwner {
               reason: outcome.detail,
             });
           }
-          save('running');
+          // macOS decisions are already one uninterrupted batch. Commit them
+          // together before the next asynchronous query instead of rewriting
+          // an expanding receipt once per survivor with FULL synchronous I/O.
+          if (darwinDecisions === undefined) save('running');
         }
+        if (darwinDecisions !== undefined) save('running');
         // Signals and observed exits can expose late forks. Withheld signals
         // alone do not justify rescanning unchanged ownership uncertainty.
         if (!progress.observed) break;
@@ -757,6 +795,86 @@ const MAX_DISCOVERY_PASSES = 8;
 /** Missing mark evidence names an uncertainty; it does not attribute the PID to a command. */
 const UNREADABLE_OWNERSHIP_REASON =
   'Same-user ownership mark could not be read; command attribution is unknown';
+
+/** Per-PID gate and terminal evidence; batching never changes the durable outcome vocabulary. */
+interface DarwinSignalDecision {
+  readonly outcome: SignalOutcome;
+  readonly terminal?: CommandTerminalEvidence;
+}
+
+/**
+ * Compose existing ownership and signal gates without a subprocess per survivor.
+ * Read boot and all required marks, then identity LAST. Every signal gate runs
+ * from that final table in the same microtask turn: no terminal query, journal
+ * await, or subsequent discovery can age the snapshot between these signals.
+ * Each PID still passes sendVerifiedSignal individually; no stored PGID is sent.
+ */
+async function signalDarwinBatch(
+  candidates: readonly {
+    readonly record: ProcessIdentityRecord;
+    readonly inherited: boolean;
+  }[],
+  boot: string | undefined,
+  life: string,
+): Promise<ReadonlyMap<number, DarwinSignalDecision>> {
+  if (candidates.length === 0) return new Map();
+  const freshBoot = await readBootIdentity();
+  const marks = await readCommandMarks(
+    candidates
+      .filter((candidate) => candidate.inherited)
+      .map((candidate) => candidate.record.pid),
+  );
+  const fresh = await readProcessTable();
+  const results = await Promise.all(
+    candidates.map(async ({ record, inherited }) => ({
+      record,
+      outcome: await sendVerifiedSignal(
+        { kind: 'recorded-process', record },
+        'SIGKILL',
+        {
+          action: 'restart command cleanup',
+          readProcessTable: () => {
+            if (
+              !fresh.supported ||
+              !fresh.processes.some((p) => p.pid === record.pid)
+            )
+              return Promise.resolve(fresh);
+            if (
+              freshBoot !== boot ||
+              (inherited &&
+                (!marks.supported || marks.marks.get(record.pid) !== life))
+            )
+              return Promise.resolve({
+                supported: false,
+                reason:
+                  'Boot or inherited ownership mark could not be confirmed at signal time',
+              });
+            return Promise.resolve(fresh);
+          },
+          reportAbstention: () => {
+            /* Persisted by the journal before subsequent discovery. */
+          },
+        },
+      ),
+    })),
+  );
+  const terminals = await readDarwinCommandTerminals(
+    results
+      .filter((result) => result.outcome.status === 'sent')
+      .map((result) => result.record),
+  );
+  return new Map(
+    results.map(({ record, outcome }) => [
+      record.pid,
+      {
+        outcome,
+        ...(outcome.status === 'sent'
+          ? { terminal: terminals.get(record.pid) ?? 'unavailable' }
+          : {}),
+      },
+    ]),
+  );
+}
 
 /** A failed or changing anchor cannot lend its old group authority to unrelated work. */
 type GroupAnchorConfirmation =
