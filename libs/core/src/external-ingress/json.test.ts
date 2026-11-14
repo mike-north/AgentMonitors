@@ -647,3 +647,249 @@ describe('external JSON canonical byte vectors', () => {
     },
   );
 });
+
+/** Both public entry points share the same refusal and hook-freedom contract. */
+const jsonEntryPoints = [
+  ['encoding', canonicalJsonStringify],
+  ['validation', (value: unknown) => assertExternalJsonValue(value, 0, 512)],
+] as const;
+
+/** These symbols are discoverable by callers and cannot be trusted as brands. */
+const cryptoKeyType = Object.getOwnPropertySymbols(
+  createSecretKey(new Uint8Array(16)),
+).find((symbol) => symbol.description === 'kKeyType');
+if (!cryptoKeyType) throw new Error('Missing crypto fixture symbol.');
+
+describe.each(jsonEntryPoints)('external JSON hook-free %s', (_entry, run) => {
+  it.each([false, true])(
+    'refuses a proxy prototype without reading it, array=%s',
+    (array) => {
+      const hook = vi.fn(() => {
+        throw new Error('caller code ran');
+      });
+      const value = Object.setPrototypeOf(
+        array ? [] : {},
+        new Proxy(
+          {},
+          {
+            get: hook,
+            getPrototypeOf: hook,
+            ownKeys: hook,
+            getOwnPropertyDescriptor: hook,
+          },
+        ),
+      );
+      expect(() => run(value)).toThrow(TypeError);
+      expect(hook).not.toHaveBeenCalled();
+    },
+  );
+
+  describe.each([null, Object.prototype])(
+    'record prototype %s',
+    (prototype) => {
+      it('refuses an own real crypto-symbol accessor without reading it', () => {
+        const hook = vi.fn(() => {
+          throw new Error('caller code ran');
+        });
+        const value: object = Object.create(prototype);
+        Object.defineProperty(value, cryptoKeyType, { get: hook });
+        expect(() => run(value)).toThrow(TypeError);
+        expect(hook).not.toHaveBeenCalled();
+      });
+
+      it.each(['KeyObject', 'CryptoKey'])(
+        'refuses %s without reading its own crypto-symbol accessor',
+        async (brand) => {
+          const value =
+            brand === 'KeyObject'
+              ? createSecretKey(new Uint8Array(16))
+              : await webcrypto.subtle.importKey(
+                  'raw',
+                  new Uint8Array(16),
+                  { name: 'HMAC', hash: 'SHA-256' },
+                  true,
+                  ['sign'],
+                );
+          Object.setPrototypeOf(value, prototype);
+          const hook = vi.fn(() => {
+            throw new Error('caller code ran');
+          });
+          Object.defineProperty(value, cryptoKeyType, { get: hook });
+          expect(() => run(value)).toThrow(TypeError);
+          expect(hook).not.toHaveBeenCalled();
+        },
+      );
+    },
+  );
+});
+
+/** Read-only witnesses establish that refusal preserves each receiver's state. */
+const readOnlyIntrinsicFixtures: readonly (readonly [
+  string,
+  () => object,
+  (value: object) => unknown,
+])[] = [
+  [
+    'WeakRef',
+    () => new WeakRef({ secret: 1 }),
+    (value) => Reflect.apply(WeakRef.prototype.deref, value, []),
+  ],
+  [
+    'FinalizationRegistry',
+    () =>
+      new FinalizationRegistry(() => {
+        /* Finalization timing is outside the synchronous refusal contract. */
+      }),
+    () => 'registration checked separately',
+  ],
+  [
+    'URL',
+    () => new URL('https://example.test/secret?a=1'),
+    (value) => Reflect.apply(URL.prototype.toString, value, []),
+  ],
+  [
+    'URLSearchParams',
+    () => new URLSearchParams('secret=one&secret=two'),
+    (value) => Reflect.apply(URLSearchParams.prototype.toString, value, []),
+  ],
+  [
+    'Intl.Collator',
+    () => new Intl.Collator('de'),
+    (value) =>
+      Reflect.apply(Intl.Collator.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.DateTimeFormat',
+    () => new Intl.DateTimeFormat('en', { timeZone: 'UTC' }),
+    (value) =>
+      Reflect.apply(Intl.DateTimeFormat.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.NumberFormat',
+    () => new Intl.NumberFormat('de'),
+    (value) =>
+      Reflect.apply(Intl.NumberFormat.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.PluralRules',
+    () => new Intl.PluralRules('en'),
+    (value) =>
+      Reflect.apply(Intl.PluralRules.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.RelativeTimeFormat',
+    () => new Intl.RelativeTimeFormat('en'),
+    (value) =>
+      Reflect.apply(
+        Intl.RelativeTimeFormat.prototype.resolvedOptions,
+        value,
+        [],
+      ),
+  ],
+  [
+    'Intl.ListFormat',
+    () => new Intl.ListFormat('en'),
+    (value) =>
+      Reflect.apply(Intl.ListFormat.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.Locale',
+    () => new Intl.Locale('fr-FR'),
+    (value) => Reflect.apply(Intl.Locale.prototype.toString, value, []),
+  ],
+  [
+    'Intl.DisplayNames',
+    () => new Intl.DisplayNames('en', { type: 'language' }),
+    (value) =>
+      Reflect.apply(Intl.DisplayNames.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.Segmenter',
+    () => new Intl.Segmenter('en'),
+    (value) =>
+      Reflect.apply(Intl.Segmenter.prototype.resolvedOptions, value, []),
+  ],
+  [
+    'Intl.DurationFormat',
+    () => new Intl.DurationFormat('en'),
+    (value) =>
+      Reflect.apply(Intl.DurationFormat.prototype.resolvedOptions, value, []),
+  ],
+];
+
+describe.each(jsonEntryPoints)(
+  'external JSON read-only intrinsic refusal through %s',
+  (_entry, run) => {
+    describe.each([null, Object.prototype])(
+      'replacement prototype %s',
+      (prototype) => {
+        it.each(readOnlyIntrinsicFixtures)(
+          'refuses %s while preserving its state',
+          (_brand, create, witness) => {
+            const value = Object.setPrototypeOf(create(), prototype);
+            const before = witness(value);
+            expect(() => run(value)).toThrow(TypeError);
+            expect(witness(value)).toEqual(before);
+          },
+        );
+        it.each(readOnlyIntrinsicFixtures)(
+          'refuses %s without consulting caller hooks',
+          (_brand, create) => {
+            const value = Object.setPrototypeOf(create(), prototype);
+            const hook = vi.fn(() => {
+              throw new Error('caller code ran');
+            });
+            for (const key of [
+              Symbol.toStringTag,
+              Symbol.toPrimitive,
+              'toJSON',
+              'constructor',
+            ]) {
+              Object.defineProperty(value, key, {
+                enumerable: true,
+                get: hook,
+              });
+            }
+            expect(() => run(value)).toThrow(TypeError);
+            expect(hook).not.toHaveBeenCalled();
+          },
+        );
+        it('preserves existing finalization registrations', () => {
+          const registry = new FinalizationRegistry(() => {
+            /* Finalization timing is outside the synchronous refusal contract. */
+          });
+          const target = {};
+          const token = {};
+          registry.register(target, 'held', token);
+          Object.setPrototypeOf(registry, prototype);
+          expect(() => run(registry)).toThrow(TypeError);
+          expect(
+            Reflect.apply(FinalizationRegistry.prototype.unregister, registry, [
+              token,
+            ]),
+          ).toBe(true);
+        });
+        it('does not synchronize pending URL query changes', () => {
+          const value = new URL('https://example.test/?before=1');
+          value.searchParams.set('after', '2');
+          Object.setPrototypeOf(value, prototype);
+          expect(() => run(value)).toThrow(TypeError);
+          expect(Reflect.apply(URL.prototype.toString, value, [])).toBe(
+            'https://example.test/?before=1&after=2',
+          );
+        });
+      },
+    );
+
+    it('accepts records with method-shaped data without calling them', () => {
+      const value = {
+        deref: 'data',
+        unregister: true,
+        resolvedOptions: 1,
+        protocol: 'data',
+        size: 2,
+      };
+      expect(() => run(value)).not.toThrow();
+    });
+  },
+);
