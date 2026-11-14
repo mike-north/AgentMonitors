@@ -714,3 +714,32 @@ import {promisify} from 'node:util';
 it('process output',async()=>{const execute=promisify(execFile);const result=await execute(process.execPath,['-e',"process.stdout.write('out');process.stderr.write('err')"],{encoding:'utf8',timeout:3000});expect(result).toMatchObject({stdout:'out',stderr:'err'});});`);
   expect(result.status, result.stdout + result.stderr).toBe(0);
 }, 20000);
+
+/** An explicitly owned parent keeps bounded work entirely inside its authorized temp tree. */
+it('places the suite coordinator under an explicitly supplied temp parent', () => {
+  const parent = mkdtempSync(join(tmpdir(), 'coordinator-parent-'));
+  try {
+    const child = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+      import {createTestBoundary} from ${JSON.stringify(pathToFileURL(join(repo, 'scripts/test-isolation/boundary.mjs')).href)};
+      const boundary = createTestBoundary();
+      console.log(JSON.stringify(boundary.root));
+      boundary.finish();
+    `,
+      ],
+      {
+        env: { ...process.env, AGENTMONITORS_TEST_TEMP_ROOT: parent },
+        encoding: 'utf8',
+        timeout: 10_000,
+      },
+    );
+    expect(child.status, child.stderr).toBe(0);
+    expect(dirname(JSON.parse(child.stdout.trim()))).toBe(parent);
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
+});

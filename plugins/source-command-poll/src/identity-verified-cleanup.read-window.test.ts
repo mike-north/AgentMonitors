@@ -22,6 +22,20 @@ import type * as Core from '@agentmonitors/core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import source from './index.js';
 
+// Exercise the daemon's identity gate even when the independent watchdog is
+// scheduled late and loses its TERM protection. Original signal and no-survivor assertions remain active;
+// the real watchdog deadline is covered separately by hard-daemon-death tests.
+vi.mock('./self-bound.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./self-bound.js')>();
+  return {
+    ...actual,
+    WATCHDOG_PROGRAM:
+      'const setTimeout = (fn, ms) => global.setTimeout(fn, ms + 2000);\n' +
+      actual.WATCHDOG_PROGRAM +
+      '\nprocess.removeAllListeners("SIGTERM");',
+  };
+});
+
 /** How long a held read may wait for the leader to exit before giving up. */
 const HOLD_LIMIT_MS = 10_000;
 

@@ -8,7 +8,8 @@
  * The tests spawn tiny real subprocesses (`node -e …`) so the no-shell spawn path is
  * genuinely exercised — not a hand-built approximation. Dates are fixed; no network.
  */
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import {
   mkdirSync,
   mkdtempSync,
@@ -25,25 +26,6 @@ import type {
 } from '@agentmonitors/core';
 import source from './index.js';
 
-/**
- * Probe pgrep availability once at module load so `describe.skipIf` has a
- * synchronous boolean — it cannot await a promise. pgrep exits 1 when there
- * are no matches (normal); ENOENT means it's not installed at all.
- */
-function probePgrep(): boolean {
-  try {
-    execFileSync('pgrep', ['-P', '0'], { stdio: 'pipe' });
-    return true;
-  } catch (e) {
-    const err = e as { code?: string | number };
-    // exit code 1 = no matches — pgrep IS available, just found nothing
-    // ENOENT = binary not found — pgrep is NOT available
-    return err.code !== 'ENOENT';
-  }
-}
-
-const PGREP_AVAILABLE = probePgrep();
-
 const NOW = new Date('2026-06-12T00:00:00.000Z');
 
 /** A context whose `now` is a fixed constant (never `Date.now()`). */
@@ -59,6 +41,10 @@ function nodeArgv(program: string): string[] {
 }
 
 describe('source-command-poll', () => {
+  // Instrumentation is process-global and must also be restored after timeout.
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
   it('has the correct name, is stateful, and exposes a scopeSchema (003 §11)', () => {
     expect(source.name).toBe('command-poll');
     expect(source.stateful).toBe(true);
@@ -1186,37 +1172,63 @@ describe('source-command-poll', () => {
 });
 
 /**
- * Process-leak guard: assert the spawned-children count returns to baseline.
- * Skipped on platforms where `pgrep` is unavailable — without it the helper
- * always returns 0 and the test would pass vacuously (003 §11.7).
+ * Track the authored command and its descendant by a unique argv token, even
+ * after reparenting. Runtime inspection helpers are unrelated to this contract.
+ * POSIX process-table inspection is unavailable on Windows.
  */
-describe.skipIf(!PGREP_AVAILABLE)(
+describe.skipIf(process.platform === 'win32')(
   'source-command-poll: no orphan processes (003 §11.7)',
   () => {
-    let baselineChildCount = 0;
-
-    afterEach(async () => {
-      // Allow any lingering teardown to settle, then confirm no extra children leaked.
-      await new Promise((r) => setTimeout(r, 50));
-    });
-
     it('a timed-out child leaves no orphan (killed within the grace window)', async () => {
-      baselineChildCount = await childProcessCount();
-
+      const token = `am-orphan-${randomUUID()}`;
+      // Both processes carry the token as an argv value. A readiness diagnostic
+      // proves the descendant actually started before cleanup is assessed.
       const hung = {
-        command: nodeArgv('setTimeout(() => {}, 60000)'),
+        command: [
+          ...nodeArgv(
+            `const { spawn } = require('node:child_process');` +
+              `const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)', process.argv[1]], { stdio: 'ignore' });` +
+              `child.once('spawn', () => process.stderr.write('descendant:' + child.pid));` +
+              `setTimeout(() => {}, 60000);`,
+          ),
+          token,
+        ],
         timeout: '1s',
       };
-      const result: ObservationResult = await source.observe(hung, {
-        now: NOW,
-      });
-      expect(result.observations).toHaveLength(1);
-
-      // Give SIGTERM time to land (timeout 1s already elapsed; the child exits on TERM).
-      await new Promise((r) => setTimeout(r, 200));
-      const after = await childProcessCount();
-      expect(after).toBeLessThanOrEqual(baselineChildCount);
-    });
+      // Timeout (1s) + specified kill grace (5s) + scheduling margin (1s).
+      // The same deadline bounds observe and cleanup: a broken timeout must
+      // still produce survivor diagnostics instead of just a test-runner timeout.
+      const deadline = Date.now() + 7_000;
+      const observation = source.observe(hung, { now: NOW });
+      let observationTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const result = await Promise.race([
+          observation,
+          new Promise<undefined>((resolve) => {
+            observationTimer = setTimeout(
+              () => resolve(undefined),
+              Math.max(0, deadline - Date.now()),
+            );
+          }),
+        ]);
+        clearTimeout(observationTimer);
+        let survivors = await processesWithToken(token);
+        while (survivors.length > 0 && Date.now() < deadline) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          survivors = await processesWithToken(token);
+        }
+        expect(survivors, 'surviving command PIDs and argv').toEqual([]);
+        expect(result?.observations).toHaveLength(1);
+        expect(result?.observations[0]?.payload).toMatchObject({
+          error: expect.stringMatching(/timed out/i),
+          stderrTail: expect.stringMatching(/descendant:\d+/),
+        });
+      } finally {
+        clearTimeout(observationTimer);
+        await killFixtureProcesses(token);
+        await observation;
+      }
+    }, 12_000);
   },
 );
 
@@ -1225,7 +1237,7 @@ describe.skipIf(!PGREP_AVAILABLE)(
  * the direct child (`child.kill()`), so a command that backgrounds a worker via a
  * shell — `sh -c 'sleep 30 & wait'`, the repro from the issue — left the `sleep`
  * grandchild running after the shell was killed. `pgrep -P <thisProcess>` (used by
- * the block above) can never catch this: `sleep`'s parent is the shell, not this
+ * a direct-child count) can never catch this: `sleep`'s parent is the shell, not this
  * test process, so a grandchild leak is invisible to a direct-children-only check
  * even before the kernel reparents it away. This test instead captures the
  * grandchild's own PID (the same way the issue's repro does) and asserts by PID —
@@ -1381,8 +1393,7 @@ describe.skipIf(process.platform === 'win32')(
 
 /**
  * Whether `pid` currently identifies a live process, checked via POSIX `kill(pid,
- * 0)` semantics (no actual signal sent). Distinct from `childProcessCount`'s
- * tree-membership check: this works even after the process has been reparented
+ * 0)` semantics (no actual signal sent). This works even after reparenting
  * away from us, which is exactly what happens to an orphan.
  */
 function isProcessAlive(pid: number): boolean {
@@ -1412,34 +1423,38 @@ async function pollUntil(
 }
 
 /**
- * Count direct child processes of this test process via POSIX `pgrep`.
- *
- * Exit code 1 means "no matches" → 0 children (normal, not an error).
- * Any other error (ENOENT, unexpected exit code) is thrown so the test fails
- * loudly rather than passing blind — a masked leak is worse than a test failure.
+ * Return PID/argv diagnostics for this test's unique token across the whole
+ * process table. Inspection errors reject rather than treating an unknown table
+ * as empty. The inspector's argv contains no token and cannot match itself.
  */
-async function childProcessCount(): Promise<number> {
-  const { execFile } = await import('node:child_process');
-  return new Promise<number>((resolve, reject) => {
-    execFile('pgrep', ['-P', String(process.pid)], (err, stdout) => {
-      if (err) {
-        const errWithCode = err as Error & { code?: string | number };
-        // pgrep exits 1 when there are no matches — that is "zero children", not an error.
-        if (errWithCode.code === 1) {
-          resolve(0);
-          return;
-        }
-        // Any other failure (ENOENT, unexpected exit code, etc.) means we can't
-        // measure — reject so the test fails loudly rather than passing vacuously.
-        reject(
-          new Error(
-            `pgrep failed unexpectedly (code=${String(errWithCode.code)}): ${err.message}`,
-          ),
-        );
+async function processesWithToken(token: string): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    execFile('/bin/ps', ['-A', '-ww', '-o', 'pid=,args='], (error, stdout) => {
+      if (error) {
+        reject(error);
         return;
       }
-      const lines = stdout.split('\n').filter((l) => l.trim().length > 0);
-      resolve(lines.length);
+      resolve(stdout.split('\n').filter((row) => row.includes(token)));
     });
   });
+}
+
+/**
+ * Remove this test's fixtures after either success or failure. Re-read the
+ * unique argv token before positive-PID signals; never signal a stored group.
+ * Unexpected signaling errors remain failures instead of concealing a leak.
+ */
+async function killFixtureProcesses(token: string): Promise<void> {
+  for (const row of await processesWithToken(token)) {
+    const pid = Number(row.trim().split(/\s+/, 1)[0]);
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch (error) {
+      if (
+        !(error instanceof Error && 'code' in error && error.code === 'ESRCH')
+      ) {
+        throw error;
+      }
+    }
+  }
 }

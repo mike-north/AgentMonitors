@@ -12,6 +12,7 @@ export default defineConfig({
   banner: {
     js: '#!/usr/bin/env node',
   },
-  noExternal: [/^(?!better-sqlite3|bindings|file-uri-to-path)/],
-  external: ['better-sqlite3', 'bindings', 'file-uri-to-path'],
+  // Native bindings must retain their package-relative binary lookup when packed.
+  noExternal: [/^(?!better-sqlite3|bindings|file-uri-to-path|koffi)/],
+  external: ['better-sqlite3', 'bindings', 'file-uri-to-path', 'koffi'],
 });

@@ -34,7 +34,8 @@
     "fix:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json"
   },
   "dependencies": {
-    "@agentmonitors/core": "workspace:*"
+    "@agentmonitors/core": "workspace:*",
+    "koffi": "3.3.7"
   },
   "license": "MIT",
   "devDependencies": {

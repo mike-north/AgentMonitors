@@ -9,6 +9,80 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-13 — Restore blocking native standard streams before exec (003 §11; 008 §3.3) — Refs #470
+
+Clear `O_NONBLOCK` on all three standard descriptors using platform-specific variadic `fcntl`
+constants and verify each status with a fresh `F_GETFL`. Preserve access mode, append mode and
+unrelated flags. Failed status operations or surviving nonblocking mode refuse authored work
+and retain the prior baseline through the existing stdio admission diagnostic. Native Perl
+pressure writers and delayed-input reads exercise blocking I/O without a compiler; real flag
+priming and injected read/write/read-back failures cover all standard streams and fail-closed
+admission. Ordinary source stdin remains ignored. Signal, process-group, environment, descriptor
+layout and watchdog ownership contracts remain unchanged.
+
+## 2026-11-13 — Isolate helper environments and reparent watchdogs before exec (003 §11; 008 §3.3) — Refs #470
+
+Keep authored and inherited environment values out of helper startup, using absolute runtime
+paths and only the life mark in the environment. Pass the intended command environment through the
+configuration pipe to native envp, preserving the plain-spawn environment budget. Linux sets
+the authored PATH at the execvpe boundary. Distinguish native-module load errors from other
+initialization failures. Start the watchdog through an intermediate, forward its armed
+acknowledgement, reap that intermediate and drain its IPC before exec regardless of event order.
+The marked watchdog keeps its original
+group and independent timers without becoming a waitable child of authored work. The journal,
+recorded command PID and watchdog reap accounting are unchanged. Near-limit plain-spawn controls,
+helper environment captures, a portable Perl wait-all fixture and process-relationship/failure
+regressions verify the contract.
+
+## 2026-11-13 — Verify standard-stream retention before native exec (003 §11; 008 §3.3) — Refs #470
+
+Clear close-on-exec on stdin/stdout/stderr with the platform's variadic `fcntl` ABI, then read
+each flag back. A failed setter/getter or retained `FD_CLOEXEC` refuses authored execution and
+keeps the prior successful baseline with failing health. Native descriptor and injected
+failure regressions verify the contract, including the Darwin arm64 variadic calling convention.
+
+## 2026-11-13 — Validate complete admission status and match native executable lookup (003 §11; 008 §3.3) — Refs #470
+
+Require complete status writes and reject missing, truncated, unknown or invalid frames before
+accepting command output; fragmented valid frames remain supported. Preserve the baseline if
+status cannot be delivered. Match plain spawn's PATH search, exhaustion errno and relative script
+spelling: Linux delegates to libc execvpe (glibc shell fallback on ENOEXEC; musl reports ENOEXEC),
+while macOS retries EINTR, continues EACCES/ENOENT/ENOTDIR, stops on other errnos and prefers
+EACCES at exhaustion. Preserve kernel traversal and literal argv. Explain native support load
+failure with loader detail. Verified by command-poll admission and real-spawn comparison tests.
+The native binding is pinned to eligible 3.3.7 with no release-age exemptions or build permission.
+
+## 2026-11-13 — Preserve command admission semantics and account for watchdog cleanup (003 §11; 008 §4.2) — Refs #470
+
+Clarify current direct-exec behavior: default signal dispositions and an empty signal mask match
+normal spawn, helpers exclude authored/inherited Node options while the command retains them,
+and ordinary exec failures report errno and the program without a native abort or crash artifact.
+Unrepresentable NUL bytes in argv/environment fail closed instead of being truncated. ESM/CJS
+consumers retain package-relative native binding resolution, including CommonJS eval callers.
+A packaged native binding calls libc execve; a separate close-on-exec status pipe orders errors
+before settlement. Native signal-state, preload-isolation and exec-error regressions verify both
+platforms. Existing guarantees remain: kernel path traversal and authored environment values
+survive admission, helper module mode does not change authored Node options, and native exec
+failures retain failing health and the prior successful baseline. Settled callers release their
+control-channel event-loop reference while the watchdog retains its independent kill grace.
+Restart reconciliation includes the marked watchdog as an independently identified process;
+a command with one descendant yields three Linux reaped outcomes. The existing identity gate
+and terminal-evidence requirement apply to all three. Verified by source admission regressions,
+the standalone consumer lifetime test and the restart-sweep integration suite.
+
+## 2026-11-13 — Bound POSIX commands independently of daemon lifetime (003 §11; 008 §3–§5) — Refs #470
+
+Require a timer-armed in-group watchdog before authored command execution. Preserve the command
+PID, original group and inherited ownership mark for restart reconciliation. The watchdog keeps
+referenced absolute deadlines across daemon loss and closed command descriptors, signals only
+its own current group. A normally completed finite observation releases its group after output
+capture; no empty-table read may cancel a late fork's bound. Monotonic deadlines withstand wall-clock
+corrections. Arming is
+asynchronous and fails closed. Graceful daemon shutdown cancels admissions and identity-verifies
+forceful cleanup of in-flight groups. macOS/Linux crash, SIGTERM/SIGINT, ordering, timer-failure,
+restricted-PATH, responsiveness and maximum-timer regressions verify the contract; Windows and
+re-sessioned-descendant limits remain explicit. Test-global restoration uses teardown hooks.
+
 ## 2026-11-13 — Retired verify-artifact repair interruption acceptance (#615)
 
 - **004 §3.4.2:** include the registered retired-artifact branch of both retry

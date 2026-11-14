@@ -12,10 +12,11 @@ import incomingChanges from '@agentmonitors/source-incoming-changes';
 export function registerCoreSources(
   registry: SourceRegistry,
   commandOwner?: CommandProcessOwner,
+  shutdownSignal?: AbortSignal,
 ): void {
   registry.register(fileFingerprint);
   registry.register(apiPoll);
-  registry.register(createCommandPollSource(commandOwner));
+  registry.register(createCommandPollSource(commandOwner, shutdownSignal));
   registry.register(schedule);
   registry.register(incomingChanges);
 }

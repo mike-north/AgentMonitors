@@ -1192,6 +1192,10 @@ include the command report; the literal-path assertion also includes retained ob
 
 All rows below are covered by `apps/cli/src/commands/pr-alerting-presets.test.ts`, which drives the
 real `command-poll` source over the real scaffolded `watch:` block with only the `gh` binary stubbed
+and runs in the serial CLI configuration. Its interrupted-capture fixtures start real Node
+helpers within the authored command deadline; the spec does not promise CPU scheduling within
+that window when competing suites saturate the runner. Serial placement preserves the existing
+two-second command deadline and all capture/readiness assertions
 (see [003 §11.9](./003-source-plugins.md#119-pr-alerting-recipe-reviewer-and-author-roles)).
 
 | Scenario                                                                                                                                                                                                                                                                                                         | Coverage (describe block)                                                                                                                                                      |

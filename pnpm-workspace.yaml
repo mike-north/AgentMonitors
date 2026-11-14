@@ -5,6 +5,8 @@ packages:
 allowBuilds:
   better-sqlite3: true
   esbuild: true
+  # Use the prebuilt platform package; never run the source build.
+  koffi: false
   nx: true
   sharp: true
 minimumReleaseAgeExclude:
