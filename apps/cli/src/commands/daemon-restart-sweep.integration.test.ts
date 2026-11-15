@@ -258,6 +258,83 @@ async function orphan(
 describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
   'restart sweep',
   () => {
+    it.skipIf(process.platform !== 'darwin')(
+      'preserves a stock shell watchdog across restart until its deadline',
+      async () => {
+        const dir = path.join(monitors, 'command');
+        mkdirSync(dir);
+        // Stock Apple sh hides envp. Shell builtins keep the original command
+        // alive, and ignoring TERM exercises the watchdog's full kill grace.
+        writeFileSync(
+          path.join(dir, 'MONITOR.md'),
+          `---\nname: Shell bound\nwatch:\n  type: command-poll\n  command: ${JSON.stringify(['/bin/sh', '-c', 'trap "" TERM; echo $$ > shell.pid; while :; do /bin/sleep 1; done'])}\n  timeout: 10s\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
+        );
+        const admittedAt = Date.now();
+        const daemon = await start();
+        await expect
+          .poll(() => existsSync(path.join(workspace, 'shell.pid')), {
+            timeout: 5000,
+          })
+          .toBe(true);
+        const command = Number(
+          readFileSync(path.join(workspace, 'shell.pid'), 'utf8').trim(),
+        );
+        groups.add(command);
+        writeFileSync(
+          path.join(workspace, 'pids.json'),
+          JSON.stringify({ parent: command, child: command, detached: false }),
+        );
+        const table = await readProcessTable();
+        if (!table.supported) throw new Error(table.reason);
+        // sleep is an authored child; the remaining Node process is the bound.
+        const members = table.processes.filter(
+          (member) => member.pgid === command && member.pid !== command,
+        );
+        // Identify the Node companion by its readable inherited life mark.
+        const { readCommandMarks } =
+          await import('../../../../libs/core/src/process/command-process-marks.js');
+        const marks = await readCommandMarks([
+          command,
+          ...members.map((member) => member.pid),
+        ]);
+        if (!marks.supported) throw new Error(marks.reason);
+        expect(marks.unreadable).toContain(command);
+        const bound = members.find((member) => marks.marks.has(member.pid));
+        if (!bound) throw new Error('Missing readable watchdog');
+        const exited = once(daemon, 'exit');
+        daemon.kill('SIGKILL');
+        await bounded(exited, 'owned daemon crash');
+        rmSync(dir, { recursive: true });
+        expect(ownedWorkerTerminated(command)).toBe(false);
+        await start();
+        const outcomes = diagnostics()?.outcomes.filter(
+          (outcome) => outcome.pid === command || outcome.pid === bound.pid,
+        );
+        expect(outcomes).toContainEqual(
+          expect.objectContaining({
+            pid: command,
+            status: 'abstained',
+            reason: expect.stringMatching(/unreadable/i),
+          }),
+        );
+        expect(outcomes).toContainEqual(
+          expect.objectContaining({
+            pid: bound.pid,
+            status: 'abstained',
+            reason: expect.stringMatching(/group.*bound/i),
+          }),
+        );
+        expect(ownedWorkerTerminated(bound.pid)).toBe(false);
+        expect(ownedWorkerTerminated(command)).toBe(false);
+        // Admission, timeout, fixed grace and a small scheduling margin share
+        // one absolute test deadline; restart latency cannot extend this wait.
+        await waitForOwnedGroupTermination(command, admittedAt + 17_000);
+        expect(ownedWorkerTerminated(command)).toBe(true);
+        expect(ownedWorkerTerminated(bound.pid)).toBe(true);
+      },
+      25_000,
+    );
+
     // Deadline enforcement must survive loss of the daemon and of inherited stdio.
     for (const closeStreams of [false, true]) {
       it(`bounds a real command group after SIGKILL (closed stdio: ${String(closeStreams)})`, async () => {

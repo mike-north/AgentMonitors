@@ -9,6 +9,33 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-14 — Commit preservation before terminal queries without aging signal evidence (008 §4.2) — Refs #627
+
+Commit the completed signal batch's preservation abstentions before terminal queries.
+The gates' resolved-Promise handoff issues no additional evidence query or journal operation. Keep FULL-sync
+journal writes after every signal has used the final identity snapshot, so persistence
+cannot introduce a blocking interval before delivery. Persist invalid PID diagnostics
+before anchor confirmation. The per-PID authorization checks and selected targets are unchanged.
+
+## 2026-11-14 — Identify restart bounds and bound reconciliation work (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Require verified watchdog role evidence before group-wide withholding. Preserve a possible
+bound if its previously verified watchdog becomes unreadable at the final gate; retain all
+watchdogs on uncertainty; retire the bound when fresh identities prove them absent or replaced. Legacy no-role groups and re-sessioned descendants without a
+watchdog keep per-process cleanup. Authored roles can only cause withholding. Carry terminal
+incarnations through late-fork membership checks while treating recycled identities as new.
+Serialize Linux terminal scans and batch synchronous abstention receipt writes.
+
+## 2026-11-14 — Preserve group bounds when restart cleanup abstains (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Withhold remaining cleanup signals for a recorded group with a verified watchdog when any member has unreadable
+ownership, changed identity or unavailable readers. Record the group-bound preservation
+reason in the existing per-PID abstention receipt. Vetoes persist through the sweep's
+bounded discovery passes. Keep per-process signal authority and reap fully verified groups,
+including their watchdogs. Native macOS stock-shell restart/deadline coverage and portable
+injected Linux-reader regressions verify that a readable watchdog cannot lose its bound
+because another member is unverified.
+
 ## 2026-11-14 — Preserve held-work reports across admitted-path ambiguity (002 §10.7; 005 §6, §15) — Refs #574
 
 A valid same-id file competing with a live watcher's admitted definition is a

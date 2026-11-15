@@ -1,5 +1,6 @@
 /**
- * Read inherited command ownership without exposing process environments. A random
+ * Read inherited command ownership and the optional watchdog role without exposing
+ * other process environment values. A random
  * daemon-life marker survives fork/exec and re-sessioning; erasing it while
  * detaching is the explicit containment escape. These are reliability marks,
  * not an authentication boundary against code running as the same OS user.
@@ -24,6 +25,8 @@ export type CommandMarks =
   | {
       readonly supported: true;
       readonly marks: ReadonlyMap<number, string>;
+      /** A role can only withhold cleanup; it never supplies ownership or signal authority. */
+      readonly watchdogs?: ReadonlySet<number>;
       readonly unreadable?: readonly number[];
       /** Why environment evidence is unavailable; never substitute argv evidence. */
       readonly unreadableReason?: string;
@@ -70,7 +73,7 @@ export async function readBootIdentity(): Promise<string | undefined> {
   return undefined;
 }
 
-/** Read only the reserved marker; no environment values are returned or persisted. @internal */
+/** Read only reserved ownership metadata; no unrelated environment values escape. @internal */
 export async function readCommandMarks(
   pids: readonly number[],
 ): Promise<CommandMarks> {
@@ -83,6 +86,7 @@ export async function readCommandMarks(
       reason: 'Command ownership marks are unavailable on this platform',
     };
   const unreadable: number[] = [];
+  const watchdogs = new Set<number>();
   // Bound filesystem work and descriptors independently of the host's process count.
   let next = 0;
   await Promise.all(
@@ -101,6 +105,8 @@ export async function readCommandMarks(
           );
           if (entry !== undefined)
             marks.set(pid, entry.slice(COMMAND_LIFE_ENV.length + 1));
+          if (entries.includes('AGENTMONITORS_COMMAND_ROLE=watchdog'))
+            watchdogs.add(pid);
         } catch (error) {
           if (
             typeof error === 'object' &&
@@ -114,7 +120,7 @@ export async function readCommandMarks(
       }
     }),
   );
-  return { supported: true, marks, unreadable };
+  return { supported: true, marks, unreadable, watchdogs };
 }
 
 /** Whether the recorded incarnation has demonstrably stopped executing. @internal */
