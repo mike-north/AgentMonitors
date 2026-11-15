@@ -430,11 +430,23 @@ life and its numeric group suspicion and allow bounded rediscovery from a fresh 
 This includes absence during initial discovery or gone batching, disappearance during anchor
 confirmation, absence at the signal gate, and ESRCH during delivery. Record a discovered marked
 anchor's group suspicion before confirmation can lose the anchor; that suspicion supplies no
-signal authority. Natural exit cannot erase a marked late fork. Retire the life only when a
-fresh readable snapshot contains neither its nonce nor a member of its recorded groups, and
+signal authority. Groups first discovered by the final bounded snapshot also gain durable
+numeric suspicions, even though no confirmation pass remains. A life admitted before a crash
+prevented PID recording requires a second readable snapshot to confirm an initially empty
+nonce search. Unavailable or unreadable confirmation retains the life; unchanged ownership
+uncertainty does not trigger repeated scans. Natural exit cannot erase a marked late fork.
+Retire the life only when a fresh readable snapshot contains neither its nonce nor a member of its recorded groups, and
 no recorded PID remains occupied (including reuse by an unmarked process in another group).
 One observation of absence earns rediscovery, not repeated scans of an unchanged occupied
-hint. Identity disagreement and unavailable ownership still withhold signals.
+hint. Discharge requires pending disappearance, readable ownership, no process carrying the
+nonce, and no occupied numeric suspicion. A confirmed reap alone cannot discharge its group
+in the same sweep. Anchor-confirmation disappearance decisions are committed before the next
+rediscovery query can suspend reconciliation. Identity disagreement and unavailable ownership
+still withhold signals.
+
+**Verified:** nonce-only missed-fork, ninth-group retention, ownership/nonce discharge guards,
+anchor-disappearance receipt and reap-hint retention regressions in
+`libs/core/src/process/command-process-journal.test.ts`.
 After signalling or observing a target vanish, discovery takes another snapshot to catch late forks. It processes readable
 positive evidence even when unrelated unreadable ownership makes the snapshot
 incomplete; that uncertainty is saved before further identity queries and cannot discard the

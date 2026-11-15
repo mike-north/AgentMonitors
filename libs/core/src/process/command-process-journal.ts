@@ -492,7 +492,21 @@ export class CommandProcessJournal implements CommandProcessOwner {
             Number(ownership.marks.get(a) === previous.life) -
             Number(ownership.marks.get(b) === previous.life),
         );
-        if (pending.length === 0 && !progress.observed) break;
+        if (pending.length === 0 && !progress.observed) {
+          // A precommitted nonce can outlive a crash before spawned() records
+          // its PID. One empty enumeration can miss an exiting parent and its
+          // last fork, so confirm that absence once within the same pass bound.
+          // Unchanged unreadable ownership earns no repeat discovery.
+          if (
+            round !== 0 ||
+            recorded.size !== 0 ||
+            (ownership.unreadable?.length ?? 0) !== 0
+          ) {
+            break;
+          }
+          disappearance.pending = true;
+          progress.observed = true;
+        }
         const byPid = new Map(reading.processes.map((p) => [p.pid, p]));
         // Absence decisions use one immutable snapshot and involve no awaits.
         // Batch their receipt before further identity reads,
@@ -902,6 +916,21 @@ export class CommandProcessJournal implements CommandProcessOwner {
               )
               .map((p) => p.pgid),
           );
+          // These groups will not reach another anchor-confirmation pass.
+          // Preserve their numeric suspicions now, while the nonce still links
+          // them to this life, so unmarked survivors remain accountable after
+          // restart. These hints never confer membership or signal authority.
+          this.sql.transaction(() => {
+            const remember = this.sql.prepare(
+              'INSERT OR IGNORE INTO command_pids VALUES(?,?)',
+            );
+            for (const group of markedGroups) {
+              if (group > 0 && !recorded.has(group)) {
+                remember.run(previous.life, group);
+                recorded.add(group);
+              }
+            }
+          })();
           const outstanding = reading.processes.filter(
             (p) =>
               !visited.has(p.pid) &&
