@@ -1315,7 +1315,7 @@ interface PollAdmission {
  */
 interface DeliveryDecision {
   sessionId: string;
-  /** Representatives plus the older `net` intermediates of each surfaced group. */
+  /** Rows represented by concrete endpoints or selected reminder batches, including net intermediates. */
   candidates: MonitorEventRecord[];
   /** True for the post-compact recap branch (commit also advances the recap cursor). */
   isRecap: boolean;
@@ -3208,6 +3208,45 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * A normal reminder may coalesce independent work, but cannot move the net
+   * endpoint beyond a high version this delivery can render. Older normal
+   * intermediates may fold into a rendered high endpoint; a newer normal
+   * endpoint must stay pending rather than suppress that high version and
+   * advance its cursor to unseen content. Full group keys preserve independence
+   * across monitors and workspaces, and persisted order resolves equal times.
+   */
+  private normalPendingForClaim(
+    sessionId: string,
+    highCandidates: MonitorEventRecord[],
+  ): MonitorEventRecord[] {
+    const normalPending = this.pendingForClaim(sessionId, 'normal');
+    if (normalPending.length === 0 || highCandidates.length === 0) {
+      return normalPending;
+    }
+    const highKeys = new Set(highCandidates.map(netCollapseGroupKey));
+    const candidateIds = new Set(
+      [...highCandidates, ...normalPending].map((event) => event.id),
+    );
+    // Concatenating urgency bands loses materialization order at equal times.
+    // Read their union in canonical store order before computing endpoints.
+    const ordered = this.store
+      .pendingEventsForSession(sessionId)
+      .filter((event) => candidateIds.has(event.id));
+    const conflictingKeys = new Set(
+      computeNetCollapseView(ordered)
+        .delivered.filter(
+          (event) =>
+            event.urgency === 'normal' &&
+            highKeys.has(netCollapseGroupKey(event)),
+        )
+        .map(netCollapseGroupKey),
+    );
+    return normalPending.filter(
+      (event) => !conflictingKeys.has(netCollapseGroupKey(event)),
+    );
+  }
+
+  /**
    * The count of a band's pending (unclaimed) events that are currently held
    * out of {@link pendingForClaim} because they are LEASED by an outstanding
    * reservation (006 §4, issue #300; PR #445 review round 10) — i.e. an
@@ -3228,15 +3267,13 @@ export class AgentMonitorRuntime {
 
   /**
    * Decide the pending delivery for a session at a lifecycle point WITHOUT
-   * mutating the store (issue #300). Mirrors the prior `claimDelivery` branch
-   * logic exactly, but (a) reads pending sets through {@link pendingForClaim} so
-   * leased rows are excluded, and (b) renders the claim from the PURE
-   * {@link computeNetCollapseView} decision — never the mutating collapse. The
-   * rendered `message`/`events` read only event fields + interpret digests, which
-   * the collapse mutation does not touch (it re-anchors `diff_text` for later
-   * `events list`/`monitor explain` only), so this renders byte-identically to
-   * the previous in-place claim. {@link applyDelivery} performs the deferred
-   * mutation.
+   * mutating the store. Reads pending sets through {@link pendingForClaim} so
+   * leased rows are excluded, and renders selected endpoints from the pure
+   * {@link computeNetCollapseView} decision. Only represented groups enter the
+   * candidate set persisted by a commit; caps and urgency eligibility cannot
+   * widen that set after rendering. The rendered claim and its selected rows
+   * remain one decision for both immediate claims and reservations;
+   * {@link applyDelivery} persists that decision after surfacing.
    */
   private decideDelivery(
     sessionId: string,
@@ -3271,7 +3308,7 @@ export class AgentMonitorRuntime {
       // previously interrupted the session twice for one action; this makes
       // it one batch when both land in the same settle window. Previously
       // surfaced rows remain unread but never block fresh pending work.
-      const normalPending = this.pendingForClaim(sessionId, 'normal');
+      const normalPending = this.normalPendingForClaim(sessionId, settledHigh);
       const normalReminderDue =
         normalPending.length > 0 &&
         this.leasedPendingCount(sessionId, 'normal') === 0;
@@ -3309,8 +3346,7 @@ export class AgentMonitorRuntime {
         // return (its return value IS `computeNetCollapseView(...).delivered`).
         // Rendering from this pure view keeps decide side-effect-free while
         // producing the same content the eventual claim surfaces.
-        const surfacedHigh =
-          computeNetCollapseView(surfacedCandidates).delivered;
+        const surfacedHigh = surfacedReps;
 
         const surfacedIds = surfacedHigh.map((event) => event.id);
         const digests = this.store.interpretDigestsForSession(
@@ -3421,13 +3457,18 @@ export class AgentMonitorRuntime {
     const unread = this.store.unreadEventsForSession(sessionId);
     if (lifecycle === 'post-compact' && unread.length > 0) {
       // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
-      // set, then recap only the delivered (post-collapse) tail. The full set is
-      // claimed at apply time so the cursor advances and suppressed intermediates
-      // are consumed. Recap reads all UNREAD (not pending), so a leased row is
-      // still recapped — a lease is not acknowledgement, and recap re-shows unread
+      // set, then recap only the delivered (post-collapse) tail. Only groups
+      // represented in that tail may be claimed or suppressed; the cap must
+      // leave unseen groups intact for a later delivery. Recap reads all UNREAD
+      // (not pending), so a leased row is still recapped — a lease is not
+      // acknowledgement, and recap re-shows unread
       // until acked (006 §5.5).
       const deliveredUnread = computeNetCollapseView(unread).delivered;
       const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
+      const recapKeys = new Set(recapSlice.map(netCollapseGroupKey));
+      const recapCandidates = unread.filter((event) =>
+        recapKeys.has(netCollapseGroupKey(event)),
+      );
       const recapIds = recapSlice.map((event) => event.id);
       const digests = this.store.interpretDigestsForSession(
         sessionId,
@@ -3450,7 +3491,7 @@ export class AgentMonitorRuntime {
       ].join('\n');
       return {
         sessionId,
-        candidates: unread,
+        candidates: recapCandidates,
         isRecap: true,
         claim: {
           sessionId,
@@ -3566,7 +3607,7 @@ export class AgentMonitorRuntime {
     );
     if (settledHigh.length === 0) return undefined;
 
-    const normalPending = this.pendingForClaim(sessionId, 'normal');
+    const normalPending = this.normalPendingForClaim(sessionId, settledHigh);
     const normalReminderDue =
       normalPending.length > 0 &&
       this.leasedPendingCount(sessionId, 'normal') === 0;

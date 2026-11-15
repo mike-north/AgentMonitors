@@ -2372,6 +2372,30 @@ Verified: `libs/core/src/runtime/types.ts` — `DeliveryLifecycle` (lines 18–2
 
 Verified: `libs/core/src/runtime/types.ts` — `AgentLifecycleEvent` (lines 9–16).
 
+**Claimed set equals rendered set (current).** For every delivery lifecycle, the runtime
+**MUST** derive rendering and the committed candidate set from the same selected net-collapse
+view. A concrete event is claimed only when rendered, or as an older net intermediate whose
+endpoint is rendered. A normal/low generic reminder represents only its selected urgency-band
+batch (§9.2–§9.3); its collapse **MUST NOT** replace a concrete endpoint rendered by the same claim.
+Unrepresented groups **MUST** stay unread and unclaimed, with no suppression or cursor advancement,
+so a later eligible claim can offer them, including after a restart. Claims never acknowledge.
+
+For example, a net object's `v1` observed at `high`, followed by an urgency edit and `v2` at
+`normal`, renders `v1` at `turn-interruptible` and leaves `v2` pending for the next normal reminder.
+Normal groups whose endpoint would replace the selected settled high version in that full
+`(monitorId, objectKey, workspacePath)` group are deferred; older normal intermediates may fold
+into a rendered high endpoint, using durable materialization order to break equal-time ties.
+An unsettled high version cannot justify consuming an intervening normal version. Another
+monitor sharing only the object key remains independent and may
+coalesce its reminder. At `turn-idle`, only the selected low batch is claimed. At `post-compact`,
+only the groups represented by the ten rendered endpoints are claimed or net-suppressed; groups
+outside the recap cap remain pending.
+
+Verified: `libs/core/src/runtime/net-collapse-claim.test.ts` drives real monitor edits, claims and
+reserve/commit delivery across all three lifecycles, checking durable `session_event_state`
+projections and subsequent claims after closing and reopening SQLite. It covers single-monitor
+urgency edits, multiple monitors sharing an object key, independent reminder coalescing and recap caps.
+
 ### 9.1 High urgency
 
 At `turn-interruptible`, the runtime **MUST** deliver all pending high-urgency events that have aged past the 15-second settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS`). The delivery payload **MUST** summarize the concrete events (titles and summaries), not just emit a generic reminder. The `DeliveryClaim` will have `mode: 'delivery'` and include a populated `events` array.
@@ -2393,7 +2417,7 @@ Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interrup
 > **withheld** whenever ANY high-urgency work is genuinely pending (settled or not), and only ever
 > fires standalone once no high-urgency work is pending at all.
 
-When a settled high-urgency batch (§9.1) is due **and** a normal-urgency reminder (§9.2) is
+When a settled high-urgency batch (§9.1) is due **and** an independent normal-urgency reminder (§9.2) is
 simultaneously due in the SAME `claimDelivery`/`reserveDelivery` decision, the runtime **MUST**
 fold both into ONE `DeliveryClaim` rather than returning the high batch and deferring the normal
 reminder to a later call:
