@@ -69,6 +69,7 @@ import {
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import {
   describeHeldNotifyWork,
+  type HeldNotifyBarrier,
   heldNotifyStage,
 } from './held-notify-diagnosis.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
@@ -1895,16 +1896,17 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Determine only the definition prerequisite for held-work diagnosis, without
+   * Determine the release prerequisite for held-work diagnosis, without
    * changing admission or release. Persistent callers supply discovery health;
    * live ephemeral declarations replace the file they never had by design.
+   * Retired declarations have a lifecycle barrier that file repair cannot lift.
    */
-  private heldDefinitionBlocked(
+  private heldReleaseBarrier(
     monitorId: string,
     workspacePath: string,
     persistentValid: boolean,
     now: Date,
-  ): boolean {
+  ): HeldNotifyBarrier {
     if (persistentValid) {
       return false;
     }
@@ -1912,9 +1914,15 @@ export class AgentMonitorRuntime {
       return true;
     }
     const declaration = this.store.findEphemeralMonitorById(monitorId);
+    if (declaration?.status !== 'active') {
+      return 'retired-ephemeral';
+    }
+    // Use tick's own eligibility query, including global declarations and the
+    // declaring session's active status, instead of a parallel workspace rule.
     if (
-      declaration?.status !== 'active' ||
-      declaration.workspacePath !== workspacePath
+      !this.store
+        .listActiveEphemeralMonitors(workspacePath)
+        .some((record) => record.id === monitorId)
     ) {
       return true;
     }
@@ -1977,7 +1985,7 @@ export class AgentMonitorRuntime {
       describeHeldNotifyWork(
         input.monitorId,
         runtimeState.notifyState,
-        this.heldDefinitionBlocked(input.monitorId, workspacePath, false, now),
+        this.heldReleaseBarrier(input.monitorId, workspacePath, false, now),
         now,
       ),
     );
@@ -2840,7 +2848,7 @@ export class AgentMonitorRuntime {
         describeHeldNotifyWork(
           monitorId,
           this.store.getMonitorState(monitorId, workspacePath).notifyState,
-          this.heldDefinitionBlocked(
+          this.heldReleaseBarrier(
             monitorId,
             workspacePath,
             !duplicateMonitorIds.has(monitorId) &&
