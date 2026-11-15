@@ -2764,6 +2764,12 @@ reconstruction and scope validation, older retained materialization work, captur
 envelope validation and effective policy comparison, then scheduling if no edit
 will drain the batch first. It does not perform any of those mutations.
 A live watcher can own a valid admitted definition outside the scanned tree.
+Scan absence alone is not a release barrier: both reports share tick's read-only
+resolution of the scanned candidate or first held envelope's captured path,
+then the live owner's admitted path. Source and scope checks use that resolved
+definition. An empty-tree tick can leave watcher admission open; the watcher
+can release due work without a definition repair. Definition discovery stages
+still describe the requested tree independently of that hold's eligibility.
 If the scan finds a second valid same-id file, both reports retain the accepted
 count and classify that ambiguity as `definition-rejected`; neither report aborts.
 The next tick still refuses the ambiguity and retains its held work. Other errors

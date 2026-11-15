@@ -727,6 +727,12 @@ the hold visible. The failure remains the verdict; the hold is `pending`.
 A same-id definition competing with a live watcher's admitted path also yields
 `releaseBarrier: "definition-rejected"` in both commands, preserving the held
 count and the rest of the report. Tick continues to refuse that ambiguity.
+If the requested tree omits a held monitor, both commands resolve its captured
+and live admitted paths through the same read-only lookup as tick. A valid
+resolved definition with an available source and valid scope is not rejected
+merely for being outside that tree. `releaseBarrier: "none"` and
+`blockedByDefinition: false` can therefore accompany a discovery-stage failure;
+source cadence and stored pacing still govern release through the live watcher.
 For a rejected persistent definition, text explains `Fix the definition so the
 runtime can release this work under its notify policy.` An unresolved source
 instead asks to restore its registration. Repair permits release under 002 §4; it does not bypass pacing,
