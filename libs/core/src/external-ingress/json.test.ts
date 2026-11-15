@@ -1383,3 +1383,139 @@ describe.each(jsonEntryPoints)(
     );
   },
 );
+
+/**
+ * Apply one post-import hook only during the synchronous boundary call. Assertions
+ * run after restoration so the test runner's own prototype use cannot interfere.
+ */
+function withPostLoadHook(
+  prototype: object,
+  key: PropertyKey,
+  descriptor: PropertyDescriptor,
+  run: () => unknown,
+): { result: unknown; error: unknown } {
+  const original = Object.getOwnPropertyDescriptor(prototype, key);
+  let result: unknown;
+  let error: unknown;
+  Object.defineProperty(prototype, key, descriptor);
+  try {
+    result = run();
+  } catch (caught) {
+    error = caught;
+  } finally {
+    if (original) {
+      Object.defineProperty(prototype, key, original);
+    } else {
+      Reflect.deleteProperty(prototype, key);
+    }
+  }
+  return { result, error };
+}
+
+for (const api of ['encode', 'validate'] as const) {
+  describe(`external JSON post-load prototypes through ${api}`, () => {
+    const run = (value: unknown): unknown =>
+      api === 'encode'
+        ? canonicalJsonStringify(value)
+        : assertExternalJsonValue(value, 0, 512);
+
+    for (const prototype of [Object.prototype, Array.prototype]) {
+      for (const key of ['0', '1']) {
+        for (const throwing of [false, true]) {
+          for (const arrays of [false, true]) {
+            it(`ignores numeric setters on ${prototype === Object.prototype ? 'Object' : 'Array'} ${key} throwing=${throwing} arrays=${arrays}`, () => {
+              let calls = 0;
+              const value = arrays ? [7, 8] : { z: 7, a: 8 };
+              const outcome = withPostLoadHook(
+                prototype,
+                key,
+                {
+                  configurable: true,
+                  set() {
+                    calls += 1;
+                    if (throwing) {
+                      throw new Error('Numeric prototype setter.');
+                    }
+                  },
+                },
+                () => run(value),
+              );
+              expect(calls).toBe(0);
+              expect(outcome.error).toBeUndefined();
+              expect(outcome.result).toBe(
+                api === 'encode'
+                  ? arrays
+                    ? '[7,8]'
+                    : '{"a":8,"z":7}'
+                  : undefined,
+              );
+            });
+          }
+        }
+      }
+    }
+
+    const protocols: readonly [object, PropertyKey][] = [
+      [Array.prototype, Symbol.iterator],
+      [Array.prototype, 'some'],
+      [Array.prototype, 'push'],
+      [Array.prototype, 'map'],
+      [Array.prototype, 'constructor'],
+      [Array.prototype, 'sort'],
+      [Array.prototype, 'join'],
+      [Set.prototype, 'has'],
+      [Set.prototype, 'add'],
+      [Set.prototype, 'delete'],
+      [String.prototype, 'toString'],
+      [String.prototype, 'charCodeAt'],
+      [String.prototype, 'replace'],
+      [Function.prototype, 'call'],
+      [Function.prototype, 'apply'],
+    ];
+    for (let index = 0; index < protocols.length; index += 1) {
+      const [prototype, key] = protocols[index]!;
+      it(`ignores protocol getter ${index} ${String(key)}`, () => {
+        let calls = 0;
+        const outcome = withPostLoadHook(
+          prototype,
+          key,
+          {
+            configurable: true,
+            get() {
+              calls += 1;
+              throw new Error('Prototype protocol getter.');
+            },
+          },
+          () => run({ z: [7, 'text'], a: { b: true } }),
+        );
+        expect(calls).toBe(0);
+        expect(outcome.error).toBeUndefined();
+        expect(outcome.result).toBe(
+          api === 'encode' ? '{"a":{"b":true},"z":[7,"text"]}' : undefined,
+        );
+      });
+    }
+
+    it('refuses hidden WeakRef state with an empty array iterator', () => {
+      const value = new WeakRef({});
+      Object.setPrototypeOf(value, Object.prototype);
+      let calls = 0;
+      const outcome = withPostLoadHook(
+        Array.prototype,
+        Symbol.iterator,
+        {
+          configurable: true,
+          value: function* () {
+            calls += 1;
+          },
+        },
+        () => run(value),
+      );
+      expect(calls).toBe(0);
+      expect(outcome.error).toBeInstanceOf(TypeError);
+      expect((outcome.error as Error).message).toBe(
+        'Intrinsic object state is not plain JSON data.',
+      );
+    });
+  });
+}
