@@ -1473,7 +1473,11 @@ for (const api of ['encode', 'validate'] as const) {
       [Function.prototype, 'apply'],
     ];
     for (let index = 0; index < protocols.length; index += 1) {
-      const [prototype, key] = protocols[index]!;
+      const protocol = protocols[index];
+      if (!protocol) {
+        throw new Error('Missing protocol fixture.');
+      }
+      const [prototype, key] = protocol;
       it(`ignores protocol getter ${index} ${String(key)}`, () => {
         let calls = 0;
         const outcome = withPostLoadHook(
@@ -1505,8 +1509,9 @@ for (const api of ['encode', 'validate'] as const) {
         Symbol.iterator,
         {
           configurable: true,
-          value: function* () {
+          value: () => {
             calls += 1;
+            return { next: () => ({ done: true, value: undefined }) };
           },
         },
         () => run(value),
@@ -1519,3 +1524,48 @@ for (const api of ['encode', 'validate'] as const) {
     });
   });
 }
+
+/** Unsupported URL objects must never enter Node's JavaScript brand-error paths. */
+describe.each(jsonEntryPoints)(
+  'external JSON unsupported URL objects through %s',
+  (_entry, run) => {
+    for (const family of ['URL', 'URLSearchParams'] as const) {
+      for (const prototype of [null, Object.prototype]) {
+        it(`never invokes the captured ${family} probe with record prototype ${prototype === null ? 'null' : 'Object'}`, () => {
+          const value =
+            family === 'URL'
+              ? new URL('https://example.test/?secret=one')
+              : new URLSearchParams('secret=one');
+          const original = Object.getPrototypeOf(value) as unknown;
+          Object.setPrototypeOf(value, prototype);
+          let calls = 0;
+          try {
+            const outcome = withPostLoadHook(
+              Object.prototype,
+              '1',
+              {
+                configurable: true,
+                set() {
+                  calls += 1;
+                  throw new Error('Inherited numeric setter.');
+                },
+              },
+              () => run(value),
+            );
+            // A successful brand probe would refuse these genuine receivers.
+            // This fixture encodes as an empty record; detection is not promised
+            // for arbitrary hidden-state objects outside the plain-data domain.
+            expect(outcome.error).toBeUndefined();
+            if (_entry === 'encoding') {
+              expect(outcome.result).toBe('{}');
+            }
+            expect(calls).toBe(0);
+          } finally {
+            Object.setPrototypeOf(value, original);
+          }
+          expect(value.toString()).toContain('secret=one');
+        });
+      }
+    }
+  },
+);
