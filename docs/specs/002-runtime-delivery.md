@@ -3390,6 +3390,19 @@ prototype. This is a stated refusal list, not a proof that all hidden state can 
 detected. Probes are captured at module load and assume unmodified runtime
 built-ins, including `Object.prototype`, at that point.
 
+For **every input**, inside or outside the plain-data domain, validation and
+encoding MUST NOT run caller code: getters, setters, `toJSON`, proxy traps or
+inherited accessors. Changes to any built-in prototype after module load MUST
+neither run code nor change a result. Internal traversal uses indexed reads,
+captured functions invoked without mutable call/apply protocols, and own-data
+buffers independent of inherited numeric setters, iterators and array species.
+Sorting and joining use captured methods on dense null-prototype buffers.
+
+A brand probe's not-a-member path MUST NOT construct an error in Node JavaScript
+internals. Even captured methods can invoke inherited numeric setters while
+constructing such an error. Only native wrong-receiver exceptions or hook-free
+boolean slot/private-brand checks meet this boundary.
+
 | Refused family                                                                                                     | Captured check                                                                                                                                                                         |
 | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | All proxies, including revoked proxies                                                                             | `util.types.isProxy`, before reflection                                                                                                                                                |
@@ -3400,7 +3413,6 @@ built-ins, including `Object.prototype`, at that point.
 | KeyObject and CryptoKey                                                                                            | Own-symbol refusal on symbol-backed runtimes; captured private/native `util.types.isKeyObject` / `isCryptoKey` after full record descriptor/child validation on private-brand runtimes |
 | WeakRef                                                                                                            | Captured `WeakRef.prototype.deref`                                                                                                                                                     |
 | FinalizationRegistry                                                                                               | Captured `unregister` with a fresh unregistered token                                                                                                                                  |
-| URL / URLSearchParams                                                                                              | Captured `protocol` / `size` getters (no query synchronization)                                                                                                                        |
 | Intl Collator, PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, Segmenter, DurationFormat                | Captured `resolvedOptions`                                                                                                                                                             |
 | Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                                                                       |
 | Intl Locale                                                                                                        | Captured `toString`                                                                                                                                                                    |
@@ -3440,9 +3452,15 @@ Any other object whose state is not held in its own enumerable data properties i
 outside the input domain. Callers MUST NOT pass it; the module makes no claim to
 detect it. **Non-exhaustive tested examples** that remain unrefused after prototype
 replacement include array/string/RegExp-string iterators, iterator helpers and
-wrappers, Intl SegmentIterator, Headers, FormData, Request, Response and AbortController.
+wrappers, Intl SegmentIterator, URL, URLSearchParams, Headers, FormData, Request,
+Response and AbortController.
 These are examples of unsupported inputs, not claims that no suitable detector
 could exist.
+No URL or URLSearchParams probe is invoked. URLSearchParams' size getter constructs
+`ERR_INVALID_THIS` in Node JavaScript for a plain record or array; its error
+constructor's internal array writes can invoke inherited numeric setters. Both
+URL families remain outside the domain rather than weakening the no-caller-code
+rule or depending on a particular wrong-receiver implementation.
 Headers' inspector builds an ordinary presentation object by assigning header
 names, which can invoke inherited setters even with null-prototype inspection
 options. Public Headers methods require Web IDL prototype identity, while direct

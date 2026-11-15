@@ -17,8 +17,15 @@
  * own enumerable data are outside this domain; callers MUST NOT pass them and
  * detection is not promised. Non-exhaustive tested examples include array,
  * string and RegExp-string iterators, iterator helpers/wrappers, SegmentIterator,
- * Headers, FormData, Request, Response and AbortController. Probes are captured at
- * module load and assume unmodified runtime built-ins, including Object.prototype.
+ * URL, URLSearchParams, Headers, FormData, Request, Response and AbortController.
+ * Probes are captured at module load and assume unmodified runtime built-ins,
+ * including Object.prototype.
+ *
+ * For every input, inside or outside the plain-data domain, validation and
+ * encoding never run caller code, assuming unmodified built-ins at module load.
+ * Later changes to any built-in prototype must neither run code nor change a
+ * result. Captured functions, indexed traversal and own-data internal buffers
+ * keep internal work independent of mutable prototype protocols.
  *
  * Descriptor fields are read only when owned by the reflected descriptor, so
  * later Object.prototype changes cannot turn accessors into data or run hooks.
@@ -56,8 +63,63 @@
  * subtrees are never traversed, though key enumeration costs the container's width
  * and canonical sorting costs O(k log k) for k accepted object keys.
  */
+/* Indexed reads must not consult a caller-replaced array iterator. */
+/* eslint-disable @typescript-eslint/prefer-for-of */
 import { createSecretKey } from 'node:crypto';
 import { types } from 'node:util';
+
+/**
+ * Trusted intrinsics are captured once. Direct calls and captured Reflect.apply
+ * never consult Function.prototype.call/apply or later built-in replacements.
+ */
+const apply = Reflect.apply;
+const defineProperty = Reflect.defineProperty;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const getPrototypeOf = Object.getPrototypeOf;
+const setPrototypeOf = Object.setPrototypeOf;
+const ownKeysOf = Reflect.ownKeys;
+const isArray = Array.isArray;
+const objectPrototype = Object.prototype;
+const arrayPrototype = Array.prototype;
+const isFiniteNumber = Number.isFinite;
+const isInteger = Number.isInteger;
+const isSafeInteger = Number.isSafeInteger;
+const stringifyScalar = JSON.stringify;
+const indexString = String;
+const JsonTypeError = TypeError;
+const AncestorSet = Set;
+// Receivers are supplied explicitly through captured Reflect.apply.
+/* eslint-disable @typescript-eslint/unbound-method */
+const setHas = Set.prototype.has;
+const setAdd = Set.prototype.add;
+const setDelete = Set.prototype.delete;
+/* eslint-enable @typescript-eslint/unbound-method */
+const sortArray = Array.prototype.sort;
+const joinArray = Array.prototype.join;
+
+/** Dense buffers have no inherited numeric setters, protocols or species. */
+function internalBuffer<T>(): T[] {
+  const buffer: T[] = [];
+  setPrototypeOf(buffer, null);
+  return buffer;
+}
+
+/** Full null-prototype descriptors cannot inherit accessor descriptor fields. */
+function appendOwn<T>(buffer: T[], value: T): void {
+  const descriptor = {
+    __proto__: null,
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  };
+  defineProperty(buffer, indexString(buffer.length), descriptor);
+}
+
+/** Only encoded strings reach joining, so no element coercion can invoke hooks. */
+function joinEncoded(buffer: string[]): string {
+  return apply(joinArray, buffer, [',']);
+}
 
 /** Inclusive supported container depth, shared by validation and encoding. */
 const MAX_SUPPORTED_DEPTH = 512;
@@ -120,7 +182,13 @@ const { isKeyObject, isCryptoKey } = types;
 
 /** Native hidden-state predicates are independent of visible prototype identity. */
 function hasUnsupportedIntrinsicState(value: object): boolean {
-  return nativeStatePredicates.some((predicate) => predicate(value));
+  for (let index = 0; index < nativeStatePredicates.length; index += 1) {
+    const predicate = nativeStatePredicates[index];
+    if (predicate?.(value)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /** Validate each captured callable once; invocation always supplies its receiver. */
@@ -129,10 +197,10 @@ function captureIntrinsicProbe(
   args: readonly unknown[] = [],
 ): (value: object) => unknown {
   if (typeof method !== 'function') {
-    throw new TypeError('Missing intrinsic state probe.');
+    throw new JsonTypeError('Missing intrinsic state probe.');
   }
   return (value) => {
-    const result: unknown = Reflect.apply(method, value, args);
+    const result: unknown = apply(method, value, args);
     return result;
   };
 }
@@ -147,32 +215,29 @@ function captureIntlProbe(
   args: readonly unknown[] = [],
 ): (value: object) => unknown {
   const constructor: unknown = ownDescriptorField(
-    Object.getOwnPropertyDescriptor(Intl, family),
+    getOwnPropertyDescriptor(Intl, family),
     'value',
   );
   if (typeof constructor !== 'function') {
-    throw new TypeError('Missing Intl constructor.');
+    throw new JsonTypeError('Missing Intl constructor.');
   }
   const prototype: unknown = ownDescriptorField(
-    Object.getOwnPropertyDescriptor(constructor, 'prototype'),
+    getOwnPropertyDescriptor(constructor, 'prototype'),
     'value',
   );
   if (typeof prototype !== 'object' || prototype === null) {
-    throw new TypeError('Missing Intl prototype.');
+    throw new JsonTypeError('Missing Intl prototype.');
   }
   return captureIntrinsicProbe(
-    ownDescriptorField(
-      Object.getOwnPropertyDescriptor(prototype, method),
-      'value',
-    ),
+    ownDescriptorField(getOwnPropertyDescriptor(prototype, method), 'value'),
     args,
   );
 }
 
 /**
- * Captured methods test internal slots without property/prototype consultation.
- * Node 24 internal/url.js: protocol reads only #context and size reads only
- * #searchParams; href would synchronize pending query state and is unsuitable.
+ * Captured native methods test internal slots without property consultation.
+ * Wrong receivers must throw natively: JavaScript error construction can run
+ * inherited hooks even when the probing method itself was captured at load.
  * V8 WeakRefDeref/FinalizationRegistryUnregister check their native receivers;
  * deref preserves the receiver (keeping its target alive for this job), and a fresh
  * unregister token cannot remove an existing registration. builtins-intl.cc and
@@ -184,31 +249,16 @@ function captureIntlProbe(
 const readOnlyIntrinsicProbes = [
   captureIntrinsicProbe(
     ownDescriptorField(
-      Object.getOwnPropertyDescriptor(WeakRef.prototype, 'deref'),
+      getOwnPropertyDescriptor(WeakRef.prototype, 'deref'),
       'value',
     ),
   ),
   captureIntrinsicProbe(
     ownDescriptorField(
-      Object.getOwnPropertyDescriptor(
-        FinalizationRegistry.prototype,
-        'unregister',
-      ),
+      getOwnPropertyDescriptor(FinalizationRegistry.prototype, 'unregister'),
       'value',
     ),
     [{}],
-  ),
-  captureIntrinsicProbe(
-    ownDescriptorField(
-      Object.getOwnPropertyDescriptor(URL.prototype, 'protocol'),
-      'get',
-    ),
-  ),
-  captureIntrinsicProbe(
-    ownDescriptorField(
-      Object.getOwnPropertyDescriptor(URLSearchParams.prototype, 'size'),
-      'get',
-    ),
   ),
   captureIntlProbe('Collator'),
   captureIntlProbe('DateTimeFormat', 'formatToParts', [0]),
@@ -223,8 +273,8 @@ const readOnlyIntrinsicProbes = [
   // Segments.containing uses a native brand and scalar index; no cursor advances.
   captureIntrinsicProbe(
     ownDescriptorField(
-      Object.getOwnPropertyDescriptor(
-        Object.getPrototypeOf(new Intl.Segmenter('en').segment('')) as object,
+      getOwnPropertyDescriptor(
+        getPrototypeOf(new Intl.Segmenter('en').segment('')) as object,
         'containing',
       ),
       'value',
@@ -239,7 +289,11 @@ const readOnlyIntrinsicProbes = [
  * code must never be mistaken for a missing slot and admit a genuine member.
  */
 function hasReadOnlyIntrinsicState(value: object): boolean {
-  for (const probe of readOnlyIntrinsicProbes) {
+  for (let index = 0; index < readOnlyIntrinsicProbes.length; index += 1) {
+    const probe = readOnlyIntrinsicProbes[index];
+    if (!probe) {
+      continue;
+    }
     try {
       probe(value);
       return true;
@@ -274,32 +328,29 @@ function encodeCanonical(
     typeof value === 'string' ||
     typeof value === 'boolean'
   ) {
-    return JSON.stringify(value);
+    return stringifyScalar(value);
   }
   if (typeof value === 'number') {
-    if (
-      !Number.isFinite(value) ||
-      (Number.isInteger(value) && !Number.isSafeInteger(value))
-    ) {
-      throw new TypeError('Invalid JSON number.');
+    if (!isFiniteNumber(value) || (isInteger(value) && !isSafeInteger(value))) {
+      throw new JsonTypeError('Invalid JSON number.');
     }
-    return JSON.stringify(value);
+    return stringifyScalar(value);
   }
   if (typeof value !== 'object' || depth > maxDepth) {
-    throw new TypeError('Non-JSON value or excessive nesting.');
+    throw new JsonTypeError('Non-JSON value or excessive nesting.');
   }
   // Descriptor and prototype inspection are safe only after excluding proxies.
   if (isProxy(value)) {
-    throw new TypeError('Proxy JSON value.');
+    throw new JsonTypeError('Proxy JSON value.');
   }
-  const array = Array.isArray(value);
-  const prototype = Object.getPrototypeOf(value) as unknown;
+  const array = isArray(value);
+  const prototype = getPrototypeOf(value) as unknown;
   if (
     array
-      ? prototype !== Array.prototype
-      : prototype !== Object.prototype && prototype !== null
+      ? prototype !== arrayPrototype
+      : prototype !== objectPrototype && prototype !== null
   ) {
-    throw new TypeError(
+    throw new JsonTypeError(
       array ? 'Non-plain JSON array.' : 'Non-plain JSON object.',
     );
   }
@@ -307,17 +358,17 @@ function encodeCanonical(
     hasUnsupportedIntrinsicState(value) ||
     (!array && hasReadOnlyIntrinsicState(value))
   ) {
-    throw new TypeError('Intrinsic object state is not plain JSON data.');
+    throw new JsonTypeError('Intrinsic object state is not plain JSON data.');
   }
-  if (ancestors.has(value)) {
-    throw new TypeError('Cyclic JSON value.');
+  if (apply(setHas, ancestors, [value])) {
+    throw new JsonTypeError('Cyclic JSON value.');
   }
 
-  ancestors.add(value);
+  apply(setAdd, ancestors, [value]);
   try {
     if (array) {
-      const ownKeys = Reflect.ownKeys(value);
-      const lengthDescriptor = Object.getOwnPropertyDescriptor(value, 'length');
+      const ownKeys = ownKeysOf(value);
+      const lengthDescriptor = getOwnPropertyDescriptor(value, 'length');
       const length = ownDescriptorField(lengthDescriptor, 'value');
       if (
         !lengthDescriptor ||
@@ -326,25 +377,23 @@ function encodeCanonical(
         typeof length !== 'number' ||
         ownKeys.length !== length + 1
       ) {
-        throw new TypeError('Non-JSON array property.');
+        throw new JsonTypeError('Non-JSON array property.');
       }
 
-      const encoded: string[] = [];
+      const encoded = internalBuffer<string>();
       for (let index = 0; index < length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(
-          value,
-          String(index),
-        );
+        const descriptor = getOwnPropertyDescriptor(value, indexString(index));
         if (!descriptor) {
-          throw new TypeError('Sparse array or array accessor.');
+          throw new JsonTypeError('Sparse array or array accessor.');
         }
         if (
           ownDescriptorField(descriptor, 'enumerable') !== true ||
           !hasOwn(descriptor, 'value')
         ) {
-          throw new TypeError('Accessor or hidden property.');
+          throw new JsonTypeError('Accessor or hidden property.');
         }
-        encoded.push(
+        appendOwn(
+          encoded,
           encodeCanonical(
             ownDescriptorField(descriptor, 'value'),
             depth + 1,
@@ -353,24 +402,26 @@ function encodeCanonical(
           ),
         );
       }
-      return `[${encoded.join(',')}]`;
+      return `[${joinEncoded(encoded)}]`;
     }
 
-    const entries: [string, string][] = [];
-    for (const key of Reflect.ownKeys(value)) {
+    const entries = internalBuffer<[string, string]>();
+    const keys = ownKeysOf(value);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
       if (typeof key !== 'string') {
-        throw new TypeError('Non-JSON object key.');
+        throw new JsonTypeError('Non-JSON object key.');
       }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      const descriptor = getOwnPropertyDescriptor(value, key);
       if (
         !descriptor ||
         ownDescriptorField(descriptor, 'enumerable') !== true ||
         !hasOwn(descriptor, 'value')
       ) {
-        throw new TypeError('Accessor or hidden property.');
+        throw new JsonTypeError('Accessor or hidden property.');
       }
       // Validate before sorting: an early invalid value must not inspect siblings.
-      entries.push([
+      appendOwn(entries, [
         key,
         encodeCanonical(
           ownDescriptorField(descriptor, 'value'),
@@ -383,16 +434,22 @@ function encodeCanonical(
     // Symbol-backed keys already refused in own-key order. Private brands follow
     // descriptors and children so their first invalid member keeps precedence.
     if (cryptoUsesPrivateBrands && (isKeyObject(value) || isCryptoKey(value))) {
-      throw new TypeError('Intrinsic object state is not plain JSON data.');
+      throw new JsonTypeError('Intrinsic object state is not plain JSON data.');
     }
-    entries.sort(([left], [right]) =>
-      left < right ? -1 : left > right ? 1 : 0,
-    );
-    return `{${entries
-      .map(([key, encoded]) => `${JSON.stringify(key)}:${encoded}`)
-      .join(',')}}`;
+    apply(sortArray, entries, [
+      (left: [string, string], right: [string, string]) =>
+        left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : 0,
+    ]);
+    const encoded = internalBuffer<string>();
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (entry) {
+        appendOwn(encoded, `${stringifyScalar(entry[0])}:${entry[1]}`);
+      }
+    }
+    return `{${joinEncoded(encoded)}}`;
   } finally {
-    ancestors.delete(value);
+    apply(setDelete, ancestors, [value]);
   }
 }
 
@@ -409,15 +466,15 @@ export function assertExternalJsonValue(
   maxDepth: number,
 ): asserts value is ExternalJsonValue {
   if (
-    !Number.isSafeInteger(initialDepth) ||
-    !Number.isSafeInteger(maxDepth) ||
+    !isSafeInteger(initialDepth) ||
+    !isSafeInteger(maxDepth) ||
     initialDepth < 0 ||
     maxDepth < initialDepth ||
     maxDepth > MAX_SUPPORTED_DEPTH
   ) {
-    throw new TypeError('Invalid JSON depth bounds.');
+    throw new JsonTypeError('Invalid JSON depth bounds.');
   }
-  encodeCanonical(value, initialDepth, maxDepth, new Set());
+  encodeCanonical(value, initialDepth, maxDepth, new AncestorSet());
 }
 
 /**
@@ -430,5 +487,5 @@ export function assertExternalJsonValue(
  * @internal
  */
 export function canonicalJsonStringify(value: unknown): string {
-  return encodeCanonical(value, 0, MAX_SUPPORTED_DEPTH, new Set());
+  return encodeCanonical(value, 0, MAX_SUPPORTED_DEPTH, new AncestorSet());
 }

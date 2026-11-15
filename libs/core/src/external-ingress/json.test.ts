@@ -751,16 +751,6 @@ const readOnlyIntrinsicFixtures: readonly (readonly [
     () => 'registration checked separately',
   ],
   [
-    'URL',
-    () => new URL('https://example.test/secret?a=1'),
-    (value) => Reflect.apply(URL.prototype.toString, value, []),
-  ],
-  [
-    'URLSearchParams',
-    () => new URLSearchParams('secret=one&secret=two'),
-    (value) => Reflect.apply(URLSearchParams.prototype.toString, value, []),
-  ],
-  [
     'Intl.Collator',
     () => new Intl.Collator('de'),
     (value) =>
@@ -881,7 +871,7 @@ describe.each(jsonEntryPoints)(
           const value = new URL('https://example.test/?before=1');
           value.searchParams.set('after', '2');
           Object.setPrototypeOf(value, prototype);
-          expect(() => run(value)).toThrow(TypeError);
+          expect(() => run(value)).not.toThrow();
           expect(Reflect.apply(URL.prototype.toString, value, [])).toBe(
             'https://example.test/?before=1&after=2',
           );
@@ -1388,25 +1378,30 @@ describe.each(jsonEntryPoints)(
  * Apply one post-import hook only during the synchronous boundary call. Assertions
  * run after restoration so the test runner's own prototype use cannot interfere.
  */
+const testGetDescriptor = Object.getOwnPropertyDescriptor;
+const testDefineProperty = Object.defineProperty;
+const testDeleteProperty = Reflect.deleteProperty;
+
+/** Restore hooks through captured functions even when reflection itself is replaced. */
 function withPostLoadHook(
   prototype: object,
   key: PropertyKey,
   descriptor: PropertyDescriptor,
   run: () => unknown,
 ): { result: unknown; error: unknown } {
-  const original = Object.getOwnPropertyDescriptor(prototype, key);
+  const original = testGetDescriptor(prototype, key);
   let result: unknown;
   let error: unknown;
-  Object.defineProperty(prototype, key, descriptor);
+  testDefineProperty(prototype, key, descriptor);
   try {
     result = run();
   } catch (caught) {
     error = caught;
   } finally {
     if (original) {
-      Object.defineProperty(prototype, key, original);
+      testDefineProperty(prototype, key, original);
     } else {
-      Reflect.deleteProperty(prototype, key);
+      testDeleteProperty(prototype, key);
     }
   }
   return { result, error };
@@ -1488,6 +1483,42 @@ for (const api of ['encode', 'validate'] as const) {
             get() {
               calls += 1;
               throw new Error('Prototype protocol getter.');
+            },
+          },
+          () => run({ z: [7, 'text'], a: { b: true } }),
+        );
+        expect(calls).toBe(0);
+        expect(outcome.error).toBeUndefined();
+        expect(outcome.result).toBe(
+          api === 'encode' ? '{"a":{"b":true},"z":[7,"text"]}' : undefined,
+        );
+      });
+    }
+
+    for (const [owner, key] of [
+      [Reflect, 'apply'],
+      [Reflect, 'defineProperty'],
+      [Reflect, 'ownKeys'],
+      [Object, 'getOwnPropertyDescriptor'],
+      [Object, 'getPrototypeOf'],
+      [Object, 'setPrototypeOf'],
+      [Object, 'hasOwn'],
+      [Array, 'isArray'],
+      [JSON, 'stringify'],
+      [Number, 'isFinite'],
+      [Number, 'isInteger'],
+      [Number, 'isSafeInteger'],
+    ] as const) {
+      it(`uses captured static ${key}`, () => {
+        let calls = 0;
+        const outcome = withPostLoadHook(
+          owner,
+          key,
+          {
+            configurable: true,
+            get() {
+              calls += 1;
+              throw new Error('Replaced static intrinsic.');
             },
           },
           () => run({ z: [7, 'text'], a: { b: true } }),
