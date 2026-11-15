@@ -881,6 +881,11 @@ function renderText(
     lines.push(`${STATUS_GLYPH[check.status]} ${check.name}: ${check.detail}`);
     if (check.remediation) lines.push(`    ↳ ${check.remediation}`);
   }
+  // Holds are independent of parsed rollups: a rejected or missing definition
+  // must still name accepted work and what allows the runtime to release it.
+  for (const hold of report.heldNotifyWork ?? []) {
+    lines.push(`Held notify work ${hold.monitorId}: ${hold.reason}`);
+  }
   // Outboxes have one location in the core report. Render records separately
   // from definition health so invalid/absent definitions cannot hide them.
   for (const group of [
@@ -978,6 +983,7 @@ function toJson(
       detail: check.detail,
       remediation: check.remediation ?? null,
     })),
+    heldNotifyWork: report.heldNotifyWork ?? [],
     orphanedMonitorWork: report.orphanedMonitorWork ?? [],
     ephemeralMonitorWork: report.ephemeralMonitorWork ?? [],
     parseErrors: report.parseErrors,
