@@ -724,13 +724,14 @@ uses to release it. This read is independent of definition discovery: a missing,
 parse-failed, duplicated, unknown-source or scope-rejected definition still shows
 the held count and strategy beside its failure. A scheduling rejection also keeps
 the hold visible. The failure remains the verdict; the hold is `pending`.
-Text explains `Fix the definition so the runtime can release this work under its
-notify policy.` Repair permits release under 002 §4; it does not bypass pacing,
+For a rejected persistent definition, text explains `Fix the definition so the
+runtime can release this work under its notify policy.` An unresolved source
+instead asks to restore its registration. Repair permits release under 002 §4; it does not bypass pacing,
 retry ordering or captured-envelope validation.
 
 For a single batch, JSON `stages[].details` keeps its existing `observations`,
 `dueAt`/`overdue` (debounce) or `window` (rollup), and adds `monitorId`, `strategy`,
-`blockedByDefinition` and `reason`; rollup also includes its captured `timezone`
+`blockedByDefinition`, `releaseBarrier` and `reason`; rollup also includes its captured `timezone`
 (default `UTC`). Timing comes from the stored batch and captured definition,
 including when the current definition is rejected or edited. Unavailable legacy
 rollup metadata is `unknown`, including a captured envelope with missing or null
@@ -2184,7 +2185,7 @@ this section's own diagnoses-only contract.
 including ids with missing, parse-failed, duplicated or otherwise rejected
 definitions. JSON adds the top-level `heldNotifyWork` array (empty when nothing
 is held), independent of the parsed `monitors` array. Each entry carries
-`monitorId`, `strategy`, `observations`, `blockedByDefinition`, `reason`, and its
+`monitorId`, `strategy`, `observations`, `blockedByDefinition`, `releaseBarrier`, `reason`, and its
 stored timing (`dueAt`/`overdue` for debounce; captured `window`/`timezone` for
 rollup), matching explain's notify details above. Entries are ordered by monitor
 id, then debounce before rollup. Each batch appears once, even for duplicate
@@ -2196,19 +2197,27 @@ delivery counts, retries and dropped observations. An ordinary pacing hold does
 not fail a health check or change the exit-code contract. A rejected definition
 keeps its existing validation failure and the hold's reason names definition
 repair as a prerequisite for release. Diagnosis never releases or edits a hold.
-An active ephemeral declaration supplies its definition without a file; the
-absence of `MONITOR.md` alone does not block its held work. Eligibility uses the
-same active-declaration query as ticks: the requested workspace includes global
-(`workspacePath: null`) declarations whose declaring session is active.
-A cancelled or reaped declaration's accepted batch remains visible. Its reason
-says the declaration is retired, no future tick will release the work, and there
-is no definition file to edit. `blockedByDefinition` is false for this lifecycle
-barrier; it does not imply release eligibility. Neither an elapsed debounce
-deadline nor a rollup window promises release for a retired declaration. This
-changes diagnosis only, leaving retention and release policy unchanged. Core cases in
-`libs/core/src/runtime/held-notify-report.test.ts` cover rejected/missing and
-duplicate definitions, workspace isolation, mixed legacy batches, empty batches
-and live ephemeral declarations.
+An active ephemeral declaration supplies its definition without a file. Both
+commands use the barrier classification in 002 §10.7 and preserve the same reason
+in text and JSON. Eligibility first applies tick's dormancy predicate, including
+its recent-declaration exemption, then the active workspace/global declaration
+query. An inactive owner, including one already due for reaping, gets
+`releaseBarrier: "owner-inactive"`: no future tick releases this work under that
+owner, and no definition file exists to edit. An unavailable source gets
+`"source-unavailable"` and asks to restore its registration. A cancelled/reaped
+record gets `"declaration-retired"` and no future-release promise. These barriers
+are distinct from `"definition-rejected"`, whose remedy remains file repair.
+
+The other values are `"workspace-mismatch"` (inspect the declaring workspace),
+`"declaration-invalid"` (restore source compatibility or declare a replacement,
+which does not drain the original batch), `"retained-work"` (complete older
+materialization retries), and `"capture-invalid"` (restore trusted captured data).
+`"none"` means no current barrier was found; it preserves pacing and cadence and
+does not promise a successful next tick. `blockedByDefinition` remains about
+persistent definition health, including its unresolved source, and never serves
+as a complete release-eligibility boolean. Retention and release policy are
+unchanged. Core real-tick cases in `held-notify-report.test.ts` and CLI daemon
+cases in `held-notify.integration.test.ts` verify matching reasons and JSON.
 
 For each monitor, `doctor` reports: **id**, **source type**, **urgency**, **cadence** (the cron
 expression for `schedule` sources, else the observe interval), **last-observed** time (or `never`),

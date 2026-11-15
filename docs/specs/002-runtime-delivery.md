@@ -2757,13 +2757,36 @@ Held-notify diagnosis reads accepted batches independently of definition health.
 Incomplete captured rollup metadata (including missing/null `monitor` or
 `frontmatter`) leaves `window` and `timezone` as `unknown`; the batch count and
 rest of the report remain available without repairing the stored envelope.
-Ephemeral eligibility uses the tick's active-declaration query, including global
-records in a named workspace. For a cancelled or reaped declaration, the reason
-identifies retirement: no future tick releases the held work and no definition
-file exists to edit. `blockedByDefinition` is false for that lifecycle barrier,
-not a claim that the batch can flush. Diagnosis changes neither release timing
-nor retention policy. Verified by `held-notify-report.test.ts` across both report
-methods, definition health, and real global/cancelled ephemeral ticks (Refs #574).
+Release diagnosis follows tick's read-only predicates in order: duplicate discovery,
+then `staleActiveSessions` (including the recent-declaration exemption), active
+workspace/global declarations and owner status, source resolution, definition
+reconstruction and scope validation, older retained materialization work, captured
+envelope validation and effective policy comparison, then scheduling if no edit
+will drain the batch first. It does not perform any of those mutations.
+Both report methods expose the first known prerequisite as `releaseBarrier`:
+
+| Value                 | Derivation and remedy                                                                                                                                                                              |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                  |
+| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                  |
+| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                        |
+| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit. |
+| `declaration-retired` | The ephemeral record is absent or reaped; no future tick releases this work and there is no file to edit.                                                                                          |
+| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                            |
+| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                         |
+| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                            |
+| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.               |
+
+`blockedByDefinition` retains its persistent-definition meaning, including an
+unresolved source in a persistent definition. It is false for ephemeral source,
+owner and retirement barriers and for retained-work/capture barriers; it does not
+assert eligibility. `none` is a snapshot, not a promise that the next tick emits:
+concurrent edits, cadence, watcher ownership, in-flight admission, transactional
+failures and deliberate artifact filtering still apply. Diagnosis changes neither
+release timing nor retention policy. `held-notify-report.test.ts` exercises both
+surfaces, read-only persistence, stale-owner and recent-declaration clocks,
+interrupted-close database reopen, source restoration, and real release/retention
+outcomes (Refs #574).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
