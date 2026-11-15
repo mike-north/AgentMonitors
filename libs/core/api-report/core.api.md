@@ -487,6 +487,9 @@ export interface GroupMembershipTracking {
 }
 
 // @public
+export type HeldNotifyBarrier = 'none' | 'definition-rejected' | 'source-unavailable' | 'owner-inactive' | 'declaration-retired' | 'workspace-mismatch' | 'declaration-invalid' | 'retained-work' | 'capture-invalid';
+
+// @public
 export interface HeldNotifyWork {
     blockedByDefinition: boolean;
     dueAt?: string;
@@ -494,6 +497,7 @@ export interface HeldNotifyWork {
     observations: number;
     overdue?: boolean;
     reason: string;
+    releaseBarrier: HeldNotifyBarrier;
     strategy: 'debounce' | 'rollup';
     timezone?: string;
     window?: string;

@@ -687,6 +687,23 @@ export interface MonitorRuntimeState {
 }
 
 /**
+ * The first known release prerequisite in tick order, separate from pacing.
+ * `none` means no current barrier was found, not a guarantee against concurrent
+ * edits, source failures or storage failures during a later tick.
+ * @public
+ */
+export type HeldNotifyBarrier =
+  | 'none'
+  | 'definition-rejected'
+  | 'source-unavailable'
+  | 'owner-inactive'
+  | 'declaration-retired'
+  | 'workspace-mismatch'
+  | 'declaration-invalid'
+  | 'retained-work'
+  | 'capture-invalid';
+
+/**
  * Accepted observations waiting for notify pacing, distinct from materialized
  * events and retry outboxes. Counts and timing come from the persisted batch;
  * definition repair permits release but does not bypass pacing or retry order.
@@ -699,8 +716,10 @@ export interface HeldNotifyWork {
   strategy: 'debounce' | 'rollup';
   /** Accepted envelopes in this batch, not source observations in the latest tick. */
   observations: number;
-  /** Whether a missing, ambiguous or rejected definition prevents release. */
+  /** Whether a missing, ambiguous or rejected persistent definition (including an unresolved source) prevents this batch's release. */
   blockedByDefinition: boolean;
+  /** First known release prerequisite; false definition blockage alone never implies eligibility. */
+  releaseBarrier: HeldNotifyBarrier;
   /** Shared text/structured explanation of what permits release. */
   reason: string;
   /** Debounce settle deadline as stored, including elapsed deadlines awaiting a tick. */

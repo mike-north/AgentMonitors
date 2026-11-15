@@ -191,6 +191,7 @@ for (const strategy of ['debounce', 'rollup'] as const) {
             strategy,
             observations: 1,
             blockedByDefinition: true,
+            releaseBarrier: 'definition-rejected',
           },
         });
         expect(notify?.reason).toContain('Fix the definition');
@@ -209,6 +210,7 @@ for (const strategy of ['debounce', 'rollup'] as const) {
             strategy,
             observations: 1,
             blockedByDefinition: true,
+            releaseBarrier: 'definition-rejected',
           }),
         ]);
         expect(doctor.heldNotifyWork[0]?.reason).toBe(notify?.reason);
@@ -226,6 +228,7 @@ for (const strategy of ['debounce', 'rollup'] as const) {
         expect.objectContaining({
           observations: 1,
           blockedByDefinition: false,
+          releaseBarrier: 'none',
         }),
       ]);
       // A valid policy edit releases the accepted batch without waiting an hour
@@ -274,6 +277,7 @@ it('keeps downstream stages pending for held work despite a quiet latest tick', 
         strategy: 'debounce',
         observations: 1,
         blockedByDefinition: false,
+        releaseBarrier: 'none',
       }),
     ]);
     expect(f.run(['doctor'], 'text')).toContain(

@@ -69,7 +69,6 @@ import {
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
 import {
   describeHeldNotifyWork,
-  type HeldNotifyBarrier,
   heldNotifyStage,
 } from './held-notify-diagnosis.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
@@ -87,6 +86,7 @@ import {
 } from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
+  HeldNotifyBarrier,
   DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
@@ -1615,16 +1615,23 @@ export class AgentMonitorRuntime {
    * gives its registered artifacts cleanup authority (issue #562).
    */
   private reapDormantSessions(now: Date, workspacePath: string): void {
-    const staleBefore = new Date(now.getTime() - this.sessionDormancyMs);
-    for (const session of this.store.staleActiveSessions(
-      workspacePath,
-      staleBefore,
-    )) {
+    for (const session of this.sessionsDueForDormancy(now, workspacePath)) {
       // Reuse closeSession so the dormancy transition and an explicit close
       // share ONE path (status → dormant, ephemeral monitors reaped, verify
       // artifacts handed cleanup authority, hook state refreshed).
       this.closeSession(session.id, now);
     }
+  }
+
+  /** Read tick's dormancy decision, including recent declarations, without closing owners. */
+  private sessionsDueForDormancy(
+    now: Date,
+    workspacePath: string,
+  ): AgentSessionRecord[] {
+    return this.store.staleActiveSessions(
+      workspacePath,
+      new Date(now.getTime() - this.sessionDormancyMs),
+    );
   }
 
   /**
@@ -1896,54 +1903,107 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Determine the release prerequisite for held-work diagnosis, without
-   * changing admission or release. Persistent callers supply discovery health;
-   * live ephemeral declarations replace the file they never had by design.
-   * Retired declarations have a lifecycle barrier that file repair cannot lift.
+   * Follow tick's read-only admission predicates in order. Diagnostics cannot
+   * run reaping, retry drains or notify reconciliation just to discover their
+   * prerequisites; they share those operations' reads instead. A later tick
+   * can still encounter concurrent edits or execution/storage failures.
    */
   private heldReleaseBarrier(
     monitorId: string,
     workspacePath: string,
-    persistentValid: boolean,
+    scan: Awaited<ReturnType<typeof scanMonitors>>,
     now: Date,
   ): HeldNotifyBarrier {
-    if (persistentValid) {
-      return false;
+    // Duplicate ids abort the entire tick before lifecycle or source processing.
+    if (scan.duplicateIds.length > 0) {
+      return 'definition-rejected';
     }
-    if (!monitorId.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
-      return true;
-    }
-    const declaration = this.store.findEphemeralMonitorById(monitorId);
-    if (declaration?.status !== 'active') {
-      return 'retired-ephemeral';
-    }
-    // Use tick's own eligibility query, including global declarations and the
-    // declaring session's active status, instead of a parallel workspace rule.
-    if (
-      !this.store
-        .listActiveEphemeralMonitors(workspacePath)
-        .some((record) => record.id === monitorId)
-    ) {
-      return true;
-    }
-    const source = this.registry.get(declaration.sourceName);
-    if (!source) {
-      return true;
-    }
-    try {
-      const monitor = this.ephemeralRecordToMonitor(declaration);
-      return (
-        validateWatchScope(
-          watchConfig(monitor.frontmatter.watch),
-          source.scopeSchema,
-        ).length > 0 ||
-        this.scheduleForMonitor(monitor, now, workspacePath).error !== undefined
+    let monitor: MonitorDefinition;
+    const ephemeral = monitorId.startsWith(EPHEMERAL_MONITOR_ID_PREFIX);
+    if (ephemeral) {
+      const declaration = this.store.findEphemeralMonitorById(monitorId);
+      // Tick reaps stale owners before querying declarations. This read includes
+      // the store's recent-declaration exemption; persisted active is insufficient.
+      if (
+        declaration &&
+        this.sessionsDueForDormancy(now, workspacePath).some(
+          (session) => session.id === declaration.sessionId,
+        )
+      ) {
+        return 'owner-inactive';
+      }
+      if (declaration?.status !== 'active') {
+        return 'declaration-retired';
+      }
+      const active = this.store.listActiveEphemeralMonitors(workspacePath);
+      if (!active.some((record) => record.id === monitorId)) {
+        return this.store.findSessionById(declaration.sessionId)?.status !==
+          'active'
+          ? 'owner-inactive'
+          : 'workspace-mismatch';
+      }
+      // Source resolution precedes reconstruction on tick; missing plugins are
+      // restorable dependencies, not a nonexistent definition file to repair.
+      if (!this.registry.get(declaration.sourceName)) {
+        return 'source-unavailable';
+      }
+      try {
+        monitor = this.ephemeralRecordToMonitor(declaration);
+      } catch {
+        return 'declaration-invalid';
+      }
+    } else {
+      const persistent = scan.monitors.find(
+        ({ monitor }) => monitor.id === monitorId,
+      )?.monitor;
+      if (!persistent) {
+        return 'definition-rejected';
+      }
+      const current = this.readCurrentNotifyDefinition(
+        monitorId,
+        workspacePath,
+        persistent.filePath,
       );
-    } catch {
-      // An unrebuildable declaration cannot authorize release. Diagnosis still
-      // reports its accepted batch instead of throwing away the whole report.
-      return true;
+      if (!current?.ok) {
+        return 'definition-rejected';
+      }
+      monitor = current.monitor;
     }
+    const source = this.registry.get(monitor.frontmatter.watch.type);
+    if (!source) {
+      return 'source-unavailable';
+    }
+    const invalid = ephemeral ? 'declaration-invalid' : 'definition-rejected';
+    if (
+      validateWatchScope(
+        watchConfig(monitor.frontmatter.watch),
+        source.scopeSchema,
+      ).length > 0
+    ) {
+      return invalid;
+    }
+    // Tick drains older retries before validating captured holds. A read-only
+    // report cannot predict a retry attempt's success, so name the prerequisite.
+    if (this.hasRetainedWork(monitorId, workspacePath)) {
+      return 'retained-work';
+    }
+    const notify = this.store.getMonitorState(
+      monitorId,
+      workspacePath,
+    ).notifyState;
+    try {
+      // Effective pacing edits drain captured work before scheduling. Reuse
+      // reconciliation's complete read-only plan, including semantic policy keys.
+      if (this.readNotifyEdit(monitor, notify).changed) {
+        return 'none';
+      }
+    } catch {
+      return 'capture-invalid';
+    }
+    if (this.scheduleForMonitor(monitor, now, workspacePath).error) {
+      return invalid;
+    }
+    return 'none';
   }
 
   async explainMonitor(
@@ -1985,7 +2045,7 @@ export class AgentMonitorRuntime {
       describeHeldNotifyWork(
         input.monitorId,
         runtimeState.notifyState,
-        this.heldReleaseBarrier(input.monitorId, workspacePath, false, now),
+        this.heldReleaseBarrier(input.monitorId, workspacePath, scan, now),
         now,
       ),
     );
@@ -2298,23 +2358,16 @@ export class AgentMonitorRuntime {
     const holds = describeHeldNotifyWork(
       input.monitorId,
       notifyState,
-      false,
+      this.heldReleaseBarrier(input.monitorId, workspacePath, scan, now),
       now,
     );
     const holdStage = heldNotifyStage(holds);
     // A quiet latest tick cannot erase accepted work from earlier ticks. Holds
     // keep downstream stages pending until materialization actually occurs.
     let notifyPending = false;
-    const heldMaterializationReason =
-      holds.length > 1
-        ? `No monitor_events rows yet — ${holdStage?.reason ?? ''}`
-        : holds[0]?.strategy === 'debounce'
-          ? holds[0].overdue
-            ? 'No monitor_events rows yet — the debounce settle window has elapsed and the batch will flush on the next daemon tick.'
-            : 'No monitor_events rows yet — the notify layer is holding the batch until the debounce settle window elapses.'
-          : holds[0]?.strategy === 'rollup'
-            ? 'No monitor_events rows yet — the rollup notify layer is accumulating observations until the next window.'
-            : null;
+    const heldMaterializationReason = holdStage
+      ? `No monitor_events rows yet — ${holdStage.reason}`
+      : null;
     if (holdStage) {
       notifyPending = true;
       stages.push(holdStage);
@@ -2848,15 +2901,7 @@ export class AgentMonitorRuntime {
         describeHeldNotifyWork(
           monitorId,
           this.store.getMonitorState(monitorId, workspacePath).notifyState,
-          this.heldReleaseBarrier(
-            monitorId,
-            workspacePath,
-            !duplicateMonitorIds.has(monitorId) &&
-              monitors.some(
-                (monitor) => monitor.id === monitorId && monitor.valid,
-              ),
-            now,
-          ),
+          this.heldReleaseBarrier(monitorId, workspacePath, scan, now),
           now,
         ),
       );
@@ -4197,6 +4242,35 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Read the prerequisites and effective change for a notify edit. Reconciliation
+   * calls this under its writer lock; diagnosis uses the same validation without
+   * learning policy identity, draining envelopes or opening admission.
+   */
+  private readNotifyEdit(
+    monitor: MonitorDefinition,
+    notify: PolicyNotifyState,
+  ): {
+    key: string;
+    held: StoredObservationEnvelope[];
+    changed: boolean;
+  } {
+    const key = notifyPolicyKey(monitor);
+    const held = [
+      ...(notify.pendingDebounce?.observations ?? []),
+      ...(notify.pendingRollup?.observations ?? []),
+    ];
+    for (const envelope of held) {
+      // Captured semantics cannot borrow instructions or urgency from an edit.
+      validateCapturedNotifyEnvelope(envelope, monitor.id);
+    }
+    const changed =
+      held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
+      (notify.policyKey !== undefined &&
+        !storedNotifyPolicyMatches(notify.policyKey, key));
+    return { key, held, changed };
+  }
+
+  /**
    * Own the edit's deterministic write unit. Re-read under the writer lock so
    * another runtime's committed drain cannot be duplicated or overwritten by a
    * decision made from an earlier read. Event units nest as SQLite savepoints;
@@ -4210,20 +4284,7 @@ export class AgentMonitorRuntime {
     return withStoreWriter(this.store, () => {
       const state = this.store.getMonitorState(monitor.id, workspacePath);
       const notify: PolicyNotifyState = state.notifyState;
-      const key = notifyPolicyKey(monitor);
-      const held = [
-        ...(notify.pendingDebounce?.observations ?? []),
-        ...(notify.pendingRollup?.observations ?? []),
-      ];
-      for (const envelope of held) {
-        // Persisted envelopes are older-version data. Missing captured semantics
-        // must block recovery, never borrow instructions or urgency from an edit.
-        validateCapturedNotifyEnvelope(envelope, monitor.id);
-      }
-      const changed =
-        held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
-        (notify.policyKey !== undefined &&
-          !storedNotifyPolicyMatches(notify.policyKey, key));
+      const { key, held, changed } = this.readNotifyEdit(monitor, notify);
       if (!changed) {
         // A successful current scan establishes future comparison identity even
         // when legacy state has only guards. Missing metadata is not an edit:

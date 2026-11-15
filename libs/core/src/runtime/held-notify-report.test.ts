@@ -5,7 +5,7 @@
  */
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { expect, it } from 'vitest';
+import { expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
 import { parseMonitor } from '../parser/parse-monitor.js';
@@ -105,6 +105,10 @@ Inspect the change.
           strategy: 'debounce',
           observations: 1,
           blockedByDefinition: true,
+          releaseBarrier:
+            rejection === 'source'
+              ? 'source-unavailable'
+              : 'definition-rejected',
         },
       },
     );
@@ -130,7 +134,7 @@ it('ignores empty batches and throttle suppression because neither contains acce
         pendingDebounce: { dueAt: now.toISOString(), observations: [] },
         pendingRollup: { observations: [] },
       },
-      false,
+      'none',
       now,
     ),
   ).toEqual([]);
@@ -168,7 +172,7 @@ Inspect the change.
       pendingDebounce: { dueAt: now.toISOString(), observations: [envelope] },
       pendingRollup: { observations: [envelope, envelope] },
     },
-    true,
+    'definition-rejected',
     now,
   );
   expect(holds).toMatchObject([
@@ -319,6 +323,10 @@ Inspect.
             strategy: 'rollup',
             observations: 1,
             blockedByDefinition: definition !== 'valid',
+            releaseBarrier:
+              definition === 'valid'
+                ? 'capture-invalid'
+                : 'definition-rejected',
             window: 'unknown',
             timezone: 'unknown',
           });
@@ -332,11 +340,11 @@ Inspect.
 }
 
 /** Create a genuine tick-admitted hold, optionally owned by a global session. */
-async function ephemeralHold(global: boolean) {
+async function ephemeralHold(global: boolean, databasePath = ':memory:') {
   const workspace = path.join(process.env.HOME ?? '', 'workspace');
   const dir = path.join(workspace, 'monitors');
   mkdirSync(dir, { recursive: true });
-  const db = createDb(':memory:');
+  const db = createDb(databasePath);
   const store = new RuntimeStore(db);
   const registry = new SourceRegistry();
   let observed = false;
@@ -384,7 +392,7 @@ async function ephemeralHold(global: boolean) {
       },
     },
   });
-  return { db, store, runtime, session, monitor, workspace, dir };
+  return { db, store, registry, runtime, session, monitor, workspace, dir };
 }
 
 it('diagnoses global ephemeral holds as eligible and releases them on a real tick without repair', async () => {
@@ -451,5 +459,383 @@ it('diagnoses retired ephemeral holds as stranded without offering nonexistent d
     expect(store.getMonitorState(monitor.id, workspace)).toEqual(before);
   } finally {
     db.$client.close();
+  }
+});
+
+/** Both read-only surfaces must name the same barrier without rewriting accepted work. */
+async function expectEphemeralBarrier(
+  fixture: Awaited<ReturnType<typeof ephemeralHold>>,
+  runtime: AgentMonitorRuntime,
+  barrier: string,
+  remedy: string,
+) {
+  const { db, monitor, workspace, dir } = fixture;
+  const before = db.$client.serialize();
+  const input = {
+    monitorsDir: dir,
+    workspacePath: workspace,
+    monitorId: monitor.id,
+  };
+  const doctor = await runtime.doctorReport(input);
+  const explain = await runtime.explainMonitor(input);
+  const hold = doctor.heldNotifyWork?.[0];
+  expect(hold?.reason).toContain(remedy);
+  expect(hold?.reason).not.toContain('Fix the definition');
+  expect(hold?.reason).not.toContain('will be flushed on the next daemon tick');
+  expect(hold).toMatchObject({
+    observations: 1,
+    blockedByDefinition: false,
+    releaseBarrier: barrier,
+  });
+  expect(
+    explain.stages.find((stage) => stage.id === 'notify')?.details,
+  ).toEqual(hold);
+  expect(explain.stages.find((stage) => stage.id === 'notify')?.reason).toBe(
+    hold?.reason,
+  );
+  expect(db.$client.serialize()).toEqual(before);
+}
+
+it('diagnoses an already stale owner before the next tick reaps its declaration', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(now);
+  const fixture = await ephemeralHold(false);
+  const { db, runtime, store, session, monitor, workspace, dir } = fixture;
+  try {
+    // Both the last owner activity and declaration precede the full dormancy window.
+    vi.setSystemTime(new Date(now.getTime() + 48 * 60 * 60 * 1000));
+    expect(store.getSessionById(session.id).status).toBe('active');
+    expect(store.getEphemeralMonitorById(monitor.id).status).toBe('active');
+    await expectEphemeralBarrier(
+      fixture,
+      runtime,
+      'owner-inactive',
+      'owner is inactive',
+    );
+    const held = store.getMonitorState(monitor.id, workspace).notifyState;
+    expect((await runtime.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect(store.getEphemeralMonitorById(monitor.id).status).toBe('reaped');
+    expect(store.getMonitorState(monitor.id, workspace).notifyState).toEqual(
+      held,
+    );
+  } finally {
+    db.$client.close();
+    vi.useRealTimers();
+  }
+});
+
+it('restores a missing ephemeral source registration without editing a definition', async () => {
+  const fixture = await ephemeralHold(false);
+  const { db, store, registry, monitor, workspace, dir } = fixture;
+  const restoredRegistry = new SourceRegistry();
+  const reopened = new AgentMonitorRuntime(store, restoredRegistry);
+  try {
+    await expectEphemeralBarrier(
+      fixture,
+      reopened,
+      'source-unavailable',
+      'Restore the source registration',
+    );
+    const held = store.getMonitorState(monitor.id, workspace).notifyState;
+    expect((await reopened.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect(store.getMonitorState(monitor.id, workspace).notifyState).toEqual(
+      held,
+    );
+    const source = registry.get('test-held');
+    if (!source) {
+      throw new Error('Missing fixture source');
+    }
+    restoredRegistry.register(source);
+    expect((await reopened.tick(dir, workspace)).emittedEventIds).toHaveLength(
+      1,
+    );
+    expect(
+      (
+        await reopened.doctorReport({
+          monitorsDir: dir,
+          workspacePath: workspace,
+        })
+      ).heldNotifyWork,
+    ).toEqual([]);
+  } finally {
+    db.$client.close();
+  }
+});
+
+it('diagnoses a durably inactive owner after an interrupted close and database reopen', async () => {
+  const databasePath = path.join(process.env.HOME ?? '', 'interrupted.sqlite');
+  const fixture = await ephemeralHold(false, databasePath);
+  const { runtime, store, session, monitor, workspace, dir, registry } =
+    fixture;
+  // A crash can commit owner dormancy before declaration retirement. Reopening
+  // must diagnose that durable lifecycle state rather than a file error.
+  const reap = vi
+    .spyOn(store, 'reapEphemeralMonitorsForSession')
+    .mockImplementation(() => {
+      throw new Error('Interrupted before declaration reap');
+    });
+  expect(() => runtime.closeSession(session.id)).toThrow(
+    'Interrupted before declaration reap',
+  );
+  reap.mockRestore();
+  fixture.db.$client.close();
+  const db = createDb(databasePath);
+  const reopenedStore = new RuntimeStore(db);
+  const reopened = new AgentMonitorRuntime(reopenedStore, registry);
+  try {
+    expect(reopenedStore.getSessionById(session.id).status).toBe('dormant');
+    expect(reopenedStore.getEphemeralMonitorById(monitor.id).status).toBe(
+      'active',
+    );
+    await expectEphemeralBarrier(
+      { ...fixture, db, store: reopenedStore },
+      reopened,
+      'owner-inactive',
+      'owner is inactive',
+    );
+    const held = reopenedStore.getMonitorState(
+      monitor.id,
+      workspace,
+    ).notifyState;
+    expect((await reopened.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect(reopenedStore.getEphemeralMonitorById(monitor.id).status).toBe(
+      'active',
+    );
+    expect(
+      reopenedStore.getMonitorState(monitor.id, workspace).notifyState,
+    ).toEqual(held);
+  } finally {
+    db.$client.close();
+  }
+});
+
+it('honors the recent-declaration dormancy exemption in reports and the next tick', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(now);
+  const fixture = await ephemeralHold(false);
+  const { db, runtime, store, session, monitor, workspace, dir } = fixture;
+  try {
+    vi.setSystemTime(new Date(now.getTime() + 31 * 60 * 1000));
+    runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'test-held',
+      scope: {},
+      urgency: 'high',
+    });
+    const input = {
+      monitorsDir: dir,
+      workspacePath: workspace,
+      monitorId: monitor.id,
+    };
+    const doctor = await runtime.doctorReport(input);
+    const explain = await runtime.explainMonitor(input);
+    expect(doctor.heldNotifyWork?.[0]).toMatchObject({
+      releaseBarrier: 'none',
+      blockedByDefinition: false,
+    });
+    expect(
+      explain.stages.find((stage) => stage.id === 'notify')?.details,
+    ).toEqual(doctor.heldNotifyWork?.[0]);
+    expect((await runtime.tick(dir, workspace)).emittedEventIds).toHaveLength(
+      1,
+    );
+    expect(store.getSessionById(session.id).status).toBe('active');
+  } finally {
+    db.$client.close();
+    vi.useRealTimers();
+  }
+});
+
+it('names source schema rejection as an invalid declaration instead of an editable file', async () => {
+  const fixture = await ephemeralHold(false);
+  const { db, store, monitor, workspace, dir } = fixture;
+  const registry = new SourceRegistry();
+  registry.register({
+    name: 'test-held',
+    scopeSchema: { type: 'object', required: ['required'] },
+    async observe() {
+      throw new Error('Rejected scope must not observe');
+    },
+  });
+  const runtime = new AgentMonitorRuntime(store, registry);
+  try {
+    await expectEphemeralBarrier(
+      fixture,
+      runtime,
+      'declaration-invalid',
+      'declaration cannot be edited',
+    );
+    const held = store.getMonitorState(monitor.id, workspace).notifyState;
+    expect((await runtime.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect(store.getMonitorState(monitor.id, workspace).notifyState).toEqual(
+      held,
+    );
+  } finally {
+    db.$client.close();
+  }
+});
+
+it('keeps a terminal retry ahead of an otherwise eligible held batch', async () => {
+  const fixture = await ephemeralHold(false);
+  const { db, runtime, store, monitor, workspace, dir } = fixture;
+  try {
+    const envelope = store.getMonitorState(monitor.id, workspace).notifyState
+      .pendingDebounce?.observations[0];
+    if (!envelope) {
+      throw new Error('Missing accepted envelope');
+    }
+    const retry = store.enqueueMaterializationRetries(
+      [
+        {
+          monitorId: monitor.id,
+          workspacePath: workspace,
+          sourceName: 'test-held',
+          envelope: { ...envelope, observedAt: new Date(envelope.observedAt) },
+          error: 'materialization failed',
+        },
+      ],
+      now,
+    )[0];
+    if (!retry) {
+      throw new Error('Missing retained retry');
+    }
+    for (let attempt = 0; attempt < 5; attempt++) {
+      store.markMaterializationRetryFailed(
+        retry.id,
+        'materialization failed',
+        now,
+      );
+    }
+    await expectEphemeralBarrier(
+      fixture,
+      runtime,
+      'retained-work',
+      'Earlier retained materialization work must complete first',
+    );
+    const held = store.getMonitorState(monitor.id, workspace).notifyState;
+    expect((await runtime.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect(store.getMonitorState(monitor.id, workspace).notifyState).toEqual(
+      held,
+    );
+  } finally {
+    db.$client.close();
+  }
+});
+
+it('reports invalid captured pacing before the next tick refuses reconciliation', async () => {
+  const fixture = await ephemeralHold(false);
+  const { db, runtime, store, monitor, workspace, dir } = fixture;
+  try {
+    const state = store.getMonitorState(monitor.id, workspace);
+    const batch = state.notifyState.pendingDebounce;
+    if (!batch) {
+      throw new Error('Missing accepted batch');
+    }
+    // Legacy data can satisfy the envelope's structural schema while violating
+    // its semantic urgency-band invariant; tick checks both before any drain.
+    store.setMonitorState(monitor.id, workspace, {
+      ...state,
+      notifyState: {
+        ...state.notifyState,
+        pendingDebounce: {
+          ...batch,
+          observations: batch.observations.map((envelope) => ({
+            ...envelope,
+            monitor: {
+              ...envelope.monitor,
+              frontmatter: {
+                ...envelope.monitor.frontmatter,
+                urgency: 'high',
+                urgencyMax: 'low',
+              },
+            },
+          })),
+        },
+      },
+    });
+    await expectEphemeralBarrier(
+      fixture,
+      runtime,
+      'capture-invalid',
+      'captured semantics',
+    );
+    const held = store.getMonitorState(monitor.id, workspace).notifyState;
+    expect((await runtime.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect(store.getMonitorState(monitor.id, workspace).notifyState).toEqual(
+      held,
+    );
+  } finally {
+    db.$client.close();
+  }
+});
+
+it('recognizes that a valid pacing edit drains held work before a scheduling error', async () => {
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(now);
+  const workspace = path.join(process.env.HOME ?? '', 'workspace');
+  const dir = path.join(workspace, 'monitors');
+  const file = path.join(dir, 'held/MONITOR.md');
+  mkdirSync(path.dirname(file), { recursive: true });
+  const definition = `---
+name: Scheduled hold
+watch:
+  type: schedule
+  cron: '* * * * *'
+  timezone: UTC
+urgency: normal
+notify:
+  strategy: debounce
+  settle-for: 1h
+---
+Inspect.
+`;
+  writeFileSync(file, definition);
+  const db = createDb(':memory:');
+  const store = new RuntimeStore(db);
+  const registry = new SourceRegistry();
+  registry.register({
+    name: 'schedule',
+    scopeSchema: { type: 'object' },
+    async observe() {
+      return { observations: [{ title: 'Accepted change' }] };
+    },
+  });
+  const runtime = new AgentMonitorRuntime(store, registry, []);
+  try {
+    await runtime.tick(dir, workspace);
+    expect(
+      store.getMonitorState('held', workspace).notifyState.pendingDebounce
+        ?.observations,
+    ).toHaveLength(1);
+    writeFileSync(
+      file,
+      definition
+        .replace('timezone: UTC', 'timezone: Invalid/Zone')
+        .replace('notify:\n  strategy: debounce\n  settle-for: 1h\n', ''),
+    );
+    const input = {
+      monitorsDir: dir,
+      workspacePath: workspace,
+      monitorId: 'held',
+    };
+    const doctor = await runtime.doctorReport(input);
+    const explain = await runtime.explainMonitor(input);
+    const hold = doctor.heldNotifyWork?.[0];
+    expect(hold).toMatchObject({
+      observations: 1,
+      blockedByDefinition: false,
+      releaseBarrier: 'none',
+    });
+    expect(
+      explain.stages.find((stage) => stage.id === 'notify')?.details,
+    ).toEqual(hold);
+    // Notify reconciliation commits the old batch before schedule evaluation.
+    const tick = await runtime.tick(dir, workspace);
+    expect(tick.emittedEventIds).toHaveLength(1);
+    expect(tick.erroredObservations).toHaveLength(1);
+    expect((await runtime.doctorReport(input)).heldNotifyWork).toEqual([]);
+  } finally {
+    db.$client.close();
+    vi.useRealTimers();
   }
 });
