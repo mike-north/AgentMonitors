@@ -2763,6 +2763,11 @@ workspace/global declarations and owner status, source resolution, definition
 reconstruction and scope validation, older retained materialization work, captured
 envelope validation and effective policy comparison, then scheduling if no edit
 will drain the batch first. It does not perform any of those mutations.
+A live watcher can own a valid admitted definition outside the scanned tree.
+If the scan finds a second valid same-id file, both reports retain the accepted
+count and classify that ambiguity as `definition-rejected`; neither report aborts.
+The next tick still refuses the ambiguity and retains its held work. Other errors
+from reading the current definition propagate normally.
 Both report methods expose the first known prerequisite as `releaseBarrier`:
 
 | Value                 | Derivation and remedy                                                                                                                                                                              |

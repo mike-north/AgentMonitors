@@ -724,6 +724,9 @@ uses to release it. This read is independent of definition discovery: a missing,
 parse-failed, duplicated, unknown-source or scope-rejected definition still shows
 the held count and strategy beside its failure. A scheduling rejection also keeps
 the hold visible. The failure remains the verdict; the hold is `pending`.
+A same-id definition competing with a live watcher's admitted path also yields
+`releaseBarrier: "definition-rejected"` in both commands, preserving the held
+count and the rest of the report. Tick continues to refuse that ambiguity.
 For a rejected persistent definition, text explains `Fix the definition so the
 runtime can release this work under its notify policy.` An unresolved source
 instead asks to restore its registration. Repair permits release under 002 §4; it does not bypass pacing,
