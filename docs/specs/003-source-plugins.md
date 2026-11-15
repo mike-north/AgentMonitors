@@ -1630,10 +1630,19 @@ EOF alone never releases the bound. This also covers background descendants that
 inherited descriptor. Re-sessioned descendants remain restart-sweep work. Windows command admission is
 unsupported and refused before spawn; the retained Windows cleanup path is not an admission fallback.
 
-Restart cleanup preserves the group's independent bound whenever it abstains on a member.
-The durable sweep receipt records why the remaining group members, including the watchdog,
-were left alone. The watchdog then enforces its original deadline and grace; fully verified
-groups are still reaped through the unchanged per-process identity gates
+Restart cleanup preserves a group's independent bound when a member is uncertain and
+current evidence identifies a watchdog: the same life mark plus
+`AGENTMONITORS_COMMAND_ROLE=watchdog` in kernel envp, with confirmed process identity.
+Only the watchdog's startup environment receives this role. A role supplies no ownership
+or signal authority. If its mark becomes unreadable during the final check, the verified
+discovery evidence conservatively retains the possible bound and records the reason.
+Several watchdogs are all preserved on uncertainty. If the final snapshot proves every
+known watchdog absent or replaced, cleanup proceeds per process. An authored command may forge the role;
+that can cause withholding (a leak), never a wrong kill. Groups with no verified watchdog,
+including older no-role admissions and re-sessioned marked descendants, retain per-process
+cleanup: reap what can be verified and abstain individually on the rest. Fully verified
+groups are reaped through the unchanged per-process identity gates. The durable sweep
+receipt records each bound-preservation reason
 ([008 §4.2](./008-reliability-process-hygiene.md)).
 
 The source factory accepts an optional shutdown signal. Aborting it refuses pending/new

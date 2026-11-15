@@ -9,9 +9,18 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-14 — Identify restart bounds and bound reconciliation work (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Require verified watchdog role evidence before group-wide withholding. Preserve a possible
+bound if its previously verified watchdog becomes unreadable at the final gate; retain all
+watchdogs on uncertainty; retire the bound when fresh identities prove them absent or replaced. Legacy no-role groups and re-sessioned descendants without a
+watchdog keep per-process cleanup. Authored roles can only cause withholding. Carry terminal
+incarnations through late-fork membership checks while treating recycled identities as new.
+Serialize Linux terminal scans and batch synchronous abstention receipt writes.
+
 ## 2026-11-14 — Preserve group bounds when restart cleanup abstains (003 §11.2; 008 §3.3, §4.2) — Refs #627
 
-Withhold remaining cleanup signals for a recorded group when any member has unreadable
+Withhold remaining cleanup signals for a recorded group with a verified watchdog when any member has unreadable
 ownership, changed identity or unavailable readers. Record the group-bound preservation
 reason in the existing per-PID abstention receipt. Vetoes persist through the sweep's
 bounded discovery passes. Keep per-process signal authority and reap fully verified groups,

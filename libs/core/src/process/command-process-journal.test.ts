@@ -18,6 +18,7 @@ vi.mock('./command-process-marks.js', () => ({
   readBootIdentity: vi.fn(),
   readCommandMarks: vi.fn(),
   readCommandTerminal: vi.fn(),
+  readDarwinCommandTerminals: vi.fn(async () => new Map()),
 }));
 const directories: string[] = [];
 const journals: CommandProcessJournal[] = [];
@@ -125,6 +126,16 @@ for (const obstacle of [
         (obstacle === 'signal-unreadable' && markReads > 1);
       return {
         supported: true,
+        watchdogs: new Set(
+          [4243, 5001].filter(
+            (pid) =>
+              !(
+                obstacle === 'watchdog-mark' &&
+                markReads > 1 &&
+                pid === watchdog.pid
+              ),
+          ),
+        ),
         marks: new Map(
           pids
             .filter(
@@ -142,7 +153,11 @@ for (const obstacle of [
             )
             .map((pid) => [pid, f.token]),
         ),
-        ...(unreadable ? { unreadable: [command.pid] } : {}),
+        ...(unreadable
+          ? { unreadable: [command.pid] }
+          : obstacle === 'watchdog-mark' && markReads > 1
+            ? { unreadable: [watchdog.pid] }
+            : {}),
       };
     });
     const result = await f.journal.sweep();
@@ -208,6 +223,7 @@ it('keeps a group veto when later discovery first finds its watchdog', async () 
   }));
   vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
     supported: true,
+    watchdogs: new Set([4243]),
     marks: new Map(
       pids
         .filter((pid) => pid !== command.pid || kill.mock.calls.length > 0)
@@ -238,6 +254,7 @@ it('keeps a sole marked watchdog when the final table reveals another member', a
   }));
   vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
     supported: true,
+    watchdogs: new Set([4243]),
     marks: new Map(
       pids.filter((pid) => pid === watchdog.pid).map((pid) => [pid, f.token]),
     ),
@@ -269,6 +286,7 @@ it('keeps a sole marked watchdog when a reaped member PID is reused', async () =
   }));
   vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
     supported: true,
+    watchdogs: new Set([4243]),
     marks: new Map(
       pids.filter((pid) => pid === watchdog.pid).map((pid) => [pid, f.token]),
     ),
@@ -1719,3 +1737,359 @@ it('does not repeat discovery when every candidate lacks readable ownership', as
   expect(readCommandMarks).toHaveBeenCalledTimes(1);
   expect(result.outcomes).toHaveLength(pids.length);
 });
+
+// An old admission (or a re-sessioned marked descendant) has no watchdog in its group.
+it('reaps verified work in an uncertain group with no watchdog across restarts', async () => {
+  const f = await fixture();
+  const command = { pid: 4242, pgid: 4242, startTime: 'unbounded-command' };
+  const hidden = { pid: 4243, pgid: 4242, startTime: 'unreadable-child' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [command, hidden],
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === command.pid).map((pid) => [pid, f.token]),
+    ),
+    ...(pids.includes(hidden.pid) ? { unreadable: [hidden.pid] } : {}),
+  }));
+  const first = await f.journal.sweep();
+  const again = CommandProcessJournal.open(f.db, path.dirname(f.db));
+  journals.push(again);
+  const second = await again.sweep();
+  console.log(
+    'NO_WATCHDOG',
+    JSON.stringify({ calls: kill.mock.calls, first, second }),
+  );
+  expect(kill.mock.calls).toContainEqual([command.pid, 'SIGKILL']);
+});
+
+it('reaps late forks even while previously reaped identities remain visible', async () => {
+  const f = await fixture();
+  const original = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+  ];
+  const late = [
+    { pid: 4244, pgid: 4242, startTime: 'late-a' },
+    { pid: 4245, pgid: 4242, startTime: 'late-b' },
+  ];
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length < 2 ? original : [...original, ...late],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const result = await f.journal.sweep();
+  console.log(
+    'LATE_FORKS',
+    JSON.stringify({ calls: kill.mock.calls, outcomes: result.outcomes }),
+  );
+  expect(kill.mock.calls).toEqual(
+    expect.arrayContaining(
+      [...original, ...late].map((p) => [p.pid, 'SIGKILL']),
+    ),
+  );
+});
+
+it('reaps a late watchdog alongside forks despite known terminal rows', async () => {
+  const f = await fixture();
+  const original = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+  ];
+  const late = [
+    { pid: 4244, pgid: 4242, startTime: 'late-a' },
+    { pid: 4245, pgid: 4242, startTime: 'late-b' },
+  ];
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length < 2 ? original : [...original, ...late],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+    watchdogs: new Set([4243, 4245]),
+  }));
+  const result = await f.journal.sweep();
+  console.log(
+    'LATE_FORKS',
+    JSON.stringify({ calls: kill.mock.calls, outcomes: result.outcomes }),
+  );
+  expect(kill.mock.calls).toEqual(
+    expect.arrayContaining(
+      [...original, ...late].map((p) => [p.pid, 'SIGKILL']),
+    ),
+  );
+});
+
+it('bounds terminal scan descriptors during a many-candidate Linux sweep', async () => {
+  const f = await fixture();
+  const records = Array.from({ length: 64 }, (_, i) => ({
+    pid: 4242 + i,
+    pgid: 4242,
+    startTime: `member-${i}`,
+  }));
+  vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const actual =
+    await vi.importActual<typeof import('./process-table.js')>(
+      './process-table.js',
+    );
+  let active = 0,
+    peak = 0,
+    failures = 0;
+  vi.mocked(readCommandTerminal).mockImplementation(async () => {
+    const reading = await actual.readLinuxProcessTable({
+      readdir: async () => Array.from({ length: 64 }, (_, i) => String(i + 1)),
+      open: async () => {
+        if (active >= 256) {
+          failures++;
+          throw Object.assign(new Error('injected descriptor cap'), {
+            code: 'EMFILE',
+          });
+        }
+        active++;
+        peak = Math.max(peak, active);
+        return {
+          read: async (buffer, position) => {
+            await new Promise((resolve) => setImmediate(resolve));
+            if (position > 0) return 0;
+            const bytes = Buffer.from(
+              '1 (fixture) Z 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1\n',
+            );
+            buffer.set(bytes);
+            return bytes.length;
+          },
+          close: async () => {
+            active--;
+          },
+        };
+      },
+    });
+    return reading.supported ? 'terminated' : 'unavailable';
+  });
+  const result = await f.journal.sweep();
+  const failed = result.outcomes.filter((o) => o.status === 'failed').length;
+  console.log('TERMINAL_FDS', JSON.stringify({ peak, failures, failed }));
+  expect(failed).toBe(0);
+  expect(peak).toBeLessThanOrEqual(32);
+  expect(failures).toBe(0);
+});
+
+it('batches durable receipts for a large vetoed macOS group', async () => {
+  const f = await fixture();
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+  const records = Array.from({ length: 8000 }, (_, i) => ({
+    pid: 4242 + i,
+    pgid: 4242,
+    startTime: `member-${i}`,
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid !== 4242).map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4243]),
+    ...(pids.includes(4242) ? { unreadable: [4242] } : {}),
+  }));
+  const prepare = Database.prototype.prepare;
+  let saves = 0;
+  vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (sql) {
+    if (sql === 'UPDATE restart_sweeps SET result = ? WHERE id = ?') saves++;
+    return prepare.call(this, sql);
+  });
+  const start = performance.now();
+  const result = await f.journal.sweep();
+  const elapsed = performance.now() - start;
+  console.log('VETO_RECEIPTS', JSON.stringify({ saves, elapsed }));
+  expect(saves).toBeLessThan(20);
+  expect(kill).not.toHaveBeenCalled();
+  expect(
+    result.outcomes.filter((outcome) => outcome.status === 'abstained').length,
+  ).toBeGreaterThanOrEqual(8000);
+}, 30000);
+
+/** Roles may only retain a bound; every permitted signal still needs its own evidence. */
+it.each([0, 1, 2])(
+  'preserves only verified watchdog groups (%i watchdog roles)',
+  async (count) => {
+    const f = await fixture();
+    const records = [4242, 4243, 4244, 4245].map((pid) => ({
+      pid,
+      pgid: 4242,
+      startTime: `member-${pid}`,
+    }));
+    const watchdogs = new Set([4243, 4244].slice(0, count));
+    vi.mocked(readProcessTable).mockResolvedValue({
+      supported: true,
+      processes: records,
+    });
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+      supported: true,
+      marks: new Map(
+        pids.filter((pid) => pid !== 4245).map((pid) => [pid, f.token]),
+      ),
+      watchdogs,
+      unreadable: pids.includes(4245) ? [4245] : [],
+    }));
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const result = await f.journal.sweep();
+    if (count === 0) {
+      expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
+      expect(
+        result.outcomes.some((o) => o.reason?.includes('Preserved group')),
+      ).toBe(false);
+    } else {
+      expect(kill).not.toHaveBeenCalled();
+      for (const pid of watchdogs)
+        expect(result.outcomes).toContainEqual(
+          expect.objectContaining({
+            pid,
+            status: 'abstained',
+            reason: expect.stringMatching(/bound/),
+          }),
+        );
+    }
+  },
+);
+
+it('does not accept an unrelated life with a forged watchdog role as a bound', async () => {
+  const f = await fixture();
+  const records = [4242, 4243, 4244].map((pid) => ({
+    pid,
+    pgid: 4242,
+    startTime: String(pid),
+  }));
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => pid !== 4244)
+        .map((pid) => [pid, pid === 4243 ? 'another-life' : f.token]),
+    ),
+    watchdogs: new Set([4243]),
+    unreadable: pids.includes(4244) ? [4244] : [],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  await f.journal.sweep();
+  expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
+});
+
+it('cleans a re-sessioned marked descendant without borrowing its former watchdog', async () => {
+  const f = await fixture();
+  const records = [
+    { pid: 4242, pgid: 4242, startTime: 'watchdog' },
+    { pid: 5000, pgid: 5000, startTime: 'escape' },
+    { pid: 5001, pgid: 5000, startTime: 'hidden' },
+  ];
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid !== 5001).map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4242]),
+    unreadable: pids.includes(5001) ? [5001] : [],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  await f.journal.sweep();
+  expect(kill).toHaveBeenCalledWith(5000, 'SIGKILL');
+});
+
+it('an authored watchdog role only withholds signals when a companion is unreadable', async () => {
+  const f = await fixture();
+  const authored = { pid: 4242, pgid: 4242, startTime: 'authored-role' };
+  const hidden = { pid: 4243, pgid: 4242, startTime: 'unreadable' };
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [authored, hidden],
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === authored.pid).map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([authored.pid]),
+    unreadable: pids.includes(hidden.pid) ? [hidden.pid] : [],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const result = await f.journal.sweep();
+  expect(kill).not.toHaveBeenCalled();
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: authored.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/bound.*unreadable/),
+    }),
+  );
+});
+
+/** A role from an earlier snapshot cannot preserve a bound proven to have ended. */
+it.each(['gone', 'recycled'] as const)(
+  'reaps verified companions when the only watchdog is %s at the final gate',
+  async (state) => {
+    const f = await fixture();
+    const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+    const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+    const hidden = { pid: 4244, pgid: 4242, startTime: 'hidden' };
+    let finalMarks = false;
+    vi.mocked(readProcessTable).mockImplementation(async () => ({
+      supported: true,
+      processes: [
+        command,
+        hidden,
+        ...(!finalMarks
+          ? [watchdog]
+          : state === 'recycled'
+            ? [{ ...watchdog, startTime: 'replacement' }]
+            : []),
+      ],
+    }));
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => {
+      if (pids.length === 1) finalMarks = true;
+      return {
+        supported: true,
+        marks: new Map(
+          pids.filter((pid) => pid !== hidden.pid).map((pid) => [pid, f.token]),
+        ),
+        watchdogs: new Set([watchdog.pid]),
+        unreadable: pids.includes(hidden.pid) ? [hidden.pid] : [],
+      };
+    });
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const result = await f.journal.sweep();
+    expect(kill).toHaveBeenCalledWith(command.pid, 'SIGKILL');
+    expect(kill).not.toHaveBeenCalledWith(watchdog.pid, 'SIGKILL');
+    expect(
+      result.outcomes.some((outcome) =>
+        outcome.reason?.includes('Preserved group'),
+      ),
+    ).toBe(false);
+  },
+);
