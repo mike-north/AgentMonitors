@@ -352,8 +352,12 @@ A terminal watchdog no longer supplies a bound. Fully verified groups, including
 remain eligible. Every target retains its own boot, required mark and start-time checks,
 and all restart signals remain positive per-PID SIGKILL, never a stored or negative PGID.
 
-All synchronous preservation abstentions are committed together before further asynchronous
-work. Linux post-signal terminal queries are serialized after the signal batch, retaining the
+All preservation abstentions from a signal batch are committed together after its per-PID
+signal gates settle and before any terminal query or later asynchronous evidence query.
+The gates use only the already-read final snapshot; their resolved-Promise handoff issues
+no additional evidence query or journal operation. Journal I/O MUST NOT block between that final identity snapshot
+and the signal batch: a FULL-sync save can age the identity evidence while the kernel
+recycles a PID. Linux post-signal terminal queries remain serialized, retaining the
 process-table reader's 32-descriptor bound independently of survivor count. macOS retains
 shared bounded terminal evidence queries.
 

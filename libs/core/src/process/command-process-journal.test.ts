@@ -2178,3 +2178,49 @@ it('commits invalid PID diagnostics before awaiting anchor confirmation', async 
   await f.journal.sweep();
   expect(reads).toBeGreaterThanOrEqual(2);
 });
+
+/** Blocking receipt I/O must not open an extra PID-reuse window in the final signal batch. */
+it('keeps receipt I/O out of the final identity-to-signal interval', async () => {
+  const f = await fixture();
+  const records = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+    { pid: 5000, pgid: 5000, startTime: 'independent' },
+  ];
+  let tables = 0;
+  let signalled = false;
+  let reusedBeforeSignal = false;
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    tables++;
+    return { supported: true, processes: records };
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => !(pids.length === 1 && pid === 4242))
+        .map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4243]),
+  }));
+  const prepare = Database.prototype.prepare;
+  vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (sql) {
+    // A synchronous disk stall can let the kernel recycle an independent PID.
+    // Model that external event at the newly introduced receipt-write boundary.
+    if (
+      sql === 'UPDATE restart_sweeps SET result = ? WHERE id = ?' &&
+      tables >= 3 &&
+      !signalled
+    ) {
+      reusedBeforeSignal = true;
+    }
+    return prepare.call(this, sql);
+  });
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+    signalled = true;
+    return true;
+  });
+  await f.journal.sweep();
+  expect(kill).toHaveBeenCalledExactlyOnceWith(5000, 'SIGKILL');
+  expect(reusedBeforeSignal).toBe(false);
+});

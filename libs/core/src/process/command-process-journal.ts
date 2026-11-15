@@ -979,8 +979,9 @@ interface SweepSignalDecision {
  * await, or subsequent discovery can age the snapshot between these signals.
  * Each eligible PID still passes sendVerifiedSignal individually; no stored PGID is sent.
  * Linux shares this batch when several marked candidates could include a watchdog.
- * The synchronous commit sink records preservation before signal-gate awaits and
- * remaining non-signal decisions before any unrelated terminal evidence query.
+ * The synchronous commit sink records non-signal decisions after the in-memory
+ * gate batch settles, before any unrelated terminal evidence query. Journal I/O
+ * must not block between the final identity snapshot and these signals.
  */
 async function signalCandidateBatch(
   candidates: readonly {
@@ -1054,8 +1055,8 @@ async function signalCandidateBatch(
       }
     }
   }
-  // Preservation is already decided from the final snapshot. Commit it as
-  // one receipt before even awaiting the independently verified signal gates.
+  // Collect preservation decisions without I/O. Every signal must use the
+  // final identity snapshot before a FULL-sync receipt save can block and age it.
   const preserved = new Map<number, SweepSignalDecision>();
   for (const { record } of candidates) {
     if (boundedGroups.has(record.pgid) && groupVetoes.has(record.pgid)) {
@@ -1073,7 +1074,6 @@ async function signalCandidateBatch(
       });
     }
   }
-  commitDecisions(preserved);
   const results = await Promise.all(
     candidates.map(async ({ record, inherited }) => ({
       record,

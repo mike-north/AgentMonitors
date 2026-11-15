@@ -9,3 +9,5 @@ Identify watchdog roles in command ownership evidence. Preserve a command group'
 Keep per-process cleanup for groups without verified watchdogs, reconcile late forks beside terminal identities, and bound restart terminal scans and durable receipt writes.
 
 Commit preservation decisions before awaiting unrelated terminal evidence, keeping receipt writes bounded. Persist invalid stored PID diagnostics before further identity queries.
+
+Keep blocking receipt writes after every signal has used the final identity snapshot, before terminal queries begin.
