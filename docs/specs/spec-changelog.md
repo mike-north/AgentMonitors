@@ -18,6 +18,85 @@ from the detectable hidden-state list: JavaScript brand-error construction can
 itself invoke inherited hooks. Preserve native/private-brand refusal checks,
 first-invalid-member order, depth bounds and canonical bytes.
 
+## 2026-11-14 — Claims consume only represented net groups (002 §9) — Refs #571
+
+Rendering and claim persistence use the same selected net groups for every lifecycle.
+Defer newer normal endpoints sharing a net group with rendered settled high work, so an interrupt showing
+the high version cannot advance its cursor to an unseen normal endpoint. An unsettled high
+version cannot authorize consuming an intervening normal version. Older normal intermediates
+may fold into a rendered high endpoint in durable event order. Independent monitor
+reminders still coalesce, even when their object keys match. Recap claims and suppresses only
+groups represented within its ten-endpoint cap. Unrepresented rows remain unread and pending
+across restart; a claim never acknowledges. This corrects the previous mixed-band collapse
+and full-unread recap mutation. Runtime regressions verify durable projection state, cursors
+and subsequent delivery through direct claims and reserve/commit across all three lifecycles.
+
+## 2026-11-14 — Resolve held definitions beyond the scanned tree (002 §10.7; 005 §6, §15) — Refs #574
+
+Both held-work reports share tick's read-only captured/admitted-path resolution.
+An absent scan entry alone no longer implies definition repair when a valid live
+watcher can still release the batch. Source and scope validation use the resolved
+definition; competing valid paths remain definition barriers. Admission, retention,
+release policy and the public barrier kinds are unchanged.
+
+## 2026-11-14 — Commit preservation before terminal queries without aging signal evidence (008 §4.2) — Refs #627
+
+Commit the completed signal batch's preservation abstentions before terminal queries.
+The gates' resolved-Promise handoff issues no additional evidence query or journal operation. Keep FULL-sync
+journal writes after every signal has used the final identity snapshot, so persistence
+cannot introduce a blocking interval before delivery. Persist invalid PID diagnostics
+before anchor confirmation. The per-PID authorization checks and selected targets are unchanged.
+
+## 2026-11-14 — Identify restart bounds and bound reconciliation work (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Require verified watchdog role evidence before group-wide withholding. Preserve a possible
+bound if its previously verified watchdog becomes unreadable at the final gate; retain all
+watchdogs on uncertainty; retire the bound when fresh identities prove them absent or replaced. Legacy no-role groups and re-sessioned descendants without a
+watchdog keep per-process cleanup. Authored roles can only cause withholding. Carry terminal
+incarnations through late-fork membership checks while treating recycled identities as new.
+Serialize Linux terminal scans and batch synchronous abstention receipt writes.
+
+## 2026-11-14 — Preserve group bounds when restart cleanup abstains (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Withhold remaining cleanup signals for a recorded group with a verified watchdog when any member has unreadable
+ownership, changed identity or unavailable readers. Record the group-bound preservation
+reason in the existing per-PID abstention receipt. Vetoes persist through the sweep's
+bounded discovery passes. Keep per-process signal authority and reap fully verified groups,
+including their watchdogs. Native macOS stock-shell restart/deadline coverage and portable
+injected Linux-reader regressions verify that a readable watchdog cannot lose its bound
+because another member is unverified.
+
+## 2026-11-14 — Preserve held-work reports across admitted-path ambiguity (002 §10.7; 005 §6, §15) — Refs #574
+
+A valid same-id file competing with a live watcher's admitted definition is a
+`definition-rejected` release barrier in doctor and explain, preserving held
+counts and the rest of both reports. Only that ambiguity is classified; unrelated
+read failures propagate. Tick's refusal and retention behavior are unchanged.
+The recent-declaration regression now asserts independently stale owner activity
+before checking both reports and a real release tick.
+
+## 2026-11-14 — Classify held-work release prerequisites in tick order (002 §10.7; 005 §6, §15) — Refs #574
+
+Add public `HeldNotifyBarrier` and `HeldNotifyWork.releaseBarrier`, preserving
+`blockedByDefinition` as a persistent-definition diagnostic. Both commands share
+read-only tick predicates for dormancy (including recent declarations), active
+owners/declarations, source availability, definition validation, retries and
+captured envelopes. Notify reconciliation and diagnosis share a read-only edit
+plan, so an effective pacing change that drains before scheduling remains eligible. Stale or durably dormant owners no longer receive flush
+promises or file-repair advice; unavailable sources ask for registration
+restoration. Retention, dormancy and release policy remain unchanged. Core stays
+minor for the additive public API; CLI stays patch.
+
+## 2026-11-14 — Preserve held-work diagnosis across incomplete capture and declaration retirement (002 §10.7; 005 §6, §15) — Refs #574
+
+Incomplete captured rollup metadata yields unknown timing without hiding accepted
+counts or aborting explain/doctor. Global ephemeral declarations share tick's
+active workspace eligibility. Retired declarations retain visible batches with
+lifecycle guidance: no future tick releases them and no definition file can be
+edited. `blockedByDefinition` remains about definition repair, so is false for
+retirement. Release and retention policy are unchanged. The additive public
+`HeldNotifyWork` and doctor field ship in a core minor Changeset; CLI stays patch.
+
 ## 2026-11-14 — Visible ingress cleanup failure causes (004 §3.4.2) — Refs #619
 
 Require cleanup to render the original scenario's cause chain and stacks in normal
@@ -31,6 +110,15 @@ Require diagnostic drains after the final tick, after watch consumption and at
 cleanup, including child stop. A caught late audit write must fail with its SQL;
 cleanup must retain an existing scenario failure alongside classification errors.
 Validation coverage only; runtime behavior and public contracts are unchanged.
+
+## 2026-11-14 — Diagnose held notify work despite rejected definitions (005 §6, §15; 002 §10.7) — Refs #574
+
+Explain keeps debounce and rollup counts, stored pacing and definition-repair
+guidance beside definition failures. Doctor reports the same batches independently
+of parsed monitor rollups, including missing, parse-failed and duplicated ids.
+Both read the runtime's existing scoped hold queries. A quiet latest tick cannot
+make downstream stages healthy while earlier accepted work is still held and no
+event has materialized. Notify release timing and health exit codes are unchanged.
 
 ## 2026-11-14 — Ship native command admission inside published packages (003 §11; 008 §3.3) — Refs #470
 

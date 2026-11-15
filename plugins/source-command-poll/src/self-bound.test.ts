@@ -148,9 +148,16 @@ describe.skipIf(process.platform === 'win32')(
           delete startup.__CF_USER_TEXT_ENCODING;
         // Reject unexpected keys before comparing values, so a regression never
         // prints unrelated inherited environment contents into a test receipt.
-        expect(Object.keys(startup)).toEqual(['AGENTMONITORS_COMMAND_LIFE']);
+        expect(Object.keys(startup)).toEqual(
+          helper === 'watchdog'
+            ? ['AGENTMONITORS_COMMAND_LIFE', 'AGENTMONITORS_COMMAND_ROLE']
+            : ['AGENTMONITORS_COMMAND_LIFE'],
+        );
         expect(startup).toEqual({
           AGENTMONITORS_COMMAND_LIFE: 'environment-test',
+          ...(helper === 'watchdog'
+            ? { AGENTMONITORS_COMMAND_ROLE: 'watchdog' }
+            : {}),
         });
       }
     });

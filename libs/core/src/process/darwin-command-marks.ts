@@ -2,7 +2,7 @@
  * macOS envp-only ownership reader. A sweep owns one asynchronous stock JXA
  * helper, reused for discovery batches and fresh signal-time checks. Kernel
  * argument buffers stay inside the helper; its protocol returns only the reserved
- * ownership value or explicit uncertainty. No shell, PATH lookup, or native addon
+ * ownership value, optional watchdog role or explicit uncertainty. No shell, PATH lookup, or native addon
  * participates. Foundation owns the native buffers passed to the sysctl bridge.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -17,9 +17,15 @@ import { DARWIN_PROCARGS_PARSER } from './darwin-procargs.js';
 import type { CommandMarks } from './command-process-marks.js';
 import { sendVerifiedSignal } from './process-identity.js';
 
-/** Each requested PID needs exactly one answer; null means readable and unmarked. */
+/** Each requested PID needs exactly one answer; null means readable and unmarked.
+ * An absent role flag means ordinary work, never a bound to preserve. */
 const responseSchema = z.array(
-  z.tuple([z.number().int().positive(), z.string().nullable(), z.boolean()]),
+  z.tuple([
+    z.number().int().positive(),
+    z.string().nullable(),
+    z.boolean(),
+    z.boolean().optional(),
+  ]),
 );
 /** Scope helper ownership to the caller rather than a global long-lived child. */
 const readers = new AsyncLocalStorage<DarwinCommandMarkReader>();
@@ -90,7 +96,13 @@ while (true) {
     var pids = JSON.parse(pending.slice(0, newline));
     pending = pending.slice(newline + 1);
     var result = pids.map(function(pid) {
-      try { return [pid, parseDarwinProcargs(query(pid)), false]; }
+      try {
+        var data = query(pid);
+        var role = parseDarwinProcargs(data, 'AGENTMONITORS_COMMAND_ROLE');
+        var result = [pid, parseDarwinProcargs(data), false];
+        if (role === 'watchdog') result.push(true);
+        return result;
+      }
       catch (_) { return [pid, null, true]; }
     });
     stdout.writeData($.NSString.alloc.initWithString(JSON.stringify(result) + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
@@ -154,6 +166,7 @@ class DarwinCommandMarkReader {
     // launched by a marked command from an earlier life.
     const env = { ...process.env };
     delete env['AGENTMONITORS_COMMAND_LIFE'];
+    delete env['AGENTMONITORS_COMMAND_ROLE'];
     let child: ChildProcessByStdio<Writable, Readable, null>;
     try {
       // Keep the fixed script in argv so startup needs no temporary executable
@@ -232,13 +245,18 @@ class DarwinCommandMarkReader {
         throw new Error('Incomplete ownership response');
       const marks = new Map<number, string>();
       const unreadable: number[] = [];
-      for (const [pid, mark, uncertain] of rows) {
+      const watchdogs = new Set<number>();
+      for (const [pid, mark, uncertain, watchdog] of rows) {
         if (uncertain) unreadable.push(pid);
-        else if (mark !== null) marks.set(pid, mark);
+        else if (mark !== null) {
+          marks.set(pid, mark);
+          if (watchdog) watchdogs.add(pid);
+        }
       }
       return {
         supported: true,
         marks,
+        watchdogs,
         unreadable,
         unreadableReason:
           'macOS kernel process environment is unreadable or its argv/envp layout is ambiguous; ownership is unproven',

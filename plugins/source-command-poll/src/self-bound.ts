@@ -90,7 +90,10 @@ function parentWatchdog() {
     process.send(message, error => process.exit(error ? 1 : code));
   }
   const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
-    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
+    // The role identifies a bound, never ownership. Authored code can forge this
+    // role and cause withholding (a leak), but cannot gain signal authority.
+    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'],
+    env: {...process.env, AGENTMONITORS_COMMAND_ROLE: 'watchdog'},
   });
   child.once('error', error => finish({kind: 'error', error: String(error.message || error)}, 1));
   child.once('exit', () => finish({kind: 'error', error: 'Watchdog exited before arming'}, 1));

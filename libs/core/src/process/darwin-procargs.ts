@@ -5,7 +5,10 @@
  */
 /** Exact parser source for the isolated native helper and portable fixtures. @internal */
 export const DARWIN_PROCARGS_PARSER = String.raw`
-function parseDarwinProcargs(data) {
+// Only callers selecting reserved ownership keys receive values; envp boundary
+// validation is identical for life and role and never searches argv for either.
+function parseDarwinProcargs(data, key) {
+  key = key || 'AGENTMONITORS_COMMAND_LIFE';
   function terminated(cursor) {
     var end = data.indexOf('\0', cursor);
     if (end < 0) throw new Error('Truncated kernel arguments');
@@ -49,7 +52,7 @@ function parseDarwinProcargs(data) {
     }
     if (entry.indexOf('=') <= 0) throw new Error('Invalid environment entry');
     entries++;
-    var prefix = 'AGENTMONITORS_COMMAND_LIFE=';
+    var prefix = key + '=';
     if (entry.indexOf(prefix) === 0) {
       if (found !== null) throw new Error('Duplicate ownership mark');
       // Kernel strings are bytes. Decode only the reserved value, strictly;
