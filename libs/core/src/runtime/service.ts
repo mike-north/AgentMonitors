@@ -1963,16 +1963,13 @@ export class AgentMonitorRuntime {
       const persistent = scan.monitors.find(
         ({ monitor }) => monitor.id === monitorId,
       )?.monitor;
-      if (!persistent) {
-        return 'definition-rejected';
-      }
       let current: ParseOutcome | undefined;
       try {
-        current = this.readCurrentNotifyDefinition(
+        ({ current } = this.readHeldNotifyDefinition(
           monitorId,
           workspacePath,
-          persistent.filePath,
-        );
+          persistent?.filePath,
+        ));
       } catch (error) {
         // A competing admitted path is a definition barrier, not a failed
         // diagnostic. Tick still throws it; unrelated failures must propagate.
@@ -2052,7 +2049,8 @@ export class AgentMonitorRuntime {
       (candidate) => candidate.id === input.monitorId,
     );
 
-    // Definition rejection pauses release; accepted work remains diagnosable.
+    // Discovery failures do not determine eligibility: held work has its own
+    // captured/admitted definition authority and remains diagnosable.
     // Read through the same scoped state query used by notify reconciliation.
     const runtimeState = this.store.getMonitorState(
       input.monitorId,
@@ -3944,6 +3942,35 @@ export class AgentMonitorRuntime {
     return undefined;
   }
 
+  /**
+   * Resolve the definition governing accepted work, independently of scan
+   * membership. Discovery supplies a candidate when present; otherwise the
+   * first held envelope supplies its captured route. Both defer to the live
+   * owner's current admitted path under the same relocation/ambiguity rules.
+   * This read cannot open or close admission or record a diagnostic; callers
+   * decide how to handle rejection after resolving the same authority.
+   */
+  private readHeldNotifyDefinition(
+    id: string,
+    workspacePath: string,
+    candidatePath?: string,
+  ): {
+    captured: ReturnType<typeof capturedNotifyRoute>;
+    current: ParseOutcome | undefined;
+  } {
+    const held = this.store.getMonitorState(id, workspacePath).notifyState;
+    const captured = capturedNotifyRoute(
+      held.pendingDebounce?.observations.at(0) ??
+        held.pendingRollup?.observations.at(0),
+    );
+    const current = this.readCurrentNotifyDefinition(
+      id,
+      workspacePath,
+      candidatePath ?? captured.filePath,
+    );
+    return { captured, current };
+  }
+
   /** Diagnose operational holds whose authored definition cannot be admitted. */
   private reportMissingHeldDefinitions(
     result: Awaited<ReturnType<typeof scanMonitors>>,
@@ -3962,17 +3989,11 @@ export class AgentMonitorRuntime {
       if (knownIds.has(id) || id.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
         continue;
       }
-      const held = this.store.getMonitorState(id, workspacePath).notifyState;
-      const captured = capturedNotifyRoute(
-        held.pendingDebounce?.observations.at(0) ??
-          held.pendingRollup?.observations.at(0),
-      );
       // The scan itself can finish out of order with a newer discovery. A stale
       // missing/invalid result must not close that newer definition's live gate.
-      const current = this.readCurrentNotifyDefinition(
+      const { captured, current } = this.readHeldNotifyDefinition(
         id,
         workspacePath,
-        captured.filePath,
       );
       let reason = current?.ok ? undefined : current?.error;
       if (current?.ok) {

@@ -223,6 +223,136 @@ Inspect.
   });
 }
 
+/** Scan absence cannot revoke a live watcher's valid admitted definition. */
+for (const method of ['doctorReport', 'explainMonitor'] as const) {
+  it(`resolves ${method} outside the scanned tree before the watcher releases without repair`, async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(now);
+    const workspace = path.join(process.env.HOME ?? '', 'unscanned');
+    const admittedDir = path.join(workspace, 'admitted');
+    const emptyDir = path.join(workspace, 'empty');
+    mkdirSync(path.join(admittedDir, 'held'), { recursive: true });
+    mkdirSync(emptyDir, { recursive: true });
+    writeFileSync(
+      path.join(admittedDir, 'held/MONITOR.md'),
+      `---
+name: Held
+watch:
+  type: test-held
+urgency: normal
+notify:
+  strategy: debounce
+  settle-for: 1s
+---
+Inspect.
+`,
+    );
+    // A controlled empty yield lets the real watcher flush its accepted hold
+    // only after both diagnosis and the empty-tree tick have completed.
+    const { promise: nextBatch, resolve: continueWatch } =
+      Promise.withResolvers<undefined>();
+    const db = createDb(':memory:');
+    const store = new RuntimeStore(db);
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'test-held',
+      scopeSchema: { type: 'object' },
+      async observe() {
+        return { observations: [] };
+      },
+      async *watch(_config, { signal }) {
+        const aborted = new Promise<void>((resolve) =>
+          signal.addEventListener('abort', () => resolve(), { once: true }),
+        );
+        yield { observations: [{ title: 'Accepted' }] };
+        await Promise.race([nextBatch, aborted]);
+        if (!signal.aborted) {
+          yield { observations: [] };
+        }
+        if (!signal.aborted) {
+          await aborted;
+        }
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry, []);
+    const errors: Error[] = [];
+    const handle = await runtime.watchMonitors(admittedDir, workspace, {
+      onError: (_id, error) => errors.push(error),
+    });
+    try {
+      for (let i = 0; i < 1000; i++) {
+        if (
+          store.getMonitorState('held', workspace).notifyState.pendingDebounce
+        ) {
+          break;
+        }
+        await setImmediate();
+      }
+      const accepted = store.getMonitorState('held', workspace);
+      expect(accepted.notifyState.pendingDebounce?.observations).toHaveLength(
+        1,
+      );
+      vi.setSystemTime(new Date(now.getTime() + 1100));
+      expect(
+        Date.parse(accepted.notifyState.pendingDebounce?.dueAt ?? ''),
+      ).toBeLessThan(Date.now());
+      for (const dir of [admittedDir, emptyDir]) {
+        const before = db.$client.serialize();
+        const report = await runtime[method]({
+          monitorsDir: dir,
+          workspacePath: workspace,
+          monitorId: 'held',
+        });
+        const hold =
+          'stages' in report
+            ? report.stages.find((stage) => stage.id === 'notify')?.details
+            : report.heldNotifyWork?.[0];
+        expect(hold).toMatchObject({
+          monitorId: 'held',
+          observations: 1,
+          strategy: 'debounce',
+          releaseBarrier: 'none',
+          blockedByDefinition: false,
+        });
+        expect(hold).toHaveProperty(
+          'reason',
+          expect.not.stringContaining('Fix the definition'),
+        );
+        expect(db.$client.serialize()).toEqual(before);
+      }
+      // No file, source, policy or owner changes separate diagnosis from tick.
+      const tick = await runtime.tick(emptyDir, workspace);
+      expect(tick.erroredObservations).toEqual([]);
+      expect(tick.emittedEventIds).toEqual([]);
+      expect(store.getMonitorState('held', workspace)).toEqual(accepted);
+      continueWatch(undefined);
+      for (let i = 0; i < 1000; i++) {
+        if (
+          !store.getMonitorState('held', workspace).notifyState.pendingDebounce
+        ) {
+          break;
+        }
+        await setImmediate();
+      }
+      expect(
+        store.getMonitorState('held', workspace).notifyState.pendingDebounce,
+      ).toBeUndefined();
+      const events = store.listEvents({
+        monitorId: 'held',
+        workspacePath: workspace,
+      });
+      expect(events).toHaveLength(1);
+      expect(events[0]?.title).toBe('Held');
+      expect(errors).toEqual([]);
+    } finally {
+      continueWatch(undefined);
+      await handle.stop();
+      db.$client.close();
+      vi.useRealTimers();
+    }
+  });
+}
+
 it('ignores empty batches and throttle suppression because neither contains accepted work', () => {
   expect(
     describeHeldNotifyWork(
