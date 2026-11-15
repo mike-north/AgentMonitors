@@ -487,6 +487,23 @@ export interface GroupMembershipTracking {
 }
 
 // @public
+export type HeldNotifyBarrier = 'none' | 'definition-rejected' | 'source-unavailable' | 'owner-inactive' | 'declaration-retired' | 'workspace-mismatch' | 'declaration-invalid' | 'retained-work' | 'capture-invalid';
+
+// @public
+export interface HeldNotifyWork {
+    blockedByDefinition: boolean;
+    dueAt?: string;
+    monitorId: string;
+    observations: number;
+    overdue?: boolean;
+    reason: string;
+    releaseBarrier: HeldNotifyBarrier;
+    strategy: 'debounce' | 'rollup';
+    timezone?: string;
+    window?: string;
+}
+
+// @public
 export interface HookDeliveryDiagnosis {
     // (undocumented)
     holds: HookDeliveryHold[];
@@ -841,6 +858,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
+    heldNotifyWork?: HeldNotifyWork[];
     invalidCount: number;
     leadSessions: AgentSessionRecord[];
     monitors: DoctorMonitorRollup[];

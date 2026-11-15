@@ -2697,7 +2697,8 @@ monitor through the persisted pipeline state and returns stages for:
 1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
 3. Observation: recent `observation_history` rows and latest outcome
-4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
+4. Notify state: accepted debounce/rollup batches and active throttle suppression in
+   `monitor_state.notify_state`, including accepted batches beside definition failures
 5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
    `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
@@ -2710,13 +2711,15 @@ monitor through the persisted pipeline state and returns stages for:
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
 - `ok` — the stage produced the signal the next stage needs.
-- `pending` — the stage is intentionally holding (debounce/throttle) or has not run because an
+- `pending` — the stage is intentionally holding (debounce/rollup/throttle) or has not run because an
   upstream stage has not produced its input.
 - `healthy` — the stage ran successfully and the correct outcome was "no work to do": the watched
   target genuinely did not change. A `no-change` or `rebaselined` observation outcome is `healthy`,
-  **not** a `failure` — an idle monitor is not a bug. When the latest observation is `healthy`, the
-  downstream materialization and delivery stages report `healthy` rather than `failure` for the
-  expected absence of events/projections. The verdict for a genuinely idle monitor is therefore an
+  **not** a `failure` — an idle monitor is not a bug. When the latest observation is `healthy` and
+  no accepted notify batch remains, downstream materialization and delivery report `healthy`
+  rather than `failure` for the expected absence of events/projections. Accepted debounce/rollup
+  work from earlier ticks keeps those stages `pending` while no event has materialized; a quiet
+  latest tick cannot erase that work (005 §6, #574). The verdict for a genuinely idle monitor is therefore an
   affirmative `healthy` at the observation stage (e.g. "Source ran, observed 0 changes — your watched
   target genuinely hasn't changed (not a bug).").
 - `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, an outstanding dropped observation, terminal retained work, or a missing expected projection.
@@ -2749,6 +2752,52 @@ events for other keys leave it failing. The observation stage still describes th
 row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
 real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
 (Refs #497, #575).
+
+Held-notify diagnosis reads accepted batches independently of definition health.
+Incomplete captured rollup metadata (including missing/null `monitor` or
+`frontmatter`) leaves `window` and `timezone` as `unknown`; the batch count and
+rest of the report remain available without repairing the stored envelope.
+Release diagnosis follows tick's read-only predicates in order: duplicate discovery,
+then `staleActiveSessions` (including the recent-declaration exemption), active
+workspace/global declarations and owner status, source resolution, definition
+reconstruction and scope validation, older retained materialization work, captured
+envelope validation and effective policy comparison, then scheduling if no edit
+will drain the batch first. It does not perform any of those mutations.
+A live watcher can own a valid admitted definition outside the scanned tree.
+Scan absence alone is not a release barrier: both reports share tick's read-only
+resolution of the scanned candidate or first held envelope's captured path,
+then the live owner's admitted path. Source and scope checks use that resolved
+definition. An empty-tree tick can leave watcher admission open; the watcher
+can release due work without a definition repair. Definition discovery stages
+still describe the requested tree independently of that hold's eligibility.
+If the scan finds a second valid same-id file, both reports retain the accepted
+count and classify that ambiguity as `definition-rejected`; neither report aborts.
+The next tick still refuses the ambiguity and retains its held work. Other errors
+from reading the current definition propagate normally.
+Both report methods expose the first known prerequisite as `releaseBarrier`:
+
+| Value                 | Derivation and remedy                                                                                                                                                                              |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                  |
+| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                  |
+| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                        |
+| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit. |
+| `declaration-retired` | The ephemeral record is absent or reaped; no future tick releases this work and there is no file to edit.                                                                                          |
+| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                            |
+| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                         |
+| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                            |
+| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.               |
+
+`blockedByDefinition` retains its persistent-definition meaning, including an
+unresolved source in a persistent definition. It is false for ephemeral source,
+owner and retirement barriers and for retained-work/capture barriers; it does not
+assert eligibility. `none` is a snapshot, not a promise that the next tick emits:
+concurrent edits, cadence, watcher ownership, in-flight admission, transactional
+failures and deliberate artifact filtering still apply. Diagnosis changes neither
+release timing nor retention policy. `held-notify-report.test.ts` exercises both
+surfaces, read-only persistence, stale-owner and recent-declaration clocks,
+interrupted-close database reopen, source restoration, and real release/retention
+outcomes (Refs #574).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the

@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-14 — Resolve held definitions beyond the scanned tree (002 §10.7; 005 §6, §15) — Refs #574
+
+Both held-work reports share tick's read-only captured/admitted-path resolution.
+An absent scan entry alone no longer implies definition repair when a valid live
+watcher can still release the batch. Source and scope validation use the resolved
+definition; competing valid paths remain definition barriers. Admission, retention,
+release policy and the public barrier kinds are unchanged.
+
 ## 2026-11-14 — Commit preservation before terminal queries without aging signal evidence (008 §4.2) — Refs #627
 
 Commit the completed signal batch's preservation abstentions before terminal queries.
@@ -36,6 +44,37 @@ including their watchdogs. Native macOS stock-shell restart/deadline coverage an
 injected Linux-reader regressions verify that a readable watchdog cannot lose its bound
 because another member is unverified.
 
+## 2026-11-14 — Preserve held-work reports across admitted-path ambiguity (002 §10.7; 005 §6, §15) — Refs #574
+
+A valid same-id file competing with a live watcher's admitted definition is a
+`definition-rejected` release barrier in doctor and explain, preserving held
+counts and the rest of both reports. Only that ambiguity is classified; unrelated
+read failures propagate. Tick's refusal and retention behavior are unchanged.
+The recent-declaration regression now asserts independently stale owner activity
+before checking both reports and a real release tick.
+
+## 2026-11-14 — Classify held-work release prerequisites in tick order (002 §10.7; 005 §6, §15) — Refs #574
+
+Add public `HeldNotifyBarrier` and `HeldNotifyWork.releaseBarrier`, preserving
+`blockedByDefinition` as a persistent-definition diagnostic. Both commands share
+read-only tick predicates for dormancy (including recent declarations), active
+owners/declarations, source availability, definition validation, retries and
+captured envelopes. Notify reconciliation and diagnosis share a read-only edit
+plan, so an effective pacing change that drains before scheduling remains eligible. Stale or durably dormant owners no longer receive flush
+promises or file-repair advice; unavailable sources ask for registration
+restoration. Retention, dormancy and release policy remain unchanged. Core stays
+minor for the additive public API; CLI stays patch.
+
+## 2026-11-14 — Preserve held-work diagnosis across incomplete capture and declaration retirement (002 §10.7; 005 §6, §15) — Refs #574
+
+Incomplete captured rollup metadata yields unknown timing without hiding accepted
+counts or aborting explain/doctor. Global ephemeral declarations share tick's
+active workspace eligibility. Retired declarations retain visible batches with
+lifecycle guidance: no future tick releases them and no definition file can be
+edited. `blockedByDefinition` remains about definition repair, so is false for
+retirement. Release and retention policy are unchanged. The additive public
+`HeldNotifyWork` and doctor field ship in a core minor Changeset; CLI stays patch.
+
 ## 2026-11-14 — Visible ingress cleanup failure causes (004 §3.4.2) — Refs #619
 
 Require cleanup to render the original scenario's cause chain and stacks in normal
@@ -49,6 +88,15 @@ Require diagnostic drains after the final tick, after watch consumption and at
 cleanup, including child stop. A caught late audit write must fail with its SQL;
 cleanup must retain an existing scenario failure alongside classification errors.
 Validation coverage only; runtime behavior and public contracts are unchanged.
+
+## 2026-11-14 — Diagnose held notify work despite rejected definitions (005 §6, §15; 002 §10.7) — Refs #574
+
+Explain keeps debounce and rollup counts, stored pacing and definition-repair
+guidance beside definition failures. Doctor reports the same batches independently
+of parsed monitor rollups, including missing, parse-failed and duplicated ids.
+Both read the runtime's existing scoped hold queries. A quiet latest tick cannot
+make downstream stages healthy while earlier accepted work is still held and no
+event has materialized. Notify release timing and health exit codes are unchanged.
 
 ## 2026-11-14 — Ship native command admission inside published packages (003 §11; 008 §3.3) — Refs #470
 

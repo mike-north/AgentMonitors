@@ -67,6 +67,10 @@ import {
   type PolicyNotifyState,
 } from './notify-policy.js';
 import { DeliveryReservationRegistry } from './delivery-reservations.js';
+import {
+  describeHeldNotifyWork,
+  heldNotifyStage,
+} from './held-notify-diagnosis.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
   isVerifyScratchObjectKey,
@@ -82,6 +86,7 @@ import {
 } from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
+  HeldNotifyBarrier,
   DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
@@ -135,6 +140,13 @@ import {
   type SessionHookState,
 } from './types.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
+
+/**
+ * Two valid same-id files compete for one notify route. The internal marker
+ * lets read-only diagnosis report this specific refusal while tick propagates
+ * the existing error and every unrelated failure retains its normal behavior.
+ */
+class AmbiguousNotifyDefinitionError extends Error {}
 
 const DEFAULT_FILE_FINGERPRINT_POLL_MS =
   schedulingDefaults.fileFingerprintPollMs;
@@ -1610,16 +1622,23 @@ export class AgentMonitorRuntime {
    * gives its registered artifacts cleanup authority (issue #562).
    */
   private reapDormantSessions(now: Date, workspacePath: string): void {
-    const staleBefore = new Date(now.getTime() - this.sessionDormancyMs);
-    for (const session of this.store.staleActiveSessions(
-      workspacePath,
-      staleBefore,
-    )) {
+    for (const session of this.sessionsDueForDormancy(now, workspacePath)) {
       // Reuse closeSession so the dormancy transition and an explicit close
       // share ONE path (status → dormant, ephemeral monitors reaped, verify
       // artifacts handed cleanup authority, hook state refreshed).
       this.closeSession(session.id, now);
     }
+  }
+
+  /** Read tick's dormancy decision, including recent declarations, without closing owners. */
+  private sessionsDueForDormancy(
+    now: Date,
+    workspacePath: string,
+  ): AgentSessionRecord[] {
+    return this.store.staleActiveSessions(
+      workspacePath,
+      new Date(now.getTime() - this.sessionDormancyMs),
+    );
   }
 
   /**
@@ -1890,6 +1909,117 @@ export class AgentMonitorRuntime {
     return current;
   }
 
+  /**
+   * Follow tick's read-only admission predicates in order. Diagnostics cannot
+   * run reaping, retry drains or notify reconciliation just to discover their
+   * prerequisites; they share those operations' reads instead. A later tick
+   * can still encounter concurrent edits or execution/storage failures.
+   */
+  private heldReleaseBarrier(
+    monitorId: string,
+    workspacePath: string,
+    scan: Awaited<ReturnType<typeof scanMonitors>>,
+    now: Date,
+  ): HeldNotifyBarrier {
+    // Duplicate ids abort the entire tick before lifecycle or source processing.
+    if (scan.duplicateIds.length > 0) {
+      return 'definition-rejected';
+    }
+    let monitor: MonitorDefinition;
+    const ephemeral = monitorId.startsWith(EPHEMERAL_MONITOR_ID_PREFIX);
+    if (ephemeral) {
+      const declaration = this.store.findEphemeralMonitorById(monitorId);
+      // Tick reaps stale owners before querying declarations. This read includes
+      // the store's recent-declaration exemption; persisted active is insufficient.
+      if (
+        declaration &&
+        this.sessionsDueForDormancy(now, workspacePath).some(
+          (session) => session.id === declaration.sessionId,
+        )
+      ) {
+        return 'owner-inactive';
+      }
+      if (declaration?.status !== 'active') {
+        return 'declaration-retired';
+      }
+      const active = this.store.listActiveEphemeralMonitors(workspacePath);
+      if (!active.some((record) => record.id === monitorId)) {
+        return this.store.findSessionById(declaration.sessionId)?.status !==
+          'active'
+          ? 'owner-inactive'
+          : 'workspace-mismatch';
+      }
+      // Source resolution precedes reconstruction on tick; missing plugins are
+      // restorable dependencies, not a nonexistent definition file to repair.
+      if (!this.registry.get(declaration.sourceName)) {
+        return 'source-unavailable';
+      }
+      try {
+        monitor = this.ephemeralRecordToMonitor(declaration);
+      } catch {
+        return 'declaration-invalid';
+      }
+    } else {
+      const persistent = scan.monitors.find(
+        ({ monitor }) => monitor.id === monitorId,
+      )?.monitor;
+      let current: ParseOutcome | undefined;
+      try {
+        ({ current } = this.readHeldNotifyDefinition(
+          monitorId,
+          workspacePath,
+          persistent?.filePath,
+        ));
+      } catch (error) {
+        // A competing admitted path is a definition barrier, not a failed
+        // diagnostic. Tick still throws it; unrelated failures must propagate.
+        if (error instanceof AmbiguousNotifyDefinitionError) {
+          return 'definition-rejected';
+        }
+        throw error;
+      }
+      if (!current?.ok) {
+        return 'definition-rejected';
+      }
+      monitor = current.monitor;
+    }
+    const source = this.registry.get(monitor.frontmatter.watch.type);
+    if (!source) {
+      return 'source-unavailable';
+    }
+    const invalid = ephemeral ? 'declaration-invalid' : 'definition-rejected';
+    if (
+      validateWatchScope(
+        watchConfig(monitor.frontmatter.watch),
+        source.scopeSchema,
+      ).length > 0
+    ) {
+      return invalid;
+    }
+    // Tick drains older retries before validating captured holds. A read-only
+    // report cannot predict a retry attempt's success, so name the prerequisite.
+    if (this.hasRetainedWork(monitorId, workspacePath)) {
+      return 'retained-work';
+    }
+    const notify = this.store.getMonitorState(
+      monitorId,
+      workspacePath,
+    ).notifyState;
+    try {
+      // Effective pacing edits drain captured work before scheduling. Reuse
+      // reconciliation's complete read-only plan, including semantic policy keys.
+      if (this.readNotifyEdit(monitor, notify).changed) {
+        return 'none';
+      }
+    } catch {
+      return 'capture-invalid';
+    }
+    if (this.scheduleForMonitor(monitor, now, workspacePath).error) {
+      return invalid;
+    }
+    return 'none';
+  }
+
   async explainMonitor(
     input: MonitorExplainInput,
   ): Promise<MonitorExplainReport> {
@@ -1919,6 +2049,22 @@ export class AgentMonitorRuntime {
       (candidate) => candidate.id === input.monitorId,
     );
 
+    // Discovery failures do not determine eligibility: held work has its own
+    // captured/admitted definition authority and remains diagnosable.
+    // Read through the same scoped state query used by notify reconciliation.
+    const runtimeState = this.store.getMonitorState(
+      input.monitorId,
+      workspacePath,
+    );
+    const rejectedHoldStage = heldNotifyStage(
+      describeHeldNotifyWork(
+        input.monitorId,
+        runtimeState.notifyState,
+        this.heldReleaseBarrier(input.monitorId, workspacePath, scan, now),
+        now,
+      ),
+    );
+
     if (parseError) {
       stages.push(
         explainStage(
@@ -1928,6 +2074,9 @@ export class AgentMonitorRuntime {
           { filePath: parseError.filePath },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -1949,6 +2098,9 @@ export class AgentMonitorRuntime {
           `Monitor "${input.monitorId}" was not found in ${input.monitorsDir}.`,
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -1971,6 +2123,9 @@ export class AgentMonitorRuntime {
           { filePaths: duplicate.filePaths },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -2008,6 +2163,9 @@ export class AgentMonitorRuntime {
           { filePath: monitor.filePath, sourceName },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       // The preflight stops a rejected config before admission, so it adds no
       // drop, but a drop admitted under the earlier config stays outstanding
       // until a later observation supersedes it (002 §2). Report it beside the
@@ -2054,10 +2212,6 @@ export class AgentMonitorRuntime {
       }),
     );
 
-    const runtimeState = this.store.getMonitorState(
-      input.monitorId,
-      workspacePath,
-    );
     const schedule = this.scheduleForMonitor(monitor, now, workspacePath);
     if (schedule.error) {
       // Defensive isolation (issue #297): scheduleForMonitor() never throws —
@@ -2085,6 +2239,9 @@ export class AgentMonitorRuntime {
           { error: schedule.error },
         ),
       );
+      if (rejectedHoldStage) {
+        stages.push(rejectedHoldStage);
+      }
       return {
         monitorId: input.monitorId,
         generatedAt: now,
@@ -2210,84 +2367,25 @@ export class AgentMonitorRuntime {
       latestObservation?.result === 'rebaselined';
 
     const notifyState = runtimeState.notifyState;
-    const pendingDebounce = notifyState.pendingDebounce;
     const suppressedUntil = notifyState.suppressedUntil
       ? new Date(notifyState.suppressedUntil)
       : null;
-    // Track whether the notify layer has a queued batch (holding or overdue) so
-    // the materialization stage can reflect 'pending' rather than 'failure'
-    // (#149, Copilot review #155).
-    //
-    // IMPORTANT: pendingDebounce can be present even when dueAt <= now. That
-    // happens when the settle window has expired but the daemon tick has not
-    // yet run to flush and clear the batch. In that window the batch is still
-    // queued — it will materialize on the next tick — so materialization is
-    // still pending, not a failure. The notify stage distinguishes "actively
-    // settling" (dueAt > now) from "ready to flush on next tick" (dueAt <= now)
-    // with distinct text, but both are semantically pending.
+    const holds = describeHeldNotifyWork(
+      input.monitorId,
+      notifyState,
+      this.heldReleaseBarrier(input.monitorId, workspacePath, scan, now),
+      now,
+    );
+    const holdStage = heldNotifyStage(holds);
+    // A quiet latest tick cannot erase accepted work from earlier ticks. Holds
+    // keep downstream stages pending until materialization actually occurs.
     let notifyPending = false;
-    // A debounce-held materialization message that describes the current hold
-    // state for the materialization stage reason (set when notifyPending is true
-    // due to a debounce batch, null when pending is due to throttle).
-    let debounceMaterializationReason: string | null = null;
-    if (pendingDebounce) {
+    const heldMaterializationReason = holdStage
+      ? `No monitor_events rows yet — ${holdStage.reason}`
+      : null;
+    if (holdStage) {
       notifyPending = true;
-      const dueAt = new Date(pendingDebounce.dueAt);
-      const isOverdue = dueAt <= now;
-      if (isOverdue) {
-        stages.push(
-          explainStage(
-            'notify',
-            'pending',
-            `debounce settle window has elapsed; ${String(pendingDebounce.observations.length)} observation(s) will be flushed on the next daemon tick.`,
-            {
-              dueAt: pendingDebounce.dueAt,
-              observations: pendingDebounce.observations.length,
-              overdue: true,
-            },
-          ),
-        );
-        debounceMaterializationReason =
-          'No monitor_events rows yet — the debounce settle window has elapsed and the batch will flush on the next daemon tick.';
-      } else {
-        stages.push(
-          explainStage(
-            'notify',
-            'pending',
-            `debounce is holding ${String(pendingDebounce.observations.length)} observation(s) until ${pendingDebounce.dueAt}.`,
-            {
-              dueAt: pendingDebounce.dueAt,
-              observations: pendingDebounce.observations.length,
-              overdue: false,
-            },
-          ),
-        );
-        debounceMaterializationReason =
-          'No monitor_events rows yet — the notify layer is holding the batch until the debounce settle window elapses.';
-      }
-    } else if (
-      notifyState.pendingRollup &&
-      notifyState.pendingRollup.observations.length > 0
-    ) {
-      // Rollup is accumulating: the notify layer is intentionally holding
-      // observations until the next delivery window fires (002 §4.4). This is
-      // expected `pending` — not a bug — consistent with the debounce branch.
-      notifyPending = true;
-      const count = notifyState.pendingRollup.observations.length;
-      const window =
-        monitor.frontmatter.notify?.strategy === 'rollup'
-          ? monitor.frontmatter.notify.window
-          : 'unknown';
-      stages.push(
-        explainStage(
-          'notify',
-          'pending',
-          `rollup is holding ${String(count)} observation(s) until the next window (${window}).`,
-          { window, observations: count },
-        ),
-      );
-      debounceMaterializationReason =
-        'No monitor_events rows yet — the rollup notify layer is accumulating observations until the next window.';
+      stages.push(holdStage);
     } else if (suppressedUntil && suppressedUntil > now) {
       notifyPending = true;
       stages.push(
@@ -2361,7 +2459,7 @@ export class AgentMonitorRuntime {
       // hasn't flushed it yet. Only treat it as failure when the notify layer is
       // clear and there is still nothing materialized (unexpected absence).
       stages.push(
-        observationHealthy
+        observationHealthy && holds.length === 0
           ? explainStage(
               'materialization',
               'healthy',
@@ -2371,7 +2469,7 @@ export class AgentMonitorRuntime {
             ? explainStage(
                 'materialization',
                 'pending',
-                debounceMaterializationReason ??
+                heldMaterializationReason ??
                   'No monitor_events rows yet — the notify layer is holding the batch until the throttle window elapses.',
               )
             : explainStage(
@@ -2528,7 +2626,7 @@ export class AgentMonitorRuntime {
       );
     } else {
       stages.push(
-        observationHealthy
+        observationHealthy && holds.length === 0
           ? explainStage(
               'delivery',
               'healthy',
@@ -2807,8 +2905,25 @@ export class AgentMonitorRuntime {
       }
     }
 
+    // Release discovery includes parse-failed, missing and duplicated ids. Use
+    // that same query, then the same scoped state read as runtime release, so a
+    // rejected definition cannot make its accepted batches disappear here.
+    const heldNotifyWork = [
+      ...new Set(heldMonitorIds(this.store, workspacePath)),
+    ]
+      .sort()
+      .flatMap((monitorId) =>
+        describeHeldNotifyWork(
+          monitorId,
+          this.store.getMonitorState(monitorId, workspacePath).notifyState,
+          this.heldReleaseBarrier(monitorId, workspacePath, scan, now),
+          now,
+        ),
+      );
+
     return {
       generatedAt: now,
+      heldNotifyWork,
       monitorsDir,
       workspacePath,
       monitorsDirExists,
@@ -3778,7 +3893,7 @@ export class AgentMonitorRuntime {
       };
     }
     if (candidate?.ok && current.ok) {
-      throw new Error(
+      throw new AmbiguousNotifyDefinitionError(
         `Duplicate monitor ids: "${id}" (${candidate.monitor.filePath}, ${current.monitor.filePath}).`,
       );
     }
@@ -3827,6 +3942,35 @@ export class AgentMonitorRuntime {
     return undefined;
   }
 
+  /**
+   * Resolve the definition governing accepted work, independently of scan
+   * membership. Discovery supplies a candidate when present; otherwise the
+   * first held envelope supplies its captured route. Both defer to the live
+   * owner's current admitted path under the same relocation/ambiguity rules.
+   * This read cannot open or close admission or record a diagnostic; callers
+   * decide how to handle rejection after resolving the same authority.
+   */
+  private readHeldNotifyDefinition(
+    id: string,
+    workspacePath: string,
+    candidatePath?: string,
+  ): {
+    captured: ReturnType<typeof capturedNotifyRoute>;
+    current: ParseOutcome | undefined;
+  } {
+    const held = this.store.getMonitorState(id, workspacePath).notifyState;
+    const captured = capturedNotifyRoute(
+      held.pendingDebounce?.observations.at(0) ??
+        held.pendingRollup?.observations.at(0),
+    );
+    const current = this.readCurrentNotifyDefinition(
+      id,
+      workspacePath,
+      candidatePath ?? captured.filePath,
+    );
+    return { captured, current };
+  }
+
   /** Diagnose operational holds whose authored definition cannot be admitted. */
   private reportMissingHeldDefinitions(
     result: Awaited<ReturnType<typeof scanMonitors>>,
@@ -3845,17 +3989,11 @@ export class AgentMonitorRuntime {
       if (knownIds.has(id) || id.startsWith(EPHEMERAL_MONITOR_ID_PREFIX)) {
         continue;
       }
-      const held = this.store.getMonitorState(id, workspacePath).notifyState;
-      const captured = capturedNotifyRoute(
-        held.pendingDebounce?.observations.at(0) ??
-          held.pendingRollup?.observations.at(0),
-      );
       // The scan itself can finish out of order with a newer discovery. A stale
       // missing/invalid result must not close that newer definition's live gate.
-      const current = this.readCurrentNotifyDefinition(
+      const { captured, current } = this.readHeldNotifyDefinition(
         id,
         workspacePath,
-        captured.filePath,
       );
       let reason = current?.ok ? undefined : current?.error;
       if (current?.ok) {
@@ -4142,6 +4280,35 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Read the prerequisites and effective change for a notify edit. Reconciliation
+   * calls this under its writer lock; diagnosis uses the same validation without
+   * learning policy identity, draining envelopes or opening admission.
+   */
+  private readNotifyEdit(
+    monitor: MonitorDefinition,
+    notify: PolicyNotifyState,
+  ): {
+    key: string;
+    held: StoredObservationEnvelope[];
+    changed: boolean;
+  } {
+    const key = notifyPolicyKey(monitor);
+    const held = [
+      ...(notify.pendingDebounce?.observations ?? []),
+      ...(notify.pendingRollup?.observations ?? []),
+    ];
+    for (const envelope of held) {
+      // Captured semantics cannot borrow instructions or urgency from an edit.
+      validateCapturedNotifyEnvelope(envelope, monitor.id);
+    }
+    const changed =
+      held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
+      (notify.policyKey !== undefined &&
+        !storedNotifyPolicyMatches(notify.policyKey, key));
+    return { key, held, changed };
+  }
+
+  /**
    * Own the edit's deterministic write unit. Re-read under the writer lock so
    * another runtime's committed drain cannot be duplicated or overwritten by a
    * decision made from an earlier read. Event units nest as SQLite savepoints;
@@ -4155,20 +4322,7 @@ export class AgentMonitorRuntime {
     return withStoreWriter(this.store, () => {
       const state = this.store.getMonitorState(monitor.id, workspacePath);
       const notify: PolicyNotifyState = state.notifyState;
-      const key = notifyPolicyKey(monitor);
-      const held = [
-        ...(notify.pendingDebounce?.observations ?? []),
-        ...(notify.pendingRollup?.observations ?? []),
-      ];
-      for (const envelope of held) {
-        // Persisted envelopes are older-version data. Missing captured semantics
-        // must block recovery, never borrow instructions or urgency from an edit.
-        validateCapturedNotifyEnvelope(envelope, monitor.id);
-      }
-      const changed =
-        held.some((envelope) => notifyPolicyKey(envelope.monitor) !== key) ||
-        (notify.policyKey !== undefined &&
-          !storedNotifyPolicyMatches(notify.policyKey, key));
+      const { key, held, changed } = this.readNotifyEdit(monitor, notify);
       if (!changed) {
         // A successful current scan establishes future comparison identity even
         // when legacy state has only guards. Missing metadata is not an edit:
