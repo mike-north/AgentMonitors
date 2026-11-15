@@ -141,6 +141,13 @@ import {
 } from './types.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
 
+/**
+ * Two valid same-id files compete for one notify route. The internal marker
+ * lets read-only diagnosis report this specific refusal while tick propagates
+ * the existing error and every unrelated failure retains its normal behavior.
+ */
+class AmbiguousNotifyDefinitionError extends Error {}
+
 const DEFAULT_FILE_FINGERPRINT_POLL_MS =
   schedulingDefaults.fileFingerprintPollMs;
 const DEFAULT_API_POLL_MS = schedulingDefaults.apiPollMs;
@@ -1959,11 +1966,21 @@ export class AgentMonitorRuntime {
       if (!persistent) {
         return 'definition-rejected';
       }
-      const current = this.readCurrentNotifyDefinition(
-        monitorId,
-        workspacePath,
-        persistent.filePath,
-      );
+      let current: ParseOutcome | undefined;
+      try {
+        current = this.readCurrentNotifyDefinition(
+          monitorId,
+          workspacePath,
+          persistent.filePath,
+        );
+      } catch (error) {
+        // A competing admitted path is a definition barrier, not a failed
+        // diagnostic. Tick still throws it; unrelated failures must propagate.
+        if (error instanceof AmbiguousNotifyDefinitionError) {
+          return 'definition-rejected';
+        }
+        throw error;
+      }
       if (!current?.ok) {
         return 'definition-rejected';
       }
@@ -3878,7 +3895,7 @@ export class AgentMonitorRuntime {
       };
     }
     if (candidate?.ok && current.ok) {
-      throw new Error(
+      throw new AmbiguousNotifyDefinitionError(
         `Duplicate monitor ids: "${id}" (${candidate.monitor.filePath}, ${current.monitor.filePath}).`,
       );
     }

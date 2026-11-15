@@ -5,6 +5,7 @@
  */
 import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { setImmediate } from 'node:timers/promises';
 import { expect, it, vi } from 'vitest';
 import { createDb } from '../inbox/db.js';
 import { SourceRegistry } from '../observation/registry.js';
@@ -122,6 +123,103 @@ Inspect the change.
       }),
     ]);
     expect(store.getMonitorState('held', workspace)).toEqual(accepted);
+  });
+}
+
+/** Live admission can make a separately scanned same-id definition ambiguous. */
+for (const method of ['doctorReport', 'explainMonitor'] as const) {
+  it(`preserves ${method} across admitted-path ambiguity`, async () => {
+    const workspace = path.join(process.env.HOME ?? '', 'ambiguity');
+    const admittedDir = path.join(workspace, 'admitted');
+    const candidateDir = path.join(workspace, 'candidate');
+    for (const dir of [admittedDir, candidateDir]) {
+      mkdirSync(path.join(dir, 'held'), { recursive: true });
+      writeFileSync(
+        path.join(dir, 'held/MONITOR.md'),
+        `---
+name: Held
+watch:
+  type: test-held
+urgency: normal
+notify:
+  strategy: debounce
+  settle-for: 1h
+---
+Inspect.
+`,
+      );
+    }
+    const db = createDb(':memory:');
+    const store = new RuntimeStore(db);
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'test-held',
+      scopeSchema: { type: 'object' },
+      async observe() {
+        return { observations: [] };
+      },
+      async *watch(_config, { signal }) {
+        yield { observations: [{ title: 'Accepted' }] };
+        if (!signal.aborted) {
+          await new Promise((resolve) =>
+            signal.addEventListener('abort', resolve, { once: true }),
+          );
+        }
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry, []);
+    const errors: Error[] = [];
+    const handle = await runtime.watchMonitors(admittedDir, workspace, {
+      onError: (_id, error) => errors.push(error),
+    });
+    try {
+      for (
+        let i = 0;
+        i < 100 &&
+        !store.getMonitorState('held', workspace).notifyState.pendingDebounce;
+        i++
+      ) {
+        await setImmediate();
+      }
+      const accepted = store.getMonitorState('held', workspace);
+      expect(accepted.notifyState.pendingDebounce?.observations).toHaveLength(
+        1,
+      );
+      // Discovery in either tree is unique; only the live admitted path makes
+      // the candidate ambiguous. Reporting must not consume or repair its hold.
+      for (const dir of [admittedDir, candidateDir]) {
+        const before = db.$client.serialize();
+        const report = await runtime[method]({
+          monitorsDir: dir,
+          workspacePath: workspace,
+          monitorId: 'held',
+        });
+        const hold =
+          'stages' in report
+            ? report.stages.find((stage) => stage.id === 'notify')?.details
+            : report.heldNotifyWork?.[0];
+        expect(hold).toMatchObject({
+          monitorId: 'held',
+          observations: 1,
+          strategy: 'debounce',
+          releaseBarrier: dir === candidateDir ? 'definition-rejected' : 'none',
+          blockedByDefinition: dir === candidateDir,
+        });
+        expect(
+          'stages' in report ? report.stages.length : report.monitors.length,
+        ).toBeGreaterThan(0);
+        expect(db.$client.serialize()).toEqual(before);
+      }
+      // Diagnosis handles the barrier, while tick keeps its existing refusal.
+      await expect(runtime.tick(candidateDir, workspace)).rejects.toThrow(
+        'Duplicate monitor ids',
+      );
+      expect(store.getMonitorState('held', workspace)).toEqual(accepted);
+      expect(errors).toEqual([]);
+    } finally {
+      await handle.stop();
+      db.$client.close();
+    }
   });
 }
 
@@ -616,12 +714,26 @@ it('honors the recent-declaration dormancy exemption in reports and the next tic
   const { db, runtime, store, session, monitor, workspace, dir } = fixture;
   try {
     vi.setSystemTime(new Date(now.getTime() + 31 * 60 * 1000));
-    runtime.declareEphemeralMonitor({
+    const recent = runtime.declareEphemeralMonitor({
       sessionId: session.id,
       source: 'test-held',
       scope: {},
       urgency: 'high',
     });
+    // Declaration also touches its owner. Backdate activity independently to
+    // model an interrupted activity update, so only the durable declaration
+    // exemption can keep this stale owner active. Native SQLite uses seconds.
+    db.$client
+      .prepare('UPDATE agent_sessions SET last_active_at = ? WHERE id = ?')
+      .run(now.getTime() / 1000, session.id);
+    const owner = store.getSessionById(session.id);
+    expect(owner.status).toBe('active');
+    expect(owner.lastActiveAt.getTime()).toBe(now.getTime());
+    expect(Date.now() - owner.lastActiveAt.getTime()).toBeGreaterThan(
+      30 * 60 * 1000,
+    );
+    expect(recent.createdAt.getTime()).toBe(Date.now());
+    const before = db.$client.serialize();
     const input = {
       monitorsDir: dir,
       workspacePath: workspace,
@@ -636,10 +748,15 @@ it('honors the recent-declaration dormancy exemption in reports and the next tic
     expect(
       explain.stages.find((stage) => stage.id === 'notify')?.details,
     ).toEqual(doctor.heldNotifyWork?.[0]);
+    expect(db.$client.serialize()).toEqual(before);
     expect((await runtime.tick(dir, workspace)).emittedEventIds).toHaveLength(
       1,
     );
     expect(store.getSessionById(session.id).status).toBe('active');
+    expect(store.getEphemeralMonitorById(monitor.id).status).toBe('active');
+    expect(
+      store.getMonitorState(monitor.id, workspace).notifyState.pendingDebounce,
+    ).toBeUndefined();
   } finally {
     db.$client.close();
     vi.useRealTimers();
