@@ -2753,6 +2753,18 @@ row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.
 real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
 (Refs #497, #575).
 
+Held-notify diagnosis reads accepted batches independently of definition health.
+Incomplete captured rollup metadata (including missing/null `monitor` or
+`frontmatter`) leaves `window` and `timezone` as `unknown`; the batch count and
+rest of the report remain available without repairing the stored envelope.
+Ephemeral eligibility uses the tick's active-declaration query, including global
+records in a named workspace. For a cancelled or reaped declaration, the reason
+identifies retirement: no future tick releases the held work and no definition
+file exists to edit. `blockedByDefinition` is false for that lifecycle barrier,
+not a claim that the batch can flush. Diagnosis changes neither release timing
+nor retention policy. Verified by `held-notify-report.test.ts` across both report
+methods, definition health, and real global/cancelled ephemeral ticks (Refs #574).
+
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
 materialization stage filters `monitor_events` to `workspacePath` (plus workspace-agnostic events)

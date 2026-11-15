@@ -733,7 +733,9 @@ For a single batch, JSON `stages[].details` keeps its existing `observations`,
 `blockedByDefinition` and `reason`; rollup also includes its captured `timezone`
 (default `UTC`). Timing comes from the stored batch and captured definition,
 including when the current definition is rejected or edited. Unavailable legacy
-rollup metadata is `unknown`. Mixed legacy state reports both batches in one
+rollup metadata is `unknown`, including a captured envelope with missing or null
+`monitor` or `frontmatter`. Such envelopes remain counted and never abort either
+report. The current definition cannot supply missing captured timing. Mixed legacy state reports both batches in one
 notify stage: `details.observations` is their total and `details.holds` contains
 each batch's fields. Empty batches and throttle suppression contribute no held
 observations: throttle drops notifications rather than retaining accepted work.
@@ -2195,7 +2197,15 @@ not fail a health check or change the exit-code contract. A rejected definition
 keeps its existing validation failure and the hold's reason names definition
 repair as a prerequisite for release. Diagnosis never releases or edits a hold.
 An active ephemeral declaration supplies its definition without a file; the
-absence of `MONITOR.md` alone does not block its held work. Core cases in
+absence of `MONITOR.md` alone does not block its held work. Eligibility uses the
+same active-declaration query as ticks: the requested workspace includes global
+(`workspacePath: null`) declarations whose declaring session is active.
+A cancelled or reaped declaration's accepted batch remains visible. Its reason
+says the declaration is retired, no future tick will release the work, and there
+is no definition file to edit. `blockedByDefinition` is false for this lifecycle
+barrier; it does not imply release eligibility. Neither an elapsed debounce
+deadline nor a rollup window promises release for a retired declaration. This
+changes diagnosis only, leaving retention and release policy unchanged. Core cases in
 `libs/core/src/runtime/held-notify-report.test.ts` cover rejected/missing and
 duplicate definitions, workspace isolation, mixed legacy batches, empty batches
 and live ephemeral declarations.

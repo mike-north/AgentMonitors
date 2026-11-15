@@ -1,6 +1,6 @@
 ---
 '@agentmonitors/cli': patch
-'@agentmonitors/core': patch
+'@agentmonitors/core': minor
 ---
 
 Report held debounce and rollup observations in monitor explain and doctor even
