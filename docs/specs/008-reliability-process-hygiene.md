@@ -220,6 +220,15 @@ Timeout failures instead retain the full kill grace. EOF alone leaves both refer
 armed. This uses no additional process-table subprocess or idle polling. A shutdown request
 can also end the group after the leader has exited while output capture remains in flight.
 
+Restart reconciliation MUST preserve the original group's verified watchdog when any member's
+ownership or identity is uncertain (§4.2). Groups without a verified watchdog retain
+per-process cleanup rather than claiming preservation of a nonexistent bound. It withholds cleanup for that recorded group
+and records a per-PID `abstained` outcome explaining that the group bound was preserved
+and why. The watchdog retains its original timeout and kill grace after restart; a
+new daemon cannot extend them. Fully verified groups are still reaped, including the
+watchdog, through each process's own signal gate. No other member's evidence authorizes
+a watchdog signal.
+
 Deadlines use the shared OS monotonic clock: launcher startup consumes the configured window,
 and wall-clock corrections cannot extend it. Capturing that native clock keeps host scheduling
 clock virtualization from changing the execution epoch. Timer segments are capped at Node's maximum
@@ -312,10 +321,51 @@ its positively observed membership and immutable process identity. A changed/mis
 start time, missing/unreadable required mark or unavailable process table withholds cleanup. The
 process-identity reading follows boot and mark checks, so identifier recycling during either
 earlier query cannot leave stale identity evidence. Linux performs those queries separately
-for each candidate. macOS batches the fresh boot, required environment marks and final identity
+for each candidate. When several marked candidates are present, Linux retains per-PID
+ownership reads but collects their vetoes before a final shared identity reading, including
+across groups. macOS batches the fresh boot, required environment marks and final identity
 reading for each pass, then invokes the same per-PID signal gates in one microtask turn, before
 terminal queries or later discovery can age that snapshot. Stored numeric PIDs are suspicions
 only; the sweep never signals a stored PGID.
+A recorded group's bound MUST survive any member's abstention when the group contains
+a verified watchdog. Discovery identifies that role from
+`AGENTMONITORS_COMMAND_ROLE=watchdog` beside the unchanged life nonce in kernel envp,
+with confirmed incarnation and group membership. Only the watchdog receives the role from
+the launcher. The role never authorizes a signal, and cannot lend another PID ownership.
+If that watchdog's own mark becomes unreadable at the final gate, its verified discovery
+identity still makes the group possibly bounded: withhold signals and record the unreadability
+reason. Without any readable role/ownership evidence, an unreadable process alone cannot
+identify a watchdog. Older no-role groups and re-sessioned descendants with no verified
+watchdog retain ordinary per-process cleanup: reap verified members and abstain on the rest.
+If the final identity snapshot proves every known watchdog absent or replaced, the group
+no longer has a verified bound and retains per-process cleanup. Multiple verified watchdogs
+are all retained when a group is uncertain; one surviving matching identity suffices. Authored code may set
+the role itself; a matching life/identity can then cause withholding (a leak), never a wrong kill.
+
+Discovery, anchor confirmation and final signal-time readings retain uncertainty across
+bounded discovery passes; it applies whenever a verified watchdog is found in that group.
+Readable mark-erased members still use existing group continuity and are considered first.
+A newly appearing unverified incarnation can withhold the remaining signals of a bounded
+group. A confirmed terminal identity is carried into later membership checks while its zombie
+row remains visible; a recycled PID with a different identity is still new uncertainty.
+A terminal watchdog no longer supplies a bound. Fully verified groups, including late forks,
+remain eligible. Every target retains its own boot, required mark and start-time checks,
+and all restart signals remain positive per-PID SIGKILL, never a stored or negative PGID.
+
+All preservation abstentions from a signal batch are committed together after its per-PID
+signal gates settle and before any terminal query or later asynchronous evidence query.
+The gates use only the already-read final snapshot; their resolved-Promise handoff issues
+no additional evidence query or journal operation. Journal I/O MUST NOT block between that final identity snapshot
+and the signal batch: a FULL-sync save can age the identity evidence while the kernel
+recycles a PID. Linux post-signal terminal queries remain serialized, retaining the
+process-table reader's 32-descriptor bound independently of survivor count. macOS retains
+shared bounded terminal evidence queries.
+
+**Verified:** injected-reader group-bound cases in
+`libs/core/src/process/command-process-journal.test.ts`, and native stock-shell deadline
+survival plus fully verified watchdog reaping in
+`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`.
+
 Ownership MUST come from the actual process environment, never matching argv text. Linux reads
 `/proc/<pid>/environ` for exactly the requested identifiers. macOS reads kernel
 `KERN_PROCARGS2`: argc determines exactly how many NUL-terminated argv entries to skip,

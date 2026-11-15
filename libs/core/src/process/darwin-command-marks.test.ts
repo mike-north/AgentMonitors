@@ -68,11 +68,13 @@ it('uses one stock system interpreter for discovery batches and fresh signal-tim
 
 it('does not give the reader an inherited command ownership mark', async () => {
   vi.stubEnv('AGENTMONITORS_COMMAND_LIFE', 'previous-life');
+  vi.stubEnv('AGENTMONITORS_COMMAND_ROLE', 'watchdog');
   helper();
   await readDarwinCommandMarks([4242]);
   const options = vi.mocked(spawn).mock.calls[0]?.[2];
   expect(options?.env).toBeDefined();
   expect(options?.env?.['AGENTMONITORS_COMMAND_LIFE']).toBeUndefined();
+  expect(options?.env?.['AGENTMONITORS_COMMAND_ROLE']).toBeUndefined();
   vi.unstubAllEnvs();
 });
 
@@ -290,4 +292,17 @@ it('retains synchronous spawn failure as unavailable evidence for the entire swe
     }
   });
   expect(spawn).toHaveBeenCalledTimes(1);
+});
+
+it('returns the watchdog role from kernel envp without changing ownership', async () => {
+  const reply = kernelReply('life');
+  const tagged = Buffer.concat([
+    reply.subarray(0, reply.length - 1),
+    Buffer.from('AGENTMONITORS_COMMAND_ROLE=watchdog\0\0'),
+  ]);
+  expect(await bridge([tagged])).toEqual([[101, 'life', false, true]]);
+  helper((pids) => pids.map((pid) => [pid, 'life', false, true]));
+  const result = await readDarwinCommandMarks([4242]);
+  expect(result.supported && result.marks.get(4242)).toBe('life');
+  expect(result.supported && result.watchdogs?.has(4242)).toBe(true);
 });
