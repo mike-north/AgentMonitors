@@ -339,6 +339,7 @@ for (const branch of [
       it(`monitor retry ${action}/${policy}/${branch}: every traced write survives kill and fault`, async () => {
         const discovery = await fixture('poll', policy);
         let points: string[];
+        let discoveryFailure: { error: unknown } | undefined;
         try {
           const child = await discovery.start();
           const retryId = await terminal(discovery, child, policy, branch);
@@ -394,14 +395,18 @@ for (const branch of [
           ).toBeGreaterThan(0);
           await stop(child);
           await recovered(discovery, retryId, action, branch, original);
+        } catch (error) {
+          discoveryFailure = { error };
+          throw error;
         } finally {
-          await discovery.cleanup();
+          await discovery.cleanup(discoveryFailure);
         }
         for (const point of points) {
           for (const mode of ['kill', 'fault']) {
             const label = `monitor retry ${action}/${policy}/${branch}/${mode} :: ${point}`;
             console.log(label);
             const f = await fixture('poll', policy);
+            let scenarioFailure: { error: unknown } | undefined;
             try {
               const child = await f.start();
               const retryId = await terminal(f, child, policy, branch);
@@ -431,9 +436,11 @@ for (const branch of [
               await stop(child);
               await recovered(f, retryId, action, branch, original);
             } catch (error) {
-              throw new Error(label, { cause: error });
+              const contextual = new Error(label, { cause: error });
+              scenarioFailure = { error: contextual };
+              throw contextual;
             } finally {
-              await f.cleanup();
+              await f.cleanup(scenarioFailure);
             }
           }
         }
