@@ -363,6 +363,74 @@ describe.skipIf(process.platform === 'win32')(
       });
     });
 
+    it.each(['read', 'restore', 'read-back', 'mismatch'])(
+      'preserves the baseline when command resource limits cannot be verified after %s failure',
+      async (fault) => {
+        // Alter only this disposable launcher's limit. The parent and watchdog
+        // retain their own limits; failed restoration must never run authored work
+        // with a different resource budget or manufacture an authored exit status.
+        injected.launcher = `const originalLoad = require('node:module')._load;
+          require('node:module')._load = function(id, ...args) {
+            const loaded = originalLoad.call(this, id, ...args);
+            if (!id.endsWith('/load.cjs')) return loaded;
+            return {...loaded, load(...args) {
+              const library = loaded.load(...args);
+              const get = library.func('int getrlimit(int resource, void *value)');
+              const set = library.func('int setrlimit(int resource, const void *value)');
+              const nofile = process.platform === 'darwin' ? 8 : 7;
+              const value = Buffer.alloc(16);
+              if (get(nofile, value) !== 0) throw new Error('fixture: getrlimit');
+              value.writeBigUInt64LE(512n);
+              if (set(nofile, value) !== 0) throw new Error('fixture: setrlimit');
+              let reads = 0;
+              return {...library, func(declaration) {
+                const native = library.func(declaration);
+                if (declaration.includes(' setrlimit(') && ${JSON.stringify(fault)} === 'restore') return () => { loaded.errno(loaded.os.errno.EPERM); return -1; };
+                if (!declaration.includes(' getrlimit(')) return native;
+                return (resource, value) => {
+                  reads++;
+                  if ((${JSON.stringify(fault)} === 'read' && reads === 1) || (${JSON.stringify(fault)} === 'read-back' && reads === 2)) { loaded.errno(loaded.os.errno.EPERM); return -1; }
+                  const result = native(resource, value);
+                  if (${JSON.stringify(fault)} === 'mismatch' && reads === 2) value.writeBigUInt64LE(512n);
+                  return result;
+                };
+              }};
+            }};
+          };`;
+        const dir = mkdtempSync(path.join(tmpdir(), 'rlimit-'));
+        const marker = path.join(dir, 'ran');
+        const previousState = {
+          stdout: 'good-baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'ok',
+          baselined: true,
+        };
+        const result = await source.observe(
+          {
+            command: ['/bin/sh', '-c', 'printf ran > "$1"', 'fixture', marker],
+            timeout: '2s',
+          },
+          { now: new Date(), previousState },
+        );
+        expect(existsSync(marker)).toBe(false);
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining(
+            'Could not restore command resource limits: RLIMIT_NOFILE:',
+          ),
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining(
+            fault === 'mismatch' ? 'read-back mismatch' : 'EPERM (1)',
+          ),
+        });
+      },
+    );
+
     it('restores blocking stdio while preserving other native status flags', async () => {
       // A real variadic binding primes every standard descriptor. Inspect at
       // exec so neither the launcher nor the authored interpreter can hide drift.

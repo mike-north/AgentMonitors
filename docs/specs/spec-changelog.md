@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
+
+Authored commands inherit the soft and hard resource limits of a plain spawn from the same
+running parent. Capture the parent's current `RLIMIT_NOFILE` pair and restore it after
+watchdog arming, undoing Node helper startup's soft-limit increase without changing the
+watchdog's limits. Refuse execution with the limit name and errno if a native read or restore
+fails; a read-back mismatch also fails admission and retains the prior baseline. Native
+macOS/Linux comparison covers every resource pair, with lowered soft and inherited/finite
+hard limits. Native fault injection verifies failure diagnostics and baseline preservation.
+
 ## 2026-11-14 — Claims consume only represented net groups (002 §9) — Refs #571
 
 Rendering and claim persistence use the same selected net groups for every lifecycle.

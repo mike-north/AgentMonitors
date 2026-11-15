@@ -132,7 +132,7 @@ function fail(error) {
     else process.exit(1);
   });
 }
-async function launch({command, env, deadline, grace, watchdog, native}) {
+async function launch({command, env, deadline, grace, watchdog, native, openFiles}) {
   // C strings cannot represent embedded NUL. Match spawn's rejection rather
   // than letting the binding silently truncate literal argv or environment data.
   if (command.some(value => value.includes('\0')) || Object.entries(env).some(([key, value]) => key.includes('\0') || value.includes('\0')))
@@ -154,6 +154,32 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
   const sigemptyset = libc.func('int sigemptyset(void *set)');
   const sigprocmask = libc.func('int sigprocmask(int how, const void *set, void *oldset)');
   const strerror = libc.func('const char *strerror(int errnum)');
+  const getrlimit = libc.func('int getrlimit(int resource, void *value)');
+  const setrlimit = libc.func('int setrlimit(int resource, const void *value)');
+  // Both supported 64-bit ABIs use two uint64_t fields. Infinity differs:
+  // Darwin reserves the sign bit, whereas Linux uses the full unsigned range.
+  const nofile = process.platform === 'darwin' ? 8 : 7;
+  const infinity = process.platform === 'darwin' ? (1n << 63n) - 1n : (1n << 64n) - 1n;
+  function restoreOpenFileLimits() {
+    const expected = Buffer.alloc(16);
+    expected.writeBigUInt64LE(openFiles.soft === 'unlimited' ? infinity : BigInt(openFiles.soft), 0);
+    expected.writeBigUInt64LE(openFiles.hard === 'unlimited' ? infinity : BigInt(openFiles.hard), 8);
+    const current = Buffer.alloc(16);
+    function failed(operation) {
+      const errno = koffi.errno();
+      return new Error('Could not restore command resource limits: RLIMIT_NOFILE: ' + operation + ': ' + getSystemErrorName(-errno) + ' (' + errno + '): ' + strerror(errno));
+    }
+    if (getrlimit(nofile, current) !== 0) throw failed('getrlimit');
+    if (current.equals(expected)) return;
+    // Node only raises the soft limit; lowering it back to the inherited value
+    // is permitted for an unprivileged process and leaves the hard limit intact.
+    // A failure is therefore unexpected in practice. Never silently execute with
+    // a different budget: retain the baseline and report the limit and errno.
+    if (setrlimit(nofile, expected) !== 0) throw failed('setrlimit');
+    if (getrlimit(nofile, current) !== 0) throw failed('getrlimit read-back');
+    if (!current.equals(expected))
+      throw new Error('Could not restore command resource limits: RLIMIT_NOFILE: read-back mismatch');
+  }
   // fcntl's optional argument is variadic: notably, Darwin arm64 passes it on
   // the stack rather than in the register used by a fixed third parameter.
   const fcntl = libc.func('int fcntl(int fd, int cmd, ...)');
@@ -259,6 +285,9 @@ async function launch({command, env, deadline, grace, watchdog, native}) {
         // independent control descriptor and timers across a successful replacement.
         // Every returning exec is a failure. Keep stdout, stderr and the prior
         // baseline untouched while the complete private error frame is flushed.
+        // Restore only after helper startup and watchdog arming: the watchdog
+        // keeps its own limits, and only the authored command receives this pair.
+        restoreOpenFileLimits();
         execute();
       } catch (error) { fail(error); }
     });

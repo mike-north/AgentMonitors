@@ -328,6 +328,40 @@ function resolveCwd(
 }
 
 /**
+ * Node raises RLIMIT_NOFILE during startup; native spawn otherwise inherits the
+ * running parent's current limits. Capture that pair before starting another Node
+ * helper, rather than treating the helper's raised limit as the command's budget.
+ * Diagnostic reports expose the current pair without loading native code into
+ * the daemon. Only this pair crosses the config pipe; no report is persisted.
+ */
+function inheritedOpenFileLimits(): { soft: string; hard: string } {
+  const report = process.report.getReport();
+  const limits: unknown =
+    'userLimits' in report ? report.userLimits : undefined;
+  const openFiles: unknown =
+    limits !== null && typeof limits === 'object' && 'open_files' in limits
+      ? limits.open_files
+      : undefined;
+  if (
+    openFiles === null ||
+    typeof openFiles !== 'object' ||
+    !('soft' in openFiles) ||
+    !('hard' in openFiles)
+  ) {
+    throw new Error('Could not capture command RLIMIT_NOFILE');
+  }
+  // Finite NOFILE values fit exactly in a JS integer on supported hosts. Keep
+  // infinity symbolic until the launcher selects the platform's native rlim_t.
+  function encode(value: unknown): string {
+    if (value === 'unlimited') return value;
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
+      return String(value);
+    throw new Error('Could not capture command RLIMIT_NOFILE: invalid limit');
+  }
+  return { soft: encode(openFiles.soft), hard: encode(openFiles.hard) };
+}
+
+/**
  * Execute authored argv literally through an armed native launcher on supported
  * POSIX hosts, refusing unsupported hosts before admission and draining
  * stdout and stderr as they stream rather than buffering to completion, enforcing
@@ -394,6 +428,13 @@ async function runCommand(
     // The launcher alone loads native code, using our package-relative payload.
     const native = vendoredNativeLoader();
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
+    let openFiles: ReturnType<typeof inheritedOpenFileLimits>;
+    try {
+      openFiles = inheritedOpenFileLimits();
+    } catch (error) {
+      resolve({ kind: 'failure', error: String(error), stderrTail: '' });
+      return;
+    }
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       isWindows ? file! : process.execPath,
@@ -428,6 +469,7 @@ async function runCommand(
           grace: SIGKILL_GRACE_MS,
           watchdog: WATCHDOG_PROGRAM,
           native,
+          openFiles,
         }),
       );
     }

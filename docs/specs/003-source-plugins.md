@@ -1595,6 +1595,18 @@ EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaust
 precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
 empty PATH components use the bare filename. The authored program starts with the default signal
 dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
+startup must not change the authored command's resource limits: every soft/hard pair matches a
+plain spawn from the same running parent. Node raises its own soft `RLIMIT_NOFILE` at startup;
+the source captures the parent's current open-file pair from its in-memory diagnostic report
+and sends only that pair over the configuration pipe. After watchdog arming, the launcher
+restores and reads back the pair through native `getrlimit`/`setrlimit` before exec. Other
+limits pass through unchanged. The watchdog keeps its own limits. A failed limit read or restore
+refuses authored execution with `RLIMIT_NOFILE`, the operation and errno in the diagnostic;
+a read-back mismatch also refuses execution. Either failure retains the previous baseline
+and leaves group/watchdog cleanup unchanged. Verified: `resource-limits.test.ts` compares every
+native resource pair with a lowered parent soft limit and both inherited and finite hard
+limits on macOS/Linux; `self-bound.test.ts` injects native failures and a read-back mismatch.
+Internal Node
 helpers use absolute Node and native-module paths and need only the command-life mark in their
 startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter
 helper startup environments. The complete intended command environment travels only over the
