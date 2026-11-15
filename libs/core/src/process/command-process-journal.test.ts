@@ -2093,3 +2093,88 @@ it.each(['gone', 'recycled'] as const)(
     ).toBe(false);
   },
 );
+
+/** A decided preservation receipt must survive loss during unrelated terminal queries. */
+it('commits final-gate preservation before awaiting another group terminal query', async () => {
+  const f = await fixture();
+  const records = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+    { pid: 5000, pgid: 5000, startTime: 'independent' },
+  ];
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => !(pids.length === 1 && pid === 4242))
+        .map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4243]),
+    unreadable: pids.length === 1 && pids[0] === 4242 ? [4242] : [],
+  }));
+  vi.mocked(readCommandTerminal).mockImplementation(async (record) => {
+    expect(record.pid).toBe(5000);
+    expect(kill.mock.calls).toEqual([[5000, 'SIGKILL']]);
+    const sql = new Database(`${f.db}.commands.sqlite`);
+    const row = sql
+      .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+      .get() as { result: string };
+    sql.close();
+    const saved = JSON.parse(row.result) as {
+      outcomes: { pid?: number; status: string; reason?: string }[];
+    };
+    console.log('PRESERVATION_BEFORE_TERMINAL', JSON.stringify(saved));
+    expect(saved.outcomes).toContainEqual(
+      expect.objectContaining({
+        pid: 4243,
+        status: 'abstained',
+        reason: expect.stringMatching(/bound.*unreadable/),
+      }),
+    );
+    return 'terminated';
+  });
+  await f.journal.sweep();
+});
+
+/** Invalid stored identifiers are decided diagnostics before any anchor can be queried. */
+it('commits invalid PID diagnostics before awaiting anchor confirmation', async () => {
+  const f = await fixture();
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  sql.prepare('UPDATE command_pids SET pid = -1').run();
+  sql.close();
+  const record = { pid: 4242, pgid: 4242, startTime: 'command' };
+  let reads = 0;
+  vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readCommandMarks).mockResolvedValue({
+    supported: true,
+    marks: new Map([[record.pid, f.token]]),
+  });
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    if (++reads === 2) {
+      const reader = new Database(`${f.db}.commands.sqlite`);
+      try {
+        const row = reader
+          .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+          .get() as { result: string };
+        expect(JSON.parse(row.result)).toMatchObject({
+          outcomes: expect.arrayContaining([
+            expect.objectContaining({
+              status: 'abstained',
+              reason: 'Invalid durable command PID record',
+            }),
+          ]),
+        });
+      } finally {
+        reader.close();
+      }
+    }
+    return { supported: true, processes: [record] };
+  });
+  await f.journal.sweep();
+  expect(reads).toBeGreaterThanOrEqual(2);
+});

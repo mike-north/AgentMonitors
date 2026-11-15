@@ -375,6 +375,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
         continue;
       }
       const recorded = new Set<number>();
+      let invalidPidRecords = false;
       for (const raw of this.sql
         .prepare('SELECT pid FROM command_pids WHERE life = ?')
         .all(previous.life)) {
@@ -382,6 +383,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
         if (pid.success) recorded.add(pid.data.pid);
         else {
           complete = false;
+          invalidPidRecords = true;
           outcomes.push({
             status: 'abstained',
             life: previous.life,
@@ -389,6 +391,9 @@ export class CommandProcessJournal implements CommandProcessOwner {
           });
         }
       }
+      // Invalid suspicions are already decided abstentions. Persist them
+      // together before anchor confirmation can suspend reconciliation.
+      if (invalidPidRecords) save('running');
       let reading = table;
       let ownership = marks;
       let retained = !complete;
@@ -547,6 +552,36 @@ export class CommandProcessJournal implements CommandProcessOwner {
             (pid) =>
               byPid.has(pid) && ownership.marks.get(pid) === previous.life,
           ).length > 1;
+        // Batch callbacks commit decided non-signal outcomes before another
+        // await. Keep their PIDs so the result loop never appends them twice.
+        const committedDecisions = new Set<number>();
+        const commitDecisions = (
+          decisions: ReadonlyMap<number, { readonly outcome: SignalOutcome }>,
+        ): void => {
+          let dirty = false;
+          for (const [pid, { outcome }] of decisions) {
+            if (outcome.status === 'sent' || committedDecisions.has(pid))
+              continue;
+            committedDecisions.add(pid);
+            visited.add(pid);
+            dirty = true;
+            if (outcome.status === 'not-needed') {
+              observeVanish(pid, outcome.detail);
+            } else {
+              retained = true;
+              outcomes.push({
+                status: outcome.status === 'abstained' ? 'abstained' : 'failed',
+                life: previous.life,
+                pid,
+                reason:
+                  outcome.status === 'abstained'
+                    ? outcome.abstention.reason
+                    : outcome.detail,
+              });
+            }
+          }
+          if (dirty) save('running');
+        };
         const batchDecisions =
           process.platform === 'darwin' || grouped
             ? await signalCandidateBatch(
@@ -567,6 +602,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
                 boundedGroups,
                 watchdogs,
                 reaped,
+                commitDecisions,
               )
             : undefined;
         // Synchronous abstentions share one durable write before the next await.
@@ -575,6 +611,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
           const record = byPid.get(pid);
           if (record === undefined) continue;
           visited.add(pid);
+          if (committedDecisions.has(pid)) continue;
           if (liveOwners.has(pid) || pid === process.pid) {
             outcomes.push({
               status: 'abstained',
@@ -942,6 +979,8 @@ interface SweepSignalDecision {
  * await, or subsequent discovery can age the snapshot between these signals.
  * Each eligible PID still passes sendVerifiedSignal individually; no stored PGID is sent.
  * Linux shares this batch when several marked candidates could include a watchdog.
+ * The synchronous commit sink records preservation before signal-gate awaits and
+ * remaining non-signal decisions before any unrelated terminal evidence query.
  */
 async function signalCandidateBatch(
   candidates: readonly {
@@ -954,6 +993,9 @@ async function signalCandidateBatch(
   boundedGroups: Set<number>,
   watchdogs: ReadonlyMap<number, ProcessIdentityRecord>,
   reaped: ReadonlyMap<number, ProcessIdentityRecord>,
+  commitDecisions: (
+    decisions: ReadonlyMap<number, SweepSignalDecision>,
+  ) => void,
 ): Promise<ReadonlyMap<number, SweepSignalDecision>> {
   if (candidates.length === 0) return new Map();
   const freshBoot = await readBootIdentity();
@@ -1012,51 +1054,65 @@ async function signalCandidateBatch(
       }
     }
   }
+  // Preservation is already decided from the final snapshot. Commit it as
+  // one receipt before even awaiting the independently verified signal gates.
+  const preserved = new Map<number, SweepSignalDecision>();
+  for (const { record } of candidates) {
+    if (boundedGroups.has(record.pgid) && groupVetoes.has(record.pgid)) {
+      preserved.set(record.pid, {
+        outcome: {
+          status: 'abstained',
+          abstention: {
+            action: 'restart command cleanup',
+            signal: 'SIGKILL',
+            target: { kind: 'process', id: record.pid },
+            reason: `Preserved group ${String(record.pgid)} bound: ${String(groupVetoes.get(record.pgid))}`,
+            observed: [],
+          },
+        },
+      });
+    }
+  }
+  commitDecisions(preserved);
   const results = await Promise.all(
     candidates.map(async ({ record, inherited }) => ({
       record,
       outcome:
-        boundedGroups.has(record.pgid) && groupVetoes.has(record.pgid)
-          ? {
-              status: 'abstained' as const,
-              abstention: {
-                action: 'restart command cleanup',
-                signal: 'SIGKILL' as const,
-                target: { kind: 'process' as const, id: record.pid },
-                reason: `Preserved group ${String(record.pgid)} bound: ${String(groupVetoes.get(record.pgid))}`,
-                observed: [],
-              },
-            }
-          : await sendVerifiedSignal(
-              { kind: 'recorded-process', record },
-              'SIGKILL',
-              {
-                action: 'restart command cleanup',
-                readProcessTable: () => {
-                  if (
-                    !fresh.supported ||
-                    !fresh.processes.some((p) => p.pid === record.pid)
-                  )
-                    return Promise.resolve(fresh);
-                  if (
-                    freshBoot !== boot ||
-                    (inherited &&
-                      (!marks.supported ||
-                        marks.marks.get(record.pid) !== life))
-                  )
-                    return Promise.resolve({
-                      supported: false,
-                      reason:
-                        'Boot or inherited ownership mark could not be confirmed at signal time',
-                    });
-                  return Promise.resolve(fresh);
-                },
-                reportAbstention: () => {
-                  /* Persisted by the journal before subsequent discovery. */
-                },
-              },
-            ),
+        preserved.get(record.pid)?.outcome ??
+        (await sendVerifiedSignal(
+          { kind: 'recorded-process', record },
+          'SIGKILL',
+          {
+            action: 'restart command cleanup',
+            readProcessTable: () => {
+              if (
+                !fresh.supported ||
+                !fresh.processes.some((p) => p.pid === record.pid)
+              )
+                return Promise.resolve(fresh);
+              if (
+                freshBoot !== boot ||
+                (inherited &&
+                  (!marks.supported || marks.marks.get(record.pid) !== life))
+              )
+                return Promise.resolve({
+                  supported: false,
+                  reason:
+                    'Boot or inherited ownership mark could not be confirmed at signal time',
+                });
+              return Promise.resolve(fresh);
+            },
+            reportAbstention: () => {
+              /* Committed with the batch before terminal queries. */
+            },
+          },
+        )),
     })),
+  );
+  // Verification abstentions, disappearances and delivery failures are also
+  // final decisions; terminal queries for other PIDs must not defer them.
+  commitDecisions(
+    new Map(results.map(({ record, outcome }) => [record.pid, { outcome }])),
   );
   const sent = results.filter((result) => result.outcome.status === 'sent');
   // Each Linux terminal query already fans out across up to 32 /proc files.
