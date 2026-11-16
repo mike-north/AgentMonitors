@@ -1291,8 +1291,10 @@ If any answer is "no", the change is underspecified.
 
 The internal external-envelope validator MUST have exact-limit accepted and
 one-past rejected cases for every exported enforcement limit (002 §16.1).
-UTF-8 fields require ASCII and multibyte cases, while canonical byte budgets
-include escaping. Container depth requires object, array and alternating paths.
+The exported table and boundary inputs MUST independently use the specification
+numbers. UTF-8 fields require ASCII and multibyte cases, including array scope
+values, while canonical scope and envelope byte budgets include escaping and
+non-ASCII data. Container depth requires object, array and alternating paths.
 Tests MUST distinguish permanent size/cardinality/depth overruns from malformed
 values, refuse each producer policy/path field, and compare repeated equivalent
 normalized values and canonical fingerprints.
@@ -1300,6 +1302,10 @@ normalized values and canonical fingerprints.
 Budget regressions MUST prove that oversized strings, wide containers and a
 32-level shared-child DAG are refused before canonical encoding/parsing. Counters
 or descriptor spies must show traversal stopping before later siblings after the
-first overrun. A guarded JSON entry point keeps a broken DAG implementation from
-exhausting the test process. `libs/core/src/external-ingress/contract.test.ts`
+first overrun. Rope-allocation and shared-child DAG cases run in child processes
+with a heap cap and external timeout; trusted descriptor counters installed before
+import can observe captured traversal. Post-load prototype replacements MUST
+neither execute hooks nor change admission or canonical bytes. An injected
+preflight undercount MUST still fail the independent output-size check.
+`libs/core/src/external-ingress/contract.test.ts`
 provides these examples alongside the §16 JSON-policy compatibility cases.

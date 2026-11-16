@@ -35,15 +35,22 @@ if (
 ) {
   Object.getOwnPropertyDescriptor = function (value, key) {
     descriptorVisits += 1;
-    if (value === observed && key === 'later') laterVisits += 1;
-    if (descriptorVisits > 50_000)
+    if (value === observed && key === 'later') {
+      laterVisits += 1;
+    }
+    if (descriptorVisits > 50_000) {
       throw new Error('Traversal exceeded its work bound');
+    }
     return originalDescriptor(value, key);
   };
 }
-const { validateExternalEventEnvelope, canonicalJsonStringify } =
-  await import('./contract.ts');
-Object.getOwnPropertyDescriptor = originalDescriptor;
+let contract;
+try {
+  contract = await import('./contract.ts');
+} finally {
+  Object.getOwnPropertyDescriptor = originalDescriptor;
+}
+const { validateExternalEventEnvelope, canonicalJsonStringify } = contract;
 descriptorVisits = 0;
 /** Match the small valid envelope used by the independent byte-budget bypass example. */
 const input = {
@@ -73,8 +80,9 @@ if (scenario === 'allocation') {
   assert.ok(growth < 16 * 1024 * 1024, `Admission allocated ${growth} bytes`);
 } else if (scenario === 'dag') {
   let state = {};
-  for (let depth = 1; depth < 32; depth += 1)
+  for (let depth = 1; depth < 32; depth += 1) {
     state = { left: state, right: state };
+  }
   input.state = state;
   const result = validateExternalEventEnvelope(input);
   assert.equal(result.error?.code, 'payload_too_large');
@@ -164,8 +172,11 @@ if (scenario === 'allocation') {
     });
     result = validateExternalEventEnvelope(input);
   } finally {
-    if (original) Object.defineProperty(Array.prototype, '0', original);
-    else delete Array.prototype[0];
+    if (original) {
+      Object.defineProperty(Array.prototype, '0', original);
+    } else {
+      delete Array.prototype[0];
+    }
   }
   assert.equal(calls, 0);
   assert.equal(result.error?.code, 'invalid_envelope');

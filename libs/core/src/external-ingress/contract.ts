@@ -4,6 +4,8 @@
  * Resource admission precedes canonical JSON validation and normalization.
  * @public
  */
+/* Admission uses indexed own-data traversal instead of mutable iterator protocols. */
+/* eslint-disable @typescript-eslint/prefer-for-of */
 import { Buffer } from 'node:buffer';
 import { types } from 'node:util';
 import type { ChangeKind } from '../observation/types.js';
@@ -13,6 +15,34 @@ import type { ExternalJsonObject } from './json.js';
 
 export { canonicalJsonStringify } from './json.js';
 export type { ExternalJsonObject, ExternalJsonValue } from './json.js';
+
+/** Captured intrinsics keep resource and semantic admission independent of later replacements. */
+const apply = Reflect.apply;
+const keysOf = Object.keys;
+const getPrototypeOf = Object.getPrototypeOf;
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const hasOwn = Object.hasOwn;
+const objectPrototype = Object.prototype;
+const isArray = Array.isArray;
+const isProxy = types.isProxy;
+const isSafeInteger = Number.isSafeInteger;
+const numberFrom = Number;
+const parseJson = JSON.parse;
+const NativeDate = Date;
+/* Receivers are supplied explicitly; no mutable call/apply method is used. */
+/* eslint-disable @typescript-eslint/unbound-method */
+const byteLength = Buffer.byteLength;
+const setHas = Set.prototype.has;
+const regexpExec = RegExp.prototype.exec;
+const setUTCFullYear = Date.prototype.setUTCFullYear;
+const setUTCHours = Date.prototype.setUTCHours;
+const getTime = Date.prototype.getTime;
+const getUTCHours = Date.prototype.getUTCHours;
+const getUTCMinutes = Date.prototype.getUTCMinutes;
+const getUTCSeconds = Date.prototype.getUTCSeconds;
+const getUTCDate = Date.prototype.getUTCDate;
+const getUTCMonth = Date.prototype.getUTCMonth;
+/* eslint-enable @typescript-eslint/unbound-method */
 
 /** Schema identifier for the first source-neutral external-event envelope. @public */
 export const EXTERNAL_EVENT_SCHEMA = 'agentmonitors.external-event.v1' as const;
@@ -213,6 +243,8 @@ const TOP_LEVEL_KEYS = new Set<string>([
   'scope',
   'state',
 ]);
+/** The complete schema cardinality is captured before its Set prototype can change. */
+const TOP_LEVEL_KEY_COUNT = TOP_LEVEL_KEYS.size;
 /** Producer identities share a UTF-8 bound independently of their character count. */
 const IDENTIFIER_FIELDS = [
   'monitorId',
@@ -247,36 +279,38 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   if (
     value === null ||
     typeof value !== 'object' ||
-    types.isProxy(value) ||
-    Array.isArray(value)
+    isProxy(value) ||
+    isArray(value)
   ) {
     return false;
   }
   try {
-    const prototype = Object.getPrototypeOf(value) as unknown;
-    return prototype === Object.prototype || prototype === null;
+    const prototype = getPrototypeOf(value) as unknown;
+    return prototype === objectPrototype || prototype === null;
   } catch {
     return false;
   }
 }
 
-/** Field limits count transport bytes rather than UTF-16 code units. */
-function utf8Bytes(value: string): number {
-  return Buffer.byteLength(value, 'utf8');
+/** UTF-16 length is a cheap lower bound that avoids flattening an already oversized rope. */
+function exceedsUtf8Bytes(value: string, limit: number): boolean {
+  return (
+    value.length > limit || apply(byteLength, Buffer, [value, 'utf8']) > limit
+  );
 }
 
 /** Permit RFC 3339 variants while refusing impossible dates and leap boundaries. */
 function isValidRfc3339(value: string): boolean {
-  const match = RFC3339.exec(value);
+  const match = apply(regexpExec, RFC3339, [value]);
   if (!match) return false;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const offsetHour = match[8] === undefined ? 0 : Number(match[8]);
-  const offsetMinute = match[9] === undefined ? 0 : Number(match[9]);
+  const year = numberFrom(match[1]);
+  const month = numberFrom(match[2]);
+  const day = numberFrom(match[3]);
+  const hour = numberFrom(match[4]);
+  const minute = numberFrom(match[5]);
+  const second = numberFrom(match[6]);
+  const offsetHour = match[8] === undefined ? 0 : numberFrom(match[8]);
+  const offsetMinute = match[9] === undefined ? 0 : numberFrom(match[9]);
   const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
   const daysInMonth = [
     31,
@@ -308,16 +342,19 @@ function isValidRfc3339(value: string): boolean {
   const offsetSign = match[7] === '-' ? -1 : 1;
   const offsetMilliseconds =
     offsetSign * (offsetHour * 60 + offsetMinute) * 60_000;
-  const local = new Date(0);
-  local.setUTCFullYear(year, month - 1, day);
-  local.setUTCHours(hour, minute, 59, 0);
-  const boundary = new Date(local.getTime() - offsetMilliseconds + 1_000);
+  const local = new NativeDate(0);
+  apply(setUTCFullYear, local, [year, month - 1, day]);
+  apply(setUTCHours, local, [hour, minute, 59, 0]);
+  const boundary = new NativeDate(
+    apply(getTime, local, []) - offsetMilliseconds + 1_000,
+  );
   return (
-    boundary.getUTCHours() === 0 &&
-    boundary.getUTCMinutes() === 0 &&
-    boundary.getUTCSeconds() === 0 &&
-    boundary.getUTCDate() === 1 &&
-    (boundary.getUTCMonth() === 0 || boundary.getUTCMonth() === 6)
+    apply(getUTCHours, boundary, []) === 0 &&
+    apply(getUTCMinutes, boundary, []) === 0 &&
+    apply(getUTCSeconds, boundary, []) === 0 &&
+    apply(getUTCDate, boundary, []) === 1 &&
+    (apply(getUTCMonth, boundary, []) === 0 ||
+      apply(getUTCMonth, boundary, []) === 6)
   );
 }
 
@@ -329,9 +366,8 @@ export function validateExternalEventEnvelope(
     return failure('invalid_envelope', 'Event envelope must be a JSON object.');
   }
   // Resource admission must finish before any canonical encoding or parsing.
-  let envelopeBytes: number;
   try {
-    envelopeBytes = envelopeJsonBytes(
+    envelopeJsonBytes(
       input,
       externalEventLimits.envelopeBytes,
       0,
@@ -350,10 +386,14 @@ export function validateExternalEventEnvelope(
   }
   // The preflight has refused accessors and proxies before these data reads.
   const candidate = input;
-  if (
-    Object.keys(candidate).length !== TOP_LEVEL_KEYS.size ||
-    Object.keys(candidate).some((key) => !TOP_LEVEL_KEYS.has(key))
-  ) {
+  const candidateKeys = keysOf(candidate);
+  let validFields = candidateKeys.length === TOP_LEVEL_KEY_COUNT;
+  for (let index = 0; index < candidateKeys.length; index += 1) {
+    if (!apply(setHas, TOP_LEVEL_KEYS, [candidateKeys[index]])) {
+      validFields = false;
+    }
+  }
+  if (!validFields) {
     return failure(
       'invalid_envelope',
       'Event envelope must contain exactly the version 1 top-level fields.',
@@ -368,7 +408,11 @@ export function validateExternalEventEnvelope(
       'External event schema is not supported.',
     );
   }
-  for (const field of IDENTIFIER_FIELDS) {
+  for (let index = 0; index < IDENTIFIER_FIELDS.length; index += 1) {
+    const field = IDENTIFIER_FIELDS[index];
+    if (field === undefined) {
+      continue;
+    }
     const value = candidate[field];
     if (typeof value !== 'string' || value.length === 0) {
       return failure(
@@ -376,7 +420,7 @@ export function validateExternalEventEnvelope(
         `Event envelope field "${field}" is invalid.`,
       );
     }
-    if (utf8Bytes(value) > externalEventLimits.identifierBytes) {
+    if (exceedsUtf8Bytes(value, externalEventLimits.identifierBytes)) {
       return failure(
         'payload_too_large',
         `Event envelope field "${field}" is too large.`,
@@ -384,7 +428,7 @@ export function validateExternalEventEnvelope(
     }
   }
   if (
-    !Number.isSafeInteger(candidate['objectSequence']) ||
+    !isSafeInteger(candidate['objectSequence']) ||
     (candidate['objectSequence'] as number) < 0
   ) {
     return failure(
@@ -392,7 +436,7 @@ export function validateExternalEventEnvelope(
       'Event envelope field "objectSequence" must be a non-negative safe integer.',
     );
   }
-  if (!CHANGE_KINDS.has(candidate['changeKind'] as ChangeKind)) {
+  if (!apply(setHas, CHANGE_KINDS, [candidate['changeKind']])) {
     return failure(
       'invalid_envelope',
       'Event envelope field "changeKind" is invalid.',
@@ -418,7 +462,10 @@ export function validateExternalEventEnvelope(
   }
 
   if (
-    utf8Bytes(candidate['resumeToken']) > externalEventLimits.resumeTokenBytes
+    exceedsUtf8Bytes(
+      candidate['resumeToken'],
+      externalEventLimits.resumeTokenBytes,
+    )
   ) {
     return failure(
       'payload_too_large',
@@ -430,40 +477,52 @@ export function validateExternalEventEnvelope(
   if (!isPlainRecord(scope)) {
     return failure('invalid_envelope', 'Event envelope scope is invalid.');
   }
-  if (Object.keys(scope).length > externalEventLimits.scopeKeys) {
+  const scopeKeys = keysOf(scope);
+  if (scopeKeys.length > externalEventLimits.scopeKeys) {
     return failure(
       'payload_too_large',
       'Event envelope has too many scope keys.',
     );
   }
-  for (const [key, value] of Object.entries(scope)) {
-    if (key.length === 0 || RESERVED_SCOPE_KEYS.has(key)) {
+  for (let index = 0; index < scopeKeys.length; index += 1) {
+    const key = scopeKeys[index];
+    if (key === undefined) {
+      continue;
+    }
+    const value = scope[key];
+    if (key.length === 0 || apply(setHas, RESERVED_SCOPE_KEYS, [key])) {
       return failure(
         'invalid_envelope',
         'Event envelope scope key is invalid.',
       );
     }
-    if (utf8Bytes(key) > externalEventLimits.scopeKeyBytes) {
+    if (exceedsUtf8Bytes(key, externalEventLimits.scopeKeyBytes)) {
       return failure(
         'payload_too_large',
         'Event envelope scope key is too large.',
       );
     }
-    const values: unknown[] = Array.isArray(value) ? value : [value];
+    const values: unknown[] = isArray(value) ? value : [value];
     if (values.length > externalEventLimits.scopeValuesPerKey) {
       return failure(
         'payload_too_large',
         'Event envelope has too many scope values.',
       );
     }
-    for (const item of values) {
+    for (let index = 0; index < values.length; index += 1) {
+      // Missing array elements remain invalid even when a prototype supplies a getter.
+      const descriptor = getOwnPropertyDescriptor(values, index);
+      const item: unknown =
+        descriptor && hasOwn(descriptor, 'value')
+          ? descriptor.value
+          : undefined;
       if (typeof item !== 'string') {
         return failure(
           'invalid_envelope',
           'Event envelope scope value is invalid.',
         );
       }
-      if (utf8Bytes(item) > externalEventLimits.scopeValueBytes) {
+      if (exceedsUtf8Bytes(item, externalEventLimits.scopeValueBytes)) {
         return failure(
           'payload_too_large',
           'Event envelope scope value is too large.',
@@ -501,7 +560,15 @@ export function validateExternalEventEnvelope(
       'Event envelope contains a non-JSON value.',
     );
   }
-  const normalized = JSON.parse(canonicalJson) as ExternalEventEnvelope;
+  // Verify the produced bytes independently: a counting defect must never admit an overrun.
+  const envelopeBytes: number = apply(byteLength, Buffer, [
+    canonicalJson,
+    'utf8',
+  ]);
+  if (envelopeBytes > externalEventLimits.envelopeBytes) {
+    return failure('payload_too_large', 'Event envelope is too large.');
+  }
+  const normalized = parseJson(canonicalJson) as ExternalEventEnvelope;
   return {
     success: true,
     envelope: normalized,

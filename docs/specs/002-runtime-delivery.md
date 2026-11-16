@@ -3609,7 +3609,15 @@ Shared acyclic children count on every occurrence: a 32-level shared-child DAG
 MUST be refused within the byte budget rather than expanded exponentially.
 As in §16, native own-key enumeration costs the container's width; descriptor and
 child traversal, string scanning, canonical output allocation and sorting are
-limited by admitted bytes. Array length can be refused before key enumeration.
+limited by admitted bytes. String length plus its quotes is checked before any
+code-unit read, preventing a rejected rope from flattening beyond the byte bound.
+Field UTF-8 checks also reject from length before measuring bytes. Array length
+can be refused before key enumeration. Captured module-load intrinsics and
+indexed own-data reads apply §16's no-caller-code and post-load prototype
+independence guarantees to both byte counting and semantic field validation.
+After encoding, a separate UTF-8 measurement of the actual canonical output MUST
+refuse an envelope over 262,144 bytes before normalization. This final check
+protects against a counting defect; preflight remains the primary resource bound.
 The preflight does not replace §16's JSON domain and prototype policies; only an
 input admitted by both boundaries can be normalized.
 
@@ -3636,4 +3644,9 @@ layer does not introduce a fingerprint API or semantic receipt identity.
 Validation: `external-ingress/contract.test.ts` pins every exact/+1 boundary,
 ASCII and multibyte field sizes, escaped canonical bytes, object/array/alternating
 depth, authority refusal, repeated canonical equivalence, inherited JSON policies,
-and counter/encoder-spy early stops for oversized strings, wide values and DAGs.
+and counter/encoder-spy early stops for oversized strings and wide values.
+Isolated child processes cap rope-allocation and shared-child DAG regressions,
+and exercise prototype replacements after import. The complete limits table and
+boundary inputs are pinned to specification numbers independently of the code;
+multibyte array values and canonical scope bytes include exact-limit acceptance.
+An injected undercount exercises the final output-size check.
