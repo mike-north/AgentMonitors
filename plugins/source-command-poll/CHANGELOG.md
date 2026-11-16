@@ -1,5 +1,94 @@
 # @agentmonitors/source-command-poll
 
+## 0.6.0
+
+### Minor Changes
+
+- 74543ad: Reconcile orphaned command-poll processes when the daemon starts on Linux, and record conservative ownership abstentions on macOS. Persist command ownership before spawning, verify boot and process identity before cleanup, and retain diagnostics for reaped processes and conservative abstentions, including detached descendants that keep their ownership marks.
+
+  Identify unreadable ownership marks by PID without attributing those processes to a command, and preserve those discovery abstentions before later identity queries.
+  Do not reclassify an already confirmed terminal incarnation as new unreadable work; reused identifiers with different process identities remain subject to discovery.
+
+  Require actual environment evidence for ownership: macOS system process listings mix argv and environment, so the shipped reader leaves same-user processes untouched with an explicit unproven-ownership reason. Linux retains environment-only ownership checks. A zombie/dead owner no longer suppresses reconciliation, and unavailable owner-state evidence withholds cleanup. Ownership queries are restricted to requested PIDs without per-survivor host-wide environment scans.
+
+  Record unchanged per-PID ownership uncertainty once and stop discovery when no signal was sent and no target was observed vanishing.
+
+  Apply one disappearance rule during initial discovery, gone batching, anchor confirmation, the signal gate and delivery ESRCH: retain the life and group suspicion and allow bounded rediscovery for marked late forks through the existing boot, mark and start-time gates. Remember a marked anchor's group before confirmation can lose it. Retire ownership only after fresh readable absence of its nonce, recorded group members and occupied recorded PIDs. Keep PID-only occupancy as a numeric suspicion during admission and restart, including reuse in another group, with no signal authority.
+
+  Retain original-group suspicion after direct-child exit so unmarked survivors receive conservative abstentions without numeric group signal authority. Continue verified late-fork cleanup despite unrelated unreadable ownership, preserving incomplete receipts and retryable lives.
+
+  Deduplicate unchanged unreadable-PID abstentions across post-signal snapshots. Retain original-group suspicion after a confirmed parent reap across journal reopenings, and retire the life only after no group member remains.
+
+  Batch gone-PID restart accounting and retire empty group hints at subsequent command admissions so completed commands do not accumulate unbounded restart work. Preserve possible-survivor suspicions and the life nonce for detached marked work when retiring empty hints. A hint refreshed during an admission read remains retained until a later snapshot confirms it empty; unrelated bookkeeping does not block empty-hint retirement. Persist newly discovered marked groups before signalling their anchors, retaining unmarked-survivor abstentions across journal reopenings. Keep distinct unreadable PIDs and changed uncertainty reasons as separate diagnostic outcomes.
+
+### Patch Changes
+
+- Updated dependencies [f071830]
+- Updated dependencies [85cce73]
+- Updated dependencies [17e29aa]
+- Updated dependencies [74543ad]
+- Updated dependencies [17e29aa]
+- Updated dependencies [17e29aa]
+  - @agentmonitors/core@0.15.0
+
+## 0.5.0
+
+### Minor Changes
+
+- 2380ebe: Commit each finite poll span, its ordered retry suffix, and source/notify checkpoints together before optional interpretation. Preserve committed recipient-cache state when admission rolls back.
+
+  When the retry outbox cannot hold a failed observation's whole ordered suffix, because the monitor's outbox is full or a value cannot be stored (such as a BigInt payload), that observation is recorded as `errored` with the reason. Its siblings still materialize and the source checkpoint advances, so the monitor keeps making progress. A rollup window clears its held batch only in the same commit as the flushed observations. A flush that fails leaves the window held and reports the error.
+
+  Breaking source-plugin migration (pre-1.0): `watch()` now yields finite `ObservationResult` batches,
+  not individual observations, and `ObservationContext.checkpoint` is removed. Yield
+  `{ observations: [...], nextState }` so all covered observations and the source checkpoint commit
+  together before interpretation or the next iterator pull. Empty batches support baseline-only
+  updates. Failed admission stops the iterator and preserves the old baseline; legacy bare yields
+  are rejected. Poll signatures are unchanged.
+
+  The five bundled source packages publish the same source contracts through their exported types and
+  default source values. Their minor releases carry this breaking type migration too, even though
+  their own implementations use polling and require no runtime changes.
+
+### Patch Changes
+
+- 36307ad: Verify a process's identity immediately before every cleanup signal. Core adds `sendVerifiedSignal` and `readProcessTable`: a target is signalled only while its spawned child is still unreaped, when a recorded process (pid and start time, read from `/proc` on Linux or `/bin/ps` on macOS) is still present, or, for a process group, while the group can be shown to be the same one (a member confirmed earlier is still in it). Otherwise the signal is withheld and a warning names what was left alone and why.
+
+  `sendVerifiedSignal` also accepts `trackMembership` (`GroupMembershipTracking`): after a step signals a process group, the gate keeps reading the group's membership every 250 ms, one read at a time, until the next step starts, so a member that forks a process and later exits passes the group on to it. Tracking stops on an empty group, on lost continuity, at `untilMs`, or when its abort signal fires, and its timers never keep the process alive.
+
+  `command-poll` timeouts still escalate from SIGTERM to SIGKILL across the command's process group, including processes the command forks after the SIGTERM step, processes a member that ignores SIGTERM forks during the grace period before exiting, and commands that exit while the SIGTERM step is checking the group. The SIGKILL follow-up now skips a group that has emptied, and leaves a group alone, with a warning, only when none of its current members was ever confirmed as part of it or the process table cannot be read. One case still escapes the timeout's bound: after the command itself has exited, a member that forks a process and exits between two consecutive readings (within one 250 ms interval plus one read, and the read time grows under load, up to the 5 s `ps` cap), while no other confirmed member is alive, leaves that process unconfirmed, and it is left alone with a warning. `daemon run --detach` failure cleanup and `verify` teardown signal only their own unreaped child, never a pid left behind by a child that has already exited.
+
+- Updated dependencies [ab9b6ad]
+- Updated dependencies [71c44fa]
+- Updated dependencies [2380ebe]
+- Updated dependencies [65351d0]
+- Updated dependencies [cb92b95]
+- Updated dependencies [d30c9a1]
+- Updated dependencies [3b205ed]
+- Updated dependencies [57e2878]
+- Updated dependencies [3b205ed]
+- Updated dependencies [f194a12]
+- Updated dependencies [e9f3fdf]
+- Updated dependencies [aa5b437]
+- Updated dependencies [820c190]
+- Updated dependencies [36307ad]
+- Updated dependencies [587d0a9]
+- Updated dependencies [caa2452]
+- Updated dependencies [2380ebe]
+- Updated dependencies [7265259]
+- Updated dependencies [d6c56a3]
+- Updated dependencies [ae08f21]
+- Updated dependencies [587d0a9]
+- Updated dependencies [1cbef80]
+- Updated dependencies [2380ebe]
+- Updated dependencies [8ce3139]
+- Updated dependencies [587d0a9]
+- Updated dependencies [28e6e00]
+- Updated dependencies [7c30c92]
+- Updated dependencies [d1649cf]
+- Updated dependencies [2380ebe]
+  - @agentmonitors/core@0.14.0
+
 ## 0.4.0
 
 ### Minor Changes

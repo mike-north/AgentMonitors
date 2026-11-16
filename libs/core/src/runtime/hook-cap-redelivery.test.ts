@@ -76,7 +76,7 @@ function nextTime(): Date {
 
 /**
  * Materialize one shared high-urgency event and project it into the workspace's
- * lead sessions (as `processObservation` would). Distinct `objectKey`s keep the
+ * lead sessions (as `materializeObservation` would). Distinct `objectKey`s keep the
  * default `net` collapse from folding events together unless a test intends it.
  */
 function materializeHigh(

@@ -1,6 +1,7 @@
-/** JSON Schema type — a plain object describing a JSON Schema fragment. */
+/** Source-plugin contracts separate acquisition and restart state from runtime delivery. */
 import type { Urgency } from '../schema/types.js';
 
+/** JSON Schema describing source configuration accepted at the plugin boundary. */
 export type JsonSchema = Record<string, unknown>;
 
 /**
@@ -117,6 +118,7 @@ export interface Observation {
   snapshot?: unknown;
 }
 
+/** Runtime-owned context shared by one-shot observations and continuous batch producers. */
 export interface ObservationContext {
   /** Persisted state from the previous observation cycle */
   previousState?: unknown;
@@ -135,38 +137,22 @@ export interface ObservationContext {
    * Unused by one-shot `observe()`.
    */
   signal?: AbortSignal;
-  /**
-   * Watch-mode source-state checkpoint (002 §2.4). Supplied **only** on the
-   * `watch()` path; `observe()` advances source state via
-   * {@link ObservationResult.nextState} instead and never receives this callback.
-   *
-   * A long-lived `watch()` source that keeps in-memory change-detection state
-   * (e.g. a file-fingerprint map) calls `checkpoint(updatedState)` to durably
-   * write that state back into the monitor's persisted `sourceState`,
-   * independent of yielding an observation. The returned promise resolves once
-   * the write is durable, so on a mid-watch daemon crash the restart reconciles
-   * from the checkpointed baseline rather than re-emitting already-delivered
-   * changes.
-   *
-   * The runtime serializes checkpoint writes with observation ingestion
-   * per-watcher: a checkpoint in flight when an observation arrives completes
-   * **before** that observation is ingested (the G14 durable-write-before-ingest
-   * ordering). A checkpoint is a state write only — it never materializes or
-   * delivers an observation. A checkpoint whose durable write fails does **not**
-   * abort the watcher (a transient durability gap, not a protocol violation): the
-   * runtime logs a warning and the promise still resolves, so a source that does
-   * not guard the call keeps watching. Sources **SHOULD** checkpoint roughly at
-   * their configured `interval` and **MAY** coalesce rapid requests.
-   *
-   * @see docs/specs/002-runtime-delivery.md §2.4
-   */
-  checkpoint?: (nextState: unknown) => Promise<void>;
 }
 
+/**
+ * One finite source admission unit, returned by observe() or yielded by watch().
+ * Observations and their associated restart state commit together before the
+ * runtime interprets any member or requests a subsequent watch batch.
+ */
 export interface ObservationResult {
+  /** All source observations covered by this batch's checkpoint; empty is valid. */
   observations: Observation[];
   /**
-   * Persisted state to use during the next observation cycle.
+   * Restart baseline associated with this batch, committed only when every
+   * observation is durably admitted as an event, retained retry, held notify
+   * work, or policy suppression. Omitted/undefined preserves the prior baseline;
+   * null resets to the existing empty object representation. The checkpoint
+   * must not skip work outside this finite batch.
    *
    * This is the source's **own change-detection state** (file fingerprints, the
    * last API body, a last-seen commit SHA) — used only to decide *whether* to
@@ -214,15 +200,19 @@ export interface ObservationSource {
     context: ObservationContext,
   ): Promise<ObservationResult>;
   /**
-   * Optional continuous watch mode. A source that opts in yields observations as
-   * they happen; the runtime drives it via `AgentMonitorRuntime.watchMonitors()`,
-   * funnelling each yielded observation through the same notify dispatch, event
-   * materialization, and session projection pipeline as `observe()`. The source
-   * **SHOULD** stop yielding when `context.signal` aborts. `observe()` remains
-   * required (it is the fallback for one-shot ticks, e.g. `daemon once`).
+   * Continuous finite batches of observations and their associated restart state.
+   * Use the same result shape as observe(); an empty observations array can
+   * checkpoint without new source observations. There is no independent context
+   * checkpoint callback. Legacy bare-observation yields are unsupported.
+   *
+   * The runtime admits each complete batch before Interpret or the next iterator
+   * pull. Failed admission stops the iterator with the old baseline unchanged.
+   * Source acquisition must remain replayable from that baseline; committing a
+   * batch is not delivery or agent acknowledgement. Stop and release resources
+   * when context.signal aborts. observe() remains the one-shot/restart fallback.
    */
   watch?(
     config: Record<string, unknown>,
     context: ObservationContext,
-  ): AsyncIterable<Observation>;
+  ): AsyncIterable<ObservationResult>;
 }

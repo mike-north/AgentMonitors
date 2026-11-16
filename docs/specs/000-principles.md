@@ -92,3 +92,4 @@ The current repository contains both public-facing docs and implementation code.
 | AP6, PP5, PP10                                              | [005 — CLI Reference](./005-cli-reference.md)                                                           |
 | PP4, PP9–PP10, AP1, AP3, AP6–AP7, BP2, NP5                  | [006 — Agent Integration & Delivery Transports](./006-agent-integration.md)                             |
 | PP1, PP4, PP9–PP10, AP3, AP6–AP7, SP4–SP5, BP1–BP2, NP5     | [007 — Agent-Facing Interaction, Ephemeral Monitors & Observability](./007-agent-facing-interaction.md) |
+| PP7, BP1, BP4, NP4                                          | [008 — Reliability & Process Hygiene](./008-reliability-process-hygiene.md)                             |

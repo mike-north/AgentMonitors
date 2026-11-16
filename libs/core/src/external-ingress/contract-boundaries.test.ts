@@ -1,3 +1,8 @@
+/**
+ * Consumer bounds and semantic identity for the versioned external envelope.
+ * @see docs/specs/002-runtime-delivery.md section 2.6
+ * @see docs/specs/004-validation-testing.md section 2.9
+ */
 import { describe, expect, it } from 'vitest';
 import {
   canonicalJsonStringify,
@@ -73,7 +78,7 @@ describe('external ingress exact boundaries', () => {
             .success,
         ).toBe(true);
       }
-      expectError(envelope({ [field]: exactUtf8(513) }), 'invalid_envelope');
+      expectError(envelope({ [field]: exactUtf8(513) }), 'payload_too_large');
     }
   });
 
@@ -89,7 +94,7 @@ describe('external ingress exact boundaries', () => {
       envelope({
         resumeToken: exactUtf8(externalEventLimits.resumeTokenBytes + 1),
       }),
-      'invalid_envelope',
+      'payload_too_large',
     );
     expectError(envelope({ resumeToken: '' }), 'invalid_envelope');
 
@@ -104,7 +109,7 @@ describe('external ingress exact boundaries', () => {
       envelope({
         scope: { [exactUtf8(externalEventLimits.scopeKeyBytes + 1)]: 'v' },
       }),
-      'invalid_envelope',
+      'payload_too_large',
     );
     expect(
       validateExternalEventEnvelope(
@@ -117,7 +122,7 @@ describe('external ingress exact boundaries', () => {
       envelope({
         scope: { key: exactUtf8(externalEventLimits.scopeValueBytes + 1) },
       }),
-      'invalid_envelope',
+      'payload_too_large',
     );
   });
 
@@ -182,7 +187,7 @@ describe('external ingress exact boundaries', () => {
       ).toBe(true);
       expectError(
         envelope({ state: nestedState(33, mode) }),
-        'invalid_envelope',
+        'payload_too_large',
       );
     }
     expect(

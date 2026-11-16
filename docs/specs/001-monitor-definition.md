@@ -58,6 +58,40 @@ The parser **MUST**:
 
 > Verified: `libs/core/src/parser/parse-monitor.ts` — trimming at line 49 (`parsed.content.trim()`); `filePath` stored at line 51; schema validation via `monitorFrontmatterSchema.safeParse` at line 36.
 
+### Monitor input admission (current)
+
+Before YAML parsing, monitor content (frontmatter and body together) MUST be at
+most **1,048,576 UTF-8 bytes**. File reads are bounded to that limit plus one byte,
+so file growth cannot bypass admission. Direct `parseMonitorFile` calls and asynchronous
+`scanMonitors` discovery share this read budget; runtime ticks, CLI validation, and
+CLI scans therefore reject oversized files before allocating or decoding their full contents. Before element validation, `tags` MUST
+contain at most **256** entries and `shape.derive` at most **128** rules. These
+collection limits apply to exported schemas as well as the parser; an oversized collection
+produces one issue at its field path without inspecting its elements or compiling
+its predicates. The declaration MUST itself be a raw array: Promises and other
+non-arrays are rejected as array type errors in both synchronous and asynchronous
+parsing, before any implicit unwrapping. An oversized raw array remains an
+`INPUT_LIMIT_EXCEEDED` admission error. Exact limits are accepted; ordinary field
+validation still applies.
+
+Diagnostic formatting MUST retain the same file budget. CLI `validate` skips
+legacy-shape hint reads for admission errors; ordinary parse errors may receive a
+hint only after another bounded read, including when the file grows or is replaced
+after discovery. The shared `readMonitorFileSync` helper reads without parsing,
+returns `undefined` without decoding oversized content, closes its descriptor on
+every path, and propagates filesystem errors to the caller.
+
+These budgets allow generous human-authored configuration while bounding validation
+work. Derive rules have a tighter budget because each rule compiles a predicate.
+They do not limit observation payloads or claim safety for arbitrary YAML aliases
+or source-plugin validation. `parseMonitor`/`parseMonitorFile` return `ok: false`,
+`filePath`, a bounded error message, and `code: INPUT_LIMIT_EXCEEDED` for admission
+failures. Other parse errors retain their existing shape.
+
+Verified: `libs/core/src/schema/input-limits.test.ts` and
+`libs/core/src/parser/parse-monitor.ts`. The editor schema advertises the tag cap;
+its existing lack of a complete shape schema is unchanged.
+
 The scanner discovers monitors using two glob passes relative to the supplied base directory:
 
 1. **Folder monitors**: `**/MONITOR.md`, then excluding any match at depth-0 — a folder monitor is
@@ -325,7 +359,7 @@ The stored value is the trimmed body — leading and trailing whitespace are rem
 > predicates, `render: rendered`, malformed-CEL rejection); `libs/core/src/runtime/shape.ts`
 > (`computeDerivedFacts` pure over `(snapshot, now)`, `renderArtifact` byte-stable);
 > `libs/core/src/runtime/diff.ts` (`renderShapeArtifact`); wired in
-> `libs/core/src/runtime/service.ts` (`processObservation` → `shapeObservation`, diffing the rendered
+> `libs/core/src/runtime/service.ts` (`materializeObservation` → `shapeObservation`, diffing the rendered
 > artifact). Proven by `libs/core/src/runtime/shape.test.ts`,
 > `libs/core/src/runtime/shape-stage.test.ts`, and `libs/core/src/schema/monitor-schema.test.ts`.
 
@@ -347,6 +381,19 @@ shape:
 
 Authoring rules:
 
+- **`shape` MUST be a mapping (current).** An omitted declaration, `{}`, and a
+  mapping such as `{render: rendered}` are valid. Scalar timestamps such as
+  `shape: 2026-11-03` are rejected even when the YAML loader represents them as
+  `Date` objects; they MUST NOT normalize to an empty declaration. The exported
+  `shapeSchema` and `monitorFrontmatterSchema` enforce the same boundary for
+  direct consumers. Programmatic inputs retain the historical object boundary:
+  `Date`, `Map`, `Set`, and objects with both callable `then` and `catch` are
+  rejected before normalization. Synchronous `safeParse` returns validation
+  failure for native Promises; asynchronous validation MUST NOT await an invalid
+  input into a valid declaration. Other objects retain their previous admission
+  (including null-prototype mappings, `RegExp`, `WeakMap`, `WeakSet`, and typed
+  arrays); this is not a new plain-object restriction. Parser and schema
+  regression tests cover these boundaries and preserve the mapping controls.
 - **`shape.derive`** is an ordered list of named derived facts. Each entry has a `name` (the marker
   surfaced in the rendered artifact) and a deterministic `when` **CEL boolean predicate** evaluated
   over `(snapshot, now)` — the shaped snapshot plus the runtime-injected `now` (never an ambient
@@ -734,3 +781,12 @@ Once the sigil-based glob scope logic is implemented, `agentmonitors validate` M
 
 See [003 §3.5](./003-source-plugins.md) for the full source-level validation rules and the
 required test matrix.
+
+### Validation library contract
+
+The exported monitor schemas use Zod 4 types. Parsed monitor fields and authored
+validation messages retain their contracts; consumers composing exported schemas
+must use Zod 4-compatible APIs. `shapeSchema` is a preprocessing pipe into its
+mapping validator so scalar admission is checked before object normalization;
+its authored input and parsed output types are unchanged. Library-generated
+issue details follow Zod 4.

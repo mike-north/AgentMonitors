@@ -114,7 +114,7 @@ function openLead(h: Harness, hostSessionId: string): string {
 
 /**
  * Materialize ONE shared HIGH-urgency event for {@link OBJECT_KEY} carrying
- * `artifact`, exactly as `processObservation` does: diff against the latest
+ * `artifact`, exactly as `materializeObservation` does: diff against the latest
  * stored snapshot for the SHARED `monitor_events.diff_text`, project + compute
  * each recipient's per-recipient `diff_text` inside `insertEvent`, then persist
  * the new snapshot. Returns the event id.

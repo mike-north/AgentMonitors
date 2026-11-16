@@ -83,7 +83,7 @@ beforeEach(() => {
   );
 
   socketPath = path.join(
-    '/tmp',
+    tmpdir(),
     `am-reaper-lease-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
   );
   dbPath = path.join(workspace, 'am.db');
@@ -226,7 +226,7 @@ function seedChannelHeartbeat(
     cliPath: '/usr/local/bin/agentmonitors',
     execPath: process.execPath,
     version: '9.9.9',
-    home: process.env['HOME'] ?? '/tmp',
+    home: process.env['HOME'] ?? tmpdir(),
     dataRoot: dataHome,
     workspacePath: workspace,
     socketPath: socketPathOverride ?? socketPath,
@@ -349,7 +349,7 @@ describe('daemon reaper heartbeat lease (issue #435 Option A)', () => {
           cliPath: '/usr/local/bin/agentmonitors',
           execPath: process.execPath,
           version: '9.9.9',
-          home: process.env['HOME'] ?? '/tmp',
+          home: process.env['HOME'] ?? tmpdir(),
           dataRoot: dataHome,
           workspacePath: workspace,
           socketPath,
@@ -433,7 +433,7 @@ describe('daemon reaper heartbeat lease (issue #435 Option A)', () => {
       try {
         openThenCloseSession('other-daemon-listener');
         const otherSocketPath = path.join(
-          '/tmp',
+          tmpdir(),
           `am-reaper-lease-other-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
         );
         seedChannelHeartbeat(

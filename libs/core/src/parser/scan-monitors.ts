@@ -1,8 +1,9 @@
-import { readFile } from 'node:fs/promises';
+/** Discover monitor definitions through bounded intake, retaining per-file diagnostics. */
 import path from 'node:path';
 import { globSync } from 'glob';
 import type { ParseError, ParseOutcome, ParseResult } from './parse-monitor.js';
-import { parseMonitor } from './parse-monitor.js';
+import { monitorByteLimitError, parseMonitor } from './parse-monitor.js';
+import { readMonitorFile } from './read-monitor-file.js';
 
 /**
  * A monitor id derived from a directory name or a flat filename that more than one
@@ -62,8 +63,10 @@ export async function scanMonitors(baseDir: string): Promise<ScanResult> {
     matches.map(async (filePath) => {
       const absolutePath = path.resolve(filePath);
       try {
-        const content = await readFile(absolutePath, 'utf-8');
-        return parseMonitor(content, absolutePath);
+        const content = await readMonitorFile(absolutePath);
+        return content === undefined
+          ? monitorByteLimitError(absolutePath)
+          : parseMonitor(content, absolutePath);
       } catch {
         return {
           ok: false as const,

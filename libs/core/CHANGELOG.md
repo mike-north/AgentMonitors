@@ -1,5 +1,206 @@
 # @agentmonitors/core
 
+## 0.15.0
+
+### Minor Changes
+
+- 17e29aa: Add `agentmonitors monitor retry rearm <monitorId> <retryId>` and `agentmonitors monitor retry skip <monitorId> <retryId> [--reason <text>]` to get a monitor stopped by a terminal materialization retry moving again. Re-arm returns the retry to automatic retry; once it completes, the monitor takes newer input in order. Skip records the retry's observation as an outstanding loss, like any other dropped observation, with the retry's last error followed by `Retry skipped after <n> failed attempts[: <reason>].`; `doctor` and `monitor explain` report it until a later event for the same object supersedes it, and the monitor resumes. Both name the retry as `monitor explain` and `doctor` list it, refuse a retry that is not terminal, and work through the daemon or, with no daemon running, directly against the workspace's store. A daemon that received the request but did not reply is reported as an unknown outcome, never repaired a second time from the CLI. A skip's `--reason` is at most 200 characters.
+
+  When the retry's observation is a `verify` scratch artifact whose cleanup has taken effect, either command removes the retry as verify-artifact cleanup instead: no loss is recorded, `rearm` does not re-arm it, and the monitor resumes. The command says so, and its JSON output carries `outcome: "verify-artifact-cleanup"` (otherwise `"rearmed"` or `"skipped"`).
+
+  The tick report, the `monitor explain` materialization reason and the `doctor` remediation for a stopped monitor now name both commands.
+
+  Core adds `AgentMonitorRuntime.rearmMaterializationRetry()` and `skipMaterializationRetry()`, which return a `MaterializationRetryRepairResult` (`outcome`, a `MaterializationRetryRepairOutcome`, and the retry's safe metadata), with the `MaterializationRetryRepairInput` and `MaterializationRetrySkipInput` input types and the `MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH` bound.
+
+- 74543ad: Reconcile orphaned command-poll processes when the daemon starts on Linux, and record conservative ownership abstentions on macOS. Persist command ownership before spawning, verify boot and process identity before cleanup, and retain diagnostics for reaped processes and conservative abstentions, including detached descendants that keep their ownership marks.
+
+  Identify unreadable ownership marks by PID without attributing those processes to a command, and preserve those discovery abstentions before later identity queries.
+  Do not reclassify an already confirmed terminal incarnation as new unreadable work; reused identifiers with different process identities remain subject to discovery.
+
+  Require actual environment evidence for ownership: macOS system process listings mix argv and environment, so the shipped reader leaves same-user processes untouched with an explicit unproven-ownership reason. Linux retains environment-only ownership checks. A zombie/dead owner no longer suppresses reconciliation, and unavailable owner-state evidence withholds cleanup. Ownership queries are restricted to requested PIDs without per-survivor host-wide environment scans.
+
+  Record unchanged per-PID ownership uncertainty once and stop discovery when no signal was sent and no target was observed vanishing.
+
+  Apply one disappearance rule during initial discovery, gone batching, anchor confirmation, the signal gate and delivery ESRCH: retain the life and group suspicion and allow bounded rediscovery for marked late forks through the existing boot, mark and start-time gates. Remember a marked anchor's group before confirmation can lose it. Retire ownership only after fresh readable absence of its nonce, recorded group members and occupied recorded PIDs. Keep PID-only occupancy as a numeric suspicion during admission and restart, including reuse in another group, with no signal authority.
+
+  Retain original-group suspicion after direct-child exit so unmarked survivors receive conservative abstentions without numeric group signal authority. Continue verified late-fork cleanup despite unrelated unreadable ownership, preserving incomplete receipts and retryable lives.
+
+  Deduplicate unchanged unreadable-PID abstentions across post-signal snapshots. Retain original-group suspicion after a confirmed parent reap across journal reopenings, and retire the life only after no group member remains.
+
+  Batch gone-PID restart accounting and retire empty group hints at subsequent command admissions so completed commands do not accumulate unbounded restart work. Preserve possible-survivor suspicions and the life nonce for detached marked work when retiring empty hints. A hint refreshed during an admission read remains retained until a later snapshot confirms it empty; unrelated bookkeeping does not block empty-hint retirement. Persist newly discovered marked groups before signalling their anchors, retaining unmarked-survivor abstentions across journal reopenings. Keep distinct unreadable PIDs and changed uncertainty reasons as separate diagnostic outcomes.
+
+- 17e29aa: Preserve the retry workspace in repair commands printed by explain and runtime diagnostics so pasted commands address the reported retry from any directory. Share the POSIX shell argument helpers between core diagnostics and CLI suggestions, including paths with quotes and shell metacharacters.
+
+  Place repair flags before `--` and monitor/retry IDs after it in explain, runtime diagnostics, and doctor suggestions so monitors whose names begin with `-` can be repaired by pasting the printed commands.
+
+  Apply the same option terminator to every follow-up explain/history hint printed by retry repairs and doctor, including dropped observations, pending retries and orphan retained work. Core and CLI share an internal monitor command builder that owns shell quoting and flag/ID ordering without adding a public API or changing runtime repair diagnostic text.
+
+### Patch Changes
+
+- f071830: Bundle the CEL parser and its dependencies into the published build instead of installing them separately. A fresh install of `@agentmonitors/core` no longer pulls in `lodash-es@4.17.21` (GHSA-r5fr-rjxr-66jc) through `cel-js` and `chevrotain`. The bundled packages' license notices ship in `THIRD_PARTY_NOTICES.md`. CEL behavior is unchanged.
+
+  Keep live advisory coverage for the exact bundled package versions by deriving actual bundled inputs from fresh build metafiles and checking their exact versions against the workspace lockfile, including default-inlined imports and injected shims. Production and bundled code share the same scoped, expiring advisory exceptions.
+
+- 85cce73: Upgrade glob to 14.0.6 to fix moderate glob cancellation and minimatch pattern amplification advisories. Preserve monitor discovery and file-fingerprint matching for existing patterns, including directory filtering and default dotfile exclusion.
+- 17e29aa: Wake a paused watcher when its host synchronously re-arms or skips terminal work from onError. Release the repair wait when the host callback throws, as well as on wake, timeout and watcher shutdown.
+
+## 0.14.0
+
+### Minor Changes
+
+- 2380ebe: Commit each finite poll span, its ordered retry suffix, and source/notify checkpoints together before optional interpretation. Preserve committed recipient-cache state when admission rolls back.
+
+  When the retry outbox cannot hold a failed observation's whole ordered suffix, because the monitor's outbox is full or a value cannot be stored (such as a BigInt payload), that observation is recorded as `errored` with the reason. Its siblings still materialize and the source checkpoint advances, so the monitor keeps making progress. A rollup window clears its held batch only in the same commit as the flushed observations. A flush that fails leaves the window held and reports the error.
+
+  Breaking source-plugin migration (pre-1.0): `watch()` now yields finite `ObservationResult` batches,
+  not individual observations, and `ObservationContext.checkpoint` is removed. Yield
+  `{ observations: [...], nextState }` so all covered observations and the source checkpoint commit
+  together before interpretation or the next iterator pull. Empty batches support baseline-only
+  updates. Failed admission stops the iterator and preserves the old baseline; legacy bare yields
+  are rejected. Poll signatures are unchanged.
+
+  The five bundled source packages publish the same source contracts through their exported types and
+  default source values. Their minor releases carry this breaking type migration too, even though
+  their own implementations use polling and require no runtime changes.
+
+- 65351d0: Bound monitor files to 1 MiB through shared bounded reads in direct parsing and production scans, tags to 256 entries, and derive rules to 128 before element validation. Exported collection schemas now preprocess admission, and parse errors optionally carry INPUT_LIMIT_EXCEEDED. Bound daemon requests to 1 MiB, 1000 entries per collection, 10000 values, and depth 32 before schema validation or runtime mutation. Rejected requests return a structured wire error without affecting existing sessions.
+
+  Integrate with Zod 4 while retaining native Shape rejection. Admission errors use only own envelope IDs, decoded traversal avoids copying container values, and raw-frame diagnostics describe bytes before decoding.
+
+  Keep validation hints within the monitor read budget, including files that grow or are replaced after discovery, and expose the existing bounded synchronous reader for diagnostic consumers. Reject Promise and other non-array collection declarations before async preprocessing can unwrap them; preserve raw-array admission and ordinary type diagnostics.
+
+- d30c9a1: Complete retained work before taking newer source input. A monitor whose observations are waiting in the retry outbox now retries them, oldest first, before its source is called again or a watcher pulls its next batch, so events are never materialized out of order. While a retry fails or backs off the monitor pauses and says so: each failed attempt is reported as an errored observation with an `errored` history row, a backing-off retry shows up as a skipped monitor with its next attempt time, and a retry that has stopped after its last attempt is reported on every tick until it is re-armed. Retained work left from before a restart drains first, in its original order, exactly once. Held notify work also waits behind retained work. Sessions now record their position in the event order when they are first registered (a new nullable `agent_sessions.registration_sequence` column, added on open), and a retry that completes late is delivered only to sessions that existed when its observation was accepted, even when a session was opened in the same second.
+- 57e2878: Add a bounded durable outbox for retrying failed observation materialization.
+
+  Reject values that JSON would silently normalize, including negative zero and customized observation timestamps, before persisting any retry batch member.
+
+  Reject proxy envelopes and proxy prototypes before traps run, using intrinsic Date detection; validate route data before invoking property reads.
+
+  Reject detectable intrinsic built-ins even after their prototypes are replaced. Document the caller-owned plain-data domain and the limits of detecting unobservable private state.
+
+- 36307ad: Verify a process's identity immediately before every cleanup signal. Core adds `sendVerifiedSignal` and `readProcessTable`: a target is signalled only while its spawned child is still unreaped, when a recorded process (pid and start time, read from `/proc` on Linux or `/bin/ps` on macOS) is still present, or, for a process group, while the group can be shown to be the same one (a member confirmed earlier is still in it). Otherwise the signal is withheld and a warning names what was left alone and why.
+
+  `sendVerifiedSignal` also accepts `trackMembership` (`GroupMembershipTracking`): after a step signals a process group, the gate keeps reading the group's membership every 250 ms, one read at a time, until the next step starts, so a member that forks a process and later exits passes the group on to it. Tracking stops on an empty group, on lost continuity, at `untilMs`, or when its abort signal fires, and its timers never keep the process alive.
+
+  `command-poll` timeouts still escalate from SIGTERM to SIGKILL across the command's process group, including processes the command forks after the SIGTERM step, processes a member that ignores SIGTERM forks during the grace period before exiting, and commands that exit while the SIGTERM step is checking the group. The SIGKILL follow-up now skips a group that has emptied, and leaves a group alone, with a warning, only when none of its current members was ever confirmed as part of it or the process table cannot be read. One case still escapes the timeout's bound: after the command itself has exited, a member that forks a process and exits between two consecutive readings (within one 250 ms interval plus one read, and the read time grows under load, up to the 5 s `ps` cap), while no other confirmed member is alive, leaves that process unconfirmed, and it is left alone with a warning. `daemon run --detach` failure cleanup and `verify` teardown signal only their own unreaped child, never a pid left behind by a child that has already exited.
+
+- 587d0a9: Expose workspace-isolated retry metadata in core explain and doctor reports, retaining actionable summaries for missing, invalid and ambiguous monitor definitions without exposing captured observations.
+- caa2452: Add bounded retry backoff, terminal re-arm, summary, and atomic completion operations. Completion owns synchronous event materialization rather than accepting callbacks, rejects terminal work until rearmed, and preserves retained work on failure. Expose typed lifecycle errors, keep retry diagnostics single-line, and round persisted deadlines upward so delays never shorten.
+- 7265259: Editing a monitor no longer leaves any doubt about already-pending events: they are delivered with
+  the urgency, title and body they were observed under, and this is now covered by tests and stated in
+  the delivery spec. `monitor explain` also reports how many pending events predate the monitor's
+  current definition (urgency, body, name, source configuration, shape, payload or baseline strategy changed since they were observed), and
+  `MonitorEventRecord` gains an optional `definitionFingerprint` field.
+- ae08f21: Upgrade direct validation to patched Zod 4 and raise MCP SDK and TOON dependency floors. Exported schema objects now use Zod 4 schema types; parsed monitor fields and authored validation messages retain their contracts. Preserve historical Shape admission by rejecting Date (including YAML timestamps), Map, Set, and objects with callable then/catch before normalization or promise assimilation; synchronous and asynchronous validation return failures for these inputs while retaining other object controls; the exported Shape validator uses a preprocessing pipe with unchanged authored input and parsed output types. The MCP SDK v3 compatibility path and external cel-js lodash dependency remain separately documented security limitations.
+- 1cbef80: Existing monitors with config rejected by their source schema now stop observing intentionally. Runtime ticks and continuous watcher startup validate before source effects; daemon output, monitor explain and doctor show the same diagnostic as validate. Correct the reported config to resume using the retained source baseline and pending notify work, including after restart.
+
+  Tick `skippedMonitors` entries now include either `validationError` for invalid config or `nextDueAt` for a valid monitor that is not yet due. Consumers must check which field is present before reading a due time.
+
+  Source-config validation uses a private schema copy so valid frozen source schemas work without mutation. Validator setup/evaluation exceptions now reject only the affected monitor with an explicit diagnostic, allowing healthy siblings, tick cleanup and watcher startup to proceed. Baselines, cursors and pending notify work are retained until the schema is corrected.
+
+- d1649cf: Keep `verify --use-workspace-daemon` scratch files out of later sessions after any delay, restart or config repair.
+
+  The run now registers exact ownership of its scratch file with the workspace daemon before creating it. Once the run finishes, or its session ends or is reaped, the daemon retracts the verified monitor's events for that file and drops that monitor's later observations of it, including held work and retained retries, with no expiry. A dropped retry never pauses the monitor, and a dropped scratch file never makes `doctor` keep reporting an observation a hold refused after a newer change to the same object has superseded it. Legitimate changes, other workspaces and real watched paths are unaffected, and sibling monitors that happen to watch the scratch path are not covered. Against an older daemon, verify falls back to the previous time-limited cleanup.
+
+  Core adds `AgentMonitorRuntime.registerVerifyArtifact`, `requestVerifyArtifactCleanup` and `listVerifyArtifacts`, the `VerifyArtifactRecord`, `RegisterVerifyArtifactInput`, `VerifyArtifactCleanupResult` and `VerifyArtifactCleanupCause` types, and an additive `verify_artifacts` table. The session reaper no longer installs a time-limited suppression for scratch-named paths it did not see registered.
+
+- 2380ebe: Keep an observation that was dropped because the retry outbox could not retain it visible until it is superseded. A drop with an object key stays reported until an event of the same monitor and workspace materializes for that key from an observation admitted after the drop (a retained retry admitted before the drop does not count, even when it completes later); a drop without one stays reported until a later observation span of that monitor materializes an event and drops nothing. Quiet ticks, notify holds, observe failures, events for other keys and daemon restarts no longer clear it. While it is outstanding, `monitor explain` fails at the materialization stage and `doctor` fails the monitor's check, naming the error. The doctor report and its JSON add `unretainedObservationLoss`. A drop whose definition was removed, fails to parse or is duplicated is reported in that id's `orphanedMonitorWork` entry, and doctor fails a `dropped-observation:<id>` check for it (also for a definition that fails validation). The doctor report's orphan groups are now `orphanedMonitorWork` (`OrphanedMonitorWork`): each carries `monitorId`, `monitorKind`, and `materializationRetries` or `unretainedObservationLoss` only when present. A live ephemeral monitor's drop and retained work are reported under that monitor in `ephemeralMonitorWork`; once it is cancelled or reaped they stay visible in `orphanedMonitorWork` as a retired ephemeral monitor, and doctor's checks name it as such instead of asking for a definition repair. While a live ephemeral monitor's persisted scope is rejected by its source, its `EphemeralMonitorWork` group (and its doctor JSON entry) carries `validationError` with the same reason the tick reports when it skips the watch, and its checks say that cancelling and re-declaring the watch restores observation but leaves this id's work reported under its retired id. The history row for a dropped observation records its position in the span, its `objectKey` and its `title`, as bounded, control-free text, and never its payload. The runtime database gains two nullable `observation_history` columns, a nullable admission column on `monitor_events` and on `materialization_retry_outbox`, and three indexes through the additive schema migration.
+
+### Patch Changes
+
+- ab9b6ad: Commit event rows, lead-session projections, recipient cursor seeds, and snapshots atomically.
+  Preserve empty snapshots as valid diff baselines, including deletion deltas for late recipients.
+- 71c44fa: Preserve pending rollup batches when a not-due window flush cannot commit its events, retry outbox, and notify state atomically.
+
+  Read and decide each not-due rollup window under the same writer lock as admission, preserving concurrent source checkpoints and held work. Roll back non-emitting state failures and continue healthy sibling monitors.
+
+  A notify-policy edit that drains held rollup work uses the same owned transaction: if the drain fails, every write and the recipient cache roll back together and the batch stays held.
+
+- cb92b95: Open databases written by every released version. The rebuild that adds the private materialization order to stored events and snapshots now carries columns the current schema does not define, with their values, declared type and default, instead of dropping them. An index or trigger that reads such a column no longer makes every open fail. A rebuild that cannot complete names the table, and the column when one is identifiable, that stopped it and leaves the database unchanged. Expression defaults are carried intact, and a table with a UNIQUE, PRIMARY KEY, CHECK or REFERENCES constraint, or a STRICT declaration, the rebuild cannot recreate is refused instead of silently loosened, with a message saying how to proceed. A carried column's collation, and its NOT NULL when it has no default, are not reproduced.
+- 3b205ed: Use durable materialization order to break equal observation-time event ties across processes. Keep net delivery previews, claims and recipient cursors aligned while preserving public event IDs and observation-time priority.
+- 3b205ed: Select snapshot diff predecessors by durable SQLite materialization order across processes and clock changes. Preserve public snapshot IDs while migrating retained history to a private sequence. Preserve exact retained trigger SQL across coordinated event and snapshot rebuilds, including dependencies from other tables.
+- f194a12: Allow fresh normal and low reminder batches while older events remain claimed and unacknowledged.
+  Preserve same-band in-flight reservation holds and high-urgency settle coalescing, and update
+  suppression diagnostics to distinguish no new work from a temporary reservation.
+
+  Use the explicit `no-new-work` diagnostic for healthy claimed-only backlogs. Retain conservative
+  health warnings for legacy daemon reasons whose policy can still block future batches.
+
+- e9f3fdf: Changing a monitor's effective notify policy now flushes its already-held debounce or rollup work
+  before observing new work. This deliberate early flush can occur before the old deadline or rollup
+  window. Captured urgency, content and timestamps stay unchanged; the new policy applies to new work.
+  Edit drains atomically commit events and hold removal. Failed drains retain the old work and defer
+  that monitor's new observation until reconciliation succeeds.
+
+  Escalation grants participate in effective policy edits even for immediate/throttle observations.
+  A yielded watch batch rechecks admission in the same turn as its durable write; failed drains
+  keep it waiting unadmitted, and the source is not pulled again until it is admitted. Startup drains
+  refresh session hook state even when the source stays idle.
+
+  Concurrent polling rechecks admission after observation and retains blocked results locally so a
+  later tick can recover without advancing the old cursor. Watcher creation uses the latest admitted
+  initial definition, and policy snapshots retire with their live admission instead of accumulating
+  retired monitor instructions.
+
+  A watcher retires its scoped ownership only after its admitted batch settles, so recovery polling
+  or replacement watchers read that batch's baseline before advancing their own. Aborted and
+  superseded watchers never admit a late batch, so they cannot rewind a newer cursor.
+
+  Reporting an older poll's ingestion failure no longer releases a successor's active admission,
+  preventing overlapping source observations and baseline regression during failure cleanup.
+
+  Tick and watcher startup reread each authored definition immediately before policy reconciliation,
+  so delayed discovery cannot restore obsolete pacing or drain newer holds. Deferred-result handoff
+  releases its retained snapshot lease even when argument access fails before ingestion, preserving
+  other live owners and reporting the already committed edit accurately.
+
+  Unknown-source admission checks current scoped holds, including a watcher's first hold created while
+  another monitor awaits, and blocks invalid-definition watch batches without skipping healthy
+  siblings. A live same-ID/workspace definition moved between flat and folder forms remains usable
+  when an older discovery or captured envelope still names its obsolete path. Current replacement
+  files and source semantics are reread; invalid definitions and duplicate IDs remain rejected.
+
+  A valid earlier location can replace an admitted path only when metadata proves that location
+  absent (ENOENT/ENOTDIR). Permission and I/O failures retain the blocked gate, original holds and
+  read diagnostic instead of being mistaken for deletion by a boolean existence check.
+
+  Closing admission now retains the current admitted or blocked location within its existing live
+  owner. Repeated unchanged discovery cannot reopen fallback while that location is still invalid
+  or unreadable. The one pathname retires with the last live lease; new owners read fresh definitions
+  and no historical paths or extra instruction snapshots are retained.
+
+  Successful unchanged reconciliation learns missing private policy identity on existing legacy
+  state without resetting clocks, holds or source baselines, so later effective edits retire old
+  guards across restart. Watcher startup also reconciles existing scoped ownership before skipping
+  a current source without a watch factory; it neither polls nor creates replacement watchers and
+  leaves unowned observe-only state untouched.
+
+  Effective policy adoption now preserves opaque source baselines, legacy fingerprints and observation
+  clocks exactly while resetting guards or draining held work, so the next source call receives its
+  original previous state across restart. Notify-only persistence remains in the same atomic drain.
+
+- aa5b437: Flush held debounce and rollup work on time while a monitor's source keeps failing. A debounce batch now flushes at its original deadline, and a rollup batch at its matching window, even when every `observe()` rejects. The source baseline and scheduling time stay unchanged, the failure is still reported beside the flushed events and stays the newest history outcome, and a failed flush keeps the work held for the next tick. Schema-invalid and missing definitions still keep held work blocked.
+- 820c190: An observation a debounce or rollup hold refuses because its payload can't be serialized is now
+  tracked as outstanding loss, like an observation the retry outbox couldn't retain. `doctor` counts
+  it and `monitor explain` keeps a failing materialization stage until it is superseded: by a later
+  event for the same object key, or, with no object key, by a later span that materializes an event
+  and drops nothing. Quiet ticks, holds and restarts no longer hide it. The refusal is still reported
+  once on the tick result or through the watcher's `onError`, with the same message. Doctor's loss
+  detail now reads `observation dropped (<count> outstanding; …)` and explain's reason
+  `<count> observation(s) were dropped because the runtime could not keep them; …`, since the loss may
+  come from either cause.
+- 2380ebe: Preserve the complete source span and held work when SQLite aborts an admission transaction. Stop fallback retry and checkpoint writes after native rollback, retain prior committed events and recipient cache, and preserve the original failure for diagnosis. Route failed held observations through their captured source after a source-type edit.
+- d6c56a3: Report unavailable incoming-changes repositories and refs as recoverable source errors instead of successful empty baselines. Resolve authored revision expressions unchanged, then verify the resolved object ID peels to a commit; reject blob paths without changing valid commit-search semantics in SHA-1 or SHA-256 repositories. Capture Git stderr and retain the last-good source state for recovery. Source consumers must now handle observation rejection for unavailable inputs through the existing error contract.
+
+  Require initial state before monitor test claims a baseline. Include source errors in history text and explain using bounded single-line display, without rewriting stored audit data. Existing source-error retry cadence and held-notification deferral remain unchanged.
+
+- 587d0a9: Fail retry diagnostic summaries explicitly on unsupported persisted lifecycle values, preserving retained rows and private envelopes.
+- 2380ebe: Start the materialization retry backoff when the retry is queued rather than when the tick began, so a slow source no longer makes a newly failed observation retry immediately. Observation timestamps are unchanged. A retry row's `createdAt`/`updatedAt` record when it was enqueued.
+- 8ce3139: Preserve SQLite locks by tightening existing database permissions before opening connections. This prevents stale reads and locking protocol errors across processes while keeping newly created files owner-only.
+- 587d0a9: Read explain's retry summary after asynchronous definition discovery so retained work committed during the scan remains visible alongside later event and history reads.
+- 28e6e00: A debounce or rollup monitor no longer stops when one observation's payload cannot be serialized (for example a BigInt or a cyclic reference). The hold refuses that observation and records it as an `errored` outcome naming the observation and the reason, in observation history and the tick's `erroredObservations` (or the watcher's `onError`). The other observations in the batch are held as usual, and later observations continue to materialize. The refusal commits atomically with the rest of its batch. A long observation title no longer hides the reason in history and explain, and a callback that throws while reporting a refusal can no longer lose a flushed batch.
+- 7c30c92: Upgrade better-sqlite3 to 13.x, fixing a native crash (env != nullptr abort in Statement teardown) that could kill the daemon on Node 24.
+
 ## 0.13.0
 
 ### Minor Changes
