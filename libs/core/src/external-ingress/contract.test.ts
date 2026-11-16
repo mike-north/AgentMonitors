@@ -1,3 +1,4 @@
+/** Contract examples pin resource admission, producer authority and canonical identity. */
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import * as json from './json.js';
@@ -10,6 +11,7 @@ import {
 import type { ExternalJsonObject } from './contract.js';
 import { envelope, expectError } from './contract.fixtures.js';
 
+/** Count the state root as the first container, independently of scalar leaves. */
 function nestedObjectState(levels: number): ExternalJsonObject {
   let result: ExternalJsonObject = { value: true };
   for (let level = 1; level < levels; level += 1) result = { child: result };
@@ -379,6 +381,17 @@ describe('external envelope enforcement boundaries', () => {
       ).toBe(createHash('sha256').update(first.canonicalJson).digest('hex'));
     }
   });
+  it('refuses root proxies without running traps, including revoked proxies', () => {
+    const trap = vi.fn(() => Object.prototype);
+    expectError(
+      new Proxy(envelope(), { getPrototypeOf: trap }),
+      'invalid_envelope',
+    );
+    expect(trap).not.toHaveBeenCalled();
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expectError(revoked.proxy, 'invalid_envelope');
+  });
   it('inherits canonical array, prototype, accessor and numeric policies', () => {
     const sparse = new Array(2);
     const custom = Object.setPrototypeOf([], null);
@@ -485,13 +498,16 @@ describe('external envelope budget before canonicalization', () => {
       Array.from({ length: 1000 }, () => 'x'.repeat(512)),
     ]) {
       const descriptor = vi.spyOn(Object, 'getOwnPropertyDescriptor');
+      const encode = vi.spyOn(json, 'canonicalJsonStringify');
       try {
         expectError(envelope({ state: { value } }), 'payload_too_large');
+        expect(encode).not.toHaveBeenCalled();
         expect(
           descriptor.mock.calls.filter(([object]) => object === value).length,
         ).toBeLessThan(520);
       } finally {
         descriptor.mockRestore();
+        encode.mockRestore();
       }
     }
   });

@@ -9,6 +9,16 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-16 — Bound internal external-envelope admission
+
+002 §16.1 and 004 §6.1 define inclusive envelope limits and their exact boundary
+coverage. Resource admission now counts escaped UTF-8 bytes before canonical JSON
+work, including shared-child graphs. Byte, cardinality and container-depth overruns
+use permanent `payload_too_large`, resolving the mismatch with the declared error
+contract. Malformed JSON and schema-shape failures retain `invalid_envelope`.
+The canonical JSON foundation's domain and prototype policies remain authoritative.
+The internal envelope contract remains outside the package-root API.
+
 ## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
 
 Admitted authored commands preserve the resource limits of a plain spawn from the same

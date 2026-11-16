@@ -1,15 +1,29 @@
+/**
+ * Versioned source-neutral envelope admission. Producer data can describe state
+ * and routing dimensions; local monitor definitions retain all delivery policy.
+ * Resource admission precedes canonical JSON validation and normalization.
+ * @public
+ */
 import { Buffer } from 'node:buffer';
+import { types } from 'node:util';
 import type { ChangeKind } from '../observation/types.js';
-import { assertExternalJsonValue, canonicalJsonStringify } from './json.js';
+import { canonicalJsonStringify } from './json.js';
+import { EnvelopeLimitError, envelopeJsonBytes } from './envelope-budget.js';
 import type { ExternalJsonObject } from './json.js';
 
 export { canonicalJsonStringify } from './json.js';
 export type { ExternalJsonObject, ExternalJsonValue } from './json.js';
 
-/** Schema identifier for the first source-neutral external-event envelope. */
+/** Schema identifier for the first source-neutral external-event envelope. @public */
 export const EXTERNAL_EVENT_SCHEMA = 'agentmonitors.external-event.v1' as const;
 
-/** Immutable validation limits for {@link ExternalEventEnvelope}. */
+/**
+ * Immutable semantic-envelope limits for {@link ExternalEventEnvelope}.
+ * The daemon's 1 MiB transport budget also covers unrelated control requests;
+ * this 256 KiB bound counts canonical envelope bytes independently of framing.
+ * Importing CLI admission policy here would invert the core/host dependency.
+ * @public
+ */
 export const externalEventLimits = Object.freeze({
   envelopeBytes: 256 * 1024,
   identifierBytes: 512,
@@ -22,7 +36,7 @@ export const externalEventLimits = Object.freeze({
   stateDepth: 32,
 } as const);
 
-/** Scope keys reserved for metadata that Agent Monitors owns. */
+/** Scope keys reserved for metadata that Agent Monitors owns. @public */
 export const externalEventReservedScopeKeys = Object.freeze([
   'ingressSource',
   'eventKind',
@@ -32,7 +46,7 @@ export const externalEventReservedScopeKeys = Object.freeze([
   'occurredAt',
 ] as const);
 
-/** Source-defined routing dimensions containing bounded strings. */
+/** Source-defined routing dimensions containing bounded strings. @public */
 export type ExternalEventScope = Record<string, string | string[]>;
 
 /**
@@ -55,6 +69,7 @@ export type ExternalEventScope = Record<string, string | string[]>;
  *   state: { status: 'passed' },
  * };
  * ```
+ * @public
  */
 export interface ExternalEventEnvelope {
   /** Exact versioned schema identifier. */
@@ -83,7 +98,7 @@ export interface ExternalEventEnvelope {
   state: ExternalJsonObject;
 }
 
-/** Local routing context paired with one validated external envelope. */
+/** Local routing context paired with one validated external envelope. @public */
 export interface ExternalEventIngestInput {
   /** Canonical daemon-owned workspace identity used in the receipt key. */
   workspaceIdentity: string;
@@ -91,12 +106,12 @@ export interface ExternalEventIngestInput {
   envelope: ExternalEventEnvelope;
 }
 
-/** Whether an ingest created a receipt or replayed an existing receipt. */
+/** Whether an ingest created a receipt or replayed an existing receipt. @public */
 export type ExternalEventDisposition =
   | /** A new event was durably accepted. */ 'accepted'
   | /** The same semantic event was already accepted. */ 'duplicate';
 
-/** Durable processing state associated with an external-event receipt. */
+/** Durable processing state associated with an external-event receipt. @public */
 export type ExternalEventOutcome =
   | /** One or more normal Agent Monitors events were committed. */ 'materialized'
   | /** A supported notify delay captured the event durably. */ 'held'
@@ -104,7 +119,7 @@ export type ExternalEventOutcome =
   | /** A newer object sequence had already been accepted. */ 'stale'
   | /** Deferred materialization exhausted automatic retries. */ 'failed';
 
-/** Stable machine-readable failure classifications for relay policy. */
+/** Stable machine-readable failure classifications for relay policy. @public */
 export type ExternalEventErrorCode =
   | /** No daemon could be reached. Retryable. */ 'daemon_unavailable'
   | /** The daemon does not implement this protocol. Retryable after upgrade. */ 'daemon_incompatible'
@@ -114,14 +129,14 @@ export type ExternalEventErrorCode =
   | /** An unclassified local failure occurred. Retryable. */ 'internal_error'
   | /** The envelope schema version is unsupported. Permanent. */ 'unsupported_schema'
   | /** The envelope violates the versioned schema. Permanent. */ 'invalid_envelope'
-  | /** A byte or cardinality limit was exceeded. Permanent. */ 'payload_too_large'
+  | /** A byte, cardinality or container-depth limit was exceeded. Permanent. */ 'payload_too_large'
   | /** The selected local monitor is absent or ambiguous. Permanent. */ 'invalid_monitor'
   | /** The selected monitor has invalid local policy. Permanent. */ 'monitor_policy_error'
   | /** The monitor uses a notify policy unsupported by this schema. Permanent. */ 'unsupported_notify_strategy'
   | /** Client and daemon workspace identities differ. Permanent. */ 'workspace_mismatch'
   | /** An idempotency key was reused for different semantic content. Permanent. */ 'idempotency_conflict';
 
-/** A safe external-ingress failure that never includes envelope state. */
+/** A safe external-ingress failure that never includes envelope state. @public */
 export interface ExternalEventError {
   /** Stable failure classification. */
   code: ExternalEventErrorCode;
@@ -143,6 +158,7 @@ export interface ExternalEventError {
  *   materializedAt: null,
  * };
  * ```
+ * @public
  */
 export interface ExternalEventIngestResult {
   /** Whether this call accepted new work or found a duplicate. */
@@ -163,7 +179,7 @@ export interface ExternalEventIngestResult {
   materializedAt: string | null;
 }
 
-/** Result of validating and canonicalizing an unknown envelope value. */
+/** Result of validating and canonicalizing an unknown envelope value. @public */
 export type ExternalEventEnvelopeValidationResult =
   | {
       /** Indicates that the normalized envelope fields are available. */
@@ -182,6 +198,7 @@ export type ExternalEventEnvelopeValidationResult =
       error: ExternalEventError;
     };
 
+/** Producer fields exclude local filesystem identities and monitor policy. */
 const TOP_LEVEL_KEYS = new Set<string>([
   'schema',
   'monitorId',
@@ -196,6 +213,7 @@ const TOP_LEVEL_KEYS = new Set<string>([
   'scope',
   'state',
 ]);
+/** Producer identities share a UTF-8 bound independently of their character count. */
 const IDENTIFIER_FIELDS = [
   'monitorId',
   'source',
@@ -203,16 +221,20 @@ const IDENTIFIER_FIELDS = [
   'objectId',
   'eventKind',
 ] as const;
+/** Only existing observation lifecycle classifications belong on this wire. */
 const CHANGE_KINDS = new Set<ChangeKind>([
   'created',
   'modified',
   'deleted',
   'descoped',
 ]);
+/** Runtime provenance cannot be overwritten by producer routing dimensions. */
 const RESERVED_SCOPE_KEYS = new Set<string>(externalEventReservedScopeKeys);
+/** Timestamp syntax is checked separately from calendar and leap-second validity. */
 const RFC3339 =
   /^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:[Zz]|([+-])(\d{2}):(\d{2}))$/;
 
+/** Failures expose a fixed diagnostic and never include producer state. */
 function failure(
   code: 'unsupported_schema' | 'invalid_envelope' | 'payload_too_large',
   message: string,
@@ -220,8 +242,14 @@ function failure(
   return { success: false, error: { code, message, retryable: false } };
 }
 
+/** Reject proxies before reflection; accepted records carry only ordinary data. */
 function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    types.isProxy(value) ||
+    Array.isArray(value)
+  ) {
     return false;
   }
   try {
@@ -232,10 +260,12 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   }
 }
 
+/** Field limits count transport bytes rather than UTF-16 code units. */
 function utf8Bytes(value: string): number {
   return Buffer.byteLength(value, 'utf8');
 }
 
+/** Permit RFC 3339 variants while refusing impossible dates and leap boundaries. */
 function isValidRfc3339(value: string): boolean {
   const match = RFC3339.exec(value);
   if (!match) return false;
@@ -291,24 +321,35 @@ function isValidRfc3339(value: string): boolean {
   );
 }
 
-/** Validate and normalize one versioned source-neutral external event envelope. */
+/** Validate and normalize one versioned source-neutral external event envelope. @public */
 export function validateExternalEventEnvelope(
   input: unknown,
 ): ExternalEventEnvelopeValidationResult {
   if (!isPlainRecord(input)) {
     return failure('invalid_envelope', 'Event envelope must be a JSON object.');
   }
-  let canonicalJson: string;
+  // Resource admission must finish before any canonical encoding or parsing.
+  let envelopeBytes: number;
   try {
-    assertExternalJsonValue(input, 0, externalEventLimits.stateDepth + 2);
-    canonicalJson = canonicalJsonStringify(input);
-  } catch {
-    return failure(
-      'invalid_envelope',
-      'Event envelope contains a non-JSON value or excessive nesting.',
+    envelopeBytes = envelopeJsonBytes(
+      input,
+      externalEventLimits.envelopeBytes,
+      0,
+      externalEventLimits.stateDepth,
     );
+  } catch (error) {
+    return error instanceof EnvelopeLimitError
+      ? failure(
+          'payload_too_large',
+          'Event envelope exceeds a size or nesting limit.',
+        )
+      : failure(
+          'invalid_envelope',
+          'Event envelope contains a non-JSON value.',
+        );
   }
-  const candidate = JSON.parse(canonicalJson) as Record<string, unknown>;
+  // The preflight has refused accessors and proxies before these data reads.
+  const candidate = input;
   if (
     Object.keys(candidate).length !== TOP_LEVEL_KEYS.size ||
     Object.keys(candidate).some((key) => !TOP_LEVEL_KEYS.has(key))
@@ -329,14 +370,16 @@ export function validateExternalEventEnvelope(
   }
   for (const field of IDENTIFIER_FIELDS) {
     const value = candidate[field];
-    if (
-      typeof value !== 'string' ||
-      value.length === 0 ||
-      utf8Bytes(value) > externalEventLimits.identifierBytes
-    ) {
+    if (typeof value !== 'string' || value.length === 0) {
       return failure(
         'invalid_envelope',
         `Event envelope field "${field}" is invalid.`,
+      );
+    }
+    if (utf8Bytes(value) > externalEventLimits.identifierBytes) {
+      return failure(
+        'payload_too_large',
+        `Event envelope field "${field}" is too large.`,
       );
     }
   }
@@ -366,8 +409,7 @@ export function validateExternalEventEnvelope(
   }
   if (
     typeof candidate['resumeToken'] !== 'string' ||
-    candidate['resumeToken'].length === 0 ||
-    utf8Bytes(candidate['resumeToken']) > externalEventLimits.resumeTokenBytes
+    candidate['resumeToken'].length === 0
   ) {
     return failure(
       'invalid_envelope',
@@ -375,42 +417,71 @@ export function validateExternalEventEnvelope(
     );
   }
 
-  const scope = candidate['scope'];
   if (
-    !isPlainRecord(scope) ||
-    Object.keys(scope).length > externalEventLimits.scopeKeys
+    utf8Bytes(candidate['resumeToken']) > externalEventLimits.resumeTokenBytes
   ) {
+    return failure(
+      'payload_too_large',
+      'Event envelope resume token is too large.',
+    );
+  }
+
+  const scope = candidate['scope'];
+  if (!isPlainRecord(scope)) {
     return failure('invalid_envelope', 'Event envelope scope is invalid.');
   }
+  if (Object.keys(scope).length > externalEventLimits.scopeKeys) {
+    return failure(
+      'payload_too_large',
+      'Event envelope has too many scope keys.',
+    );
+  }
   for (const [key, value] of Object.entries(scope)) {
-    if (
-      key.length === 0 ||
-      utf8Bytes(key) > externalEventLimits.scopeKeyBytes ||
-      RESERVED_SCOPE_KEYS.has(key)
-    ) {
+    if (key.length === 0 || RESERVED_SCOPE_KEYS.has(key)) {
       return failure(
         'invalid_envelope',
         'Event envelope scope key is invalid.',
       );
     }
-    const values = Array.isArray(value) ? value : [value];
-    if (
-      values.length > externalEventLimits.scopeValuesPerKey ||
-      values.some(
-        (item) =>
-          typeof item !== 'string' ||
-          utf8Bytes(item) > externalEventLimits.scopeValueBytes,
-      )
-    ) {
+    if (utf8Bytes(key) > externalEventLimits.scopeKeyBytes) {
       return failure(
-        'invalid_envelope',
-        'Event envelope scope value is invalid.',
+        'payload_too_large',
+        'Event envelope scope key is too large.',
       );
     }
+    const values: unknown[] = Array.isArray(value) ? value : [value];
+    if (values.length > externalEventLimits.scopeValuesPerKey) {
+      return failure(
+        'payload_too_large',
+        'Event envelope has too many scope values.',
+      );
+    }
+    for (const item of values) {
+      if (typeof item !== 'string') {
+        return failure(
+          'invalid_envelope',
+          'Event envelope scope value is invalid.',
+        );
+      }
+      if (utf8Bytes(item) > externalEventLimits.scopeValueBytes) {
+        return failure(
+          'payload_too_large',
+          'Event envelope scope value is too large.',
+        );
+      }
+    }
   }
-  const canonicalScope = canonicalJsonStringify(scope as ExternalJsonObject);
-  if (utf8Bytes(canonicalScope) > externalEventLimits.scopeBytes) {
-    return failure('payload_too_large', 'Event envelope scope is too large.');
+  try {
+    envelopeJsonBytes(
+      scope,
+      externalEventLimits.scopeBytes,
+      0,
+      externalEventLimits.stateDepth,
+    );
+  } catch (error) {
+    return error instanceof EnvelopeLimitError
+      ? failure('payload_too_large', 'Event envelope scope is too large.')
+      : failure('invalid_envelope', 'Event envelope scope is invalid.');
   }
 
   const state = candidate['state'];
@@ -420,22 +491,20 @@ export function validateExternalEventEnvelope(
       'Event envelope state must be a JSON object.',
     );
   }
+  let canonicalJson: string;
   try {
-    assertExternalJsonValue(state, 1, externalEventLimits.stateDepth);
+    // json.ts remains the authority for arrays, hidden state, numbers and prototypes.
+    canonicalJson = canonicalJsonStringify(candidate);
   } catch {
     return failure(
       'invalid_envelope',
-      'Event envelope state contains a non-JSON value or excessive nesting.',
+      'Event envelope contains a non-JSON value.',
     );
   }
-
-  const envelopeBytes = utf8Bytes(canonicalJson);
-  if (envelopeBytes > externalEventLimits.envelopeBytes) {
-    return failure('payload_too_large', 'Event envelope is too large.');
-  }
+  const normalized = JSON.parse(canonicalJson) as ExternalEventEnvelope;
   return {
     success: true,
-    envelope: candidate as unknown as ExternalEventEnvelope,
+    envelope: normalized,
     canonicalJson,
     envelopeBytes,
   };

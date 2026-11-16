@@ -1286,3 +1286,20 @@ Any substantive spec addition or change MUST answer all of the following:
 - If it resolves a contradiction, is that recorded in `spec-changelog.md`?
 
 If any answer is "no", the change is underspecified.
+
+### 6.1 External-envelope admission coverage (_current_)
+
+The internal external-envelope validator MUST have exact-limit accepted and
+one-past rejected cases for every exported enforcement limit (002 §16.1).
+UTF-8 fields require ASCII and multibyte cases, while canonical byte budgets
+include escaping. Container depth requires object, array and alternating paths.
+Tests MUST distinguish permanent size/cardinality/depth overruns from malformed
+values, refuse each producer policy/path field, and compare repeated equivalent
+normalized values and canonical fingerprints.
+
+Budget regressions MUST prove that oversized strings, wide containers and a
+32-level shared-child DAG are refused before canonical encoding/parsing. Counters
+or descriptor spies must show traversal stopping before later siblings after the
+first overrun. A guarded JSON entry point keeps a broken DAG implementation from
+exhausting the test process. `libs/core/src/external-ingress/contract.test.ts`
+provides these examples alongside the §16 JSON-policy compatibility cases.
