@@ -191,9 +191,22 @@ records each shipped file's SHA-256 and source. Offline script tests verify thes
 bytes and reject tampering.
 
 Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
-filename, identically in the source package and CLI bundle. Only the asynchronous
-launcher loads it. The loader allowlists the platform/architecture, requires glibc
-on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+filename, identically in the source package and CLI bundle. The daemon loads it
+lazily for resource-limit capture; the asynchronous launcher also loads it. The
+loader allowlists the platform/architecture and, on Linux, synchronously reads
+`/proc/self/maps` once before loading exactly that package's binary. Admission
+requires a mapped `libc.so.6` or older `libc-2.N.so` and no mapped
+`ld-musl-*.so.1` or `libc.musl-*`, including deleted mappings. Musl takes precedence
+even alongside glibc filenames, so compatibility layers cannot admit native
+initializers. Musl wildcard matching includes CR and Unicode line separators
+retained in pathnames; positive glibc evidence requires an exact basename.
+Unreadable, empty, malformed or unrecognized libc evidence refuses
+with `glibc is required`, including static Node builds without a mapped libc.
+Neither diagnostic reports nor subprocesses supply evidence. After admission,
+the native `gnu_get_libc_version` symbol provides a second consistency check.
+Non-Linux platforms never read maps. `scripts/koffi-loader.test.ts` verifies
+these admission and no-native-load refusals with injected mappings;
+`scripts/vendor-koffi.test.ts` verifies both packaged copies and digests. Koffi's indirect entry point has
 no explicit-native hook, so the refresh script makes a minimal checked shim: replace
 its detect/load stanza with a factory argument, return its exports and close the
 factory. This retains upstream wrapping/version checks while bypassing its native
@@ -205,8 +218,9 @@ build is attempted. Koffi's build-from-source fallback does not link on macOS 27
 with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
 we never trigger it.
 
-Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
-blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals
+Arming uses asynchronous spawn and pipe acknowledgements; it never waits on a
+synchronous subprocess or blocking IPC open. Linux native admission performs the single
+synchronous procfs maps read described above. The watchdog ignores SIGTERM/SIGINT and signals
 its **current group** with `kill(0, SIGTERM)` and `kill(0, SIGKILL)`. It never changes group;
 its continued membership prevents that group ID being recycled. Neither daemon EOF, command
 exit, nor closure of inherited command descriptors cancels its timers. No Linux-only
