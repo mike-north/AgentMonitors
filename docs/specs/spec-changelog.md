@@ -3,6 +3,13 @@
 This file records clarifications, contradiction resolutions, and structural changes to the
 Agent Monitors spec set in `docs/specs/`.
 
+## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
+
+Envelope admission refuses own `__proto__` keys throughout producer scope/state, including
+nested array members, while general canonical JSON continues to preserve ordinary data keys.
+Leap-second syntax accepts every UTC month end and equivalent offset spellings; timestamp
+validation does not depend on a leap-second announcement table.
+
 ## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.9) — Refs #481
 
 Core now exports the strict `agentmonitors.external-event.v1` envelope validator, recursively

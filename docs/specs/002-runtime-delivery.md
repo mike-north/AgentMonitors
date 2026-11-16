@@ -1415,7 +1415,9 @@ required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`
 `objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `resumeToken`, `scope`, and `state`;
 unknown top-level fields are rejected. `changeKind` uses `created | modified | deleted | descoped`.
 `objectSequence` is a non-negative safe integer. `occurredAt` accepts RFC3339's case-insensitive
-`T`/`Z`, arbitrary non-empty fractional seconds, numeric offsets, and valid leap-second forms. `scope` contains
+`T`/`Z`, arbitrary non-empty fractional seconds, numeric offsets, and leap-second forms
+at any UTC month end (including offset spellings). Validation checks syntax and calendar
+placement, rather than consulting an announcement table. `scope` contains
 only local query metadata; `state` is a JSON object containing current state, never instructions or
 an incremental patch. The envelope cannot set monitor policy, instructions, urgency, shaping,
 notify strategy, tags, workspace paths, or recipients.
@@ -1436,6 +1438,9 @@ Scope keys `ingressSource`, `eventKind`, `changeKind`, `upstreamEventId`, `objec
 `occurredAt` are reserved for runtime-owned query metadata. Empty identifiers/cursors, invalid or
 non-finite JSON values, accessors/custom objects, cycles, sparse arrays, extra array properties, and
 unsafe integers are rejected without invoking accessors or echoing state in the structured error.
+Own `__proto__` keys anywhere in scope/state, including nested objects in arrays, are refused
+at envelope admission so downstream copying cannot invoke the legacy prototype setter.
+`constructor` and `prototype` remain ordinary data keys.
 
 Canonical JSON recursively sorts object keys and preserves array order. The semantic SHA-256 hash
 selects exactly `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -3664,7 +3669,10 @@ After encoding, a separate UTF-8 measurement of the actual canonical output MUST
 refuse an envelope over 262,144 bytes before normalization. This final check
 protects against a counting defect; preflight remains the primary resource bound.
 The preflight does not replace §16's JSON domain and prototype policies; only an
-input admitted by both boundaries can be normalized.
+input admitted by both boundaries can be normalized. Envelope admission additionally
+refuses own `__proto__` keys anywhere in scope/state after normalization; the general JSON
+encoder retains those keys as data. RFC 3339 leap-second spellings are valid at any UTC
+month end, including equivalent numeric-offset spellings; no announcement table is required.
 
 Limits are inclusive: envelope 262,144 canonical UTF-8 bytes; each of `monitorId`,
 `source`, `upstreamEventId`, `objectId` and `eventKind` 512 UTF-8 bytes; resume token

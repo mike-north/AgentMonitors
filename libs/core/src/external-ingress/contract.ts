@@ -41,7 +41,6 @@ const getUTCHours = Date.prototype.getUTCHours;
 const getUTCMinutes = Date.prototype.getUTCMinutes;
 const getUTCSeconds = Date.prototype.getUTCSeconds;
 const getUTCDate = Date.prototype.getUTCDate;
-const getUTCMonth = Date.prototype.getUTCMonth;
 /* eslint-enable @typescript-eslint/unbound-method */
 
 /** Schema identifier for the first source-neutral external-event envelope. @public */
@@ -352,10 +351,39 @@ function isValidRfc3339(value: string): boolean {
     apply(getUTCHours, boundary, []) === 0 &&
     apply(getUTCMinutes, boundary, []) === 0 &&
     apply(getUTCSeconds, boundary, []) === 0 &&
-    apply(getUTCDate, boundary, []) === 1 &&
-    (apply(getUTCMonth, boundary, []) === 0 ||
-      apply(getUTCMonth, boundary, []) === 6)
+    apply(getUTCDate, boundary, []) === 1
   );
+}
+
+/**
+ * Refuse the legacy prototype-setter key in normalized producer metadata/state.
+ * Only fresh JSON.parse output reaches this walk: user accessors and proxies have
+ * already been refused, and descriptor reads never consult inherited members.
+ * General JSON encoding retains ordinary own keys; this is an envelope safety
+ * boundary for downstream consumers that may copy producer-owned state.
+ */
+function containsPrototypeKey(value: unknown): boolean {
+  if (value === null || typeof value !== 'object') {
+    return false;
+  }
+  const keys = keysOf(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === '__proto__') {
+      return true;
+    }
+    if (key !== undefined) {
+      const descriptor = getOwnPropertyDescriptor(value, key);
+      if (
+        descriptor &&
+        hasOwn(descriptor, 'value') &&
+        containsPrototypeKey(descriptor.value)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 /** Validate and normalize one versioned source-neutral external event envelope. @public */
@@ -569,6 +597,15 @@ export function validateExternalEventEnvelope(
     return failure('payload_too_large', 'Event envelope is too large.');
   }
   const normalized = parseJson(canonicalJson) as ExternalEventEnvelope;
+  if (
+    containsPrototypeKey(normalized.scope) ||
+    containsPrototypeKey(normalized.state)
+  ) {
+    return failure(
+      'invalid_envelope',
+      'Event envelope contains an unsafe object key.',
+    );
+  }
   return {
     success: true,
     envelope: normalized,
