@@ -1,7 +1,5 @@
 /** Self-bounding admission is asynchronous, ordered before user work, and fails closed. */
-import * as childProcess from 'node:child_process';
 import { spawnSync } from 'node:child_process';
-import * as fsPromises from 'node:fs/promises';
 import {
   existsSync,
   mkdirSync,
@@ -24,10 +22,6 @@ const injected = vi.hoisted(() => ({
   launcher: '',
   replacement: '',
 }));
-// Call-through spies retain real admission while exposing any helper spawn or
-// temporary-directory creation during capture and refusal.
-vi.mock('node:child_process', { spy: true });
-vi.mock('node:fs/promises', { spy: true });
 vi.mock('./self-bound.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./self-bound.js')>();
   return {
@@ -413,101 +407,7 @@ describe.skipIf(process.platform === 'win32')(
       expect(events.slice(1)).toContain('read');
     });
 
-    // Explicit conversion models the rounded value returned by Node's report.
-    it.each([
-      9007199254740992,
-      9007199254740994,
-      Number('9223372036854775806'),
-    ])(
-      'refuses an unsafe soft RLIMIT_NOFILE value of %s before spawning',
-      async (soft) => {
-        // Rounded report values cannot authorize a command with an exact native
-        // budget. Refusal must happen before any helper or authored work starts.
-        const report = process.report.getReport();
-        vi.spyOn(process.report, 'getReport').mockReturnValue({
-          ...report,
-          userLimits: { open_files: { soft, hard: 'unlimited' } },
-        });
-        const writer = vi
-          .spyOn(process.report, 'writeReport')
-          .mockImplementation(() => {
-            throw new Error('A diagnostic report must never be persisted');
-          });
-        const spawned = vi.spyOn(childProcess, 'spawn');
-        const dir = mkdtempSync(path.join(tmpdir(), 'unsafe-'));
-        const marker = path.join(dir, 'ran');
-        const previousState = {
-          stdout: 'baseline',
-          exitCode: 7,
-          truncated: false,
-          health: 'ok',
-          baselined: true,
-        };
-        const result = await source.observe(
-          {
-            command: ['/bin/sh', '-c', 'printf ran > "$1"', 'fixture', marker],
-            timeout: '2s',
-          },
-          { now: new Date(), previousState },
-        );
-        expect(existsSync(marker)).toBe(false);
-        expect(result.nextState).toEqual({
-          ...previousState,
-          health: 'failing',
-        });
-        expect(result.observations[0]?.payload).toMatchObject({
-          error: expect.stringContaining(
-            'RLIMIT_NOFILE: inherited soft limit is too large to reproduce exactly',
-          ),
-        });
-        expect(spawned).not.toHaveBeenCalled();
-        expect(writer).not.toHaveBeenCalled();
-      },
-    );
-
-    it.each([
-      0,
-      512,
-      Number.MAX_SAFE_INTEGER,
-      'unlimited',
-      9007199254740992,
-      Number('9223372036854775806'),
-      -1,
-      0.5,
-      NaN,
-      Infinity,
-      'invalid',
-      undefined,
-    ])('captures soft NOFILE %s without filesystem writes', async (soft) => {
-      // Exercise valid, unsafe and malformed reports. Spies also detect a
-      // temporary report that would be deleted before capture returns.
-      const report = process.report.getReport();
-      const shutdown = new AbortController();
-      vi.spyOn(process.report, 'getReport').mockImplementation(() => {
-        shutdown.abort();
-        return {
-          ...report,
-          userLimits: { open_files: { soft, hard: 'unlimited' } },
-        };
-      });
-      const directory = vi.spyOn(fsPromises, 'mkdtemp');
-      const writer = vi
-        .spyOn(process.report, 'writeReport')
-        .mockImplementation(() => {
-          throw new Error('A diagnostic report must never be persisted');
-        });
-      const spawned = vi.spyOn(childProcess, 'spawn');
-      const owned = createCommandPollSource(undefined, shutdown.signal);
-      await owned.observe(
-        { command: ['/bin/echo', 'unused'], timeout: '2s' },
-        { now: new Date() },
-      );
-      expect(writer).not.toHaveBeenCalled();
-      expect(directory).not.toHaveBeenCalled();
-      expect(spawned).not.toHaveBeenCalled();
-    });
-
-    it.each(['read', 'restore', 'read-back', 'mismatch'])(
+    it.each(['read', 'restore', 'read-back', 'mismatch', 'hard-mismatch'])(
       'preserves the baseline when command resource limits cannot be verified after %s failure',
       async (fault) => {
         // Alter only this disposable launcher's limit. The parent and watchdog
@@ -535,6 +435,7 @@ describe.skipIf(process.platform === 'win32')(
                   reads++;
                   if ((${JSON.stringify(fault)} === 'read' && reads === 1) || (${JSON.stringify(fault)} === 'read-back' && reads === 2)) { loaded.errno(loaded.os.errno.EPERM); return -1; }
                   const result = native(resource, value);
+                  if (${JSON.stringify(fault)} === 'hard-mismatch' && reads === 1) value.writeBigUInt64LE(value.readBigUInt64LE(8) - 1n, 8);
                   if (${JSON.stringify(fault)} === 'mismatch' && reads === 2) value.writeBigUInt64LE(512n);
                   return result;
                 };
@@ -569,7 +470,11 @@ describe.skipIf(process.platform === 'win32')(
         });
         expect(result.observations[0]?.payload).toMatchObject({
           error: expect.stringContaining(
-            fault === 'mismatch' ? 'read-back mismatch' : 'EPERM (1)',
+            fault === 'hard-mismatch'
+              ? 'hard-limit mismatch'
+              : fault === 'mismatch'
+                ? 'read-back mismatch'
+                : 'EPERM (1)',
           ),
         });
       },

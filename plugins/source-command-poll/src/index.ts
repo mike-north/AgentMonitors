@@ -25,6 +25,7 @@ import {
 } from '@agentmonitors/core';
 
 import { vendoredNativeLoader } from './native-binding.js';
+import { inheritedOpenFileLimits } from './open-file-limits.js';
 import {
   LAUNCHER_PROGRAM,
   WATCHDOG_PROGRAM,
@@ -327,47 +328,6 @@ function resolveCwd(
   return workspacePath === undefined ? cwd : path.resolve(workspacePath, cwd);
 }
 
-/** Read only the soft open-file field from the in-memory diagnostic report. */
-function reportedSoftOpenFiles(report: unknown): unknown {
-  const limits =
-    report !== null && typeof report === 'object' && 'userLimits' in report
-      ? report.userLimits
-      : undefined;
-  const openFiles =
-    limits !== null && typeof limits === 'object' && 'open_files' in limits
-      ? limits.open_files
-      : undefined;
-  return openFiles !== null &&
-    typeof openFiles === 'object' &&
-    'soft' in openFiles
-    ? openFiles.soft
-    : undefined;
-}
-
-/**
- * Capture the parent's soft NOFILE limit synchronously without loading native
- * code or persisting a diagnostic report in the daemon. Node startup changes
- * only the soft field; the launcher preserves the inherited native hard field.
- *
- * Safe report integers and symbolic infinity identify an exact native value.
- * Unsafe numbers cannot: distinct native limits can round to the same number,
- * including when helper startup changes the soft limit. Refuse those budgets
- * before spawning rather than authorize execution from an ambiguous value.
- */
-function inheritedOpenFileLimits(): { soft: string } {
-  const value = reportedSoftOpenFiles(process.report.getReport());
-  if (value === 'unlimited') return { soft: value };
-  if (typeof value === 'number' && !Number.isSafeInteger(value)) {
-    throw new Error(
-      'Could not capture command RLIMIT_NOFILE: inherited soft limit is too large to reproduce exactly',
-    );
-  }
-  if (typeof value !== 'number' || value < 0) {
-    throw new Error('Could not capture command RLIMIT_NOFILE: invalid limit');
-  }
-  return { soft: String(value) };
-}
-
 /**
  * Execute authored argv literally through an armed native launcher on supported
  * POSIX hosts, refusing unsupported hosts before admission and draining
@@ -446,7 +406,7 @@ async function runCommand(
           '-e',
           LAUNCHER_PROGRAM,
         ];
-    // The launcher alone loads native code, using our package-relative payload.
+    // The launcher uses the same package-relative native payload as capture.
     const native = vendoredNativeLoader();
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(

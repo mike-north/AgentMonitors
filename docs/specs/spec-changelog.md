@@ -12,15 +12,17 @@ Agent Monitors spec set in `docs/specs/`.
 ## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
 
 Admitted authored commands preserve the resource limits of a plain spawn from the same
-running parent. Capture the parent's soft `RLIMIT_NOFILE` synchronously from the in-memory
-report without writing a diagnostic report to disk. Nonnegative safe soft integers through
-`9007199254740991` and symbolic infinity are exact; finite soft limits at or above 2^53 are
-refused before spawn because rounded numbers cannot identify the native value. Keep the
-inherited native hard field exact, including finite values above 2^53, and restore the soft
-value only after watchdog arming. Failed capture, native read/restore failures and read-back
-mismatches refuse admission and retain the prior baseline. Native macOS/Linux comparisons,
-macOS large finite hard limits, unsafe soft refusals, capture without filesystem writes and
-watchdog-before-restore ordering cover this contract.
+running parent. Capture the exact soft/hard `RLIMIT_NOFILE` pair directly with native
+`getrlimit` through the lazily cached vendored binding. Encode finite fields with BigInt
+and platform infinity as `unlimited`; capture neither generates diagnostics nor writes
+files, and does not depend on daemon sockets, handles or worker progress. Linux native
+admission checks glibc without a diagnostic report. After watchdog arming, verify the
+inherited hard field against capture, restore the soft value and verify the full pair.
+Native load/read failures refuse before spawn, preserving the baseline and committed
+ownership mark without adding a PID suspicion. Native restore and pair mismatches also
+refuse execution. Native macOS/Linux comparisons, macOS finite soft/hard values above
+2^53, fault refusals, binding reuse, no-report/no-write capture and a busy-daemon
+one-second observation cover the contract.
 
 ## 2026-11-15 — Retain restart attribution at discovery boundaries (008 §4.2) — Refs #622
 

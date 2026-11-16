@@ -84,6 +84,154 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
       bundle = path.join(outDir, 'index.cjs');
     }, 30_000);
 
+    it.each(['load', 'getrlimit'])(
+      'refuses NOFILE capture %s failure before spawn and preserves ownership admission',
+      async (fault) => {
+        const output = await runParent(
+          `
+          const {createCommandPollSource} = require(${JSON.stringify(bundle)});
+          const cp = require('node:child_process');
+          const originalSpawn = cp.spawn;
+          let spawned = 0, loads = 0, committed = 0, recorded = 0, exited = 0;
+          cp.spawn = (...args) => { spawned++; return originalSpawn(...args); };
+          const Module = require('node:module');
+          const originalLoad = Module._load;
+          Module._load = function(id, ...args) {
+            if (!id.endsWith('/load.cjs')) return originalLoad.call(this, id, ...args);
+            loads++;
+            if (${JSON.stringify(fault)} === 'load') throw Object.assign(new Error('fixture native load: ERR_DLOPEN_FAILED'), {code: 'ERR_DLOPEN_FAILED'});
+            const koffi = originalLoad.call(this, id, ...args);
+            return {...koffi, load(...args) {
+              const lib = koffi.load(...args);
+              return {...lib, func(declaration) {
+                if (declaration.includes(' getrlimit(')) return () => { koffi.errno(koffi.os.errno.EPERM); return -1; };
+                return lib.func(declaration);
+              }};
+            }};
+          };
+          const owner = {
+            async environment() { committed++; return {AGENTMONITORS_COMMAND_LIFE: 'fixture'}; },
+            spawned() { recorded++; }, exited() { exited++; },
+          };
+          const previousState = {stdout: 'baseline', exitCode: 7, truncated: false, health: 'ok', baselined: true};
+          createCommandPollSource(owner).observe({command: ['/bin/echo', 'capture'], timeout: '1s'}, {now: new Date(), previousState})
+            .then(result => console.log(JSON.stringify({result, spawned, loads, committed, recorded, exited})))
+            .catch(error => {console.error(error); process.exitCode = 1;});
+        `,
+          dir,
+        );
+        const receipt = JSON.parse(output);
+        expect(receipt.result.nextState).toEqual({
+          stdout: 'baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'failing',
+          baselined: true,
+        });
+        expect(receipt.spawned).toBe(0);
+        expect(receipt.loads).toBe(1);
+        expect(receipt.committed).toBe(1);
+        expect(receipt.recorded).toBe(0);
+        expect(receipt.exited).toBe(0);
+        const error = receipt.result.observations[0]?.payload.error;
+        expect(error).toContain('RLIMIT_NOFILE');
+        expect(error).toContain(
+          fault === 'load' ? 'could not be loaded' : 'getrlimit: EPERM (1)',
+        );
+        expect(error).toContain(
+          fault === 'load' ? 'ERR_DLOPEN_FAILED' : 'operation not permitted',
+        );
+      },
+    );
+
+    it('captures NOFILE without reports or writes and caches the native function', async () => {
+      // Instrument the daemon, not its disposable helpers. Even a deleted report
+      // is a forbidden write; two observations must share one native binding.
+      const output = await runParent(
+        `
+        const source = require(${JSON.stringify(bundle)}).default;
+        const fs = require('node:fs'), fsp = require('node:fs/promises');
+        let reports = 0, writes = 0, loads = 0, declarations = 0, calls = 0;
+        process.report.getReport = () => { reports++; throw new Error('no diagnostic reports'); };
+        process.report.writeReport = () => { reports++; throw new Error('no diagnostic reports'); };
+        for (const name of ['writeFileSync', 'appendFileSync', 'mkdirSync', 'mkdtempSync', 'writeSync', 'writeFile', 'appendFile', 'mkdir', 'mkdtemp', 'write', 'createWriteStream']) {
+          fs[name] = () => { writes++; throw new Error('no capture writes: ' + name); };
+        }
+        for (const name of ['writeFile', 'appendFile', 'mkdir', 'mkdtemp']) {
+          fsp[name] = async () => { writes++; throw new Error('no capture writes: ' + name); };
+        }
+        const Module = require('node:module'), originalLoad = Module._load;
+        Module._load = function(id, ...args) {
+          const loaded = originalLoad.call(this, id, ...args);
+          if (!id.endsWith('/load.cjs')) return loaded;
+          loads++;
+          return {...loaded, load(...args) {
+            const lib = loaded.load(...args);
+            return {...lib, func(declaration) {
+              const fn = lib.func(declaration);
+              if (!declaration.includes(' getrlimit(')) return fn;
+              declarations++;
+              return (...args) => {calls++; return fn(...args);};
+            }};
+          }};
+        };
+        (async () => {
+          const results = [];
+          for (let i = 0; i < 2; i++) results.push(await source.observe({command: ['/bin/echo', 'capture'], timeout: '1s'}, {now: new Date()}));
+          console.log(JSON.stringify({results, reports, writes, loads, declarations, calls}));
+        })().catch(error => {console.error(error); process.exitCode = 1;});
+      `,
+        dir,
+      );
+      const receipt = JSON.parse(output);
+      for (const result of receipt.results)
+        expect(result.nextState).toMatchObject({
+          health: 'ok',
+          stdout: 'capture\n',
+        });
+      expect(receipt).toMatchObject({
+        reports: 0,
+        writes: 0,
+        loads: 1,
+        declarations: 1,
+        calls: 2,
+      });
+    });
+
+    it('captures NOFILE promptly with a link-local UDP peer, 1100 handles and a busy worker', async () => {
+      // A worker deliberately cannot service report interrupts. Capture must
+      // remain bounded by its own fixed native read, independent of daemon state.
+      const output = await runParent(
+        `
+        const source = require(${JSON.stringify(bundle)}).default;
+        const {Worker, MessageChannel} = require('node:worker_threads');
+        const udp = require('node:dgram').createSocket('udp4');
+        const started = new Int32Array(new SharedArrayBuffer(4));
+        const worker = new Worker('const {workerData} = require("node:worker_threads"); Atomics.store(workerData, 0, 1); Atomics.notify(workerData, 0); const end = Date.now() + 6000; while (Date.now() < end) {}', {eval: true, workerData: started});
+        const handles = Array.from({length: 1100}, () => new MessageChannel());
+        for (const {port1, port2} of handles) {port1.on('message', () => {}); port2.on('message', () => {});}
+        udp.connect(9, '169.254.254.254', async () => {
+          Atomics.wait(started, 0, 0, 2000);
+          if (Atomics.load(started, 0) !== 1) throw new Error('worker never started');
+          const start = performance.now();
+          const result = await source.observe({command: ['/bin/echo', 'prompt'], timeout: '1s'}, {now: new Date()});
+          console.log(JSON.stringify({elapsed: performance.now() - start, result, handles: handles.length * 2}));
+          udp.close();
+          for (const {port1, port2} of handles) {port1.close(); port2.close();}
+          await worker.terminate();
+        });
+      `,
+        dir,
+      );
+      const receipt = JSON.parse(output);
+      expect(receipt.handles).toBeGreaterThan(1000);
+      expect(receipt.result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'prompt\n',
+      });
+      expect(receipt.elapsed).toBeLessThan(1000);
+    }, 15_000);
+
     it.each([
       { soft: '512', hard: 'inherited' },
       { soft: '512', hard: '4096' },
@@ -108,9 +256,6 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
     ])(
       'verifies native resource limits for soft $soft / hard $hard',
       async ({ soft, hard: hardLimit }) => {
-        const refused =
-          soft !== 'unlimited' && !Number.isSafeInteger(Number(soft));
-        const marker = path.join(dir, `ran-${soft}-${hardLimit}`);
         const native = fileURLToPath(
           new URL('../vendor/koffi/load.cjs', import.meta.url),
         );
@@ -143,9 +288,9 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
         // Count only source admission, after the plain-spawn comparison.
         let spawned = 0;
         require('node:child_process').spawn = (...args) => { spawned++; return spawn(...args); };
-        const command = ${JSON.stringify(refused)} ? ['/bin/sh', '-c', 'printf ran > "$1"; exec "$2"', 'fixture', ${JSON.stringify(marker)}, ${JSON.stringify(binary)}] : [${JSON.stringify(binary)}];
+        const command = [${JSON.stringify(binary)}];
         const bounded = await source.observe({command, timeout: '5s'}, {now: new Date(), previousState});
-        console.log(JSON.stringify({platform: process.platform, nofile, nativeSoft, hard, plain, bounded, spawned, markerExists: require('node:fs').existsSync(${JSON.stringify(marker)})}));
+        console.log(JSON.stringify({platform: process.platform, nofile, nativeSoft, hard, plain, bounded, spawned}));
       })().catch(error => { console.error(error); process.exitCode = 1; });
     `,
           dir,
@@ -159,23 +304,7 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
         expect(limits).toBe(
           `${receipt.nofile} ${receipt.nativeSoft} ${receipt.hard}`,
         );
-        if (refused) {
-          expect(receipt.markerExists).toBe(false);
-          expect(receipt.spawned).toBe(0);
-          expect(receipt.bounded.nextState).toEqual({
-            stdout: 'baseline',
-            exitCode: 7,
-            truncated: false,
-            health: 'failing',
-            baselined: true,
-          });
-          expect(receipt.bounded.observations[0]?.payload).toMatchObject({
-            error: expect.stringContaining(
-              'RLIMIT_NOFILE: inherited soft limit is too large to reproduce exactly',
-            ),
-          });
-          return;
-        }
+        expect(receipt.spawned).toBe(1);
         expect(receipt.bounded.nextState).toMatchObject({
           health: 'ok',
           exitCode: 0,

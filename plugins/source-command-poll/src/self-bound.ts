@@ -137,7 +137,7 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
   // than letting the binding silently truncate literal argv or environment data.
   if (command.some(value => value.includes('\0')) || Object.entries(env).some(([key, value]) => key.includes('\0') || value.includes('\0')))
     throw new Error('Could not execute ' + command[0] + ': ERR_INVALID_ARG_VALUE: arguments and environment must be strings without null bytes');
-  // All native work lives in this disposable helper, never on the observe path.
+  // Mutating native process state and exec belong only to this disposable helper.
   // libc execve returns errno; Node's process.execve aborts on ordinary failures.
   let koffi;
   try { koffi = require(native); }
@@ -167,8 +167,11 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
       return new Error('Could not restore command resource limits: RLIMIT_NOFILE: ' + operation + ': ' + getSystemErrorName(-errno) + ' (' + errno + '): ' + strerror(errno));
     }
     if (getrlimit(nofile, current) !== 0) throw failed('getrlimit');
-    // Node startup never changes rlim_max. Preserve those native bytes even when
-    // the finite hard limit exceeds JS precision; only rlim_cur needs restoration.
+    // Node never changes rlim_max, so a mismatch should be impossible. Fail closed
+    // before altering the soft field, preserving the launcher's native hard bytes.
+    const capturedHard = openFiles.hard === 'unlimited' ? infinity : BigInt(openFiles.hard);
+    if (current.readBigUInt64LE(8) !== capturedHard)
+      throw new Error('Could not restore command resource limits: RLIMIT_NOFILE: hard-limit mismatch');
     const expected = Buffer.from(current);
     expected.writeBigUInt64LE(openFiles.soft === 'unlimited' ? infinity : BigInt(openFiles.soft), 0);
     if (current.equals(expected)) return;

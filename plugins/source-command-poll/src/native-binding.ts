@@ -1,4 +1,4 @@
-/** Resolve packaged native admission beside our own module in source, ESM, CJS and the CLI bundle. */
+/** Resolve packaged native capture and admission beside our own module in source, ESM, CJS and the CLI bundle. */
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
