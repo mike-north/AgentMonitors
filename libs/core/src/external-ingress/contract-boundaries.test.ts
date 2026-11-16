@@ -126,6 +126,18 @@ describe('external ingress exact boundaries', () => {
     );
   });
 
+  it('accepts sixteen scope values and rejects seventeen independently of byte size', () => {
+    expect(
+      validateExternalEventEnvelope(
+        envelope({ scope: { key: Array(16).fill('v') } }),
+      ).success,
+    ).toBe(true);
+    expectError(
+      envelope({ scope: { key: Array(17).fill('v') } }),
+      'payload_too_large',
+    );
+  });
+
   it('returns invalid_envelope without throwing for every scalar field runtime type', () => {
     const fields = [
       'monitorId',
@@ -239,31 +251,55 @@ describe('external ingress semantic identity', () => {
     );
 
     const mutations = {
-      schema: envelope({ schema: 'agentmonitors.external-event.v2' as never }),
-      monitorId: envelope({ monitorId: 'other-monitor' }),
-      source: envelope({ source: 'other-source' }),
-      upstreamEventId: envelope({ upstreamEventId: 'other-delivery' }),
-      objectId: envelope({ objectId: 'other-object' }),
-      objectSequence: envelope({ objectSequence: 43 }),
-      eventKind: envelope({ eventKind: 'build.completed' }),
-      changeKind: envelope({ changeKind: 'created' }),
-      occurredAt: envelope({ occurredAt: '2026-08-13T18:00:01Z' }),
-      scope: envelope({ scope: { project: 'other/project' } }),
-      state: envelope({ state: { nested: { a: [1, 2], z: 2 }, a: 0, z: 1 } }),
-    } satisfies Record<
-      Exclude<keyof ExternalEventEnvelope, 'resumeToken'>,
-      ExternalEventEnvelope
-    >;
-    expect(Object.keys(mutations).sort()).toEqual(
-      Object.keys(base)
-        .filter((field) => field !== 'resumeToken')
-        .sort(),
-    );
-    for (const changed of Object.values(mutations)) {
-      expect(externalEventSemanticHash(changed)).not.toBe(
-        externalEventSemanticHash(base),
-      );
+      schema: 'agentmonitors.external-event.v2' as never,
+      monitorId: 'other-monitor',
+      source: 'other-source',
+      upstreamEventId: 'other-delivery',
+      objectId: 'other-object',
+      objectSequence: 43,
+      eventKind: 'build.completed',
+      changeKind: 'created',
+      occurredAt: '2026-08-13T18:00:01Z',
+      scope: { project: 'other/project' },
+      state: { nested: { a: [1, 2], z: 2 }, a: 0, z: 1 },
+    } satisfies Omit<ExternalEventEnvelope, 'resumeToken'>;
+    for (const [field, value] of Object.entries(mutations)) {
+      // Each row varies exactly one field, so dropping that field cannot hide
+      // behind a second changed field in the same fixture.
+      expect(
+        externalEventSemanticHash({ ...base, [field]: value }),
+        field,
+      ).not.toBe(externalEventSemanticHash(base));
     }
+    expect(
+      externalEventSemanticHash(
+        envelope({
+          ...base,
+          scope: { ...base.scope, a: ['one', 'two'] },
+        }),
+      ),
+    ).not.toBe(externalEventSemanticHash(base));
+  });
+
+  it('ignores unknown properties outside the closed v1 identity', () => {
+    const base = envelope();
+    const wider = { ...base, extra: 'transport-metadata' };
+    expect(externalEventSemanticHash(wider)).toBe(
+      externalEventSemanticHash(base),
+    );
+  });
+
+  it('pins SHA-256 of the documented eleven-field preimage', () => {
+    // Keys are written in UTF-16 lexical order, with compact JSON punctuation;
+    // the expected digest is independently computed from these literal bytes.
+    const preimage =
+      '{"changeKind":"modified","eventKind":"build.updated","monitorId":"build-health","objectId":"build-group-123","objectSequence":42,"occurredAt":"2026-08-13T18:00:00.000Z","schema":"agentmonitors.external-event.v1","scope":{},"source":"example-build-system","state":{},"upstreamEventId":"delivery-01HX"}';
+    const fixed = envelope({ scope: {}, state: {} });
+    const { resumeToken: _cursor, ...semantic } = fixed;
+    expect(canonicalJsonStringify(semantic)).toBe(preimage);
+    expect(externalEventSemanticHash(fixed)).toBe(
+      '26c08c7be5b2d14c1aa56db8cdd8c9284c66278f1d096c106fb2492396ca94c2',
+    );
   });
 
   it('builds a collision-free source/object tuple key', () => {
