@@ -3593,3 +3593,65 @@ in large inputs. Intrinsic replacement-prototype matrices, the supported maximum
 100,000-container configuration refusals and hand-written numeric/string byte
 vectors also enforce this boundary. Retained-retry, polled-source and watched-source suites continue
 to validate their existing independent contracts.
+
+### 16.1 Versioned external envelopes (_current internal contract_)
+
+`validateExternalEventEnvelope` admits only the complete
+`agentmonitors.external-event.v1` field set. Unknown fields, including instructions,
+urgency, notify policy and local filesystem paths, MUST be refused. This internal
+validator does not expose ingestion, persistence or routing through the package root.
+
+The validator MUST preflight encoded size before canonical JSON validation,
+normalization or fingerprinting. Its descriptor walk counts exact escaped UTF-8
+bytes without building escaped strings, refuses proxies/accessors without invoking
+them, and stops before visiting the next member once the budget is exceeded.
+Shared acyclic children count on every occurrence: a 32-level shared-child DAG
+MUST be refused within the byte budget rather than expanded exponentially.
+As in §16, native own-key enumeration costs the container's width; descriptor and
+child traversal, string scanning, canonical output allocation and sorting are
+limited by admitted bytes. String length plus its quotes is checked before any
+code-unit read, preventing a rejected rope from flattening beyond the byte bound.
+Field UTF-8 checks also reject from length before measuring bytes. Array length
+can be refused before key enumeration. Captured module-load intrinsics and
+indexed own-data reads apply §16's no-caller-code and post-load prototype
+independence guarantees to byte counting, semantic field validation and refusal.
+Resource refusals are classified by private identity without reading the thrown
+value or consulting error constructors or prototype membership hooks.
+After encoding, a separate UTF-8 measurement of the actual canonical output MUST
+refuse an envelope over 262,144 bytes before normalization. This final check
+protects against a counting defect; preflight remains the primary resource bound.
+The preflight does not replace §16's JSON domain and prototype policies; only an
+input admitted by both boundaries can be normalized.
+
+Limits are inclusive: envelope 262,144 canonical UTF-8 bytes; each of `monitorId`,
+`source`, `upstreamEventId`, `objectId` and `eventKind` 512 UTF-8 bytes; resume token
+2,048 UTF-8 bytes; scope 32 keys and 32,768 canonical UTF-8 bytes, with 64 UTF-8
+bytes per key, 16 values per key and 512 UTF-8 bytes per value; state 32 container
+levels with its root at level 1. Scalars consume no depth. Every byte, cardinality
+and depth overrun MUST return permanent `payload_too_large`. Malformed values
+return permanent `invalid_envelope`; an unknown string schema returns permanent
+`unsupported_schema`. Diagnostics MUST NOT echo producer data. Structural checks
+may reject malformed data before another independent limit is reached.
+
+These semantic bounds are independent of `apps/cli/src/input-limits.ts`: its 1 MiB
+request framing budget and collection/value-depth policies cover all daemon control
+requests and decoded request wrappers. Reusing them here would change envelope
+compatibility and make core depend on its host. No second daemon transport bound
+is introduced. Future transport integration must honor both boundaries.
+
+Equivalent object-key orderings MUST return identical normalized values and
+canonical JSON bytes on repeated runs. Hashing those bytes is deterministic; this
+layer does not introduce a fingerprint API or semantic receipt identity.
+
+Validation: `external-ingress/contract.test.ts` pins every exact/+1 boundary,
+ASCII and multibyte field sizes, escaped canonical bytes, object/array/alternating
+depth, authority refusal, repeated canonical equivalence, inherited JSON policies,
+and counter/encoder-spy early stops for oversized strings and wide values.
+Isolated child processes cap rope-allocation and shared-child DAG regressions,
+and exercise prototype replacements after import. The complete limits table and
+boundary inputs are pinned to specification numbers independently of the code;
+multibyte array values and canonical scope bytes include exact-limit acceptance.
+Canonical scope boundaries cover short and control escapes independently of the
+larger envelope bound. Refusal cases replace error constructors and error
+membership hooks after import and require zero calls with unchanged error codes.
+An injected undercount exercises the final output-size check.
