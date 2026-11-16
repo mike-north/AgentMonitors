@@ -169,14 +169,22 @@ their startup environment. They exclude authored and inherited variables, includ
 asynchronous configuration pipe, with only the deliberate ownership-mark override. Native exec
 receives it as envp; Linux installs the authored PATH just before `execvpe` for libc lookup.
 Helper argv does not consume the authored environment's plain-spawn admission budget. Private
-descriptors close at exec; only standard input/output/error survive. Admission clears their
+descriptors close at exec; standard input/output/error and the explicit macOS life-token descriptor below survive. Admission clears their
 close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. It also
 reads status with `F_GETFL`, clears only `O_NONBLOCK` through `F_SETFL`, and verifies blocking
 mode with another `F_GETFL`. Access mode, append mode and unrelated flags remain intact.
 This restores native spawn I/O semantics after Node helper startup; ordinary stdin is still
 `/dev/null`. Failed calls, failed read-backs, a remaining `O_NONBLOCK` or
 a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
-without running authored work. Missing native binding support
+without running authored work. On macOS, durable ownership admission also supplies the journal's
+private life-token tuple (§4.2). The asynchronous launcher opens that regular file with no-follow
+semantics and verifies device/inode with fstat before starting authored work. After watchdog
+arming and resource-limit restoration, it clears only that descriptor's `FD_CLOEXEC` and verifies
+the flag is clear. Missing/replaced files, failed flag calls or failed read-back refuse authored
+exec with a life-token diagnostic and preserve the previous baseline. The watchdog never inherits
+that vnode: it retains its existing readable environment ownership. Ordinary shell fork/exec
+children inherit the token; commands that close extra descriptors can remain unprovable.
+Missing native binding support
 fails closed with a platform-support explanation and the underlying loader error. Other startup
 or native-initialization failures preserve their own detail without a module-loading label.
 
@@ -289,6 +297,18 @@ Unavailable discovery retains hints. Spawn/exit bookkeeping during a read retain
 hint; older unchanged empty hints can still retire under continuous unrelated admissions. An
 earlier snapshot cannot retire refreshed work. The life nonce remains available for marked detached work.
 
+On macOS, that same pre-spawn admission commits the canonical path, unsigned device and inode
+of a fresh, exclusively created `0600` regular file in the journal's owner-only
+`<db>.commands.sqlite.tokens` directory. File and directory reservations are synchronized before
+the FULL-synchronous life-row commit returns. Resource-limit capture and other pre-spawn refusals
+occur after this admission. A crash between file creation and row commit leaves an inert orphan
+file: the sweep MUST NOT discover authority by scanning token files or reconstructing missing
+metadata. Old rows without vnode metadata retain only their original environment-based behavior.
+The file stays reserved until existing life-retirement conditions discharge pending attribution
+and occupied suspicions; retirement revokes the row before removing the exact recorded file.
+A missing/replaced token is never recreated for an old life. In-memory journals do not create
+persistent vnode ownership.
+
 The sweep reads the platform process table and inherited ownership marks, independently of current
 parent, group or session membership. A marked live member also confirms the identities of its
 current process-group members, including children that cleared their environment while staying
@@ -363,11 +383,12 @@ shared bounded terminal evidence queries.
 
 **Verified:** injected-reader group-bound cases in
 `libs/core/src/process/command-process-journal.test.ts`, and native stock-shell deadline
-survival plus fully verified watchdog reaping in
+survival when vnode metadata is unavailable, restricted-command cleanup and fully verified watchdog reaping in
 `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`.
 
-Ownership MUST come from the actual process environment, never matching argv text. Linux reads
-`/proc/<pid>/environ` for exactly the requested identifiers. macOS reads kernel
+Ownership MUST come from the candidate's own environment or, only on macOS when that environment
+is unreadable, its own exact journaled vnode. Matching argv text never supplies ownership.
+Linux reads `/proc/<pid>/environ` for exactly the requested identifiers. macOS first reads kernel
 `KERN_PROCARGS2`: argc determines exactly how many NUL-terminated argv entries to skip,
 then only envp supplies ownership. Nonce-shaped arguments never become ownership. Empty or
 padded argv entries, including process-title rewrites, and an unproven envp boundary are
@@ -384,6 +405,39 @@ returned by each successful sysctl call, never the unused remainder of its reuse
 allocation; a short reply or failed call cannot borrow an earlier PID's evidence.
 The reader requires a nonempty, structurally valid envp before accepting its terminator and rejects
 duplicate reserved keys and malformed/truncated buffers.
+
+For unreadable macOS envp only, the same stock helper enumerates that PID's descriptors using
+`proc_pidinfo(PROC_PIDLISTFDS)` and reads its vnode descriptors with
+`proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`. A complete detail reply must match all three journaled
+fields: canonical pathname, device and inode. Inode values remain exact unsigned 64-bit decimal
+strings across JXA. Native replies are copied in bounded bulk reads so pathname length does
+not multiply Objective-C pointer accesses. Canonical Unicode paths round-trip through ASCII-escaped
+JSON requests. The helper's existing deadline is unchanged. Descriptor enumeration is bounded to 4096 entries; empty, partial, saturated,
+failed or malformed replies are uncertainty. An unmatched descriptor, argv-only nonce, readable
+conflicting/absent life mark, sibling or watchdog MUST NOT supply fallback ownership. Token files
+are revalidated before every ownership request. Discovery and the final signal-time gate each
+read the candidate's own vnode; boot and final start-time/group checks remain mandatory, with
+identity read last. A vnode holder cannot anchor group-continuity authority for a different
+process, including a readable unmarked sibling; only the existing envp-marked anchors retain
+their unchanged readable-member path. A fallback failure records its PID and bounded reason. It never authorizes
+an unreadable same-group member through group continuity, and any unresolved member continues
+to preserve a verified watchdog under the existing veto rule.
+
+**Current command coverage:** readable Node/user binaries retain the original envp path. Stock
+`/bin/sh`, `/bin/bash`, `/bin/sleep`, `/usr/bin/curl`, and shell scripts run by `/bin/sh` can now be
+reconciled when they retain the admitted descriptor. Ordinary shell children inherit it; each
+child still needs its own proof. Commands that explicitly close inherited descriptors remain
+unprovable when envp is withheld. Native SIGKILL/restart tests cover a retained `sh -c` plus its
+sleep child and curl against a local listener; byte-level tests enforce full-size libproc replies,
+exact tuple matching and 64-bit decoding. Admission, uncommitted-file, missing-metadata,
+same-group/argv-only and signal-time proof-loss regressions enforce the fail-closed boundaries.
+Linux ownership behavior is unchanged. The boundaries are exercised by
+`libs/core/src/process/command-life-token.test.ts`,
+`libs/core/src/process/command-process-vnode.test.ts`,
+`libs/core/src/process/darwin-vnode-proof.test.ts`,
+`libs/core/src/process/darwin-command-vnode.integration.test.ts`, and
+`plugins/source-command-poll/src/life-token-admission.test.ts`.
+
 One asynchronous `/usr/bin/osascript -l JavaScript` helper is owned by the entire sweep,
 accepts batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
 Discovery and fresh signal-time checks reuse that helper; no subprocess starts per survivor.
@@ -392,8 +446,8 @@ output and size buffers. It needs only stock macOS, with no developer tools, Hom
 native addon or shipped binary. The daemon never invokes Python or developer-tool probes.
 A helper startup failure (synchronous or emitted), timeout or invalid evidence makes the sweep
 incomplete with a reason. An unreadable process environment (including protected executables,
-another user's processes, exit races and ambiguous argv/envp layouts) records a PID-specific
-abstention with a reason, never an unmarked/owned guess.
+another user's processes, exit races and ambiguous argv/envp layouts) without its own valid
+vnode fallback records a PID-specific abstention with a reason, never an unmarked/owned guess.
 Boot and identity still use bounded system `sysctl` and `ps` calls. macOS terminal evidence
 is also batched, and synchronous receipt writes are committed together before the next
 asynchronous discovery query. Signal-time ownership queries read only the requested candidate
