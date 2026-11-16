@@ -145,13 +145,15 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
   // Only the journal creates life ownership. Open its committed tuple here,
   // asynchronously, while Node-created descriptors still close on exec. The
   // watchdog receives only its explicit control descriptor, never this vnode.
+  // A replaced FIFO must not wait for a writer before the watchdog can arm.
+  // O_NONBLOCK has no I/O effect on the validated regular file and stays set.
   let tokenFile;
   if (lifeToken !== undefined) {
     const fs = require('node:fs');
     if (process.platform !== 'darwin' || lifeToken.life !== env.AGENTMONITORS_COMMAND_LIFE)
       throw new Error('Could not retain command life token: invalid admission metadata');
     try {
-      tokenFile = await require('node:fs/promises').open(lifeToken.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      tokenFile = await require('node:fs/promises').open(lifeToken.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       const stat = await tokenFile.stat({bigint: true});
       if (!stat.isFile() || String(stat.dev) !== lifeToken.device || String(stat.ino) !== lifeToken.inode)
         throw new Error('vnode identity mismatch');

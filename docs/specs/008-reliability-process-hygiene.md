@@ -177,8 +177,11 @@ This restores native spawn I/O semantics after Node helper startup; ordinary std
 `/dev/null`. Failed calls, failed read-backs, a remaining `O_NONBLOCK` or
 a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
 without running authored work. On macOS, durable ownership admission also supplies the journal's
-private life-token tuple (§4.2). The asynchronous launcher opens that regular file with no-follow
-semantics and verifies device/inode with fstat before starting authored work. After watchdog
+private life-token tuple (§4.2). The asynchronous launcher opens the token with `O_NOFOLLOW | O_NONBLOCK`, then
+requires a regular file with the committed device/inode from fstat before starting authored
+work. FIFO, directory, socket and symlink replacements refuse promptly even after control EOF;
+token opening cannot wait for a FIFO writer before watchdog arming. `O_NONBLOCK` remains set
+on the validated regular-file descriptor, where it has no I/O effect. After watchdog
 arming and resource-limit restoration, it clears only that descriptor's `FD_CLOEXEC` and verifies
 the flag is clear. Missing/replaced files, failed flag calls or failed read-back refuse authored
 exec with a life-token diagnostic and preserve the previous baseline. The watchdog never inherits
@@ -303,7 +306,12 @@ of a fresh, exclusively created `0600` regular file in the journal's owner-only
 the FULL-synchronous life-row commit returns. Resource-limit capture and other pre-spawn refusals
 occur after this admission. A crash between file creation and row commit leaves an inert orphan
 file: the sweep MUST NOT discover authority by scanning token files or reconstructing missing
-metadata. Old rows without vnode metadata retain only their original environment-based behavior.
+metadata. A handled admission failure confirms row absence before releasing only the exact
+device/inode reserved by that attempt; a retained row or unreadable commit state preserves
+the reservation. It rotates the uncommitted life nonce so the next admission on the same journal uses
+a fresh pathname even if release failed or the pathname was replaced. A leftover file has no
+committed row and remains inert. This failure path never rotates or removes a committed life.
+Old rows without vnode metadata retain only their original environment-based behavior.
 The file stays reserved until existing life-retirement conditions discharge pending attribution
 and occupied suspicions; retirement revokes the row before removing the exact recorded file.
 A missing/replaced token is never recreated for an old life. In-memory journals do not create

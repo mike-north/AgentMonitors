@@ -118,7 +118,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
   private constructor(
     private readonly sql: Database.Database,
     private readonly workspace: string,
-    private readonly life: string,
+    private life: string,
     private readonly tokenDirectory: string | undefined,
   ) {}
 
@@ -166,21 +166,45 @@ export class CommandProcessJournal implements CommandProcessOwner {
     await this.initializeIdentity();
     if (this.registered) await this.retireEmptyGroups();
     if (!this.registered) {
-      const token =
-        process.platform === 'darwin' && this.tokenDirectory !== undefined
-          ? createCommandLifeToken(this.tokenDirectory, this.life)
-          : undefined;
-      this.sql
-        .prepare(
-          'INSERT INTO command_lives(life,workspace,boot,owner,vnode) VALUES(?,?,?,?,?)',
-        )
-        .run(
-          this.life,
-          this.workspace,
-          this.boot ?? '',
-          JSON.stringify(this.owner ?? null),
-          token === undefined ? null : JSON.stringify(token),
-        );
+      let token: CommandLifeToken | undefined;
+      try {
+        token =
+          process.platform === 'darwin' && this.tokenDirectory !== undefined
+            ? createCommandLifeToken(this.tokenDirectory, this.life)
+            : undefined;
+        this.sql
+          .prepare(
+            'INSERT INTO command_lives(life,workspace,boot,owner,vnode) VALUES(?,?,?,?,?)',
+          )
+          .run(
+            this.life,
+            this.workspace,
+            this.boot ?? '',
+            JSON.stringify(this.owner ?? null),
+            token === undefined ? null : JSON.stringify(token),
+          );
+      } catch (error) {
+        if (token !== undefined) {
+          // A reported INSERT error does not prove absence: SQLite FAIL can
+          // retain a row. Unavailable commit state must preserve its reservation.
+          let uncommitted = false;
+          try {
+            uncommitted =
+              this.sql
+                .prepare('SELECT 1 FROM command_lives WHERE life = ?')
+                .get(this.life) === undefined;
+          } catch {
+            /* Unknown row state cannot authorize removing a potentially committed token. */
+          }
+          // Release only this attempt's exact inode after confirming no row owns
+          // it. A replaced pathname belongs to someone else and stays untouched.
+          if (uncommitted) retireCommandLifeToken(token);
+        }
+        // A fresh uncommitted nonce also gives retries a fresh pathname when
+        // release fails. Committed lives never rotate or reconstruct authority.
+        if (process.platform === 'darwin') this.life = randomUUID();
+        throw error;
+      }
       this.token = token;
       this.registered = true;
     }

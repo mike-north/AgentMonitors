@@ -1765,7 +1765,8 @@ result at all (§11.5).
 
 On macOS, an optional durable command owner also supplies its committed life-token tuple after
 `environment()` resolves. The source passes it through the private launcher configuration, not
-the authored environment. The launcher opens it asynchronously with no-follow semantics and
+the authored environment. The launcher opens it asynchronously with no-follow and nonblocking semantics, rejects
+non-regular replacements promptly before watchdog arming, and
 checks its fstat device/inode. After the watchdog is armed and the inherited resource-limit pair
 is restored and verified, it clears and verifies `FD_CLOEXEC` on that one descriptor. Every failure
 refuses authored exec and retains the baseline. The extra descriptor deliberately survives into

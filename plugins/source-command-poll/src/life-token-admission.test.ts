@@ -2,15 +2,29 @@
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
+  renameSync,
+  symlinkSync,
   realpathSync,
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { spawn, execFileSync } from 'node:child_process';
+import { once } from 'node:events';
+import { createServer } from 'node:net';
+import { setTimeout as delay } from 'node:timers/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { CommandProcessJournal } from '@agentmonitors/core';
 import { createCommandPollSource } from './index.js';
+import {
+  LAUNCHER_PROGRAM,
+  WATCHDOG_PROGRAM,
+  monotonicNowMs,
+} from './self-bound.js';
+import { inheritedOpenFileLimits } from './open-file-limits.js';
+import { vendoredNativeLoader } from './native-binding.js';
 
 /** Fault only the disposable launcher, never authored code or the test host. */
 const injection = vi.hoisted(() => ({ prefix: '', captureFailure: false }));
@@ -182,4 +196,111 @@ it.skipIf(process.platform !== 'darwin')(
       journal.close();
     }
   },
+);
+
+/** Path replacements must refuse even when no daemon remains to supervise startup. */
+it
+  .skipIf(process.platform !== 'darwin')
+  .each(['FIFO', 'directory', 'socket', 'symlink'])(
+  'refuses a %s replacement promptly and stays bounded after control EOF',
+  async (replacement) => {
+    const f = fixture();
+    const original = f.token.path + '.reserved';
+    renameSync(f.token.path, original);
+    const server = createServer();
+    if (replacement === 'FIFO')
+      execFileSync('/usr/bin/mkfifo', ['-m', '600', f.token.path], {
+        timeout: 1000,
+      });
+    if (replacement === 'directory') mkdirSync(f.token.path);
+    if (replacement === 'symlink') symlinkSync(original, f.token.path);
+    if (replacement === 'socket') {
+      server.listen(f.token.path);
+      await once(server, 'listening');
+    }
+    const sentinel = path.join(f.root, 'ran');
+    const command = [
+      process.execPath,
+      '-e',
+      `require('node:fs').writeFileSync(${JSON.stringify(sentinel)}, 'ran')`,
+    ];
+    // A detached launcher owns its group; cleanup never targets the test runner.
+    const child = spawn(
+      process.execPath,
+      ['--input-type=commonjs', '-e', LAUNCHER_PROGRAM],
+      {
+        cwd: f.root,
+        detached: true,
+        stdio: ['ignore', 'ignore', 'pipe', 'pipe', 'pipe', 'pipe'],
+      },
+    );
+    // Drain the private diagnostic as well as observing process termination.
+    const exited = once(child, 'close');
+    let status = '';
+    child.stdio[5]?.on('data', (chunk: Buffer) => {
+      status += chunk.toString();
+    });
+    try {
+      const control = child.stdio[3];
+      const config = child.stdio[4];
+      if (!control || !('end' in control) || !config || !('end' in config))
+        throw new Error('Missing fixture pipes');
+      config.end(
+        JSON.stringify({
+          command,
+          env: await f.owner.environment(),
+          deadline: monotonicNowMs() + 250,
+          grace: 5000,
+          watchdog: WATCHDOG_PROGRAM,
+          native: vendoredNativeLoader(),
+          openFiles: inheritedOpenFileLimits(),
+          lifeToken: f.token,
+        }),
+      );
+      control.end();
+      const start = monotonicNowMs();
+      const outcome = await Promise.race([
+        exited.then(() => 'exited'),
+        delay(6000).then(() => 'unbounded'),
+      ]);
+      expect(outcome).toBe('exited');
+      expect(monotonicNowMs() - start).toBeLessThan(2000);
+      expect(status).toMatch(/life token/i);
+      expect(existsSync(sentinel)).toBe(false);
+      const previousState = {
+        stdout: 'baseline',
+        exitCode: 7,
+        truncated: false,
+        health: 'ok',
+        baselined: true,
+      };
+      const result = await createCommandPollSource(f.owner).observe(
+        { command, timeout: '3s' },
+        { now: new Date(), previousState },
+      );
+      expect(result.nextState).toMatchObject({
+        ...previousState,
+        health: 'failing',
+      });
+      expect(result.observations[0]?.payload).toMatchObject({
+        error: expect.stringMatching(/life token/i),
+      });
+      expect(existsSync(sentinel)).toBe(false);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.kill('SIGKILL');
+        await Promise.race([
+          exited,
+          delay(1000).then(() => {
+            throw new Error('Fixture did not exit');
+          }),
+        ]);
+      }
+      if (server.listening)
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+    }
+  },
+  12_000,
 );
