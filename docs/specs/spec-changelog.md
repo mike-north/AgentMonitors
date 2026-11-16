@@ -117,6 +117,15 @@ pending disappearance, readable ownership, nonce absence and vacant hints for di
 commit anchor-disappearance receipts before rediscovery. Journal regressions exercise these
 boundaries without changing per-process signal authority or watchdog preservation.
 
+## 2026-11-14 — External JSON post-load prototype independence (002 §16)
+
+Require zero caller-code execution for every input under the module-load built-in
+trust assumption. Internal buffers and traversal must not consult mutable
+prototype protocols or inherited numeric setters. Exclude URL and URLSearchParams
+from the detectable hidden-state list: JavaScript brand-error construction can
+itself invoke inherited hooks. Preserve native/private-brand refusal checks,
+first-invalid-member order, depth bounds and canonical bytes.
+
 ## 2026-11-14 — Claims consume only represented net groups (002 §9) — Refs #571
 
 Rendering and claim persistence use the same selected net groups for every lifecycle.
@@ -232,6 +241,63 @@ and offline hash/tampering tests protect shipped bytes. The standalone consumer 
 native package registry requests and requires a real installed CLI monitor to fire.
 Koffi's source-build fallback fails to link on macOS 27.3, CMake 4.3.4, Apple clang 21
 (`napi_*` undefined); it is never triggered.
+
+## 2026-11-14 — External JSON own descriptor fields and Headers domain (002 §16) — Refs #596
+
+Require own descriptor fields so post-load Object.prototype properties cannot
+admit accessors or run inherited hooks. Record and array accessors report
+`Accessor or hidden property.`. Remove the Headers inspector: its presentation
+object can invoke inherited header-name setters, and a thrown setter can look
+like a missing brand. Headers joins the non-exhaustive examples outside the
+plain-data domain; no detection result is promised after prototype replacement.
+
+## 2026-11-14 — External JSON crypto representation and inherited hooks (002 §16) — Refs #596
+
+Select the crypto representation from a genuine key at module load. Symbol-backed
+Node 24 refuses keys at the own-symbol gate and never invokes property-reading
+crypto wrappers, preserving hook freedom after inherited symbol getters are added.
+Private-brand Node 24 runs crypto predicates after full descriptor/child validation.
+Pin first-invalid-child and accessor errors before key refusal through both entry
+points on both representations.
+
+## 2026-11-14 — Portable external JSON brands and explicit input domain (002 §16) — Refs #596
+
+Refuse genuine crypto keys across symbol-backed and private-slot Node 24 runtimes,
+using captured crypto predicates only after full record descriptor/child checks.
+Specify deterministic gate ordering and the trusted-runtime capture assumption.
+Refuse Headers and Intl Segments with hook-free, state-preserving probes. Exclude
+FormData because its inspector can call stored array methods and mutate values.
+Replace the detection-limit claim with a tested refusal list and non-exhaustive
+examples outside the plain-data domain. Keep crypto-symbol accessor cases only on
+runtimes that expose that representation; always run the genuine-key matrix.
+
+## 2026-11-14 — Hook-free external JSON brand checks and detection limits (002 §16) — Refs #596
+
+Remove property-reading crypto predicates and refuse real keys by their own symbols.
+Establish proxy refusal and exact prototypes before captured read-only intrinsic
+checks. Refuse prototype-replaced weak references, finalization registries, URLs,
+query parameters and the supported Intl families without changing receiver state.
+Document that callers must exclude prototype-replaced array/string iterators and
+Headers because the available checks advance state or depend on prototype identity.
+
+## 2026-11-14 — Intrinsic refusal and supported external JSON depth (002 §16) — Refs #596
+
+Reject native intrinsic brands before accepting record prototypes, including when
+those prototypes have been replaced. Cap caller-selected maximum depth at 512
+and refuse unsupported configurations with TypeError before inspecting input.
+Keep the inclusive limit, scalar leaves and state/envelope depths 32/34. Add
+explicit scalar byte vectors and specify lossless lone-surrogate escaping.
+
+## 2026-11-14 — External JSON plain-data and depth policies (002 §16) — Refs #596
+
+Specify the internal external-event encoder independently of retained-retry
+serialization. Accept null-prototype records and dense ordinary arrays; reject
+array subclasses, proxies before reflection, unsafe values and unsupported own
+properties. State inclusive container depth with caller-selected initial depth,
+scalar leaves, and valid bounds. Encode members before canonical key sorting so
+an early invalid value cannot inspect later members. Cover these rules with
+boundary tables, deterministic generated permutations and early-refusal tests.
+The package-root surface and retained-retry behavior remain unchanged.
 
 ## 2026-11-13 — Restore blocking native standard streams before exec (003 §11; 008 §3.3) — Refs #470
 

@@ -3447,3 +3447,149 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 | `updated_at`   | INTEGER NOT NULL |                                                                     |
 | `acked_at`     | INTEGER nullable |                                                                     |
 | `completed_at` | INTEGER nullable |                                                                     |
+
+## 16. External JSON foundation
+
+**Current internal contract.** `libs/core/src/external-ingress/json.ts` validates and
+canonically encodes external plain JSON data. It remains outside the package root.
+It is independent of `runtime/retry-envelope.ts`: retained retries continue to use
+`serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
+`observedAt` Date. External JSON permits no Date values.
+
+The input domain is primitives, ordinary records with `Object.prototype` or a
+null prototype, and dense ordinary arrays. The following tested built-in families
+are refused even after replacing their prototype with either accepted record
+prototype. This is a stated refusal list, not a proof that all hidden state can be
+detected. Probes are captured at module load and assume unmodified runtime
+built-ins, including `Object.prototype`, at that point.
+
+For **every input**, inside or outside the plain-data domain, validation and
+encoding MUST NOT run caller code: getters, setters, `toJSON`, proxy traps or
+inherited accessors. Changes to any built-in prototype after module load MUST
+neither run code nor change a result. Internal traversal uses indexed reads,
+captured functions invoked without mutable call/apply protocols, and own-data
+buffers independent of inherited numeric setters, iterators and array species.
+Sorting and joining use captured methods on dense null-prototype buffers.
+
+A brand probe's not-a-member path MUST NOT construct an error in Node JavaScript
+internals. Even captured methods can invoke inherited numeric setters while
+constructing such an error. Only native wrong-receiver exceptions or hook-free
+boolean slot/private-brand checks meet this boundary.
+
+| Refused family                                                                                                     | Captured check                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| All proxies, including revoked proxies                                                                             | `util.types.isProxy`, before reflection                                                                                                                                                |
+| Date, RegExp, Map, Set, WeakMap, WeakSet                                                                           | Corresponding native `util.types.is*` slot predicates                                                                                                                                  |
+| Boxed primitives                                                                                                   | `util.types.isBoxedPrimitive`                                                                                                                                                          |
+| ArrayBuffer/SharedArrayBuffer, typed arrays/DataView (including Buffer)                                            | `util.types.isAnyArrayBuffer` / `isArrayBufferView`                                                                                                                                    |
+| Promise, native errors, Map/Set iterators, generator objects, arguments, module namespaces, native external values | Corresponding native `util.types.is*` slot predicates                                                                                                                                  |
+| KeyObject and CryptoKey                                                                                            | Own-symbol refusal on symbol-backed runtimes; captured private/native `util.types.isKeyObject` / `isCryptoKey` after full record descriptor/child validation on private-brand runtimes |
+| WeakRef                                                                                                            | Captured `WeakRef.prototype.deref`                                                                                                                                                     |
+| FinalizationRegistry                                                                                               | Captured `unregister` with a fresh unregistered token                                                                                                                                  |
+| Intl Collator, PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, Segmenter, DurationFormat                | Captured `resolvedOptions`                                                                                                                                                             |
+| Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                                                                       |
+| Intl Locale                                                                                                        | Captured `toString`                                                                                                                                                                    |
+| Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                                                                                 |
+
+Probes MUST NOT run caller code or mutate receiver state. A swallowed probe
+exception MUST mean a missing native slot or private field: a genuine supported
+member must not throw from caller hooks and then pass as an ordinary record.
+WeakRef dereferencing retains its target for the current job; it does not alter
+the receiver.
+
+Descriptor fields MUST be read only as own fields, using a captured
+`Object.hasOwn` check. In particular, inherited `value` cannot make an accessor
+look like a data property. Post-load `Object.prototype` data properties or getters
+for `value`, `enumerable`, `get` or `set` MUST NOT change validation or run hooks.
+Record and array accessors report `Accessor or hidden property.`.
+
+The deterministic first-violation order is: depth-bound configuration and scalar
+checks; proxy refusal; exact prototype identity; native/read-only intrinsic brands;
+ancestor-cycle refusal; then own keys, descriptors and children in own-key order
+(array length/indices for arrays). A genuine secret key created at module load
+selects the crypto representation without consulting caller input. On symbol-backed
+Node 24, genuine keys carry own symbols and MUST be refused at the own-symbol gate.
+The property-reading `isKeyObject` / `isCryptoKey` wrappers MUST NOT run there:
+post-load `Object.prototype` symbol getters could otherwise run on ordinary records.
+On private-brand Node 24, captured crypto predicates read no receiver properties
+and MUST run after all of that record's descriptors and children pass, before
+canonical sorting. Both paths preserve first-invalid-member refusal before later
+sibling descriptors or children are inspected. For example, a genuine KeyObject
+with `Object.prototype` and a first enumerable child of `NaN` reports
+`Invalid JSON number.`; a first enumerable accessor reports
+`Accessor or hidden property.` without calling it, before either crypto refusal.
+The JSON tests pin these outcomes through both entry points and require zero
+inherited crypto-symbol getter calls where those symbols exist.
+
+Any other object whose state is not held in its own enumerable data properties is
+outside the input domain. Callers MUST NOT pass it; the module makes no claim to
+detect it. **Non-exhaustive tested examples** that remain unrefused after prototype
+replacement include array/string/RegExp-string iterators, iterator helpers and
+wrappers, Intl SegmentIterator, URL, URLSearchParams, Headers, FormData, Request,
+Response and AbortController.
+These are examples of unsupported inputs, not claims that no suitable detector
+could exist.
+No URL or URLSearchParams probe is invoked. URLSearchParams' size getter constructs
+`ERR_INVALID_THIS` in Node JavaScript for a plain record or array; its error
+constructor's internal array writes can invoke inherited numeric setters. Both
+URL families remain outside the domain rather than weakening the no-caller-code
+rule or depending on a particular wrong-receiver implementation.
+Headers' inspector builds an ordinary presentation object by assigning header
+names, which can invoke inherited setters even with null-prototype inspection
+options. Public Headers methods require Web IDL prototype identity, while direct
+private-field helpers are not exported. No captured Headers inspector is invoked;
+Headers therefore remains outside the domain after accepted prototype replacement.
+FormData's inspector can call a stored array's own `push` method and mutate that
+stored value: its API permits arrays with `File.prototype`, and duplicate field
+names take that path even with negative inspection depth. It therefore fails the probe
+contract. The tested Request/Response methods require Web IDL prototype identity
+and their inspectors read receiver properties; the AbortController signal getter lazily
+creates state and its inspector reads a receiver property. These candidates do
+not meet this module's hook-free, non-mutating probe contract.
+
+Arrays MUST be dense ordinary arrays with exactly `Array.prototype`, enumerable
+data elements, and no own properties other than their indices and built-in data
+`length`. Frozen arrays are allowed. Sparse, subclassed, custom-prototype and typed
+arrays are refused. Ordinary array `length` cannot be an accessor; proxy simulations
+are refused before any trap runs. Accessors, hidden or symbol properties,
+undefined, functions, symbols, bigint, non-finite numbers, unsafe integers,
+non-plain prototypes and all proxies (including revoked ones) MUST be rejected
+without calling accessors, proxy traps or custom serialization hooks.
+
+The caller selects inclusive container depth through
+`assertExternalJsonValue(value, initialDepth, maxDepth)`. Both bounds MUST be
+nonnegative safe integers with `initialDepth <= maxDepth <= 512`. Larger
+configurations MUST throw `TypeError` before inspecting the value. This supported
+maximum bounds recursive traversal; a 100,000-container input with maximum
+99,999 is an invalid configuration, rather than an accepted traversal that can
+exhaust the stack. The root container
+uses `initialDepth`; each child container adds one. Scalars consume no container
+level, so `{ child: { value: true } }` is accepted at initial depth 1 and maximum
+2, but `{ child: { child: {} } }` is refused. `canonicalJsonStringify` starts at
+0 with maximum 512 (513 containers). This preserves callers that count a state
+root as depth 1 and set maximum 32.
+
+Object keys MUST sort recursively by UTF-16 order; array order MUST remain
+unchanged. Numbers MUST be finite and integer-valued numbers MUST be safe
+integers regardless of source notation: `1e21` and `-1.5e300` are refused as unsafe
+integers, while the fractions `1e-7` and `5e-324` encode as `1e-7` and `5e-324`.
+Negative zero canonicalizes to `0`. Strings use JSON escaping: quotes
+and backslashes are escaped, U+0000–U+001F use their short escapes or lowercase
+`\uXXXX` escapes, and U+007F, non-ASCII characters and paired astral characters
+remain literal. Lone surrogate code units MUST use lowercase `\uXXXX` escapes
+(for example, a lone high surrogate U+D800 encodes as `"\ud800"`), so parsing
+returns the same JavaScript string without replacing a code unit. Cycles MUST be refused; a shared
+acyclic child is serialized by value for each occurrence. Validation MUST stop
+at the first invalid member in own-key order before reading later descriptors
+or traversing later child values. It enumerates each container's own keys once;
+that enumeration costs the container's width. Accepted object entries are sorted
+only after encoding their children, at O(k log k) for k accepted keys.
+
+Validation: `libs/core/src/external-ingress/json.test.ts` covers descriptor and
+proxy non-execution, the array policy, exact and excessive object/array depth
+(including nonzero initial depth), invalid bounds, cycles/shared children,
+equivalence tables, deterministic generated key permutations, and early refusal
+in large inputs. Intrinsic replacement-prototype matrices, the supported maximum,
+100,000-container configuration refusals and hand-written numeric/string byte
+vectors also enforce this boundary. Retained-retry, polled-source and watched-source suites continue
+to validate their existing independent contracts.
