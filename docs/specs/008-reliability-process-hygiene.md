@@ -169,16 +169,49 @@ their startup environment. They exclude authored and inherited variables, includ
 asynchronous configuration pipe, with only the deliberate ownership-mark override. Native exec
 receives it as envp; Linux installs the authored PATH just before `execvpe` for libc lookup.
 Helper argv does not consume the authored environment's plain-spawn admission budget. Private
-descriptors close at exec; only standard input/output/error survive. Admission clears their
+descriptors close at exec; standard input/output/error and the explicit macOS life-token descriptor below survive. Admission clears their
 close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. It also
 reads status with `F_GETFL`, clears only `O_NONBLOCK` through `F_SETFL`, and verifies blocking
 mode with another `F_GETFL`. Access mode, append mode and unrelated flags remain intact.
 This restores native spawn I/O semantics after Node helper startup; ordinary stdin is still
 `/dev/null`. Failed calls, failed read-backs, a remaining `O_NONBLOCK` or
 a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
-without running authored work. Missing native binding support
+without running authored work. On macOS, durable ownership admission also supplies the journal's
+private life-token tuple (§4.2). The asynchronous launcher opens the token with `O_NOFOLLOW | O_NONBLOCK`, then
+requires a regular file with the committed device/inode from fstat before starting authored
+work. FIFO, directory, socket and symlink replacements refuse promptly even after control EOF;
+token opening cannot wait for a FIFO writer before watchdog arming. `O_NONBLOCK` remains set
+on the validated regular-file descriptor, where it has no I/O effect. After watchdog
+arming and resource-limit restoration, it clears only that descriptor's `FD_CLOEXEC` and verifies
+the flag is clear. Missing/replaced files, failed flag calls or failed read-back refuse authored
+exec with a life-token diagnostic and preserve the previous baseline. The watchdog never inherits
+that vnode: it retains its existing readable environment ownership. Ordinary shell fork/exec
+children inherit the token; commands that close extra descriptors can remain unprovable.
+Missing native binding support
 fails closed with a platform-support explanation and the underlying loader error. Other startup
 or native-initialization failures preserve their own detail without a module-loading label.
+
+**Current Linux adopted-watchdog lifecycle:** a PID 1 observer or an existing child subreaper
+MUST reap its own adopted watchdog zombies without consuming exit statuses belonging to libuv.
+The watchdog directly reports its PID, current parent and kernel birth time over a separate
+Linux-only pipe. Partial writes MUST complete and that descriptor MUST close before any timer
+is armed: an already elapsed watchdog deadline cannot kill the messengers before registration.
+That pinned lifetime may remain pending while its reported intermediate is still the parent,
+but cannot be waited on yet. On registration or arming failure the Linux intermediate drains
+and reaps its own unarmed watchdog before reporting failure. Reaping MUST use only positive, specifically reported PIDs
+with `WNOHANG`, after a fresh synchronous `/proc/<pid>/stat` read verifies zombie state, this
+observer as parent, the pinned birth time, and the original launcher's group and session. A live
+child, a PID with another parent, a recycled PID, or unreadable identity MUST never be waited on.
+No wildcard wait, process signal, general SIGCHLD handler, or automatic subreaper enablement is
+permitted. Ordinary Linux observers and macOS perform no reaping. A transient outstanding
+watchdog is polled with an unreferenced timer; the timer stops when no reported lifetimes remain.
+For example, a libuv-spawned authored command keeps its real exit code while an adopted watchdog
+is reaped. This wait-only identity does not extend the ownership/signal rules in §4. The watchdog
+still cannot be waited on by authored work and retains its independent self-group deadline across
+observer death. Verified by `plugins/source-command-poll/src/watchdog-reaper.test.ts`,
+`watchdog-registration.test.ts` (before-timer registration and unarmed failure),
+`watchdog-reaping.test.ts` (native Linux subreaper, authored and unrelated libuv exit codes), and
+`watchdog-reaping.docker.test.ts` (12 real observations as PID 1 without an init).
 
 Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
 `@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
@@ -191,9 +224,35 @@ records each shipped file's SHA-256 and source. Offline script tests verify thes
 bytes and reject tampering.
 
 Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
-filename, identically in the source package and CLI bundle. Only the asynchronous
-launcher loads it. The loader allowlists the platform/architecture, requires glibc
-on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+filename, identically in the source package and CLI bundle. The daemon loads it
+lazily for resource-limit capture and Linux watchdog reaping through one shared parent-side
+binding and libc handle; the asynchronous launcher loads its own binding in its own process. The
+loader allowlists the platform/architecture and, on Linux, synchronously reads
+`/proc/self/maps` once before loading exactly that package's binary. Admission
+requires an exact file-backed `libc.so.6` or older `libc-2.N.so` basename,
+including deleted real files. Positive evidence must have an absolute filesystem
+pathname. Kernel synthetic or synthetic-looking names (`/memfd:…`, `/dmabuf:…`,
+`/SYSV` plus eight hex digits, `/dev/zero`, `/anon_hugepage`, `/secretmem`, and
+bracketed pseudo-mappings such as `/[aio]` or `[anon:…]`) and nonabsolute/pathless
+records never establish glibc. This also excludes `anon_inode:…`. Device numbers
+do not determine eligibility: container overlays can use anonymous devices for
+real files. Every musl-shaped name (`ld-musl-*.so.1` or `libc.musl-*`) still
+refuses before native loading, even beside real glibc and on synthetic mappings.
+Classification checks every slash-delimited segment and every colon/bracket-delimited
+label segment, including direct `memfd:`, `dmabuf:`, `anon_inode:` and `[anon:…]`
+labels. Wildcards may span these delimiters too, so punctuation inside a legal
+musl name cannot hide it. Musl wildcards include CR, U+2028 and U+2029 retained in names.
+Maps text cannot reliably distinguish caller labels from real paths under a
+synthetic-looking root directory. Such paths cannot establish glibc, but they
+cannot hide musl either. Harmless musl-shaped labels or directory segments cause
+needless refusal by design; ambiguous names must never admit a non-glibc host.
+Unreadable, empty, malformed or unrecognized libc evidence refuses
+with `glibc is required`, including static Node builds without a mapped libc.
+Neither diagnostic reports nor subprocesses supply evidence. After admission,
+the native `gnu_get_libc_version` symbol provides a second consistency check.
+Non-Linux platforms never read maps. `scripts/koffi-loader.test.ts` verifies
+these admission and no-native-load refusals with injected mappings;
+`scripts/vendor-koffi.test.ts` verifies both packaged copies and digests. Koffi's indirect entry point has
 no explicit-native hook, so the refresh script makes a minimal checked shim: replace
 its detect/load stanza with a factory argument, return its exports and close the
 factory. This retains upstream wrapping/version checks while bypassing its native
@@ -205,8 +264,9 @@ build is attempted. Koffi's build-from-source fallback does not link on macOS 27
 with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
 we never trigger it.
 
-Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
-blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals
+Arming uses asynchronous spawn and pipe acknowledgements; it never waits on a
+synchronous subprocess or blocking IPC open. Linux native admission performs the single
+synchronous procfs maps read described above. The watchdog ignores SIGTERM/SIGINT and signals
 its **current group** with `kill(0, SIGTERM)` and `kill(0, SIGKILL)`. It never changes group;
 its continued membership prevents that group ID being recycled. Neither daemon EOF, command
 exit, nor closure of inherited command descriptors cancels its timers. No Linux-only
@@ -289,6 +349,23 @@ Unavailable discovery retains hints. Spawn/exit bookkeeping during a read retain
 hint; older unchanged empty hints can still retire under continuous unrelated admissions. An
 earlier snapshot cannot retire refreshed work. The life nonce remains available for marked detached work.
 
+On macOS, that same pre-spawn admission commits the canonical path, unsigned device and inode
+of a fresh, exclusively created `0600` regular file in the journal's owner-only
+`<db>.commands.sqlite.tokens` directory. File and directory reservations are synchronized before
+the FULL-synchronous life-row commit returns. Resource-limit capture and other pre-spawn refusals
+occur after this admission. A crash between file creation and row commit leaves an inert orphan
+file: the sweep MUST NOT discover authority by scanning token files or reconstructing missing
+metadata. A handled admission failure confirms row absence before releasing only the exact
+device/inode reserved by that attempt; a retained row or unreadable commit state preserves
+the reservation. It rotates the uncommitted life nonce so the next admission on the same journal uses
+a fresh pathname even if release failed or the pathname was replaced. A leftover file has no
+committed row and remains inert. This failure path never rotates or removes a committed life.
+Old rows without vnode metadata retain only their original environment-based behavior.
+The file stays reserved until existing life-retirement conditions discharge pending attribution
+and occupied suspicions; retirement revokes the row before removing the exact recorded file.
+A missing/replaced token is never recreated for an old life. In-memory journals do not create
+persistent vnode ownership.
+
 The sweep reads the platform process table and inherited ownership marks, independently of current
 parent, group or session membership. A marked live member also confirms the identities of its
 current process-group members, including children that cleared their environment while staying
@@ -363,11 +440,12 @@ shared bounded terminal evidence queries.
 
 **Verified:** injected-reader group-bound cases in
 `libs/core/src/process/command-process-journal.test.ts`, and native stock-shell deadline
-survival plus fully verified watchdog reaping in
+survival when vnode metadata is unavailable, restricted-command cleanup and fully verified watchdog reaping in
 `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`.
 
-Ownership MUST come from the actual process environment, never matching argv text. Linux reads
-`/proc/<pid>/environ` for exactly the requested identifiers. macOS reads kernel
+Ownership MUST come from the candidate's own environment or, only on macOS when that environment
+is unreadable, its own exact journaled vnode. Matching argv text never supplies ownership.
+Linux reads `/proc/<pid>/environ` for exactly the requested identifiers. macOS first reads kernel
 `KERN_PROCARGS2`: argc determines exactly how many NUL-terminated argv entries to skip,
 then only envp supplies ownership. Nonce-shaped arguments never become ownership. Empty or
 padded argv entries, including process-title rewrites, and an unproven envp boundary are
@@ -384,6 +462,39 @@ returned by each successful sysctl call, never the unused remainder of its reuse
 allocation; a short reply or failed call cannot borrow an earlier PID's evidence.
 The reader requires a nonempty, structurally valid envp before accepting its terminator and rejects
 duplicate reserved keys and malformed/truncated buffers.
+
+For unreadable macOS envp only, the same stock helper enumerates that PID's descriptors using
+`proc_pidinfo(PROC_PIDLISTFDS)` and reads its vnode descriptors with
+`proc_pidfdinfo(PROC_PIDFDVNODEPATHINFO)`. A complete detail reply must match all three journaled
+fields: canonical pathname, device and inode. Inode values remain exact unsigned 64-bit decimal
+strings across JXA. Native replies are copied in bounded bulk reads so pathname length does
+not multiply Objective-C pointer accesses. Canonical Unicode paths round-trip through ASCII-escaped
+JSON requests. The helper's existing deadline is unchanged. Descriptor enumeration is bounded to 4096 entries; empty, partial, saturated,
+failed or malformed replies are uncertainty. An unmatched descriptor, argv-only nonce, readable
+conflicting/absent life mark, sibling or watchdog MUST NOT supply fallback ownership. Token files
+are revalidated before every ownership request. Discovery and the final signal-time gate each
+read the candidate's own vnode; boot and final start-time/group checks remain mandatory, with
+identity read last. A vnode holder cannot anchor group-continuity authority for a different
+process, including a readable unmarked sibling; only the existing envp-marked anchors retain
+their unchanged readable-member path. A fallback failure records its PID and bounded reason. It never authorizes
+an unreadable same-group member through group continuity, and any unresolved member continues
+to preserve a verified watchdog under the existing veto rule.
+
+**Current command coverage:** readable Node/user binaries retain the original envp path. Stock
+`/bin/sh`, `/bin/bash`, `/bin/sleep`, `/usr/bin/curl`, and shell scripts run by `/bin/sh` can now be
+reconciled when they retain the admitted descriptor. Ordinary shell children inherit it; each
+child still needs its own proof. Commands that explicitly close inherited descriptors remain
+unprovable when envp is withheld. Native SIGKILL/restart tests cover a retained `sh -c` plus its
+sleep child and curl against a local listener; byte-level tests enforce full-size libproc replies,
+exact tuple matching and 64-bit decoding. Admission, uncommitted-file, missing-metadata,
+same-group/argv-only and signal-time proof-loss regressions enforce the fail-closed boundaries.
+Linux ownership behavior is unchanged. The boundaries are exercised by
+`libs/core/src/process/command-life-token.test.ts`,
+`libs/core/src/process/command-process-vnode.test.ts`,
+`libs/core/src/process/darwin-vnode-proof.test.ts`,
+`libs/core/src/process/darwin-command-vnode.integration.test.ts`, and
+`plugins/source-command-poll/src/life-token-admission.test.ts`.
+
 One asynchronous `/usr/bin/osascript -l JavaScript` helper is owned by the entire sweep,
 accepts batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
 Discovery and fresh signal-time checks reuse that helper; no subprocess starts per survivor.
@@ -392,8 +503,8 @@ output and size buffers. It needs only stock macOS, with no developer tools, Hom
 native addon or shipped binary. The daemon never invokes Python or developer-tool probes.
 A helper startup failure (synchronous or emitted), timeout or invalid evidence makes the sweep
 incomplete with a reason. An unreadable process environment (including protected executables,
-another user's processes, exit races and ambiguous argv/envp layouts) records a PID-specific
-abstention with a reason, never an unmarked/owned guess.
+another user's processes, exit races and ambiguous argv/envp layouts) without its own valid
+vnode fallback records a PID-specific abstention with a reason, never an unmarked/owned guess.
 Boot and identity still use bounded system `sysctl` and `ps` calls. macOS terminal evidence
 is also batched, and synchronous receipt writes are committed together before the next
 asynchronous discovery query. Signal-time ownership queries read only the requested candidate

@@ -28,6 +28,10 @@ export type CommandMarks =
       /** A role can only withhold cleanup; it never supplies ownership or signal authority. */
       readonly watchdogs?: ReadonlySet<number>;
       readonly unreadable?: readonly number[];
+      /** Candidate-local vnode proofs; absent on the unchanged Linux/envp paths. */
+      readonly vnodes?: ReadonlySet<number>;
+      /** A bounded reason for each failed fallback, without exposing descriptors or envp. */
+      readonly unreadableReasons?: ReadonlyMap<number, string>;
       /** Why environment evidence is unavailable; never substitute argv evidence. */
       readonly unreadableReason?: string;
     }

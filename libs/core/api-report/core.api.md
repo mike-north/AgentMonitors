@@ -187,10 +187,19 @@ export interface ClaudeInterpretAdapterOptions {
 }
 
 // @public
+export interface CommandLifeToken {
+    readonly device: string;
+    readonly inode: string;
+    readonly life: string;
+    readonly path: string;
+}
+
+// @public
 export class CommandProcessJournal implements CommandProcessOwner {
     close(): void;
     environment(): Promise<Readonly<Record<string, string>>>;
     exited(pid: number): void;
+    lifeToken(): CommandLifeToken | undefined;
     static open(dbPath: string, workspace: string): CommandProcessJournal;
     spawned(pid: number): void;
     sweep(): Promise<RestartSweepResult>;
@@ -200,6 +209,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
 export interface CommandProcessOwner {
     environment(): Promise<Readonly<Record<string, string>>>;
     exited(pid: number): void;
+    lifeToken?(): CommandLifeToken | undefined;
     spawned(pid: number): void;
 }
 
@@ -1418,7 +1428,7 @@ export interface RestartSweepOutcome {
     readonly evidence?: ProcessIdentityRecord & {
         readonly boot: string;
         readonly mark: string;
-        readonly via: 'inherited-mark' | 'group-continuity';
+        readonly via: 'inherited-mark' | 'inherited-vnode' | 'group-continuity';
         readonly groupAnchor?: ProcessIdentityRecord;
     };
     readonly life: string;

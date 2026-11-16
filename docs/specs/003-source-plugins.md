@@ -1585,7 +1585,29 @@ validation note in §11.7).
 An asynchronous launcher starts an in-group watchdog through a short-lived intermediate. It waits
 for the timer-armed acknowledgement, reaps the intermediate and drains its IPC channel before replacing itself with the
 authored command. The watchdog is reparented within the same group, never a waitable child of the
-authored command; commands that reap all children can finish normally. The command retains its PID, process group and
+authored command; commands that reap all children can finish normally.
+**Current Linux adoption contract:** when the observer is namespace PID 1 or is already a child
+subreaper, it MUST reap only its own reported watchdogs. The watchdog writes its PID, current parent and `/proc`
+start time directly to a dedicated private observer pipe, completing partial writes and closing
+that descriptor before it arms any deadline. The pipe passes through both intermediates without
+sharing the admission-status stream: an elapsed watchdog deadline cannot kill the messengers
+before they forward its identity. Registration can arrive before adoption; that exact lifetime
+remains pending while its reported intermediate still owns it. On a Linux arming failure the
+intermediate drains and reaps its unarmed watchdog before reporting failure, including when
+registration itself could not be completed. Before every `waitpid(pid, WNOHANG)`, the observer MUST verify
+that this exact lifetime is a zombie child of itself in the launcher's original group and session.
+Missing, unreadable or changed identity MUST withhold the wait. It MUST NOT use wildcard waits,
+signal while reaping, or reap when neither PID 1 nor a subreaper; macOS is unchanged. For example,
+a reported PID that has been recycled or is still running cannot be waited on. Private watchdog
+registration does not establish journal ownership or signal authority. The reaper polls only
+outstanding reported lifetimes with an unreferenced timer, retiring it when none remain. It never
+installs a general child-exit handler or enables subreaping on the caller. Verified by
+`watchdog-reaper.test.ts` (identity, state, pending adoption and eligibility refusal),
+`watchdog-registration.test.ts` (registration before timers and unarmed-child failure reaping),
+`watchdog-reaping.test.ts`
+(real Linux subreaper and libuv exit statuses), and `watchdog-reaping.docker.test.ts` (12 bounded
+observations as PID 1 without an init, zero remaining `/proc` zombies).
+The command retains its PID, process group and
 inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
 rather than being truncated at the native string boundary. Executable paths retain their authored
 spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
@@ -1600,10 +1622,16 @@ pair matches a plain spawn from the same running parent. Node startup can raise 
 `RLIMIT_NOFILE`, but never changes its hard limit. The source synchronously captures the
 parent's soft and hard open-file values directly with native `getrlimit` through the
 package's vendored binding, loaded lazily and cached per process on supported POSIX hosts.
+Resource capture and Linux watchdog reaping share one parent-side native binding and libc handle;
+adding reaping must not initialize a second binding or change the captured budget.
 The 16-byte native pair is encoded as exact BigInt decimal strings or platform-specific
 `unlimited` over the configuration pipe, including finite values above 2^53. Capture does
 not generate diagnostics or write files; its work does not scale with sockets, handles or
-workers. Linux binding admission checks the native glibc symbol without a diagnostic report.
+workers. Linux binding admission reads `/proc/self/maps` once before requiring the binary,
+accepting only a file-backed `libc.so.6` or `libc-2.N.so` with no musl-shaped
+name in any path or synthetic label segment (the fail-closed rule in §11.2). Unreadable, empty or ambiguous evidence refuses
+with `glibc is required`; no diagnostic report or subprocess runs. The native glibc
+symbol is checked only after this admission.
 After watchdog arming, the launcher reads the native pair and refuses a hard-field mismatch
 against the captured value: Node never changes that field, so drift is unexpected. It keeps
 the native hard bytes, restores the exact soft value and reads back both fields through
@@ -1643,7 +1671,8 @@ module-loading label. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG,
 reports it) report errno and a short message naming the program, without a native abort, core file
 or crash report. They preserve failing health and the prior successful baseline (§11.5). Arming
 failure is an execution failure and no authored work runs. No synchronous subprocess, FIFO or
-blocking open runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute
+blocking IPC open runs on `observe()`; Linux native admission performs the single
+synchronous procfs maps read described above. The watchdog's referenced timers send SIGTERM at the absolute
 deadline and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
 continued membership supplies identity safety, independent of daemon liveness and command stdio.
 Once a normally completed finite observation has captured its output, it releases the whole original
@@ -1685,9 +1714,34 @@ records each shipped file's SHA-256 and source. Offline script tests verify thes
 bytes and reject tampering.
 
 Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
-filename, identically in the source package and CLI bundle. Only the asynchronous
-launcher loads it. The loader allowlists the platform/architecture, requires glibc
-on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+filename, identically in the source package and CLI bundle. The daemon loads it
+lazily for resource-limit capture; the asynchronous launcher also loads it. The
+loader allowlists the platform/architecture and, on Linux, synchronously reads
+`/proc/self/maps` once before loading exactly that package's binary. Admission
+requires an exact file-backed `libc.so.6` or older `libc-2.N.so` basename,
+including deleted real files. Positive evidence must have an absolute filesystem
+pathname. Kernel synthetic or synthetic-looking names (`/memfd:…`, `/dmabuf:…`,
+`/SYSV` plus eight hex digits, `/dev/zero`, `/anon_hugepage`, `/secretmem`, and
+bracketed pseudo-mappings such as `/[aio]` or `[anon:…]`) and nonabsolute/pathless
+records never establish glibc. This also excludes `anon_inode:…`. Device numbers
+do not determine eligibility: container overlays can use anonymous devices for
+real files. Every musl-shaped name (`ld-musl-*.so.1` or `libc.musl-*`) still
+refuses before native loading, even beside real glibc and on synthetic mappings.
+Classification checks every slash-delimited segment and every colon/bracket-delimited
+label segment, including direct `memfd:`, `dmabuf:`, `anon_inode:` and `[anon:…]`
+labels. Wildcards may span these delimiters too, so punctuation inside a legal
+musl name cannot hide it. Musl wildcards include CR, U+2028 and U+2029 retained in names.
+Maps text cannot reliably distinguish caller labels from real paths under a
+synthetic-looking root directory. Such paths cannot establish glibc, but they
+cannot hide musl either. Harmless musl-shaped labels or directory segments cause
+needless refusal by design; ambiguous names must never admit a non-glibc host.
+Unreadable, empty, malformed or unrecognized libc evidence refuses
+with `glibc is required`, including static Node builds without a mapped libc.
+Neither diagnostic reports nor subprocesses supply evidence. After admission,
+the native `gnu_get_libc_version` symbol provides a second consistency check.
+Non-Linux platforms never read maps. `scripts/koffi-loader.test.ts` verifies
+these admission and no-native-load refusals with injected mappings;
+`scripts/vendor-koffi.test.ts` verifies both packaged copies and digests. Koffi's indirect entry point has
 no explicit-native hook, so the refresh script makes a minimal checked shim: replace
 its detect/load stanza with a factory argument, return its exports and close the
 factory. This retains upstream wrapping/version checks while bypassing its native
@@ -1762,6 +1816,17 @@ The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code wi
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
 whose backing app is closed). The failure category is reserved for executions that produce no
 result at all (§11.5).
+
+On macOS, an optional durable command owner also supplies its committed life-token tuple after
+`environment()` resolves. The source passes it through the private launcher configuration, not
+the authored environment. The launcher opens it asynchronously with no-follow and nonblocking semantics, rejects
+non-regular replacements promptly before watchdog arming, and
+checks its fstat device/inode. After the watchdog is armed and the inherited resource-limit pair
+is restored and verified, it clears and verifies `FD_CLOEXEC` on that one descriptor. Every failure
+refuses authored exec and retains the baseline. The extra descriptor deliberately survives into
+commands and ordinary shell children so the restart sweep can prove each restricted PID from its
+own vnode (008 §4.2). The descriptor number is never ownership evidence; the watchdog retains its
+existing environment-based proof, and Linux admission is unchanged.
 
 ### 11.3 Change-detection strategies
 

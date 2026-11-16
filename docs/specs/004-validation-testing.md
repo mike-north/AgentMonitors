@@ -496,12 +496,19 @@ Script test files run serially so nested Vitest/package-manager processes cannot
 multiply outer worker pools. Package `pnpm test` scheduling and aggregate commands
 remain unchanged. Each negative command-deadline phase selects one actual command
 invocation; both positive canonical reductions still execute. The private fixture
-allows 4 seconds for framework launch/import/report work plus the independently strict
-1,000ms jq verdict: a 5-second complete-phase allowance. It requires the complete
+runs driver launch/import startup in a separate setup hook, bounded to 7 seconds.
+Startup failures name that phase and its elapsed time; the existing 10-second hook
+limit reserves owned cleanup and scheduling margin. The unchanged 5-second
+command/report allowance starts at the selected fake-jq phase's timestamp: 4 seconds
+for framework/report work plus the independently strict 1,000ms jq verdict. Startup
+cannot consume that allowance or the separate 7-second command test. A phase that
+begins at or after its startup deadline cannot rescue expired startup.
+The complete report must name the unchanged 1,000ms jq budget. It requires the complete
 end-of-run result for the intended module/test, a visible jq deadline failure, and
 its sole owned jq terminal before fixture force-cleanup. Natural reporter/process
-close is not the command outcome. Driver close and group-terminal confirmation have
-a separate hard 1-second cleanup reservation, with harness margin in a 7-second test.
+close is not the command outcome. Driver close and group-terminal confirmation retain
+a separate hard 1-second cleanup reservation, with a further second of harness margin
+inside the unchanged 7-second command test.
 No partial/first-test error may stand in for the whole intended phase. The framework
 allowance does not extend jq execution or child/query helper deadlines.
 The facility driver's owned boundary covers its Node/jq process group, not production

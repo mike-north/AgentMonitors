@@ -5,6 +5,8 @@
  * a waitable child of authored work. Keeping itself in
  * the group makes kill(0) identity-safe even after every other member has exited:
  * this live member prevents group-ID reuse, with no remembered numeric target.
+ * A Linux-only registration pipe reports its exact lifetime before timers can
+ * kill its intermediates, allowing safe reaping by an adopting observer.
  */
 
 /**
@@ -18,6 +20,23 @@ try {
 const {Socket} = require('node:net');
 const {deadline, grace} = JSON.parse(process.argv[1]);
 const now = () => Number(process.hrtime.bigint() / 1000000n);
+if (process.platform === 'linux') {
+  // Report directly to the observer, not through either short-lived parent.
+  // An already elapsed deadline may kill both parents as soon as it is armed;
+  // the complete birth identity must be buffered on its own pipe first. This
+  // descriptor is separate from admission status and is closed before arming.
+  const {readFileSync, writeSync, closeSync} = require('node:fs');
+  const stat = readFileSync('/proc/self/stat', 'utf8');
+  const startTime = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19];
+  if (!/^\d+$/.test(startTime)) throw new Error('Missing watchdog birth identity');
+  const frame = Buffer.from(JSON.stringify({kind: 'watchdog', pid: process.pid, parent: process.ppid, startTime}) + '\n');
+  for (let offset = 0; offset < frame.length;) {
+    const written = writeSync(5, frame, offset, frame.length - offset);
+    if (written <= 0) throw new Error('Watchdog registration write made no progress');
+    offset += written;
+  }
+  closeSync(5);
+}
 // The launcher created a new session, and this program never changes group.
 // Signal the current group, not a persisted PID that could have been recycled.
 process.on('SIGTERM', () => {});
@@ -84,7 +103,17 @@ function parentWatchdog() {
   const {spawn} = require('node:child_process');
   const {watchdog, deadline, grace} = JSON.parse(process.argv[1]);
   let settled = false;
+  let pendingFailure;
+  let watchdogClosed = false;
   function finish(message, code) {
+    if (process.platform === 'linux' && code !== 0) {
+      // A registration failure leaves no birth proof at the observer. Retain
+      // the first diagnostic and let libuv reap our own unarmed child before
+      // exiting; otherwise that unregistered failure could itself be adopted.
+      pendingFailure ??= {message, code};
+      if (!watchdogClosed) return;
+      ({message, code} = pendingFailure);
+    }
     if (settled) return;
     settled = true;
     process.send(message, error => process.exit(error ? 1 : code));
@@ -92,11 +121,18 @@ function parentWatchdog() {
   const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
     // The role identifies a bound, never ownership. Authored code can forge this
     // role and cause withholding (a leak), but cannot gain signal authority.
-    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'],
+    // Only Linux carries a separate, wait-only identity descriptor. It is
+    // never the admission pipe or the journal's macOS life-token descriptor.
+    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc', ...(process.platform === 'linux' ? [5] : [])],
     env: {...process.env, AGENTMONITORS_COMMAND_ROLE: 'watchdog'},
   });
   child.once('error', error => finish({kind: 'error', error: String(error.message || error)}, 1));
-  child.once('exit', () => finish({kind: 'error', error: 'Watchdog exited before arming'}, 1));
+  if (process.platform === 'linux') {
+    child.once('close', () => {
+      watchdogClosed = true;
+      finish({kind: 'error', error: 'Watchdog exited before arming'}, 1);
+    });
+  } else child.once('exit', () => finish({kind: 'error', error: 'Watchdog exited before arming'}, 1));
   child.once('message', message => {
     if (message !== 'armed') {
       finish({kind: 'error', error: message && message.kind === 'error' ? message.error : 'Invalid watchdog acknowledgement'}, 1);
@@ -132,7 +168,7 @@ function fail(error) {
     else process.exit(1);
   });
 }
-async function launch({command, env, deadline, grace, watchdog, native, openFiles}) {
+async function launch({command, env, deadline, grace, watchdog, native, openFiles, lifeToken}) {
   // C strings cannot represent embedded NUL. Match spawn's rejection rather
   // than letting the binding silently truncate literal argv or environment data.
   if (command.some(value => value.includes('\0')) || Object.entries(env).some(([key, value]) => key.includes('\0') || value.includes('\0')))
@@ -142,6 +178,25 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
   let koffi;
   try { koffi = require(native); }
   catch (error) { throw new Error('Native exec support for ' + process.platform + '-' + process.arch + ' could not be loaded: ' + String(error.message || error)); }
+  // Only the journal creates life ownership. Open its committed tuple here,
+  // asynchronously, while Node-created descriptors still close on exec. The
+  // watchdog receives only its explicit control descriptor, never this vnode.
+  // A replaced FIFO must not wait for a writer before the watchdog can arm.
+  // O_NONBLOCK has no I/O effect on the validated regular file and stays set.
+  let tokenFile;
+  if (lifeToken !== undefined) {
+    const fs = require('node:fs');
+    if (process.platform !== 'darwin' || lifeToken.life !== env.AGENTMONITORS_COMMAND_LIFE)
+      throw new Error('Could not retain command life token: invalid admission metadata');
+    try {
+      tokenFile = await require('node:fs/promises').open(lifeToken.path, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      const stat = await tokenFile.stat({bigint: true});
+      if (!stat.isFile() || String(stat.dev) !== lifeToken.device || String(stat.ino) !== lifeToken.inode)
+        throw new Error('vnode identity mismatch');
+    } catch (error) {
+      throw new Error('Could not retain command life token: ' + String(error.message || error));
+    }
+  }
   const libc = koffi.load(null);
   const execve = libc.func('int execve(const char *path, const char **argv, const char **envp)');
   // Linux libuv calls execvp after chdir and environment setup. execvpe uses
@@ -234,7 +289,9 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
     throw execError(denied ? koffi.os.errno.EACCES : errno);
   }
   const child = spawn(process.execPath, ['--input-type=commonjs', '-e', '(' + parentWatchdog.toString() + ')()', JSON.stringify({watchdog, deadline, grace})], {
-    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
+    // Relay the observer's dedicated Linux registration pipe without owning
+    // its framing. The watchdog writes and closes it before any timer can fire.
+    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc', ...(process.platform === 'linux' ? [6] : [])], env: process.env,
   });
   let acknowledged = false;
   child.once('error', fail);
@@ -267,7 +324,7 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
         if (sigemptyset(mask) !== 0 || sigprocmask(process.platform === 'darwin' ? 3 : 2, mask, null) !== 0)
           throw new Error('Could not restore command signal mask');
         // libuv marks even the inherited stdio duplicates close-on-exec. Retain
-        // exactly stdin/stdout/stderr; private control and Node internals stay closed.
+        // stdin/stdout/stderr here; private control and Node internals stay closed.
         for (const fd of [0, 1, 2]) {
           if (fcntl(fd, F_SETFD, 'int', 0) === -1) throw new Error('Could not retain command stdio');
           // A successful setter alone cannot prove that exec will retain stdio.
@@ -285,13 +342,24 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
           if (retainedStatus === -1 || (retainedStatus & O_NONBLOCK) !== 0)
             throw new Error('Could not retain command stdio');
         }
-        // All other Node-created descriptors are close-on-exec. The watchdog retains its
+        // Other Node-created descriptors stay close-on-exec, except the explicit life token below. The watchdog retains its
         // independent control descriptor and timers across a successful replacement.
         // Every returning exec is a failure. Keep stdout, stderr and the prior
         // baseline untouched while the complete private error frame is flushed.
         // Restore only after helper startup and watchdog arming: the watchdog
         // keeps its own limits, and only the authored command receives this pair.
         restoreOpenFileLimits();
+        if (tokenFile !== undefined) {
+          // Retain only this additional descriptor. Preserve unrelated descriptor
+          // flags and verify inheritance before the authored command may execute.
+          const fd = tokenFile.fd;
+          const flags = fcntl(fd, F_GETFD);
+          if (flags === -1 || fcntl(fd, F_SETFD, 'int', flags & ~FD_CLOEXEC) === -1)
+            throw new Error('Could not retain command life token: descriptor flags unavailable');
+          const retained = fcntl(fd, F_GETFD);
+          if (retained === -1 || (retained & FD_CLOEXEC) !== 0)
+            throw new Error('Could not retain command life token: close-on-exec read-back failed');
+        }
         execute();
       } catch (error) { fail(error); }
     });

@@ -1,8 +1,7 @@
 /** Capture only the running parent's NOFILE budget; daemon handles and workers are irrelevant. */
-import { createRequire } from 'node:module';
 import { getSystemErrorMessage, getSystemErrorName } from 'node:util';
 
-import { vendoredNativeLoader } from './native-binding.js';
+import { nativeProcessLibrary } from './native-process.js';
 
 /** The deliberately narrow ABI used from the package's CommonJS native binding. */
 interface INoFileBinding {
@@ -17,19 +16,10 @@ let binding: INoFileBinding | undefined;
 function nativeBinding(): INoFileBinding {
   if (binding !== undefined) return binding;
   try {
-    const filename = vendoredNativeLoader();
-    // The vendored CommonJS factory is outside TypeScript. This assertion records
-    // only the two callable ABI members used here; limit values stay in bytes.
-    const koffi = createRequire(filename)(filename) as {
-      errno: () => number;
-      load: (filename: null) => {
-        func: (declaration: string) => INoFileBinding['getrlimit'];
-      };
-    };
-    const library = koffi.load(null);
+    const library = nativeProcessLibrary();
     binding = {
       getrlimit: library.func('int getrlimit(int resource, void *value)'),
-      errno: koffi.errno,
+      errno: library.errno,
     };
     return binding;
   } catch (error) {

@@ -298,6 +298,7 @@ export type {
   ClaudeInterpretAdapterOptions,
 } from './adapter/interpret.js';
 
+export type { CommandLifeToken } from './process/command-life-token.js';
 export { CommandProcessJournal } from './process/command-process-journal.js';
 export type {
   CommandProcessOwner,

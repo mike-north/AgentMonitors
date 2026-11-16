@@ -28,6 +28,90 @@ escapes at 32,768 and 32,769 canonical bytes below the envelope budget.
 The canonical JSON foundation's domain and prototype policies remain authoritative.
 The internal envelope contract remains outside the package-root API.
 
+## 2026-11-16 — Reap specifically reported adopted watchdogs (003 §11.2; 008 §3.3) — Refs #632
+
+Linux PID 1 observers and existing child subreapers now reap their own adopted watchdog zombies.
+The watchdog directly reports PID, initial parent and kernel birth time on a separate private
+pipe before arming any deadline, so intermediate death cannot lose that report. Pending adoption
+never grants wait authority. Linux intermediates reap unarmed watchdogs before reporting startup
+failure. A fresh check requires that lifetime to be this observer's zombie child in the original group and session.
+Resource capture and reaping share one lazy parent-side native binding and libc handle.
+Only positive-PID nonblocking waits are permitted, with no wildcard waits, signals or changes
+to libuv child ownership. Ordinary Linux processes and macOS do not reap. Unit refusal cases,
+a native Linux subreaper test, and a PID 1 Docker regression cover identity, eligibility, real
+command exit statuses and repeated observations without zombie accumulation.
+
+## 2026-11-16 — Separate negative jq startup from the command verdict (004 §2.10) — Refs #645
+
+The negative facility driver bounds startup independently in a setup hook, then starts
+its unchanged five-second command/report allowance at the selected fake-jq phase.
+Startup has a seven-second bound with a named elapsed-time failure, inside the existing
+ten-second hook limit. The command test retains its seven-second bound and reserved
+one-second owned cleanup. Slow launch/import work cannot spend either command window.
+The real helper's one-second jq budget remains unchanged. Deterministic clock
+regressions cover slow startup, unlimited startup, a restarted allowance and a missing
+one-second verdict.
+
+## 2026-11-16 — Fail closed on synthetic libc names (003 §11.2; 008 §3.3) — Refs #643
+
+Synthetic or synthetic-looking mappings never establish glibc. Musl-shaped names
+still refuse on every mapping, including slash-delimited path segments and
+colon/bracket-delimited label segments in memfd, DMA-buffer, anonymous-inode and
+bracketed names. Real paths under `/memfd:…/` or `/dmabuf:…/` cannot hide musl.
+Harmless musl-shaped synthetic labels now refuse beside real glibc by design:
+ambiguous text may cause needless refusal, never admission on a non-glibc host.
+Injected maps tests cover both musl families, deleted suffixes and CR/U+2028/U+2029.
+
+## 2026-11-15 — Ignore synthetic mappings in Linux libc evidence (003 §11.2; 008 §3.3) — Refs #643
+
+Only absolute filesystem paths contribute mapped libc evidence. Kernel memory-object
+names, bracketed pseudo-mappings and pathless/nonabsolute records contribute nothing,
+including caller-controlled memfd and DMA-buffer labels that resemble libc filenames.
+Deleted real files still count; anonymous device numbers do not exclude real overlay
+files. Injected maps tests cover synthetic names beside glibc and as the only evidence,
+while preserving real musl precedence and refusal before native loading.
+
+## 2026-11-15 — Bound token replacement refusal and recover failed admission (008 §3.3, §4.2; 003 §11.2) — Refs #626
+
+Open committed tokens nonblocking before validating their regular-file identity, so FIFO
+replacement cannot strand an unarmed launcher after daemon loss. Directory, socket and symlink
+replacements also refuse before authored execution while preserving the baseline. On a handled
+life-row INSERT failure, release only the uncommitted reservation's exact device/inode and
+rotate its nonce for retry, including when release fails. Confirm row absence before release;
+SQLite errors that retain a row preserve its file. Committed life authority stays stable;
+leftover unjournaled files remain inert. Admission regressions cover prompt refusal, control EOF,
+same-journal recovery, failed release and replacement preservation.
+
+## 2026-11-15 — Prove restricted macOS command ownership from inherited vnodes (008 §3.3, §4.2; 003 §11.2) — Refs #626
+
+Commit a private regular-file identity with each admitted macOS life before any command can
+spawn. The asynchronous launcher verifies that tuple and retains its descriptor only after
+watchdog arming and resource-limit restoration. For unreadable envp only, the stock JXA helper
+can prove a candidate from its own exact path/device/inode at discovery and again at signal time;
+readable environment behavior and Linux remain unchanged. Missing journal metadata, uncommitted
+files, closed descriptors and failed/truncated native reads confer no authority. No unreadable
+member borrows sibling or watchdog proof. Native restart tests cover stock shell/child and curl;
+admission, per-PID safety and ABI regressions enforce the contract. Tokens retire only after
+existing attribution/suspicion conditions are satisfied.
+
+## 2026-11-15 — Preserve musl precedence for every pathname character (003 §11.2; 008 §3.3) — Refs #640
+
+Musl wildcard matching covers CR, U+2028 and U+2029 retained in mapped pathnames,
+including alongside ordinary glibc evidence. These mappings refuse before native
+loading. Positive glibc evidence still requires an exact basename, so appended
+separators cannot establish glibc. Injected mapping regressions verify both rules.
+
+## 2026-11-15 — Refuse uncertain Linux libc before native loading (003 §11.2; 008 §3.3) — Refs #640
+
+Linux native admission reads the running process's mapped libraries once before
+requiring the vendored binary. A mapped glibc filename is required, and any musl
+loader/libc mapping refuses even alongside glibc compatibility files. Unreadable,
+empty or ambiguous evidence refuses with `glibc is required`; static Node without
+mapped libc is deliberately unsupported. No diagnostic report or subprocess runs.
+The post-load glibc symbol check remains a second consistency check. VM tests
+verify admission order and non-Linux isolation; provenance tests verify both
+packaged copies and their digests.
+
 ## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
 
 Admitted authored commands preserve the resource limits of a plain spawn from the same
