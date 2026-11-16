@@ -732,7 +732,7 @@ byte-identical to establish preservation with foreign-write exclusions; every
 excluded file and PID MUST be named. Whole-installation byte identity remains a
 separate reported outcome. A partial test run is insufficient.
 
-### 2.9 External-ingress envelope validation
+### 2.14 External-ingress envelope validation
 
 The exported `validateExternalEventEnvelope()` helper is the validation boundary for the
 source-neutral `agentmonitors.external-event.v1` contract. It validates the complete JSON value
@@ -1097,7 +1097,7 @@ normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resol
 including an explicitly overlong derived path, rather than assuming the raw workspace path
 always fits the Unix socket limit.
 
-#### 3.4.1 External-ingress contract
+### 3.4.3 External-ingress contract
 
 | Scenario                                                         | Coverage                                                                                                                                                 |
 | ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |

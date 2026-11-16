@@ -16,7 +16,7 @@ nested array members, while general canonical JSON continues to preserve ordinar
 Leap-second syntax accepts every UTC month end and equivalent offset spellings; timestamp
 validation does not depend on a leap-second announcement table.
 
-## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.9) — Refs #481
+## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.14) — Refs #481
 
 Core now exports the strict `agentmonitors.external-event.v1` envelope validator,
 JSON value types, semantic SHA-256 helper over the closed v1 field set, collision-free

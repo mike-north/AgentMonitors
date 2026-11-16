@@ -1,7 +1,7 @@
 /**
  * Consumer bounds and semantic identity for the versioned external envelope.
  * @see docs/specs/002-runtime-delivery.md section 2.6
- * @see docs/specs/004-validation-testing.md section 2.9
+ * @see docs/specs/004-validation-testing.md section 2.14
  */
 import { describe, expect, it } from 'vitest';
 import {

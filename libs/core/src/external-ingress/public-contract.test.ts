@@ -1,5 +1,5 @@
 /**
- * Public-entry-point consumer behavior for 002 section 2.6 and 004 section 2.9.
+ * Public-entry-point consumer behavior for 002 section 2.6 and 004 section 2.14.
  * The compiled package and its trimmed declarations are the consumer boundary.
  */
 import { readFileSync } from 'node:fs';
