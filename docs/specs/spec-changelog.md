@@ -11,16 +11,15 @@ Agent Monitors spec set in `docs/specs/`.
 
 ## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
 
-Authored commands preserve the resource limits of a plain spawn from the same running
-parent. Capture only the parent's exact soft `RLIMIT_NOFILE` value and restore it after
-watchdog arming. Keep the inherited native hard field exact, even above JavaScript's
-safe-integer range. Safe soft integers and symbolic infinity use the in-memory report;
-unsafe soft integers use the raw diagnostic report's decimal token, captured inside a
-private temporary directory that is removed on success or failure. Rounded-number equality
-cannot prove unchanged native inheritance: Node 24/macOS can raise soft values while both
-values round identically. Failed exact capture, native read/restore failures and read-back
+Admitted authored commands preserve the resource limits of a plain spawn from the same
+running parent. Capture the parent's soft `RLIMIT_NOFILE` synchronously from the in-memory
+report without writing a diagnostic report to disk. Nonnegative safe soft integers through
+`9007199254740991` and symbolic infinity are exact; finite soft limits at or above 2^53 are
+refused before spawn because rounded numbers cannot identify the native value. Keep the
+inherited native hard field exact, including finite values above 2^53, and restore the soft
+value only after watchdog arming. Failed capture, native read/restore failures and read-back
 mismatches refuse admission and retain the prior baseline. Native macOS/Linux comparisons,
-macOS large finite limits and rounding collisions, capture cleanup/failure injection and
+macOS large finite hard limits, unsafe soft refusals, capture without filesystem writes and
 watchdog-before-restore ordering cover this contract.
 
 ## 2026-11-15 — Retain restart attribution at discovery boundaries (008 §4.2) — Refs #622

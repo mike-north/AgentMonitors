@@ -108,6 +108,9 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
     ])(
       'verifies native resource limits for soft $soft / hard $hard',
       async ({ soft, hard: hardLimit }) => {
+        const refused =
+          soft !== 'unlimited' && !Number.isSafeInteger(Number(soft));
+        const marker = path.join(dir, `ran-${soft}-${hardLimit}`);
         const native = fileURLToPath(
           new URL('../vendor/koffi/load.cjs', import.meta.url),
         );
@@ -137,8 +140,12 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
           child.once('error', reject);
           child.once('close', code => code === 0 ? resolve(stdout) : reject(new Error('plain spawn failed: ' + code)));
         });
-        const bounded = await source.observe({command: [${JSON.stringify(binary)}], timeout: '5s'}, {now: new Date(), previousState});
-        console.log(JSON.stringify({platform: process.platform, nofile, nativeSoft, hard, plain, bounded}));
+        // Count only source admission, after the plain-spawn comparison.
+        let spawned = 0;
+        require('node:child_process').spawn = (...args) => { spawned++; return spawn(...args); };
+        const command = ${JSON.stringify(refused)} ? ['/bin/sh', '-c', 'printf ran > "$1"; exec "$2"', 'fixture', ${JSON.stringify(marker)}, ${JSON.stringify(binary)}] : [${JSON.stringify(binary)}];
+        const bounded = await source.observe({command, timeout: '5s'}, {now: new Date(), previousState});
+        console.log(JSON.stringify({platform: process.platform, nofile, nativeSoft, hard, plain, bounded, spawned, markerExists: require('node:fs').existsSync(${JSON.stringify(marker)})}));
       })().catch(error => { console.error(error); process.exitCode = 1; });
     `,
           dir,
@@ -152,6 +159,23 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
         expect(limits).toBe(
           `${receipt.nofile} ${receipt.nativeSoft} ${receipt.hard}`,
         );
+        if (refused) {
+          expect(receipt.markerExists).toBe(false);
+          expect(receipt.spawned).toBe(0);
+          expect(receipt.bounded.nextState).toEqual({
+            stdout: 'baseline',
+            exitCode: 7,
+            truncated: false,
+            health: 'failing',
+            baselined: true,
+          });
+          expect(receipt.bounded.observations[0]?.payload).toMatchObject({
+            error: expect.stringContaining(
+              'RLIMIT_NOFILE: inherited soft limit is too large to reproduce exactly',
+            ),
+          });
+          return;
+        }
         expect(receipt.bounded.nextState).toMatchObject({
           health: 'ok',
           exitCode: 0,

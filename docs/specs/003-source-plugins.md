@@ -1595,31 +1595,27 @@ EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaust
 precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
 empty PATH components use the bare filename. The authored program starts with the default signal
 dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
-startup must not change the authored command's resource limits: every soft/hard pair matches a
-plain spawn from the same running parent. Node startup can raise its own soft
-`RLIMIT_NOFILE`, but never changes its hard limit. The source sends only the parent's exact soft
-open-file value over the configuration pipe.
-After watchdog arming, the launcher reads the native pair and keeps the hard field exactly,
-including finite values above JavaScript's safe-integer range. Safe soft integers and
-symbolic `unlimited` come directly from the in-memory report. An unsafe numeric soft report
-requires a raw diagnostic report: Node writes the exact decimal integer, and Node 24's JSON
-reviver source context retains that token without rounding. The report is written inside a
-private temporary directory (mode 0700) and the directory is removed after capture, including
-capture failures. Only the exact soft value crosses the configuration pipe. No native code
-is loaded in the daemon. Numeric equality with the launcher's soft limit is insufficient:
-Node can change a soft limit while both values round to the same JavaScript number. For
-example, a parent soft limit of `9007199254740992` with hard `9007199254740993` becomes
-`9007199254740993` during helper startup while both soft values report as `9007199254740992`.
-The launcher restores the exact soft value and reads back both fields through native
-`getrlimit`/`setrlimit` before exec. Other limits pass through unchanged; the watchdog keeps
-its own limits. Failed report capture refuses execution with `RLIMIT_NOFILE`; a failed
-native read or restore includes the operation and errno, and a read-back mismatch also
-refuses execution. Each refusal retains the previous baseline and leaves group/watchdog
-cleanup unchanged. Verified: `resource-limits.test.ts` compares every native resource pair
-with lowered soft and inherited/finite hard limits on macOS/Linux, including macOS finite
-values above 2^53, symbolic infinity and distinct native soft values that round identically;
-`self-bound.test.ts` verifies arming-before-read ordering, report cleanup and capture failures,
-native failures and a read-back mismatch.
+startup must not change an admitted authored command's resource limits: every soft/hard
+pair matches a plain spawn from the same running parent. Node startup can raise its own soft
+`RLIMIT_NOFILE`, but never changes its hard limit. The source synchronously captures the
+parent's soft open-file value from the in-memory report and sends it over the configuration
+pipe. No diagnostic report is written to disk and no native code is loaded in the daemon.
+Nonnegative safe soft integers (through `9007199254740991`) and symbolic `unlimited` are exact.
+A finite soft limit at or above 2^53 is refused before any helper or authored command is
+spawned, with an `RLIMIT_NOFILE` error explaining that the inherited soft limit is too large
+to reproduce exactly. Numeric equality cannot prove unchanged native inheritance: distinct
+native soft values can round to the same JavaScript number, even across helper startup.
+After watchdog arming, the launcher reads the native pair, retains the hard field exactly
+(including finite hard values above 2^53), restores the captured soft value and reads back
+both fields through native `getrlimit`/`setrlimit` before exec. Other limits pass through
+unchanged; the watchdog keeps its own limits. Failed capture refuses execution with
+`RLIMIT_NOFILE`; a failed native read or restore includes the operation and errno, and a
+read-back mismatch also refuses execution. Each refusal retains the previous baseline and
+leaves group/watchdog cleanup unchanged. Verified: `resource-limits.test.ts` compares every
+native resource pair with lowered soft and inherited/finite hard limits on macOS/Linux,
+including macOS finite hard values above 2^53 and symbolic infinity, and verifies unsafe
+soft refusal; `self-bound.test.ts` verifies arming-before-read ordering, capture without
+filesystem writes, refusal before spawn, native failures and a read-back mismatch.
 Internal Node
 helpers use absolute Node and native-module paths and need only the command-life mark in their
 startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter

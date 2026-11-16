@@ -1,8 +1,6 @@
 /** Execute finite, self-bounding command observations with optional durable ownership and shutdown cancellation. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { Socket } from 'node:net';
-import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
 import type {
@@ -329,7 +327,7 @@ function resolveCwd(
   return workspacePath === undefined ? cwd : path.resolve(workspacePath, cwd);
 }
 
-/** Read only the soft open-file field from either diagnostic-report representation. */
+/** Read only the soft open-file field from the in-memory diagnostic report. */
 function reportedSoftOpenFiles(report: unknown): unknown {
   const limits =
     report !== null && typeof report === 'object' && 'userLimits' in report
@@ -347,58 +345,27 @@ function reportedSoftOpenFiles(report: unknown): unknown {
 }
 
 /**
- * Capture the parent's soft NOFILE limit without loading native code in the
- * daemon. Node startup changes only the soft field; the launcher keeps the native
- * hard field exactly. Safe report numbers and symbolic infinity need no file.
+ * Capture the parent's soft NOFILE limit synchronously without loading native
+ * code or persisting a diagnostic report in the daemon. Node startup changes
+ * only the soft field; the launcher preserves the inherited native hard field.
  *
- * An unsafe report number cannot identify the inherited integer, even when the
- * launcher's native value rounds to that same number. Node 24 on Darwin can
- * change an already-unsafe soft value by one or raise it to infinity. Raw reports
- * preserve the decimal token before JSON parsing rounds it. A private temporary directory
- * contains that sensitive report only until capture finishes, including failures.
+ * Safe report integers and symbolic infinity identify an exact native value.
+ * Unsafe numbers cannot: distinct native limits can round to the same number,
+ * including when helper startup changes the soft limit. Refuse those budgets
+ * before spawning rather than authorize execution from an ambiguous value.
  */
-async function inheritedOpenFileLimits(): Promise<{ soft: string }> {
+function inheritedOpenFileLimits(): { soft: string } {
   const value = reportedSoftOpenFiles(process.report.getReport());
   if (value === 'unlimited') return { soft: value };
-  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
-    throw new Error('Could not capture command RLIMIT_NOFILE: invalid limit');
-  }
-  if (Number.isSafeInteger(value)) return { soft: String(value) };
-  try {
-    const directory = await mkdtemp(path.join(tmpdir(), 'am-limit-'));
-    try {
-      const filename = path.join(directory, 'report.json');
-      process.report.writeReport(filename);
-      // Node 24's reviver context exposes the original JSON number token. Parse
-      // the report structurally so unrelated fields cannot masquerade as NOFILE.
-      const report: unknown = JSON.parse(
-        await readFile(filename, 'utf8'),
-        (
-          key: string,
-          field: unknown,
-          context?: { source?: string },
-        ): unknown =>
-          key === 'soft' && typeof field === 'number' ? context?.source : field,
-      );
-      const soft = reportedSoftOpenFiles(report);
-      if (
-        typeof soft !== 'string' ||
-        !/^(0|[1-9][0-9]*)$/.test(soft) ||
-        BigInt(soft) > (1n << 64n) - 1n ||
-        Number(soft) !== value
-      ) {
-        throw new Error('inherited soft limit cannot be represented exactly');
-      }
-      return { soft };
-    } finally {
-      await rm(directory, { recursive: true, force: true });
-    }
-  } catch (error) {
+  if (typeof value === 'number' && !Number.isSafeInteger(value)) {
     throw new Error(
-      'Could not capture command RLIMIT_NOFILE: ' + String(error),
-      { cause: error },
+      'Could not capture command RLIMIT_NOFILE: inherited soft limit is too large to reproduce exactly',
     );
   }
+  if (typeof value !== 'number' || value < 0) {
+    throw new Error('Could not capture command RLIMIT_NOFILE: invalid limit');
+  }
+  return { soft: String(value) };
 }
 
 /**
@@ -452,13 +419,13 @@ async function runCommand(
     helperEnv[COMMAND_LIFE_ENV] = commandEnv[COMMAND_LIFE_ENV];
   }
   const deadline = monotonicNowMs() + scope.timeoutMs;
-  let openFiles: Awaited<ReturnType<typeof inheritedOpenFileLimits>>;
+  let openFiles: ReturnType<typeof inheritedOpenFileLimits>;
   try {
-    openFiles = await inheritedOpenFileLimits();
+    openFiles = inheritedOpenFileLimits();
   } catch (error) {
     return { kind: 'failure', error: String(error), stderrTail: '' };
   }
-  // Exact capture can await filesystem I/O; shutdown must still prevent admission.
+  // A shutdown observed during synchronous capture must still prevent admission.
   if (shutdownSignal?.aborted) {
     return {
       kind: 'failure',
