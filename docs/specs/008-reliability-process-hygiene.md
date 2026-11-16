@@ -206,11 +206,23 @@ filename, identically in the source package and CLI bundle. The daemon loads it
 lazily for resource-limit capture; the asynchronous launcher also loads it. The
 loader allowlists the platform/architecture and, on Linux, synchronously reads
 `/proc/self/maps` once before loading exactly that package's binary. Admission
-requires a mapped `libc.so.6` or older `libc-2.N.so` and no mapped
-`ld-musl-*.so.1` or `libc.musl-*`, including deleted mappings. Musl takes precedence
-even alongside glibc filenames, so compatibility layers cannot admit native
-initializers. Musl wildcard matching includes CR and Unicode line separators
-retained in pathnames; positive glibc evidence requires an exact basename.
+requires an exact file-backed `libc.so.6` or older `libc-2.N.so` basename,
+including deleted real files. Positive evidence must have an absolute filesystem
+pathname. Kernel synthetic or synthetic-looking names (`/memfd:…`, `/dmabuf:…`,
+`/SYSV` plus eight hex digits, `/dev/zero`, `/anon_hugepage`, `/secretmem`, and
+bracketed pseudo-mappings such as `/[aio]` or `[anon:…]`) and nonabsolute/pathless
+records never establish glibc. This also excludes `anon_inode:…`. Device numbers
+do not determine eligibility: container overlays can use anonymous devices for
+real files. Every musl-shaped name (`ld-musl-*.so.1` or `libc.musl-*`) still
+refuses before native loading, even beside real glibc and on synthetic mappings.
+Classification checks every slash-delimited segment and every colon/bracket-delimited
+label segment, including direct `memfd:`, `dmabuf:`, `anon_inode:` and `[anon:…]`
+labels. Wildcards may span these delimiters too, so punctuation inside a legal
+musl name cannot hide it. Musl wildcards include CR, U+2028 and U+2029 retained in names.
+Maps text cannot reliably distinguish caller labels from real paths under a
+synthetic-looking root directory. Such paths cannot establish glibc, but they
+cannot hide musl either. Harmless musl-shaped labels or directory segments cause
+needless refusal by design; ambiguous names must never admit a non-glibc host.
 Unreadable, empty, malformed or unrecognized libc evidence refuses
 with `glibc is required`, including static Node builds without a mapped libc.
 Neither diagnostic reports nor subprocesses supply evidence. After admission,
