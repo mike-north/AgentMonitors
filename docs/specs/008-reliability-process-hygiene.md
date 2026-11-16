@@ -86,52 +86,32 @@ the system, and the only one the system does not claim to account for.)
 
 ### 3.1 Time-bounded execution with platform tree termination (current)
 
-A monitored command MUST run only within its configured window: **escalation begins at the
-configured timeout, and the hard upper bound on the command's lifetime is the configured
-timeout plus the fixed 5-second forceful-kill grace period** (a SIGTERM-ignoring child runs
-until the grace expires — empirically, a `timeout: 1s` command resolves in ~6s). On POSIX
-the runtime sends SIGTERM and, after the grace, SIGKILL to the command's **original process
-group**; on Windows it invokes `taskkill /PID <pid> /T /F` and repeats that forceful tree
-kill after the grace period as a defensive retry. A descendant that remains in the original
-process group — e.g. one holding stdio open or surviving its parent — MUST NOT outlive that
-hard upper bound. Descendants that leave the original process group/session are **not**
-covered by this current guarantee; they enter the deferred-reconciliation state (§2.2,
-§3.2).
+A monitored command MUST run only within its configured window. Escalation begins at the
+configured timeout; the hard bound is that timeout plus the fixed **5-second kill grace**,
+subject to ordinary OS scheduling. On POSIX, an independent in-group watchdog enforces that
+bound even if the command ignores SIGTERM, exits before a descendant, closes inherited
+stdio, or the daemon disappears (§3.3). Descendants that leave the original process group
+are outside this deadline mechanism and require §4.2 reconciliation (§3.2).
 
-Both escalation steps are identity-verified (§5) before they signal. A descendant still in the
-original group is confirmed through the group's continuity (§5.1), including one forked after
-the SIGTERM step: by the command's leader before it exits (the read at the leader's exit), or by
-any confirmed member that is still alive at one of the membership readings taken every 250 ms
-through the grace period. Verification therefore does not exempt such descendants from the
-bound. The SIGKILL step abstains (§2.2 state 4) only when continuity cannot be shown: the
-process table cannot be read, or the group holds none of the processes confirmed as its members.
+The daemon also retains its identity-verified SIGTERM → SIGKILL escalation (§5). Its readings
+at leader exit and every 250 ms during the grace confirm late forks. Those daemon-origin
+steps may abstain when the process table is unreadable or continuity cannot be established
+across a hand-off between readings. That conservative abstention does not cancel the
+watchdog: its own continued group membership supplies uninterrupted identity evidence and
+its self-group signals require no process-table read. The daemon's table-read latency no
+longer extends the POSIX watchdog deadline.
 
-**Exception to the bound above (the hand-off residual).** Continuity is re-established only at
-a reading. After the command's leader has exited, a group member that forks a process and exits
-between two consecutive readings (within one 250 ms interval plus one read; the read time grows under load, up to the 5 s `ps` cap), while no other
-confirmed member is alive, hands the group to a process no reading saw beside a confirmed
-member. That process, and anything it forks, cannot be told apart from unrelated work that
-reused an emptied group id, so the SIGKILL step abstains and they MAY outlive the hard upper
-bound. The abstention is reported (§6.1). While the process table is readable, this is the only
-way a process that stays in the original group escapes the bound. (A group that truly empties
-and whose id is then reused also makes the step abstain, but nothing of ours is left in it; see
-§5.1's residual window.)
+Windows admission is unsupported and fails closed before spawn. Its retained cleanup
+path invokes `taskkill /PID <pid> /T /F` at timeout and repeats the forceful tree
+kill after the grace as a defensive retry, only while the direct child remains unreaped.
+The independent POSIX watchdog does not provide a Windows daemon-death guarantee.
 
-Verification reads the process table, which adds latency to each step. The SIGKILL goes out
-after the later of the grace expiry and the end of the SIGTERM step's read, and after the
-SIGKILL step's own read, once any grace-period reading still in flight and (if the leader
-exited) the read taken at its exit have landed. Normally that adds tens of milliseconds to
-timeout + 5 s. On macOS each read is capped by a 5-second `ps` timeout, and the in-flight and
-exit reads both started before the SIGKILL step, so even a pathologically slow table delays the
-SIGKILL to at most timeout + 15 s; a read that times out is unreadable, and that step abstains.
-On Linux the reads are `/proc` file reads, which do not wait on other processes.
-
-**Current** — implemented by `@agentmonitors/source-command-poll` per
-[003 §11](./003-source-plugins.md) (escalation targeting fixed in #303). Verified: the
-no-orphan-on-timeout guards in `plugins/source-command-poll/src/index.test.ts` (direct child
-**and** a backgrounded `sh -c` descendant that remains in the original process group) and
-the live daemon-run/daemon-stop no-orphan check in
-`apps/cli/src/commands/cli.integration.test.ts`.
+**Verified:** timeout/no-orphan cases in `plugins/source-command-poll/src/index.test.ts`;
+`identity-verified-cleanup.test.ts` and `identity-verified-cleanup.read-window.test.ts` in that
+directory retain all daemon-gate assertions while injecting late watchdog scheduling and loss
+of its SIGTERM protection, so the
+independent deadline cannot mask a broken identity gate. Unmodified real watchdogs are
+exercised by `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`.
 
 ### 3.2 Full-boundary bounds (target — #480, with #478 as reconciliation)
 
@@ -154,31 +134,142 @@ on a kernel-containment rung — see that child terminated at the deadline; on t
 rung, the child MUST be reaped by the next daemon start (regression for the
 detached-descendant survival reproduced during this spec's review).
 
-### 3.3 Bounds must not require a live daemon (target — #470, narrowed by PR #472)
+### 3.3 Bounds must not require a live daemon (current on macOS/Linux — #470)
 
-The lifetime bound of §3.1 MUST hold even if the daemon dies before the timeout fires.
-**Current behavior falls short:** bounds live only in daemon-resident timers, so a hard-killed
-daemon can orphan the command and its descendants (a detached child reparents to the OS
-supervisor and keeps running). **Target:** spawned work is self-bounding — the mechanism
-enforcing the window survives daemon death (PR #472's self-bounding watchdog is the intended
-narrowing). Its residual close-on-exec-descendant gap **remains open under #470**: such a
-survivor is genuinely unbounded once the daemon is gone, until a future daemon start
-reconciles it. §4.2's sweep is complementary reconciliation, never a substitute for this
-lifetime bound.
+Every POSIX command admission starts a detached launcher and an in-group watchdog using the
+running Node executable. The watchdog registers referenced timers for the absolute timeout
+and timeout-plus-grace, then acknowledges arming through a short-lived intermediate. The launcher
+waits for that acknowledgement, reaps the intermediate's successful exit and drains its IPC
+channel before native exec, regardless of which readiness event arrives first.
+The watchdog is thereby reparented without changing its group, so it is never a waitable child
+of the authored command; a command may reap all its own children without waiting on the bound.
+Only then does the launcher replace itself with the authored command. The command retains the recorded PID,
+original group and inherited life mark. Missing launcher support, failed watchdog startup,
+failed timer registration or an elapsed admission deadline fails closed: authored work does
+not run, and observation health reports an execution failure.
 
-**Test implication:** kill the daemon (SIGKILL) mid-command with a timeout pending; the
-command's covered tree (§3.1's mechanism class) MUST still terminate at its deadline with no
-daemon present. The close-on-exec residual is exercised as a sweep-reconciliation case
-(§4.2), not a deadline case, until #470 closes it.
+The launcher uses the packaged native binding to retain the PID without Node's abort-on-exec-error
+path. Linux uses libc `execvpe`, matching glibc's ENOEXEC shell fallback; musl admission is unsupported.
+macOS uses `execve` with libuv's ordered search: retry EINTR, continue EACCES/ENOENT/ENOTDIR, stop
+on other errnos, and prefer EACCES at exhaustion, otherwise the last errno. Slash-containing names
+bypass search; empty PATH components use the bare filename. Authored relative paths and symlink/`..`
+components stay intact, resolved by the command cwd set before exec. Arguments and environment
+strings containing NUL are rejected before the native call, preserving normal spawn's failure
+semantics. It restores every catchable signal to its default and clears the signal mask before exec,
+matching normal spawn. A private close-on-exec status pipe carries arming/errno diagnostics and
+closes on successful replacement; settlement consumes its complete status before classifying an
+exit. Writers retry short writes; missing frames, trailing incomplete bytes, unknown kinds and
+invalid schemas fail closed, while fragmented valid frames are accepted. If error status cannot be
+written at all, the helper exits by signal rather than allowing a normal exit to masquerade as a
+command result. Ordinary exec errors name the program and errno, preserve failing health and the
+previous baseline, and create no abort/core/crash report. All Node helpers, including the
+intermediate, use absolute Node and native-module paths and need only the command-life mark in
+their startup environment. They exclude authored and inherited variables, including `PATH`,
+`HOME`, `TMPDIR` and `NODE_OPTIONS`. The command receives the complete intended environment through a separate
+asynchronous configuration pipe, with only the deliberate ownership-mark override. Native exec
+receives it as envp; Linux installs the authored PATH just before `execvpe` for libc lookup.
+Helper argv does not consume the authored environment's plain-spawn admission budget. Private
+descriptors close at exec; only standard input/output/error survive. Admission clears their
+close-on-exec flags with a variadic `fcntl` call and verifies each with `F_GETFD`. It also
+reads status with `F_GETFL`, clears only `O_NONBLOCK` through `F_SETFL`, and verifies blocking
+mode with another `F_GETFL`. Access mode, append mode and unrelated flags remain intact.
+This restores native spawn I/O semantics after Node helper startup; ordinary stdin is still
+`/dev/null`. Failed calls, failed read-backs, a remaining `O_NONBLOCK` or
+a remaining `FD_CLOEXEC` fail closed with `Could not retain command stdio`, retaining the baseline
+without running authored work. Missing native binding support
+fails closed with a platform-support explanation and the underlying loader error. Other startup
+or native-initialization failures preserve their own detail without a module-loading label.
+
+Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
+`@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
+Each tarball carries the JavaScript wrapper, MIT license, integrity/hash manifest and
+unmodified prebuilt `koffi.node` files for `darwin-arm64`, `darwin-x64`, `linux-x64`
+and `linux-arm64` (glibc only). Refresh with `node scripts/vendor-koffi.mjs` (also
+`pnpm fix:vendor-koffi`). The single version constant controls all five downloads;
+the script verifies each registry `dist.integrity` SHA-512 before extraction and
+records each shipped file's SHA-256 and source. Offline script tests verify these
+bytes and reject tampering.
+
+Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
+filename, identically in the source package and CLI bundle. Only the asynchronous
+launcher loads it. The loader allowlists the platform/architecture, requires glibc
+on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+no explicit-native hook, so the refresh script makes a minimal checked shim: replace
+its detect/load stanza with a factory argument, return its exports and close the
+factory. This retains upstream wrapping/version checks while bypassing its native
+search. The watchdog and intermediate need no native binding; they inherit the
+launcher's group and already use embedded programs. Unsupported platforms or
+architectures (including Windows and musl), missing or corrupt binaries fail closed
+with the platform name and underlying error; no unbounded plain spawn or source
+build is attempted. Koffi's build-from-source fallback does not link on macOS 27.3
+with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
+we never trigger it.
+
+Arming uses asynchronous spawn and pipe acknowledgements: no synchronous subprocess or
+blocking filesystem open runs on `observe()`. The watchdog ignores SIGTERM/SIGINT and signals
+its **current group** with `kill(0, SIGTERM)` and `kill(0, SIGKILL)`. It never changes group;
+its continued membership prevents that group ID being recycled. Neither daemon EOF, command
+exit, nor closure of inherited command descriptors cancels its timers. No Linux-only
+parent-death facility or PATH utility is required.
+
+After direct-command output has settled, a normally completed finite observation sends an
+explicit completion request over a private descriptor. The watchdog ends its entire current
+group, including itself and any remaining background work. It never cancels the deadline on
+an apparently empty process-table snapshot: a fork-and-exit hand-off can evade such a read.
+Timeout failures instead retain the full kill grace. EOF alone leaves both referenced timers
+armed. This uses no additional process-table subprocess or idle polling. A shutdown request
+can also end the group after the leader has exited while output capture remains in flight.
+
+Restart reconciliation MUST preserve the original group's verified watchdog when any member's
+ownership or identity is uncertain (§4.2). Groups without a verified watchdog retain
+per-process cleanup rather than claiming preservation of a nonexistent bound. It withholds cleanup for that recorded group
+and records a per-PID `abstained` outcome explaining that the group bound was preserved
+and why. The watchdog retains its original timeout and kill grace after restart; a
+new daemon cannot extend them. Fully verified groups are still reaped, including the
+watchdog, through each process's own signal gate. No other member's evidence authorizes
+a watchdog signal.
+
+Deadlines use the shared OS monotonic clock: launcher startup consumes the configured window,
+and wall-clock corrections cannot extend it. Capturing that native clock keeps host scheduling
+clock virtualization from changing the execution epoch. Timer segments are capped at Node's maximum
+delay, including the maximum configured timeout plus the grace, without integer overflow.
+
+**Verified:** `plugins/source-command-poll/src/self-bound.test.ts` covers ordering, injected
+arming failure, near-limit environment admission compared with plain spawn, helper environment
+isolation, child-reaping command compatibility, reparenting/group membership, intermediate-exit
+failures, native standard-stream close-on-exec and nonblocking clearing, preservation of other
+status flags, flag-operation/read-back failures,
+restricted PATH, literal argv, preserved PID/mark, event-loop progress and
+absence of synchronous arming APIs. `stdio-semantics.test.ts` uses Perl native I/O to verify
+8 MiB stdout/stderr writes and a blocking stdin read with delayed input at the admission seam
+without a C compiler. `exec-semantics.test.ts` compares all native signal
+dispositions/mask bits with plain spawn on macOS/Linux, verifies errno diagnostics and absence
+of owned crash artifacts, and covers authored/inherited Node preload and module options. `watchdog-program.test.ts` covers self-group targeting,
+referenced timers after EOF, completion/shutdown self-group termination, clock correction and
+maximum-delay arithmetic. `global-state.test.ts` forces an actual nested test timeout and
+proves that the successor sees the original PATH and instrumentation.
+`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` SIGKILLs a real daemon running
+a hanging command and descendant, with both ordinary and closed command stdio, and proves
+the whole original group terminates without another daemon.
+
+Re-sessioned descendants remain §3.2/§4.2 reconciliation work. Windows daemon-death bounds
+remain unimplemented; this guarantee is specifically for macOS/Linux.
 
 ## 4. Crash Survival — "it survives its own death without leaving a mess"
 
-### 4.1 In-flight work stays bounded across daemon death (target — #470)
+### 4.1 In-flight work stays bounded across daemon death (current on macOS/Linux — #470)
 
-Same mechanism as §3.3, stated as the crash-survival guarantee: cleanup of in-flight spawned
-work MUST NOT depend on the daemon being alive to perform it.
+§3.3 enforces the original-group bound independently of daemon liveness. Graceful SIGTERM,
+SIGINT and IPC stop additionally abort new command admissions and actively SIGKILL each
+in-flight command group through the daemon's existing identity gate before the observation
+settles and the daemon exits. If the command leader has already exited, its still-live
+watchdog accepts a shutdown request on the private channel and kills its own group; command
+output capture does not discard this remaining cleanup responsibility. Shutdown does not wait for a long command timeout. Real SIGTERM
+and SIGINT cases in `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` assert
+both parent and descendant termination at daemon exit. A late ownership admission cannot
+spawn after cancellation (`plugins/source-command-poll/src/self-bound.test.ts`).
 
-### 4.2 The restart sweep (current Linux cleanup and macOS conservative abstentions for command-poll; adjacent hygiene remains target — #426)
+### 4.2 The restart sweep (current Linux and macOS cleanup for command-poll; adjacent hygiene remains target — #426)
 
 Before its first tick, the daemon reconciles command work from dead previous lives in its
 workspace. A separate owner-only SQLite journal beside the runtime database
@@ -228,17 +319,86 @@ target. Inside that gate, fresh process identity and boot are checked again, alo
 mark for a candidate discovered through that mark. A group-confirmed candidate instead carries
 its positively observed membership and immutable process identity. A changed/missing boot, changed
 start time, missing/unreadable required mark or unavailable process table withholds cleanup. The
-process-identity reading is the final asynchronous query inside the gate, after boot and mark
-checks, so identifier recycling during either earlier query cannot leave stale identity evidence. Stored numeric PIDs are suspicions only; the sweep never signals a stored PGID.
+process-identity reading follows boot and mark checks, so identifier recycling during either
+earlier query cannot leave stale identity evidence. Linux performs those queries separately
+for each candidate. When several marked candidates are present, Linux retains per-PID
+ownership reads but collects their vetoes before a final shared identity reading, including
+across groups. macOS batches the fresh boot, required environment marks and final identity
+reading for each pass, then invokes the same per-PID signal gates in one microtask turn, before
+terminal queries or later discovery can age that snapshot. Stored numeric PIDs are suspicions
+only; the sweep never signals a stored PGID.
+A recorded group's bound MUST survive any member's abstention when the group contains
+a verified watchdog. Discovery identifies that role from
+`AGENTMONITORS_COMMAND_ROLE=watchdog` beside the unchanged life nonce in kernel envp,
+with confirmed incarnation and group membership. Only the watchdog receives the role from
+the launcher. The role never authorizes a signal, and cannot lend another PID ownership.
+If that watchdog's own mark becomes unreadable at the final gate, its verified discovery
+identity still makes the group possibly bounded: withhold signals and record the unreadability
+reason. Without any readable role/ownership evidence, an unreadable process alone cannot
+identify a watchdog. Older no-role groups and re-sessioned descendants with no verified
+watchdog retain ordinary per-process cleanup: reap verified members and abstain on the rest.
+If the final identity snapshot proves every known watchdog absent or replaced, the group
+no longer has a verified bound and retains per-process cleanup. Multiple verified watchdogs
+are all retained when a group is uncertain; one surviving matching identity suffices. Authored code may set
+the role itself; a matching life/identity can then cause withholding (a leak), never a wrong kill.
+
+Discovery, anchor confirmation and final signal-time readings retain uncertainty across
+bounded discovery passes; it applies whenever a verified watchdog is found in that group.
+Readable mark-erased members still use existing group continuity and are considered first.
+A newly appearing unverified incarnation can withhold the remaining signals of a bounded
+group. A confirmed terminal identity is carried into later membership checks while its zombie
+row remains visible; a recycled PID with a different identity is still new uncertainty.
+A terminal watchdog no longer supplies a bound. Fully verified groups, including late forks,
+remain eligible. Every target retains its own boot, required mark and start-time checks,
+and all restart signals remain positive per-PID SIGKILL, never a stored or negative PGID.
+
+All preservation abstentions from a signal batch are committed together after its per-PID
+signal gates settle and before any terminal query or later asynchronous evidence query.
+The gates use only the already-read final snapshot; their resolved-Promise handoff issues
+no additional evidence query or journal operation. Journal I/O MUST NOT block between that final identity snapshot
+and the signal batch: a FULL-sync save can age the identity evidence while the kernel
+recycles a PID. Linux post-signal terminal queries remain serialized, retaining the
+process-table reader's 32-descriptor bound independently of survivor count. macOS retains
+shared bounded terminal evidence queries.
+
+**Verified:** injected-reader group-bound cases in
+`libs/core/src/process/command-process-journal.test.ts`, and native stock-shell deadline
+survival plus fully verified watchdog reaping in
+`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`.
+
 Ownership MUST come from the actual process environment, never matching argv text. Linux reads
-`/proc/<pid>/environ` for exactly the requested identifiers. The shipped macOS system `ps` output
-mixes argv and environment without an unambiguous boundary, so it cannot prove ownership:
-macOS records same-user PIDs as unproven abstentions and does not signal them. Automatic macOS
-cleanup remains unavailable until an environment-only reader exists. Its identity/boot reads use
-bounded system `ps`/`sysctl` calls; ownership-uncertainty queries request only the supplied PIDs,
-in batches of at most 2048, and never read argv or environments. Signal-time ownership queries
-never scan all host environments; Linux queries only the candidate PID. Discovery remains bounded
-by the pass limit below rather than repeating a host-wide environment scan for each survivor.
+`/proc/<pid>/environ` for exactly the requested identifiers. macOS reads kernel
+`KERN_PROCARGS2`: argc determines exactly how many NUL-terminated argv entries to skip,
+then only envp supplies ownership. Nonce-shaped arguments never become ownership. Empty or
+padded argv entries, including process-title rewrites, and an unproven envp boundary are
+unreadable for that PID; they MUST NOT be reported as readable and unmarked. The reader
+skips exactly `(8 - ((execPathByteLength + 1) % 8)) % 8` NUL bytes after the
+executable path terminator, as established by XNU's target-pointer alignment on
+64-bit Intel and Apple silicon. The separately returned four-byte argc is excluded
+from that calculation. Every expected padding byte MUST be NUL; missing/non-NUL
+padding or any extra NUL at argv[0] makes that PID unreadable. It MUST NOT scan for
+a mark or skip an unbounded NUL run. XNU copies the process's live string area;
+process-title rewrites do not update the saved argc or provide a new envp boundary.
+Every counted argv entry must be nonempty. The helper parses only the byte count
+returned by each successful sysctl call, never the unused remainder of its reused
+allocation; a short reply or failed call cannot borrow an earlier PID's evidence.
+The reader requires a nonempty, structurally valid envp before accepting its terminator and rejects
+duplicate reserved keys and malformed/truncated buffers.
+One asynchronous `/usr/bin/osascript -l JavaScript` helper is owned by the entire sweep,
+accepts batched PID requests over stdin and returns only reserved marks or per-PID uncertainty.
+Discovery and fresh signal-time checks reuse that helper; no subprocess starts per survivor.
+The helper calls system libc through JXA's Objective-C bridge with Foundation-owned MIB,
+output and size buffers. It needs only stock macOS, with no developer tools, Homebrew,
+native addon or shipped binary. The daemon never invokes Python or developer-tool probes.
+A helper startup failure (synchronous or emitted), timeout or invalid evidence makes the sweep
+incomplete with a reason. An unreadable process environment (including protected executables,
+another user's processes, exit races and ambiguous argv/envp layouts) records a PID-specific
+abstention with a reason, never an unmarked/owned guess.
+Boot and identity still use bounded system `sysctl` and `ps` calls. macOS terminal evidence
+is also batched, and synchronous receipt writes are committed together before the next
+asynchronous discovery query. Signal-time ownership queries read only the requested candidate
+PIDs; neither platform scans all host environments separately for each survivor. Discovery
+remains bounded by the pass limit below.
 Neither platform persists or prints process environments. These marks are reliability evidence
 within the same-user trust boundary, not protection against deliberate impersonation by code
 running as that user.
@@ -270,11 +430,23 @@ life and its numeric group suspicion and allow bounded rediscovery from a fresh 
 This includes absence during initial discovery or gone batching, disappearance during anchor
 confirmation, absence at the signal gate, and ESRCH during delivery. Record a discovered marked
 anchor's group suspicion before confirmation can lose the anchor; that suspicion supplies no
-signal authority. Natural exit cannot erase a marked late fork. Retire the life only when a
-fresh readable snapshot contains neither its nonce nor a member of its recorded groups, and
+signal authority. Groups first discovered by the final bounded snapshot also gain durable
+numeric suspicions, even though no confirmation pass remains. A life admitted before a crash
+prevented PID recording requires a second readable snapshot to confirm an initially empty
+nonce search. Unavailable or unreadable confirmation retains the life; unchanged ownership
+uncertainty does not trigger repeated scans. Natural exit cannot erase a marked late fork.
+Retire the life only when a fresh readable snapshot contains neither its nonce nor a member of its recorded groups, and
 no recorded PID remains occupied (including reuse by an unmarked process in another group).
 One observation of absence earns rediscovery, not repeated scans of an unchanged occupied
-hint. Identity disagreement and unavailable ownership still withhold signals.
+hint. Discharge requires pending disappearance, readable ownership, no process carrying the
+nonce, and no occupied numeric suspicion. A confirmed reap alone cannot discharge its group
+in the same sweep. Anchor-confirmation disappearance decisions are committed before the next
+rediscovery query can suspend reconciliation. Identity disagreement and unavailable ownership
+still withhold signals.
+
+**Verified:** nonce-only missed-fork, ninth-group retention, ownership/nonce discharge guards,
+anchor-disappearance receipt and reap-hint retention regressions in
+`libs/core/src/process/command-process-journal.test.ts`.
 After signalling or observing a target vanish, discovery takes another snapshot to catch late forks. It processes readable
 positive evidence even when unrelated unreadable ownership makes the snapshot
 incomplete; that uncertainty is saved before further identity queries and cannot discard the
@@ -284,16 +456,32 @@ only once per startup and takes at most eight discovery passes per old life; if 
 appearing, the pass is incomplete and each still-discovered PID gets an abstention reason. This
 bounds startup work without guessing at identifiers or repeatedly signalling a disputed PID.
 
-The sweep is reconciliation, not the live lifetime bound of #470. Commands from releases before
+The launcher preserves the recorded command PID and group; the watchdog and authored descendants
+inherit the same life mark. A leftover watchdog is owned work: Linux reconciliation records
+and reaps its exact PID/start-time/group identity through the same inherited-mark gate as
+the command and marked descendants. A command, one descendant and its watchdog therefore
+produce three reaped outcomes, including terminal evidence for the watchdog. It never
+changes group and cannot survive the group’s self-directed SIGKILL; restart cleanup can end
+it sooner. The sweep is reconciliation, not the live lifetime bound of #470. Commands from releases before
 ownership journaling cannot be safely attributed and are not heuristically collected. Windows
 currently records unavailable discovery rather than claiming a successful sweep. Stray daemons,
 channel servers and stale sockets remain the separate #426 scope.
 
 **Verified:** `apps/cli/src/commands/daemon-restart-sweep.integration.test.ts` runs real daemon
-SIGKILL/restarts and asserts Linux direct/descendant cleanup, detached mark-kept cleanup, mark-erased
-escape silence, macOS unproven-environment abstentions, argv-only nonce survival, responsive unrelated PID/PGID survival with diagnostic abstention, previous-boot
+SIGKILL/restarts and asserts Linux and macOS direct/descendant cleanup, detached mark-kept cleanup, Linux mark-erased
+escape silence, argv-only nonce survival, responsive unrelated PID/PGID survival with diagnostic abstention, previous-boot
 recycling despite a retained nonce, and an empty-start receipt. Every owned process is stopped in
-cleanup, including assertion failures. `libs/core/src/process/command-process-journal.test.ts`
+cleanup, including assertion failures. `libs/core/src/process/darwin-command-marks.integration.test.ts`
+proves envp-only reads with empty/marker-shaped argv and Homebrew off PATH. The marker-reader
+integration suite also requires owned evidence or a durable discovery abstention for real
+empty-first-argument and retitled workers. `libs/core/src/process/darwin-procargs.test.ts`
+rejects initial padding with or without empty arguments and rewritten argv storage.
+`libs/core/src/process/darwin-command-marks.test.ts` executes the exact embedded bridge
+against full, shorter, failed and differently marked sysctl replies to reject stale-buffer evidence.
+The marker-reader
+suites cover unavailable tools, malformed/partial responses, per-process unreadability, bounded
+helper lifetime, batch reuse and the fresh boot/mark/start-time gates.
+`libs/core/src/process/command-process-journal.test.ts`
 asserts discovery without a recorded child PID, signal-time mark loss/start-time reuse, unavailable
 evidence, live-owner exclusion, group membership, late forks, malformed records, bounded discovery
 the distinction between signal acceptance and proven termination, anchor-PID recycling between
@@ -332,10 +520,12 @@ never collateral damage.
 
 ### 5.1 The verification gate (current)
 
-Every cleanup or enforcement signal goes through one shared gate,
+Every daemon-origin cleanup or enforcement signal goes through one shared gate,
 `sendVerifiedSignal` in `libs/core/src/process/process-identity.ts`, which verifies and then
 signals, or withholds the signal and reports an abstention. No shipped code signals a stored
-pid or pgid any other way. Identity evidence:
+pid or pgid any other way. The standalone watchdog instead signals only its own current group
+with literal target `0`: its uninterrupted membership is identity evidence by construction,
+without a recorded numeric target or a process-table race. Identity evidence for daemon signals:
 
 - **Live child handle.** While Node still holds an unreaped `ChildProcess` for a pid, the OS
   cannot reuse that pid, nor the process-group id of a group that child leads (a POSIX
@@ -410,17 +600,20 @@ the window is the whole gap between steps.
 Every place shipped code (`libs/`, `apps/`, `plugins/`) sends a signal, and its disposition.
 Keep this table current when a signal site is added.
 
-| Site                                                                                                                                                                                                                                     | Signal and target                                                           | Identity evidence                                                                                                                                                                                                                                                   | Disposition                                                                                                                                                       |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                                    | the read starts while the leader is unreaped (the timeout only fires while the command runs); the members it lists are confirmed, a read at the leader's exit confirms later forks, and readings every 250 ms until the follow-up confirm hand-offs between members | verified; if the leader exits during the read, the reading's members still confirm the group; an empty group needs no signal                                      |
-| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later (after the `SIGTERM` step's read)  | the leader is unreaped, or a member confirmed earlier (at the `SIGTERM` step, the leader's exit or a grace-period reading) is still in the group                                                                                                                    | verified; an empty group needs no signal; abstains (§6.1) only when continuity is lost (a reused id, or the hand-off residual of §5.1) or the table is unreadable |
-| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                                                 | live child handle                                                                                                                                                                                                                                                   | verified; the follow-up is skipped once the direct child has been reaped                                                                                          |
-| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned                   | live child handle                                                                                                                                                                                                                                                   | verified; a child that has already exited is never signalled by pid                                                                                               |
-| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child                              | live child handle                                                                                                                                                                                                                                                   | verified                                                                                                                                                          |
-| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                            | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
-| Restart command sweep (`libs/core/src/process/command-process-journal.ts`, `CommandProcessJournal.sweep`)                                                                                                                                | `SIGKILL` to each confirmed process PID                                     | committed daemon-life nonce (or group membership observed beside a marked anchor), matching boot, dead owner and fresh start-time identity; required nonce and boot checked again inside the gate                                                                   | verified; uncertainty is a durable abstention, never a group signal                                                                                               |
-| Ownership readers (`libs/core/src/process/command-process-marks.ts`, `systemRead`)                                                                                                                                                       | Node's `execFile` timeout sends `SIGKILL` to its own `ps` or `sysctl` child | unreaped child handle held internally by Node                                                                                                                                                                                                                       | identity-safe by construction; not a cleanup of stored identifiers                                                                                                |
-| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                          | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
+| Site                                                                                                                                                                                                                                     | Signal and target                                                                               | Identity evidence                                                                                                                                                                                                                                                   | Disposition                                                                                                                                                       |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `command-poll` timeout, POSIX (`plugins/source-command-poll/src/index.ts`, `killProcessTree`)                                                                                                                                            | `SIGTERM` to the command's process group                                                        | the read starts while the leader is unreaped (the timeout only fires while the command runs); the members it lists are confirmed, a read at the leader's exit confirms later forks, and readings every 250 ms until the follow-up confirm hand-offs between members | verified; if the leader exits during the read, the reading's members still confirm the group; an empty group needs no signal                                      |
+| `command-poll` grace follow-up, POSIX (same)                                                                                                                                                                                             | `SIGKILL` to the process group, 5s later (after the `SIGTERM` step's read)                      | the leader is unreaped, or a member confirmed earlier (at the `SIGTERM` step, the leader's exit or a grace-period reading) is still in the group                                                                                                                    | verified; an empty group needs no signal; abstains (§6.1) only when continuity is lost (a reused id, or the hand-off residual of §5.1) or the table is unreadable |
+| `command-poll` timeout and follow-up, Windows (same)                                                                                                                                                                                     | `taskkill /PID <pid> /T /F`                                                                     | live child handle                                                                                                                                                                                                                                                   | verified; the follow-up is skipped once the direct child has been reaped                                                                                          |
+| `daemon run --detach` failure cleanup (`apps/cli/src/commands/daemon.ts`, `terminateSpawnedDetachedDaemon`)                                                                                                                              | `SIGTERM`, then `SIGKILL`, to the daemon child it spawned                                       | live child handle                                                                                                                                                                                                                                                   | verified; a child that has already exited is never signalled by pid                                                                                               |
+| `verify` isolated-daemon teardown (`apps/cli/src/commands/verify.ts`)                                                                                                                                                                    | `SIGTERM`, then `SIGKILL`, to its daemon child                                                  | live child handle                                                                                                                                                                                                                                                   | verified                                                                                                                                                          |
+| Node-internal timeouts: `verify --trigger-cmd` (`execSync` `timeout`), the interpret adapter (`execFile` `timeout`, `libs/core/src/adapter/interpret.ts`), the legacy-socket probe (`spawnSync` `timeout`, `apps/cli/src/daemon-ipc.ts`) | `SIGKILL`/`SIGTERM` to the child Node is running                                                | Node signals through its own child before reaping it                                                                                                                                                                                                                | identity-safe by construction; not routed through the gate                                                                                                        |
+| Restart command sweep (`libs/core/src/process/command-process-journal.ts`, `CommandProcessJournal.sweep`)                                                                                                                                | `SIGKILL` to each confirmed process PID                                                         | committed daemon-life nonce (or group membership observed beside a marked anchor), matching boot, dead owner and fresh start-time identity; required nonce and boot checked again inside the gate                                                                   | verified; uncertainty is a durable abstention, never a group signal                                                                                               |
+| Ownership readers (`libs/core/src/process/command-process-marks.ts`, `systemRead`)                                                                                                                                                       | Node's `execFile` timeout sends `SIGKILL` to its own `ps` or `sysctl` child                     | unreaped child handle held internally by Node                                                                                                                                                                                                                       | identity-safe by construction; not a cleanup of stored identifiers                                                                                                |
+| Self-bounding POSIX watchdog (`plugins/source-command-poll/src/self-bound.ts`, `WATCHDOG_PROGRAM`)                                                                                                                                       | `SIGTERM`, then `SIGKILL`, or immediate shutdown `SIGKILL`, to its current group (`kill(0, …)`) | own uninterrupted group membership; the program never changes group                                                                                                                                                                                                 | identity-safe by construction; no stored PID/PGID target                                                                                                          |
+| Command shutdown (`plugins/source-command-poll/src/index.ts`, `cancel`)                                                                                                                                                                  | `SIGKILL` to each in-flight group (Windows: `taskkill /T /F`)                                   | live command target through the existing verification gate                                                                                                                                                                                                          | verified; no unverified numeric kill                                                                                                                              |
+| macOS environment helper (`libs/core/src/process/darwin-command-marks.ts`, `DarwinCommandMarkReader.close`)                                                                                                                              | `SIGKILL` to its own JXA child on completion, failure or timeout                                | unreaped spawned child handle                                                                                                                                                                                                                                       | verified through the shared gate; a reaped helper is never signalled                                                                                              |
+| `daemon stop`                                                                                                                                                                                                                            | none sent: an IPC request; the daemon exits itself                                              | —                                                                                                                                                                                                                                                                   | not a signal site                                                                                                                                                 |
 
 Classified as not signal sends: `process.kill(pid, 0)` liveness probes (the startup-lock check
 in `apps/cli/src/daemon-ipc.ts`; signal 0 delivers nothing), `process.on('SIGTERM' | 'SIGINT')`

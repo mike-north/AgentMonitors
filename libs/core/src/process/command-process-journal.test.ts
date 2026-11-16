@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CommandProcessJournal } from './command-process-journal.js';
 import { readProcessTable } from './process-table.js';
 import {
@@ -18,9 +18,18 @@ vi.mock('./command-process-marks.js', () => ({
   readBootIdentity: vi.fn(),
   readCommandMarks: vi.fn(),
   readCommandTerminal: vi.fn(),
+  readDarwinCommandTerminals: vi.fn(async () => new Map()),
 }));
 const directories: string[] = [];
 const journals: CommandProcessJournal[] = [];
+// Resolve the host native binding before selecting a simulated platform.
+const nativeBinding = new Database(':memory:');
+nativeBinding.close();
+// These injected-reader cases exercise the sequential /proc path independently
+// of the host. macOS batched signal gates have their own marker-reader suite.
+beforeEach(() => {
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('linux');
+});
 afterEach(() => {
   for (const journal of journals.splice(0)) journal.close();
   for (const dir of directories.splice(0))
@@ -58,6 +67,240 @@ async function fixture() {
   journals.push(next);
   return { journal: next, admission: journal, token, db };
 }
+
+// The readable companion represents the independent watchdog. Enumeration order
+// must not let it lose its deadline before another member's uncertainty is known.
+for (const obstacle of [
+  'discovery-unreadable',
+  'signal-unreadable',
+  'identity',
+  'unsupported',
+  'table-unavailable',
+  'watchdog-mark',
+  'new-member',
+  'group-change',
+  'group-change-single-anchor',
+  'verified',
+] as const) {
+  it(`preserves the group bound unless every member is verified (${obstacle})`, async () => {
+    const f = await fixture();
+    const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+    const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+    const otherBound = { pid: 5001, pgid: 5000, startTime: 'other-bound' };
+    let markReads = 0;
+    let tableReads = 0;
+    const groupChange =
+      obstacle === 'group-change' || obstacle === 'group-change-single-anchor';
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    vi.mocked(readProcessTable).mockImplementation(async () => {
+      tableReads++;
+      if (obstacle === 'table-unavailable' && markReads > 1) {
+        return {
+          supported: false,
+          reason: 'injected identity reader unavailable',
+        };
+      }
+      return {
+        supported: true,
+        processes: [
+          watchdog,
+          obstacle === 'identity' && markReads > 1
+            ? { ...command, startTime: 'replacement' }
+            : groupChange && tableReads > 2
+              ? { ...command, pgid: otherBound.pgid, startTime: 'replacement' }
+              : command,
+          ...(groupChange ? [otherBound] : []),
+          ...(obstacle === 'new-member' && markReads > 1
+            ? [{ pid: 4244, pgid: 4242, startTime: 'late' }]
+            : []),
+        ],
+      };
+    });
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => {
+      markReads++;
+      if (obstacle === 'unsupported' && markReads > 1) {
+        return { supported: false, reason: 'injected reader unavailable' };
+      }
+      const unreadable =
+        obstacle === 'discovery-unreadable' ||
+        (obstacle === 'signal-unreadable' && markReads > 1);
+      return {
+        supported: true,
+        watchdogs: new Set(
+          [4243, 5001].filter(
+            (pid) =>
+              !(
+                obstacle === 'watchdog-mark' &&
+                markReads > 1 &&
+                pid === watchdog.pid
+              ),
+          ),
+        ),
+        marks: new Map(
+          pids
+            .filter(
+              (pid) =>
+                (!unreadable || pid !== command.pid) &&
+                !(
+                  obstacle === 'group-change-single-anchor' &&
+                  pid === command.pid
+                ) &&
+                !(
+                  obstacle === 'watchdog-mark' &&
+                  markReads > 1 &&
+                  pid === watchdog.pid
+                ),
+            )
+            .map((pid) => [pid, f.token]),
+        ),
+        ...(unreadable
+          ? { unreadable: [command.pid] }
+          : obstacle === 'watchdog-mark' && markReads > 1
+            ? { unreadable: [watchdog.pid] }
+            : {}),
+      };
+    });
+    const result = await f.journal.sweep();
+    if (obstacle === 'verified') {
+      expect(kill.mock.calls).toEqual(
+        expect.arrayContaining([
+          [command.pid, 'SIGKILL'],
+          [watchdog.pid, 'SIGKILL'],
+        ]),
+      );
+      expect(result.outcomes).toContainEqual(
+        expect.objectContaining({ pid: watchdog.pid, status: 'reaped' }),
+      );
+    } else {
+      expect(kill.mock.calls).toEqual([]);
+      expect(result.outcomes).toContainEqual(
+        expect.objectContaining({
+          pid: watchdog.pid,
+          status: 'abstained',
+          reason: expect.stringMatching(
+            /group.*bound.*(unreadable|identity|unavailable)/i,
+          ),
+        }),
+      );
+    }
+    if (groupChange) {
+      expect(result.outcomes).toContainEqual(
+        expect.objectContaining({
+          pid: otherBound.pid,
+          status: 'abstained',
+          reason: expect.stringMatching(/group.*bound.*identity/i),
+        }),
+      );
+    }
+    const sql = new Database(`${f.db}.commands.sqlite`);
+    try {
+      expect(
+        JSON.parse(
+          sql
+            .prepare(
+              'SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1',
+            )
+            .pluck()
+            .get(),
+        ),
+      ).toEqual(result);
+    } finally {
+      sql.close();
+    }
+  });
+}
+
+it('keeps a group veto when later discovery first finds its watchdog', async () => {
+  const f = await fixture();
+  const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+  const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+  const other = { pid: 5000, pgid: 5000, startTime: 'other-command' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes:
+      kill.mock.calls.length === 0 ? [command, other] : [command, watchdog],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    watchdogs: new Set([4243]),
+    marks: new Map(
+      pids
+        .filter((pid) => pid !== command.pid || kill.mock.calls.length > 0)
+        .map((pid) => [pid, f.token]),
+    ),
+    ...(kill.mock.calls.length === 0 ? { unreadable: [command.pid] } : {}),
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([[other.pid, 'SIGKILL']]);
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: watchdog.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/group.*bound.*unreadable/i),
+    }),
+  );
+});
+
+it('keeps a sole marked watchdog when the final table reveals another member', async () => {
+  const f = await fixture();
+  const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+  const late = { pid: 4244, pgid: 4242, startTime: 'late-command' };
+  let reads = 0;
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: ++reads <= 2 ? [watchdog] : [watchdog, late],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    watchdogs: new Set([4243]),
+    marks: new Map(
+      pids.filter((pid) => pid === watchdog.pid).map((pid) => [pid, f.token]),
+    ),
+    ...(pids.includes(late.pid) ? { unreadable: [late.pid] } : {}),
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([]);
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: watchdog.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/group.*bound.*identity/i),
+    }),
+  );
+});
+
+it('keeps a sole marked watchdog when a reaped member PID is reused', async () => {
+  const f = await fixture();
+  const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+  const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+  let reads = 0;
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: [
+      ++reads < 4 ? command : { ...command, startTime: 'replacement' },
+      watchdog,
+    ],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    watchdogs: new Set([4243]),
+    marks: new Map(
+      pids.filter((pid) => pid === watchdog.pid).map((pid) => [pid, f.token]),
+    ),
+  }));
+  const result = await f.journal.sweep();
+  expect(kill.mock.calls).toEqual([[command.pid, 'SIGKILL']]);
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: watchdog.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/group.*bound.*identity/i),
+    }),
+  );
+});
 
 it('sweeps 12,001 gone hints within the detached readiness budget', async () => {
   const f = await fixture();
@@ -576,6 +819,257 @@ it('bounds rediscovery of a continuously vanishing marked lineage to eight passe
     }),
   );
   expect(kill).not.toHaveBeenCalled();
+});
+
+/** A final discovery is still durable attribution even without another confirmation pass. */
+it('retains the ninth marked group across restart after eight disappearing generations', async () => {
+  const f = await fixture();
+  let reads = 0;
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    const index = reads++;
+    const pid = 4242 + Math.floor(index / 2);
+    return {
+      supported: true,
+      processes: index % 2 === 0 ? [{ pid, pgid: pid, startTime: 'fork' }] : [],
+    };
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  try {
+    const first = await f.journal.sweep();
+    expect(reads).toBe(17);
+    expect(first.status).toBe('incomplete');
+    expect(first.outcomes).toContainEqual(
+      expect.objectContaining({ pid: 4250, status: 'abstained' }),
+    );
+    expect(
+      sql.prepare('SELECT pid FROM command_pids WHERE pid = 4250').all(),
+    ).toEqual([{ pid: 4250 }]);
+    // The last marked anchor exits before restart, leaving only its unmarked child.
+    vi.mocked(readProcessTable).mockResolvedValue({
+      supported: true,
+      processes: [{ pid: 4251, pgid: 4250, startTime: 'unmarked-survivor' }],
+    });
+    vi.mocked(readCommandMarks).mockResolvedValue({
+      supported: true,
+      marks: new Map(),
+    });
+    const reopened = CommandProcessJournal.open(f.db, path.dirname(f.db));
+    journals.push(reopened);
+    const second = await reopened.sweep();
+    expect(second.outcomes).toContainEqual(
+      expect.objectContaining({ pid: 4251, status: 'abstained' }),
+    );
+    expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+      { life: f.token },
+    ]);
+    expect(kill).not.toHaveBeenCalled();
+    vi.mocked(readProcessTable).mockResolvedValue({
+      supported: true,
+      processes: [],
+    });
+    await reopened.sweep();
+    expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([]);
+  } finally {
+    sql.close();
+  }
+});
+
+/** Pre-spawn admission leaves a nonce even if SIGKILL prevents direct-PID bookkeeping. */
+it.each(['child', 'empty', 'unavailable', 'unreadable'] as const)(
+  'confirms nonce-only absence beyond a missed fork snapshot (%s)',
+  async (next) => {
+    const f = await fixture();
+    const sql = new Database(`${f.db}.commands.sqlite`);
+    sql.prepare('DELETE FROM command_pids').run();
+    const child = { pid: 5000, pgid: 5000, startTime: 'late-marked-child' };
+    let reads = 0;
+    vi.mocked(readProcessTable).mockImplementation(async () => {
+      reads++;
+      if (reads > 1 && next === 'unavailable')
+        return { supported: false, reason: 'injected confirmation failure' };
+      return {
+        supported: true,
+        processes: reads === 1 || next === 'empty' ? [] : [child],
+      };
+    });
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+      supported: true,
+      marks: new Map(next === 'child' ? pids.map((pid) => [pid, f.token]) : []),
+      ...(next === 'unreadable' && reads > 1
+        ? { unreadable: [child.pid] }
+        : {}),
+    }));
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    try {
+      const result = await f.journal.sweep();
+      expect(reads).toBeGreaterThanOrEqual(2);
+      if (next === 'empty') {
+        expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([]);
+      } else {
+        expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+          { life: f.token },
+        ]);
+        expect(result.outcomes).toContainEqual(
+          expect.objectContaining(
+            next === 'unavailable'
+              ? { status: 'abstained', reason: 'injected confirmation failure' }
+              : {
+                  pid: child.pid,
+                  status: next === 'child' ? 'reaped' : 'abstained',
+                },
+          ),
+        );
+        vi.mocked(readProcessTable).mockResolvedValue({
+          supported: true,
+          processes: [],
+        });
+        vi.mocked(readCommandMarks).mockResolvedValue({
+          supported: true,
+          marks: new Map(),
+        });
+        await f.journal.sweep();
+        expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([]);
+      }
+      expect(kill.mock.calls).toEqual(
+        next === 'child' ? [[child.pid, 'SIGKILL']] : [],
+      );
+    } finally {
+      sql.close();
+    }
+  },
+);
+
+/** Unrelated unreadability cannot certify that a vanished group's attribution is finished. */
+it('keeps disappearance hints when fresh ownership is unreadable', async () => {
+  const f = await fixture();
+  let reads = 0;
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes:
+      ++reads === 1 ? [] : [{ pid: 9000, pgid: 9000, startTime: 'unreadable' }],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(),
+    unreadable: [...pids],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  try {
+    await f.journal.sweep();
+    expect(reads).toBe(2);
+    expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([
+      { pid: 4242 },
+    ]);
+    expect(kill).not.toHaveBeenCalled();
+  } finally {
+    sql.close();
+  }
+});
+
+/** A nonce anywhere keeps existing suspicions while a new anchor is still unconfirmed. */
+it('keeps disappearance hints while a marked child vanishes at confirmation', async () => {
+  const f = await fixture();
+  const child = { pid: 5000, pgid: 5000, startTime: 'marked' };
+  const survivor = { pid: 5001, pgid: 5000, startTime: 'unmarked' };
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  let reads = 0;
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    reads++;
+    if (reads === 3)
+      expect(
+        sql.prepare('SELECT pid FROM command_pids WHERE pid = 4242').all(),
+      ).toEqual([{ pid: 4242 }]);
+    return {
+      supported: true,
+      processes:
+        reads === 1 || reads === 3 ? [] : reads === 2 ? [child] : [survivor],
+    };
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === child.pid).map((pid) => [pid, f.token]),
+    ),
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  try {
+    const result = await f.journal.sweep();
+    expect(result.outcomes).toContainEqual(
+      expect.objectContaining({ pid: survivor.pid, status: 'abstained' }),
+    );
+    expect(sql.prepare('SELECT life FROM command_lives').all()).toEqual([
+      { life: f.token },
+    ]);
+    expect(kill).not.toHaveBeenCalled();
+  } finally {
+    sql.close();
+  }
+});
+
+/** Anchor disappearance must already be in the receipt before rediscovery can block or crash. */
+it('commits anchor disappearance before awaiting rediscovery', async () => {
+  const f = await fixture();
+  const anchor = { pid: 4242, pgid: 4242, startTime: 'anchor' };
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  let reads = 0;
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    reads++;
+    if (reads === 3) {
+      const saved = JSON.parse(
+        sql
+          .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+          .pluck()
+          .get(),
+      );
+      expect(saved.outcomes).toContainEqual(
+        expect.objectContaining({ pid: anchor.pid, status: 'gone' }),
+      );
+    }
+    return { supported: true, processes: reads === 1 ? [anchor] : [] };
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  try {
+    await f.journal.sweep();
+    expect(reads).toBe(3);
+    expect(kill).not.toHaveBeenCalled();
+  } finally {
+    sql.close();
+  }
+});
+
+/** A reap retains its group until a later startup, even if this sweep sees an empty table. */
+it('keeps a reaped group hint without pending disappearance', async () => {
+  const f = await fixture();
+  const anchor = { pid: 4242, pgid: 4242, startTime: 'anchor' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length === 0 ? [anchor] : [],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  try {
+    await f.journal.sweep();
+    expect(kill).toHaveBeenCalledExactlyOnceWith(anchor.pid, 'SIGKILL');
+    expect(sql.prepare('SELECT pid FROM command_pids').all()).toEqual([
+      { pid: anchor.pgid },
+    ]);
+  } finally {
+    sql.close();
+  }
 });
 
 it('keeps a hint refreshed while admission reads an earlier empty process snapshot', async () => {
@@ -1493,4 +1987,491 @@ it('does not repeat discovery when every candidate lacks readable ownership', as
     );
   expect(readCommandMarks).toHaveBeenCalledTimes(1);
   expect(result.outcomes).toHaveLength(pids.length);
+});
+
+// An old admission (or a re-sessioned marked descendant) has no watchdog in its group.
+it('reaps verified work in an uncertain group with no watchdog across restarts', async () => {
+  const f = await fixture();
+  const command = { pid: 4242, pgid: 4242, startTime: 'unbounded-command' };
+  const hidden = { pid: 4243, pgid: 4242, startTime: 'unreadable-child' };
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [command, hidden],
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === command.pid).map((pid) => [pid, f.token]),
+    ),
+    ...(pids.includes(hidden.pid) ? { unreadable: [hidden.pid] } : {}),
+  }));
+  const first = await f.journal.sweep();
+  const again = CommandProcessJournal.open(f.db, path.dirname(f.db));
+  journals.push(again);
+  const second = await again.sweep();
+  console.log(
+    'NO_WATCHDOG',
+    JSON.stringify({ calls: kill.mock.calls, first, second }),
+  );
+  expect(kill.mock.calls).toContainEqual([command.pid, 'SIGKILL']);
+});
+
+it('reaps late forks even while previously reaped identities remain visible', async () => {
+  const f = await fixture();
+  const original = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+  ];
+  const late = [
+    { pid: 4244, pgid: 4242, startTime: 'late-a' },
+    { pid: 4245, pgid: 4242, startTime: 'late-b' },
+  ];
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length < 2 ? original : [...original, ...late],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const result = await f.journal.sweep();
+  console.log(
+    'LATE_FORKS',
+    JSON.stringify({ calls: kill.mock.calls, outcomes: result.outcomes }),
+  );
+  expect(kill.mock.calls).toEqual(
+    expect.arrayContaining(
+      [...original, ...late].map((p) => [p.pid, 'SIGKILL']),
+    ),
+  );
+});
+
+it('reaps a late watchdog alongside forks despite known terminal rows', async () => {
+  const f = await fixture();
+  const original = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+  ];
+  const late = [
+    { pid: 4244, pgid: 4242, startTime: 'late-a' },
+    { pid: 4245, pgid: 4242, startTime: 'late-b' },
+  ];
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockImplementation(async () => ({
+    supported: true,
+    processes: kill.mock.calls.length < 2 ? original : [...original, ...late],
+  }));
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+    watchdogs: new Set([4243, 4245]),
+  }));
+  const result = await f.journal.sweep();
+  console.log(
+    'LATE_FORKS',
+    JSON.stringify({ calls: kill.mock.calls, outcomes: result.outcomes }),
+  );
+  expect(kill.mock.calls).toEqual(
+    expect.arrayContaining(
+      [...original, ...late].map((p) => [p.pid, 'SIGKILL']),
+    ),
+  );
+});
+
+it('bounds terminal scan descriptors during a many-candidate Linux sweep', async () => {
+  const f = await fixture();
+  const records = Array.from({ length: 64 }, (_, i) => ({
+    pid: 4242 + i,
+    pgid: 4242,
+    startTime: `member-${i}`,
+  }));
+  vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(pids.map((pid) => [pid, f.token])),
+  }));
+  const actual =
+    await vi.importActual<typeof import('./process-table.js')>(
+      './process-table.js',
+    );
+  let active = 0,
+    peak = 0,
+    failures = 0;
+  vi.mocked(readCommandTerminal).mockImplementation(async () => {
+    const reading = await actual.readLinuxProcessTable({
+      readdir: async () => Array.from({ length: 64 }, (_, i) => String(i + 1)),
+      open: async () => {
+        if (active >= 256) {
+          failures++;
+          throw Object.assign(new Error('injected descriptor cap'), {
+            code: 'EMFILE',
+          });
+        }
+        active++;
+        peak = Math.max(peak, active);
+        return {
+          read: async (buffer, position) => {
+            await new Promise((resolve) => setImmediate(resolve));
+            if (position > 0) return 0;
+            const bytes = Buffer.from(
+              '1 (fixture) Z 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1\n',
+            );
+            buffer.set(bytes);
+            return bytes.length;
+          },
+          close: async () => {
+            active--;
+          },
+        };
+      },
+    });
+    return reading.supported ? 'terminated' : 'unavailable';
+  });
+  const result = await f.journal.sweep();
+  const failed = result.outcomes.filter((o) => o.status === 'failed').length;
+  console.log('TERMINAL_FDS', JSON.stringify({ peak, failures, failed }));
+  expect(failed).toBe(0);
+  expect(peak).toBeLessThanOrEqual(32);
+  expect(failures).toBe(0);
+});
+
+it('batches durable receipts for a large vetoed macOS group', async () => {
+  const f = await fixture();
+  vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
+  const records = Array.from({ length: 8000 }, (_, i) => ({
+    pid: 4242 + i,
+    pgid: 4242,
+    startTime: `member-${i}`,
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid !== 4242).map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4243]),
+    ...(pids.includes(4242) ? { unreadable: [4242] } : {}),
+  }));
+  const prepare = Database.prototype.prepare;
+  let saves = 0;
+  vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (sql) {
+    if (sql === 'UPDATE restart_sweeps SET result = ? WHERE id = ?') saves++;
+    return prepare.call(this, sql);
+  });
+  const start = performance.now();
+  const result = await f.journal.sweep();
+  const elapsed = performance.now() - start;
+  console.log('VETO_RECEIPTS', JSON.stringify({ saves, elapsed }));
+  expect(saves).toBeLessThan(20);
+  expect(kill).not.toHaveBeenCalled();
+  expect(
+    result.outcomes.filter((outcome) => outcome.status === 'abstained').length,
+  ).toBeGreaterThanOrEqual(8000);
+}, 30000);
+
+/** Roles may only retain a bound; every permitted signal still needs its own evidence. */
+it.each([0, 1, 2])(
+  'preserves only verified watchdog groups (%i watchdog roles)',
+  async (count) => {
+    const f = await fixture();
+    const records = [4242, 4243, 4244, 4245].map((pid) => ({
+      pid,
+      pgid: 4242,
+      startTime: `member-${pid}`,
+    }));
+    const watchdogs = new Set([4243, 4244].slice(0, count));
+    vi.mocked(readProcessTable).mockResolvedValue({
+      supported: true,
+      processes: records,
+    });
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+      supported: true,
+      marks: new Map(
+        pids.filter((pid) => pid !== 4245).map((pid) => [pid, f.token]),
+      ),
+      watchdogs,
+      unreadable: pids.includes(4245) ? [4245] : [],
+    }));
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const result = await f.journal.sweep();
+    if (count === 0) {
+      expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
+      expect(
+        result.outcomes.some((o) => o.reason?.includes('Preserved group')),
+      ).toBe(false);
+    } else {
+      expect(kill).not.toHaveBeenCalled();
+      for (const pid of watchdogs)
+        expect(result.outcomes).toContainEqual(
+          expect.objectContaining({
+            pid,
+            status: 'abstained',
+            reason: expect.stringMatching(/bound/),
+          }),
+        );
+    }
+  },
+);
+
+it('does not accept an unrelated life with a forged watchdog role as a bound', async () => {
+  const f = await fixture();
+  const records = [4242, 4243, 4244].map((pid) => ({
+    pid,
+    pgid: 4242,
+    startTime: String(pid),
+  }));
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => pid !== 4244)
+        .map((pid) => [pid, pid === 4243 ? 'another-life' : f.token]),
+    ),
+    watchdogs: new Set([4243]),
+    unreadable: pids.includes(4244) ? [4244] : [],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  await f.journal.sweep();
+  expect(kill).toHaveBeenCalledWith(4242, 'SIGKILL');
+});
+
+it('cleans a re-sessioned marked descendant without borrowing its former watchdog', async () => {
+  const f = await fixture();
+  const records = [
+    { pid: 4242, pgid: 4242, startTime: 'watchdog' },
+    { pid: 5000, pgid: 5000, startTime: 'escape' },
+    { pid: 5001, pgid: 5000, startTime: 'hidden' },
+  ];
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid !== 5001).map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4242]),
+    unreadable: pids.includes(5001) ? [5001] : [],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  await f.journal.sweep();
+  expect(kill).toHaveBeenCalledWith(5000, 'SIGKILL');
+});
+
+it('an authored watchdog role only withholds signals when a companion is unreadable', async () => {
+  const f = await fixture();
+  const authored = { pid: 4242, pgid: 4242, startTime: 'authored-role' };
+  const hidden = { pid: 4243, pgid: 4242, startTime: 'unreadable' };
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: [authored, hidden],
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids.filter((pid) => pid === authored.pid).map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([authored.pid]),
+    unreadable: pids.includes(hidden.pid) ? [hidden.pid] : [],
+  }));
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  const result = await f.journal.sweep();
+  expect(kill).not.toHaveBeenCalled();
+  expect(result.outcomes).toContainEqual(
+    expect.objectContaining({
+      pid: authored.pid,
+      status: 'abstained',
+      reason: expect.stringMatching(/bound.*unreadable/),
+    }),
+  );
+});
+
+/** A role from an earlier snapshot cannot preserve a bound proven to have ended. */
+it.each(['gone', 'recycled'] as const)(
+  'reaps verified companions when the only watchdog is %s at the final gate',
+  async (state) => {
+    const f = await fixture();
+    const command = { pid: 4242, pgid: 4242, startTime: 'command' };
+    const watchdog = { pid: 4243, pgid: 4242, startTime: 'watchdog' };
+    const hidden = { pid: 4244, pgid: 4242, startTime: 'hidden' };
+    let finalMarks = false;
+    vi.mocked(readProcessTable).mockImplementation(async () => ({
+      supported: true,
+      processes: [
+        command,
+        hidden,
+        ...(!finalMarks
+          ? [watchdog]
+          : state === 'recycled'
+            ? [{ ...watchdog, startTime: 'replacement' }]
+            : []),
+      ],
+    }));
+    vi.mocked(readCommandMarks).mockImplementation(async (pids) => {
+      if (pids.length === 1) finalMarks = true;
+      return {
+        supported: true,
+        marks: new Map(
+          pids.filter((pid) => pid !== hidden.pid).map((pid) => [pid, f.token]),
+        ),
+        watchdogs: new Set([watchdog.pid]),
+        unreadable: pids.includes(hidden.pid) ? [hidden.pid] : [],
+      };
+    });
+    const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const result = await f.journal.sweep();
+    expect(kill).toHaveBeenCalledWith(command.pid, 'SIGKILL');
+    expect(kill).not.toHaveBeenCalledWith(watchdog.pid, 'SIGKILL');
+    expect(
+      result.outcomes.some((outcome) =>
+        outcome.reason?.includes('Preserved group'),
+      ),
+    ).toBe(false);
+  },
+);
+
+/** A decided preservation receipt must survive loss during unrelated terminal queries. */
+it('commits final-gate preservation before awaiting another group terminal query', async () => {
+  const f = await fixture();
+  const records = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+    { pid: 5000, pgid: 5000, startTime: 'independent' },
+  ];
+  const kill = vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readProcessTable).mockResolvedValue({
+    supported: true,
+    processes: records,
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => !(pids.length === 1 && pid === 4242))
+        .map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4243]),
+    unreadable: pids.length === 1 && pids[0] === 4242 ? [4242] : [],
+  }));
+  vi.mocked(readCommandTerminal).mockImplementation(async (record) => {
+    expect(record.pid).toBe(5000);
+    expect(kill.mock.calls).toEqual([[5000, 'SIGKILL']]);
+    const sql = new Database(`${f.db}.commands.sqlite`);
+    const row = sql
+      .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+      .get() as { result: string };
+    sql.close();
+    const saved = JSON.parse(row.result) as {
+      outcomes: { pid?: number; status: string; reason?: string }[];
+    };
+    console.log('PRESERVATION_BEFORE_TERMINAL', JSON.stringify(saved));
+    expect(saved.outcomes).toContainEqual(
+      expect.objectContaining({
+        pid: 4243,
+        status: 'abstained',
+        reason: expect.stringMatching(/bound.*unreadable/),
+      }),
+    );
+    return 'terminated';
+  });
+  await f.journal.sweep();
+});
+
+/** Invalid stored identifiers are decided diagnostics before any anchor can be queried. */
+it('commits invalid PID diagnostics before awaiting anchor confirmation', async () => {
+  const f = await fixture();
+  const sql = new Database(`${f.db}.commands.sqlite`);
+  sql.prepare('UPDATE command_pids SET pid = -1').run();
+  sql.close();
+  const record = { pid: 4242, pgid: 4242, startTime: 'command' };
+  let reads = 0;
+  vi.spyOn(process, 'kill').mockReturnValue(true);
+  vi.mocked(readCommandMarks).mockResolvedValue({
+    supported: true,
+    marks: new Map([[record.pid, f.token]]),
+  });
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    if (++reads === 2) {
+      const reader = new Database(`${f.db}.commands.sqlite`);
+      try {
+        const row = reader
+          .prepare('SELECT result FROM restart_sweeps ORDER BY id DESC LIMIT 1')
+          .get() as { result: string };
+        expect(JSON.parse(row.result)).toMatchObject({
+          outcomes: expect.arrayContaining([
+            expect.objectContaining({
+              status: 'abstained',
+              reason: 'Invalid durable command PID record',
+            }),
+          ]),
+        });
+      } finally {
+        reader.close();
+      }
+    }
+    return { supported: true, processes: [record] };
+  });
+  await f.journal.sweep();
+  expect(reads).toBeGreaterThanOrEqual(2);
+});
+
+/** Blocking receipt I/O must not open an extra PID-reuse window in the final signal batch. */
+it('keeps receipt I/O out of the final identity-to-signal interval', async () => {
+  const f = await fixture();
+  const records = [
+    { pid: 4242, pgid: 4242, startTime: 'command' },
+    { pid: 4243, pgid: 4242, startTime: 'watchdog' },
+    { pid: 5000, pgid: 5000, startTime: 'independent' },
+  ];
+  let tables = 0;
+  let signalled = false;
+  let reusedBeforeSignal = false;
+  vi.mocked(readProcessTable).mockImplementation(async () => {
+    tables++;
+    return { supported: true, processes: records };
+  });
+  vi.mocked(readCommandMarks).mockImplementation(async (pids) => ({
+    supported: true,
+    marks: new Map(
+      pids
+        .filter((pid) => !(pids.length === 1 && pid === 4242))
+        .map((pid) => [pid, f.token]),
+    ),
+    watchdogs: new Set([4243]),
+  }));
+  const prepare = Database.prototype.prepare;
+  vi.spyOn(Database.prototype, 'prepare').mockImplementation(function (sql) {
+    // A synchronous disk stall can let the kernel recycle an independent PID.
+    // Model that external event at the newly introduced receipt-write boundary.
+    if (
+      sql === 'UPDATE restart_sweeps SET result = ? WHERE id = ?' &&
+      tables >= 3 &&
+      !signalled
+    ) {
+      reusedBeforeSignal = true;
+    }
+    return prepare.call(this, sql);
+  });
+  const kill = vi.spyOn(process, 'kill').mockImplementation(() => {
+    signalled = true;
+    return true;
+  });
+  await f.journal.sweep();
+  expect(kill).toHaveBeenCalledExactlyOnceWith(5000, 'SIGKILL');
+  expect(reusedBeforeSignal).toBe(false);
 });

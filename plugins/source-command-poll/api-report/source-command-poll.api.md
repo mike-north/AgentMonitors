@@ -15,7 +15,7 @@ export interface CommandProcessOwner {
 }
 
 // @public
-export function createCommandPollSource(owner?: CommandProcessOwner): ObservationSource;
+export function createCommandPollSource(owner?: CommandProcessOwner, shutdownSignal?: AbortSignal): ObservationSource;
 
 // @public
 export type JsonSchema = Record<string, unknown>;

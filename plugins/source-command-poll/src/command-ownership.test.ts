@@ -1,27 +1,44 @@
 /** Optional numeric bookkeeping must never dismantle live command supervision. */
 import { waitForOwnedGroupTermination } from '../../../scripts/owned-test-group.mjs';
-import { expect, it, vi } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { createCommandPollSource } from './index.js';
+
+/** Cancellation retains the source's live handle/control channel instead of guessing at a reaped PGID. */
+interface IOwnedFixture {
+  readonly shutdown: AbortController;
+  group?: number;
+}
+const fixtures: IOwnedFixture[] = [];
+
+// A timed-out observation must restore instrumentation and stop its owned work.
+afterEach(async () => {
+  vi.restoreAllMocks();
+  for (const fixture of fixtures.splice(0)) await cleanupGroup(fixture);
+});
 
 for (const failure of ['spawned', 'exited'] as const) {
   it.skipIf(process.platform !== 'linux' && process.platform !== 'darwin')(
     `keeps managing and collecting a command when ${failure} PID bookkeeping fails`,
     async () => {
       const stderr = vi.spyOn(process.stderr, 'write').mockReturnValue(true);
-      let group: number | undefined;
+      const fixture: IOwnedFixture = { shutdown: new AbortController() };
+      fixtures.push(fixture);
       try {
-        const source = createCommandPollSource({
-          environment: async () => ({
-            AGENTMONITORS_COMMAND_LIFE: 'test-owner',
-          }),
-          spawned: (pid) => {
-            group = pid;
-            if (failure === 'spawned') throw new Error('disk unavailable');
+        const source = createCommandPollSource(
+          {
+            environment: async () => ({
+              AGENTMONITORS_COMMAND_LIFE: 'test-owner',
+            }),
+            spawned: (pid) => {
+              fixture.group = pid;
+              if (failure === 'spawned') throw new Error('disk unavailable');
+            },
+            exited: () => {
+              if (failure === 'exited') throw new Error('disk unavailable');
+            },
           },
-          exited: () => {
-            if (failure === 'exited') throw new Error('disk unavailable');
-          },
-        });
+          fixture.shutdown.signal,
+        );
         const result = await source.observe(
           {
             command: [
@@ -42,19 +59,16 @@ for (const failure of ['spawned', 'exited'] as const) {
         );
       } finally {
         stderr.mockRestore();
-        if (group !== undefined) await cleanupGroup(group);
+        await cleanupGroup(fixture);
       }
     },
   );
 }
 
 /** Preserve termination evidence even when the observation assertion fails. */
-async function cleanupGroup(group: number): Promise<void> {
-  try {
-    process.kill(-group, 'SIGKILL');
-  } catch (error) {
-    if (!(error instanceof Error && 'code' in error && error.code === 'ESRCH'))
-      throw error;
+async function cleanupGroup(fixture: IOwnedFixture): Promise<void> {
+  fixture.shutdown.abort();
+  if (fixture.group !== undefined) {
+    await waitForOwnedGroupTermination(fixture.group, Date.now() + 5_000);
   }
-  await waitForOwnedGroupTermination(group, Date.now() + 5_000);
 }

@@ -63,6 +63,11 @@ function expectOwnedDefaultSocket(workspace: string, dataHome: string): void {
   }
 }
 
+/** Keep pathname-limit fixtures directly beneath an explicitly owned short parent. */
+function shortOwnedTempParent(): string {
+  return process.env.AGENTMONITORS_TEST_TEMP_ROOT ?? tmpdir();
+}
+
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
 // Repo root holds the activation plugin. The config-drift UAT below reads the
@@ -5127,7 +5132,7 @@ This monitor has a typo'd timezone.
     // Isolated fake HOME + pinned XDG_DATA_HOME (workspacePaths() prefers it
     // over HOME) so the derived per-workspace db lands under a directory this
     // test controls and cleans up, never the developer's real data dir.
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     const xdgDataHome = path.join(fakeHome, 'd');
     expectOwnedDefaultSocket(dir, xdgDataHome);
     // Enabled, but deliberately NO `db:` value — resolveWorkspaceDbPath must
@@ -5287,8 +5292,8 @@ Handle it.
 
   function doctorSocket(label: string): string {
     return path.join(
-      tmpdir(),
-      `agentmon-doctor-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      shortOwnedTempParent(),
+      `d-${label.slice(0, 8)}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
   }
 
@@ -6461,7 +6466,7 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET anywhere below —
     // that is the exact condition that reproduces the study's finding. Pinning
     // XDG_DATA_HOME under fakeHome (rather than leaving it to whatever the
@@ -6584,7 +6589,7 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET / --socket
     // anywhere below — that is the exact condition the issue reports. Pinning
     // XDG_DATA_HOME under fakeHome (which `workspacePaths()` prefers over
@@ -6705,7 +6710,7 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'h'));
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     // Pin XDG_DATA_HOME under fakeHome (it takes priority over HOME in
     // `workspacePaths()`) and use `runWithCleanEnv` so an ambient
     // AGENTMONITORS_DB/AGENTMONITORS_SOCKET/XDG_DATA_HOME in the developer's

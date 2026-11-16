@@ -2372,6 +2372,30 @@ Verified: `libs/core/src/runtime/types.ts` — `DeliveryLifecycle` (lines 18–2
 
 Verified: `libs/core/src/runtime/types.ts` — `AgentLifecycleEvent` (lines 9–16).
 
+**Claimed set equals rendered set (current).** For every delivery lifecycle, the runtime
+**MUST** derive rendering and the committed candidate set from the same selected net-collapse
+view. A concrete event is claimed only when rendered, or as an older net intermediate whose
+endpoint is rendered. A normal/low generic reminder represents only its selected urgency-band
+batch (§9.2–§9.3); its collapse **MUST NOT** replace a concrete endpoint rendered by the same claim.
+Unrepresented groups **MUST** stay unread and unclaimed, with no suppression or cursor advancement,
+so a later eligible claim can offer them, including after a restart. Claims never acknowledge.
+
+For example, a net object's `v1` observed at `high`, followed by an urgency edit and `v2` at
+`normal`, renders `v1` at `turn-interruptible` and leaves `v2` pending for the next normal reminder.
+Normal groups whose endpoint would replace the selected settled high version in that full
+`(monitorId, objectKey, workspacePath)` group are deferred; older normal intermediates may fold
+into a rendered high endpoint, using durable materialization order to break equal-time ties.
+An unsettled high version cannot justify consuming an intervening normal version. Another
+monitor sharing only the object key remains independent and may
+coalesce its reminder. At `turn-idle`, only the selected low batch is claimed. At `post-compact`,
+only the groups represented by the ten rendered endpoints are claimed or net-suppressed; groups
+outside the recap cap remain pending.
+
+Verified: `libs/core/src/runtime/net-collapse-claim.test.ts` drives real monitor edits, claims and
+reserve/commit delivery across all three lifecycles, checking durable `session_event_state`
+projections and subsequent claims after closing and reopening SQLite. It covers single-monitor
+urgency edits, multiple monitors sharing an object key, independent reminder coalescing and recap caps.
+
 ### 9.1 High urgency
 
 At `turn-interruptible`, the runtime **MUST** deliver all pending high-urgency events that have aged past the 15-second settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS`). The delivery payload **MUST** summarize the concrete events (titles and summaries), not just emit a generic reminder. The `DeliveryClaim` will have `mode: 'delivery'` and include a populated `events` array.
@@ -2393,7 +2417,7 @@ Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` turn-interrup
 > **withheld** whenever ANY high-urgency work is genuinely pending (settled or not), and only ever
 > fires standalone once no high-urgency work is pending at all.
 
-When a settled high-urgency batch (§9.1) is due **and** a normal-urgency reminder (§9.2) is
+When a settled high-urgency batch (§9.1) is due **and** an independent normal-urgency reminder (§9.2) is
 simultaneously due in the SAME `claimDelivery`/`reserveDelivery` decision, the runtime **MUST**
 fold both into ONE `DeliveryClaim` rather than returning the high batch and deferring the normal
 reminder to a later call:
@@ -2697,7 +2721,8 @@ monitor through the persisted pipeline state and returns stages for:
 1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
 3. Observation: recent `observation_history` rows and latest outcome
-4. Notify state: active debounce or throttle state in `monitor_state.notify_state`
+4. Notify state: accepted debounce/rollup batches and active throttle suppression in
+   `monitor_state.notify_state`, including accepted batches beside definition failures
 5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
    `monitor_events`
 6. Projection and delivery: `session_event_state` joined to `agent_sessions`, reported as
@@ -2710,13 +2735,15 @@ monitor through the persisted pipeline state and returns stages for:
 Each stage carries a `status` of `ok`, `pending`, `healthy`, or `failure`:
 
 - `ok` — the stage produced the signal the next stage needs.
-- `pending` — the stage is intentionally holding (debounce/throttle) or has not run because an
+- `pending` — the stage is intentionally holding (debounce/rollup/throttle) or has not run because an
   upstream stage has not produced its input.
 - `healthy` — the stage ran successfully and the correct outcome was "no work to do": the watched
   target genuinely did not change. A `no-change` or `rebaselined` observation outcome is `healthy`,
-  **not** a `failure` — an idle monitor is not a bug. When the latest observation is `healthy`, the
-  downstream materialization and delivery stages report `healthy` rather than `failure` for the
-  expected absence of events/projections. The verdict for a genuinely idle monitor is therefore an
+  **not** a `failure` — an idle monitor is not a bug. When the latest observation is `healthy` and
+  no accepted notify batch remains, downstream materialization and delivery report `healthy`
+  rather than `failure` for the expected absence of events/projections. Accepted debounce/rollup
+  work from earlier ticks keeps those stages `pending` while no event has materialized; a quiet
+  latest tick cannot erase that work (005 §6, #574). The verdict for a genuinely idle monitor is therefore an
   affirmative `healthy` at the observation stage (e.g. "Source ran, observed 0 changes — your watched
   target genuinely hasn't changed (not a bug).").
 - `failure` — a real fault: invalid definition, errored observe, a zero-file match diagnostic, an outstanding dropped observation, terminal retained work, or a missing expected projection.
@@ -2749,6 +2776,52 @@ events for other keys leave it failing. The observation stage still describes th
 row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
 real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
 (Refs #497, #575).
+
+Held-notify diagnosis reads accepted batches independently of definition health.
+Incomplete captured rollup metadata (including missing/null `monitor` or
+`frontmatter`) leaves `window` and `timezone` as `unknown`; the batch count and
+rest of the report remain available without repairing the stored envelope.
+Release diagnosis follows tick's read-only predicates in order: duplicate discovery,
+then `staleActiveSessions` (including the recent-declaration exemption), active
+workspace/global declarations and owner status, source resolution, definition
+reconstruction and scope validation, older retained materialization work, captured
+envelope validation and effective policy comparison, then scheduling if no edit
+will drain the batch first. It does not perform any of those mutations.
+A live watcher can own a valid admitted definition outside the scanned tree.
+Scan absence alone is not a release barrier: both reports share tick's read-only
+resolution of the scanned candidate or first held envelope's captured path,
+then the live owner's admitted path. Source and scope checks use that resolved
+definition. An empty-tree tick can leave watcher admission open; the watcher
+can release due work without a definition repair. Definition discovery stages
+still describe the requested tree independently of that hold's eligibility.
+If the scan finds a second valid same-id file, both reports retain the accepted
+count and classify that ambiguity as `definition-rejected`; neither report aborts.
+The next tick still refuses the ambiguity and retains its held work. Other errors
+from reading the current definition propagate normally.
+Both report methods expose the first known prerequisite as `releaseBarrier`:
+
+| Value                 | Derivation and remedy                                                                                                                                                                              |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                  |
+| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                  |
+| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                        |
+| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit. |
+| `declaration-retired` | The ephemeral record is absent or reaped; no future tick releases this work and there is no file to edit.                                                                                          |
+| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                            |
+| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                         |
+| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                            |
+| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.               |
+
+`blockedByDefinition` retains its persistent-definition meaning, including an
+unresolved source in a persistent definition. It is false for ephemeral source,
+owner and retirement barriers and for retained-work/capture barriers; it does not
+assert eligibility. `none` is a snapshot, not a promise that the next tick emits:
+concurrent edits, cadence, watcher ownership, in-flight admission, transactional
+failures and deliberate artifact filtering still apply. Diagnosis changes neither
+release timing nor retention policy. `held-notify-report.test.ts` exercises both
+surfaces, read-only persistence, stale-owner and recent-declaration clocks,
+interrupted-close database reopen, source restoration, and real release/retention
+outcomes (Refs #574).
 
 The method MUST NOT mutate runtime state. **It MUST scope to the requested workspace.** The inbox DB
 is global (not per-workspace), so the same `monitorId` can exist in multiple workspaces; the
@@ -3374,3 +3447,149 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 | `updated_at`   | INTEGER NOT NULL |                                                                     |
 | `acked_at`     | INTEGER nullable |                                                                     |
 | `completed_at` | INTEGER nullable |                                                                     |
+
+## 16. External JSON foundation
+
+**Current internal contract.** `libs/core/src/external-ingress/json.ts` validates and
+canonically encodes external plain JSON data. It remains outside the package root.
+It is independent of `runtime/retry-envelope.ts`: retained retries continue to use
+`serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
+`observedAt` Date. External JSON permits no Date values.
+
+The input domain is primitives, ordinary records with `Object.prototype` or a
+null prototype, and dense ordinary arrays. The following tested built-in families
+are refused even after replacing their prototype with either accepted record
+prototype. This is a stated refusal list, not a proof that all hidden state can be
+detected. Probes are captured at module load and assume unmodified runtime
+built-ins, including `Object.prototype`, at that point.
+
+For **every input**, inside or outside the plain-data domain, validation and
+encoding MUST NOT run caller code: getters, setters, `toJSON`, proxy traps or
+inherited accessors. Changes to any built-in prototype after module load MUST
+neither run code nor change a result. Internal traversal uses indexed reads,
+captured functions invoked without mutable call/apply protocols, and own-data
+buffers independent of inherited numeric setters, iterators and array species.
+Sorting and joining use captured methods on dense null-prototype buffers.
+
+A brand probe's not-a-member path MUST NOT construct an error in Node JavaScript
+internals. Even captured methods can invoke inherited numeric setters while
+constructing such an error. Only native wrong-receiver exceptions or hook-free
+boolean slot/private-brand checks meet this boundary.
+
+| Refused family                                                                                                     | Captured check                                                                                                                                                                         |
+| ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| All proxies, including revoked proxies                                                                             | `util.types.isProxy`, before reflection                                                                                                                                                |
+| Date, RegExp, Map, Set, WeakMap, WeakSet                                                                           | Corresponding native `util.types.is*` slot predicates                                                                                                                                  |
+| Boxed primitives                                                                                                   | `util.types.isBoxedPrimitive`                                                                                                                                                          |
+| ArrayBuffer/SharedArrayBuffer, typed arrays/DataView (including Buffer)                                            | `util.types.isAnyArrayBuffer` / `isArrayBufferView`                                                                                                                                    |
+| Promise, native errors, Map/Set iterators, generator objects, arguments, module namespaces, native external values | Corresponding native `util.types.is*` slot predicates                                                                                                                                  |
+| KeyObject and CryptoKey                                                                                            | Own-symbol refusal on symbol-backed runtimes; captured private/native `util.types.isKeyObject` / `isCryptoKey` after full record descriptor/child validation on private-brand runtimes |
+| WeakRef                                                                                                            | Captured `WeakRef.prototype.deref`                                                                                                                                                     |
+| FinalizationRegistry                                                                                               | Captured `unregister` with a fresh unregistered token                                                                                                                                  |
+| Intl Collator, PluralRules, RelativeTimeFormat, ListFormat, DisplayNames, Segmenter, DurationFormat                | Captured `resolvedOptions`                                                                                                                                                             |
+| Intl DateTimeFormat / NumberFormat                                                                                 | Captured `formatToParts(0)`, avoiding legacy receiver unwrapping                                                                                                                       |
+| Intl Locale                                                                                                        | Captured `toString`                                                                                                                                                                    |
+| Intl Segments                                                                                                      | Captured `containing(0)`, without advancing any cursor                                                                                                                                 |
+
+Probes MUST NOT run caller code or mutate receiver state. A swallowed probe
+exception MUST mean a missing native slot or private field: a genuine supported
+member must not throw from caller hooks and then pass as an ordinary record.
+WeakRef dereferencing retains its target for the current job; it does not alter
+the receiver.
+
+Descriptor fields MUST be read only as own fields, using a captured
+`Object.hasOwn` check. In particular, inherited `value` cannot make an accessor
+look like a data property. Post-load `Object.prototype` data properties or getters
+for `value`, `enumerable`, `get` or `set` MUST NOT change validation or run hooks.
+Record and array accessors report `Accessor or hidden property.`.
+
+The deterministic first-violation order is: depth-bound configuration and scalar
+checks; proxy refusal; exact prototype identity; native/read-only intrinsic brands;
+ancestor-cycle refusal; then own keys, descriptors and children in own-key order
+(array length/indices for arrays). A genuine secret key created at module load
+selects the crypto representation without consulting caller input. On symbol-backed
+Node 24, genuine keys carry own symbols and MUST be refused at the own-symbol gate.
+The property-reading `isKeyObject` / `isCryptoKey` wrappers MUST NOT run there:
+post-load `Object.prototype` symbol getters could otherwise run on ordinary records.
+On private-brand Node 24, captured crypto predicates read no receiver properties
+and MUST run after all of that record's descriptors and children pass, before
+canonical sorting. Both paths preserve first-invalid-member refusal before later
+sibling descriptors or children are inspected. For example, a genuine KeyObject
+with `Object.prototype` and a first enumerable child of `NaN` reports
+`Invalid JSON number.`; a first enumerable accessor reports
+`Accessor or hidden property.` without calling it, before either crypto refusal.
+The JSON tests pin these outcomes through both entry points and require zero
+inherited crypto-symbol getter calls where those symbols exist.
+
+Any other object whose state is not held in its own enumerable data properties is
+outside the input domain. Callers MUST NOT pass it; the module makes no claim to
+detect it. **Non-exhaustive tested examples** that remain unrefused after prototype
+replacement include array/string/RegExp-string iterators, iterator helpers and
+wrappers, Intl SegmentIterator, URL, URLSearchParams, Headers, FormData, Request,
+Response and AbortController.
+These are examples of unsupported inputs, not claims that no suitable detector
+could exist.
+No URL or URLSearchParams probe is invoked. URLSearchParams' size getter constructs
+`ERR_INVALID_THIS` in Node JavaScript for a plain record or array; its error
+constructor's internal array writes can invoke inherited numeric setters. Both
+URL families remain outside the domain rather than weakening the no-caller-code
+rule or depending on a particular wrong-receiver implementation.
+Headers' inspector builds an ordinary presentation object by assigning header
+names, which can invoke inherited setters even with null-prototype inspection
+options. Public Headers methods require Web IDL prototype identity, while direct
+private-field helpers are not exported. No captured Headers inspector is invoked;
+Headers therefore remains outside the domain after accepted prototype replacement.
+FormData's inspector can call a stored array's own `push` method and mutate that
+stored value: its API permits arrays with `File.prototype`, and duplicate field
+names take that path even with negative inspection depth. It therefore fails the probe
+contract. The tested Request/Response methods require Web IDL prototype identity
+and their inspectors read receiver properties; the AbortController signal getter lazily
+creates state and its inspector reads a receiver property. These candidates do
+not meet this module's hook-free, non-mutating probe contract.
+
+Arrays MUST be dense ordinary arrays with exactly `Array.prototype`, enumerable
+data elements, and no own properties other than their indices and built-in data
+`length`. Frozen arrays are allowed. Sparse, subclassed, custom-prototype and typed
+arrays are refused. Ordinary array `length` cannot be an accessor; proxy simulations
+are refused before any trap runs. Accessors, hidden or symbol properties,
+undefined, functions, symbols, bigint, non-finite numbers, unsafe integers,
+non-plain prototypes and all proxies (including revoked ones) MUST be rejected
+without calling accessors, proxy traps or custom serialization hooks.
+
+The caller selects inclusive container depth through
+`assertExternalJsonValue(value, initialDepth, maxDepth)`. Both bounds MUST be
+nonnegative safe integers with `initialDepth <= maxDepth <= 512`. Larger
+configurations MUST throw `TypeError` before inspecting the value. This supported
+maximum bounds recursive traversal; a 100,000-container input with maximum
+99,999 is an invalid configuration, rather than an accepted traversal that can
+exhaust the stack. The root container
+uses `initialDepth`; each child container adds one. Scalars consume no container
+level, so `{ child: { value: true } }` is accepted at initial depth 1 and maximum
+2, but `{ child: { child: {} } }` is refused. `canonicalJsonStringify` starts at
+0 with maximum 512 (513 containers). This preserves callers that count a state
+root as depth 1 and set maximum 32.
+
+Object keys MUST sort recursively by UTF-16 order; array order MUST remain
+unchanged. Numbers MUST be finite and integer-valued numbers MUST be safe
+integers regardless of source notation: `1e21` and `-1.5e300` are refused as unsafe
+integers, while the fractions `1e-7` and `5e-324` encode as `1e-7` and `5e-324`.
+Negative zero canonicalizes to `0`. Strings use JSON escaping: quotes
+and backslashes are escaped, U+0000–U+001F use their short escapes or lowercase
+`\uXXXX` escapes, and U+007F, non-ASCII characters and paired astral characters
+remain literal. Lone surrogate code units MUST use lowercase `\uXXXX` escapes
+(for example, a lone high surrogate U+D800 encodes as `"\ud800"`), so parsing
+returns the same JavaScript string without replacing a code unit. Cycles MUST be refused; a shared
+acyclic child is serialized by value for each occurrence. Validation MUST stop
+at the first invalid member in own-key order before reading later descriptors
+or traversing later child values. It enumerates each container's own keys once;
+that enumeration costs the container's width. Accepted object entries are sorted
+only after encoding their children, at O(k log k) for k accepted keys.
+
+Validation: `libs/core/src/external-ingress/json.test.ts` covers descriptor and
+proxy non-execution, the array policy, exact and excessive object/array depth
+(including nonzero initial depth), invalid bounds, cycles/shared children,
+equivalence tables, deterministic generated key permutations, and early refusal
+in large inputs. Intrinsic replacement-prototype matrices, the supported maximum,
+100,000-container configuration refusals and hand-written numeric/string byte
+vectors also enforce this boundary. Retained-retry, polled-source and watched-source suites continue
+to validate their existing independent contracts.

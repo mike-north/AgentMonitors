@@ -9,6 +9,318 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
+
+Admitted authored commands preserve the resource limits of a plain spawn from the same
+running parent. Capture the exact soft/hard `RLIMIT_NOFILE` pair directly with native
+`getrlimit` through the lazily cached vendored binding. Encode finite fields with BigInt
+and platform infinity as `unlimited`; capture neither generates diagnostics nor writes
+files, and does not depend on daemon sockets, handles or worker progress. Linux native
+admission checks glibc without a diagnostic report. After watchdog arming, verify the
+inherited hard field against capture, restore the soft value and verify the full pair.
+Native load/read failures refuse before spawn, preserving the baseline and committed
+ownership mark without adding a PID suspicion. Native restore and pair mismatches also
+refuse execution. Native macOS/Linux comparisons, macOS finite soft/hard values above
+2^53, fault refusals, binding reuse, no-report/no-write capture and a busy-daemon
+one-second observation cover the contract.
+
+## 2026-11-15 — Retain restart attribution at discovery boundaries (008 §4.2) — Refs #622
+
+Persist marked groups discovered at the eight-pass limit as numeric suspicions for later
+reconciliation. Confirm an initially empty nonce-only life with a second readable snapshot,
+retaining it if confirmation is unavailable or ownership is unreadable. Explicitly require
+pending disappearance, readable ownership, nonce absence and vacant hints for discharge;
+commit anchor-disappearance receipts before rediscovery. Journal regressions exercise these
+boundaries without changing per-process signal authority or watchdog preservation.
+
+## 2026-11-14 — External JSON post-load prototype independence (002 §16)
+
+Require zero caller-code execution for every input under the module-load built-in
+trust assumption. Internal buffers and traversal must not consult mutable
+prototype protocols or inherited numeric setters. Exclude URL and URLSearchParams
+from the detectable hidden-state list: JavaScript brand-error construction can
+itself invoke inherited hooks. Preserve native/private-brand refusal checks,
+first-invalid-member order, depth bounds and canonical bytes.
+
+## 2026-11-14 — Claims consume only represented net groups (002 §9) — Refs #571
+
+Rendering and claim persistence use the same selected net groups for every lifecycle.
+Defer newer normal endpoints sharing a net group with rendered settled high work, so an interrupt showing
+the high version cannot advance its cursor to an unseen normal endpoint. An unsettled high
+version cannot authorize consuming an intervening normal version. Older normal intermediates
+may fold into a rendered high endpoint in durable event order. Independent monitor
+reminders still coalesce, even when their object keys match. Recap claims and suppresses only
+groups represented within its ten-endpoint cap. Unrepresented rows remain unread and pending
+across restart; a claim never acknowledges. This corrects the previous mixed-band collapse
+and full-unread recap mutation. Runtime regressions verify durable projection state, cursors
+and subsequent delivery through direct claims and reserve/commit across all three lifecycles.
+
+## 2026-11-14 — Resolve held definitions beyond the scanned tree (002 §10.7; 005 §6, §15) — Refs #574
+
+Both held-work reports share tick's read-only captured/admitted-path resolution.
+An absent scan entry alone no longer implies definition repair when a valid live
+watcher can still release the batch. Source and scope validation use the resolved
+definition; competing valid paths remain definition barriers. Admission, retention,
+release policy and the public barrier kinds are unchanged.
+
+## 2026-11-14 — Commit preservation before terminal queries without aging signal evidence (008 §4.2) — Refs #627
+
+Commit the completed signal batch's preservation abstentions before terminal queries.
+The gates' resolved-Promise handoff issues no additional evidence query or journal operation. Keep FULL-sync
+journal writes after every signal has used the final identity snapshot, so persistence
+cannot introduce a blocking interval before delivery. Persist invalid PID diagnostics
+before anchor confirmation. The per-PID authorization checks and selected targets are unchanged.
+
+## 2026-11-14 — Identify restart bounds and bound reconciliation work (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Require verified watchdog role evidence before group-wide withholding. Preserve a possible
+bound if its previously verified watchdog becomes unreadable at the final gate; retain all
+watchdogs on uncertainty; retire the bound when fresh identities prove them absent or replaced. Legacy no-role groups and re-sessioned descendants without a
+watchdog keep per-process cleanup. Authored roles can only cause withholding. Carry terminal
+incarnations through late-fork membership checks while treating recycled identities as new.
+Serialize Linux terminal scans and batch synchronous abstention receipt writes.
+
+## 2026-11-14 — Preserve group bounds when restart cleanup abstains (003 §11.2; 008 §3.3, §4.2) — Refs #627
+
+Withhold remaining cleanup signals for a recorded group with a verified watchdog when any member has unreadable
+ownership, changed identity or unavailable readers. Record the group-bound preservation
+reason in the existing per-PID abstention receipt. Vetoes persist through the sweep's
+bounded discovery passes. Keep per-process signal authority and reap fully verified groups,
+including their watchdogs. Native macOS stock-shell restart/deadline coverage and portable
+injected Linux-reader regressions verify that a readable watchdog cannot lose its bound
+because another member is unverified.
+
+## 2026-11-14 — Preserve held-work reports across admitted-path ambiguity (002 §10.7; 005 §6, §15) — Refs #574
+
+A valid same-id file competing with a live watcher's admitted definition is a
+`definition-rejected` release barrier in doctor and explain, preserving held
+counts and the rest of both reports. Only that ambiguity is classified; unrelated
+read failures propagate. Tick's refusal and retention behavior are unchanged.
+The recent-declaration regression now asserts independently stale owner activity
+before checking both reports and a real release tick.
+
+## 2026-11-14 — Classify held-work release prerequisites in tick order (002 §10.7; 005 §6, §15) — Refs #574
+
+Add public `HeldNotifyBarrier` and `HeldNotifyWork.releaseBarrier`, preserving
+`blockedByDefinition` as a persistent-definition diagnostic. Both commands share
+read-only tick predicates for dormancy (including recent declarations), active
+owners/declarations, source availability, definition validation, retries and
+captured envelopes. Notify reconciliation and diagnosis share a read-only edit
+plan, so an effective pacing change that drains before scheduling remains eligible. Stale or durably dormant owners no longer receive flush
+promises or file-repair advice; unavailable sources ask for registration
+restoration. Retention, dormancy and release policy remain unchanged. Core stays
+minor for the additive public API; CLI stays patch.
+
+## 2026-11-14 — Preserve held-work diagnosis across incomplete capture and declaration retirement (002 §10.7; 005 §6, §15) — Refs #574
+
+Incomplete captured rollup metadata yields unknown timing without hiding accepted
+counts or aborting explain/doctor. Global ephemeral declarations share tick's
+active workspace eligibility. Retired declarations retain visible batches with
+lifecycle guidance: no future tick releases them and no definition file can be
+edited. `blockedByDefinition` remains about definition repair, so is false for
+retirement. Release and retention policy are unchanged. The additive public
+`HeldNotifyWork` and doctor field ship in a core minor Changeset; CLI stays patch.
+
+## 2026-11-14 — Visible ingress cleanup failure causes (004 §3.4.2) — Refs #619
+
+Require cleanup to render the original scenario's cause chain and stacks in normal
+test output alongside every queued SQL diagnostic. Add deterministic coverage for
+watch-idle followed by a diagnostic before the final control acknowledgment.
+Validation coverage only; runtime behavior and public contracts are unchanged.
+
+## 2026-11-14 — Final ingress classification checks (004 §3.4.2) — Refs #619
+
+Require diagnostic drains after the final tick, after watch consumption and at
+cleanup, including child stop. A caught late audit write must fail with its SQL;
+cleanup must retain an existing scenario failure alongside classification errors.
+Validation coverage only; runtime behavior and public contracts are unchanged.
+
+## 2026-11-14 — Diagnose held notify work despite rejected definitions (005 §6, §15; 002 §10.7) — Refs #574
+
+Explain keeps debounce and rollup counts, stored pacing and definition-repair
+guidance beside definition failures. Doctor reports the same batches independently
+of parsed monitor rollups, including missing, parse-failed and duplicated ids.
+Both read the runtime's existing scoped hold queries. A quiet latest tick cannot
+make downstream stages healthy while earlier accepted work is still held and no
+event has materialized. Notify release timing and health exit codes are unchanged.
+
+## 2026-11-14 — Ship native command admission inside published packages (003 §11; 008 §3.3) — Refs #470
+
+Vendor Koffi 3.3.7 JavaScript, MIT license and four unmodified prebuilds in the CLI and
+command-poll tarballs: macOS arm64/x64 and Linux glibc arm64/x64. Remove registry native
+binding dependencies. Resolve the payload relative to our own ESM/CJS entry point and
+select the exact prebuild through a checked explicit-native wrapper shim. Unsupported
+hosts (including Windows and musl), missing or corrupt binaries refuse work with a
+platform diagnostic, without plain-spawn or source-build fallback. The refresh command
+`node scripts/vendor-koffi.mjs` verifies registry SHA-512 integrity; a committed manifest
+and offline hash/tampering tests protect shipped bytes. The standalone consumer denies
+native package registry requests and requires a real installed CLI monitor to fire.
+Koffi's source-build fallback fails to link on macOS 27.3, CMake 4.3.4, Apple clang 21
+(`napi_*` undefined); it is never triggered.
+
+## 2026-11-14 — External JSON own descriptor fields and Headers domain (002 §16) — Refs #596
+
+Require own descriptor fields so post-load Object.prototype properties cannot
+admit accessors or run inherited hooks. Record and array accessors report
+`Accessor or hidden property.`. Remove the Headers inspector: its presentation
+object can invoke inherited header-name setters, and a thrown setter can look
+like a missing brand. Headers joins the non-exhaustive examples outside the
+plain-data domain; no detection result is promised after prototype replacement.
+
+## 2026-11-14 — External JSON crypto representation and inherited hooks (002 §16) — Refs #596
+
+Select the crypto representation from a genuine key at module load. Symbol-backed
+Node 24 refuses keys at the own-symbol gate and never invokes property-reading
+crypto wrappers, preserving hook freedom after inherited symbol getters are added.
+Private-brand Node 24 runs crypto predicates after full descriptor/child validation.
+Pin first-invalid-child and accessor errors before key refusal through both entry
+points on both representations.
+
+## 2026-11-14 — Portable external JSON brands and explicit input domain (002 §16) — Refs #596
+
+Refuse genuine crypto keys across symbol-backed and private-slot Node 24 runtimes,
+using captured crypto predicates only after full record descriptor/child checks.
+Specify deterministic gate ordering and the trusted-runtime capture assumption.
+Refuse Headers and Intl Segments with hook-free, state-preserving probes. Exclude
+FormData because its inspector can call stored array methods and mutate values.
+Replace the detection-limit claim with a tested refusal list and non-exhaustive
+examples outside the plain-data domain. Keep crypto-symbol accessor cases only on
+runtimes that expose that representation; always run the genuine-key matrix.
+
+## 2026-11-14 — Hook-free external JSON brand checks and detection limits (002 §16) — Refs #596
+
+Remove property-reading crypto predicates and refuse real keys by their own symbols.
+Establish proxy refusal and exact prototypes before captured read-only intrinsic
+checks. Refuse prototype-replaced weak references, finalization registries, URLs,
+query parameters and the supported Intl families without changing receiver state.
+Document that callers must exclude prototype-replaced array/string iterators and
+Headers because the available checks advance state or depend on prototype identity.
+
+## 2026-11-14 — Intrinsic refusal and supported external JSON depth (002 §16) — Refs #596
+
+Reject native intrinsic brands before accepting record prototypes, including when
+those prototypes have been replaced. Cap caller-selected maximum depth at 512
+and refuse unsupported configurations with TypeError before inspecting input.
+Keep the inclusive limit, scalar leaves and state/envelope depths 32/34. Add
+explicit scalar byte vectors and specify lossless lone-surrogate escaping.
+
+## 2026-11-14 — External JSON plain-data and depth policies (002 §16) — Refs #596
+
+Specify the internal external-event encoder independently of retained-retry
+serialization. Accept null-prototype records and dense ordinary arrays; reject
+array subclasses, proxies before reflection, unsafe values and unsupported own
+properties. State inclusive container depth with caller-selected initial depth,
+scalar leaves, and valid bounds. Encode members before canonical key sorting so
+an early invalid value cannot inspect later members. Cover these rules with
+boundary tables, deterministic generated permutations and early-refusal tests.
+The package-root surface and retained-retry behavior remain unchanged.
+
+## 2026-11-13 — Restore blocking native standard streams before exec (003 §11; 008 §3.3) — Refs #470
+
+Clear `O_NONBLOCK` on all three standard descriptors using platform-specific variadic `fcntl`
+constants and verify each status with a fresh `F_GETFL`. Preserve access mode, append mode and
+unrelated flags. Failed status operations or surviving nonblocking mode refuse authored work
+and retain the prior baseline through the existing stdio admission diagnostic. Native Perl
+pressure writers and delayed-input reads exercise blocking I/O without a compiler; real flag
+priming and injected read/write/read-back failures cover all standard streams and fail-closed
+admission. Ordinary source stdin remains ignored. Signal, process-group, environment, descriptor
+layout and watchdog ownership contracts remain unchanged.
+
+## 2026-11-13 — Isolate helper environments and reparent watchdogs before exec (003 §11; 008 §3.3) — Refs #470
+
+Keep authored and inherited environment values out of helper startup, using absolute runtime
+paths and only the life mark in the environment. Pass the intended command environment through the
+configuration pipe to native envp, preserving the plain-spawn environment budget. Linux sets
+the authored PATH at the execvpe boundary. Distinguish native-module load errors from other
+initialization failures. Start the watchdog through an intermediate, forward its armed
+acknowledgement, reap that intermediate and drain its IPC before exec regardless of event order.
+The marked watchdog keeps its original
+group and independent timers without becoming a waitable child of authored work. The journal,
+recorded command PID and watchdog reap accounting are unchanged. Near-limit plain-spawn controls,
+helper environment captures, a portable Perl wait-all fixture and process-relationship/failure
+regressions verify the contract.
+
+## 2026-11-13 — Verify standard-stream retention before native exec (003 §11; 008 §3.3) — Refs #470
+
+Clear close-on-exec on stdin/stdout/stderr with the platform's variadic `fcntl` ABI, then read
+each flag back. A failed setter/getter or retained `FD_CLOEXEC` refuses authored execution and
+keeps the prior successful baseline with failing health. Native descriptor and injected
+failure regressions verify the contract, including the Darwin arm64 variadic calling convention.
+
+## 2026-11-13 — Validate complete admission status and match native executable lookup (003 §11; 008 §3.3) — Refs #470
+
+Require complete status writes and reject missing, truncated, unknown or invalid frames before
+accepting command output; fragmented valid frames remain supported. Preserve the baseline if
+status cannot be delivered. Match plain spawn's PATH search, exhaustion errno and relative script
+spelling: Linux delegates to libc execvpe (glibc shell fallback on ENOEXEC; musl reports ENOEXEC),
+while macOS retries EINTR, continues EACCES/ENOENT/ENOTDIR, stops on other errnos and prefers
+EACCES at exhaustion. Preserve kernel traversal and literal argv. Explain native support load
+failure with loader detail. Verified by command-poll admission and real-spawn comparison tests.
+The native binding is pinned to eligible 3.3.7 with no release-age exemptions or build permission.
+
+## 2026-11-13 — Preserve command admission semantics and account for watchdog cleanup (003 §11; 008 §4.2) — Refs #470
+
+Clarify current direct-exec behavior: default signal dispositions and an empty signal mask match
+normal spawn, helpers exclude authored/inherited Node options while the command retains them,
+and ordinary exec failures report errno and the program without a native abort or crash artifact.
+Unrepresentable NUL bytes in argv/environment fail closed instead of being truncated. ESM/CJS
+consumers retain package-relative native binding resolution, including CommonJS eval callers.
+A packaged native binding calls libc execve; a separate close-on-exec status pipe orders errors
+before settlement. Native signal-state, preload-isolation and exec-error regressions verify both
+platforms. Existing guarantees remain: kernel path traversal and authored environment values
+survive admission, helper module mode does not change authored Node options, and native exec
+failures retain failing health and the prior successful baseline. Settled callers release their
+control-channel event-loop reference while the watchdog retains its independent kill grace.
+Restart reconciliation includes the marked watchdog as an independently identified process;
+a command with one descendant yields three Linux reaped outcomes. The existing identity gate
+and terminal-evidence requirement apply to all three. Verified by source admission regressions,
+the standalone consumer lifetime test and the restart-sweep integration suite.
+
+## 2026-11-13 — Bound POSIX commands independently of daemon lifetime (003 §11; 008 §3–§5) — Refs #470
+
+Require a timer-armed in-group watchdog before authored command execution. Preserve the command
+PID, original group and inherited ownership mark for restart reconciliation. The watchdog keeps
+referenced absolute deadlines across daemon loss and closed command descriptors, signals only
+its own current group. A normally completed finite observation releases its group after output
+capture; no empty-table read may cancel a late fork's bound. Monotonic deadlines withstand wall-clock
+corrections. Arming is
+asynchronous and fails closed. Graceful daemon shutdown cancels admissions and identity-verifies
+forceful cleanup of in-flight groups. macOS/Linux crash, SIGTERM/SIGINT, ordering, timer-failure,
+restricted-PATH, responsiveness and maximum-timer regressions verify the contract; Windows and
+re-sessioned-descendant limits remain explicit. Test-global restoration uses teardown hooks.
+
+## 2026-11-13 — Exact macOS executable alignment and helper startup abstention (008 §4.2) — Refs #618
+
+Use XNU's eight-byte target-pointer alignment after the executable path, excluding
+the separately returned argc. Require exactly the calculated NUL padding before
+counting nonempty argv entries; extra NULs, malformed padding and unproven envp
+remain unreadable. Native path residues must retain marks and be reaped on restart,
+while empty argv[0] at each residue retains an abstention. Synchronous helper spawn
+errors follow the same scope-wide unavailable-evidence path as emitted errors.
+
+## 2026-11-13 — Ambiguous initial argv and reused native buffers (008 §4.2) — Refs #618
+
+Count argv immediately after the executable path's terminator, abstaining on any
+additional NUL rather than guessing whether it is padding or an empty first argument.
+Native empty-first-argument and crafted padded/title-rewrite layouts must preserve
+ownership or explicit uncertainty, including durable discovery abstentions. Exercise
+the exact embedded bridge with full, shorter, failed and differently marked replies;
+only sysctl's returned byte count may supply a PID's evidence.
+
+## 2026-11-13 — macOS environment-only restart cleanup (008 §4.2) — Refs #618
+
+macOS ownership now comes from kernel `KERN_PROCARGS2` envp, after counting argv by
+argc. One asynchronous stock `/usr/bin/osascript -l JavaScript` helper calls sysctl
+through Foundation-owned buffers for discovery batches and fresh signal-time checks.
+No developer tools or Python shim are involved. Empty/padded argv entries, title rewrites
+and unproven envp boundaries are per-PID unreadability, never readable/unmarked evidence.
+Unavailable helpers and unreadable process environments retain explicit abstentions. Batch macOS final identity checks, individual signal gates, terminal
+evidence and receipt writes without weakening boot, mark or start-time verification.
+Helper completion, failure and timeout cleanup also uses the shared live-child
+signal gate; an already reaped helper receives no cleanup signal.
+Real restart tests require macOS command/descendant reaps. Reader tests cover argv-only
+marks, empty arguments, Homebrew-free PATH, optional tools and malformed evidence.
+
 ## 2026-11-13 — Retired verify-artifact repair interruption acceptance (#615)
 
 - **004 §3.4.2:** include the registered retired-artifact branch of both retry
