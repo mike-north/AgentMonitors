@@ -9,6 +9,22 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
+
+Envelope admission refuses own `__proto__` keys throughout producer scope/state, including
+nested array members, while general canonical JSON continues to preserve ordinary data keys.
+Leap-second syntax accepts every UTC month end and equivalent offset spellings; timestamp
+validation does not depend on a leap-second announcement table.
+
+## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.14) — Refs #481
+
+Core now exports the strict `agentmonitors.external-event.v1` envelope validator,
+JSON value types, semantic SHA-256 helper over the closed v1 field set, collision-free
+source/object key, and structured validation error types. Exact UTF-8 size, scope, JSON-depth,
+timestamp, and sequence bounds are enforced without echoing state in failures. This change exposes
+the contract only: durable receipts, runtime ingestion, daemon IPC, and CLI submission remain target
+behavior in future changes.
+
 ## 2026-11-16 — Bound internal external-envelope admission
 
 002 §16.1 and 004 §6.1 define inclusive envelope limits and their exact boundary

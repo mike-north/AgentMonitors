@@ -732,6 +732,26 @@ byte-identical to establish preservation with foreign-write exclusions; every
 excluded file and PID MUST be named. Whole-installation byte identity remains a
 separate reported outcome. A partial test run is insufficient.
 
+### 2.14 External-ingress envelope validation
+
+The exported `validateExternalEventEnvelope()` helper is the validation boundary for the
+source-neutral `agentmonitors.external-event.v1` contract. It validates the complete JSON value
+before returning a normalized envelope, applies the exact UTF-8 byte, cardinality, and depth limits
+from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-contract), and rejects
+unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
+non-finite numbers. Validation errors contain only stable safe text and never echo external state.
+
+This surface currently proves the public contract only. A later change adds receipt persistence and
+the runtime mutation boundary; callers cannot ingest an envelope through the runtime, daemon, or CLI
+yet.
+
+**Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
+`contract-boundaries.test.ts`, `admission-safety.test.ts`, and `public-contract.test.ts`.
+The public consumer suite exercises ESM/CJS exports and compiles against the trimmed
+package declarations. A fixed eleven-field canonical preimage pins the SHA-256 value;
+each identity-field mutation varies only that field. Runtime mutation of every limit
+is refused, and sixteen/seventeen scope alternatives are tested independently of bytes.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.
@@ -1076,6 +1096,17 @@ Verification launched with an isolated home/data root MUST retain 002 §10.3's s
 normalization. `apps/cli/src/manual-daemon.test.ts` compares the canonical resolved socket,
 including an explicitly overlong derived path, rather than assuming the raw workspace path
 always fits the Unix socket limit.
+
+### 3.4.3 External-ingress contract
+
+| Scenario                                                         | Coverage                                                                                                                                                 |
+| ---------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                   |
+| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                    |
+| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope). |
+| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).       |
+| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).            |
+| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                         |
 
 ### 3.5 CLI behavior
 

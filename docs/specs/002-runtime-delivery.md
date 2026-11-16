@@ -1405,6 +1405,54 @@ unregistered, foreign-workspace and proof-phase controls that still record the l
 `libs/core/src/runtime/verify-artifact-rejected-config.test.ts`; schema in
 `libs/core/src/inbox/schema.ts` (`verify_artifacts`).
 
+### 2.6 Source-neutral external event contract
+
+> **Status: target.** Core publishes envelope admission and identity helpers as building
+> blocks for this capability, including structured validation errors and immutable limits. No runtime, CLI, or daemon method accepts the envelope yet.
+
+`agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
+required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
+`objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `resumeToken`, `scope`, and `state`;
+unknown top-level fields are rejected. `changeKind` uses `created | modified | deleted | descoped`.
+`objectSequence` is a non-negative safe integer. `occurredAt` accepts RFC3339's case-insensitive
+`T`/`Z`, arbitrary non-empty fractional seconds, numeric offsets, and leap-second forms
+at any UTC month end (including offset spellings). Validation checks syntax and calendar
+placement, rather than consulting an announcement table. `scope` contains
+only local query metadata; `state` is a JSON object containing current state, never instructions or
+an incremental patch. The envelope cannot set monitor policy, instructions, urgency, shaping,
+notify strategy, tags, workspace paths, or recipients.
+
+Validation applies these UTF-8/canonical-JSON limits before any future mutation:
+
+| Value                                                                          |                                                Limit |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------: |
+| Canonical serialized envelope                                                  |                                              256 KiB |
+| Identifier (`monitorId`, `source`, `upstreamEventId`, `objectId`, `eventKind`) |                                            512 bytes |
+| `resumeToken`                                                                  |                                          2,048 bytes |
+| Scope keys / canonical scope                                                   |                                          32 / 32 KiB |
+| Scope key                                                                      |                                             64 bytes |
+| Scope value                                                                    | String or at most 16 strings, each at most 512 bytes |
+| State object/array nesting                                                     |                                            32 levels |
+
+Scope keys `ingressSource`, `eventKind`, `changeKind`, `upstreamEventId`, `objectSequence`, and
+`occurredAt` are reserved for runtime-owned query metadata. Empty identifiers/cursors, invalid or
+non-finite JSON values, accessors/custom objects, cycles, sparse arrays, extra array properties, and
+unsafe integers are rejected without invoking accessors or echoing state in the structured error.
+Own `__proto__` keys anywhere in scope/state, including nested objects in arrays, are refused
+at envelope admission so downstream copying cannot invoke the legacy prototype setter.
+`constructor` and `prototype` remain ordinary data keys.
+
+Canonical JSON recursively sorts object keys and preserves array order. The semantic SHA-256 hash
+selects exactly `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
+`objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `scope`, and `state`, excluding
+`resumeToken` and unknown properties, allowing one upstream event to replay from another relay cursor. The
+snapshot object key is `external:` plus canonical JSON for `[source, objectId]`, avoiding delimiter
+collisions. Receipt persistence, ordering decisions, observation mapping, and ingestion remain
+target behavior in §16.1.
+
+Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
+`contract-boundaries.test.ts`.
+
 ## 3. Persisted Monitor State
 
 Each monitor has persisted runtime state containing: `lastObservationAt`, `sourceState`, `notifyState`. `sourceState` is owned by the source plugin and returned via `nextState`. `notifyState` is owned by the runtime and records delivery timing state such as active suppression windows for throttle, pending observation batches for debounce, and the accumulated rollup batch (`pendingRollup`, [§4.4](#44-scheduled-rollup-pace-mode-current)) held between delivery windows.
@@ -3450,8 +3498,11 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 
 ## 16. External JSON foundation
 
-**Current internal contract.** `libs/core/src/external-ingress/json.ts` validates and
-canonically encodes external plain JSON data. It remains outside the package root.
+**Current JSON contract.** `libs/core/src/external-ingress/json.ts` validates and
+canonically encodes external plain JSON data. The package root publishes JSON value types
+needed by the envelope state in §2.6. Canonical encoding, the assertion helper and
+traversal machinery remain internal; the validator returns canonical JSON and the
+identity helpers expose the semantic operations.
 It is independent of `runtime/retry-envelope.ts`: retained retries continue to use
 `serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
 `observedAt` Date. External JSON permits no Date values.
@@ -3594,12 +3645,12 @@ in large inputs. Intrinsic replacement-prototype matrices, the supported maximum
 vectors also enforce this boundary. Retained-retry, polled-source and watched-source suites continue
 to validate their existing independent contracts.
 
-### 16.1 Versioned external envelopes (_current internal contract_)
+### 16.1 Versioned external envelopes (_current admission; target ingestion_)
 
 `validateExternalEventEnvelope` admits only the complete
 `agentmonitors.external-event.v1` field set. Unknown fields, including instructions,
-urgency, notify policy and local filesystem paths, MUST be refused. This internal
-validator does not expose ingestion, persistence or routing through the package root.
+urgency, notify policy and local filesystem paths, MUST be refused. The package-root
+validator exposes admission only; ingestion, persistence and routing remain target behavior.
 
 The validator MUST preflight encoded size before canonical JSON validation,
 normalization or fingerprinting. Its descriptor walk counts exact escaped UTF-8
@@ -3621,7 +3672,10 @@ After encoding, a separate UTF-8 measurement of the actual canonical output MUST
 refuse an envelope over 262,144 bytes before normalization. This final check
 protects against a counting defect; preflight remains the primary resource bound.
 The preflight does not replace §16's JSON domain and prototype policies; only an
-input admitted by both boundaries can be normalized.
+input admitted by both boundaries can be normalized. Envelope admission additionally
+refuses own `__proto__` keys anywhere in scope/state after normalization; the general JSON
+encoder retains those keys as data. RFC 3339 leap-second spellings are valid at any UTC
+month end, including equivalent numeric-offset spellings; no announcement table is required.
 
 Limits are inclusive: envelope 262,144 canonical UTF-8 bytes; each of `monitorId`,
 `source`, `upstreamEventId`, `objectId` and `eventKind` 512 UTF-8 bytes; resume token
@@ -3641,7 +3695,8 @@ is introduced. Future transport integration must honor both boundaries.
 
 Equivalent object-key orderings MUST return identical normalized values and
 canonical JSON bytes on repeated runs. Hashing those bytes is deterministic; this
-layer does not introduce a fingerprint API or semantic receipt identity.
+admission layer does not itself fingerprint or persist receipts. The public identity
+helper in §2.6 composes canonical encoding with the closed v1 semantic field set.
 
 Validation: `external-ingress/contract.test.ts` pins every exact/+1 boundary,
 ASCII and multibyte field sizes, escaped canonical bytes, object/array/alternating
