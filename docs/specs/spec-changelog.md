@@ -16,6 +16,7 @@ The watchdog directly reports PID, initial parent and kernel birth time on a sep
 pipe before arming any deadline, so intermediate death cannot lose that report. Pending adoption
 never grants wait authority. Linux intermediates reap unarmed watchdogs before reporting startup
 failure. A fresh check requires that lifetime to be this observer's zombie child in the original group and session.
+Resource capture and reaping share one lazy parent-side native binding and libc handle.
 Only positive-PID nonblocking waits are permitted, with no wildcard waits, signals or changes
 to libuv child ownership. Ordinary Linux processes and macOS do not reap. Unit refusal cases,
 a native Linux subreaper test, and a PID 1 Docker regression cover identity, eligibility, real

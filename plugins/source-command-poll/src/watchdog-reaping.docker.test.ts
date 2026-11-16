@@ -7,9 +7,22 @@ import { describe, expect, it } from 'vitest';
 /** A stopped Docker daemon is a reported skip, never permission to start it. */
 function hasDocker(): boolean {
   try {
-    execFileSync('docker', ['info'], { stdio: 'ignore', timeout: 5_000 });
+    execFileSync('docker', ['info'], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 5_000,
+      killSignal: 'SIGKILL',
+    });
     return true;
-  } catch {
+  } catch (error) {
+    // Hosted Linux must exercise PID 1, rather than silently turn a missing or
+    // unhealthy Docker daemon into acceptance. Local stopped Docker stays a skip.
+    if (process.platform === 'linux' && process.env.CI) {
+      throw new Error(
+        'Linux CI requires Docker for the PID 1 watchdog regression: ' +
+          String(error),
+        { cause: error },
+      );
+    }
     return false;
   }
 }

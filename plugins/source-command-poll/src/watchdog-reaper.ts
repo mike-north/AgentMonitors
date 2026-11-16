@@ -5,9 +5,8 @@
  * This module never enumerates children, installs SIGCHLD handlers or signals.
  */
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 
-import { vendoredNativeLoader } from './native-binding.js';
+import { nativeProcessLibrary } from './native-process.js';
 
 /** Nonblocking waits may release only an already terminated, specifically named child. */
 const WNOHANG = 1;
@@ -173,17 +172,7 @@ let binding: IReapingBinding | undefined;
 /** Reuse the existing packaged binding; no new binary, subprocess or native dependency. */
 function nativeBinding(): IReapingBinding {
   if (binding !== undefined) return binding;
-  const filename = vendoredNativeLoader();
-  // Koffi's CommonJS API is outside TypeScript. Describe only the scalar and
-  // pointer ABI calls used below; all public reaper inputs remain checked.
-  const koffi = createRequire(filename)(filename) as {
-    load: (filename: null) => {
-      func: (
-        declaration: string,
-      ) => (...args: (number | string | Buffer)[]) => number;
-    };
-  };
-  const libc = koffi.load(null);
+  const libc = nativeProcessLibrary();
   const prctl = libc.func('int prctl(int option, ...)');
   binding = {
     waitpid: libc.func('int waitpid(int pid, void *status, int options)'),

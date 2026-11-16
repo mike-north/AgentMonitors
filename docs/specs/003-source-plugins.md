@@ -1622,6 +1622,8 @@ pair matches a plain spawn from the same running parent. Node startup can raise 
 `RLIMIT_NOFILE`, but never changes its hard limit. The source synchronously captures the
 parent's soft and hard open-file values directly with native `getrlimit` through the
 package's vendored binding, loaded lazily and cached per process on supported POSIX hosts.
+Resource capture and Linux watchdog reaping share one parent-side native binding and libc handle;
+adding reaping must not initialize a second binding or change the captured budget.
 The 16-byte native pair is encoded as exact BigInt decimal strings or platform-specific
 `unlimited` over the configuration pipe, including finite values above 2^53. Capture does
 not generate diagnostics or write files; its work does not scale with sockets, handles or

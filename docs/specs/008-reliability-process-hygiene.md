@@ -225,7 +225,8 @@ bytes and reject tampering.
 
 Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
 filename, identically in the source package and CLI bundle. The daemon loads it
-lazily for resource-limit capture; the asynchronous launcher also loads it. The
+lazily for resource-limit capture and Linux watchdog reaping through one shared parent-side
+binding and libc handle; the asynchronous launcher loads its own binding in its own process. The
 loader allowlists the platform/architecture and, on Linux, synchronously reads
 `/proc/self/maps` once before loading exactly that package's binary. Admission
 requires an exact file-backed `libc.so.6` or older `libc-2.N.so` basename,
