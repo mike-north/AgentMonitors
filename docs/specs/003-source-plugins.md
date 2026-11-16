@@ -1596,16 +1596,30 @@ precedence if encountered; otherwise the last errno is reported. Names containin
 empty PATH components use the bare filename. The authored program starts with the default signal
 dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
 startup must not change the authored command's resource limits: every soft/hard pair matches a
-plain spawn from the same running parent. Node raises its own soft `RLIMIT_NOFILE` at startup;
-the source captures the parent's current open-file pair from its in-memory diagnostic report
-and sends only that pair over the configuration pipe. After watchdog arming, the launcher
-restores and reads back the pair through native `getrlimit`/`setrlimit` before exec. Other
-limits pass through unchanged. The watchdog keeps its own limits. A failed limit read or restore
-refuses authored execution with `RLIMIT_NOFILE`, the operation and errno in the diagnostic;
-a read-back mismatch also refuses execution. Either failure retains the previous baseline
-and leaves group/watchdog cleanup unchanged. Verified: `resource-limits.test.ts` compares every
-native resource pair with a lowered parent soft limit and both inherited and finite hard
-limits on macOS/Linux; `self-bound.test.ts` injects native failures and a read-back mismatch.
+plain spawn from the same running parent. Node startup can raise its own soft
+`RLIMIT_NOFILE`, but never changes its hard limit. The source sends only the parent's exact soft
+open-file value over the configuration pipe.
+After watchdog arming, the launcher reads the native pair and keeps the hard field exactly,
+including finite values above JavaScript's safe-integer range. Safe soft integers and
+symbolic `unlimited` come directly from the in-memory report. An unsafe numeric soft report
+requires a raw diagnostic report: Node writes the exact decimal integer, and Node 24's JSON
+reviver source context retains that token without rounding. The report is written inside a
+private temporary directory (mode 0700) and the directory is removed after capture, including
+capture failures. Only the exact soft value crosses the configuration pipe. No native code
+is loaded in the daemon. Numeric equality with the launcher's soft limit is insufficient:
+Node can change a soft limit while both values round to the same JavaScript number. For
+example, a parent soft limit of `9007199254740992` with hard `9007199254740993` becomes
+`9007199254740993` during helper startup while both soft values report as `9007199254740992`.
+The launcher restores the exact soft value and reads back both fields through native
+`getrlimit`/`setrlimit` before exec. Other limits pass through unchanged; the watchdog keeps
+its own limits. Failed report capture refuses execution with `RLIMIT_NOFILE`; a failed
+native read or restore includes the operation and errno, and a read-back mismatch also
+refuses execution. Each refusal retains the previous baseline and leaves group/watchdog
+cleanup unchanged. Verified: `resource-limits.test.ts` compares every native resource pair
+with lowered soft and inherited/finite hard limits on macOS/Linux, including macOS finite
+values above 2^53, symbolic infinity and distinct native soft values that round identically;
+`self-bound.test.ts` verifies arming-before-read ordering, report cleanup and capture failures,
+native failures and a read-back mismatch.
 Internal Node
 helpers use absolute Node and native-module paths and need only the command-life mark in their
 startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter

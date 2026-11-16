@@ -11,13 +11,17 @@ Agent Monitors spec set in `docs/specs/`.
 
 ## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
 
-Authored commands inherit the soft and hard resource limits of a plain spawn from the same
-running parent. Capture the parent's current `RLIMIT_NOFILE` pair and restore it after
-watchdog arming, undoing Node helper startup's soft-limit increase without changing the
-watchdog's limits. Refuse execution with the limit name and errno if a native read or restore
-fails; a read-back mismatch also fails admission and retains the prior baseline. Native
-macOS/Linux comparison covers every resource pair, with lowered soft and inherited/finite
-hard limits. Native fault injection verifies failure diagnostics and baseline preservation.
+Authored commands preserve the resource limits of a plain spawn from the same running
+parent. Capture only the parent's exact soft `RLIMIT_NOFILE` value and restore it after
+watchdog arming. Keep the inherited native hard field exact, even above JavaScript's
+safe-integer range. Safe soft integers and symbolic infinity use the in-memory report;
+unsafe soft integers use the raw diagnostic report's decimal token, captured inside a
+private temporary directory that is removed on success or failure. Rounded-number equality
+cannot prove unchanged native inheritance: Node 24/macOS can raise soft values while both
+values round identically. Failed exact capture, native read/restore failures and read-back
+mismatches refuse admission and retain the prior baseline. Native macOS/Linux comparisons,
+macOS large finite limits and rounding collisions, capture cleanup/failure injection and
+watchdog-before-restore ordering cover this contract.
 
 ## 2026-11-15 — Retain restart attribution at discovery boundaries (008 §4.2) — Refs #622
 

@@ -84,9 +84,30 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
       bundle = path.join(outDir, 'index.cjs');
     }, 30_000);
 
-    it.each(['inherited', '4096'])(
-      'matches every plain-spawn soft and hard limit with lowered NOFILE and %s hard limit',
-      async (hardLimit) => {
+    it.each([
+      { soft: '512', hard: 'inherited' },
+      { soft: '512', hard: '4096' },
+      ...(process.platform === 'darwin'
+        ? [
+            ...[
+              '9007199254740993',
+              '9007199254740992',
+              '9223372036854775806',
+            ].map((hard) => ({ soft: '512', hard })),
+            ...[
+              '9007199254740993',
+              '9007199254740992',
+              '9223372036854775806',
+            ].map((soft) => ({ soft, hard: soft })),
+            { soft: 'unlimited', hard: 'inherited' },
+            { soft: '9007199254740993', hard: 'inherited' },
+            { soft: '9223372036854775806', hard: 'inherited' },
+            { soft: '9007199254740992', hard: '9007199254740993' },
+          ]
+        : []),
+    ])(
+      'verifies native resource limits for soft $soft / hard $hard',
+      async ({ soft, hard: hardLimit }) => {
         const native = fileURLToPath(
           new URL('../vendor/koffi/load.cjs', import.meta.url),
         );
@@ -102,8 +123,10 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
       if (get(nofile, value) !== 0) throw new Error('fixture getrlimit failed');
       if (${JSON.stringify(hardLimit)} !== 'inherited') value.writeBigUInt64LE(BigInt(${JSON.stringify(hardLimit)}), 8);
       const hard = value.readBigUInt64LE(8).toString();
-      value.writeBigUInt64LE(512n);
+      value.writeBigUInt64LE(${JSON.stringify(soft)} === 'unlimited' ? (1n << 63n) - 1n : BigInt(${JSON.stringify(soft)}));
       if (set(nofile, value) !== 0) throw new Error('fixture setrlimit failed');
+      const nativeSoft = value.readBigUInt64LE().toString();
+      const previousState = { stdout: 'baseline', exitCode: 7, truncated: false, health: 'ok', baselined: true };
       const {spawn} = require('node:child_process');
       (async () => {
         const plain = await new Promise((resolve, reject) => {
@@ -114,8 +137,8 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
           child.once('error', reject);
           child.once('close', code => code === 0 ? resolve(stdout) : reject(new Error('plain spawn failed: ' + code)));
         });
-        const bounded = await source.observe({command: [${JSON.stringify(binary)}], timeout: '5s'}, {now: new Date()});
-        console.log(JSON.stringify({platform: process.platform, nofile, hard, plain, bounded}));
+        const bounded = await source.observe({command: [${JSON.stringify(binary)}], timeout: '5s'}, {now: new Date(), previousState});
+        console.log(JSON.stringify({platform: process.platform, nofile, nativeSoft, hard, plain, bounded}));
       })().catch(error => { console.error(error); process.exitCode = 1; });
     `,
           dir,
@@ -126,7 +149,9 @@ describe.skipIf(!['darwin', 'linux'].includes(process.platform))(
           .trim()
           .split('\n')
           .find((row: string) => row.startsWith(`${receipt.nofile} `));
-        expect(limits).toBe(`${receipt.nofile} 512 ${receipt.hard}`);
+        expect(limits).toBe(
+          `${receipt.nofile} ${receipt.nativeSoft} ${receipt.hard}`,
+        );
         expect(receipt.bounded.nextState).toMatchObject({
           health: 'ok',
           exitCode: 0,

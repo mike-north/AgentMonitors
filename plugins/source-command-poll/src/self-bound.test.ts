@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   symlinkSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -362,6 +363,129 @@ describe.skipIf(process.platform === 'win32')(
         exitCode: 7,
       });
     });
+
+    it('reads command resource limits only after watchdog arming', async () => {
+      // Record the actual watchdog acknowledgement and first native read in a
+      // shared fixture. A restore before arming must fail even if exec succeeds.
+      const dir = mkdtempSync(path.join(tmpdir(), 'order-'));
+      const trace = path.join(dir, 'trace');
+      const record = `const record = event => require('node:fs').appendFileSync(${JSON.stringify(trace)}, event + '\\n');`;
+      injected.watchdog =
+        record +
+        `
+        const send = process.send;
+        process.send = function(message, ...args) {
+          if (message === 'armed') record('armed');
+          return send.call(this, message, ...args);
+        };`;
+      injected.launcher =
+        record +
+        `
+        const originalLoad = require('node:module')._load;
+        require('node:module')._load = function(id, ...args) {
+          const loaded = originalLoad.call(this, id, ...args);
+          if (!id.endsWith('/load.cjs')) return loaded;
+          return {...loaded, load(...args) {
+            const library = loaded.load(...args);
+            return {...library, func(declaration) {
+              const native = library.func(declaration);
+              if (!declaration.includes(' getrlimit(')) return native;
+              return (...args) => { record('read'); return native(...args); };
+            }};
+          }};
+        };`;
+      const result = await source.observe(
+        { command: ['/bin/echo', 'ordered'], timeout: '2s' },
+        { now: new Date() },
+      );
+      expect(result.nextState).toMatchObject({
+        health: 'ok',
+        stdout: 'ordered\n',
+      });
+      const events = readFileSync(trace, 'utf8').trim().split('\n');
+      expect(events[0]).toBe('armed');
+      expect(events.slice(1)).toContain('read');
+    });
+
+    // Darwin permits the success fixture's large soft limit; Linux generally
+    // has a much smaller hard ceiling. Both hosts exercise capture failures.
+    it.each([
+      'write',
+      'malformed',
+      ...(process.platform === 'darwin' ? ['success'] : []),
+    ])(
+      'handles unsafe soft capture with a %s report and removes the private report directory',
+      async (fault) => {
+        // An exact fallback must never expose a diagnostic report in a shared
+        // directory or execute authored work after capture becomes unverifiable.
+        const report = process.report.getReport();
+        vi.spyOn(process.report, 'getReport').mockReturnValue({
+          ...report,
+          userLimits: {
+            open_files: { soft: 9007199254740992, hard: 'unlimited' },
+          },
+        });
+        let reportDirectory = '';
+        let reportMode = 0;
+        vi.spyOn(process.report, 'writeReport').mockImplementation(
+          (filename) => {
+            if (typeof filename !== 'string')
+              throw new Error('fixture: missing report filename');
+            reportDirectory = path.dirname(filename);
+            reportMode = statSync(reportDirectory).mode & 0o777;
+            if (fault === 'write')
+              throw new Error('fixture: report unavailable');
+            writeFileSync(
+              filename,
+              fault === 'success'
+                ? '{"userLimits":{"open_files":{"soft":9007199254740993}}}'
+                : '{"userLimits":{"open_files":{"soft":"invalid"}}}',
+            );
+            return filename;
+          },
+        );
+        const dir = mkdtempSync(path.join(tmpdir(), 'unsafe-'));
+        const marker = path.join(dir, 'ran');
+        const previousState = {
+          stdout: 'baseline',
+          exitCode: 7,
+          truncated: false,
+          health: 'ok',
+          baselined: true,
+        };
+        const result = await source.observe(
+          {
+            command: ['/bin/sh', '-c', 'printf ran > "$1"', 'fixture', marker],
+            timeout: '2s',
+          },
+          { now: new Date(), previousState },
+        );
+        expect(reportDirectory).not.toBe('');
+        // Assert outside the injected writer: capture deliberately catches its
+        // exceptions, so an assertion inside it could look like a refused write.
+        expect(reportMode).toBe(0o700);
+        expect(existsSync(reportDirectory)).toBe(false);
+        if (fault === 'success') {
+          expect(existsSync(marker)).toBe(true);
+          expect(result.nextState).toMatchObject({
+            health: 'ok',
+            exitCode: 0,
+            stdout: '',
+          });
+          return;
+        }
+        expect(existsSync(marker)).toBe(false);
+        expect(result.nextState).toEqual({
+          ...previousState,
+          health: 'failing',
+        });
+        expect(result.observations[0]?.payload).toMatchObject({
+          error: expect.stringContaining(
+            'Could not capture command RLIMIT_NOFILE:',
+          ),
+        });
+      },
+    );
 
     it.each(['read', 'restore', 'read-back', 'mismatch'])(
       'preserves the baseline when command resource limits cannot be verified after %s failure',

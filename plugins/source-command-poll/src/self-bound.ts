@@ -161,15 +161,16 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
   const nofile = process.platform === 'darwin' ? 8 : 7;
   const infinity = process.platform === 'darwin' ? (1n << 63n) - 1n : (1n << 64n) - 1n;
   function restoreOpenFileLimits() {
-    const expected = Buffer.alloc(16);
-    expected.writeBigUInt64LE(openFiles.soft === 'unlimited' ? infinity : BigInt(openFiles.soft), 0);
-    expected.writeBigUInt64LE(openFiles.hard === 'unlimited' ? infinity : BigInt(openFiles.hard), 8);
     const current = Buffer.alloc(16);
     function failed(operation) {
       const errno = koffi.errno();
       return new Error('Could not restore command resource limits: RLIMIT_NOFILE: ' + operation + ': ' + getSystemErrorName(-errno) + ' (' + errno + '): ' + strerror(errno));
     }
     if (getrlimit(nofile, current) !== 0) throw failed('getrlimit');
+    // Node startup never changes rlim_max. Preserve those native bytes even when
+    // the finite hard limit exceeds JS precision; only rlim_cur needs restoration.
+    const expected = Buffer.from(current);
+    expected.writeBigUInt64LE(openFiles.soft === 'unlimited' ? infinity : BigInt(openFiles.soft), 0);
     if (current.equals(expected)) return;
     // Node only raises the soft limit; lowering it back to the inherited value
     // is permitted for an unprivileged process and leaves the hard limit intact.

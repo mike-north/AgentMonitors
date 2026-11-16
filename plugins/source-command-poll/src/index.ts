@@ -1,6 +1,8 @@
 /** Execute finite, self-bounding command observations with optional durable ownership and shutdown cancellation. */
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { Socket } from 'node:net';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
 import type {
@@ -327,38 +329,76 @@ function resolveCwd(
   return workspacePath === undefined ? cwd : path.resolve(workspacePath, cwd);
 }
 
-/**
- * Node raises RLIMIT_NOFILE during startup; native spawn otherwise inherits the
- * running parent's current limits. Capture that pair before starting another Node
- * helper, rather than treating the helper's raised limit as the command's budget.
- * Diagnostic reports expose the current pair without loading native code into
- * the daemon. Only this pair crosses the config pipe; no report is persisted.
- */
-function inheritedOpenFileLimits(): { soft: string; hard: string } {
-  const report = process.report.getReport();
-  const limits: unknown =
-    'userLimits' in report ? report.userLimits : undefined;
-  const openFiles: unknown =
+/** Read only the soft open-file field from either diagnostic-report representation. */
+function reportedSoftOpenFiles(report: unknown): unknown {
+  const limits =
+    report !== null && typeof report === 'object' && 'userLimits' in report
+      ? report.userLimits
+      : undefined;
+  const openFiles =
     limits !== null && typeof limits === 'object' && 'open_files' in limits
       ? limits.open_files
       : undefined;
-  if (
-    openFiles === null ||
-    typeof openFiles !== 'object' ||
-    !('soft' in openFiles) ||
-    !('hard' in openFiles)
-  ) {
-    throw new Error('Could not capture command RLIMIT_NOFILE');
-  }
-  // Finite NOFILE values fit exactly in a JS integer on supported hosts. Keep
-  // infinity symbolic until the launcher selects the platform's native rlim_t.
-  function encode(value: unknown): string {
-    if (value === 'unlimited') return value;
-    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0)
-      return String(value);
+  return openFiles !== null &&
+    typeof openFiles === 'object' &&
+    'soft' in openFiles
+    ? openFiles.soft
+    : undefined;
+}
+
+/**
+ * Capture the parent's soft NOFILE limit without loading native code in the
+ * daemon. Node startup changes only the soft field; the launcher keeps the native
+ * hard field exactly. Safe report numbers and symbolic infinity need no file.
+ *
+ * An unsafe report number cannot identify the inherited integer, even when the
+ * launcher's native value rounds to that same number. Node 24 on Darwin can
+ * change an already-unsafe soft value by one or raise it to infinity. Raw reports
+ * preserve the decimal token before JSON parsing rounds it. A private temporary directory
+ * contains that sensitive report only until capture finishes, including failures.
+ */
+async function inheritedOpenFileLimits(): Promise<{ soft: string }> {
+  const value = reportedSoftOpenFiles(process.report.getReport());
+  if (value === 'unlimited') return { soft: value };
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
     throw new Error('Could not capture command RLIMIT_NOFILE: invalid limit');
   }
-  return { soft: encode(openFiles.soft), hard: encode(openFiles.hard) };
+  if (Number.isSafeInteger(value)) return { soft: String(value) };
+  try {
+    const directory = await mkdtemp(path.join(tmpdir(), 'am-limit-'));
+    try {
+      const filename = path.join(directory, 'report.json');
+      process.report.writeReport(filename);
+      // Node 24's reviver context exposes the original JSON number token. Parse
+      // the report structurally so unrelated fields cannot masquerade as NOFILE.
+      const report: unknown = JSON.parse(
+        await readFile(filename, 'utf8'),
+        (
+          key: string,
+          field: unknown,
+          context?: { source?: string },
+        ): unknown =>
+          key === 'soft' && typeof field === 'number' ? context?.source : field,
+      );
+      const soft = reportedSoftOpenFiles(report);
+      if (
+        typeof soft !== 'string' ||
+        !/^(0|[1-9][0-9]*)$/.test(soft) ||
+        BigInt(soft) > (1n << 64n) - 1n ||
+        Number(soft) !== value
+      ) {
+        throw new Error('inherited soft limit cannot be represented exactly');
+      }
+      return { soft };
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  } catch (error) {
+    throw new Error(
+      'Could not capture command RLIMIT_NOFILE: ' + String(error),
+      { cause: error },
+    );
+  }
 }
 
 /**
@@ -411,10 +451,24 @@ async function runCommand(
   if (commandEnv[COMMAND_LIFE_ENV] !== undefined) {
     helperEnv[COMMAND_LIFE_ENV] = commandEnv[COMMAND_LIFE_ENV];
   }
+  const deadline = monotonicNowMs() + scope.timeoutMs;
+  let openFiles: Awaited<ReturnType<typeof inheritedOpenFileLimits>>;
+  try {
+    openFiles = await inheritedOpenFileLimits();
+  } catch (error) {
+    return { kind: 'failure', error: String(error), stderrTail: '' };
+  }
+  // Exact capture can await filesystem I/O; shutdown must still prevent admission.
+  if (shutdownSignal?.aborted) {
+    return {
+      kind: 'failure',
+      error: 'Command cancelled during shutdown',
+      stderrTail: '',
+    };
+  }
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
-    const deadline = monotonicNowMs() + scope.timeoutMs;
     // The POSIX launcher keeps its PID when it becomes the command. Its in-group
     // watchdog has acknowledged a referenced timer before that replacement.
     const launchArgs = isWindows
@@ -428,13 +482,6 @@ async function runCommand(
     // The launcher alone loads native code, using our package-relative payload.
     const native = vendoredNativeLoader();
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
-    let openFiles: ReturnType<typeof inheritedOpenFileLimits>;
-    try {
-      openFiles = inheritedOpenFileLimits();
-    } catch (error) {
-      resolve({ kind: 'failure', error: String(error), stderrTail: '' });
-      return;
-    }
     const child = spawn(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       isWindows ? file! : process.execPath,
