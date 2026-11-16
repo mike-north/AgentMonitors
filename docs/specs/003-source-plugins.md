@@ -1585,7 +1585,29 @@ validation note in §11.7).
 An asynchronous launcher starts an in-group watchdog through a short-lived intermediate. It waits
 for the timer-armed acknowledgement, reaps the intermediate and drains its IPC channel before replacing itself with the
 authored command. The watchdog is reparented within the same group, never a waitable child of the
-authored command; commands that reap all children can finish normally. The command retains its PID, process group and
+authored command; commands that reap all children can finish normally.
+**Current Linux adoption contract:** when the observer is namespace PID 1 or is already a child
+subreaper, it MUST reap only its own reported watchdogs. The watchdog writes its PID, current parent and `/proc`
+start time directly to a dedicated private observer pipe, completing partial writes and closing
+that descriptor before it arms any deadline. The pipe passes through both intermediates without
+sharing the admission-status stream: an elapsed watchdog deadline cannot kill the messengers
+before they forward its identity. Registration can arrive before adoption; that exact lifetime
+remains pending while its reported intermediate still owns it. On a Linux arming failure the
+intermediate drains and reaps its unarmed watchdog before reporting failure, including when
+registration itself could not be completed. Before every `waitpid(pid, WNOHANG)`, the observer MUST verify
+that this exact lifetime is a zombie child of itself in the launcher's original group and session.
+Missing, unreadable or changed identity MUST withhold the wait. It MUST NOT use wildcard waits,
+signal while reaping, or reap when neither PID 1 nor a subreaper; macOS is unchanged. For example,
+a reported PID that has been recycled or is still running cannot be waited on. Private watchdog
+registration does not establish journal ownership or signal authority. The reaper polls only
+outstanding reported lifetimes with an unreferenced timer, retiring it when none remain. It never
+installs a general child-exit handler or enables subreaping on the caller. Verified by
+`watchdog-reaper.test.ts` (identity, state, pending adoption and eligibility refusal),
+`watchdog-registration.test.ts` (registration before timers and unarmed-child failure reaping),
+`watchdog-reaping.test.ts`
+(real Linux subreaper and libuv exit statuses), and `watchdog-reaping.docker.test.ts` (12 bounded
+observations as PID 1 without an init, zero remaining `/proc` zombies).
+The command retains its PID, process group and
 inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
 rather than being truncated at the native string boundary. Executable paths retain their authored
 spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
@@ -1600,6 +1622,8 @@ pair matches a plain spawn from the same running parent. Node startup can raise 
 `RLIMIT_NOFILE`, but never changes its hard limit. The source synchronously captures the
 parent's soft and hard open-file values directly with native `getrlimit` through the
 package's vendored binding, loaded lazily and cached per process on supported POSIX hosts.
+Resource capture and Linux watchdog reaping share one parent-side native binding and libc handle;
+adding reaping must not initialize a second binding or change the captured budget.
 The 16-byte native pair is encoded as exact BigInt decimal strings or platform-specific
 `unlimited` over the configuration pipe, including finite values above 2^53. Capture does
 not generate diagnostics or write files; its work does not scale with sockets, handles or
