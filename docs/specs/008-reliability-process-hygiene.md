@@ -198,7 +198,9 @@ loader allowlists the platform/architecture and, on Linux, synchronously reads
 requires a mapped `libc.so.6` or older `libc-2.N.so` and no mapped
 `ld-musl-*.so.1` or `libc.musl-*`, including deleted mappings. Musl takes precedence
 even alongside glibc filenames, so compatibility layers cannot admit native
-initializers. Unreadable, empty, malformed or unrecognized libc evidence refuses
+initializers. Musl wildcard matching includes CR and Unicode line separators
+retained in pathnames; positive glibc evidence requires an exact basename.
+Unreadable, empty, malformed or unrecognized libc evidence refuses
 with `glibc is required`, including static Node builds without a mapped libc.
 Neither diagnostic reports nor subprocesses supply evidence. After admission,
 the native `gnu_get_libc_version` symbol provides a second consistency check.

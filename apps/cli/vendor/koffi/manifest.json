@@ -46,7 +46,7 @@
     },
     {
       "path": "load.cjs",
-      "sha256": "944295e43254171f804b824fa00cf5dee803d6d4959b4db1c873e8590392ee71",
+      "sha256": "e658765fd2e668909fe4eb4e59f251b7d93f332b22764669d08c52839f3b274e",
       "source": "scripts/lib/koffi-loader.cjs"
     }
   ]

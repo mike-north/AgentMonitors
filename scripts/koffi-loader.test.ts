@@ -152,6 +152,49 @@ describe('packaged native selection', () => {
     expect(result.error).toBeUndefined();
     expect(result.module.exports).toBe(result.native);
   });
+  // Musl evidence dominates a normal glibc mapping even when its basename retains
+  // legal non-LF separators; refusal must precede every native initializer.
+  it.each(
+    ['\r', '\u2028', '\u2029'].flatMap((separator) => [
+      [
+        `libc suffix ${JSON.stringify(separator)}`,
+        `/lib/libc.musl-x86_64.so.1${separator}`,
+      ],
+      [
+        `libc interior ${JSON.stringify(separator)}`,
+        `/lib/libc.musl-x86${separator}_64.so.1`,
+      ],
+      [
+        `loader wildcard ${JSON.stringify(separator)}`,
+        `/lib/ld-musl-x86${separator}_64.so.1`,
+      ],
+    ]),
+  )(
+    'refuses mixed musl evidence with %s before native loading',
+    (_name, filename) => {
+      const result = load('linux', 'x64', glibcMaps + mapping(filename));
+      expect(result.requests.filter((id) => id.endsWith('.node'))).toEqual([]);
+      expect(result.requests).not.toContain('./wrapper.cjs');
+      expect(result.error).toMatchObject({
+        message:
+          'Native exec support for linux-x64 could not be loaded: glibc is required',
+      });
+    },
+  );
+  // Positive glibc evidence requires the entire basename, including older names.
+  it.each(
+    ['\r', '\u2028', '\u2029'].flatMap((separator) =>
+      ['libc.so.6', 'libc-2.31.so'].map((name) => `${name}${separator}`),
+    ),
+  )('refuses a glibc basename with an appended separator %j', (filename) => {
+    const result = load('linux', 'x64', mapping(`/lib/${filename}`));
+    expect(result.requests.filter((id) => id.endsWith('.node'))).toEqual([]);
+    expect(result.requests).not.toContain('./wrapper.cjs');
+    expect(result.error).toMatchObject({
+      message:
+        'Native exec support for linux-x64 could not be loaded: glibc is required',
+    });
+  });
   it.each([
     ['musl loader', mapping('/lib/ld-musl-x86_64.so.1')],
     ['musl libc', mapping('/lib/libc.musl-aarch64.so.1')],

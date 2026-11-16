@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-15 — Preserve musl precedence for every pathname character (003 §11.2; 008 §3.3) — Refs #640
+
+Musl wildcard matching covers CR, U+2028 and U+2029 retained in mapped pathnames,
+including alongside ordinary glibc evidence. These mappings refuse before native
+loading. Positive glibc evidence still requires an exact basename, so appended
+separators cannot establish glibc. Injected mapping regressions verify both rules.
+
 ## 2026-11-15 — Refuse uncertain Linux libc before native loading (003 §11.2; 008 §3.3) — Refs #640
 
 Linux native admission reads the running process's mapped libraries once before

@@ -45,8 +45,10 @@ try {
     const glibc = filenames.some((name) =>
       /^(?:libc\.so\.6|libc-2\.\d+\.so)$/.test(name),
     );
+    // Musl wildcards cover every pathname character accepted by the record
+    // parser; a legal line separator must never hide negative ABI evidence.
     const musl = filenames.some((name) =>
-      /^(?:ld-musl-.+\.so\.1|libc\.musl-.+)$/.test(name),
+      /^(?:ld-musl-.+\.so\.1|libc\.musl-.+)$/s.test(name),
     );
     if (!glibc || musl) throw new Error('glibc is required');
   }
