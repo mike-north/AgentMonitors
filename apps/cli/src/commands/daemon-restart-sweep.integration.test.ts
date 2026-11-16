@@ -1,6 +1,7 @@
 /** Restart-time containment proves both cleanup and the stronger never-wrong-kill boundary. */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import { createServer, type Socket } from 'node:net';
 import {
   existsSync,
   mkdirSync,
@@ -27,6 +28,8 @@ let db: string;
 let monitors: string;
 const children: ChildProcess[] = [];
 const groups = new Set<number>();
+/** Exact fixture identities survive authored exit, including local-server teardown. */
+const fixtureMembers: ProcessIdentityRecord[] = [];
 
 /** Dispose the deadline timer whether an owned process exits or an operation fails. */
 async function bounded<T>(operation: Promise<T>, label: string): Promise<T> {
@@ -66,7 +69,7 @@ afterEach(async () => {
   // A completed watchdog may already have ended its group. Capture live,
   // fixture-anchored membership before cleanup, then verify each recorded
   // incarnation at delivery. Never signal a bare, possibly reaped group ID.
-  const owned: ProcessIdentityRecord[] = [];
+  const owned: ProcessIdentityRecord[] = fixtureMembers.splice(0);
   const snapshot = await readProcessTable();
   if (!snapshot.supported) throw new Error(snapshot.reason);
   for (const group of groups) {
@@ -259,7 +262,136 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
   'restart sweep',
   () => {
     it.skipIf(process.platform !== 'darwin')(
-      'preserves a stock shell watchdog across restart until its deadline',
+      'reaps stock sh and its sleep child using each process own vnode after daemon SIGKILL',
+      async () => {
+        const dir = path.join(monitors, 'command');
+        mkdirSync(dir);
+        // A retained shell and a long-lived stock child must both be killed by
+        // restart reconciliation, well before their independent lifetime bound.
+        writeFileSync(
+          path.join(dir, 'MONITOR.md'),
+          `---\nname: Shell restart\nwatch:\n  type: command-poll\n  command: ${JSON.stringify(['/bin/sh', '-c', 'echo $$ > shell.pid; /bin/sleep 300 & echo $! > child.pid; wait'])}\n  timeout: 5m\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
+        );
+        const daemon = await start();
+        await expect
+          .poll(() => existsSync(path.join(workspace, 'child.pid')), {
+            timeout: 5000,
+          })
+          .toBe(true);
+        const command = Number(
+          readFileSync(path.join(workspace, 'shell.pid'), 'utf8').trim(),
+        );
+        const child = Number(
+          readFileSync(path.join(workspace, 'child.pid'), 'utf8').trim(),
+        );
+        groups.add(command);
+        writeFileSync(
+          path.join(workspace, 'pids.json'),
+          JSON.stringify({ parent: command, child, detached: false }),
+        );
+        const exit = once(daemon, 'exit');
+        daemon.kill('SIGKILL');
+        await bounded(exit, 'owned daemon crash');
+        rmSync(dir, { recursive: true });
+        expect(ownedWorkerTerminated(command)).toBe(false);
+        expect(ownedWorkerTerminated(child)).toBe(false);
+        await start();
+        for (const pid of [command, child]) {
+          expect(diagnostics()?.outcomes).toContainEqual(
+            expect.objectContaining({
+              pid,
+              status: 'reaped',
+              evidence: expect.objectContaining({ via: 'inherited-vnode' }),
+            }),
+          );
+          expect(ownedWorkerTerminated(pid)).toBe(true);
+        }
+        await waitForOwnedGroupTermination(command, Date.now() + 1000);
+      },
+      25_000,
+    );
+
+    it.skipIf(process.platform !== 'darwin')(
+      'reaps stock curl using its own vnode after daemon SIGKILL',
+      async () => {
+        const sockets = new Set<Socket>();
+        const server = createServer((socket) => {
+          sockets.add(socket);
+          socket.on('close', () => sockets.delete(socket));
+        });
+        server.listen(0, '127.0.0.1');
+        await bounded(once(server, 'listening'), 'local curl server');
+        try {
+          const address = server.address();
+          if (address === null || typeof address === 'string')
+            throw new Error('Missing local listener');
+          const dir = path.join(monitors, 'command');
+          mkdirSync(dir);
+          writeFileSync(
+            path.join(dir, 'MONITOR.md'),
+            `---\nname: Curl restart\nwatch:\n  type: command-poll\n  command: ${JSON.stringify(['/usr/bin/curl', '--silent', '--max-time', '300', `http://127.0.0.1:${address.port}/`])}\n  timeout: 5m\n  interval: 1h\nurgency: normal\n---\nInspect changes.\n`,
+          );
+          const daemon = await start();
+          await expect.poll(() => sockets.size, { timeout: 5000 }).toBe(1);
+          const sql = new Database(`${db}.commands.sqlite`);
+          let command: number;
+          try {
+            const row = sql.prepare('SELECT pid FROM command_pids').get();
+            if (
+              typeof row !== 'object' ||
+              row === null ||
+              !('pid' in row) ||
+              typeof row.pid !== 'number'
+            )
+              throw new Error('Missing curl suspicion');
+            command = row.pid;
+          } finally {
+            sql.close();
+          }
+          groups.add(command);
+          const table = await readProcessTable();
+          if (!table.supported) throw new Error(table.reason);
+          // The live, unreaped curl pins its original group while we capture
+          // the bound. Saved incarnations, never bare group IDs, authorize cleanup.
+          fixtureMembers.push(
+            ...table.processes.filter((member) => member.pgid === command),
+          );
+          writeFileSync(
+            path.join(workspace, 'pids.json'),
+            JSON.stringify({
+              parent: command,
+              child: command,
+              detached: false,
+            }),
+          );
+          const exit = once(daemon, 'exit');
+          daemon.kill('SIGKILL');
+          await bounded(exit, 'owned daemon crash');
+          rmSync(dir, { recursive: true });
+          expect(ownedWorkerTerminated(command)).toBe(false);
+          await start();
+          expect(diagnostics()?.outcomes).toContainEqual(
+            expect.objectContaining({
+              pid: command,
+              status: 'reaped',
+              evidence: expect.objectContaining({ via: 'inherited-vnode' }),
+            }),
+          );
+          expect(ownedWorkerTerminated(command)).toBe(true);
+          await waitForOwnedGroupTermination(command, Date.now() + 1000);
+        } finally {
+          for (const socket of sockets) socket.destroy();
+          await new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+        }
+      },
+      25_000,
+    );
+
+    it.skipIf(process.platform !== 'darwin')(
+      'preserves a stock shell watchdog when committed vnode metadata is unavailable',
+
       async () => {
         const dir = path.join(monitors, 'command');
         mkdirSync(dir);
@@ -306,6 +438,14 @@ describe.skipIf(process.platform !== 'darwin' && process.platform !== 'linux')(
         await bounded(exited, 'owned daemon crash');
         rmSync(dir, { recursive: true });
         expect(ownedWorkerTerminated(command)).toBe(false);
+        // A legacy or incomplete life row cannot authorize fallback proof, even
+        // while its command still holds the exact token's inherited descriptor.
+        const sql = new Database(`${db}.commands.sqlite`);
+        try {
+          sql.prepare('UPDATE command_lives SET vnode = NULL').run();
+        } finally {
+          sql.close();
+        }
         await start();
         const outcomes = diagnostics()?.outcomes.filter(
           (outcome) => outcome.pid === command || outcome.pid === bound.pid,

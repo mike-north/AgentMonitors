@@ -4,6 +4,7 @@ import { Socket } from 'node:net';
 import path from 'node:path';
 import { Duplex } from 'node:stream';
 import type {
+  CommandLifeToken,
   CommandProcessOwner,
   JsonSchema,
   KeyedCollectionConfig,
@@ -38,6 +39,7 @@ import {
 // warnings in the checked-in API report.
 export type {
   ChangeKind,
+  CommandLifeToken,
   CommandProcessOwner,
   JsonSchema,
   Observation,
@@ -380,7 +382,12 @@ async function runCommand(
   }
   const deadline = monotonicNowMs() + scope.timeoutMs;
   let openFiles: ReturnType<typeof inheritedOpenFileLimits>;
+  let lifeToken: CommandLifeToken | undefined;
+  // Ownership was durably admitted above. Snapshot its optional vnode before
+  // resource capture can refuse and before any disposable helper is spawned.
   try {
+    lifeToken =
+      process.platform === 'darwin' ? owner?.lifeToken?.() : undefined;
     openFiles = inheritedOpenFileLimits();
   } catch (error) {
     return { kind: 'failure', error: String(error), stderrTail: '' };
@@ -444,6 +451,7 @@ async function runCommand(
           watchdog: WATCHDOG_PROGRAM,
           native,
           openFiles,
+          lifeToken,
         }),
       );
     }

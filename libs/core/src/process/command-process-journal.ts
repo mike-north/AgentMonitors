@@ -2,11 +2,12 @@
  * Durable command ownership and restart reconciliation (008 §4.2). The life
  * nonce is committed before any command can spawn, so even SIGKILL inside
  * spawn cannot leave identifiable work without a durable attribution record.
- * Numeric PIDs are suspicions only; boot, inherited mark and fresh start-time
+ * Numeric PIDs are suspicions only; boot, candidate-local proof and fresh start-time
  * identity must all agree before the shared signal gate can send anything.
  */
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import Database from 'better-sqlite3';
 import { z } from 'zod';
 import {
@@ -22,6 +23,12 @@ import {
   readDarwinCommandTerminals,
   type CommandTerminalEvidence,
 } from './command-process-marks.js';
+import {
+  commandLifeTokenSchema,
+  createCommandLifeToken,
+  retireCommandLifeToken,
+  type CommandLifeToken,
+} from './command-life-token.js';
 import { withDarwinCommandMarkReader } from './darwin-command-marks.js';
 import { sendVerifiedSignal, type SignalOutcome } from './process-identity.js';
 import {
@@ -33,6 +40,8 @@ import {
 export interface CommandProcessOwner {
   /** Await the committed admission mark before spawning, then apply it after authored env. */
   environment(): Promise<Readonly<Record<string, string>>>;
+  /** Optional committed macOS vnode, available only after environment() admits this life. */
+  lifeToken?(): CommandLifeToken | undefined;
   /** Persist the directly spawned identifier as a suspicion, never proof of identity. */
   spawned(pid: number): void;
   /** Retain an exited child's original-group suspicion; surviving members still need accounting. */
@@ -53,8 +62,8 @@ export interface RestartSweepOutcome {
   readonly evidence?: ProcessIdentityRecord & {
     readonly boot: string;
     readonly mark: string;
-    /** A same-group member may be identified through an already marked anchor. */
-    readonly via: 'inherited-mark' | 'group-continuity';
+    /** Name the candidate-local proof, or existing readable member continuity. */
+    readonly via: 'inherited-mark' | 'inherited-vnode' | 'group-continuity';
     readonly groupAnchor?: ProcessIdentityRecord;
   };
 }
@@ -78,6 +87,7 @@ const identitySchema = z.object({
 const lifeSchema = z.object({
   life: z.uuid(),
   boot: z.string(),
+  vnode: z.string().nullable().optional(),
   owner: z.string().transform((value, context) => {
     try {
       return identitySchema.nullable().parse(JSON.parse(value));
@@ -101,12 +111,15 @@ export class CommandProcessJournal implements CommandProcessOwner {
   private owner: ProcessIdentityRecord | undefined;
   private identityReady: Promise<void> | undefined;
   private registered = false;
+  /** No in-memory or uncommitted file may grant persistent ownership. */
+  private token: CommandLifeToken | undefined;
   /** Transient tokens invalidate only refreshed hints in concurrent admission snapshots. */
   private readonly hintRevisions = new Map<number, symbol>();
   private constructor(
     private readonly sql: Database.Database,
     private readonly workspace: string,
     private readonly life: string,
+    private readonly tokenDirectory: string | undefined,
   ) {}
 
   /** Open durable storage without scanning the host when no command life needs reconciliation. */
@@ -123,7 +136,25 @@ export class CommandProcessJournal implements CommandProcessOwner {
         CREATE TABLE IF NOT EXISTS command_pids(life TEXT NOT NULL, pid INTEGER NOT NULL, PRIMARY KEY(life,pid));
         CREATE TABLE IF NOT EXISTS restart_sweeps(id INTEGER PRIMARY KEY, workspace TEXT NOT NULL, result TEXT NOT NULL);
       `);
-      return new CommandProcessJournal(sql, workspace, randomUUID());
+      // Nullable migration preserves old lives without granting them vnode proof.
+      const columns = z
+        .array(z.object({ name: z.string() }))
+        .parse(sql.pragma('table_info(command_lives)'));
+      if (!columns.some((column) => column.name === 'vnode'))
+        sql.exec('ALTER TABLE command_lives ADD COLUMN vnode TEXT');
+      const tokenDirectory =
+        filename === ':memory:'
+          ? undefined
+          : path.join(
+              realpathSync(path.dirname(filename)),
+              `${path.basename(filename)}.tokens`,
+            );
+      return new CommandProcessJournal(
+        sql,
+        workspace,
+        randomUUID(),
+        tokenDirectory,
+      );
     } catch (error) {
       sql.close();
       throw error;
@@ -135,17 +166,30 @@ export class CommandProcessJournal implements CommandProcessOwner {
     await this.initializeIdentity();
     if (this.registered) await this.retireEmptyGroups();
     if (!this.registered) {
+      const token =
+        process.platform === 'darwin' && this.tokenDirectory !== undefined
+          ? createCommandLifeToken(this.tokenDirectory, this.life)
+          : undefined;
       this.sql
-        .prepare('INSERT INTO command_lives VALUES(?,?,?,?)')
+        .prepare(
+          'INSERT INTO command_lives(life,workspace,boot,owner,vnode) VALUES(?,?,?,?,?)',
+        )
         .run(
           this.life,
           this.workspace,
           this.boot ?? '',
           JSON.stringify(this.owner ?? null),
+          token === undefined ? null : JSON.stringify(token),
         );
+      this.token = token;
       this.registered = true;
     }
     return { [COMMAND_LIFE_ENV]: this.life };
+  }
+
+  /** Return only the tuple whose FULL-synchronous admission has completed. @public */
+  lifeToken(): CommandLifeToken | undefined {
+    return this.token;
   }
 
   /**
@@ -221,7 +265,42 @@ export class CommandProcessJournal implements CommandProcessOwner {
 
   /** Reconcile only dead lives in this workspace, never a numerically matching group. */
   async sweep(): Promise<RestartSweepResult> {
-    return withDarwinCommandMarkReader(() => this.reconcile());
+    // Only validated journal rows in this workspace may contribute fallback
+    // proof. The reader still queries and rechecks each candidate independently.
+    const tokens: CommandLifeToken[] = [];
+    if (process.platform === 'darwin') {
+      for (const raw of this.sql
+        .prepare(
+          'SELECT life, boot, owner, vnode FROM command_lives WHERE workspace = ? AND life != ?',
+        )
+        .all(this.workspace, this.life)) {
+        const row = lifeSchema.safeParse(raw);
+        if (!row.success) continue;
+        const token = this.recordedToken(row.data.life, row.data.vnode);
+        if (token) tokens.push(token);
+      }
+    }
+    return withDarwinCommandMarkReader(() => this.reconcile(), tokens);
+  }
+
+  /** Stored metadata must name this journal's reserved, life-specific path. */
+  private recordedToken(
+    life: string,
+    value: string | null | undefined,
+  ): CommandLifeToken | undefined {
+    if (!value || !this.tokenDirectory) return undefined;
+    try {
+      const parsed = commandLifeTokenSchema.safeParse(JSON.parse(value));
+      if (
+        parsed.success &&
+        parsed.data.life === life &&
+        parsed.data.path === path.join(this.tokenDirectory, `${life}.token`)
+      )
+        return parsed.data;
+    } catch {
+      /* Malformed metadata never widens legacy ownership. */
+    }
+    return undefined;
   }
 
   /** One reconciliation scope retains a single helper while every gate still reads fresh evidence. */
@@ -255,7 +334,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
     };
     const rows = this.sql
       .prepare(
-        'SELECT life, boot, owner FROM command_lives WHERE workspace = ? AND life != ?',
+        'SELECT life, boot, owner, vnode FROM command_lives WHERE workspace = ? AND life != ?',
       )
       .all(this.workspace, this.life);
     // Without an admitted earlier command life there is no nonce to attribute.
@@ -291,7 +370,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
         status: 'abstained',
         life: this.life,
         pid,
-        reason: marks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON,
+        reason:
+          marks.unreadableReasons?.get(pid) ??
+          marks.unreadableReason ??
+          UNREADABLE_OWNERSHIP_REASON,
       });
     // A later identity query can block or the daemon can crash. The running
     // receipt must already retain the obstacles discovered by this reading.
@@ -443,8 +525,17 @@ export class CommandProcessJournal implements CommandProcessOwner {
             }
           }
         })();
+        // Only existing envp marks may anchor the unchanged readable,
+        // mark-erased membership path. A vnode proves its holder alone and
+        // must never add group-continuity authority for a different process.
+        const continuityMembers =
+          process.platform === 'darwin'
+            ? markedMembers.filter(
+                (member) => !ownership.vnodes?.has(member.pid),
+              )
+            : markedMembers;
         const confirmed = await confirmGroupAnchors(
-          sameBoot ? markedMembers : [],
+          sameBoot ? continuityMembers : [],
         );
         if (!confirmed.supported) {
           complete = false;
@@ -606,7 +697,10 @@ export class CommandProcessJournal implements CommandProcessOwner {
                     record &&
                     !liveOwners.has(pid) &&
                     pid !== process.pid &&
-                    (inherited || anchors.has(record.pgid))
+                    (inherited ||
+                      (anchors.has(record.pgid) &&
+                        (process.platform !== 'darwin' ||
+                          !ownership.unreadable?.includes(pid))))
                     ? [{ record, inherited }]
                     : [];
                 }),
@@ -643,11 +737,11 @@ export class CommandProcessJournal implements CommandProcessOwner {
           if (
             sameBoot &&
             !inherited &&
-            anchor === undefined &&
+            (anchor === undefined || process.platform === 'darwin') &&
             ownership.unreadable?.includes(pid)
           ) {
             // Discovery already durably recorded this exact uncertainty. A stored
-            // numeric suspicion supplies no new evidence or decision to append.
+            // numeric suspicion or macOS sibling supplies no new proof to append.
             retained = true;
             continue;
           }
@@ -773,7 +867,11 @@ export class CommandProcessJournal implements CommandProcessOwner {
                 ...record,
                 boot: previous.boot,
                 mark: previous.life,
-                via: inherited ? 'inherited-mark' : 'group-continuity',
+                via: inherited
+                  ? ownership.vnodes?.has(pid)
+                    ? 'inherited-vnode'
+                    : 'inherited-mark'
+                  : 'group-continuity',
                 ...(!inherited && anchor !== undefined
                   ? { groupAnchor: anchor }
                   : {}),
@@ -857,7 +955,9 @@ export class CommandProcessJournal implements CommandProcessOwner {
           retained = true;
           for (const pid of nextMarks.unreadable ?? []) {
             const reason =
-              nextMarks.unreadableReason ?? UNREADABLE_OWNERSHIP_REASON;
+              nextMarks.unreadableReasons?.get(pid) ??
+              nextMarks.unreadableReason ??
+              UNREADABLE_OWNERSHIP_REASON;
             // Repeated snapshots can preserve one unchanged obstacle while
             // finding new marked work. Record equal uncertainty once per pass,
             // including obstacles already found before selecting an old life.
@@ -952,7 +1052,7 @@ export class CommandProcessJournal implements CommandProcessOwner {
           }
         }
       }
-      if (!retained && !disappearance.pending)
+      if (!retained && !disappearance.pending) {
         this.sql.transaction(() => {
           this.sql
             .prepare('DELETE FROM command_pids WHERE life = ?')
@@ -961,6 +1061,9 @@ export class CommandProcessJournal implements CommandProcessOwner {
             .prepare('DELETE FROM command_lives WHERE life = ?')
             .run(previous.life);
         })();
+        const token = this.recordedToken(previous.life, previous.vnode);
+        if (token) retireCommandLifeToken(token);
+      }
       save('running');
     }
     return finish(complete ? 'complete' : 'incomplete');
@@ -1058,7 +1161,8 @@ async function signalCandidateBatch(
               inherited &&
               (!marks.supported || marks.marks.get(record.pid) !== life)
             ? marks.supported
-              ? 'ownership mark differs or is unreadable'
+              ? (marks.unreadableReasons?.get(record.pid) ??
+                'ownership mark differs or is unreadable')
               : marks.reason
             : undefined;
     if (reason !== undefined) groupVetoes.set(record.pgid, reason);
@@ -1127,7 +1231,12 @@ async function signalCandidateBatch(
                 return Promise.resolve({
                   supported: false,
                   reason:
-                    'Boot or inherited ownership mark could not be confirmed at signal time',
+                    process.platform === 'darwin' &&
+                    freshBoot === boot &&
+                    marks.supported
+                      ? (marks.unreadableReasons?.get(record.pid) ??
+                        'Boot or inherited ownership mark could not be confirmed at signal time')
+                      : 'Boot or inherited ownership mark could not be confirmed at signal time',
                 });
               return Promise.resolve(fresh);
             },
