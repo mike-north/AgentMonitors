@@ -32,6 +32,24 @@ member borrows sibling or watchdog proof. Native restart tests cover stock shell
 admission, per-PID safety and ABI regressions enforce the contract. Tokens retire only after
 existing attribution/suspicion conditions are satisfied.
 
+## 2026-11-15 — Preserve musl precedence for every pathname character (003 §11.2; 008 §3.3) — Refs #640
+
+Musl wildcard matching covers CR, U+2028 and U+2029 retained in mapped pathnames,
+including alongside ordinary glibc evidence. These mappings refuse before native
+loading. Positive glibc evidence still requires an exact basename, so appended
+separators cannot establish glibc. Injected mapping regressions verify both rules.
+
+## 2026-11-15 — Refuse uncertain Linux libc before native loading (003 §11.2; 008 §3.3) — Refs #640
+
+Linux native admission reads the running process's mapped libraries once before
+requiring the vendored binary. A mapped glibc filename is required, and any musl
+loader/libc mapping refuses even alongside glibc compatibility files. Unreadable,
+empty or ambiguous evidence refuses with `glibc is required`; static Node without
+mapped libc is deliberately unsupported. No diagnostic report or subprocess runs.
+The post-load glibc symbol check remains a second consistency check. VM tests
+verify admission order and non-Linux isolation; provenance tests verify both
+packaged copies and their digests.
+
 ## 2026-11-15 — Preserve command resource limits across launcher startup (003 §11.2) — Refs #631
 
 Admitted authored commands preserve the resource limits of a plain spawn from the same
