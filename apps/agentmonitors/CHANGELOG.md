@@ -1,5 +1,22 @@
 # agentmonitors
 
+## 0.11.4
+
+### Patch Changes
+
+- Updated dependencies [2090673]
+- Updated dependencies [a66ccec]
+- Updated dependencies [3a00022]
+- Updated dependencies [413db36]
+- Updated dependencies [90a76c7]
+- Updated dependencies [8e5723a]
+- Updated dependencies [4249d1f]
+- Updated dependencies [c425397]
+- Updated dependencies [4249d1f]
+- Updated dependencies [2090673]
+- Updated dependencies [e1331c8]
+  - @agentmonitors/cli@0.13.1
+
 ## 0.11.3
 
 ### Patch Changes
