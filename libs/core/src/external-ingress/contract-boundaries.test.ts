@@ -67,6 +67,15 @@ function nestedState(
 }
 
 describe('external ingress exact boundaries', () => {
+  it('refuses writes to every exported limit without weakening admission', () => {
+    for (const key of Object.keys(externalEventLimits)) {
+      const before = Reflect.get(externalEventLimits, key);
+      expect(Reflect.set(externalEventLimits, key, 999999), key).toBe(false);
+      expect(Reflect.get(externalEventLimits, key), key).toBe(before);
+    }
+    expectError(envelope({ monitorId: 'x'.repeat(513) }), 'payload_too_large');
+  });
+
   it('enforces 511/512/513 UTF-8 bytes for every identifier', () => {
     for (const field of [
       'monitorId',

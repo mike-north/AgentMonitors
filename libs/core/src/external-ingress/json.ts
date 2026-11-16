@@ -484,7 +484,7 @@ export function assertExternalJsonValue(
  * accessors, hidden or symbol properties, cycles, unsafe integers, non-finite
  * numbers, sparse arrays, or non-JSON prototypes are rejected.
  * Uses the module's zero-based inclusive depth bound of 512.
- * @public
+ * @internal
  */
 export function canonicalJsonStringify(value: unknown): string {
   return encodeCanonical(value, 0, MAX_SUPPORTED_DEPTH, new AncestorSet());

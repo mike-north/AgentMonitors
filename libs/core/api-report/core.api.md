@@ -152,9 +152,6 @@ export function buildDiff(previous: string, current: string, strategy?: ChangeDe
 export function buildTextDiff(previous: string, current: string): string;
 
 // @public
-export function canonicalJsonStringify(value: unknown): string;
-
-// @public
 export function changeDetectionCollectionError(watchConfig: Record<string, unknown>): string | undefined;
 
 // @public

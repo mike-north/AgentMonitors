@@ -3,6 +3,12 @@
 This file records clarifications, contradiction resolutions, and structural changes to the
 Agent Monitors spec set in `docs/specs/`.
 
+## Usage
+
+- Add entries when ambiguity is resolved or the intended contract changes.
+- Prefer short entries tied to the numbered doc affected.
+- If implementation behavior and desired behavior differ, say so explicitly.
+
 ## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
 
 Envelope admission refuses own `__proto__` keys throughout producer scope/state, including
@@ -12,18 +18,12 @@ validation does not depend on a leap-second announcement table.
 
 ## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.9) — Refs #481
 
-Core now exports the strict `agentmonitors.external-event.v1` envelope validator, recursively
-canonical JSON encoder, semantic SHA-256 helper that excludes only the relay cursor, collision-free
+Core now exports the strict `agentmonitors.external-event.v1` envelope validator,
+JSON value types, semantic SHA-256 helper over the closed v1 field set, collision-free
 source/object key, and structured validation error types. Exact UTF-8 size, scope, JSON-depth,
 timestamp, and sequence bounds are enforced without echoing state in failures. This change exposes
 the contract only: durable receipts, runtime ingestion, daemon IPC, and CLI submission remain target
 behavior in future changes.
-
-## Usage
-
-- Add entries when ambiguity is resolved or the intended contract changes.
-- Prefer short entries tied to the numbered doc affected.
-- If implementation behavior and desired behavior differ, say so explicitly.
 
 ## 2026-11-16 — Bound internal external-envelope admission
 

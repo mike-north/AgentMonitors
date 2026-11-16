@@ -111,7 +111,6 @@ export type {
 // Versioned source-neutral envelope admission and semantic identity.
 export {
   EXTERNAL_EVENT_SCHEMA,
-  canonicalJsonStringify,
   externalEventLimits,
   externalEventReservedScopeKeys,
   validateExternalEventEnvelope,

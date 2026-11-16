@@ -3499,9 +3499,10 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 ## 16. External JSON foundation
 
 **Current JSON contract.** `libs/core/src/external-ingress/json.ts` validates and
-canonically encodes external plain JSON data. The package root publishes its canonical
-encoder and JSON value types to support the envelope and identity surface in §2.6;
-the assertion helper and traversal machinery remain internal.
+canonically encodes external plain JSON data. The package root publishes JSON value types
+needed by the envelope state in §2.6. Canonical encoding, the assertion helper and
+traversal machinery remain internal; the validator returns canonical JSON and the
+identity helpers expose the semantic operations.
 It is independent of `runtime/retry-envelope.ts`: retained retries continue to use
 `serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
 `observedAt` Date. External JSON permits no Date values.

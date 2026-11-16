@@ -40,9 +40,14 @@ describe('public external envelope contract', () => {
       const result = api.validateExternalEventEnvelope(envelope());
       expect(result.success).toBe(true);
       if (!result.success) throw new Error(result.error.message);
-      expect(api.canonicalJsonStringify(result.envelope)).toBe(
-        result.canonicalJson,
-      );
+      expect(JSON.parse(result.canonicalJson)).toEqual(result.envelope);
+      const reordered = api.validateExternalEventEnvelope({
+        ...result.envelope,
+        state: { total: 12, completed: 12, status: 'passed' },
+      });
+      expect(reordered.success).toBe(true);
+      if (!reordered.success) throw new Error(reordered.error.message);
+      expect(reordered.canonicalJson).toBe(result.canonicalJson);
       expect(
         api.externalEventSemanticHash({
           ...result.envelope,
@@ -67,26 +72,28 @@ describe('public external envelope contract', () => {
     ).toEqual(
       [
         'EXTERNAL_EVENT_SCHEMA',
-        'canonicalJsonStringify',
         'externalEventLimits',
         'externalEventObjectKey',
         'externalEventReservedScopeKeys',
         'externalEventSemanticHash',
       ].sort(),
     );
+    expect(core).not.toHaveProperty('canonicalJsonStringify');
     expect(core).not.toHaveProperty('assertExternalJsonValue');
     expect(core).not.toHaveProperty('envelopeJsonBytes');
   });
 
   it('exports composable documented types and literal limits without speculative ingestion types', () => {
     const diagnostics = consumerDiagnostics(`
-      import { canonicalJsonStringify, externalEventLimits, validateExternalEventEnvelope } from '@agentmonitors/core';
+      import { externalEventLimits, validateExternalEventEnvelope } from '@agentmonitors/core';
       import type { ExternalEventEnvelope, ExternalEventErrorCode, ExternalJsonValue } from '@agentmonitors/core';
       // @ts-expect-error Ingestion has no public producer yet.
       import type { ExternalEventIngestInput, ExternalEventIngestResult, ExternalEventOutcome, ExternalEventDisposition } from '@agentmonitors/core';
       declare const event: ExternalEventEnvelope;
       const json: ExternalJsonValue = event;
-      canonicalJsonStringify(json);
+      JSON.stringify(json);
+      // @ts-expect-error General canonical encoding is an internal implementation detail.
+      import { canonicalJsonStringify } from '@agentmonitors/core';
       const envelopeBytes: 262144 = externalEventLimits.envelopeBytes;
       const scopeBytes: 32768 = externalEventLimits.scopeBytes;
       type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -126,6 +133,7 @@ describe('public external envelope contract', () => {
     expect(report).not.toMatch(
       /export (?:interface|type) ExternalEvent(?:Ingest|Outcome|Disposition)/,
     );
+    expect(report).not.toContain('export function canonicalJsonStringify');
   });
 
   it('cannot weaken any limit through exported runtime metadata', () => {
