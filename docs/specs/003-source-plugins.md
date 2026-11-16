@@ -1595,6 +1595,30 @@ EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaust
 precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
 empty PATH components use the bare filename. The authored program starts with the default signal
 dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
+startup must not change an admitted authored command's resource limits: every soft/hard
+pair matches a plain spawn from the same running parent. Node startup can raise its own soft
+`RLIMIT_NOFILE`, but never changes its hard limit. The source synchronously captures the
+parent's soft and hard open-file values directly with native `getrlimit` through the
+package's vendored binding, loaded lazily and cached per process on supported POSIX hosts.
+The 16-byte native pair is encoded as exact BigInt decimal strings or platform-specific
+`unlimited` over the configuration pipe, including finite values above 2^53. Capture does
+not generate diagnostics or write files; its work does not scale with sockets, handles or
+workers. Linux binding admission checks the native glibc symbol without a diagnostic report.
+After watchdog arming, the launcher reads the native pair and refuses a hard-field mismatch
+against the captured value: Node never changes that field, so drift is unexpected. It keeps
+the native hard bytes, restores the exact soft value and reads back both fields through
+native `getrlimit`/`setrlimit` before exec. Other limits pass through unchanged; the watchdog
+keeps its own limits. Failed binding load or capture refuses execution before spawn with
+`RLIMIT_NOFILE` and the operation; native read/restore failures include errno. A hard-field
+or read-back mismatch also refuses execution. Each refusal retains the previous baseline.
+Capture follows committed ownership admission; a capture failure adds no PID suspicion and
+leaves the committed life mark available to the existing reconciliation path. Verified:
+`resource-limits.test.ts` compares every native resource pair with plain spawn on macOS/Linux,
+including macOS large soft/hard values and symbolic infinity, and exercises native load/read
+failures, no reports/writes, binding reuse and a one-second observation with a link-local UDP
+peer, more than 1,000 handles and a busy worker. `self-bound.test.ts` verifies
+watchdog-before-restore ordering, native restore failures and hard-field/read-back mismatches.
+Internal Node
 helpers use absolute Node and native-module paths and need only the command-life mark in their
 startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter
 helper startup environments. The complete intended command environment travels only over the

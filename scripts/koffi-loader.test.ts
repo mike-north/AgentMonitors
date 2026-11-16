@@ -16,7 +16,15 @@ function load(
   failure?: string,
 ) {
   const requests: string[] = [];
-  const native = { version: '3.3.7' };
+  const native = {
+    version: '3.3.7',
+    load: () => ({
+      func: () => {
+        if (!glibc) throw new Error('missing gnu_get_libc_version');
+        return () => glibc;
+      },
+    }),
+  };
   const module = { exports: {} };
   runInNewContext(loader, {
     __dirname: '/package/vendor/koffi',
@@ -24,7 +32,11 @@ function load(
     process: {
       platform,
       arch,
-      report: { getReport: () => ({ header: { glibcVersionRuntime: glibc } }) },
+      report: {
+        getReport: () => {
+          throw new Error('Diagnostic capture is forbidden');
+        },
+      },
     },
     require: (id: string) => {
       requests.push(id);

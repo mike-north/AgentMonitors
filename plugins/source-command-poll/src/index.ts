@@ -25,6 +25,7 @@ import {
 } from '@agentmonitors/core';
 
 import { vendoredNativeLoader } from './native-binding.js';
+import { inheritedOpenFileLimits } from './open-file-limits.js';
 import {
   LAUNCHER_PROGRAM,
   WATCHDOG_PROGRAM,
@@ -377,10 +378,24 @@ async function runCommand(
   if (commandEnv[COMMAND_LIFE_ENV] !== undefined) {
     helperEnv[COMMAND_LIFE_ENV] = commandEnv[COMMAND_LIFE_ENV];
   }
+  const deadline = monotonicNowMs() + scope.timeoutMs;
+  let openFiles: ReturnType<typeof inheritedOpenFileLimits>;
+  try {
+    openFiles = inheritedOpenFileLimits();
+  } catch (error) {
+    return { kind: 'failure', error: String(error), stderrTail: '' };
+  }
+  // A shutdown observed during synchronous capture must still prevent admission.
+  if (shutdownSignal?.aborted) {
+    return {
+      kind: 'failure',
+      error: 'Command cancelled during shutdown',
+      stderrTail: '',
+    };
+  }
   return new Promise<ExecOutcome>((resolve) => {
     const [file, ...args] = scope.command;
     const isWindows = process.platform === 'win32';
-    const deadline = monotonicNowMs() + scope.timeoutMs;
     // The POSIX launcher keeps its PID when it becomes the command. Its in-group
     // watchdog has acknowledged a referenced timer before that replacement.
     const launchArgs = isWindows
@@ -391,7 +406,7 @@ async function runCommand(
           '-e',
           LAUNCHER_PROGRAM,
         ];
-    // The launcher alone loads native code, using our package-relative payload.
+    // The launcher uses the same package-relative native payload as capture.
     const native = vendoredNativeLoader();
     // `file` is guaranteed defined: parseScopeConfig rejects an empty command.
     const child = spawn(
@@ -428,6 +443,7 @@ async function runCommand(
           grace: SIGKILL_GRACE_MS,
           watchdog: WATCHDOG_PROGRAM,
           native,
+          openFiles,
         }),
       );
     }
