@@ -1603,7 +1603,11 @@ package's vendored binding, loaded lazily and cached per process on supported PO
 The 16-byte native pair is encoded as exact BigInt decimal strings or platform-specific
 `unlimited` over the configuration pipe, including finite values above 2^53. Capture does
 not generate diagnostics or write files; its work does not scale with sockets, handles or
-workers. Linux binding admission checks the native glibc symbol without a diagnostic report.
+workers. Linux binding admission reads `/proc/self/maps` once before requiring the binary,
+accepting only a mapped `libc.so.6` or `libc-2.N.so` with no mapped
+`ld-musl-*.so.1` or `libc.musl-*`. Unreadable, empty or ambiguous evidence refuses
+with `glibc is required`; no diagnostic report or subprocess runs. The native glibc
+symbol is checked only after this admission.
 After watchdog arming, the launcher reads the native pair and refuses a hard-field mismatch
 against the captured value: Node never changes that field, so drift is unexpected. It keeps
 the native hard bytes, restores the exact soft value and reads back both fields through
@@ -1643,7 +1647,8 @@ module-loading label. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG,
 reports it) report errno and a short message naming the program, without a native abort, core file
 or crash report. They preserve failing health and the prior successful baseline (§11.5). Arming
 failure is an execution failure and no authored work runs. No synchronous subprocess, FIFO or
-blocking open runs on `observe()`. The watchdog's referenced timers send SIGTERM at the absolute
+blocking IPC open runs on `observe()`; Linux native admission performs the single
+synchronous procfs maps read described above. The watchdog's referenced timers send SIGTERM at the absolute
 deadline and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
 continued membership supplies identity safety, independent of daemon liveness and command stdio.
 Once a normally completed finite observation has captured its output, it releases the whole original
@@ -1685,9 +1690,20 @@ records each shipped file's SHA-256 and source. Offline script tests verify thes
 bytes and reject tampering.
 
 Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
-filename, identically in the source package and CLI bundle. Only the asynchronous
-launcher loads it. The loader allowlists the platform/architecture, requires glibc
-on Linux and loads exactly that package's binary. Koffi's indirect entry point has
+filename, identically in the source package and CLI bundle. The daemon loads it
+lazily for resource-limit capture; the asynchronous launcher also loads it. The
+loader allowlists the platform/architecture and, on Linux, synchronously reads
+`/proc/self/maps` once before loading exactly that package's binary. Admission
+requires a mapped `libc.so.6` or older `libc-2.N.so` and no mapped
+`ld-musl-*.so.1` or `libc.musl-*`, including deleted mappings. Musl takes precedence
+even alongside glibc filenames, so compatibility layers cannot admit native
+initializers. Unreadable, empty, malformed or unrecognized libc evidence refuses
+with `glibc is required`, including static Node builds without a mapped libc.
+Neither diagnostic reports nor subprocesses supply evidence. After admission,
+the native `gnu_get_libc_version` symbol provides a second consistency check.
+Non-Linux platforms never read maps. `scripts/koffi-loader.test.ts` verifies
+these admission and no-native-load refusals with injected mappings;
+`scripts/vendor-koffi.test.ts` verifies both packaged copies and digests. Koffi's indirect entry point has
 no explicit-native hook, so the refresh script makes a minimal checked shim: replace
 its detect/load stanza with a factory argument, return its exports and close the
 factory. This retains upstream wrapping/version checks while bypassing its native
