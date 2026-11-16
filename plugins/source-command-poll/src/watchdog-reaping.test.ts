@@ -1,5 +1,6 @@
 /** A real Linux subreaper exercises native waits without a Docker daemon. */
 import { spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 
@@ -63,6 +64,7 @@ describe.skipIf(process.platform !== 'linux')(
         ['--input-type=module', '-e', program, native, source],
         {
           detached: true,
+          cwd: tmpdir(),
           encoding: 'utf8',
           timeout: 60_000,
           killSignal: 'SIGKILL',

@@ -73,7 +73,7 @@ describe.skipIf(!hasDocker())('Linux adopted watchdog lifecycle', () => {
           '-v',
           `${repo}:/workspace:ro`,
           '-w',
-          '/workspace',
+          '/tmp',
           'node:24-bookworm-slim',
           'node',
           '--input-type=module',
