@@ -3614,7 +3614,9 @@ code-unit read, preventing a rejected rope from flattening beyond the byte bound
 Field UTF-8 checks also reject from length before measuring bytes. Array length
 can be refused before key enumeration. Captured module-load intrinsics and
 indexed own-data reads apply §16's no-caller-code and post-load prototype
-independence guarantees to both byte counting and semantic field validation.
+independence guarantees to byte counting, semantic field validation and refusal.
+Resource refusals are classified by private identity without reading the thrown
+value or consulting error constructors or prototype membership hooks.
 After encoding, a separate UTF-8 measurement of the actual canonical output MUST
 refuse an envelope over 262,144 bytes before normalization. This final check
 protects against a counting defect; preflight remains the primary resource bound.
@@ -3649,4 +3651,7 @@ Isolated child processes cap rope-allocation and shared-child DAG regressions,
 and exercise prototype replacements after import. The complete limits table and
 boundary inputs are pinned to specification numbers independently of the code;
 multibyte array values and canonical scope bytes include exact-limit acceptance.
+Canonical scope boundaries cover short and control escapes independently of the
+larger envelope bound. Refusal cases replace error constructors and error
+membership hooks after import and require zero calls with unchanged error codes.
 An injected undercount exercises the final output-size check.

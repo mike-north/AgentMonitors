@@ -6,6 +6,8 @@
  */
 /* Indexed own-data traversal must not consult mutable iterator protocols. */
 /* eslint-disable @typescript-eslint/prefer-for-of */
+/* Private refusal tokens deliberately avoid Error construction and prototype protocols. */
+/* eslint-disable @typescript-eslint/only-throw-error */
 import { types } from 'node:util';
 
 /** Module-load intrinsics preserve the canonical foundation's post-load trust boundary. */
@@ -37,8 +39,18 @@ function ownDescriptorValue(
     : undefined;
 }
 
-/** Size and inclusive container-depth overruns share the permanent payload code. @internal */
-export class EnvelopeLimitError extends Error {}
+/**
+ * Private identity tokens distinguish resource refusal from malformed JSON without
+ * constructor calls, prototype reads or caller-controlled error membership hooks.
+ * Null prototypes and freezing keep the tokens inert even if caught elsewhere.
+ */
+const limitRefusal = Object.freeze({ __proto__: null });
+const invalidJson = Object.freeze({ __proto__: null });
+
+/** Identify only this counter's resource refusals without inspecting the thrown value. @internal */
+export function isEnvelopeLimitError(error: unknown): boolean {
+  return error === limitRefusal;
+}
 
 /**
  * Count exact JSON string bytes without creating an escaped copy or scanning past
@@ -47,11 +59,11 @@ export class EnvelopeLimitError extends Error {}
 function stringBytes(value: string, remaining: number): number {
   // A rope can flatten on its first code-unit read. Reject its known lower bound first.
   if (value.length + 2 > remaining) {
-    throw new EnvelopeLimitError();
+    throw limitRefusal;
   }
   let bytes = 2;
   for (let index = 0; index < value.length; index += 1) {
-    if (bytes > remaining) throw new EnvelopeLimitError();
+    if (bytes > remaining) throw limitRefusal;
     const unit = apply(charCodeAt, value, [index]);
     if (
       unit === 34 ||
@@ -79,7 +91,7 @@ function stringBytes(value: string, remaining: number): number {
       bytes += 3;
     }
   }
-  if (bytes > remaining) throw new EnvelopeLimitError();
+  if (bytes > remaining) throw limitRefusal;
   return bytes;
 }
 
@@ -103,7 +115,7 @@ export function envelopeJsonBytes(
   const ancestors = new AncestorSet<object>();
   const consume = (count: number): void => {
     bytes += count;
-    if (bytes > limit) throw new EnvelopeLimitError();
+    if (bytes > limit) throw limitRefusal;
   };
   const visit = (value: unknown, depth: number): void => {
     if (typeof value === 'string') {
@@ -119,9 +131,9 @@ export function envelopeJsonBytes(
       consume(stringifyScalar(value).length);
       return;
     }
-    if (typeof value !== 'object') throw new TypeError('Non-JSON value.');
-    if (depth > maxDepth) throw new EnvelopeLimitError();
-    if (isProxy(value)) throw new TypeError('Proxy JSON value.');
+    if (typeof value !== 'object') throw invalidJson;
+    if (depth > maxDepth) throw limitRefusal;
+    if (isProxy(value)) throw invalidJson;
     const array = isArray(value);
     const prototype: unknown = getPrototypeOf(value);
     if (
@@ -129,10 +141,10 @@ export function envelopeJsonBytes(
         ? prototype !== arrayPrototype
         : prototype !== objectPrototype && prototype !== null
     ) {
-      throw new TypeError('Non-plain JSON container.');
+      throw invalidJson;
     }
     if (apply(setHas, ancestors, [value])) {
-      throw new TypeError('Cyclic JSON value.');
+      throw invalidJson;
     }
     apply(setAdd, ancestors, [value]);
     consume(2);
@@ -140,18 +152,16 @@ export function envelopeJsonBytes(
       const length = ownDescriptorValue(
         getOwnPropertyDescriptor(value, 'length'),
       );
-      if (typeof length !== 'number')
-        throw new TypeError('Invalid array length.');
+      if (typeof length !== 'number') throw invalidJson;
       // Even empty-string elements require two quotes and separating commas.
-      if (length > 0 && length * 2 - 1 > limit - bytes)
-        throw new EnvelopeLimitError();
+      if (length > 0 && length * 2 - 1 > limit - bytes) throw limitRefusal;
     }
     const keys = ownKeys(value);
     let members = 0;
     for (let index = 0; index < keys.length; index += 1) {
       const key = keys[index];
       if (array && key === 'length') continue;
-      if (typeof key !== 'string') throw new TypeError('Non-JSON key.');
+      if (typeof key !== 'string') throw invalidJson;
       if (members > 0) consume(1);
       if (!array) consume(stringBytes(key, limit - bytes) + 1);
       const descriptor = getOwnPropertyDescriptor(value, key);
@@ -161,7 +171,7 @@ export function envelopeJsonBytes(
         !hasOwn(descriptor, 'enumerable') ||
         descriptor.enumerable !== true
       ) {
-        throw new TypeError('Accessor or hidden property.');
+        throw invalidJson;
       }
       // Descriptor values are data, never property reads from the producer object.
       const child: unknown = descriptor.value;

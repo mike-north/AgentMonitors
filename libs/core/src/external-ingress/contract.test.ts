@@ -318,6 +318,29 @@ describe('external envelope enforcement boundaries', () => {
       }
     });
   }
+  for (const escape of ['\n', '"', '\u0001']) {
+    it(`bounds canonical scope bytes with ${JSON.stringify(escape)} escapes`, () => {
+      for (const bytes of [32_768, 32_769]) {
+        // Fill independently with ASCII, then exchange raw bytes for encoded escapes.
+        const scope = scopeAtBytes(bytes);
+        const values = scope['k0'];
+        if (!values) throw new Error('Missing scope fixture values');
+        const cost = escape === '\u0001' ? 6 : 2;
+        values[0] = escape + 'x'.repeat(512 - cost);
+        expect(Buffer.byteLength(canonicalJsonStringify(scope))).toBe(bytes);
+        const input = envelope({ scope });
+        // The envelope budget cannot mask an off-by-one in its smaller scope budget.
+        expect(Buffer.byteLength(canonicalJsonStringify(input))).toBeLessThan(
+          262_144,
+        );
+        if (bytes === 32_768) {
+          expect(validateExternalEventEnvelope(input).success).toBe(true);
+        } else {
+          expectError(input, 'payload_too_large');
+        }
+      }
+    });
+  }
   it('bounds canonical envelope bytes including escaping and UTF-8', () => {
     for (const prefix of ['', 'é😀\\\n\u0000\ud800']) {
       const base = envelope({ state: { value: prefix } });
@@ -524,6 +547,9 @@ describe('external envelope isolated admission guarantees', () => {
     'iterator-throw',
     'string-bypass',
     'semantic-intrinsics',
+    'error-membership-count',
+    'error-membership-throw',
+    'refusal-constructors',
     'scope-prototype-hole',
     'dag',
   ]) {

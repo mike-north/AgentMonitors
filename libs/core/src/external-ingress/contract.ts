@@ -10,7 +10,7 @@ import { Buffer } from 'node:buffer';
 import { types } from 'node:util';
 import type { ChangeKind } from '../observation/types.js';
 import { canonicalJsonStringify } from './json.js';
-import { EnvelopeLimitError, envelopeJsonBytes } from './envelope-budget.js';
+import { isEnvelopeLimitError, envelopeJsonBytes } from './envelope-budget.js';
 import type { ExternalJsonObject } from './json.js';
 
 export { canonicalJsonStringify } from './json.js';
@@ -374,7 +374,7 @@ export function validateExternalEventEnvelope(
       externalEventLimits.stateDepth,
     );
   } catch (error) {
-    return error instanceof EnvelopeLimitError
+    return isEnvelopeLimitError(error)
       ? failure(
           'payload_too_large',
           'Event envelope exceeds a size or nesting limit.',
@@ -538,7 +538,7 @@ export function validateExternalEventEnvelope(
       externalEventLimits.stateDepth,
     );
   } catch (error) {
-    return error instanceof EnvelopeLimitError
+    return isEnvelopeLimitError(error)
       ? failure('payload_too_large', 'Event envelope scope is too large.')
       : failure('invalid_envelope', 'Event envelope scope is invalid.');
   }

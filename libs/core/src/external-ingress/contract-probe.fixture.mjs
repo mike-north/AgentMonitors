@@ -180,6 +180,90 @@ if (scenario === 'allocation') {
   }
   assert.equal(calls, 0);
   assert.equal(result.error?.code, 'invalid_envelope');
+} else if (
+  scenario === 'error-membership-count' ||
+  scenario === 'error-membership-throw' ||
+  scenario === 'refusal-constructors'
+) {
+  // Exercise both counting catch sites and each distinct malformed-container refusal.
+  const oversized = { ...input, state: { value: 'x'.repeat(262_145) } };
+  const scope = Object.fromEntries(
+    Array.from({ length: 5 }, (_, index) => [
+      `k${index}`,
+      Array.from({ length: 16 }, () => 'x'.repeat(512)),
+    ]),
+  );
+  const accessor = Object.defineProperty({}, 'value', {
+    enumerable: true,
+    get() {
+      throw new Error('Input accessor ran');
+    },
+  });
+  const cycle = {};
+  cycle.self = cycle;
+  const malformed = [
+    { value: undefined },
+    { value: new Proxy({}, {}) },
+    { value: new Date() },
+    cycle,
+    { [Symbol('key')]: true },
+    accessor,
+    // Sparse arrays pass counting but must still be refused by canonical validation.
+    { value: new Array(1) },
+  ];
+  const originalError = Error;
+  const originalTypeError = TypeError;
+  const originalRangeError = RangeError;
+  const membership = Object.getOwnPropertyDescriptor(Error, Symbol.hasInstance);
+  let calls = 0;
+  let results;
+  try {
+    if (scenario === 'refusal-constructors') {
+      const replacement = function () {
+        calls += 1;
+        throw new originalError('Live error constructor ran');
+      };
+      globalThis.Error = replacement;
+      globalThis.TypeError = replacement;
+      globalThis.RangeError = replacement;
+    } else {
+      Object.defineProperty(originalError, Symbol.hasInstance, {
+        configurable: true,
+        get() {
+          calls += 1;
+          if (scenario === 'error-membership-throw') {
+            throw new originalError('Error membership getter ran');
+          }
+          return Function.prototype[Symbol.hasInstance];
+        },
+      });
+    }
+    results = [
+      validateExternalEventEnvelope(oversized),
+      validateExternalEventEnvelope({ ...input, scope }),
+    ];
+    for (let index = 0; index < malformed.length; index += 1) {
+      results[results.length] = validateExternalEventEnvelope({
+        ...input,
+        state: malformed[index],
+      });
+    }
+  } finally {
+    globalThis.Error = originalError;
+    globalThis.TypeError = originalTypeError;
+    globalThis.RangeError = originalRangeError;
+    if (membership) {
+      Object.defineProperty(originalError, Symbol.hasInstance, membership);
+    } else {
+      Reflect.deleteProperty(originalError, Symbol.hasInstance);
+    }
+  }
+  assert.equal(calls, 0);
+  assert.equal(results[0].error?.code, 'payload_too_large');
+  assert.equal(results[1].error?.code, 'payload_too_large');
+  for (let index = 2; index < results.length; index += 1) {
+    assert.equal(results[index].error?.code, 'invalid_envelope');
+  }
 } else if (scenario === 'semantic-intrinsics') {
   input.occurredAt = '1990-12-31T23:59:60Z';
   input.scope = { project: ['é'] };

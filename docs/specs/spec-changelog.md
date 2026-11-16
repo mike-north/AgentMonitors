@@ -22,6 +22,9 @@ prototype replacements cannot execute producer code or alter admission. Actual
 canonical output bytes are checked independently before normalization. Tests pin
 the complete numeric contract, multibyte scope boundaries, isolated allocation and
 prototype behavior, and refusal when preflight is made to undercount.
+Refusal classification uses private identity tokens without mutable error
+constructors or membership hooks. Scope boundaries include short and control
+escapes at 32,768 and 32,769 canonical bytes below the envelope budget.
 The canonical JSON foundation's domain and prototype policies remain authoritative.
 The internal envelope contract remains outside the package-root API.
 
