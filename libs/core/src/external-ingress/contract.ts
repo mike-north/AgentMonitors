@@ -86,6 +86,7 @@ export const externalEventReservedScopeKeys = Object.freeze([
 /** Source-defined routing dimensions containing bounded strings. @public */
 export type ExternalEventScope = Record<string, string | string[]>;
 
+/* eslint-disable @typescript-eslint/consistent-type-definitions -- Closed aliases compose with JSON index signatures without interface augmentation. */
 /**
  * A validated current-state event from a source outside Agent Monitors.
  *
@@ -108,8 +109,6 @@ export type ExternalEventScope = Record<string, string | string[]>;
  * ```
  * @public
  */
-// A closed alias composes with the JSON value index signature; interfaces can be augmented.
-// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
 export type ExternalEventEnvelope = {
   /** Exact versioned schema identifier. */
   schema: typeof EXTERNAL_EVENT_SCHEMA;
@@ -136,6 +135,8 @@ export type ExternalEventEnvelope = {
   /** Complete current observed state, never incremental instructions. */
   state: ExternalJsonObject;
 };
+
+/* eslint-enable @typescript-eslint/consistent-type-definitions */
 
 /** Local routing context paired with one validated external envelope. @internal */
 export interface ExternalEventIngestInput {
