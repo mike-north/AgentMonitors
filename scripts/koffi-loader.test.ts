@@ -107,6 +107,51 @@ describe('packaged native selection', () => {
       load('linux', 'x64', mapping('/lib/libc.so.6 (deleted)')).error,
     ).toBeUndefined();
   });
+  // Kernel records use LF alone as their delimiter; these characters remain in file paths.
+  it.each(['\r', '\u2028', '\u2029'])(
+    'admits glibc alongside a legal pathname containing %j',
+    (separator) => {
+      const result = load(
+        'linux',
+        'x64',
+        glibcMaps + mapping(`/tmp/a${separator}b/addon.so`),
+      );
+      expect(result.error).toBeUndefined();
+      expect(result.module.exports).toBe(result.native);
+    },
+  );
+  // Valid unrelated mappings must not turn positive libc evidence into a format refusal.
+  it.each([
+    ['pathless anonymous', '7f000000-7f001000 rw-p 00000000 00:00 0\n'],
+    ['padded pathless anonymous', mapping('')],
+    ...[
+      '[heap]',
+      '[stack]',
+      '[vdso]',
+      '[vvar]',
+      '[vsyscall]',
+      '[anon:v8 shared memory]',
+      '[anon_shmem:arena 1]',
+      '/memfd:v8 code pages (deleted)',
+      '/tmp/with spaces/addon.so',
+      '/tmp/with\ttabs/addon.so',
+      '/tmp/escaped\\012lf/addon.so',
+      '/tmp/addon.so (deleted)',
+    ].map((filename) => [filename, mapping(filename)]),
+    ['long pathname', mapping(`/tmp/${'a/'.repeat(2040)}addon.so`)],
+    [
+      'wide fields',
+      'ffffffffff600000-ffffffffff601000 --xp ffffffffffffffff fff:fffff 18446744073709551615 /tmp/addon.so\n',
+    ],
+    [
+      'zero fields and padded pathname',
+      '00000000-00001000 rw-s 00000000 00:00 0                  /tmp/addon.so\n',
+    ],
+  ])('admits glibc alongside %s', (_name, record) => {
+    const result = load('linux', 'x64', glibcMaps + record);
+    expect(result.error).toBeUndefined();
+    expect(result.module.exports).toBe(result.native);
+  });
   it.each([
     ['musl loader', mapping('/lib/ld-musl-x86_64.so.1')],
     ['musl libc', mapping('/lib/libc.musl-aarch64.so.1')],

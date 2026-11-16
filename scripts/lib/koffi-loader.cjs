@@ -26,8 +26,10 @@ try {
         .split('\n')
         .filter(Boolean)
         .map((line) => {
+          // Only LF separates records; kernel paths can retain CR and Unicode
+          // line separators, so the pathname remainder must use dotAll.
           const record = line.match(
-            /^[\da-f]+-[\da-f]+\s+[rwxps-]{4}\s+[\da-f]+\s+[\da-f]+:[\da-f]+\s+\d+(?:\s+(.*))?$/,
+            /^[\da-f]+-[\da-f]+\s+[rwxps-]{4}\s+[\da-f]+\s+[\da-f]+:[\da-f]+\s+\d+(?:\s+(.*))?$/s,
           );
           if (!record) throw new Error('unrecognized mapping');
           // Deleted files remain mapped evidence until the process unmaps them.
