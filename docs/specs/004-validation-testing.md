@@ -745,8 +745,12 @@ This surface currently proves the public contract only. A later change adds rece
 the runtime mutation boundary; callers cannot ingest an envelope through the runtime, daemon, or CLI
 yet.
 
-**Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
-`contract-boundaries.test.ts`.
+**Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
+`contract-boundaries.test.ts`, `admission-safety.test.ts`, and `public-contract.test.ts`.
+The public consumer suite exercises ESM/CJS exports and compiles against the trimmed
+package declarations. A fixed eleven-field canonical preimage pins the SHA-256 value;
+each identity-field mutation varies only that field. Runtime mutation of every limit
+is refused, and sixteen/seventeen scope alternatives are tested independently of bytes.
 
 ## 3. Required Test Scenarios
 

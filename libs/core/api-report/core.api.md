@@ -151,9 +151,7 @@ export function buildDiff(previous: string, current: string, strategy?: ChangeDe
 // @public (undocumented)
 export function buildTextDiff(previous: string, current: string): string;
 
-// Warning: (ae-internal-missing-underscore) The name "canonicalJsonStringify" should be prefixed with an underscore because the declaration is marked as @internal
-//
-// @internal
+// @public
 export function canonicalJsonStringify(value: unknown): string;
 
 // @public
@@ -493,21 +491,20 @@ export interface EventQuery {
 export const EXTERNAL_EVENT_SCHEMA: "agentmonitors.external-event.v1";
 
 // @public
-export interface ExternalEventEnvelope {
-    changeKind: ChangeKind;
-    eventKind: string;
+export type ExternalEventEnvelope = {
+    schema: typeof EXTERNAL_EVENT_SCHEMA;
     monitorId: string;
+    source: string;
+    upstreamEventId: string;
     objectId: string;
     objectSequence: number;
+    eventKind: string;
+    changeKind: 'created' | 'modified' | 'deleted' | 'descoped';
     occurredAt: string;
     resumeToken: string;
-    schema: typeof EXTERNAL_EVENT_SCHEMA;
     scope: ExternalEventScope;
-    source: string;
-    // Warning: (ae-incompatible-release-tags) The symbol "state" is marked as @public, but its signature references "ExternalJsonObject" which is marked as @internal
     state: ExternalJsonObject;
-    upstreamEventId: string;
-}
+};
 
 // @public
 export type ExternalEventEnvelopeValidationResult = {
@@ -528,15 +525,15 @@ export interface ExternalEventError {
 }
 
 // @public
-export type ExternalEventErrorCode = /** No daemon could be reached. Retryable. */ 'daemon_unavailable' | /** The daemon does not implement this protocol. Retryable after upgrade. */ 'daemon_incompatible' | /** The daemon could not service the request yet. Retryable. */ 'daemon_busy' | /** Durable local storage failed. Retryable. */ 'storage_failure' | /** Bounded pending capacity is currently full. Retryable. */ 'capacity_exceeded' | /** An unclassified local failure occurred. Retryable. */ 'internal_error' | /** The envelope schema version is unsupported. Permanent. */ 'unsupported_schema' | /** The envelope violates the versioned schema. Permanent. */ 'invalid_envelope' | /** A byte, cardinality or container-depth limit was exceeded. Permanent. */ 'payload_too_large' | /** The selected local monitor is absent or ambiguous. Permanent. */ 'invalid_monitor' | /** The selected monitor has invalid local policy. Permanent. */ 'monitor_policy_error' | /** The monitor uses a notify policy unsupported by this schema. Permanent. */ 'unsupported_notify_strategy' | /** Client and daemon workspace identities differ. Permanent. */ 'workspace_mismatch' | /** An idempotency key was reused for different semantic content. Permanent. */ 'idempotency_conflict';
+export type ExternalEventErrorCode = /** The envelope schema version is unsupported. */ 'unsupported_schema' | /** The envelope violates the versioned schema. */ 'invalid_envelope' | /** A byte, cardinality or container-depth limit was exceeded. */ 'payload_too_large';
 
 // @public
 export const externalEventLimits: Readonly<{
-    readonly envelopeBytes: number;
+    readonly envelopeBytes: 262144;
     readonly identifierBytes: 512;
     readonly resumeTokenBytes: 2048;
     readonly scopeKeys: 32;
-    readonly scopeBytes: number;
+    readonly scopeBytes: 32768;
     readonly scopeKeyBytes: 64;
     readonly scopeValuesPerKey: 16;
     readonly scopeValueBytes: 512;
@@ -555,14 +552,10 @@ export type ExternalEventScope = Record<string, string | string[]>;
 // @public
 export function externalEventSemanticHash(envelope: ExternalEventEnvelope): string;
 
-// Warning: (ae-internal-missing-underscore) The name "ExternalJsonObject" should be prefixed with an underscore because the declaration is marked as @internal
-//
-// @internal
+// @public
 export type ExternalJsonObject = Record<string, ExternalJsonValue>;
 
-// Warning: (ae-internal-missing-underscore) The name "ExternalJsonValue" should be prefixed with an underscore because the declaration is marked as @internal
-//
-// @internal
+// @public
 export type ExternalJsonValue = null | boolean | number | string | ExternalJsonValue[] | {
     [key: string]: ExternalJsonValue;
 };

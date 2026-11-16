@@ -3498,8 +3498,10 @@ Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12
 
 ## 16. External JSON foundation
 
-**Current internal contract.** `libs/core/src/external-ingress/json.ts` validates and
-canonically encodes external plain JSON data. It remains outside the package root.
+**Current JSON contract.** `libs/core/src/external-ingress/json.ts` validates and
+canonically encodes external plain JSON data. The package root publishes its canonical
+encoder and JSON value types to support the envelope and identity surface in §2.6;
+the assertion helper and traversal machinery remain internal.
 It is independent of `runtime/retry-envelope.ts`: retained retries continue to use
 `serializeRetryEnvelope` / `deserializeRetryEnvelope`, including their typed
 `observedAt` Date. External JSON permits no Date values.
@@ -3642,12 +3644,12 @@ in large inputs. Intrinsic replacement-prototype matrices, the supported maximum
 vectors also enforce this boundary. Retained-retry, polled-source and watched-source suites continue
 to validate their existing independent contracts.
 
-### 16.1 Versioned external envelopes (_current internal contract_)
+### 16.1 Versioned external envelopes (_current admission; target ingestion_)
 
 `validateExternalEventEnvelope` admits only the complete
 `agentmonitors.external-event.v1` field set. Unknown fields, including instructions,
-urgency, notify policy and local filesystem paths, MUST be refused. This internal
-validator does not expose ingestion, persistence or routing through the package root.
+urgency, notify policy and local filesystem paths, MUST be refused. The package-root
+validator exposes admission only; ingestion, persistence and routing remain target behavior.
 
 The validator MUST preflight encoded size before canonical JSON validation,
 normalization or fingerprinting. Its descriptor walk counts exact escaped UTF-8
@@ -3692,7 +3694,8 @@ is introduced. Future transport integration must honor both boundaries.
 
 Equivalent object-key orderings MUST return identical normalized values and
 canonical JSON bytes on repeated runs. Hashing those bytes is deterministic; this
-layer does not introduce a fingerprint API or semantic receipt identity.
+admission layer does not itself fingerprint or persist receipts. The public identity
+helper in §2.6 composes canonical encoding with the closed v1 semantic field set.
 
 Validation: `external-ingress/contract.test.ts` pins every exact/+1 boundary,
 ASCII and multibyte field sizes, escaped canonical bytes, object/array/alternating

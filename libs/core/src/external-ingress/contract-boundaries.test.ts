@@ -21,12 +21,14 @@ import {
   externalEventSemanticHash,
 } from './identity.js';
 
+/** Mixed-width strings distinguish UTF-8 bytes from character counts at odd boundaries. */
 function exactUtf8(bytes: number): string {
   if (bytes === 0) return '';
   if (bytes === 1) return 'x';
   return `${'x'.repeat(bytes - 2)}é`;
 }
 
+/** Fill the independent scope budget without exceeding per-key or per-value limits. */
 function scopeWithCanonicalBytes(targetBytes: number): ExternalEventScope {
   const scope: Record<string, string[]> = Object.fromEntries(
     Array.from({ length: 4 }, (_, key) => [
@@ -50,6 +52,7 @@ function scopeWithCanonicalBytes(targetBytes: number): ExternalEventScope {
   return scope;
 }
 
+/** State roots count as level one, regardless of nested container transitions. */
 function nestedState(
   levels: number,
   mode: 'object' | 'array' | 'alternating',

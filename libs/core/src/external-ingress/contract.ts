@@ -8,7 +8,6 @@
 /* eslint-disable @typescript-eslint/prefer-for-of */
 import { Buffer } from 'node:buffer';
 import { types } from 'node:util';
-import type { ChangeKind } from '../observation/types.js';
 import { canonicalJsonStringify } from './json.js';
 import { isEnvelopeLimitError, envelopeJsonBytes } from './envelope-budget.js';
 import type { ExternalJsonObject } from './json.js';
@@ -54,14 +53,23 @@ export const EXTERNAL_EVENT_SCHEMA = 'agentmonitors.external-event.v1' as const;
  * @public
  */
 export const externalEventLimits = Object.freeze({
-  envelopeBytes: 256 * 1024,
+  /** Maximum canonical envelope size in UTF-8 bytes (256 KiB). */
+  envelopeBytes: 262_144,
+  /** Maximum UTF-8 bytes for each producer or routing identifier. */
   identifierBytes: 512,
+  /** Maximum UTF-8 bytes in the opaque relay cursor. */
   resumeTokenBytes: 2_048,
+  /** Maximum number of source-defined routing dimensions. */
   scopeKeys: 32,
-  scopeBytes: 32 * 1024,
+  /** Maximum canonical routing metadata size in UTF-8 bytes (32 KiB). */
+  scopeBytes: 32_768,
+  /** Maximum UTF-8 bytes in one routing dimension name. */
   scopeKeyBytes: 64,
+  /** Maximum alternatives for one routing dimension. */
   scopeValuesPerKey: 16,
+  /** Maximum UTF-8 bytes in each routing dimension value. */
   scopeValueBytes: 512,
+  /** Maximum state container levels, counting the state root as level one. */
   stateDepth: 32,
 } as const);
 
@@ -100,7 +108,9 @@ export type ExternalEventScope = Record<string, string | string[]>;
  * ```
  * @public
  */
-export interface ExternalEventEnvelope {
+// A closed alias composes with the JSON value index signature; interfaces can be augmented.
+// eslint-disable-next-line @typescript-eslint/consistent-type-definitions
+export type ExternalEventEnvelope = {
   /** Exact versioned schema identifier. */
   schema: typeof EXTERNAL_EVENT_SCHEMA;
   /** Local monitor definition that owns shaping, policy, and delivery. */
@@ -115,8 +125,8 @@ export interface ExternalEventEnvelope {
   objectSequence: number;
   /** Source-defined semantic event label, such as `build.updated`. */
   eventKind: string;
-  /** Existing Agent Monitors change-detection classification. */
-  changeKind: ChangeKind;
+  /** Frozen v1 lifecycle classification, intentionally matching current observation kinds. */
+  changeKind: 'created' | 'modified' | 'deleted' | 'descoped';
   /** RFC 3339 timestamp at which the upstream state occurred. */
   occurredAt: string;
   /** Opaque relay cursor excluded from semantic idempotency hashing. */
@@ -125,9 +135,9 @@ export interface ExternalEventEnvelope {
   scope: ExternalEventScope;
   /** Complete current observed state, never incremental instructions. */
   state: ExternalJsonObject;
-}
+};
 
-/** Local routing context paired with one validated external envelope. @public */
+/** Local routing context paired with one validated external envelope. @internal */
 export interface ExternalEventIngestInput {
   /** Canonical daemon-owned workspace identity used in the receipt key. */
   workspaceIdentity: string;
@@ -135,12 +145,12 @@ export interface ExternalEventIngestInput {
   envelope: ExternalEventEnvelope;
 }
 
-/** Whether an ingest created a receipt or replayed an existing receipt. @public */
+/** Whether an ingest created a receipt or replayed an existing receipt. @internal */
 export type ExternalEventDisposition =
   | /** A new event was durably accepted. */ 'accepted'
   | /** The same semantic event was already accepted. */ 'duplicate';
 
-/** Durable processing state associated with an external-event receipt. @public */
+/** Durable processing state associated with an external-event receipt. @internal */
 export type ExternalEventOutcome =
   | /** One or more normal Agent Monitors events were committed. */ 'materialized'
   | /** A supported notify delay captured the event durably. */ 'held'
@@ -148,22 +158,11 @@ export type ExternalEventOutcome =
   | /** A newer object sequence had already been accepted. */ 'stale'
   | /** Deferred materialization exhausted automatic retries. */ 'failed';
 
-/** Stable machine-readable failure classifications for relay policy. @public */
+/** Implemented envelope-admission failures; `retryable` carries retry policy. @public */
 export type ExternalEventErrorCode =
-  | /** No daemon could be reached. Retryable. */ 'daemon_unavailable'
-  | /** The daemon does not implement this protocol. Retryable after upgrade. */ 'daemon_incompatible'
-  | /** The daemon could not service the request yet. Retryable. */ 'daemon_busy'
-  | /** Durable local storage failed. Retryable. */ 'storage_failure'
-  | /** Bounded pending capacity is currently full. Retryable. */ 'capacity_exceeded'
-  | /** An unclassified local failure occurred. Retryable. */ 'internal_error'
-  | /** The envelope schema version is unsupported. Permanent. */ 'unsupported_schema'
-  | /** The envelope violates the versioned schema. Permanent. */ 'invalid_envelope'
-  | /** A byte, cardinality or container-depth limit was exceeded. Permanent. */ 'payload_too_large'
-  | /** The selected local monitor is absent or ambiguous. Permanent. */ 'invalid_monitor'
-  | /** The selected monitor has invalid local policy. Permanent. */ 'monitor_policy_error'
-  | /** The monitor uses a notify policy unsupported by this schema. Permanent. */ 'unsupported_notify_strategy'
-  | /** Client and daemon workspace identities differ. Permanent. */ 'workspace_mismatch'
-  | /** An idempotency key was reused for different semantic content. Permanent. */ 'idempotency_conflict';
+  | /** The envelope schema version is unsupported. */ 'unsupported_schema'
+  | /** The envelope violates the versioned schema. */ 'invalid_envelope'
+  | /** A byte, cardinality or container-depth limit was exceeded. */ 'payload_too_large';
 
 /** A safe external-ingress failure that never includes envelope state. @public */
 export interface ExternalEventError {
@@ -171,7 +170,7 @@ export interface ExternalEventError {
   code: ExternalEventErrorCode;
   /** Human-readable guidance without private payload content. */
   message: string;
-  /** Whether a relay may retry without changing the event. */
+  /** Sole retry-policy signal; envelope validation always returns `false`. */
   retryable: boolean;
 }
 
@@ -187,7 +186,7 @@ export interface ExternalEventError {
  *   materializedAt: null,
  * };
  * ```
- * @public
+ * @internal
  */
 export interface ExternalEventIngestResult {
   /** Whether this call accepted new work or found a duplicate. */
@@ -241,7 +240,7 @@ const TOP_LEVEL_KEYS = new Set<string>([
   'resumeToken',
   'scope',
   'state',
-]);
+] as const satisfies readonly (keyof ExternalEventEnvelope)[]);
 /** The complete schema cardinality is captured before its Set prototype can change. */
 const TOP_LEVEL_KEY_COUNT = TOP_LEVEL_KEYS.size;
 /** Producer identities share a UTF-8 bound independently of their character count. */
@@ -252,13 +251,19 @@ const IDENTIFIER_FIELDS = [
   'objectId',
   'eventKind',
 ] as const;
-/** Only existing observation lifecycle classifications belong on this wire. */
-const CHANGE_KINDS = new Set<ChangeKind>([
-  'created',
-  'modified',
-  'deleted',
-  'descoped',
-]);
+/**
+ * The exhaustive record binds validation to the closed v1 field type without
+ * exposing an internal tuple in the package declaration rollup. Internal
+ * observation classifications can evolve without widening this wire schema.
+ */
+const CHANGE_KINDS = new Set<string>(
+  keysOf({
+    created: true,
+    modified: true,
+    deleted: true,
+    descoped: true,
+  } satisfies Record<ExternalEventEnvelope['changeKind'], true>),
+);
 /** Runtime provenance cannot be overwritten by producer routing dimensions. */
 const RESERVED_SCOPE_KEYS = new Set<string>(externalEventReservedScopeKeys);
 /** Timestamp syntax is checked separately from calendar and leap-second validity. */
@@ -386,7 +391,21 @@ function containsPrototypeKey(value: unknown): boolean {
   return false;
 }
 
-/** Validate and normalize one versioned source-neutral external event envelope. @public */
+/**
+ * Validate and normalize one versioned source-neutral external event envelope.
+ *
+ * @example
+ * ```ts
+ * const result = validateExternalEventEnvelope(parsedJson);
+ * if (result.success) {
+ *   const identity = externalEventSemanticHash(result.envelope);
+ *   console.log(identity, result.envelopeBytes);
+ * } else {
+ *   console.error(result.error.code, result.error.retryable);
+ * }
+ * ```
+ * @public
+ */
 export function validateExternalEventEnvelope(
   input: unknown,
 ): ExternalEventEnvelopeValidationResult {
@@ -596,6 +615,8 @@ export function validateExternalEventEnvelope(
   if (envelopeBytes > externalEventLimits.envelopeBytes) {
     return failure('payload_too_large', 'Event envelope is too large.');
   }
+  // Resource, JSON-domain and complete field checks above establish this shape;
+  // parsing fresh canonical bytes removes caller-owned references and descriptors.
   const normalized = parseJson(canonicalJson) as ExternalEventEnvelope;
   if (
     containsPrototypeKey(normalized.scope) ||
