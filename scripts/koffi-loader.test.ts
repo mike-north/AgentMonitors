@@ -14,6 +14,34 @@ function mapping(filename: string): string {
 }
 const glibcMaps = mapping('/usr/lib/x86_64-linux-gnu/libc.so.6');
 
+/** Kernel-generated names describe memory objects, even when caller labels resemble libc. */
+const syntheticNames = [
+  '/memfd:cache/libc.so.6',
+  '/memfd:cache/libc.so.6 (deleted)',
+  '/memfd:cache/ld-musl-x86_64.so.1 (deleted)',
+  '/dmabuf:cache/libc.so.6',
+  '/dmabuf:cache/ld-musl-x86_64.so.1',
+  'anon_inode:cache/libc.so.6',
+  'anon_inode:cache/libc.musl-x86_64.so.1',
+  '[anon:cache/libc.so.6]',
+  '[anon:cache/libc.musl-x86_64.so.1]',
+  '[anon_shmem:cache/libc.so.6]',
+  '[anon_shmem:cache/libc.musl-x86_64.so.1]',
+  '/SYSV00000000 (deleted)',
+  '/dev/zero (deleted)',
+  '/anon_hugepage (deleted)',
+  '/[aio] (deleted)',
+  '/secretmem (deleted)',
+  '[heap]',
+  '[stack]',
+  '[vdso]',
+  '[vvar]',
+  'libc.so.6',
+  'relative/libc.so.6',
+  'relative/ld-musl-x86_64.so.1',
+  '',
+];
+
 /** VM-only evidence injection exposes ordering without adding a production override. */
 function load(
   platform: string,
@@ -96,6 +124,55 @@ describe('packaged native selection', () => {
       expect(result.reads).toEqual(os === 'linux' ? ['/proc/self/maps'] : []);
     },
   );
+  it.each(syntheticNames)(
+    'admits file-backed glibc alongside synthetic or nonabsolute name %j',
+    (filename) => {
+      const result = load('linux', 'x64', glibcMaps + mapping(filename));
+      expect(result.error).toBeUndefined();
+      expect(result.module.exports).toBe(result.native);
+      expect(result.reads).toEqual(['/proc/self/maps']);
+    },
+  );
+  it.each(syntheticNames)(
+    'refuses synthetic or nonabsolute name %j as the only evidence before native loading',
+    (filename) => {
+      const result = load('linux', 'x64', mapping(filename));
+      expect(result.requests.filter((id) => id.endsWith('.node'))).toEqual([]);
+      expect(result.requests).not.toContain('./wrapper.cjs');
+      expect(result.error).toMatchObject({
+        message:
+          'Native exec support for linux-x64 could not be loaded: glibc is required',
+      });
+      expect(result.reads).toEqual(['/proc/self/maps']);
+    },
+  );
+  // Overlay filesystems can use anonymous device numbers for ordinary mapped files.
+  it('admits file-backed glibc on an anonymous device', () => {
+    const result = load('linux', 'x64', glibcMaps.replace('08:01', '00:42'));
+    expect(result.error).toBeUndefined();
+    expect(result.module.exports).toBe(result.native);
+  });
+  // Synthetic-looking components below a real directory do not name kernel objects.
+  it.each([
+    '/usr/lib/memfd:cache',
+    '/usr/lib/dmabuf:cache',
+    '/usr/lib/SYSV00000000',
+    '/usr/lib/anon_hugepage',
+    '/[lib]',
+  ])('keeps real file evidence under directory %s', (directory) => {
+    expect(
+      load('linux', 'x64', mapping(`${directory}/libc.so.6`)).error,
+    ).toBeUndefined();
+    const result = load(
+      'linux',
+      'x64',
+      glibcMaps + mapping(`${directory}/ld-musl-x86_64.so.1`),
+    );
+    expect(result.error).toMatchObject({
+      message: expect.stringContaining('glibc is required'),
+    });
+    expect(result.requests.filter((id) => id.endsWith('.node'))).toEqual([]);
+  });
   it.each(['x64', 'arm64'])('accepts older glibc naming on %s', (arch) => {
     const result = load('linux', arch, mapping('/lib/libc-2.31.so'));
     expect(result.error).toBeUndefined();

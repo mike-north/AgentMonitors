@@ -2,7 +2,7 @@
  * Native capture and admission are package-relative and allowlisted. The daemon
  * reads limits; disposable launchers mutate process state. No registry resolution,
  * native search, lifecycle script or source compilation can be a fallback.
- * Linux admission inspects mapped libc before any native initializer can run;
+ * Linux admission inspects file-backed libc before any native initializer can run;
  * uncertain evidence refuses without diagnostics or subprocesses. The refresh
  * script copies this file into each package beside its payload.
  */
@@ -32,10 +32,23 @@ try {
             /^[\da-f]+-[\da-f]+\s+[rwxps-]{4}\s+[\da-f]+\s+[\da-f]+:[\da-f]+\s+\d+(?:\s+(.*))?$/s,
           );
           if (!record) throw new Error('unrecognized mapping');
-          // Deleted files remain mapped evidence until the process unmaps them.
-          return path.posix.basename(
-            (record[1] || '').replace(/ \(deleted\)$/, ''),
-          );
+          // Deleted real files remain evidence, but kernel memory-object names
+          // are not filesystem paths even when they begin with a slash. Filter
+          // before basename extraction: memfd/dmabuf labels can contain slashes.
+          // Linux sources: fs/proc/task_mmu.c, mm/memfd.c, ipc/shm.c,
+          // mm/{shmem,mmap,secretmem}.c, fs/aio.c, fs/anon_inodes.c and
+          // drivers/dma-buf/dma-buf.c (https://github.com/torvalds/linux).
+          const filename = (record[1] || '').replace(/ \(deleted\)$/, '');
+          if (
+            !filename.startsWith('/') ||
+            /^\/(?:memfd:|dmabuf:|SYSV[\da-f]{8}$|dev\/zero$|anon_hugepage$|secretmem$|\[aio\]$)/.test(
+              filename,
+            )
+          )
+            return '';
+          // Device numbers cannot distinguish synthetic objects from real files:
+          // container overlays also allocate anonymous devices for mapped libc.
+          return path.posix.basename(filename);
         });
     } catch {
       throw new Error('glibc is required');

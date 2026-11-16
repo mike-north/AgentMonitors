@@ -195,8 +195,14 @@ filename, identically in the source package and CLI bundle. The daemon loads it
 lazily for resource-limit capture; the asynchronous launcher also loads it. The
 loader allowlists the platform/architecture and, on Linux, synchronously reads
 `/proc/self/maps` once before loading exactly that package's binary. Admission
-requires a mapped `libc.so.6` or older `libc-2.N.so` and no mapped
-`ld-musl-*.so.1` or `libc.musl-*`, including deleted mappings. Musl takes precedence
+requires a file-backed `libc.so.6` or older `libc-2.N.so` and no file-backed
+`ld-musl-*.so.1` or `libc.musl-*`, including deleted real files. Evidence must
+have an absolute filesystem pathname. Kernel synthetic names (`/memfd:…`,
+`/dmabuf:…`, `/SYSV` plus eight hex digits, `/dev/zero`, `/anon_hugepage`,
+`/secretmem`, and bracketed pseudo-mappings such as `/[aio]` or `[anon:…]`)
+and nonabsolute/pathless records remain parseable but contribute no evidence.
+This also excludes `anon_inode:…`. Device numbers do not determine eligibility:
+container overlays can use anonymous devices for real files. Musl takes precedence
 even alongside glibc filenames, so compatibility layers cannot admit native
 initializers. Musl wildcard matching includes CR and Unicode line separators
 retained in pathnames; positive glibc evidence requires an exact basename.
