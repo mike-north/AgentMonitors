@@ -191,6 +191,28 @@ Missing native binding support
 fails closed with a platform-support explanation and the underlying loader error. Other startup
 or native-initialization failures preserve their own detail without a module-loading label.
 
+**Current Linux adopted-watchdog lifecycle:** a PID 1 observer or an existing child subreaper
+MUST reap its own adopted watchdog zombies without consuming exit statuses belonging to libuv.
+The watchdog directly reports its PID, current parent and kernel birth time over a separate
+Linux-only pipe. Partial writes MUST complete and that descriptor MUST close before any timer
+is armed: an already elapsed watchdog deadline cannot kill the messengers before registration.
+That pinned lifetime may remain pending while its reported intermediate is still the parent,
+but cannot be waited on yet. On registration or arming failure the Linux intermediate drains
+and reaps its own unarmed watchdog before reporting failure. Reaping MUST use only positive, specifically reported PIDs
+with `WNOHANG`, after a fresh synchronous `/proc/<pid>/stat` read verifies zombie state, this
+observer as parent, the pinned birth time, and the original launcher's group and session. A live
+child, a PID with another parent, a recycled PID, or unreadable identity MUST never be waited on.
+No wildcard wait, process signal, general SIGCHLD handler, or automatic subreaper enablement is
+permitted. Ordinary Linux observers and macOS perform no reaping. A transient outstanding
+watchdog is polled with an unreferenced timer; the timer stops when no reported lifetimes remain.
+For example, a libuv-spawned authored command keeps its real exit code while an adopted watchdog
+is reaped. This wait-only identity does not extend the ownership/signal rules in §4. The watchdog
+still cannot be waited on by authored work and retains its independent self-group deadline across
+observer death. Verified by `plugins/source-command-poll/src/watchdog-reaper.test.ts`,
+`watchdog-registration.test.ts` (before-timer registration and unarmed failure),
+`watchdog-reaping.test.ts` (native Linux subreaper, authored and unrelated libuv exit codes), and
+`watchdog-reaping.docker.test.ts` (12 real observations as PID 1 without an init).
+
 Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
 `@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
 Each tarball carries the JavaScript wrapper, MIT license, integrity/hash manifest and

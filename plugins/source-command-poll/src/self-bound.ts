@@ -5,6 +5,8 @@
  * a waitable child of authored work. Keeping itself in
  * the group makes kill(0) identity-safe even after every other member has exited:
  * this live member prevents group-ID reuse, with no remembered numeric target.
+ * A Linux-only registration pipe reports its exact lifetime before timers can
+ * kill its intermediates, allowing safe reaping by an adopting observer.
  */
 
 /**
@@ -18,6 +20,23 @@ try {
 const {Socket} = require('node:net');
 const {deadline, grace} = JSON.parse(process.argv[1]);
 const now = () => Number(process.hrtime.bigint() / 1000000n);
+if (process.platform === 'linux') {
+  // Report directly to the observer, not through either short-lived parent.
+  // An already elapsed deadline may kill both parents as soon as it is armed;
+  // the complete birth identity must be buffered on its own pipe first. This
+  // descriptor is separate from admission status and is closed before arming.
+  const {readFileSync, writeSync, closeSync} = require('node:fs');
+  const stat = readFileSync('/proc/self/stat', 'utf8');
+  const startTime = stat.slice(stat.lastIndexOf(') ') + 2).trim().split(/\s+/)[19];
+  if (!/^\d+$/.test(startTime)) throw new Error('Missing watchdog birth identity');
+  const frame = Buffer.from(JSON.stringify({kind: 'watchdog', pid: process.pid, parent: process.ppid, startTime}) + '\n');
+  for (let offset = 0; offset < frame.length;) {
+    const written = writeSync(5, frame, offset, frame.length - offset);
+    if (written <= 0) throw new Error('Watchdog registration write made no progress');
+    offset += written;
+  }
+  closeSync(5);
+}
 // The launcher created a new session, and this program never changes group.
 // Signal the current group, not a persisted PID that could have been recycled.
 process.on('SIGTERM', () => {});
@@ -84,7 +103,17 @@ function parentWatchdog() {
   const {spawn} = require('node:child_process');
   const {watchdog, deadline, grace} = JSON.parse(process.argv[1]);
   let settled = false;
+  let pendingFailure;
+  let watchdogClosed = false;
   function finish(message, code) {
+    if (process.platform === 'linux' && code !== 0) {
+      // A registration failure leaves no birth proof at the observer. Retain
+      // the first diagnostic and let libuv reap our own unarmed child before
+      // exiting; otherwise that unregistered failure could itself be adopted.
+      pendingFailure ??= {message, code};
+      if (!watchdogClosed) return;
+      ({message, code} = pendingFailure);
+    }
     if (settled) return;
     settled = true;
     process.send(message, error => process.exit(error ? 1 : code));
@@ -92,11 +121,18 @@ function parentWatchdog() {
   const child = spawn(process.execPath, ['--input-type=commonjs', '-e', watchdog, JSON.stringify({deadline, grace})], {
     // The role identifies a bound, never ownership. Authored code can forge this
     // role and cause withholding (a leak), but cannot gain signal authority.
-    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'],
+    // Only Linux carries a separate, wait-only identity descriptor. It is
+    // never the admission pipe or the journal's macOS life-token descriptor.
+    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc', ...(process.platform === 'linux' ? [5] : [])],
     env: {...process.env, AGENTMONITORS_COMMAND_ROLE: 'watchdog'},
   });
   child.once('error', error => finish({kind: 'error', error: String(error.message || error)}, 1));
-  child.once('exit', () => finish({kind: 'error', error: 'Watchdog exited before arming'}, 1));
+  if (process.platform === 'linux') {
+    child.once('close', () => {
+      watchdogClosed = true;
+      finish({kind: 'error', error: 'Watchdog exited before arming'}, 1);
+    });
+  } else child.once('exit', () => finish({kind: 'error', error: 'Watchdog exited before arming'}, 1));
   child.once('message', message => {
     if (message !== 'armed') {
       finish({kind: 'error', error: message && message.kind === 'error' ? message.error : 'Invalid watchdog acknowledgement'}, 1);
@@ -253,7 +289,9 @@ async function launch({command, env, deadline, grace, watchdog, native, openFile
     throw execError(denied ? koffi.os.errno.EACCES : errno);
   }
   const child = spawn(process.execPath, ['--input-type=commonjs', '-e', '(' + parentWatchdog.toString() + ')()', JSON.stringify({watchdog, deadline, grace})], {
-    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc'], env: process.env,
+    // Relay the observer's dedicated Linux registration pipe without owning
+    // its framing. The watchdog writes and closes it before any timer can fire.
+    detached: false, stdio: ['ignore', 'ignore', 'ignore', 3, 'ipc', ...(process.platform === 'linux' ? [6] : [])], env: process.env,
   });
   let acknowledged = false;
   child.once('error', fail);

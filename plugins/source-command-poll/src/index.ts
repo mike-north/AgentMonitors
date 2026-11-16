@@ -27,6 +27,7 @@ import {
 
 import { vendoredNativeLoader } from './native-binding.js';
 import { inheritedOpenFileLimits } from './open-file-limits.js';
+import { trackAdoptedWatchdog } from './watchdog-reaper.js';
 import {
   LAUNCHER_PROGRAM,
   WATCHDOG_PROGRAM,
@@ -433,7 +434,11 @@ async function runCommand(
         detached: !isWindows,
         stdio: isWindows
           ? ['ignore', 'pipe', 'pipe']
-          : ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
+          : // Linux alone has a seventh descriptor: direct watchdog identity,
+            // separate from the close-on-exec admission status on descriptor 5.
+            process.platform === 'linux'
+            ? ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe']
+            : ['ignore', 'pipe', 'pipe', 'pipe', 'pipe', 'pipe'],
       },
     );
 
@@ -474,6 +479,71 @@ async function runCommand(
       | { code: number | null; signal: NodeJS.Signals | null }
       | undefined;
     let controlInput = '';
+    // Linux watchdogs report themselves before arming, directly through a
+    // separate descriptor. Neither intermediate death nor admission errors can
+    // erase a buffered identity or interleave bytes with this single writer.
+    const registration = child.stdio.at(6);
+    let registrationEnded = !(registration instanceof Duplex);
+    let registrationInput = '';
+    /** Drain registration independently of admission; either channel can reach EOF first. */
+    function registrationFinished(): void {
+      if (registrationEnded) return;
+      registrationEnded = true;
+      if (registrationInput.length > 0) {
+        armingError = 'Incomplete watchdog registration frame';
+      }
+      if (pendingExit) resolveFromExit(pendingExit.code, pendingExit.signal);
+    }
+    if (registration instanceof Duplex) {
+      registration.on('data', (chunk: Buffer) => {
+        registrationInput += chunk.toString();
+        const lines = registrationInput.split('\n');
+        registrationInput = lines.pop() ?? '';
+        for (const line of lines) {
+          try {
+            const message: unknown = JSON.parse(line);
+            if (
+              typeof message !== 'object' ||
+              message === null ||
+              Object.keys(message).length !== 4 ||
+              !('kind' in message) ||
+              message.kind !== 'watchdog' ||
+              !('pid' in message) ||
+              typeof message.pid !== 'number' ||
+              !Number.isSafeInteger(message.pid) ||
+              message.pid <= 1 ||
+              !('parent' in message) ||
+              typeof message.parent !== 'number' ||
+              !Number.isSafeInteger(message.parent) ||
+              message.parent < 1 ||
+              !('startTime' in message) ||
+              typeof message.startTime !== 'string' ||
+              !/^\d+$/.test(message.startTime) ||
+              child.pid === undefined
+            ) {
+              armingError = 'Invalid watchdog registration schema';
+              continue;
+            }
+            // The private report grants wait authority only. Every actual wait
+            // rechecks birth, group, session, adoption and zombie state.
+            trackAdoptedWatchdog(
+              message.pid,
+              message.startTime,
+              child.pid,
+              message.parent,
+            );
+          } catch {
+            armingError = 'Invalid watchdog registration frame';
+          }
+        }
+      });
+      registration.once('end', registrationFinished);
+      registration.once('close', registrationFinished);
+      registration.on('error', () => {
+        armingError = 'Could not read watchdog registration';
+        registrationFinished();
+      });
+    }
     if (status instanceof Duplex) {
       status.on('error', () => {
         /* A vanished daemon/worker cannot revoke the bound. */
@@ -653,7 +723,7 @@ async function runCommand(
       code: number | null,
       signal: NodeJS.Signals | null,
     ): void {
-      if (!statusEnded) {
+      if (!statusEnded || !registrationEnded) {
         pendingExit = { code, signal };
         return;
       }
