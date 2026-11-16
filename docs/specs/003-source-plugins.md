@@ -1793,6 +1793,17 @@ valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, l
 whose backing app is closed). The failure category is reserved for executions that produce no
 result at all (§11.5).
 
+On macOS, an optional durable command owner also supplies its committed life-token tuple after
+`environment()` resolves. The source passes it through the private launcher configuration, not
+the authored environment. The launcher opens it asynchronously with no-follow and nonblocking semantics, rejects
+non-regular replacements promptly before watchdog arming, and
+checks its fstat device/inode. After the watchdog is armed and the inherited resource-limit pair
+is restored and verified, it clears and verifies `FD_CLOEXEC` on that one descriptor. Every failure
+refuses authored exec and retains the baseline. The extra descriptor deliberately survives into
+commands and ordinary shell children so the restart sweep can prove each restricted PID from its
+own vnode (008 §4.2). The descriptor number is never ownership evidence; the watchdog retains its
+existing environment-based proof, and Linux admission is unchanged.
+
 ### 11.3 Change-detection strategies
 
 Mirrors `api-poll` (§4.2), substituting the local-process equivalents:

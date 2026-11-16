@@ -1,5 +1,5 @@
 /**
- * macOS envp-only ownership reader. A sweep owns one asynchronous stock JXA
+ * macOS per-PID environment and inherited-vnode ownership reader. A sweep owns one asynchronous stock JXA
  * helper, reused for discovery batches and fresh signal-time checks. Kernel
  * argument buffers stay inside the helper; its protocol returns only the reserved
  * ownership value, optional watchdog role or explicit uncertainty. No shell, PATH lookup, or native addon
@@ -13,6 +13,11 @@ import {
 } from 'node:child_process';
 import type { Readable, Writable } from 'node:stream';
 import { z } from 'zod';
+import {
+  commandLifeTokenPresent,
+  type CommandLifeToken,
+} from './command-life-token.js';
+import { DARWIN_VNODE_PROOF } from './darwin-vnode-proof.js';
 import { DARWIN_PROCARGS_PARSER } from './darwin-procargs.js';
 import type { CommandMarks } from './command-process-marks.js';
 import { sendVerifiedSignal } from './process-identity.js';
@@ -25,6 +30,8 @@ const responseSchema = z.array(
     z.string().nullable(),
     z.boolean(),
     z.boolean().optional(),
+    z.boolean().optional(),
+    z.string().max(256).optional(),
   ]),
 );
 /** Scope helper ownership to the caller rather than a global long-lived child. */
@@ -39,6 +46,7 @@ const HELPER = String.raw`
 ObjC.import('Foundation');
 ObjC.bindFunction('sysctl', ['int', ['void *', 'unsigned int', 'void *', 'void *', 'void *', 'unsigned long']]);
 ${DARWIN_PROCARGS_PARSER}
+${DARWIN_VNODE_PROOF}
 // Latin-1 preserves all kernel bytes, including NULs, without decoding argv/envp.
 function bytes(value) {
   return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(value, $.NSISOLatin1StringEncoding));
@@ -93,17 +101,28 @@ while (true) {
   if (pending.length > 32 * 1024 * 1024) throw new Error('Request too large');
   var newline;
   while ((newline = pending.indexOf('\n')) >= 0) {
-    var pids = JSON.parse(pending.slice(0, newline));
+    var request = JSON.parse(pending.slice(0, newline));
+    var pids = Array.isArray(request) ? request : request.pids;
+    var tokens = Array.isArray(request) ? [] : request.tokens;
     pending = pending.slice(newline + 1);
     var result = pids.map(function(pid) {
+      var environmentReadable = false;
       try {
         var data = query(pid);
+        var mark = parseDarwinProcargs(data);
+        environmentReadable = true;
         var role = parseDarwinProcargs(data, 'AGENTMONITORS_COMMAND_ROLE');
-        var result = [pid, parseDarwinProcargs(data), false];
+        var result = [pid, mark, false];
         if (role === 'watchdog') result.push(true);
         return result;
       }
-      catch (_) { return [pid, null, true]; }
+      catch (_) {
+        // Fallback is available only when envp is unreadable. A readable
+        // absent/conflicting nonce retains its original meaning unchanged.
+        if (environmentReadable || tokens.length === 0) return [pid, null, true];
+        try { return [pid, queryVnodeOwnership(pid, tokens), false, false, true]; }
+        catch (error) { return [pid, null, true, false, false, String(error.message)]; }
+      }
     });
     stdout.writeData($.NSString.alloc.initWithString(JSON.stringify(result) + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
   }
@@ -113,8 +132,9 @@ while (true) {
 /** Own one helper for the whole reconciliation, including exceptional exits. @internal */
 export async function withDarwinCommandMarkReader<T>(
   operation: () => Promise<T>,
+  tokens: readonly CommandLifeToken[] = [],
 ): Promise<T> {
-  const reader = new DarwinCommandMarkReader();
+  const reader = new DarwinCommandMarkReader(tokens);
   try {
     return await readers.run(reader, operation);
   } finally {
@@ -133,6 +153,8 @@ export async function readDarwinCommandMarks(
 
 /** A failed helper stays failed for its scope; uncertainty never becomes an empty mark map. */
 class DarwinCommandMarkReader {
+  /** Only committed journal tuples are supplied; files are revalidated per read. */
+  constructor(private readonly tokens: readonly CommandLifeToken[]) {}
   private child: ChildProcess | undefined;
   private failure: string | undefined;
   private output = '';
@@ -227,13 +249,25 @@ class DarwinCommandMarkReader {
     if (this.failure) return { supported: false, reason: this.failure };
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
+      const tokens: CommandLifeToken[] = [];
+      for (const token of this.tokens) {
+        if (await commandLifeTokenPresent(token)) tokens.push(token);
+      }
+      if (this.failure) return { supported: false, reason: this.failure };
       const output = await new Promise<string>((resolve, reject) => {
         this.answer = resolve;
         this.reject = reject;
         timer = setTimeout(() => {
           this.fail('timed out');
         }, 5_000);
-        this.child?.stdin?.write(`${JSON.stringify(pids)}\n`);
+        const request = tokens.length === 0 ? pids : { pids, tokens };
+        // ASCII JSON preserves Unicode paths through byte-oriented framing,
+        // including pipe chunks split inside a UTF-8 character or surrogate pair.
+        const payload = JSON.stringify(request).replace(
+          /[\u007f-\uffff]/g,
+          (value) => `\\u${value.charCodeAt(0).toString(16).padStart(4, '0')}`,
+        );
+        this.child?.stdin?.write(`${payload}\n`);
       });
       const rows = responseSchema.parse(JSON.parse(output));
       const wanted = new Set(pids);
@@ -246,10 +280,24 @@ class DarwinCommandMarkReader {
       const marks = new Map<number, string>();
       const unreadable: number[] = [];
       const watchdogs = new Set<number>();
-      for (const [pid, mark, uncertain, watchdog] of rows) {
-        if (uncertain) unreadable.push(pid);
-        else if (mark !== null) {
+      const vnodes = new Set<number>();
+      const unreadableReasons = new Map<number, string>();
+      for (const [pid, mark, uncertain, watchdog, vnode, reason] of rows) {
+        if (uncertain) {
+          unreadable.push(pid);
+          if (reason) unreadableReasons.set(pid, reason);
+          else if (this.tokens.length > 0 && tokens.length === 0)
+            unreadableReasons.set(
+              pid,
+              'macOS ownership unreadable; committed vnode metadata is missing or its file is unavailable',
+            );
+        } else if (mark !== null) {
+          // Protocol evidence can grant only a nonce from this scope's valid
+          // committed tuple. Native evidence must belong to this exact PID.
+          if (vnode && !tokens.some((token) => token.life === mark))
+            throw new Error('Unjournaled vnode ownership');
           marks.set(pid, mark);
+          if (vnode) vnodes.add(pid);
           if (watchdog) watchdogs.add(pid);
         }
       }
@@ -258,6 +306,8 @@ class DarwinCommandMarkReader {
         marks,
         watchdogs,
         unreadable,
+        ...(vnodes.size > 0 ? { vnodes } : {}),
+        ...(unreadableReasons.size > 0 ? { unreadableReasons } : {}),
         unreadableReason:
           'macOS kernel process environment is unreadable or its argv/envp layout is ambiguous; ownership is unproven',
       };

@@ -8,9 +8,18 @@
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
+export interface CommandLifeToken {
+    readonly device: string;
+    readonly inode: string;
+    readonly life: string;
+    readonly path: string;
+}
+
+// @public
 export interface CommandProcessOwner {
     environment(): Promise<Readonly<Record<string, string>>>;
     exited(pid: number): void;
+    lifeToken?(): CommandLifeToken | undefined;
     spawned(pid: number): void;
 }
 
