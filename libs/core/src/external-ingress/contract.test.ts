@@ -342,17 +342,18 @@ describe('external envelope enforcement boundaries', () => {
       );
     });
   }
-  for (const field of [
-    'instructions',
-    'urgency',
-    'notify',
-    'notifyPolicy',
-    'workspacePath',
-    'monitorPath',
-    'path',
-  ]) {
+  // Valid policy values pin the authority boundary independently of value syntax.
+  for (const [field, value] of Object.entries({
+    instructions: 'Report failed builds',
+    urgency: 'high',
+    notify: { strategy: 'immediate' },
+    notifyPolicy: { strategy: 'immediate' },
+    workspacePath: '/tmp/producer-workspace',
+    monitorPath: '/tmp/producer-monitor',
+    path: '/tmp/producer-state',
+  })) {
     it(`refuses producer control of ${field}`, () => {
-      expectError({ ...envelope(), [field]: 'SECRET' }, 'invalid_envelope');
+      expectError({ ...envelope(), [field]: value }, 'invalid_envelope');
     });
   }
   it('normalizes ordered equivalents to identical canonical bytes and fingerprints repeatedly', () => {
@@ -461,11 +462,11 @@ describe('external envelope budget before canonicalization', () => {
       .spyOn(Object, 'getOwnPropertyDescriptor')
       .mockImplementation((value, key) => {
         visits += 1;
-        // A bounded sentinel makes the pre-fix exponential traversal safe to execute.
+        // The sentinel prevents a budget regression from exhausting the test process.
         if (visits > 50_000) throw new Error('Unbounded traversal');
         return original(value, key);
       });
-    // Refuse entry to unbounded legacy passes so the red case cannot expand the DAG.
+    // Guard JSON entry points so a missing preflight cannot expand the DAG in tests.
     const assert = vi
       .spyOn(json, 'assertExternalJsonValue')
       .mockImplementation(() => {

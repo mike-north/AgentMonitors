@@ -54,7 +54,7 @@ function stringBytes(value: string, remaining: number): number {
  * a shared-child DAG cannot cause exponential work before refusal. Arrays can be
  * refused from their length; record own-key enumeration still costs native width,
  * but descriptors, children and string scanning stop at the first overrun. No
- * sorting, JSON encoding, parsing or fingerprinting is done during this walk.
+ * sorting, full-document encoding, parsing or fingerprinting is done during this walk.
  * The caller supplies root depth so state retains its inclusive depth-1 policy.
  * @internal
  */
