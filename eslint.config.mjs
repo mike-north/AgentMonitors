@@ -58,6 +58,7 @@ export default tseslint.config(
     files: [
       'scripts/**/*.mjs',
       'libs/core/src/runtime/test-fixtures/**/*.mjs',
+      'libs/core/src/external-ingress/contract-probe.fixture.mjs',
       'apps/cli/src/commands/fixtures/owned-capture-group.mjs',
       'apps/cli/src/commands/fixtures/ingress-preload.mjs',
     ],

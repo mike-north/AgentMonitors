@@ -1,7 +1,10 @@
 /** Contract examples pin resource admission, producer authority and canonical identity. */
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import * as json from './json.js';
+import * as budget from './envelope-budget.js';
 import {
   canonicalJsonStringify,
   externalEventLimits,
@@ -37,6 +40,20 @@ describe('external ingress envelope validation', () => {
     );
   });
 
+  it('pins the complete inclusive limits to 002 section 16.1', () => {
+    expect(externalEventLimits).toEqual({
+      envelopeBytes: 262_144,
+      identifierBytes: 512,
+      resumeTokenBytes: 2_048,
+      scopeKeys: 32,
+      scopeBytes: 32_768,
+      scopeKeyBytes: 64,
+      scopeValuesPerKey: 16,
+      scopeValueBytes: 512,
+      stateDepth: 32,
+    });
+  });
+
   it('keeps exported enforcement metadata immutable at runtime', () => {
     expect(Object.isFrozen(externalEventLimits)).toBe(true);
     expect(Object.isFrozen(externalEventReservedScopeKeys)).toBe(true);
@@ -49,7 +66,7 @@ describe('external ingress envelope validation', () => {
     ).toBe(false);
     expectError(
       envelope({
-        monitorId: 'x'.repeat(externalEventLimits.identifierBytes + 1),
+        monitorId: 'x'.repeat(512 + 1),
       }),
       'payload_too_large',
     );
@@ -130,7 +147,7 @@ describe('external ingress envelope validation', () => {
 
   it('enforces scope shape, cardinality, and reserved names', () => {
     const maxKeys = Object.fromEntries(
-      Array.from({ length: externalEventLimits.scopeKeys }, (_, index) => [
+      Array.from({ length: 32 }, (_, index) => [
         `key${String(index)}`,
         'value',
       ]),
@@ -196,7 +213,10 @@ function byteString(bytes: number, multibyte: boolean): string {
 }
 
 /** Keep individual fields valid while filling the independent canonical scope budget. */
-function scopeAtBytes(bytes: number): Record<string, string[]> {
+function scopeAtBytes(
+  bytes: number,
+  multibyte = false,
+): Record<string, string[]> {
   const scope: Record<string, string[]> = {};
   let remaining = bytes - 2;
   for (let key = 0; remaining > 0; key += 1) {
@@ -207,7 +227,7 @@ function scopeAtBytes(bytes: number): Record<string, string[]> {
     while (remaining > 0 && values.length < 16) {
       const overhead = values.length === 0 ? 2 : 3;
       const size = Math.min(512, remaining - overhead);
-      values.push('x'.repeat(size));
+      values.push(byteString(size, multibyte));
       remaining -= size + overhead;
     }
     scope[name] = values;
@@ -226,10 +246,7 @@ describe('external envelope enforcement boundaries', () => {
       'resumeToken',
     ] as const) {
       it(`bounds ${field} in ${multibyte ? 'multibyte' : 'ASCII'} bytes`, () => {
-        const limit =
-          field === 'resumeToken'
-            ? externalEventLimits.resumeTokenBytes
-            : externalEventLimits.identifierBytes;
+        const limit = field === 'resumeToken' ? 2_048 : 512;
         expect(
           validateExternalEventEnvelope(
             envelope({ [field]: byteString(limit, multibyte) }),
@@ -243,10 +260,7 @@ describe('external envelope enforcement boundaries', () => {
     }
     for (const field of ['key', 'value'] as const) {
       it(`bounds scope ${field} in ${multibyte ? 'multibyte' : 'ASCII'} bytes`, () => {
-        const limit =
-          field === 'key'
-            ? externalEventLimits.scopeKeyBytes
-            : externalEventLimits.scopeValueBytes;
+        const limit = field === 'key' ? 64 : 512;
         const scope = (bytes: number) =>
           field === 'key'
             ? { [byteString(bytes, multibyte)]: 'value' }
@@ -256,11 +270,17 @@ describe('external envelope enforcement boundaries', () => {
             .success,
         ).toBe(true);
         expectError(envelope({ scope: scope(limit + 1) }), 'payload_too_large');
-        if (field === 'value')
+        if (field === 'value') {
+          expect(
+            validateExternalEventEnvelope(
+              envelope({ scope: { key: [byteString(limit, multibyte)] } }),
+            ).success,
+          ).toBe(true);
           expectError(
             envelope({ scope: { key: [byteString(limit + 1, multibyte)] } }),
             'payload_too_large',
           );
+        }
       });
     }
   }
@@ -269,10 +289,7 @@ describe('external envelope enforcement boundaries', () => {
       validateExternalEventEnvelope(
         envelope({
           scope: {
-            key: Array.from(
-              { length: externalEventLimits.scopeValuesPerKey },
-              () => '',
-            ),
+            key: Array.from({ length: 16 }, () => ''),
           },
         }),
       ).success,
@@ -280,34 +297,31 @@ describe('external envelope enforcement boundaries', () => {
     expectError(
       envelope({
         scope: {
-          key: Array.from(
-            { length: externalEventLimits.scopeValuesPerKey + 1 },
-            () => '',
-          ),
+          key: Array.from({ length: 16 + 1 }, () => ''),
         },
       }),
       'payload_too_large',
     );
   });
-  it('bounds canonical scope bytes exactly', () => {
-    for (const extra of [0, 1]) {
-      const scope = scopeAtBytes(externalEventLimits.scopeBytes + extra);
-      expect(Buffer.byteLength(canonicalJsonStringify(scope))).toBe(
-        externalEventLimits.scopeBytes + extra,
-      );
-      if (extra === 0)
-        expect(validateExternalEventEnvelope(envelope({ scope })).success).toBe(
-          true,
+  for (const multibyte of [false, true]) {
+    it(`bounds canonical scope bytes exactly with ${multibyte ? 'multibyte' : 'ASCII'} values`, () => {
+      for (const extra of [0, 1]) {
+        const scope = scopeAtBytes(32_768 + extra, multibyte);
+        expect(Buffer.byteLength(canonicalJsonStringify(scope))).toBe(
+          32_768 + extra,
         );
-      else expectError(envelope({ scope }), 'payload_too_large');
-    }
-  });
+        if (extra === 0)
+          expect(
+            validateExternalEventEnvelope(envelope({ scope })).success,
+          ).toBe(true);
+        else expectError(envelope({ scope }), 'payload_too_large');
+      }
+    });
+  }
   it('bounds canonical envelope bytes including escaping and UTF-8', () => {
     for (const prefix of ['', 'é😀\\\n\u0000\ud800']) {
       const base = envelope({ state: { value: prefix } });
-      const padding =
-        externalEventLimits.envelopeBytes -
-        Buffer.byteLength(canonicalJsonStringify(base));
+      const padding = 262_144 - Buffer.byteLength(canonicalJsonStringify(base));
       expect(
         validateExternalEventEnvelope(
           envelope({ state: { value: prefix + 'x'.repeat(padding) } }),
@@ -332,12 +346,11 @@ describe('external envelope enforcement boundaries', () => {
         return child as ExternalJsonObject;
       };
       expect(
-        validateExternalEventEnvelope(
-          envelope({ state: stateAtDepth(externalEventLimits.stateDepth) }),
-        ).success,
+        validateExternalEventEnvelope(envelope({ state: stateAtDepth(32) }))
+          .success,
       ).toBe(true);
       expectError(
-        envelope({ state: stateAtDepth(externalEventLimits.stateDepth + 1) }),
+        envelope({ state: stateAtDepth(32 + 1) }),
         'payload_too_large',
       );
     });
@@ -429,12 +442,23 @@ describe('external envelope enforcement boundaries', () => {
 });
 
 describe('external envelope budget before canonicalization', () => {
+  it('checks actual canonical bytes even if preflight undercounts', () => {
+    const count = vi.spyOn(budget, 'envelopeJsonBytes').mockReturnValue(0);
+    try {
+      expectError(
+        envelope({ state: { value: 'é'.repeat(160_000) } }),
+        'payload_too_large',
+      );
+    } finally {
+      count.mockRestore();
+    }
+  });
   it('stops an oversized string before encoding, parsing or visiting its later sibling', () => {
     const encode = vi.spyOn(json, 'canonicalJsonStringify');
     const parse = vi.spyOn(JSON, 'parse');
     const descriptor = vi.spyOn(Object, 'getOwnPropertyDescriptor');
     const state = {
-      first: 'x'.repeat(externalEventLimits.envelopeBytes + 1),
+      first: 'x'.repeat(262_144 + 1),
       later: true,
     };
     try {
@@ -450,42 +474,6 @@ describe('external envelope budget before canonicalization', () => {
       encode.mockRestore();
       parse.mockRestore();
       descriptor.mockRestore();
-    }
-  });
-  it('cuts off a 32-level shared-child DAG within the byte budget', () => {
-    let state: ExternalJsonObject = {};
-    for (let depth = 1; depth < 32; depth += 1)
-      state = { left: state, right: state };
-    const original = Object.getOwnPropertyDescriptor;
-    let visits = 0;
-    const descriptor = vi
-      .spyOn(Object, 'getOwnPropertyDescriptor')
-      .mockImplementation((value, key) => {
-        visits += 1;
-        // The sentinel prevents a budget regression from exhausting the test process.
-        if (visits > 50_000) throw new Error('Unbounded traversal');
-        return original(value, key);
-      });
-    // Guard JSON entry points so a missing preflight cannot expand the DAG in tests.
-    const assert = vi
-      .spyOn(json, 'assertExternalJsonValue')
-      .mockImplementation(() => {
-        throw new Error('Unbounded validation');
-      });
-    const encode = vi
-      .spyOn(json, 'canonicalJsonStringify')
-      .mockImplementation(() => {
-        throw new Error('Unbounded encoding');
-      });
-    try {
-      expectError(envelope({ state }), 'payload_too_large');
-      expect(visits).toBeLessThan(externalEventLimits.envelopeBytes);
-      expect(encode).not.toHaveBeenCalled();
-      expect(assert).not.toHaveBeenCalled();
-    } finally {
-      descriptor.mockRestore();
-      encode.mockRestore();
-      assert.mockRestore();
     }
   });
   it('stops wide object and array traversal at the first overrun', () => {
@@ -524,4 +512,36 @@ describe('external envelope budget before canonicalization', () => {
       encode.mockRestore();
     }
   });
+});
+
+/** Subprocesses isolate prototype replacements and cap pathological allocation regressions. */
+describe('external envelope isolated admission guarantees', () => {
+  for (const scenario of [
+    'early-string',
+    'early-wide',
+    'allocation',
+    'iterator-getter',
+    'iterator-throw',
+    'string-bypass',
+    'semantic-intrinsics',
+    'scope-prototype-hole',
+    'dag',
+  ]) {
+    it(`preserves admission under ${scenario}`, () => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--max-old-space-size=512',
+          '--expose-gc',
+          fileURLToPath(
+            new URL('./contract-probe.fixture.mjs', import.meta.url),
+          ),
+          scenario,
+        ],
+        { encoding: 'utf8', timeout: 30_000 },
+      );
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+    }, 35_000);
+  }
 });
