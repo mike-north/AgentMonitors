@@ -9,6 +9,25 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-16 — Fail closed on synthetic libc names (003 §11.2; 008 §3.3) — Refs #643
+
+Synthetic or synthetic-looking mappings never establish glibc. Musl-shaped names
+still refuse on every mapping, including slash-delimited path segments and
+colon/bracket-delimited label segments in memfd, DMA-buffer, anonymous-inode and
+bracketed names. Real paths under `/memfd:…/` or `/dmabuf:…/` cannot hide musl.
+Harmless musl-shaped synthetic labels now refuse beside real glibc by design:
+ambiguous text may cause needless refusal, never admission on a non-glibc host.
+Injected maps tests cover both musl families, deleted suffixes and CR/U+2028/U+2029.
+
+## 2026-11-15 — Ignore synthetic mappings in Linux libc evidence (003 §11.2; 008 §3.3) — Refs #643
+
+Only absolute filesystem paths contribute mapped libc evidence. Kernel memory-object
+names, bracketed pseudo-mappings and pathless/nonabsolute records contribute nothing,
+including caller-controlled memfd and DMA-buffer labels that resemble libc filenames.
+Deleted real files still count; anonymous device numbers do not exclude real overlay
+files. Injected maps tests cover synthetic names beside glibc and as the only evidence,
+while preserving real musl precedence and refusal before native loading.
+
 ## 2026-11-15 — Preserve musl precedence for every pathname character (003 §11.2; 008 §3.3) — Refs #640
 
 Musl wildcard matching covers CR, U+2028 and U+2029 retained in mapped pathnames,

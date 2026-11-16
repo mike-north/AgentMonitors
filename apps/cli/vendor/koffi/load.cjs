@@ -2,8 +2,9 @@
  * Native capture and admission are package-relative and allowlisted. The daemon
  * reads limits; disposable launchers mutate process state. No registry resolution,
  * native search, lifecycle script or source compilation can be a fallback.
- * Linux admission inspects mapped libc before any native initializer can run;
- * uncertain evidence refuses without diagnostics or subprocesses. The refresh
+ * Linux admission requires file-backed glibc before any native initializer can run;
+ * musl-shaped names veto loading even on synthetic mappings. Ambiguous labels
+ * deliberately cause needless refusal, never positive evidence. The refresh
  * script copies this file into each package beside its payload.
  */
 const path = require('node:path');
@@ -32,24 +33,40 @@ try {
             /^[\da-f]+-[\da-f]+\s+[rwxps-]{4}\s+[\da-f]+\s+[\da-f]+:[\da-f]+\s+\d+(?:\s+(.*))?$/s,
           );
           if (!record) throw new Error('unrecognized mapping');
-          // Deleted files remain mapped evidence until the process unmaps them.
-          return path.posix.basename(
-            (record[1] || '').replace(/ \(deleted\)$/, ''),
-          );
+          // Preserve every name for the musl veto. Deleted real files still
+          // establish glibc; removing this kernel suffix also exposes musl labels.
+          return (record[1] || '').replace(/ \(deleted\)$/, '');
         });
     } catch {
       throw new Error('glibc is required');
     }
-    // A positive glibc filename alone is insufficient when musl is also mapped.
+    // Only absolute, nonsynthetic paths can establish glibc. Caller-chosen
+    // memfd/dmabuf labels cannot be distinguished from real paths under matching
+    // root directories, so both deliberately remain ineligible as positive evidence.
+    // Linux sources: fs/proc/task_mmu.c, mm/memfd.c, ipc/shm.c,
+    // mm/{shmem,mmap,secretmem}.c, fs/aio.c, fs/anon_inodes.c and
+    // drivers/dma-buf/dma-buf.c (https://github.com/torvalds/linux).
+    // Device numbers cannot distinguish synthetic objects from real files:
+    // container overlays also allocate anonymous devices for mapped libc.
+    const glibc = filenames.some(
+      (filename) =>
+        filename.startsWith('/') &&
+        !/^\/(?:memfd:|dmabuf:|SYSV[\da-f]{8}$|dev\/zero$|anon_hugepage$|secretmem$|\[aio\]$)/.test(
+          filename,
+        ) &&
+        /^(?:libc\.so\.6|libc-2\.\d+\.so)$/.test(path.posix.basename(filename)),
+    );
+    // A musl name at any slash/colon/bracket boundary vetoes loading, including
+    // synthetic and nonabsolute names. Wildcards may span those delimiters too:
+    // splitting first could hide a real musl basename containing ':' or brackets.
+    // Harmless labels or directory segments may therefore cause needless refusal.
+    // dotAll keeps legal non-LF separators from hiding negative ABI evidence.
+    const musl = filenames.some((filename) =>
+      /(?:^|\/|:|\[|\])(?:ld-musl-.+\.so\.1|libc\.musl-.+)(?=$|\/|:|\[|\])/s.test(
+        filename,
+      ),
+    );
     // Static Node builds and hidden/unknown libc mappings deliberately refuse.
-    const glibc = filenames.some((name) =>
-      /^(?:libc\.so\.6|libc-2\.\d+\.so)$/.test(name),
-    );
-    // Musl wildcards cover every pathname character accepted by the record
-    // parser; a legal line separator must never hide negative ABI evidence.
-    const musl = filenames.some((name) =>
-      /^(?:ld-musl-.+\.so\.1|libc\.musl-.+)$/s.test(name),
-    );
     if (!glibc || musl) throw new Error('glibc is required');
   }
   const native = require(path.join(__dirname, platform, 'koffi.node'));
