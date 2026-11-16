@@ -3,4 +3,4 @@
 '@agentmonitors/source-command-poll': patch
 ---
 
-Ignore synthetic Linux memory mappings when identifying the running C library, so memory-object labels cannot admit or reject native command support.
+Require real glibc evidence before loading native command support on Linux. Synthetic or synthetic-looking mappings cannot establish glibc; musl-shaped path or label segments always refuse, including harmless synthetic labels beside real glibc. Ambiguous names deliberately cause refusal rather than admitting a non-glibc host.
