@@ -2149,6 +2149,19 @@ blocking made `doctor` exit non-zero for up to a day after every single upgrade,
 outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
 action needed" wording.
 
+**Target (Refs #462): `channel-session-unmatched` becomes the third advisory code, and the exit code
+agrees with the verdict.** A channel record whose session is no longer an active lead is normally a
+leftover from an ended session, which expires within the channel heartbeat TTL. Reported as a
+blocking problem, it made `doctor` print a healthy delivery verdict and still exit 1 after ordinary
+session churn. Target contract:
+
+- `channel-session-unmatched` is reported but never blocking, like the two codes above. It never
+  sets a transport's `fail` status on its own.
+- `doctor`'s exit status **MUST** agree with the delivery verdict line: whenever the verdict reports
+  delivery as deliverable, no delivery-transport check may fail. A genuinely wrong binding, where the
+  channel is the only route and it serves another session, already makes the verdict
+  undeliverable, so that case still fails.
+
 The section closes with a single verdict line: `delivery to active sessions in this workspace → via
 {hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is
 scoped to the workspace, not to the invoking session specifically — `doctor` has no per-session

@@ -9,6 +9,26 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — Session lifetime, held work, claim expiry and doctor exit status (target) — Refs #396, #636, #468, #462
+
+Four target decisions for delivery honesty. Current behaviour is unchanged until each one ships;
+roadmap G22 tracks them.
+
+- **002 §6.3, 007 §4.4 (#396).** A session is alive while its host process is alive. Inactivity is
+  no longer a liveness signal, because an agent may wait for a delivery with no hook activity.
+  Liveness checks are process checks that never reach the model. An explicit end reaps ephemeral
+  monitors. Losing the host without an end suspends them, and a resume re-arms them. Retention, not
+  a timer, retires a session that is never resumed. §6.2's inactivity trigger is marked for
+  replacement.
+- **002 §6.4 (#636).** Held notify work is never held forever or discarded silently. A cancel or a
+  retirement records a durable, visible terminal disposition. Suspension keeps the work and
+  releases it on resume.
+- **002 §7.1 (#468).** Claim expiry: a claim that is not acknowledged within a configurable claim
+  TTL returns to unread. Expiry is measured from the durable claim time and releases the
+  `coalesced-until-ack` mute. In-flight leases are unaffected. Delivery is at-least-once.
+- **005 doctor (#462).** `channel-session-unmatched` becomes advisory. `doctor`'s exit status agrees
+  with the delivery verdict.
+
 ## 2026-11-16 — Bound internal external-envelope admission
 
 002 §16.1 and 004 §6.1 define inclusive envelope limits and their exact boundary

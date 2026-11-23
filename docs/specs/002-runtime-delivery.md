@@ -2304,6 +2304,11 @@ Verified: `libs/core/src/runtime/store.ts` — `openSession()` (lines 102–152)
 
 > **Status: current** (Refs #312). Added so [007 §4.4](./007-agent-facing-interaction.md)'s
 > ephemeral monitors reap on a session going dormant, not only on an explicit close.
+>
+> **To be replaced by [§6.3](#63-session-liveness-by-host-process-and-suspension-target) (Refs #396).**
+> Inactivity does not show that a session has gone. An agent may legitimately wait, with no hook
+> activity, until a delivery arrives and then act on it; this trigger reaps that agent's watches at
+> the point it most needs them.
 
 §6.1 makes a session dormant on an **explicit** close (the `session close` verb, driven by the host's
 session-end hook). A session can also go away **without** an explicit close — the host crashes, the
@@ -2336,6 +2341,64 @@ Verified: `libs/core/src/runtime/service.ts` — `reapDormantSessions()` (called
 `reaps on per-session dormancy by inactivity` and `does NOT reap a session that is still within the
 dormancy window` cases in `libs/core/src/runtime/ephemeral-monitors.test.ts`.
 
+### 6.3 Session liveness by host process, and suspension (_target_)
+
+> **Status: target** (Refs #396). Replaces the inactivity trigger of [§6.2](#62-per-session-dormancy-current).
+
+A session is **alive while its host process is alive**. Activity, or its absence, is never a
+liveness signal.
+
+- **Liveness evidence.** When a session is opened or resumed, the adapter records the identity of
+  the host process that owns it: a process id plus evidence that rules out process-id reuse, such as
+  the process start time. The daemon decides liveness by checking that this exact process still
+  exists. The check **MUST NOT** send anything into the host's conversation. A liveness probe that
+  costs model input is out of contract, because after the host's prompt-cache window expires every
+  probe would resend the whole conversation.
+- **No inactivity reap.** While the host process is alive, the runtime **MUST NOT** make the session
+  dormant, suspend its ephemeral monitors or reap them, however long the session goes without a
+  hook or claim.
+- **Explicit end.** A session end reported by the host ([§6.1](#61-session-identity)) — for Claude
+  the `SessionEnd` hook, which also fires on `/clear` — reaps the session's ephemeral monitors as
+  today ([007 §4.4](./007-agent-facing-interaction.md)). This stays the primary reap path; it is the
+  only one while the host lives.
+- **Host loss without an end.** When the recorded host process is gone and no end was reported, as
+  after a crash or a killed host, the session becomes **suspended**. Its ephemeral monitors stop
+  observing; they are not reaped. Suspension keeps their durable state: source state, snapshots,
+  per-recipient cursors, delivery rows and held notify work ([§6.4](#64-held-notify-work-when-an-ephemeral-declaration-retires-or-suspends-target)).
+- **Resume.** Opening the session again with the same `(adapter, hostSessionId)`, such as a host
+  resume, records the new host process and re-arms its suspended ephemeral monitors. Each source
+  resumes from its own durable state, so changes made while suspended are observed on the next
+  tick rather than lost.
+- **Final expiry.** A suspended session that is never resumed is retired by the retention policy for
+  ephemeral records (Refs #395), not by a liveness timer. Retirement reaps its ephemeral monitors.
+- **Unknown liveness.** If the adapter cannot identify a host process, the session's ephemeral
+  monitors are kept until an explicit end or retention retires them. The runtime **MUST NOT** fall
+  back to an inactivity timer.
+
+Suspension is per session, like §6.2's dormancy, and is distinct from the daemon-wide idle
+self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server).
+
+### 6.4 Held notify work when an ephemeral declaration retires or suspends (_target_)
+
+> **Status: target** (Refs #636).
+
+Notify work that the runtime has accepted for an ephemeral monitor, such as a debounce batch or a
+rollup window, **MUST NOT** be held indefinitely or discarded silently when the declaration stops
+being evaluated.
+
+- **Cancellation** (`watch cancel`): the held work is recorded with an explicit terminal
+  disposition, _discarded on cancel_, at the moment of cancellation. The agent asked to stop
+  watching, so the work is not delivered after the cancel. The disposition is durable and appears in
+  `monitor explain` and `doctor`.
+- **Suspension** ([§6.3](#63-session-liveness-by-host-process-and-suspension-target)): the held work
+  is kept with its original acceptance and timing. On resume it is released through the normal
+  notify timing. A deadline that passed while suspended releases on the first tick after resume.
+- **Explicit session end, or retention retiring a suspended session**: the held work is recorded
+  with an explicit terminal disposition, _discarded on retirement_, durable and visible in the same
+  way as a cancellation.
+- After any of these, no "held" entry may remain for a retired declaration in `doctor` or
+  `monitor explain`.
+
 ## 7. Unread, Claimed, and Acknowledged
 
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):
@@ -2345,6 +2408,25 @@ For each projected event, the runtime tracks session-specific delivery state via
 - **Acknowledged:** `acknowledgedAt IS NOT NULL`. The session explicitly marked the event read.
 
 This distinction matters because a claimed event may still need user or agent attention later.
+
+### 7.1 Claim expiry (_target_)
+
+> **Status: target** (Refs #468; origin #434).
+
+A claim that is not followed by an acknowledgement within the **claim TTL** expires: the event
+returns from claimed to unread and becomes deliverable again. This adds one edge to the three-state
+model, claimed → unread. Expiry never acknowledges. An acknowledgement keeps its meaning,
+"handled", and delivery becomes at-least-once without relying on the agent to acknowledge.
+
+- The claim TTL is one configurable duration. Its default is an implementation choice, documented
+  with the CLI ([005](./005-cli-reference.md)).
+- Expiry is computed from the durable claim time, so it behaves the same across daemon restarts.
+- An expired event follows its own urgency's delivery rules again ([§9](#9-delivery-lifecycles)).
+  Expiry also releases the `coalesced-until-ack` mute that the claim held.
+- In-flight delivery leases (`reserved-in-flight`) are a separate mechanism, already
+  self-resolving, and are unaffected by claim expiry.
+- A long task may therefore see an event delivered twice. That is accepted: a duplicate costs less
+  than a missed event.
 
 Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
 
