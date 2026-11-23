@@ -764,6 +764,19 @@ The real-CLI/live-daemon cases in
 `apps/cli/src/commands/held-notify.integration.test.ts` enforce this outcome and
 rejected-definition debounce/rollup text/JSON parity.
 
+**Delivery counts (current, #572).** The delivery stage's reason and JSON `details` count the
+monitor's projections per lead session by what the session was actually shown:
+
+- `unread` — projected, never surfaced to the session.
+- `claimed` — surfaced to the session, still unacknowledged.
+- `acknowledged` — surfaced and acknowledged.
+- `netSuppressed` — an older intermediate of a `baseline-strategy: net` catch-up span that the
+  per-recipient net collapse consumed with its newest sibling (002 §1.1.7). It was never shown
+  to the session, so it is **not** included in `claimed`.
+
+A count is omitted while it is zero. The counts partition the projections: each row falls under
+exactly one of them.
+
 A genuinely idle monitor therefore renders `○` at the observation stage with an affirmative verdict
 (e.g. "Source ran, observed 0 changes — your watched target genuinely hasn't changed (not a bug)."),
 never `✗`. JSON output returns:

@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — `monitor explain` counts net-suppressed rows separately
+
+005 `monitor explain` now describes each delivery count. Rows the per-recipient net collapse
+suppressed (002 §1.1.7) were stored as `claimed` and so inflated that count even though the
+session never saw them; they are now reported under their own `netSuppressed` count. Output
+shape is otherwise unchanged. Implementation now matches the described behavior.
+
 ## 2026-11-16 — Bound internal external-envelope admission
 
 002 §16.1 and 004 §6.1 define inclusive envelope limits and their exact boundary
