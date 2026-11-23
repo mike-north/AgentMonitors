@@ -12,6 +12,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  lt,
   lte,
   ne,
   notExists,
@@ -68,11 +69,7 @@ import {
   sessionObjectCursor,
   verifyArtifacts,
 } from '../inbox/schema.js';
-import {
-  type ExternalEventIngestInput,
-  type ExternalEventOutcome,
-  validateExternalEventEnvelope,
-} from '../external-ingress/contract.js';
+import { validateExternalEventEnvelope } from '../external-ingress/contract.js';
 import { externalEventSemanticHash } from '../external-ingress/identity.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import { registerRuntimeTransaction } from './runtime-transaction.js';
@@ -81,7 +78,9 @@ import type {
   EnqueueMaterializationRetryInput,
   EphemeralMonitorRecord,
   ExternalEventReceiptDecision,
+  ExternalEventReceiptInput,
   ExternalEventReceiptOperation,
+  ExternalEventReceiptOutcome,
   ExternalEventReceiptRecord,
   EventQuery,
   MonitorEventRecord,
@@ -325,41 +324,155 @@ function isUniqueNonemptyStringArray(value: unknown): value is string[] {
   );
 }
 
-function externalReceiptEventIds(value: string, receiptId: string): string[] {
-  const parsed = parseJson<unknown>(value, null);
-  if (!isUniqueNonemptyStringArray(parsed)) {
-    throw new Error(
-      `External event receipt ${receiptId} has invalid event ids.`,
-    );
-  }
-  return parsed;
+/** Every durable receipt outcome (002 §15). */
+const EXTERNAL_RECEIPT_OUTCOMES: ReadonlySet<string> =
+  new Set<ExternalEventReceiptOutcome>([
+    'materialized',
+    'held',
+    'suppressed',
+    'stale',
+    'failed',
+  ]);
+
+/** Every envelope change kind a receipt can record (002 §2.6). */
+const EXTERNAL_RECEIPT_CHANGE_KINDS: ReadonlySet<string> = new Set<
+  ExternalEventReceiptRecord['changeKind']
+>(['created', 'modified', 'deleted', 'descoped']);
+
+/**
+ * A stored receipt row that cannot be a state this store ever writes. Thrown
+ * instead of returning a typed record that would misdescribe durable work. The
+ * message names the receipt and the broken rule only, never stored content.
+ */
+function invalidStoredReceipt(receiptId: string, rule: string): Error {
+  return new Error(
+    `Stored external event receipt ${receiptId} is invalid: ${rule}.`,
+  );
 }
 
+function isValidDate(value: unknown): value is Date {
+  return value instanceof Date && Number.isFinite(value.getTime());
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Hydrate a stored receipt row, failing closed on anything the store could not
+ * have written (SQLite enforces no outcome or kind domain). Rules by outcome:
+ *
+ * - every receipt: a known outcome and change kind, a non-negative integer
+ *   object sequence and attempt count, valid accepted/updated times, and an
+ *   optional valid next-attempt time;
+ * - `materialized`: one or more unique event IDs and a materialization time,
+ *   and no scheduled retry;
+ * - every other outcome: no event IDs and no materialization time;
+ * - `stale`: no attempt, error or scheduled retry, since no work ever ran;
+ * - `suppressed`: no scheduled retry;
+ * - `failed`: at least one attempt and its error, and no scheduled retry.
+ */
 function rowToExternalEventReceipt(
   row: typeof externalEventReceipts.$inferSelect,
 ): ExternalEventReceiptRecord {
+  const id = row.id;
+  const outcome: unknown = row.outcome;
+  if (typeof outcome !== 'string' || !EXTERNAL_RECEIPT_OUTCOMES.has(outcome)) {
+    throw invalidStoredReceipt(id, 'unknown outcome');
+  }
+  const changeKind: unknown = row.changeKind;
+  if (
+    typeof changeKind !== 'string' ||
+    !EXTERNAL_RECEIPT_CHANGE_KINDS.has(changeKind)
+  ) {
+    throw invalidStoredReceipt(id, 'unknown change kind');
+  }
+  if (!isNonNegativeSafeInteger(row.objectSequence)) {
+    throw invalidStoredReceipt(id, 'object sequence is not a safe integer');
+  }
+  if (!isNonNegativeSafeInteger(row.attemptCount)) {
+    throw invalidStoredReceipt(id, 'attempt count is not a safe integer');
+  }
+  if (!isValidDate(row.acceptedAt) || !isValidDate(row.updatedAt)) {
+    throw invalidStoredReceipt(id, 'acceptance or update time is invalid');
+  }
+  const nextAttemptAt = row.nextAttemptAt ?? null;
+  if (nextAttemptAt !== null && !isValidDate(nextAttemptAt)) {
+    throw invalidStoredReceipt(id, 'next attempt time is invalid');
+  }
+  const materializedAt = row.materializedAt ?? null;
+  if (materializedAt !== null && !isValidDate(materializedAt)) {
+    throw invalidStoredReceipt(id, 'materialization time is invalid');
+  }
+  const eventIds = parseJson<unknown>(row.eventIds, null);
+  if (!isUniqueNonemptyStringArray(eventIds)) {
+    throw invalidStoredReceipt(
+      id,
+      'event ids are not unique non-empty strings',
+    );
+  }
+  const lastError = row.lastError ?? null;
+
+  if (outcome === 'materialized') {
+    if (eventIds.length === 0 || materializedAt === null) {
+      throw invalidStoredReceipt(
+        id,
+        'a materialized receipt needs event ids and a materialization time',
+      );
+    }
+  } else if (eventIds.length > 0 || materializedAt !== null) {
+    throw invalidStoredReceipt(
+      id,
+      `a ${outcome} receipt cannot carry event ids or a materialization time`,
+    );
+  }
+  if (
+    outcome === 'stale' &&
+    (row.attemptCount !== 0 || lastError !== null || nextAttemptAt !== null)
+  ) {
+    throw invalidStoredReceipt(id, 'a stale receipt cannot carry retry state');
+  }
+  if (
+    (outcome === 'materialized' || outcome === 'suppressed') &&
+    nextAttemptAt !== null
+  ) {
+    throw invalidStoredReceipt(
+      id,
+      `a ${outcome} receipt cannot have a scheduled retry`,
+    );
+  }
+  if (
+    outcome === 'failed' &&
+    (row.attemptCount === 0 || lastError === null || nextAttemptAt !== null)
+  ) {
+    throw invalidStoredReceipt(
+      id,
+      'a failed receipt needs a recorded attempt and error and no scheduled retry',
+    );
+  }
+
   return {
-    receiptId: row.id,
+    receiptId: id,
     monitorId: row.monitorId,
     source: row.source,
     upstreamEventId: row.upstreamEventId,
     objectId: row.objectId,
     objectSequence: row.objectSequence,
     eventKind: row.eventKind,
-    changeKind: row.changeKind,
+    changeKind: changeKind as ExternalEventReceiptRecord['changeKind'],
     occurredAt: row.occurredAt,
-    outcome: row.outcome,
-    eventIds: externalReceiptEventIds(row.eventIds, row.id),
+    outcome: outcome as ExternalEventReceiptOutcome,
+    eventIds,
     attemptCount: row.attemptCount,
-    lastError: row.lastError ?? null,
-    nextAttemptAt: row.nextAttemptAt ?? null,
+    lastError,
+    nextAttemptAt,
     acceptedAt: row.acceptedAt,
-    materializedAt: row.materializedAt ?? null,
+    materializedAt,
     updatedAt: row.updatedAt,
   };
 }
 
-function externalReceiptKey(input: ExternalEventIngestInput) {
+function externalReceiptKey(input: ExternalEventReceiptInput) {
   return and(
     eq(externalEventReceipts.workspaceIdentity, input.workspaceIdentity),
     eq(externalEventReceipts.monitorId, input.envelope.monitorId),
@@ -368,7 +481,7 @@ function externalReceiptKey(input: ExternalEventIngestInput) {
   );
 }
 
-function externalObjectSequenceKey(input: ExternalEventIngestInput) {
+function externalObjectSequenceKey(input: ExternalEventReceiptInput) {
   return and(
     eq(externalObjectSequences.workspaceIdentity, input.workspaceIdentity),
     eq(externalObjectSequences.monitorId, input.envelope.monitorId),
@@ -414,18 +527,25 @@ function normalizeExternalReceiptCompletion(
   completion: unknown,
   acceptedAt: Date,
 ): {
-  outcome: Exclude<ExternalEventOutcome, 'stale'>;
+  outcome: 'materialized' | 'held' | 'suppressed';
   eventIds: string[];
   materializedAt: Date | null;
 } {
+  if (
+    (typeof completion === 'object' || typeof completion === 'function') &&
+    completion !== null &&
+    typeof (completion as { then?: unknown }).then === 'function'
+  ) {
+    throw new TypeError(
+      'External event receipt operation must be synchronous; it returned a promise.',
+    );
+  }
   if (completion === null || typeof completion !== 'object') {
     throw new Error('External event completion outcome is invalid.');
   }
   const value = completion as Record<string, unknown>;
   const outcome = value['outcome'];
-  if (
-    !['materialized', 'held', 'suppressed', 'failed'].includes(String(outcome))
-  ) {
+  if (!['materialized', 'held', 'suppressed'].includes(String(outcome))) {
     throw new Error('External event completion outcome is invalid.');
   }
 
@@ -461,10 +581,91 @@ function normalizeExternalReceiptCompletion(
     );
   }
   return {
-    outcome: outcome as 'held' | 'suppressed' | 'failed',
+    outcome: outcome as 'held' | 'suppressed',
     eventIds: [],
     materializedAt: null,
   };
+}
+
+/**
+ * Receipt identities each connection is currently accepting, so a re-entrant
+ * call from inside a receipt operation can be refused for its own identity.
+ * Keyed by connection because every store sharing one connection shares its
+ * transaction; entries live only while an operation's callback runs.
+ */
+const externalReceiptInFlightByClient = new WeakMap<object, Set<string>>();
+
+function externalReceiptsInFlight(client: object): Set<string> {
+  let inFlight = externalReceiptInFlightByClient.get(client);
+  if (!inFlight) {
+    inFlight = new Set();
+    externalReceiptInFlightByClient.set(client, inFlight);
+  }
+  return inFlight;
+}
+
+/**
+ * Reserve the object's high-water sequence for a new event before its durable
+ * work runs, in the same step as the read, so nothing (including a re-entrant
+ * call from that work) can interleave between deciding and writing.
+ *
+ * Returns `false`, writing nothing, when the event is stale: its sequence is at
+ * or below the current mark. Otherwise inserts the mark or raises it to this
+ * event's sequence and returns `true`. The update is conditional on the mark
+ * still being lower, so it can never lower it. The caller's transaction rolls
+ * the reservation back if anything later fails.
+ */
+function reserveExternalObjectSequence(
+  db: InternalInboxDb,
+  input: ExternalEventReceiptInput,
+  receiptId: string,
+  now: Date,
+): boolean {
+  const { envelope } = input;
+  const current = db
+    .select({
+      id: externalObjectSequences.id,
+      highestSequence: externalObjectSequences.highestSequence,
+    })
+    .from(externalObjectSequences)
+    .where(externalObjectSequenceKey(input))
+    .get();
+  if (current && envelope.objectSequence <= current.highestSequence) {
+    return false;
+  }
+  const values = {
+    highestSequence: envelope.objectSequence,
+    receiptId,
+    upstreamEventId: envelope.upstreamEventId,
+    updatedAt: now,
+  };
+  if (current) {
+    const raised = db
+      .update(externalObjectSequences)
+      .set(values)
+      .where(
+        and(
+          eq(externalObjectSequences.id, current.id),
+          lt(externalObjectSequences.highestSequence, envelope.objectSequence),
+        ),
+      )
+      .run();
+    if (raised.changes !== 1) {
+      throw new Error('External object sequence changed during reservation.');
+    }
+    return true;
+  }
+  db.insert(externalObjectSequences)
+    .values({
+      id: externalSequenceUlid(now.getTime()),
+      workspaceIdentity: input.workspaceIdentity,
+      monitorId: envelope.monitorId,
+      source: envelope.source,
+      objectId: envelope.objectId,
+      ...values,
+    })
+    .run();
+  return true;
 }
 
 /** Raised when a workspace/monitor retry outbox has reached its bound. @public */
@@ -674,20 +875,35 @@ export class RuntimeStore {
   }
 
   /**
-   * Persist one external-event idempotency and object-ordering decision.
+   * Persist one external-event idempotency and object-ordering decision, and
+   * commit the event's durable consequence with it.
    *
-   * The synchronous `operation` runs only for a genuinely new event above the
-   * current object sequence. It runs inside the same immediate transaction as
-   * receipt, high-water, and compatibility-marker writes. Duplicate, conflict,
-   * and stale decisions never invoke it. Any thrown error rolls the complete
-   * transaction back.
+   * Everything happens in one immediate transaction:
    *
-   * @param input - Canonical workspace identity and unknown-boundary-validated envelope.
+   * 1. An existing receipt with the same key (workspace, monitor, source,
+   *    upstream event) and semantic hash is returned as `duplicate`; with a
+   *    different hash the result is `conflict`. Neither writes anything or runs
+   *    `operation`.
+   * 2. A new event whose object sequence is at or below the object's high-water
+   *    mark records a `stale` receipt without running `operation` or moving the
+   *    mark.
+   * 3. Otherwise the high-water mark is reserved at this event's sequence first,
+   *    then `operation` runs, then the receipt and the workspace compatibility
+   *    marker are written.
+   *
+   * Any error, from `operation` or from any write, rolls all of it back, so a
+   * failure leaves no receipt, no sequence change and none of the operation's
+   * writes, and the same event can be retried. See
+   * {@link ExternalEventReceiptOperation} for the callback's synchronous and
+   * re-entrancy rules. A stored receipt the store could not have written is
+   * refused with an error rather than returned.
+   *
+   * @param input - Canonical workspace identity and the event, which is validated again here.
    * @param operation - Synchronous durable work for a new, non-stale event.
    * @param acceptedAt - Injectable local receipt clock; producer occurrence time is in the envelope.
    */
   withExternalEventReceipt(
-    input: ExternalEventIngestInput,
+    input: ExternalEventReceiptInput,
     operation: ExternalEventReceiptOperation,
     acceptedAt = new Date(),
   ): ExternalEventReceiptDecision {
@@ -711,16 +927,31 @@ export class RuntimeStore {
     if (!validation.success) {
       throw new Error(validation.error.message);
     }
-    const normalizedInput: ExternalEventIngestInput = {
+    const normalizedInput: ExternalEventReceiptInput = {
       workspaceIdentity: input.workspaceIdentity,
       envelope: validation.envelope,
     };
-    const semanticHash = externalEventSemanticHash(validation.envelope);
+    const envelope = validation.envelope;
+    const semanticHash = externalEventSemanticHash(envelope);
     const receiptAcceptedAt = new Date(acceptedAt.getTime());
     const db = asInternalDb(this.db);
+    const inFlight = externalReceiptsInFlight(db.$client);
+    const identity = JSON.stringify([
+      normalizedInput.workspaceIdentity,
+      envelope.monitorId,
+      envelope.source,
+      envelope.upstreamEventId,
+    ]);
 
     return db.$client
-      .transaction(() => {
+      .transaction((): ExternalEventReceiptDecision => {
+        // A nested call for the identity this connection is already accepting
+        // would otherwise find no receipt yet and race its own outer call.
+        if (inFlight.has(identity)) {
+          throw new Error(
+            'This external event is already being accepted by an enclosing receipt operation.',
+          );
+        }
         const existing = db
           .select()
           .from(externalEventReceipts)
@@ -729,54 +960,59 @@ export class RuntimeStore {
         if (existing) {
           if (existing.semanticHash !== semanticHash) {
             return {
-              decision: 'conflict' as const,
+              decision: 'conflict',
               existingReceiptId: existing.id,
             };
           }
           return {
-            decision: 'duplicate' as const,
+            decision: 'duplicate',
             receipt: rowToExternalEventReceipt(existing),
           };
         }
 
         const receiptId = externalReceiptUlid(receiptAcceptedAt.getTime());
-        const sequence = db
-          .select()
-          .from(externalObjectSequences)
-          .where(externalObjectSequenceKey(normalizedInput))
-          .get();
-        const stale =
-          sequence !== undefined &&
-          validation.envelope.objectSequence <= sequence.highestSequence;
-        let outcome: ExternalEventOutcome = 'stale';
+        const stale = !reserveExternalObjectSequence(
+          db,
+          normalizedInput,
+          receiptId,
+          receiptAcceptedAt,
+        );
+        let outcome: ExternalEventReceiptOutcome = 'stale';
         let eventIds: string[] = [];
         let materializedAt: Date | null = null;
         if (!stale) {
-          const completion = normalizeExternalReceiptCompletion(
-            operation({
+          inFlight.add(identity);
+          let completion: unknown;
+          try {
+            completion = operation({
               receiptId,
               acceptedAt: new Date(receiptAcceptedAt.getTime()),
-            }),
+            });
+          } finally {
+            inFlight.delete(identity);
+          }
+          const normalized = normalizeExternalReceiptCompletion(
+            completion,
             receiptAcceptedAt,
           );
-          outcome = completion.outcome;
-          eventIds = completion.eventIds;
-          materializedAt = completion.materializedAt;
+          outcome = normalized.outcome;
+          eventIds = normalized.eventIds;
+          materializedAt = normalized.materializedAt;
         }
 
         db.insert(externalEventReceipts)
           .values({
             id: receiptId,
             workspaceIdentity: normalizedInput.workspaceIdentity,
-            monitorId: validation.envelope.monitorId,
-            source: validation.envelope.source,
-            upstreamEventId: validation.envelope.upstreamEventId,
+            monitorId: envelope.monitorId,
+            source: envelope.source,
+            upstreamEventId: envelope.upstreamEventId,
             semanticHash,
-            objectId: validation.envelope.objectId,
-            objectSequence: validation.envelope.objectSequence,
-            eventKind: validation.envelope.eventKind,
-            changeKind: validation.envelope.changeKind,
-            occurredAt: validation.envelope.occurredAt,
+            objectId: envelope.objectId,
+            objectSequence: envelope.objectSequence,
+            eventKind: envelope.eventKind,
+            changeKind: envelope.changeKind,
+            occurredAt: envelope.occurredAt,
             outcome,
             eventIds: JSON.stringify(eventIds),
             acceptedAt: receiptAcceptedAt,
@@ -784,32 +1020,6 @@ export class RuntimeStore {
             updatedAt: receiptAcceptedAt,
           })
           .run();
-
-        if (!stale) {
-          const sequenceValues = {
-            highestSequence: validation.envelope.objectSequence,
-            receiptId,
-            upstreamEventId: validation.envelope.upstreamEventId,
-            updatedAt: receiptAcceptedAt,
-          };
-          if (sequence) {
-            db.update(externalObjectSequences)
-              .set(sequenceValues)
-              .where(eq(externalObjectSequences.id, sequence.id))
-              .run();
-          } else {
-            db.insert(externalObjectSequences)
-              .values({
-                id: externalSequenceUlid(receiptAcceptedAt.getTime()),
-                workspaceIdentity: normalizedInput.workspaceIdentity,
-                monitorId: validation.envelope.monitorId,
-                source: validation.envelope.source,
-                objectId: validation.envelope.objectId,
-                ...sequenceValues,
-              })
-              .run();
-          }
-        }
 
         writeCompatibilityMarker(
           db,
@@ -825,7 +1035,7 @@ export class RuntimeStore {
           throw new Error('External event receipt was not persisted.');
         }
         return {
-          decision: 'accepted' as const,
+          decision: 'accepted',
           receipt: rowToExternalEventReceipt(inserted),
         };
       })

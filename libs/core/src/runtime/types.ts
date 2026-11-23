@@ -7,10 +7,7 @@ import type {
 import type { ephemeralMonitorStatus } from '../inbox/schema.js';
 import type { Observation } from '../observation/types.js';
 import type { DuplicateMonitorId } from '../parser/scan-monitors.js';
-import type {
-  ExternalEventIngestInput,
-  ExternalEventOutcome,
-} from '../external-ingress/contract.js';
+import type { ExternalEventEnvelope } from '../external-ingress/contract.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
 
 export type AgentLifecycleEvent =
@@ -787,8 +784,44 @@ export interface StoredObservationEnvelope {
   effectiveUrgency: Urgency;
 }
 
-/** Capability persisted once a workspace contains forward-only durable work. @public */
+/**
+ * Capability recorded once a workspace's database holds durable external-event
+ * receipts, so a version that predates them can recognize the database as
+ * forward-only. @internal
+ */
 export const DURABLE_INGRESS_COMPATIBILITY_MARKER = 'durable-ingress-v1';
+
+/**
+ * One validated external event and the local workspace it belongs to, as the
+ * receipt operation accepts it. The workspace identity is the canonical
+ * daemon-owned identity that scopes the receipt key; it is never returned.
+ * @public
+ */
+export interface ExternalEventReceiptInput {
+  /** Canonical local workspace identity; part of the receipt key. */
+  workspaceIdentity: string;
+  /** The external event, validated again by the operation before any write. */
+  envelope: ExternalEventEnvelope;
+}
+
+/**
+ * Durable state of an external-event receipt.
+ *
+ * - `materialized`: normal Agent Monitors events were committed.
+ * - `held`: a supported notify delay captured the event durably.
+ * - `suppressed`: local shaping policy deliberately produced no event.
+ * - `stale`: a newer or equal object sequence had already been accepted, so
+ *   no work ran.
+ * - `failed`: deferred materialization exhausted its automatic retries. Only a
+ *   later retry transition records it; acceptance never does.
+ * @public
+ */
+export type ExternalEventReceiptOutcome =
+  | 'materialized'
+  | 'held'
+  | 'suppressed'
+  | 'stale'
+  | 'failed';
 
 /**
  * Safe receipt metadata; deliberately excludes workspace identity, semantic
@@ -811,11 +844,11 @@ export interface ExternalEventReceiptRecord {
   /** Source-defined semantic event label. */
   eventKind: string;
   /** Agent Monitors change classification. */
-  changeKind: ExternalEventIngestInput['envelope']['changeKind'];
+  changeKind: ExternalEventEnvelope['changeKind'];
   /** Original RFC 3339 producer timestamp. */
   occurredAt: string;
   /** Current durable receipt outcome. */
-  outcome: ExternalEventOutcome;
+  outcome: ExternalEventReceiptOutcome;
   /** Correlated Agent Monitors event IDs, empty before materialization. */
   eventIds: string[];
   /** Deferred materialization failures recorded so far. */
@@ -842,8 +875,10 @@ export interface ExternalEventReceiptContext {
 
 /**
  * Durable consequence produced inside a new receipt's acceptance transaction.
- * Materialized work requires at least one event ID; other outcomes cannot carry
- * event correlation or a materialization timestamp.
+ * Materialized work requires at least one event ID; `held` and `suppressed`
+ * cannot carry event correlation or a materialization timestamp. `failed` and
+ * `stale` are not initial outcomes: the operation records `stale` itself, and
+ * only an exhausted deferred retry records `failed`.
  * @public
  */
 export type ExternalEventReceiptCompletion =
@@ -856,8 +891,8 @@ export type ExternalEventReceiptCompletion =
       materializedAt?: Date;
     }
   | {
-      /** A supported delay held work, policy suppressed it, or retries failed. */
-      outcome: 'held' | 'suppressed' | 'failed';
+      /** A supported delay held the work, or local policy suppressed it. */
+      outcome: 'held' | 'suppressed';
       /** Non-materialized outcomes cannot claim event correlation. */
       eventIds?: never;
       /** Non-materialized outcomes cannot claim a materialization time. */
@@ -867,9 +902,25 @@ export type ExternalEventReceiptCompletion =
 /**
  * Synchronous durable work for a genuinely new, non-stale receipt.
  *
- * The operation runs inside the same immediate transaction as receipt and
- * sequence persistence. It is not invoked for duplicate, conflict, or stale
- * decisions. Throwing rolls back both callback writes and receipt state.
+ * Boundary rules:
+ *
+ * - It runs inside the same immediate transaction as the receipt, the object's
+ *   high-water sequence and the compatibility marker, after the sequence is
+ *   already reserved. It is never invoked for duplicate, conflict or stale
+ *   decisions.
+ * - It MUST be synchronous and write through the same database connection. A
+ *   returned promise (any thenable) is refused and the transaction rolls back;
+ *   work after its first `await` would run outside the transaction, so it is
+ *   never durable work.
+ * - Throwing rolls back the callback's writes together with the receipt,
+ *   sequence and marker.
+ * - It may accept other external events re-entrantly. A nested call runs in the
+ *   outer transaction and commits or rolls back with it. Because the outer
+ *   sequence is reserved first, a nested event for the same object at or below
+ *   it is `stale`, and a higher one advances the high-water mark, which the outer
+ *   call never lowers afterwards. A nested call for the exact identity being
+ *   accepted (workspace, monitor, source, upstream event) is refused with an
+ *   error.
  * @public
  */
 export type ExternalEventReceiptOperation = (
