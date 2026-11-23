@@ -1546,6 +1546,12 @@ function ensureIndex(sqlite: BetterSQLiteClient, index: IndexDefinition): void {
   try {
     sqlite.exec(index.sql);
   } catch (error) {
+    // Only a constraint failure means existing rows violate the index; any
+    // other error is not about the data and propagates as it is.
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code !== 'string' || !code.startsWith('SQLITE_CONSTRAINT')) {
+      throw error;
+    }
     throw new SchemaMigrationError(
       index.table,
       undefined,
