@@ -9,6 +9,27 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — Cover foreign exceptions at envelope admission catch sites (002 §16.1; 004 §6.1) — Refs #649
+
+004 §6.1 now requires isolated coverage of each envelope admission catch site: envelope
+byte preflight, scope byte preflight and canonical encoding. A counting proxy, an
+ordinary object with counting coercion and inspection getters, and a native
+stack-overflow `RangeError`, thrown there from a descriptor intrinsic installed before
+import, must yield permanent `invalid_envelope` with no escape, no output and no
+inspection of the thrown value. The ordinary object covers logging and `util.inspect`,
+which format a proxy's target without running its traps. Validator behavior is unchanged; this records existing guarantees
+as required scenarios.
+
+## 2026-11-23 — Strict `channel serve --poll-ms` validation (005 §13) — Refs #306
+
+`--poll-ms` previously went through `parseInt(value) || 3000`, so negative values, partly
+numeric strings and fractions were silently truncated, out-of-range values reached
+`setTimeout` (which clamps them to 1 ms), and an explicit `0` became the default. The flag now
+accepts only plain decimal digits from 100 to 2147483647. Any other value is rejected with a
+one-line stderr diagnostic and exit code 1 before the MCP server starts. Omitting the flag
+still means 3000 ms. A shared CLI parser (`apps/cli/src/integer-option.ts`) holds the rule;
+other numeric flags keep their current ranges.
+
 ## 2026-11-23 — Nx cache contract for package targets
 
 004 §2.14 records which root configs, cross-project files and host facilities each cached
