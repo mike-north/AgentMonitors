@@ -1,12 +1,39 @@
 {
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "name": "@agentmonitors/cli",
+  "namedInputs": {
+    "repoFixtureInputs": [
+      "{workspaceRoot}/agent-plugins/agentmonitors/**/*",
+      "{workspaceRoot}/scripts/owned-test-group.mjs",
+      "{workspaceRoot}/scripts/owned-worker-terminated.mjs"
+    ],
+    "dockerSmokeInputs": [
+      "{workspaceRoot}/package.json",
+      "{workspaceRoot}/pnpm-lock.yaml",
+      "{workspaceRoot}/pnpm-workspace.yaml"
+    ]
+  },
   "targets": {
     "test": {
-      "dependsOn": ["^build", "build"]
+      "dependsOn": ["^build", "build"],
+      "inputs": [
+        "default",
+        "^production",
+        "testIsolation",
+        "testEnvironment",
+        "repoFixtureInputs"
+      ]
     },
     "test:serial": {
-      "dependsOn": ["^build", "build"]
+      "dependsOn": ["^build", "build"],
+      "inputs": [
+        "default",
+        "^production",
+        "testIsolation",
+        "dockerEnvironment",
+        "repoFixtureInputs",
+        "dockerSmokeInputs"
+      ]
     }
   }
 }

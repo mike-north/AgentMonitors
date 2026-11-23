@@ -732,6 +732,41 @@ byte-identical to establish preservation with foreign-write exclusions; every
 excluded file and PID MUST be named. Whole-installation byte identity remains a
 separate reported outcome. A partial test run is insufficient.
 
+### 2.14 Nx cache contract (current)
+
+**Current, normative:** a cacheable Nx target MUST hash every input that can change its result,
+so a replayed result is one the same inputs would have produced. Nx already hashes the owning
+project's files, the declared upstream named inputs, `nx.json`, `.gitignore` and, for these
+script targets, every locked external dependency. The workspace adds:
+
+| Input                                                                                                   | Hashed by                  | Why                                                                                           |
+| ------------------------------------------------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------- |
+| `tsconfig.base.json`, `api-extractor.base.json`, `api-extractor.build.json` (`sharedGlobals`)           | every target via `default` | Package tsconfigs and API Extractor configs extend them.                                      |
+| `api-extractor.report.json`                                                                             | `check:api-report`         | The report-mode config.                                                                       |
+| `scripts/test-isolation/**` (`testIsolation`)                                                           | `test`, `test:serial`      | The shared boundary of §2.13.                                                                 |
+| `node scripts/nx-test-environment.mjs` runtime fingerprint (`testEnvironment`)                          | `test`                     | Node version and platform, `jq` availability and `CI` change what suites run or skip (§2.10). |
+| The same fingerprint with `--docker` (`dockerEnvironment`)                                              | `test:serial`              | Docker reachability decides whether the smoke suite runs (§2.11).                             |
+| `apps/cli/src/**/*.ts`, `plugins/**/*.ts`, `docs/specs/008-reliability-process-hygiene.md`              | core `test`                | The signal inventory reads them.                                                              |
+| `agent-plugins/agentmonitors/**`, `scripts/owned-test-group.mjs`, `scripts/owned-worker-terminated.mjs` | CLI `test`, `test:serial`  | CLI suites load them.                                                                         |
+| Root `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`                                            | CLI `test:serial`          | The Docker smoke copies the workspace and installs from them.                                 |
+
+`build` declares `{projectRoot}/dist`, its sole intended writer. `check:api-report` declares
+`{projectRoot}/temp`. It also re-emits `dist/` before API Extractor runs (see the CI note on
+`--parallel=1`), so it is a known second writer of identical declarations. Consolidating it
+behind `build` is a tracked follow-up. Cache scope is local (`.nx/cache` per worktree). CI does
+not restore an Nx cache.
+
+A test that reads a file outside its project MUST add that file to its target inputs. The
+`pnpm affected` development path selects projects whose hashed inputs changed since
+`origin/main` (or `NX_BASE`), including uncommitted and untracked files. It runs `build`,
+`check` and `test`, then `check:api-report` serially, and omits `test:serial`. It is not a
+substitute for §2.10. A cache-hit `test:serial` with Docker reachable replays the pinned Docker
+smoke rather than re-running its registry installs; use `NX_SKIP_NX_CACHE=true` for fresh
+execution evidence.
+
+**Verified in:** `scripts/nx-cache-contract.test.ts` reads Nx's own hash plan for these targets
+and checks that the fingerprint reports a missing `jq`, `CI` and unreachable Docker.
+
 ## 3. Required Test Scenarios
 
 The spec set is incomplete unless each major rule has at least one concrete testable scenario. The table below maps each scenario to the test file that covers it, or flags it as a gap.

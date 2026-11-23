@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "verify": "pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run",
+    "affected": "NX_TUI=false nx affected -t build check test --exclude=agentmonitors-workspace,@agentmonitors/website --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t check:api-report --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main} --parallel=1",
     "build": "NX_TUI=false nx run-many --target=build --exclude=agentmonitors-workspace,@agentmonitors/website",
     "check": "pnpm check:packages && pnpm check:workspace && pnpm check:aipm",
     "check:aipm": "aipm validate",

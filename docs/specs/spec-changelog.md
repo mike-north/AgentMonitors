@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — Nx cache contract for package targets
+
+004 §2.14 records which root configs, cross-project files and host facilities each cached
+target hashes. Before this, editing `tsconfig.base.json` or a shared API Extractor config
+replayed cached builds and checks, a CLI source edit replayed core's signal-inventory test,
+and a host gaining or losing `jq` or Docker replayed a result recorded with different
+coverage. `pnpm affected` documents the development path; `pnpm verify` remains the gate.
+
 ## 2026-11-16 — Bound internal external-envelope admission
 
 002 §16.1 and 004 §6.1 define inclusive envelope limits and their exact boundary

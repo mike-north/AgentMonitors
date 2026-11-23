@@ -75,6 +75,26 @@ pnpm --filter @agentmonitors/core exec vitest run -t "high urgency"             
 pnpm nx build @agentmonitors/core         # build a single project (and its deps)
 ```
 
+**Development loop (use this while iterating; `pnpm verify` stays the pre-push gate):**
+
+```bash
+pnpm nx test @agentmonitors/core          # focused: the package you are editing (builds its deps first)
+pnpm nx run-many -t build check test -p @agentmonitors/core @agentmonitors/cli   # focused: owner + named consumers
+pnpm affected                             # affected: build/check/test, then check:api-report, for every
+                                          # project touched since origin/main (NX_BASE=<ref> to override),
+                                          # including uncommitted and untracked files
+```
+
+Nx caches these targets locally (`.nx/cache`), so an unchanged rerun replays in about a second. The cache
+contract (which root configs, cross-project files and host facilities each target hashes) is in
+[`004`](docs/specs/004-validation-testing.md) §2.14 and guarded by `scripts/nx-cache-contract.test.ts`.
+`pnpm affected` does not run `test:serial`; run `pnpm test:serial` too when you touch daemon, process or
+IPC code. Escalate to `pnpm verify` when you change shared compiler, test, lint, dependency, generator or
+package-export configuration (`tsconfig.base.json`, `api-extractor.*.json`, `nx.json`, `project.json`,
+`vitest*.config.ts`, `scripts/test-isolation/`, `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`),
+or when it is unclear what a change affects. If a test reads a file outside its project, add that file to
+the target's inputs (see `libs/core/project.json`) or the cache can replay a stale green.
+
 The CLI binary is `agentmonitors` (from `@agentmonitors/cli`). Build, then run `node apps/cli/dist/index.cjs <cmd>`.
 CLI tests that spawn the binary use that same bundle: `pnpm nx test @agentmonitors/cli` builds it first, but a direct
 `vitest run` does not, and tests must never rebuild it ([`004`](docs/specs/004-validation-testing.md) §2.9).

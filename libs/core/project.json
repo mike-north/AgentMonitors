@@ -1,9 +1,23 @@
 {
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
   "name": "@agentmonitors/core",
+  "namedInputs": {
+    "signalInventoryInputs": [
+      "{workspaceRoot}/apps/cli/src/**/*.ts",
+      "{workspaceRoot}/plugins/**/*.ts",
+      "{workspaceRoot}/docs/specs/008-reliability-process-hygiene.md"
+    ]
+  },
   "targets": {
     "test": {
-      "dependsOn": ["^build", "build"]
+      "dependsOn": ["^build", "build"],
+      "inputs": [
+        "default",
+        "^production",
+        "testIsolation",
+        "testEnvironment",
+        "signalInventoryInputs"
+      ]
     }
   }
 }
