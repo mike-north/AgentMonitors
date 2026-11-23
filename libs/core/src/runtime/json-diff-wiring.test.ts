@@ -3,12 +3,12 @@
  * (issue #437 review, comment 3608965102): the `diff.test.ts` suite exercises
  * `buildDiff`/`buildJsonDiff` directly, but not the actual call sites that
  * decide `strategy` from persisted `snapshotMetadata` and materialize the
- * result — `AgentMonitorRuntime.processObservation` (`service.ts`),
+ * result — `AgentMonitorRuntime.materializeObservation` (`service.ts`),
  * `RuntimeStore.insertEvent` (per-recipient projection), and
  * `RuntimeStore.collapseNetForClaim` (net-collapse recomputation).
  *
  * These exercise the durable substrate directly through {@link RuntimeStore},
- * mirroring `processObservation`'s materialize flow (`changeDetectionStrategyOf`
+ * mirroring `materializeObservation`'s materialize flow (`changeDetectionStrategyOf`
  * read off `snapshotMetadata`, then `buildDiff(previous, current, strategy)`)
  * rather than re-deriving the diff by hand, so a regression in the actual
  * strategy-selection wiring — not just the renderer itself — is caught.
@@ -66,7 +66,7 @@ function openLead(store: RuntimeStore, hostSessionId: string): string {
 
 /**
  * Materialize ONE shared `json-diff` event for {@link OBJECT_KEY}, replicating
- * `processObservation`'s ACTUAL wiring (`service.ts` ~3215–3221): read the
+ * `materializeObservation`'s ACTUAL wiring (`service.ts` ~3215–3221): read the
  * `snapshotMetadata.strategy` back off via `changeDetectionStrategyOf`, then
  * render the shared diff via `buildDiff(previous, current, strategy)` — never
  * a hand-picked renderer — so this test would catch a regression in the

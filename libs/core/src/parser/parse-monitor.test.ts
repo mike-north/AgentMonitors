@@ -32,6 +32,48 @@ Check the modified files and report changes.
 `;
 
 describe('parseMonitor', () => {
+  // 001 §5.1: YAML timestamps are scalars, even when the YAML loader
+  // represents them as Date objects. They must not become empty declarations.
+  it.each([
+    '2026-11-03',
+    '2026-11-03T12:34:56Z',
+    '!!timestamp 2026-11-03',
+    '"2026-11-03"',
+  ])('rejects a scalar shape declaration: %s', (shape) => {
+    const filePath = '/monitors/shape/MONITOR.md';
+    const result = parseMonitor(
+      `---\nwatch: {type: schedule}\nshape: ${shape}\n---\n`,
+      filePath,
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.filePath).toBe(filePath);
+    expect(result.error).toContain('shape:');
+    expect(result.error).toContain('expected object');
+  });
+
+  it.each([
+    { declaration: '', expected: undefined },
+    { declaration: 'shape: {}\n', expected: {} },
+    {
+      declaration: 'shape:\n  render: rendered\n',
+      expected: { render: 'rendered' },
+    },
+  ])(
+    'preserves valid shape mappings and omission: $declaration',
+    ({ declaration, expected }) => {
+      const result = parseMonitor(
+        `---\nwatch: {type: schedule}\n${declaration}---\n`,
+        '/monitors/shape/MONITOR.md',
+      );
+      expect(result.ok).toBe(true);
+      if (!result.ok) return;
+      expect(result.monitor.frontmatter.shape).toEqual(expected);
+      expect(result.monitor.frontmatter.urgency).toBe('normal');
+      expect(result.monitor.frontmatter.baselineStrategy).toBe('net');
+    },
+  );
+
   it('parses valid full monitor', () => {
     const result = parseMonitor(
       validContent,

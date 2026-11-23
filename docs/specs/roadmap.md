@@ -196,7 +196,7 @@ Interpret → Deliver → [React]`:
 > injected. It is best-effort — a tool failure falls back to the §1.1.5 `rendered` artifact and is
 > recorded — and every per-recipient verdict (`deliver` / `suppress` / `failed`) is recorded on
 > `session_event_state` and surfaced by `monitor explain` ([§10.7](./002-runtime-delivery.md#107-monitor-pipeline-diagnosis)),
-> so "why nothing fired" is inspectable (C12). Wired in `processObservation`/`runInterpret`
+> so "why nothing fired" is inspectable (C12). Wired in `interpretMaterializedObservation`/`runInterpret`
 > (`libs/core/src/runtime/service.ts`), with the per-recipient verdict persisted via
 > `recordInterpretDecision` and excluded-when-suppressed from delivery (`libs/core/src/runtime/store.ts`),
 > on new `session_event_state.interpret_*` columns (`libs/core/src/inbox/schema.ts` / `db.ts`). Proven
@@ -213,7 +213,7 @@ Interpret → Deliver → [React]`:
 > (`prose | structured | artifact | rendered`, the stable exported `PayloadForm` type) with a turnkey
 > transform for `structured` — `jq` reshapes, `cel` gates (`false` suppresses delivery) via
 > `applyPayloadTransform` (`libs/core/src/runtime/transform.ts`), C46. New `shape`/`payload`
-> frontmatter (`libs/core/src/schema/monitor-schema.ts`), wired in `processObservation`
+> frontmatter (`libs/core/src/schema/monitor-schema.ts`), wired in `materializeObservation`
 > (`libs/core/src/runtime/service.ts` → `shape-stage.ts`). Sources surface raw facts and do not
 > pre-compute them ([003 §2.7](./003-source-plugins.md)). The transform evaluators (`cel-js`,
 > `jq-in-the-browser`) are CSP/Workers-safe (no `Function`/`eval`). Proven by
@@ -304,17 +304,44 @@ Interpret → Deliver → [React]`:
 > source-side poll-cursor sketch, G20 is the Cursor editor host; see the **Poll cursor / source
 > cursor protocol** disambiguation in [glossary.md](./glossary.md).)
 
+### G21 — Reliability & process hygiene target set (P1)
+
+- **Current:** timeout escalation of the original process group (POSIX) / `taskkill` tree
+  (Windows) is enforced ([008 §3.1](./008-reliability-process-hygiene.md)) — descendants that
+  leave the original group are not yet covered; every live cleanup signal is identity-verified
+  through one shared gate, abstaining with a daemon-log warning when identity cannot be
+  confirmed ([008 §5](./008-reliability-process-hygiene.md), #479); the rest of the reliability
+  contract is target — lifetime bounds die with the daemon, there is no restart sweep, durable
+  abstention warnings and the capability probe/report do not exist, and the daemon has no
+  coherent power posture.
+- **Target:** the full contract of [008](./008-reliability-process-hygiene.md): full-boundary
+  bounds with the reported deferred-reconciliation state (§3.2), daemon-death-independent
+  bounds (§3.3), the restart sweep and process hygiene (§4), identity-verified cleanup (§5),
+  the abstention warning surface (§6.1), capability probe + achieved-guarantee reporting
+  (§7), power posture (§8).
+- **Governs:** [008](./008-reliability-process-hygiene.md); PP7, BP1, BP4, NP4 ([000](./000-principles.md)).
+- **Files (anticipated):** `plugins/source-command-poll/src/*`, `libs/core/src/runtime/*`, `apps/cli/src/commands/doctor.ts`, daemon startup path.
+- **Proof:** the per-rule test implications in 008, which are the acceptance bars for #470,
+  #478, #479 (GitHub milestone "M1 — Ingress loses nothing") and #480, #507, #426, #469
+  (milestone "M5 — The middle (parked)"), and for the durable-state and verification-gate
+  sets cited in 008 §9–§10 (milestones "M1 — Ingress loses nothing", "M3 — Delivery is honest
+  on Claude" and "M0 — Trustworthy gate").
+
 ## Test gaps
 
 All test gaps tracked from [004 §3](./004-validation-testing.md) are now closed:
 
 - **T1** — `low` urgency acceptance: added to the schema test loop
-  (`libs/core/src/schema/monitor-schema.test.ts`).
+  (`libs/core/src/schema/monitor-schema.test.ts` › "accepts all urgency values").
 - **T2** — snapshot persistence & isolation: `RuntimeStore` save/retrieve/isolation tests plus a
   runtime diff-on-change test (SP5, [002 §5.2](./002-runtime-delivery.md)).
 - **T3** — `validate` failure paths: closed alongside G2 (unknown-source + schema-violation
   integration tests).
-- **T4** — `schema generate` / `session list|close` CLI wiring: standalone CLI integration tests.
+- **T4** — `schema generate` / `session list|close` CLI wiring: standalone CLI integration tests (`apps/cli/src/commands/cli.integration.test.ts` › `schema generate`,
+  `session list and close`).
+
+Gap ids and the marker convention are defined in [004 §3.0](./004-validation-testing.md);
+`scripts/spec-gap-drift.test.ts` fails if a gap listed here as closed still has a spec marker.
 
 ## How to retire an item
 

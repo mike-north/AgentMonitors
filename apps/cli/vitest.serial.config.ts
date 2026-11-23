@@ -1,3 +1,4 @@
+import { testIsolation } from '../../scripts/test-isolation/config.mjs';
 import { defineConfig } from 'vitest/config';
 
 /**
@@ -26,14 +27,24 @@ import { defineConfig } from 'vitest/config';
  */
 export default defineConfig({
   test: {
+    ...testIsolation,
     include: [
       'src/concurrent-spawn.test.ts',
+      'src/input-limits.integration.test.ts',
       'src/detached-spawn.test.ts',
       'src/commands/daemon-detach.integration.test.ts',
+      'src/commands/daemon-crash-recovery.integration.test.ts',
+      'src/commands/daemon-restart-sweep.integration.test.ts',
+      'src/commands/daemon-ingress-kill-fault.integration.test.ts',
+      'src/commands/daemon-retry-kill-fault.integration.test.ts',
       'src/commands/verify.integration.test.ts',
       'src/commands/cli.docker.test.ts',
       'src/channel-shutdown.integration.test.ts',
       'src/commands/transport-health.integration.test.ts',
+      'src/commands/held-notify.integration.test.ts',
+      // Preset subprocess captures share the daemon suites' CPU-isolation need.
+      'src/commands/pr-alerting-presets.test.ts',
+      'src/commands/source-command-lifetime.test.ts',
       'src/commands/daemon-reaper-lease.integration.test.ts',
     ],
     // No file-level parallelism — each file must complete before the next
@@ -45,7 +56,9 @@ export default defineConfig({
     maxWorkers: 1,
     isolate: false,
     testTimeout: 30_000,
-    retry: 2,
+    // A failed first attempt must fail the gate; durable-state regressions
+    // must never be converted to green by a suite-wide retry budget.
+    retry: 0,
     passWithNoTests: false,
   },
 });

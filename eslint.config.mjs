@@ -7,12 +7,16 @@ export default tseslint.config(
   {
     ignores: [
       '**/dist/**',
+      '**/vendor/koffi/**',
       '**/temp/**',
       '**/node_modules/**',
       '**/.next/**',
       '.Codex/**',
       '.codex/**',
       '.worktrees/**',
+      // Whole checkouts of this repo, outside every tsconfig and each as large as
+      // the repo itself. ESLint does not read .gitignore, which also lists them.
+      '.claude/worktrees/**',
       'scratch/**',
       'experiments/**',
       'apps/website/**',
@@ -49,7 +53,15 @@ export default tseslint.config(
     ...tseslint.configs.disableTypeChecked,
   },
   {
-    files: ['scripts/**/*.mjs'],
+    // Owned child-process fixtures are native Node JavaScript outside the
+    // TypeScript project, like repository scripts, but still receive lint checks.
+    files: [
+      'scripts/**/*.mjs',
+      'libs/core/src/runtime/test-fixtures/**/*.mjs',
+      'libs/core/src/external-ingress/contract-probe.fixture.mjs',
+      'apps/cli/src/commands/fixtures/owned-capture-group.mjs',
+      'apps/cli/src/commands/fixtures/ingress-preload.mjs',
+    ],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {
       parserOptions: {
@@ -58,6 +70,8 @@ export default tseslint.config(
       globals: {
         console: 'readonly',
         process: 'readonly',
+        Atomics: 'readonly',
+        SharedArrayBuffer: 'readonly',
       },
     },
   },
@@ -69,7 +83,7 @@ export default tseslint.config(
   // languageOptions entry. `no-require-imports` is also disabled: this file is
   // intentionally CommonJS (the `require()` calls are its entire purpose).
   {
-    files: ['apps/agentmonitors/bin/**/*.cjs'],
+    files: ['apps/agentmonitors/bin/**/*.cjs', 'scripts/lib/koffi-loader.cjs'],
     ...tseslint.configs.disableTypeChecked,
     rules: {
       ...tseslint.configs.disableTypeChecked.rules,
@@ -77,7 +91,7 @@ export default tseslint.config(
     },
   },
   {
-    files: ['apps/agentmonitors/bin/**/*.cjs'],
+    files: ['apps/agentmonitors/bin/**/*.cjs', 'scripts/lib/koffi-loader.cjs'],
     languageOptions: {
       parserOptions: {
         projectService: false,

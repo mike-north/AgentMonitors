@@ -1,3 +1,4 @@
+/** Synthetic envelope data and safe-error assertions shared by contract suites. */
 import { expect } from 'vitest';
 import {
   EXTERNAL_EVENT_SCHEMA,
@@ -8,6 +9,7 @@ import type {
   ExternalEventErrorCode,
 } from './contract.js';
 
+/** Build one complete current-state event with only the fields under test varied. @internal */
 export function envelope(
   overrides: Partial<ExternalEventEnvelope> = {},
 ): ExternalEventEnvelope {
@@ -31,6 +33,7 @@ export function envelope(
   };
 }
 
+/** Require a permanent error with the stable machine code promised to producers. @internal */
 export function expectError(input: unknown, code: ExternalEventErrorCode) {
   const result = validateExternalEventEnvelope(input);
   expect(result.success).toBe(false);

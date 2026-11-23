@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { stripVTControlCharacters } from 'node:util';
 import { readFileSync } from 'node:fs';
 import { setTimeout } from 'node:timers/promises';
 import { Command, Option } from 'commander';
@@ -7,6 +8,7 @@ import {
   SourceRegistry,
   validateWatchScope,
   type MonitorExplainReport,
+  type ObservationHistoryRecord,
   type MonitorExplainStageId,
   type MonitorExplainStageStatus,
   type ObservationContext,
@@ -15,9 +17,15 @@ import {
   type Observation,
 } from '@agentmonitors/core';
 import { registerCoreSources } from '../sources.js';
+import {
+  isMaterializationRetrySummary,
+  normalizeRetrySummary,
+  retryRecordLines,
+} from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
 import { requireFile } from '../validation.js';
 import { appendErrorHints } from '../command-hints.js';
+import { monitorRetryCommand } from './monitor-retry.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import { DaemonConnectionError } from '../daemon-ipc.js';
 import { resolveManualDaemonSocketPath } from '../manual-daemon.js';
@@ -93,16 +101,52 @@ function statusGlyph(status: MonitorExplainStageStatus): string {
   return '✗';
 }
 
+/**
+ * Render legacy error text without allowing terminal commands, line injection
+ * or unbounded headlines. This mirrors core's private explain display policy
+ * (runtime/service.ts); persisted/structured audit data remains untouched.
+ */
+function displayObservationError(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const line = stripVTControlCharacters(value)
+    // eslint-disable-next-line no-control-regex -- Remove literal terminal control bytes from legacy diagnostics.
+    .replace(/[\u0000-\u001f\u007f-\u009f]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  const points = Array.from(line);
+  return points.length > 512
+    ? `${points.slice(0, 509).join('')}...`
+    : line || undefined;
+}
+
+/** History's human view includes the failure reason already present in its audit row. */
+function formatHistoryText(record: ObservationHistoryRecord): string {
+  const error =
+    record.result === 'errored'
+      ? displayObservationError(record.observationData['error'])
+      : undefined;
+  return `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})${error ? `  ${error}` : ''}`;
+}
+
 function printExplainText(report: MonitorExplainReport): void {
   console.log(`Monitor ${report.monitorId}`);
   for (const stage of report.stages) {
     console.log(`${statusGlyph(stage.status)} ${stage.label}: ${stage.reason}`);
   }
-  for (const retry of report.materializationRetries?.records ?? []) {
-    console.log(
-      `  Retry ${retry.id}: status=${retry.status}  attempts=${String(retry.attemptCount)}  next-at=${retry.nextAttemptAt?.toISOString() ?? 'none'}  updated-at=${retry.updatedAt.toISOString()}`,
-    );
-    if (retry.lastError) console.log(`    Last error: ${retry.lastError}`);
+  // An existing report summary is authoritative, even when explicitly empty.
+  // Partial legacy reports can retain known stage metadata while omitting that
+  // field; choose a local text source without changing structured omission.
+  let retries = report.materializationRetries;
+  if (retries === undefined) {
+    const details = report.stages.find(
+      (stage) => stage.id === 'materialization',
+    )?.details;
+    if (isMaterializationRetrySummary(details)) {
+      retries = normalizeRetrySummary(details);
+    }
+  }
+  for (const line of retryRecordLines(retries)) {
+    console.log(line);
   }
   console.log(
     `Verdict: ${report.verdict.status} at ${EXPLAIN_STAGE_LABELS[report.verdict.stage]} - ${report.verdict.reason}`,
@@ -448,6 +492,16 @@ monitorTestCommand
           formatGlobsForMessage(monitorWatchConfig),
         );
       } else if (observations.length === 0 && source.stateful) {
+        // State is source-owned and may be a primitive. Only nullish absence
+        // disproves an initial baseline; scope diagnostics take precedence above.
+        if (
+          firstResult.nextState === undefined ||
+          firstResult.nextState === null
+        ) {
+          throw new Error(
+            `Stateful source "${source.name}" returned no baseline state.`,
+          );
+        }
         await handleStatefulSource(
           source,
           monitorWatchConfig,
@@ -596,16 +650,16 @@ monitorTestCommand
         //
         // (A) Definition stage is not 'ok' (parse error, monitor not found,
         //     duplicate ID, unknown source, …), OR any stage reports a genuine
-        //     'failure' with nothing persisted to explain it (issue #297: an
+        //     'failure' computed from the current definition (issue #297: an
         //     invalid schedule timezone renders an 'observation'-stage failure
         //     computed purely in-memory — explainMonitor MUST NOT mutate state,
         //     so no observation_history row backs it, yet it is real actionable
         //     content, not "nothing has ever ticked"). The report carries the
-        //     exact failure the author needs. Show it WITHOUT the no-daemon
-        //     banner — the banner would be misleading (for a definition
-        //     failure, no persisted state is involved at all; for the #297
-        //     case, the failure is a fresh in-memory computation, not a stale
-        //     persisted diagnosis). Exit 0 (mirrors the live-daemon path).
+        //     exact failure the author needs and may also contain retained
+        //     retry metadata. Show it WITHOUT the no-daemon banner: its primary
+        //     diagnosis comes from the current definition, even when persisted
+        //     retry work accompanies that failure. Exit 0 (mirrors the
+        //     live-daemon path).
         //
         //     IMPORTANT: this is NOT "any stage is 'failure'" — a never-ticked
         //     monitor's 'observation' stage is ALSO reported 'failure' ("No
@@ -617,15 +671,15 @@ monitorTestCommand
         //     before scheduling could be evaluated at all).
         //
         // (B) Definition stage is 'ok', a 'scheduling' stage IS present, AND
-        //     there IS persisted state (observation history or materialized
-        //     events). The report is a real diagnosis from the last tick. Show
-        //     it WITH the no-daemon banner so the author knows it came from the
+        //     there IS persisted state (observation history, materialized
+        //     events, or retained retries). Show this persisted diagnosis
+        //     WITH the no-daemon banner so the author knows it came from the
         //     store, not a live daemon. Exit 0.
         //
         // (C) Definition stage is 'ok', a 'scheduling' stage IS present, AND
-        //     nothing has been persisted (no observations, no events). The
-        //     daemon is down and nothing has ever ticked. Show the actionable
-        //     remediation line (issue #150, PM decision (b)(i)) — not a raw
+        //     nothing is retained (no observations, events, or retries). The
+        //     daemon is down and has no persisted work to explain. Show the
+        //     actionable remediation line (issue #150, PM decision (b)(i)) — not a raw
         //     ENOENT. Exit 1.
         //     NOTE: a definition-failure (or #297-style unschedulable) report
         //     must never be replaced by the remediation message; those reach
@@ -756,9 +810,7 @@ const monitorHistoryCommand = monitorTestCommand
           return;
         }
         for (const record of records) {
-          console.log(
-            `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})`,
-          );
+          console.log(formatHistoryText(record));
         }
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -805,9 +857,7 @@ const monitorHistoryCommand = monitorTestCommand
         }
         console.log(NO_DAEMON_BANNER);
         for (const record of records) {
-          console.log(
-            `${String(record.createdAt)}  ${record.result.padEnd(10)}  ${record.monitorId}  (${record.sourceName})`,
-          );
+          console.log(formatHistoryText(record));
         }
       }
     },
@@ -826,3 +876,6 @@ appendErrorHints(monitorHistoryCommand, [
     hint: 'monitor history scopes by --workspace (the project directory), not --dir.',
   },
 ]);
+
+// Repairs for the retained work `monitor explain` lists (005 `monitor retry`).
+monitorTestCommand.addCommand(monitorRetryCommand);

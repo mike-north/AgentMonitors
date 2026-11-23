@@ -671,38 +671,19 @@ describe('source-incoming-changes', () => {
   // Fix 1: option-injection guard — branch values starting with '--'
   // -------------------------------------------------------------------------
 
-  describe('option-injection guard (Fix 1)', () => {
-    it('returns a safe result (re-baseline or empty) when branch looks like a git flag', async () => {
-      // A branch value of '--help' would cause `git rev-parse --help` to exit
-      // immediately (or hang/print usage) without --end-of-options.
-      // With --end-of-options it becomes a ref lookup which fails → resilience
-      // path returns { observations: [], nextState: undefined }.
-      const dir = makeTempRepo();
-      writeAndCommit(dir, { 'a.txt': 'seed' }, 'init');
-
-      // Must not throw, must not hang
-      const result = await source.observe(
-        { paths: ['.'], cwd: dir, branch: '--help' },
-        { now: NOW },
-      );
-
-      // Whether it re-baselines or returns empty doesn't matter — it must not crash
-      expect(Array.isArray(result.observations)).toBe(true);
-      expect(result.observations).toHaveLength(0);
-    });
-
-    it('returns a safe result when branch is a double-dash flag with an argument', async () => {
-      const dir = makeTempRepo();
-      writeAndCommit(dir, { 'a.txt': 'seed' }, 'init');
-
-      const result = await source.observe(
-        { paths: ['.'], cwd: dir, branch: '--git-dir=/etc/passwd' },
-        { now: NOW },
-      );
-
-      expect(Array.isArray(result.observations)).toBe(true);
-      expect(result.observations).toHaveLength(0);
-    });
+  describe('option-injection guard', () => {
+    it.each(['--help', '--git-dir=/etc/passwd'])(
+      'rejects an option-looking ref %s as a recoverable source error',
+      async (branch) => {
+        const dir = makeTempRepo();
+        writeAndCommit(dir, { 'a.txt': 'seed' }, 'init');
+        await expect(
+          source.observe({ paths: ['.'], cwd: dir, branch }, { now: NOW }),
+        ).rejects.toThrow(
+          'incoming-changes: could not resolve the configured ref to a commit.',
+        );
+      },
+    );
   });
 
   // -------------------------------------------------------------------------
@@ -798,43 +779,14 @@ describe('source-incoming-changes', () => {
       expect(result.outcome).toBeUndefined();
     });
 
-    it("does NOT set outcome when cwd is not a git repo (transient can't-observe, no state advance)", async () => {
-      // The not-a-repo path returns no nextState at all — it's a transient failure,
-      // not a graceful re-baseline with state advance. outcome must be absent.
+    it('rejects an unavailable repository rather than manufacturing a result', async () => {
       const nonGitDir = mkdtempSync(path.join(tmpdir(), 'ic-nongit-rebase-'));
       dirs.push(nonGitDir);
-
-      const result = await source.observe(
-        { paths: ['.'], cwd: nonGitDir },
-        { now: NOW },
+      await expect(
+        source.observe({ paths: ['.'], cwd: nonGitDir }, { now: NOW }),
+      ).rejects.toThrow(
+        'incoming-changes: could not resolve the configured ref to a commit.',
       );
-
-      expect(result.observations).toHaveLength(0);
-      expect(result.nextState).toBeUndefined();
-      expect(result.outcome).toBeUndefined();
-    });
-  });
-
-  // -------------------------------------------------------------------------
-  // Fix 4: resilience — non-git cwd → graceful empty result
-  // -------------------------------------------------------------------------
-
-  describe('resilience: non-git cwd (Fix 4)', () => {
-    it('returns empty observations without throwing when cwd is not a git repo', async () => {
-      // A directory that is not a git repo will cause git rev-parse to fail.
-      // The source should catch this and return an empty result with no nextState.
-      const nonGitDir = mkdtempSync(path.join(tmpdir(), 'ic-nongit-'));
-      dirs.push(nonGitDir);
-
-      const result = await source.observe(
-        { paths: ['.'], cwd: nonGitDir },
-        { now: NOW },
-      );
-
-      expect(Array.isArray(result.observations)).toBe(true);
-      expect(result.observations).toHaveLength(0);
-      // nextState should be absent (can't establish a baseline without a valid repo)
-      expect(result.nextState).toBeUndefined();
     });
   });
 
