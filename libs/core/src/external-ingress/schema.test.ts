@@ -483,6 +483,84 @@ describe('ingress tables follow the store migration rule: carry or refuse', () =
     after.close();
   });
 
+  it('adds a missing column that is nullable or has a default, keeping existing rows', () => {
+    const { thrown, after } = openWith((sqlite) => {
+      sqlite.exec(sql`
+        ALTER TABLE external_event_receipts DROP COLUMN last_error;
+        ALTER TABLE external_event_receipts DROP COLUMN attempt_count;
+      `);
+      sqlite
+        .prepare(
+          sql`INSERT INTO external_event_receipts (
+            id, workspace_identity, monitor_id, source, upstream_event_id,
+            semantic_hash, object_id, object_sequence, event_kind, change_kind,
+            occurred_at, outcome, accepted_at, updated_at
+          ) VALUES ('receipt-1', '/workspace-a', 'build-health', 'build-system',
+            'delivery-1', 'hash-1', 'build-1', 1, 'build.updated', 'modified',
+            '2026-08-13T18:00:00Z', 'held', ?, ?)`,
+        )
+        .run(NOW_SECONDS, NOW_SECONDS);
+    });
+    expect(thrown).toBeUndefined();
+    expect(
+      after
+        .prepare(
+          `SELECT id, attempt_count, last_error, event_ids FROM external_event_receipts`,
+        )
+        .all(),
+    ).toEqual([
+      // 002 §15 defaults: attempt_count 0, last_error NULL, event_ids '[]'.
+      { id: 'receipt-1', attempt_count: 0, last_error: null, event_ids: '[]' },
+    ]);
+    after.close();
+  });
+
+  it('keeps an equivalent index written with other formatting instead of rebuilding it', () => {
+    // The index text an earlier open stored, with its line breaks.
+    const stored = sql`CREATE UNIQUE INDEX idx_external_event_receipt_key
+      ON external_event_receipts (
+        workspace_identity, monitor_id, source, upstream_event_id
+      )`;
+    const { thrown, after } = openWith((sqlite) => {
+      sqlite.exec(sql`DROP INDEX idx_external_event_receipt_key`);
+      sqlite.exec(stored);
+    });
+    expect(thrown).toBeUndefined();
+    expect(
+      (
+        after
+          .prepare(
+            `SELECT sql FROM sqlite_master WHERE name = 'idx_external_event_receipt_key'`,
+          )
+          .get() as { sql: string }
+      ).sql,
+    ).toBe(stored);
+    after.close();
+  });
+
+  it('replaces a same-named index whose definition differs', () => {
+    const { thrown, after } = openWith((sqlite) => {
+      sqlite.exec(sql`
+        DROP INDEX idx_external_object_sequence_key;
+        CREATE INDEX idx_external_object_sequence_key
+          ON external_object_sequences (object_id);
+      `);
+    });
+    expect(thrown).toBeUndefined();
+    expect(
+      indexShape(
+        after,
+        'external_object_sequences',
+        'idx_external_object_sequence_key',
+      ),
+    ).toEqual({
+      unique: 1,
+      partial: 0,
+      columns: ['workspace_identity', 'monitor_id', 'source', 'object_id'],
+    });
+    after.close();
+  });
+
   it('refuses, naming the table and column, when an existing table lacks a required column', () => {
     const { thrown, schemaBefore, after } = openWith((sqlite) => {
       // Rebuild the sequence table by hand without `receipt_id`: a shape the
