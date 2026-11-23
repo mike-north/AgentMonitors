@@ -170,8 +170,9 @@ export function createDb(dbPath: string): InboxDb {
 }
 
 /**
- * How long one open waits for another connection's lock, both through SQLite's
- * busy handler and while switching a fresh file to write-ahead logging.
+ * How long one open waits for another connection's lock: the connection's
+ * busy timeout, and the total time {@link enableWriteAheadLog} may spend
+ * switching a fresh file to write-ahead logging.
  */
 const BUSY_TIMEOUT_MS = 5000;
 
@@ -179,35 +180,66 @@ const BUSY_TIMEOUT_MS = 5000;
 const WAL_RETRY_PAUSE_MS = 5;
 
 /**
- * Put the database in write-ahead-log mode, waiting out a concurrent opener.
+ * The time source {@link enableWriteAheadLog} measures its deadline with and
+ * pauses between attempts on. Production uses the wall clock; tests substitute
+ * a virtual one to pin the bound without real waiting.
  *
- * Switching a rollback-journal file to WAL needs an exclusive lock, and SQLite
- * reports `SQLITE_BUSY` for that switch without consulting the busy handler
- * when another connection is making the same switch or holds the lock. Two
- * processes first-opening one fresh file therefore race here, before the
- * schema transaction can serialize them. Retrying until {@link BUSY_TIMEOUT_MS}
- * gives this step the same wait the busy handler gives every later statement.
- * Once one opener has switched the file, WAL mode persists and later attempts
- * succeed immediately.
+ * @internal
  */
-function enableWriteAheadLog(sqlite: BetterSQLiteClient): void {
-  const deadline = Date.now() + BUSY_TIMEOUT_MS;
-  for (;;) {
-    try {
-      // The resulting mode is not checked, as before: an in-memory database
-      // reports `memory`, and a file SQLite cannot put in WAL keeps working
-      // in its rollback-journal mode.
-      sqlite.pragma('journal_mode = WAL');
-      return;
-    } catch (error) {
-      if (!isSqliteBusy(error) || Date.now() >= deadline) throw error;
-      Atomics.wait(
-        new Int32Array(new SharedArrayBuffer(4)),
-        0,
-        0,
-        WAL_RETRY_PAUSE_MS,
-      );
+export interface WalSwitchClock {
+  now(): number;
+  sleep(ms: number): void;
+}
+
+const SYSTEM_CLOCK: WalSwitchClock = {
+  now: () => Date.now(),
+  sleep: (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  },
+};
+
+/**
+ * Put the database in write-ahead-log mode, waiting out a concurrent opener
+ * for at most `timeoutMs` in total.
+ *
+ * Switching a rollback-journal file to WAL needs an exclusive lock. When
+ * another connection holds a lock, SQLite's busy handler waits for it; but
+ * while another connection is making the same switch, SQLite can report
+ * `SQLITE_BUSY` at once without consulting the handler. Two processes
+ * first-opening one fresh file therefore race here, before the schema
+ * transaction can serialize them, so a busy switch is retried.
+ *
+ * Both kinds of wait share one deadline: each attempt's busy timeout is set to
+ * the time left before it, so an attempt that blocks in the busy handler can
+ * never carry the step past `timeoutMs`. The connection's busy timeout is
+ * restored to {@link BUSY_TIMEOUT_MS} afterwards. Once one opener has switched
+ * the file, WAL mode persists and later attempts succeed immediately.
+ *
+ * @internal
+ */
+export function enableWriteAheadLog(
+  sqlite: Pick<BetterSQLiteClient, 'pragma'>,
+  clock: WalSwitchClock = SYSTEM_CLOCK,
+  timeoutMs: number = BUSY_TIMEOUT_MS,
+): void {
+  const deadline = clock.now() + timeoutMs;
+  try {
+    for (;;) {
+      const remaining = Math.max(1, Math.ceil(deadline - clock.now()));
+      sqlite.pragma(`busy_timeout = ${String(remaining)}`);
+      try {
+        // The resulting mode is not checked, as before: an in-memory database
+        // reports `memory`, and a file SQLite cannot put in WAL keeps working
+        // in its rollback-journal mode.
+        sqlite.pragma('journal_mode = WAL');
+        return;
+      } catch (error) {
+        if (!isSqliteBusy(error) || clock.now() >= deadline) throw error;
+        clock.sleep(Math.min(WAL_RETRY_PAUSE_MS, deadline - clock.now()));
+      }
     }
+  } finally {
+    sqlite.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
   }
 }
 
