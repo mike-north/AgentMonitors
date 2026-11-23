@@ -737,8 +737,8 @@ describe('receipt tables stay separate from source checkpoint state', () => {
 });
 
 describe('concurrent first open from independent processes', () => {
-  const CHILD_COUNT = 4;
-  const TRIALS = 8;
+  const CHILD_COUNT = 6;
+  const TRIALS = 20;
 
   /** Start one bounded child that opens `dbPath` once `barrier` appears. */
   function startChild(dbPath: string, barrier: string) {
@@ -858,5 +858,5 @@ describe('concurrent first open from independent processes', () => {
         await Promise.allSettled(children.map((c) => c.exited));
       }
     }
-  }, 60_000);
+  }, 180_000);
 });
