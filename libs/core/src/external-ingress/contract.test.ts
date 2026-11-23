@@ -571,3 +571,34 @@ describe('external envelope isolated admission guarantees', () => {
     }, 35_000);
   }
 });
+
+/**
+ * Admission catch sites contain anything thrown inside them. Child processes install
+ * a throwing descriptor intrinsic before import and cap heap and wall time.
+ */
+describe('external envelope foreign exception containment', () => {
+  for (const scenario of [
+    'foreign-envelope-preflight',
+    'foreign-scope-preflight',
+    'foreign-canonical',
+    'recursion-envelope-preflight',
+    'recursion-scope-preflight',
+    'recursion-canonical',
+  ]) {
+    it(`returns invalid_envelope under ${scenario}`, () => {
+      const result = spawnSync(
+        process.execPath,
+        [
+          '--max-old-space-size=512',
+          fileURLToPath(
+            new URL('./contract-probe.fixture.mjs', import.meta.url),
+          ),
+          scenario,
+        ],
+        { encoding: 'utf8', timeout: 30_000 },
+      );
+      expect(result.error, result.stderr).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+    }, 35_000);
+  }
+});

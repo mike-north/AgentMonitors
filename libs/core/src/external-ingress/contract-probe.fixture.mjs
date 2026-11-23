@@ -44,6 +44,71 @@ if (
     return originalDescriptor(value, key);
   };
 }
+/**
+ * Foreign-throw scenarios name a catch site and the value thrown there. Validation
+ * refuses proxies and never invokes accessors, so ordinary input cannot raise a
+ * foreign value inside admission; a trusted descriptor wrapper installed before
+ * import throws on a chosen visit instead. Each site is selected by the
+ * (object, key) visit number: envelope preflight is the first visit of a state
+ * member, scope preflight is the second visit of a scope member (the first is the
+ * envelope preflight), and canonical encoding is the second visit of a state member.
+ */
+const foreignMatch =
+  /^(foreign|recursion)-(envelope-preflight|scope-preflight|canonical)$/.exec(
+    scenario ?? '',
+  );
+const foreign = foreignMatch && {
+  thrown: foreignMatch[1],
+  site: foreignMatch[2],
+  target: undefined,
+  key: undefined,
+  visit: foreignMatch[2] === 'envelope-preflight' ? 1 : 2,
+  visits: 0,
+  fired: 0,
+  trapCalls: 0,
+};
+/** Every proxy trap counts, so any inspection of the caught value is observable. */
+function countingProxy() {
+  const handler = Object.create(null);
+  for (const trap of [
+    'apply',
+    'construct',
+    'defineProperty',
+    'deleteProperty',
+    'get',
+    'getOwnPropertyDescriptor',
+    'getPrototypeOf',
+    'has',
+    'isExtensible',
+    'ownKeys',
+    'preventExtensions',
+    'set',
+    'setPrototypeOf',
+  ]) {
+    handler[trap] = function () {
+      foreign.trapCalls += 1;
+      return Reflect[trap](...arguments);
+    };
+  }
+  return new Proxy(function () {}, handler);
+}
+/** Unbounded non-tail recursion raises the engine's own stack-overflow RangeError. */
+function overflow(depth) {
+  return overflow(depth + 1) + 1;
+}
+if (foreign) {
+  Object.getOwnPropertyDescriptor = function (value, key) {
+    if (value === foreign.target && key === foreign.key) {
+      foreign.visits += 1;
+      if (foreign.visits === foreign.visit) {
+        foreign.fired += 1;
+        if (foreign.thrown === 'foreign') throw countingProxy();
+        overflow(0);
+      }
+    }
+    return originalDescriptor(value, key);
+  };
+}
 let contract;
 try {
   contract = await import('./contract.ts');
@@ -322,6 +387,41 @@ if (scenario === 'allocation') {
   assert.equal(calls, 0);
   assert.equal(baseline.success, true);
   assert.deepEqual(result, baseline);
+} else if (foreign) {
+  // A control call proves the recursion helper raises a native RangeError here.
+  let native;
+  try {
+    overflow(0);
+  } catch (error) {
+    native = error;
+  }
+  assert.ok(native instanceof RangeError);
+  input.scope = { project: 'alpha' };
+  input.state = { value: true };
+  if (foreign.site === 'scope-preflight') {
+    foreign.target = input.scope;
+    foreign.key = 'project';
+  } else {
+    foreign.target = input.state;
+    foreign.key = 'value';
+  }
+  let escaped = false;
+  let result;
+  try {
+    result = validateExternalEventEnvelope(input);
+  } catch {
+    // The escaped value is not inspected; inspection would itself count traps.
+    escaped = true;
+  }
+  foreign.target = undefined;
+  assert.equal(escaped, false, 'A foreign exception escaped validation');
+  assert.equal(foreign.fired, 1, 'The injected throw did not run');
+  assert.equal(foreign.visits, foreign.visit);
+  assert.equal(foreign.trapCalls, 0, 'The caught value was inspected');
+  // 002 §16.1: malformed values are a permanent invalid_envelope, never thrown.
+  assert.equal(result?.success, false);
+  assert.equal(result.error.code, 'invalid_envelope');
+  assert.equal(result.error.retryable, false);
 } else {
   throw new Error(`Unknown probe: ${scenario}`);
 }

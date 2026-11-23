@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — Cover foreign exceptions at envelope admission catch sites (002 §16.1; 004 §6.1) — Refs #649
+
+004 §6.1 now requires isolated coverage of each envelope admission catch site: envelope
+byte preflight, scope byte preflight and canonical encoding. A counting proxy and a
+native stack-overflow `RangeError`, thrown there from a descriptor intrinsic installed
+before import, must yield permanent `invalid_envelope` with no escape and no inspection
+of the thrown value. Validator behavior is unchanged; this records existing guarantees
+as required scenarios.
+
 ## 2026-11-16 — Bound internal external-envelope admission
 
 002 §16.1 and 004 §6.1 define inclusive envelope limits and their exact boundary
