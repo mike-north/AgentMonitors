@@ -541,6 +541,68 @@ export const externalEventLimits: Readonly<{
 export function externalEventObjectKey(source: string, objectId: string): string;
 
 // @public
+export type ExternalEventReceiptCompletion = {
+    outcome: 'materialized';
+    eventIds: [string, ...string[]];
+    materializedAt?: Date;
+} | {
+    outcome: 'held' | 'suppressed';
+    eventIds?: never;
+    materializedAt?: never;
+};
+
+// @public
+export interface ExternalEventReceiptContext {
+    acceptedAt: Date;
+    receiptId: string;
+}
+
+// @public
+export type ExternalEventReceiptDecision = {
+    decision: 'accepted';
+    receipt: ExternalEventReceiptRecord;
+} | {
+    decision: 'duplicate';
+    receipt: ExternalEventReceiptRecord;
+} | {
+    decision: 'conflict';
+    existingReceiptId: string;
+};
+
+// @public
+export interface ExternalEventReceiptInput {
+    envelope: ExternalEventEnvelope;
+    workspaceIdentity: string;
+}
+
+// @public
+export type ExternalEventReceiptOperation = (context: ExternalEventReceiptContext) => ExternalEventReceiptCompletion;
+
+// @public
+export type ExternalEventReceiptOutcome = 'materialized' | 'held' | 'suppressed' | 'stale' | 'failed';
+
+// @public
+export interface ExternalEventReceiptRecord {
+    acceptedAt: Date;
+    attemptCount: number;
+    changeKind: ExternalEventEnvelope['changeKind'];
+    eventIds: string[];
+    eventKind: string;
+    lastError: string | null;
+    materializedAt: Date | null;
+    monitorId: string;
+    nextAttemptAt: Date | null;
+    objectId: string;
+    objectSequence: number;
+    occurredAt: string;
+    outcome: ExternalEventReceiptOutcome;
+    receiptId: string;
+    source: string;
+    updatedAt: Date;
+    upstreamEventId: string;
+}
+
+// @public
 export const externalEventReservedScopeKeys: readonly ["ingressSource", "eventKind", "changeKind", "upstreamEventId", "objectSequence", "occurredAt"];
 
 // @public
@@ -1763,6 +1825,7 @@ export class RuntimeStore {
     }): void;
     verifyArtifactsAwaitingCleanup(workspacePath: string): VerifyArtifactRecord[];
     verifyArtifactsAwaitingCleanupForOwner(ownerSessionId: string): VerifyArtifactRecord[];
+    withExternalEventReceipt(input: ExternalEventReceiptInput, operation: ExternalEventReceiptOperation, acceptedAt?: Date): ExternalEventReceiptDecision;
 }
 
 // @public
