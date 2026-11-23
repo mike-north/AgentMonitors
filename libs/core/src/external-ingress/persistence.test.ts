@@ -836,9 +836,14 @@ describe('hydrating a stored receipt fails closed on an impossible state', () =>
 
 describe('overlapping independent processes', () => {
   const CHILD_COUNT = 4;
-  const TRIALS = 4;
+  const TRIALS = 12;
 
-  function startChild(dbPath: string, barrier: string) {
+  /**
+   * Start one bounded child that runs every trial under `root` (see the
+   * fixture's protocol). Each process starts once for all trials, so the
+   * test's cost is the racing acceptances rather than repeated startup.
+   */
+  function startChild(root: string) {
     const child = spawn(
       process.execPath,
       [
@@ -846,8 +851,8 @@ describe('overlapping independent processes', () => {
         '--import',
         path.resolve('src/runtime/__fixtures__/typescript-loader.ts'),
         path.resolve('src/external-ingress/__fixtures__/receipt-race-child.ts'),
-        dbPath,
-        barrier,
+        root,
+        String(TRIALS),
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
@@ -862,7 +867,7 @@ describe('overlapping independent processes', () => {
     const exited = new Promise<number | null>((resolve, reject) => {
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-      }, 15_000);
+      }, 60_000);
       child.once('exit', (code) => {
         clearTimeout(timer);
         resolve(code);
@@ -884,36 +889,54 @@ describe('overlapping independent processes', () => {
     };
   }
 
-  it('accepts the same event exactly once, running its work once; the rest see duplicates', async () => {
-    for (let trial = 0; trial < TRIALS; trial += 1) {
-      const dbPath = receiptScratchDb();
-      const dir = path.dirname(dbPath);
-      // Create the schema first so the race is over acceptance, not first open.
-      clientOf(createDb(dbPath)).close();
-      const barrier = path.join(dir, 'go');
-      const children = Array.from({ length: CHILD_COUNT }, () =>
-        startChild(dbPath, barrier),
-      );
-      try {
-        const deadline = Date.now() + 10_000;
-        while (!children.every((c) => c.output.includes('READY'))) {
-          if (Date.now() >= deadline) throw new Error('children never ready');
-          await new Promise((resolve) => setTimeout(resolve, 10));
-        }
-        writeFileSync(barrier, 'go');
-        const codes = await Promise.all(children.map((c) => c.exited));
+  type Child = ReturnType<typeof startChild>;
+
+  /** The line a child printed for `trial` with one of `prefixes`, if any. */
+  function lineFor(c: Child, trial: string, prefixes: string[]) {
+    return c.output
+      .split('\n')
+      .find((line) => prefixes.some((p) => line.startsWith(`${p} ${trial}`)));
+  }
+
+  /** Wait until every child has printed a `prefixes` line for `trial`. */
+  async function waitForTrial(
+    children: Child[],
+    trial: string,
+    prefixes: string[],
+  ): Promise<void> {
+    const deadline = Date.now() + 20_000;
+    while (!children.every((c) => lineFor(c, trial, prefixes) !== undefined)) {
+      if (Date.now() >= deadline) {
         const report = children.map((c) => c.output + c.errors).join('\n');
-        expect(codes, `trial ${String(trial)}:\n${report}`).toEqual(
-          Array.from({ length: CHILD_COUNT }, () => 0),
-        );
-        const results = children.map(
-          (c) =>
-            JSON.parse(c.output.split('RESULT ')[1]?.trim() ?? 'null') as {
-              decision: string;
-              ran: boolean;
-              receiptId: string;
-            },
-        );
+        throw new Error(`children never reported trial ${trial}:\n${report}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2));
+    }
+  }
+
+  it('accepts the same event exactly once, running its work once; the rest see duplicates', async () => {
+    const root = path.dirname(receiptScratchDb());
+    const children = Array.from({ length: CHILD_COUNT }, () =>
+      startChild(root),
+    );
+    try {
+      for (let trial = 0; trial < TRIALS; trial += 1) {
+        const n = String(trial);
+        const dbPath = path.join(root, `trial-${n}`, 'agentmon.db');
+        // Create the schema first so the race is over acceptance, not first open.
+        clientOf(createDb(dbPath)).close();
+        await waitForTrial(children, n, ['READY']);
+        writeFileSync(path.join(root, `go-${n}`), 'go');
+        await waitForTrial(children, n, ['RESULT', 'ERROR']);
+        const results = children.map((c) => {
+          const line = lineFor(c, n, ['RESULT', 'ERROR']);
+          expect(line, `trial ${n}`).toMatch(new RegExp(`^RESULT ${n} `));
+          return JSON.parse(line?.slice(`RESULT ${n} `.length) ?? 'null') as {
+            decision: string;
+            ran: boolean;
+            receiptId: string;
+          };
+        });
         expect(results.filter((r) => r.decision === 'accepted')).toHaveLength(
           1,
         );
@@ -935,13 +958,15 @@ describe('overlapping independent processes', () => {
             .get(),
         ).toEqual({ receipts: 1, sequences: 1, events: 1 });
         sqlite.close();
-      } finally {
-        for (const c of children) {
-          if (c.child.exitCode === null && c.child.signalCode === null)
-            c.child.kill('SIGKILL');
-        }
-        await Promise.allSettled(children.map((c) => c.exited));
       }
+      const codes = await Promise.all(children.map((c) => c.exited));
+      expect(codes).toEqual(Array.from({ length: CHILD_COUNT }, () => 0));
+    } finally {
+      for (const c of children) {
+        if (c.child.exitCode === null && c.child.signalCode === null)
+          c.child.kill('SIGKILL');
+      }
+      await Promise.allSettled(children.map((c) => c.exited));
     }
   }, 120_000);
 });
