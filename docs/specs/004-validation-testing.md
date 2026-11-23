@@ -741,9 +741,39 @@ from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-cont
 unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
 non-finite numbers. Validation errors contain only stable safe text and never echo external state.
 
-This surface currently proves the public contract and the receipt storage schema only. A later
-change writes receipts and adds the runtime mutation boundary; callers cannot ingest an envelope
-through the runtime, daemon, or CLI yet.
+This surface proves the public contract, the receipt storage schema, and the receipt operation
+([002 §2.6.1](./002-runtime-delivery.md#261-receipt-operation-current-primitive-target-ingestion)).
+Callers cannot ingest an envelope through the runtime, daemon, or CLI yet.
+
+The receipt operation requires these scenarios, against real SQLite:
+
+- **Replay and conflict.** A replay from another cursor, including from a reopened database, returns
+  the full stored receipt, with dates round-tripped and no private field. It does not run work or
+  change any row. Reuse with different state, sequence, or scope returns `conflict` and changes
+  nothing.
+- **Ordering.** 42 then 43 raises the mark to 43 with the new receipt. A distinct event at 42 and an
+  older one at 41 are `stale`, run no work, and leave the mark unchanged. An older sequence cannot
+  replace the newer object snapshot.
+- **Re-entry.** With a mark of 1, an outer call at 2 whose callback accepts 3 leaves the mark at 3, and
+  a later new event at 3 is stale. With no prior mark, both calls commit. A nested call at or below
+  the outer sequence is stale. A nested call for the outer identity is refused, and an inner
+  acceptance rolls back with a failing outer callback.
+- **Callback boundary.** An asynchronous callback and an initial `failed` outcome are refused, with
+  their writes rolled back.
+- **Fault injection.** Aborting the callback's event or snapshot write, the receipt write, the first
+  or a raised high-water write, or the marker write leaves every table unchanged, and a retry then
+  succeeds.
+- **Hydration.** Each impossible stored state listed in 002 §2.6.1 is refused without echoing stored
+  content; a coherent `failed` receipt hydrates.
+- **Marker.** One `durable-ingress-v1` marker per workspace, with its exact identity and time.
+- **Concurrency.** Independent processes accepting one event at once: exactly one accepts and runs
+  its work, the rest get `duplicate`, and one receipt, sequence, and event remain.
+- **Public surface.** The receipt types resolve exactly in the trimmed public declarations, and the
+  marker constant is not exported.
+
+Reading the sequence before the callback and writing it after, dropping the rollback on a callback
+throw, accepting a replay with different content, or accepting an older sequence MUST each fail one
+of these tests.
 
 The receipt storage schema ([002 §15](./002-runtime-delivery.md#15-persistence-schema-appendix),
 external ingress receipts) requires these scenarios, each against a real on-disk database:
@@ -771,8 +801,8 @@ Removing the earlier-index drop, recreating a table instead of migrating it, or 
 WAL retry MUST each fail one of these tests.
 
 **Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
-`contract-boundaries.test.ts`, `admission-safety.test.ts`, `public-contract.test.ts`, and
-`schema.test.ts`.
+`contract-boundaries.test.ts`, `admission-safety.test.ts`, `public-contract.test.ts`,
+`schema.test.ts`, `persistence.test.ts`, and `receipt-public-contract.test.ts`.
 The public consumer suite exercises ESM/CJS exports and compiles against the trimmed
 package declarations. A fixed eleven-field canonical preimage pins the SHA-256 value;
 each identity-field mutation varies only that field. Runtime mutation of every limit
@@ -1125,17 +1155,17 @@ always fits the Unix socket limit.
 
 ### 3.4.3 External-ingress contract
 
-| Scenario                                                         | Coverage                                                                                                                                                         |
-| ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                           |
-| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                            |
-| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope).         |
-| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).               |
-| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).                    |
-| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                                 |
-| Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` — cursor-only replay, conflict, stale sequence, and exact receipt/high-water rows).                                               |
-| Receipt acceptance and durable callback work roll back together  | Covered (`persistence.test.ts` — injected callback failure leaves no receipt, sequence, marker, or monitor state).                                               |
-| Compatibility migration preserves existing data                  | Covered (`schema.test.ts` — additive table/index recreation preserves existing sessions/events and distinguishes global, empty, and concrete marker identities). |
+| Scenario                                                         | Coverage                                                                                                                                                        |
+| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                          |
+| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                           |
+| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope).        |
+| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).              |
+| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).                   |
+| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                                |
+| Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` — replay from a reopened database, conflict, equal and older sequences, re-entrant ordering, and exact receipt/high-water rows). |
+| Receipt acceptance and durable callback work roll back together  | Covered (`persistence.test.ts` — callback failure and an aborted write at every step leave every table unchanged; a retry then succeeds).                       |
+| Compatibility migration preserves existing data                  | Covered (`schema.test.ts` — upgrade from the earlier marker index keeps every row and distinguishes global, empty, and concrete marker identities).             |
 
 ### 3.5 CLI behavior
 

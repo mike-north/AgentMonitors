@@ -9,6 +9,18 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — External event receipt operation (002 §2.6, §2.6.1, §15, §16.1; 004 §2.14, §3.4.3) — Refs #481
+
+002 §2.6.1 specifies `RuntimeStore.withExternalEventReceipt()`. One immediate transaction decides
+duplicate, conflict, stale, or accepted, and commits the receipt, the object's high-water mark, the
+workspace compatibility marker, and the callback's durable work together, or rolls all of it back.
+The high-water mark is reserved before the callback runs and only ever raised, so re-entrant
+acceptance from the callback cannot lower it or collide on its key. A nested call for the identity
+being accepted is refused. The callback must be synchronous. `failed` is no longer an initial
+outcome. Stored receipts are returned only when their fields form a state the store writes. The
+public receipt types resolve without internal envelope types. Ingestion through the runtime,
+daemon, or CLI remains target. 004 §2.14 lists the required scenarios.
+
 ## 2026-11-23 — External event receipt storage schema (002 §2.6, §15, §16.1; 004 §2.14) — Refs #481
 
 002 §15 now specifies the `external_event_receipts`, `external_object_sequences`, and
@@ -28,15 +40,6 @@ Envelope admission refuses own `__proto__` keys throughout producer scope/state,
 nested array members, while general canonical JSON continues to preserve ordinary data keys.
 Leap-second syntax accepts every UTC month end and equivalent offset spellings; timestamp
 validation does not depend on a leap-second announcement table.
-
-## 2026-08-13 — External receipts and object ordering are durable (002 §2.6, §15; 004 §3.4.1) — Refs #481
-
-Core now persists compact workspace-aware external-event receipts and per-object sequence
-high-water marks. One immediate transaction decides duplicate/conflict/stale status, runs accepted
-synchronous durable work, and commits its receipt/order consequence; callback failure rolls all of
-it back. The accepted decision exposes safe receipt metadata without state, payload, cursor, hash,
-scope, or workspace identity. A per-workspace `durable-ingress-v1` marker commits atomically with
-each first receipt; read APIs and marker propagation to held/retry work follow in the next layer.
 
 ## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.14) — Refs #481
 

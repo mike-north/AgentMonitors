@@ -1409,8 +1409,9 @@ unregistered, foreign-workspace and proof-phase controls that still record the l
 
 > **Status: target.** Core publishes envelope admission and identity helpers as building
 > blocks for this capability, including structured validation errors and immutable limits. No runtime, CLI, or daemon method accepts the envelope yet.
-> The durable receipt, object-sequence, and compatibility-marker tables exist in every database
-> (§15, external ingress receipts); writing them remains target behavior.
+> The durable receipt tables exist in every database (§15, external ingress receipts), and core
+> publishes the receipt operation that writes them (§2.6.1). No runtime, CLI, or daemon path calls
+> it, so receipt persistence for ingested events remains target behavior.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -1449,21 +1450,68 @@ selects exactly `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
 `objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `scope`, and `state`, excluding
 `resumeToken` and unknown properties, allowing one upstream event to replay from another relay cursor. The
 snapshot object key is `external:` plus canonical JSON for `[source, objectId]`, avoiding delimiter
-collisions. The receipt storage schema is current (§15); writing receipts, ordering decisions,
-observation mapping, and ingestion remain target behavior in §16.1.
+collisions. The receipt storage schema (§15) and the receipt operation (§2.6.1) are current;
+observation mapping and ingestion remain target behavior in §16.1.
 
-`RuntimeStore.withExternalEventReceipt()` serializes the idempotency and sequence decision in one
-immediate transaction. A same-key/same-hash replay returns the retained receipt; conflicting reuse
-mutates nothing. A new lower or equal sequence records a compact `stale` receipt without invoking
-durable work or moving the high-water row. For a newer event, the caller's synchronous durable work,
-receipt, high-water mark, and compatibility marker commit or roll back together. Receipts retain
-only safe correlation metadata, outcome, event IDs, and timestamps; state, payload, scope, resume
-token, workspace identity, and semantic hash are absent from the returned decision. Workspace-safe
-status/high-water queries, observation mapping, and runtime/IPC ingestion remain target behavior in
-the next stacked changes.
+Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
+`contract-boundaries.test.ts`.
 
-Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
-`contract-boundaries.test.ts`, and `persistence.test.ts`; `libs/core/src/runtime/store.ts`.
+#### 2.6.1 Receipt operation (_current primitive; target ingestion_)
+
+`RuntimeStore.withExternalEventReceipt(input, operation, acceptedAt?)` decides one external event and
+commits its durable consequence in one immediate transaction. `input` is an
+`ExternalEventReceiptInput`: the canonical workspace identity and the envelope, which the operation
+validates again. In order:
+
+1. **Duplicate or conflict.** A receipt with the same key `(workspace_identity, monitor_id, source,
+upstream_event_id)` and the same semantic hash is returned as `duplicate`; a different hash
+   returns `conflict` with the existing receipt ID. Neither writes anything or runs `operation`, so
+   replay from another relay cursor is a successful no-op and reusing an identity with different
+   content changes nothing.
+2. **Stale.** A new event whose `objectSequence` is at or below the object's high-water mark records
+   a `stale` receipt. `operation` does not run and the mark does not move, so an older sequence can
+   never replace a newer snapshot.
+3. **Accepted.** Otherwise the high-water mark is reserved at this sequence first: inserted, or
+   raised by an update conditional on the stored mark being lower, in the same step as the read.
+   Then `operation` runs, then the receipt and the workspace's `durable-ingress-v1` compatibility
+   marker are written.
+
+Any error, from `operation` or from any write, rolls the whole transaction back: no receipt, no
+sequence change, no marker, and none of the operation's writes. The same event can then be retried.
+
+**Callback boundary.** `operation` MUST be synchronous and write through the store's connection. A
+returned promise or other thenable is refused and rolls back; writes after its first `await` would
+fall outside the transaction. It returns `materialized` with one or more event IDs (and optionally a
+materialization time), or `held` or `suppressed` with neither. `failed` is never an initial
+outcome: only an exhausted deferred retry records it. `operation` may accept other events
+re-entrantly. A nested call runs inside the outer transaction and commits or rolls back with it.
+Because the outer sequence is already reserved, a nested event for the same object at or below it is
+`stale`, and a higher one raises the mark, which the outer call never lowers. A nested call for the
+exact identity being accepted is refused with an error.
+
+**Returned receipts** carry only `receiptId`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
+`objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `outcome`, `eventIds`, `attemptCount`,
+`lastError`, `nextAttemptAt`, `acceptedAt`, `materializedAt`, and `updatedAt`. Workspace identity,
+semantic hash, scope, state, payload, and resume token are never returned. A stored receipt is
+returned only if it is a state the store writes:
+
+- the outcome and change kind are known;
+- the sequence and attempt count are non-negative integers and the timestamps are valid;
+- `materialized` has unique event IDs, a materialization time, and no scheduled retry;
+- any other outcome has no event IDs and no materialization time;
+- `stale` has no retry state;
+- `suppressed` has no scheduled retry;
+- `failed` has at least one attempt, its error, and no scheduled retry.
+
+Anything else is refused with an error that names the receipt and the broken rule, never stored
+content.
+
+Concurrent callers on independent connections serialize on the immediate transaction: exactly one
+accepts and runs `operation`; the rest observe `duplicate`.
+
+Verified: `libs/core/src/external-ingress/persistence.test.ts` and
+`receipt-public-contract.test.ts`; `libs/core/src/runtime/store.ts`
+(`withExternalEventReceipt`, `reserveExternalObjectSequence`).
 
 ## 3. Persisted Monitor State
 
@@ -3259,26 +3307,6 @@ Real owned-socket tests verify dates rather than inferring correctness from core
 
 Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Retained rows drain before newer input (§2.7). Final crash acceptance remains separate work.
 
-### External-ingress persistence
-
-`external_event_receipts` is the compact, indefinitely retained idempotency tombstone. Its unique
-key is `(workspace_identity, monitor_id, source, upstream_event_id)`; it stores the semantic hash,
-object identity/sequence, safe event metadata, outcome, correlated event IDs, attempt/error state,
-and accepted/materialized/update timestamps. It never stores external state, payload, scope, or the
-resume token. The accepted/duplicate decision omits both `workspace_identity` and `semantic_hash`;
-workspace-scoped status reads remain target in the next review layer.
-
-`external_object_sequences` holds the highest accepted sequence and its receipt/upstream event ID.
-Its unique key is exactly `(workspace_identity, monitor_id, source, object_id)`, so another monitor
-or workspace advances independently. Stale receipts do not mutate this table.
-
-`database_compatibility_markers` records `durable-ingress-v1` once per workspace using separate
-partial unique indexes for global and concrete identities. A receipt and its marker share a
-transaction. Marker propagation to held notify batches and materialization retries is target in the
-next review layer. Direct use of an old binary after a marker exists is unsupported; a
-version-aware installer can refuse that downgrade. Merely opening/migrating an older database
-creates the additive tables but does not mark it forward-only.
-
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
@@ -3508,11 +3536,12 @@ lookup, and refusal of a key owned by another run); partial
 `idx_verify_artifacts_awaiting_cleanup (workspace_path, owner_session_id) WHERE cleanup_requested_at IS NULL`
 (per-tick reconciliation reads only records still awaiting cleanup).
 
-### External ingress receipts (_current schema; target writes_)
+### External ingress receipts (_current schema and store operation; target ingestion_)
 
-> **Status: schema current, writes target.** Every open creates these three tables; no runtime,
-> CLI, or daemon path writes them yet (§2.6). They are additive (`CREATE TABLE` only when absent),
-> so every released database shape opens with its existing rows unchanged.
+> **Status: schema and store operation current, ingestion target.** Every open creates these three
+> tables, and `RuntimeStore.withExternalEventReceipt()` writes them (§2.6.1). No runtime, CLI, or
+> daemon path calls it yet. The tables are additive (`CREATE TABLE` only when absent), so every
+> released database shape opens with its existing rows unchanged.
 
 The tables hold external-event idempotency and ordering state. They are separate from source
 checkpoint state: none shares a row, foreign key, or trigger with `monitor_state`, and `monitor_state`
@@ -3520,8 +3549,9 @@ gains no column for them. A source's `source_state` remains the only change-dete
 
 #### `external_event_receipts`
 
-One compact receipt per accepted upstream event. The receipt stores identity, ordering, and outcome
-only, never the event's `scope` or `state`.
+One compact receipt per decided upstream event, `stale` ones included, retained indefinitely as the
+idempotency record. The receipt stores identity, ordering, and outcome only, never the event's
+`scope`, `state`, or resume token.
 
 | Column               | Type             | Notes                                                   |
 | -------------------- | ---------------- | ------------------------------------------------------- |
@@ -3550,6 +3580,8 @@ Index: unique `idx_external_event_receipt_key (workspace_identity, monitor_id, s
 #### `external_object_sequences`
 
 The highest accepted producer sequence for one external object, so a stale event cannot regress it.
+It is reserved before an accepted event's durable work runs and only ever raised (§2.6.1); stale
+receipts do not change it. Another monitor or workspace advances independently.
 
 | Column               | Type             | Notes                                     |
 | -------------------- | ---------------- | ----------------------------------------- |
@@ -3568,7 +3600,10 @@ Index: unique `idx_external_object_sequence_key (workspace_identity, monitor_id,
 #### `database_compatibility_markers`
 
 Forward-only durable capabilities present in the database. A `NULL` workspace identity is the global
-scope; it is distinct from every concrete identity, including the empty string.
+scope; it is distinct from every concrete identity, including the empty string. The receipt
+operation writes `durable-ingress-v1` for a workspace once, in the same transaction as that
+workspace's first receipt. Opening or migrating a database creates the table but writes no marker.
+Using an older binary on a database that holds a marker is unsupported.
 
 | Column               | Type             | Notes                 |
 | -------------------- | ---------------- | --------------------- |
@@ -3783,8 +3818,8 @@ to validate their existing independent contracts.
 `validateExternalEventEnvelope` admits only the complete
 `agentmonitors.external-event.v1` field set. Unknown fields, including instructions,
 urgency, notify policy and local filesystem paths, MUST be refused. The package-root
-validator exposes admission only. The receipt storage tables exist (§15); writing receipts,
-ingestion and routing remain target behavior.
+validator exposes admission only. The receipt storage tables (§15) and the receipt operation
+(§2.6.1) are current; ingestion and routing remain target behavior.
 
 The validator MUST preflight encoded size before canonical JSON validation,
 normalization or fingerprinting. Its descriptor walk counts exact escaped UTF-8
