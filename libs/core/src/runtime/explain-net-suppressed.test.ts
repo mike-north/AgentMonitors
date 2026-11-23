@@ -10,7 +10,16 @@
  * the session, and is asserted exactly (`toEqual`), so an extra or missing
  * count key fails.
  *
+ * A recap re-shows claimed-but-unacknowledged endpoints. It must render each
+ * one with the delta that endpoint was first claimed with (this recipient's
+ * cursor → endpoint), not a recomputation against a cursor that the earlier
+ * claim already moved to the endpoint.
+ *
+ * Deltas are line-based (`buildTextDiff`, 002 §5.2): a single-line snapshot
+ * changing from `a` to `b` renders as `- 1: a` / `+ 1: b`.
+ *
  * @see docs/specs/002-runtime-delivery.md §1.1.7 (net collapse over unclaimed events)
+ * @see docs/specs/002-runtime-delivery.md §5.2 (snapshots and diffs)
  * @see docs/specs/002-runtime-delivery.md §9 (claimed set equals rendered set)
  * @see docs/specs/005-cli-reference.md `monitor explain` delivery counts
  */
@@ -122,6 +131,13 @@ Handle net-mon changes.
     lifecycle: Parameters<typeof runtime.claimDelivery>[1],
   ) =>
     runtime.claimDelivery(session.id, lifecycle)?.events.map((e) => e.summary);
+  /** What a claim rendered: each event's summary and per-recipient delta. */
+  const shownWithDiffs = (
+    lifecycle: Parameters<typeof runtime.claimDelivery>[1],
+  ) =>
+    runtime
+      .claimDelivery(session.id, lifecycle)
+      ?.events.map((e) => ({ summary: e.summary, diffText: e.diffText }));
   return {
     runtime,
     session,
@@ -129,6 +145,7 @@ Handle net-mon changes.
     deliveryCounts,
     allEventIds,
     shownSummaries,
+    shownWithDiffs,
   };
 }
 
@@ -221,5 +238,40 @@ describe('monitor explain delivery counts (net-suppressed rows)', () => {
       claimed: 3,
       unread: 1,
     });
+  });
+});
+
+describe('net collapse across successive recaps', () => {
+  it('keeps the endpoint delta when a later recap re-shows a claimed endpoint (#572)', async () => {
+    const h = setup('net');
+    await h.emit('v1');
+    await h.emit('v2');
+    expect(h.shownSummaries('turn-interruptible')).toEqual(['v2']);
+    await h.emit('v3');
+    await h.emit('v4');
+    expect(h.shownSummaries('turn-interruptible')).toEqual(['v4']);
+    await h.emit('v5');
+
+    // The cursor sits at v4 (the last artifact shown), so v5's delta is
+    // v4 → v5. Every recap until acknowledgement re-shows that same delta.
+    const v4ToV5 = { summary: 'v5', diffText: '- 1: v4\n+ 1: v5' };
+    expect(h.shownWithDiffs('post-compact')).toEqual([v4ToV5]);
+    expect(h.shownWithDiffs('post-compact')).toEqual([v4ToV5]);
+    expect(h.shownWithDiffs('post-compact')).toEqual([v4ToV5]);
+  });
+
+  it('keeps a claimed endpoint delta in a recap with no newer event (#572)', async () => {
+    const h = setup('net');
+    await h.emit('v1');
+    await h.emit('v2');
+    expect(h.shownSummaries('turn-interruptible')).toEqual(['v2']);
+    await h.emit('v3');
+    await h.emit('v4');
+    // The cursor sat at v2 when v4 was claimed, so v4's delta is v2 → v4.
+    const v2ToV4 = { summary: 'v4', diffText: '- 1: v2\n+ 1: v4' };
+    expect(h.shownWithDiffs('turn-interruptible')).toEqual([v2ToV4]);
+
+    expect(h.shownWithDiffs('post-compact')).toEqual([v2ToV4]);
+    expect(h.shownWithDiffs('post-compact')).toEqual([v2ToV4]);
   });
 });

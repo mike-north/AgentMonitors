@@ -3337,7 +3337,8 @@ export class RuntimeStore {
    * `buildDiff(cursor.baselineContent, newestArtifact, strategy)` (issue #437:
    * strategy-aware — structural for `json-diff`, line-based otherwise) so the
    * delta spans the recipient's cursor → endpoint (not the shared snapshot
-   * baseline). The older same-object events that no earlier claim surfaced are
+   * baseline). An endpoint an earlier claim already surfaced keeps the delta it
+   * was first claimed with. The older same-object events that no earlier claim surfaced are
    * recorded CLAIMED-BUT-SUPPRESSED (`net_suppressed_at`): retained for
    * `monitor explain` but excluded from delivery (unread/pending/recap). An
    * older sibling an earlier claim already showed (a recap can collapse over
@@ -3379,11 +3380,21 @@ export class RuntimeStore {
     // group ("missed nothing") is left byte-identical to what materialization
     // recorded — the degenerate case where `net` ≡ `incremental`, so a baseline
     // event with a NULL delta is not rewritten to an empty diff.
+    //
+    // An endpoint this recipient already claimed (a recap re-showing it before
+    // acknowledgement) keeps the delta it was first claimed with: that claim
+    // moved the cursor to this endpoint, so recomputing now would span nothing.
+    // Read before {@link markClaimed} stamps the current claim.
+    const alreadyClaimed = this.claimedEventIds(
+      sessionId,
+      view.delivered.map((event) => event.id),
+    );
     for (const event of view.delivered) {
       if (
         event.baselineStrategy !== 'net' ||
         event.snapshotText === null ||
-        event.objectKey === null
+        event.objectKey === null ||
+        alreadyClaimed.has(event.id)
       )
         continue;
       const key = view.groupKeyByEventId.get(event.id);
@@ -3412,6 +3423,26 @@ export class RuntimeStore {
       this.markNetSuppressed(sessionId, view.suppressedIds);
     }
     return view.delivered;
+  }
+
+  /**
+   * The subset of `eventIds` this recipient has already claimed
+   * (`first_notified_at` set), i.e. surfaced by an earlier claim.
+   */
+  private claimedEventIds(sessionId: string, eventIds: string[]): Set<string> {
+    if (eventIds.length === 0) return new Set();
+    const rows = asInternalDb(this.db)
+      .select({ eventId: sessionEventState.eventId })
+      .from(sessionEventState)
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          inArray(sessionEventState.eventId, eventIds),
+          isNotNull(sessionEventState.firstNotifiedAt),
+        ),
+      )
+      .all();
+    return new Set(rows.map((row) => row.eventId));
   }
 
   /**
