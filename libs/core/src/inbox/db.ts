@@ -530,80 +530,7 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       )
   `);
 
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS database_compatibility_markers (
-      id TEXT PRIMARY KEY,
-      workspace_identity TEXT,
-      capability TEXT NOT NULL,
-      created_at INTEGER NOT NULL
-    )
-  `);
-
-  db.run(sql`DROP INDEX IF EXISTS idx_database_compatibility_marker_key`);
-
-  db.run(sql`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_database_compatibility_marker_workspace_key
-      ON database_compatibility_markers (workspace_identity, capability)
-      WHERE workspace_identity IS NOT NULL
-  `);
-
-  db.run(sql`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_database_compatibility_marker_global_key
-      ON database_compatibility_markers (capability)
-      WHERE workspace_identity IS NULL
-  `);
-
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS external_event_receipts (
-      id TEXT PRIMARY KEY,
-      workspace_identity TEXT NOT NULL,
-      monitor_id TEXT NOT NULL,
-      source TEXT NOT NULL,
-      upstream_event_id TEXT NOT NULL,
-      semantic_hash TEXT NOT NULL,
-      object_id TEXT NOT NULL,
-      object_sequence INTEGER NOT NULL,
-      event_kind TEXT NOT NULL,
-      change_kind TEXT NOT NULL,
-      occurred_at TEXT NOT NULL,
-      outcome TEXT NOT NULL,
-      event_ids TEXT NOT NULL DEFAULT '[]',
-      attempt_count INTEGER NOT NULL DEFAULT 0,
-      last_error TEXT,
-      next_attempt_at INTEGER,
-      accepted_at INTEGER NOT NULL,
-      materialized_at INTEGER,
-      updated_at INTEGER NOT NULL
-    )
-  `);
-
-  db.run(sql`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_event_receipt_key
-      ON external_event_receipts (
-        workspace_identity, monitor_id, source, upstream_event_id
-      )
-  `);
-
-  db.run(sql`
-    CREATE TABLE IF NOT EXISTS external_object_sequences (
-      id TEXT PRIMARY KEY,
-      workspace_identity TEXT NOT NULL,
-      monitor_id TEXT NOT NULL,
-      source TEXT NOT NULL,
-      object_id TEXT NOT NULL,
-      highest_sequence INTEGER NOT NULL,
-      receipt_id TEXT NOT NULL,
-      upstream_event_id TEXT NOT NULL,
-      updated_at INTEGER NOT NULL
-    )
-  `);
-
-  db.run(sql`
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_external_object_sequence_key
-      ON external_object_sequences (
-        workspace_identity, monitor_id, source, object_id
-      )
-  `);
+  migrateExternalIngressTables(sqlite);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS session_event_state (
@@ -1370,4 +1297,264 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 /** Narrow to an array, or `[]` for any non-array. */
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Compact idempotency receipts for source-neutral external events (002 §15).
+ * Kept apart from `monitor_state`: a receipt records that one upstream event
+ * was decided, never a source's change-detection checkpoint.
+ */
+const EXTERNAL_EVENT_RECEIPT_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'id', definition: 'TEXT PRIMARY KEY' },
+  { name: 'workspace_identity', definition: 'TEXT NOT NULL' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'source', definition: 'TEXT NOT NULL' },
+  { name: 'upstream_event_id', definition: 'TEXT NOT NULL' },
+  { name: 'semantic_hash', definition: 'TEXT NOT NULL' },
+  { name: 'object_id', definition: 'TEXT NOT NULL' },
+  { name: 'object_sequence', definition: 'INTEGER NOT NULL' },
+  { name: 'event_kind', definition: 'TEXT NOT NULL' },
+  { name: 'change_kind', definition: 'TEXT NOT NULL' },
+  { name: 'occurred_at', definition: 'TEXT NOT NULL' },
+  { name: 'outcome', definition: 'TEXT NOT NULL' },
+  { name: 'event_ids', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { name: 'attempt_count', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'last_error', definition: 'TEXT' },
+  { name: 'next_attempt_at', definition: 'INTEGER' },
+  { name: 'accepted_at', definition: 'INTEGER NOT NULL' },
+  { name: 'materialized_at', definition: 'INTEGER' },
+  { name: 'updated_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** The highest accepted producer sequence for one external object (002 §15). */
+const EXTERNAL_OBJECT_SEQUENCE_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'id', definition: 'TEXT PRIMARY KEY' },
+  { name: 'workspace_identity', definition: 'TEXT NOT NULL' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'source', definition: 'TEXT NOT NULL' },
+  { name: 'object_id', definition: 'TEXT NOT NULL' },
+  { name: 'highest_sequence', definition: 'INTEGER NOT NULL' },
+  { name: 'receipt_id', definition: 'TEXT NOT NULL' },
+  { name: 'upstream_event_id', definition: 'TEXT NOT NULL' },
+  { name: 'updated_at', definition: 'INTEGER NOT NULL' },
+];
+
+/**
+ * Forward-only durable capabilities present in a database (002 §15). A `NULL`
+ * workspace identity is the global scope, distinct from any concrete identity,
+ * including the empty string.
+ */
+const DATABASE_COMPATIBILITY_MARKER_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'id', definition: 'TEXT PRIMARY KEY' },
+  { name: 'workspace_identity', definition: 'TEXT' },
+  { name: 'capability', definition: 'TEXT NOT NULL' },
+  { name: 'created_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** A named index the current schema owns, with its exact definition. */
+interface IndexDefinition {
+  readonly name: string;
+  readonly table: string;
+  readonly sql: string;
+}
+
+/**
+ * The external-ingress tables in creation order, with the indexes each owns.
+ * The marker table keeps global and concrete identities under two partial
+ * unique indexes so `NULL` and `''` never collide.
+ */
+const EXTERNAL_INGRESS_TABLES: readonly {
+  readonly table: string;
+  readonly columns: readonly ColumnDefinition[];
+  readonly indexes: readonly IndexDefinition[];
+}[] = [
+  {
+    table: 'database_compatibility_markers',
+    columns: DATABASE_COMPATIBILITY_MARKER_COLUMNS,
+    indexes: [
+      {
+        name: 'idx_database_compatibility_marker_workspace_key',
+        table: 'database_compatibility_markers',
+        sql:
+          'CREATE UNIQUE INDEX idx_database_compatibility_marker_workspace_key ' +
+          'ON database_compatibility_markers (workspace_identity, capability) ' +
+          'WHERE workspace_identity IS NOT NULL',
+      },
+      {
+        name: 'idx_database_compatibility_marker_global_key',
+        table: 'database_compatibility_markers',
+        sql:
+          'CREATE UNIQUE INDEX idx_database_compatibility_marker_global_key ' +
+          'ON database_compatibility_markers (capability) ' +
+          'WHERE workspace_identity IS NULL',
+      },
+    ],
+  },
+  {
+    table: 'external_event_receipts',
+    columns: EXTERNAL_EVENT_RECEIPT_COLUMNS,
+    indexes: [
+      {
+        name: 'idx_external_event_receipt_key',
+        table: 'external_event_receipts',
+        sql:
+          'CREATE UNIQUE INDEX idx_external_event_receipt_key ' +
+          'ON external_event_receipts ' +
+          '(workspace_identity, monitor_id, source, upstream_event_id)',
+      },
+    ],
+  },
+  {
+    table: 'external_object_sequences',
+    columns: EXTERNAL_OBJECT_SEQUENCE_COLUMNS,
+    indexes: [
+      {
+        name: 'idx_external_object_sequence_key',
+        table: 'external_object_sequences',
+        sql:
+          'CREATE UNIQUE INDEX idx_external_object_sequence_key ' +
+          'ON external_object_sequences ' +
+          '(workspace_identity, monitor_id, source, object_id)',
+      },
+    ],
+  },
+];
+
+/**
+ * The compatibility-marker index written before global and concrete identities
+ * were split. Its `COALESCE(workspace_identity, '')` key folds the global scope
+ * into the empty-string identity, so it must not survive alongside the partial
+ * indexes that replace it.
+ */
+const LEGACY_COMPATIBILITY_MARKER_INDEX =
+  'idx_database_compatibility_marker_key';
+
+/**
+ * Create or upgrade the external-ingress tables under the schema-build
+ * immediate transaction. These tables are additive: no rebuild is needed, so
+ * an existing table keeps its rows and any column the current schema does not
+ * define, which the current writer never names (002 §5.2's carry rule). It is
+ * refused instead, with a {@link SchemaMigrationError} that rolls the whole
+ * open back, when the current writer could not use it:
+ *
+ * - a current column is missing and cannot be added in place (NOT NULL with no
+ *   default); a missing nullable or defaulted column is added;
+ * - a carried column is NOT NULL with no default, so every new row the current
+ *   writer inserts would fail;
+ * - existing rows violate a unique index the current schema requires.
+ *
+ * Indexes the current schema owns are compared with their exact definitions; a
+ * same-named index with another definition is replaced. The legacy marker index
+ * is dropped before the partial marker indexes are created.
+ */
+function migrateExternalIngressTables(sqlite: BetterSQLiteClient): void {
+  for (const { table, columns, indexes } of EXTERNAL_INGRESS_TABLES) {
+    if (tableExists(sqlite, table)) {
+      reconcileAdditiveColumns(sqlite, table, columns);
+    } else {
+      sqlite.exec(createTableSql(table, columns));
+    }
+    if (table === 'database_compatibility_markers') {
+      sqlite.exec(
+        `DROP INDEX IF EXISTS ${quoteIdentifier(LEGACY_COMPATIBILITY_MARKER_INDEX)}`,
+      );
+    }
+    for (const index of indexes) ensureIndex(sqlite, index);
+  }
+}
+
+/**
+ * Bring an existing additive table's columns up to `columns`, or refuse it.
+ * See {@link migrateExternalIngressTables} for the rule.
+ */
+function reconcileAdditiveColumns(
+  sqlite: BetterSQLiteClient,
+  table: string,
+  columns: readonly ColumnDefinition[],
+): void {
+  const live = sqlite.pragma(`table_xinfo(${table})`) as LiveColumn[];
+  const liveNames = new Set(live.map((column) => column.name.toLowerCase()));
+  const currentNames = new Set(
+    columns.map((column) => column.name.toLowerCase()),
+  );
+
+  for (const column of live) {
+    if (currentNames.has(column.name.toLowerCase()) || column.hidden !== 0) {
+      continue;
+    }
+    if (column.notnull !== 0 && column.dflt_value === null) {
+      throw new SchemaMigrationError(
+        table,
+        column.name,
+        'is NOT NULL without a default, so no row the current schema writes could be inserted',
+        {
+          remedy:
+            'Give the column a default or rebuild the table without it (or restore the database), and the open will then proceed.',
+        },
+      );
+    }
+  }
+
+  for (const column of columns) {
+    if (liveNames.has(column.name.toLowerCase())) continue;
+    const definition = column.definition.toUpperCase();
+    const addable =
+      !definition.includes('PRIMARY KEY') &&
+      (!definition.includes('NOT NULL') || definition.includes('DEFAULT'));
+    if (!addable) {
+      throw new SchemaMigrationError(
+        table,
+        column.name,
+        'is missing, and the current schema requires it with no default to fill existing rows',
+        {
+          remedy:
+            'Restore the database, or rebuild the table with the column, and the open will then proceed.',
+        },
+      );
+    }
+    addColumnIfMissing(sqlite, table, column.name, column.definition);
+  }
+}
+
+/** Collapse whitespace so equivalent stored and declared index SQL compare equal. */
+function normalizeIndexSql(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([(),])\s*/g, '$1')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Make `index` exist with exactly its declared definition, replacing a
+ * same-named index that differs. Existing rows that violate a unique index stop
+ * the open with a {@link SchemaMigrationError} naming the table and index.
+ */
+function ensureIndex(sqlite: BetterSQLiteClient, index: IndexDefinition): void {
+  const stored = sqlite
+    .prepare<
+      [string],
+      { sql: string | null }
+    >(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`)
+    .get(index.name);
+  if (stored !== undefined) {
+    if (normalizeIndexSql(stored.sql ?? '') === normalizeIndexSql(index.sql)) {
+      return;
+    }
+    sqlite.exec(`DROP INDEX ${quoteIdentifier(index.name)}`);
+  }
+  try {
+    sqlite.exec(index.sql);
+  } catch (error) {
+    throw new SchemaMigrationError(
+      index.table,
+      undefined,
+      `existing rows violate the index ${index.name} the current schema requires`,
+      {
+        cause: error,
+        remedy:
+          'Remove or repair the duplicate rows (or restore the database), and the open will then proceed.',
+      },
+    );
+  }
 }
