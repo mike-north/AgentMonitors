@@ -90,7 +90,10 @@ function countingProxy() {
       return Reflect[trap](...arguments);
     };
   }
-  return new Proxy(function () {}, handler);
+  // A callable target lets the apply and construct traps observe calls too.
+  return new Proxy(function foreignTarget() {
+    return undefined;
+  }, handler);
 }
 /** Unbounded non-tail recursion raises the engine's own stack-overflow RangeError. */
 function overflow(depth) {
