@@ -765,10 +765,17 @@ external ingress receipts) requires these scenarios, each against a real on-disk
   or carries trigger links, and writes on either side leave the other unchanged.
 - **Concurrent first open.** Several independent processes released together against one fresh
   path all succeed, each observes the complete schema, and the file passes `integrity_check` in WAL
-  mode. Children have bounded lifetimes and are killed and awaited on failure.
+  mode. Each child process runs every trial, released through per-trial barriers, so the race costs
+  the opens rather than process startup. Children have bounded lifetimes and are killed and awaited
+  on failure.
+- **Bounded WAL switch.** Opening a fresh rollback-journal file while another connection holds an
+  exclusive lock waits for it and then fails with `SQLITE_BUSY` within 5 seconds plus a small margin.
+  Under a virtual clock, immediate busy results that use up most of the bound, followed by a held
+  lock, still end the switch within the bound and restore the busy timeout.
 
-Removing the earlier-index drop, recreating a table instead of migrating it, or removing the bounded
-WAL retry MUST each fail one of these tests.
+Removing the earlier-index drop, recreating a table instead of migrating it, skipping the immediate
+schema transaction, removing the WAL retry, or letting one attempt wait past the deadline MUST each
+fail one of these tests.
 
 **Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
 `contract-boundaries.test.ts`, `admission-safety.test.ts`, `public-contract.test.ts`, and

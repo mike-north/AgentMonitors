@@ -3570,9 +3570,11 @@ column when one is identifiable, leaving the database unchanged, when:
 #### Concurrent first open
 
 Independent processes may open one fresh database at the same time; each open MUST succeed and
-observe the complete schema, created once. Switching a fresh file to write-ahead logging can report
-`SQLITE_BUSY` without consulting SQLite's busy handler while another process makes the same switch,
-so the open retries that switch for the same 5-second bound as the busy timeout. The schema build
+observe the complete schema, created once. Switching a fresh file to write-ahead logging needs an
+exclusive lock. While another process makes the same switch, SQLite can report `SQLITE_BUSY` at once
+without consulting its busy handler, so the open retries the switch. While another connection holds
+a lock, an attempt waits in the busy handler instead. Retries and busy-handler waits share one
+deadline: the switch gives up with `SQLITE_BUSY` at most 5 seconds after it starts. The schema build
 then runs under one immediate transaction (see `createDb`), which serializes the remaining work.
 
 Verified: `libs/core/src/external-ingress/schema.test.ts`; schema in `libs/core/src/inbox/schema.ts`
