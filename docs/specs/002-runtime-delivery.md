@@ -3737,3 +3737,7 @@ Canonical scope boundaries cover short and control escapes independently of the
 larger envelope bound. Refusal cases replace error constructors and error
 membership hooks after import and require zero calls with unchanged error codes.
 An injected undercount exercises the final output-size check.
+Each catch site also contains a foreign value thrown from a descriptor intrinsic
+installed before import: a counting proxy, an ordinary object with counting
+coercion and inspection getters, and a native stack-overflow `RangeError` each
+yield `invalid_envelope` without escaping, output or inspection of the thrown value.
