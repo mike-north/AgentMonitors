@@ -170,17 +170,65 @@ export function createDb(dbPath: string): InboxDb {
 }
 
 /**
+ * How long one open waits for another connection's lock, both through SQLite's
+ * busy handler and while switching a fresh file to write-ahead logging.
+ */
+const BUSY_TIMEOUT_MS = 5000;
+
+/** Pause between attempts to switch a contended fresh file to WAL. */
+const WAL_RETRY_PAUSE_MS = 5;
+
+/**
+ * Put the database in write-ahead-log mode, waiting out a concurrent opener.
+ *
+ * Switching a rollback-journal file to WAL needs an exclusive lock, and SQLite
+ * reports `SQLITE_BUSY` for that switch without consulting the busy handler
+ * when another connection is making the same switch or holds the lock. Two
+ * processes first-opening one fresh file therefore race here, before the
+ * schema transaction can serialize them. Retrying until {@link BUSY_TIMEOUT_MS}
+ * gives this step the same wait the busy handler gives every later statement.
+ * Once one opener has switched the file, WAL mode persists and later attempts
+ * succeed immediately.
+ */
+function enableWriteAheadLog(sqlite: BetterSQLiteClient): void {
+  const deadline = Date.now() + BUSY_TIMEOUT_MS;
+  for (;;) {
+    try {
+      // The resulting mode is not checked, as before: an in-memory database
+      // reports `memory`, and a file SQLite cannot put in WAL keeps working
+      // in its rollback-journal mode.
+      sqlite.pragma('journal_mode = WAL');
+      return;
+    } catch (error) {
+      if (!isSqliteBusy(error) || Date.now() >= deadline) throw error;
+      Atomics.wait(
+        new Int32Array(new SharedArrayBuffer(4)),
+        0,
+        0,
+        WAL_RETRY_PAUSE_MS,
+      );
+    }
+  }
+}
+
+/** True for SQLite's `SQLITE_BUSY` family (including extended busy codes). */
+function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code.startsWith('SQLITE_BUSY');
+}
+
+/**
  * Open the SQLite connection and materialize the schema. Extracted from
  * {@link createDb} so the whole synchronous open+build can run inside a
  * restricted-umask window for on-disk databases.
  */
 function buildDb(dbPath: string): InboxDb {
   const sqlite = new Database(dbPath);
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.pragma('foreign_keys = ON');
   // Wait for a concurrent first-open's migration transaction to commit rather
   // than failing with SQLITE_BUSY (see `buildSchema`'s immediate transaction).
-  sqlite.pragma('busy_timeout = 5000');
+  sqlite.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
+  enableWriteAheadLog(sqlite);
+  sqlite.pragma('foreign_keys = ON');
 
   /*
    * This cast is deliberate.
