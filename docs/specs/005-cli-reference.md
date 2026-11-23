@@ -1850,7 +1850,15 @@ channel plugin, not run by hand.
   land on a dead socket (reproducing issue #358's original symptom). This mirrors the isolation
   guarantee `hook deliver` already enforces (§12) by refusing to fall back past an enabled
   workspace's socket at all.
-- `--poll-ms` — delivery poll interval in milliseconds (default: `3000`).
+- `--poll-ms` — delivery poll interval in milliseconds (default: `3000` when omitted). The value
+  must be a whole number written as plain decimal digits, from `100` to `2147483647` inclusive. The
+  floor bounds an accidental storm: each poll is a daemon round trip plus a heartbeat write, so a
+  mistyped tiny value cannot drive more than ten polls a second. The ceiling is the largest delay
+  Node's timers honor. Anything else — negative, `0`, fractional, partly numeric (`1junk`),
+  exponent or hex forms, or out of range — is rejected **before** the MCP server starts or the
+  daemon is contacted: `channel serve` writes one line,
+  `Error: --poll-ms must be a whole number from 100 to 2147483647 (got "<value>").`, to stderr and
+  exits `1`. An explicit `0` is an error, never the default.
 - `--host-session-id` — host session id (default: `$CLAUDE_CODE_SESSION_ID`).
 - `--workspace` — workspace path (default: `$CLAUDE_PROJECT_DIR`).
 
@@ -1865,7 +1873,8 @@ the hook-state surface are automatic. A missing/unreachable daemon is handled qu
 path still delivers durably); the server shuts down when stdin closes (MCP disconnect). With no host
 session id it stays connected (the ack tool reports an error if called) but does not poll.
 
-**Output:** none on stdout (the stdio channel is the MCP transport). Errors are quiet by design.
+**Output:** none on stdout (the stdio channel is the MCP transport). Runtime errors are quiet by
+design; the only exception is an invalid `--poll-ms`, which is reported on stderr before startup.
 
 ---
 
