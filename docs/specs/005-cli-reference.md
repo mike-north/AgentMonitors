@@ -765,17 +765,22 @@ The real-CLI/live-daemon cases in
 rejected-definition debounce/rollup text/JSON parity.
 
 **Delivery counts (current, #572).** The delivery stage's reason and JSON `details` count the
-monitor's projections per lead session by what the session was actually shown:
+monitor's projections into lead sessions. Each projection falls under exactly one count:
 
-- `unread` — projected, never surfaced to the session.
-- `claimed` — surfaced to the session, still unacknowledged.
-- `acknowledged` — surfaced and acknowledged.
 - `netSuppressed` — an older intermediate of a `baseline-strategy: net` catch-up span that the
-  per-recipient net collapse consumed with its newest sibling (002 §1.1.7). It was never shown
-  to the session, so it is **not** included in `claimed`.
+  per-recipient net collapse folded into a newer endpoint before any claim surfaced it (002
+  §1.1.7). The session was never shown it. It stays under this count whether or not it is
+  later acknowledged (an ack by event ID can reach it), so it is never counted as `claimed` or
+  `acknowledged`.
+- `unread` — not suppressed and never claimed.
+- `claimed` — not suppressed, claimed by a delivery and not yet acknowledged. A claim either
+  rendered the event itself or covered it with a generic normal/low reminder that names no
+  events (002 §9.2–§9.3), so `claimed` does not mean the event's content was shown.
+- `acknowledged` — not suppressed and acknowledged.
 
-A count is omitted while it is zero. The counts partition the projections: each row falls under
-exactly one of them.
+A row an earlier claim surfaced keeps its own count even when a later `post-compact` recap
+collapses over it into a newer endpoint: the collapse marks only unclaimed intermediates
+suppressed. A count is omitted while it is zero.
 
 A genuinely idle monitor therefore renders `○` at the observation stage with an affirmative verdict
 (e.g. "Source ran, observed 0 changes — your watched target genuinely hasn't changed (not a bug)."),

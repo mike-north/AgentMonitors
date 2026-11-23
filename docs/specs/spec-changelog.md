@@ -11,10 +11,17 @@ Agent Monitors spec set in `docs/specs/`.
 
 ## 2026-11-23 — `monitor explain` counts net-suppressed rows separately
 
-005 `monitor explain` now describes each delivery count. Rows the per-recipient net collapse
+005 `monitor explain` now defines each delivery count. Rows the per-recipient net collapse
 suppressed (002 §1.1.7) were stored as `claimed` and so inflated that count even though the
-session never saw them; they are now reported under their own `netSuppressed` count. Output
-shape is otherwise unchanged. Implementation now matches the described behavior.
+session never saw them; they are now reported under their own `netSuppressed` count, which an
+ack by event ID no longer moves into `acknowledged`. The 005 text also states that `claimed`
+includes rows covered only by a generic normal/low reminder.
+
+002 §1.1.7 now states that the collapse suppresses only intermediates no earlier claim
+surfaced. A `post-compact` recap over claimed-but-unacknowledged rows had been marking rows the
+session was already shown as suppressed; those rows now stay claimed and unread until
+acknowledged. Rendering and cursor advance are unchanged. Output shape is otherwise unchanged.
+Implementation now matches the described behavior.
 
 ## 2026-11-16 — Bound internal external-envelope admission
 
