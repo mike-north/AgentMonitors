@@ -12,12 +12,17 @@
  * @see https://www.sqlite.org/wal.html#concurrency
  */
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createDb, SchemaMigrationError } from '../inbox/db.js';
+import {
+  createDb,
+  enableWriteAheadLog,
+  SchemaMigrationError,
+  type WalSwitchClock,
+} from '../inbox/db.js';
 import { RuntimeStore } from '../runtime/store.js';
 
 const sql = String.raw;
@@ -738,10 +743,14 @@ describe('receipt tables stay separate from source checkpoint state', () => {
 
 describe('concurrent first open from independent processes', () => {
   const CHILD_COUNT = 6;
-  const TRIALS = 20;
+  const TRIALS = 60;
 
-  /** Start one bounded child that opens `dbPath` once `barrier` appears. */
-  function startChild(dbPath: string, barrier: string) {
+  /**
+   * Start one bounded child that runs every trial under `root` (see the
+   * fixture's protocol). Each process starts once for all trials, so the
+   * test's cost is the racing opens rather than repeated startup.
+   */
+  function startChild(root: string) {
     const child = spawn(
       process.execPath,
       [
@@ -749,8 +758,8 @@ describe('concurrent first open from independent processes', () => {
         '--import',
         path.resolve('src/runtime/__fixtures__/typescript-loader.ts'),
         path.resolve('src/external-ingress/__fixtures__/first-open-child.ts'),
-        dbPath,
-        barrier,
+        root,
+        String(TRIALS),
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
@@ -765,7 +774,7 @@ describe('concurrent first open from independent processes', () => {
     const exited = new Promise<number | null>((resolve, reject) => {
       const timer = setTimeout(() => {
         child.kill('SIGKILL');
-      }, 15_000);
+      }, 60_000);
       child.once('exit', (code) => {
         clearTimeout(timer);
         resolve(code);
@@ -787,13 +796,25 @@ describe('concurrent first open from independent processes', () => {
     };
   }
 
-  async function waitForReady(
-    children: ReturnType<typeof startChild>[],
+  type Child = ReturnType<typeof startChild>;
+
+  /** Wait until every child has printed a line starting with one of `prefixes`. */
+  async function waitForLine(
+    children: Child[],
+    prefixes: string[],
+    what: string,
   ): Promise<void> {
-    const deadline = Date.now() + 10_000;
-    while (!children.every((c) => c.output.includes('READY'))) {
-      if (Date.now() >= deadline) throw new Error('children never got ready');
-      await new Promise((resolve) => setTimeout(resolve, 10));
+    const deadline = Date.now() + 20_000;
+    const seen = (c: Child) =>
+      c.output
+        .split('\n')
+        .some((line) => prefixes.some((prefix) => line.startsWith(prefix)));
+    while (!children.every(seen)) {
+      if (Date.now() >= deadline) {
+        const report = children.map((c) => c.output + c.errors).join('\n');
+        throw new Error(`children never reported ${what}:\n${report}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 2));
     }
   }
 
@@ -815,27 +836,38 @@ describe('concurrent first open from independent processes', () => {
       ),
     );
 
-    for (let trial = 0; trial < TRIALS; trial += 1) {
-      const dir = scratchDir();
-      const dbPath = path.join(dir, 'agentmon.db');
-      const barrier = path.join(dir, 'go');
-      const children = Array.from({ length: CHILD_COUNT }, () =>
-        startChild(dbPath, barrier),
-      );
-      try {
-        await waitForReady(children);
-        writeFileSync(barrier, 'go');
-        const codes = await Promise.all(children.map((c) => c.exited));
-        const report = children.map((c) => c.output + c.errors).join('\n');
-        expect(codes, `trial ${String(trial)}:\n${report}`).toEqual(
-          Array.from({ length: CHILD_COUNT }, () => 0),
+    const root = scratchDir();
+    const children = Array.from({ length: CHILD_COUNT }, () =>
+      startChild(root),
+    );
+    try {
+      for (let trial = 0; trial < TRIALS; trial += 1) {
+        const n = String(trial);
+        await waitForLine(children, [`READY ${n}`], `READY ${n}`);
+        // Every child is now polling this trial's barrier against one fresh path.
+        mkdirSync(path.join(root, `trial-${n}`), { mode: 0o700 });
+        writeFileSync(path.join(root, `go-${n}`), 'go');
+        await waitForLine(
+          children,
+          [`RESULT ${n} `, `ERROR ${n} `],
+          `trial ${n}`,
         );
         for (const c of children) {
-          const line = c.output.split('RESULT ')[1]?.trim() ?? 'null';
-          expect(JSON.parse(line)).toEqual(expectedNames);
+          const line = c.output
+            .split('\n')
+            .find(
+              (l) =>
+                l.startsWith(`RESULT ${n} `) || l.startsWith(`ERROR ${n} `),
+            );
+          expect(line, `trial ${n}`).toMatch(new RegExp(`^RESULT ${n} `));
+          expect(
+            JSON.parse(line?.slice(`RESULT ${n} `.length) ?? 'null'),
+          ).toEqual(expectedNames);
         }
         // One schema: each object exists exactly once and the file is sound.
-        const sqlite = new Database(dbPath);
+        const sqlite = new Database(
+          path.join(root, `trial-${n}`, 'agentmon.db'),
+        );
         expect(
           sqlite
             .prepare(
@@ -850,13 +882,117 @@ describe('concurrent first open from independent processes', () => {
         ]);
         expect(sqlite.pragma('journal_mode', { simple: true })).toBe('wal');
         sqlite.close();
-      } finally {
-        for (const c of children) {
-          if (c.child.exitCode === null && c.child.signalCode === null)
-            c.child.kill('SIGKILL');
-        }
-        await Promise.allSettled(children.map((c) => c.exited));
       }
+      const codes = await Promise.all(children.map((c) => c.exited));
+      expect(codes).toEqual(Array.from({ length: CHILD_COUNT }, () => 0));
+    } finally {
+      for (const c of children) {
+        if (c.child.exitCode === null && c.child.signalCode === null)
+          c.child.kill('SIGKILL');
+      }
+      await Promise.allSettled(children.map((c) => c.exited));
     }
-  }, 180_000);
+  }, 120_000);
+});
+
+describe('switching a fresh file to write-ahead logging is bounded', () => {
+  /** 002 §15: the switch waits at most this long in total, retries included. */
+  const BOUND_MS = 5000;
+
+  function busyError(): Error {
+    return Object.assign(new Error('database is locked'), {
+      code: 'SQLITE_BUSY',
+    });
+  }
+
+  /**
+   * A connection whose WAL switch reports `SQLITE_BUSY` at once until
+   * `immediateUntil` (another opener mid-switch, so SQLite skips the busy
+   * handler) and afterwards blocks for its whole busy timeout before failing
+   * (a lock held by another connection), unless `releasedAt` has passed. Time
+   * is virtual: blocking and pauses only advance the clock.
+   */
+  function contendedConnection(immediateUntil: number, releasedAt = Infinity) {
+    let time = 0;
+    // buildDb sets the connection's busy timeout before the switch.
+    let busyTimeout = BOUND_MS;
+    const clock: WalSwitchClock = {
+      now: () => time,
+      sleep: (ms) => {
+        time += ms;
+      },
+    };
+    const sqlite = {
+      pragma(source: string): unknown {
+        const timeout = /^busy_timeout = (\d+)$/.exec(source);
+        if (timeout) {
+          busyTimeout = Number(timeout[1]);
+          return undefined;
+        }
+        if (source !== 'journal_mode = WAL') {
+          throw new Error(`unexpected pragma ${source}`);
+        }
+        if (time >= releasedAt) return 'wal';
+        if (time < immediateUntil) throw busyError();
+        const waited = Math.min(busyTimeout, Math.max(0, releasedAt - time));
+        time += waited;
+        if (time >= releasedAt) return 'wal';
+        throw busyError();
+      },
+    };
+    return {
+      sqlite,
+      clock,
+      get time() {
+        return time;
+      },
+      get busyTimeout() {
+        return busyTimeout;
+      },
+    };
+  }
+
+  it('fails at the bound when a held lock follows immediate busy results', () => {
+    // Immediate busy results use up almost all of the bound; the next attempt
+    // may block in the busy handler only for the time that is left.
+    const connection = contendedConnection(BOUND_MS - 10);
+    expect(() => {
+      enableWriteAheadLog(connection.sqlite, connection.clock, BOUND_MS);
+    }).toThrow(expect.objectContaining({ code: 'SQLITE_BUSY' }));
+    expect(connection.time).toBeLessThanOrEqual(BOUND_MS);
+    expect(connection.busyTimeout).toBe(BOUND_MS);
+  });
+
+  it('succeeds once a concurrent switch finishes, restoring the busy timeout', () => {
+    const connection = contendedConnection(Infinity, 120);
+    enableWriteAheadLog(connection.sqlite, connection.clock, BOUND_MS);
+    expect(connection.time).toBeGreaterThanOrEqual(120);
+    expect(connection.time).toBeLessThan(BOUND_MS);
+    expect(connection.busyTimeout).toBe(BOUND_MS);
+  });
+
+  it('opening a fresh rollback-journal file under a held lock fails within the bound', () => {
+    const dbPath = scratchDb();
+    const holder = new Database(dbPath);
+    holder.exec('CREATE TABLE held (x INTEGER)');
+    expect(holder.pragma('journal_mode', { simple: true })).toBe('delete');
+    holder.exec('BEGIN EXCLUSIVE');
+    holder.exec('INSERT INTO held VALUES (1)');
+    const started = Date.now();
+    let failure: unknown;
+    try {
+      createDb(dbPath);
+    } catch (error) {
+      failure = error;
+    }
+    const elapsed = Date.now() - started;
+    holder.exec('ROLLBACK');
+    holder.close();
+    expect(failure).toEqual(
+      expect.objectContaining({ code: expect.stringMatching(/^SQLITE_BUSY/) }),
+    );
+    // It waited for the lock rather than failing at once, and stopped at the bound.
+    expect(elapsed).toBeGreaterThanOrEqual(BOUND_MS - 100);
+    expect(elapsed).toBeLessThan(BOUND_MS + 1000);
+  }, 20_000);
 });

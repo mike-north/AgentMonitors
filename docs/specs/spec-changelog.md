@@ -30,9 +30,9 @@ database with the earlier `COALESCE` marker index drops it and keeps every marke
 empty-string identities no longer collide. Existing ingress tables follow 002 §5.2's
 carry-or-refuse rule: extra columns are carried, missing nullable or defaulted columns are added,
 and a shape the current writer cannot use refuses with the database unchanged. Concurrent first
-opens of one fresh file now all succeed: the switch to write-ahead logging retries a busy result
-within the busy-timeout bound instead of failing before the schema transaction. 004 §2.14 lists
-the required scenarios.
+opens of one fresh file now all succeed: the switch to write-ahead logging retries a busy result,
+with retries and busy-handler waits sharing one 5-second deadline, instead of failing before the
+schema transaction. 004 §2.14 lists the required scenarios.
 
 ## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
 
