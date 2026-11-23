@@ -54,7 +54,7 @@ if (
  * envelope preflight), and canonical encoding is the second visit of a state member.
  */
 const foreignMatch =
-  /^(foreign|recursion)-(envelope-preflight|scope-preflight|canonical)$/.exec(
+  /^(foreign|getters|recursion)-(envelope-preflight|scope-preflight|canonical)$/.exec(
     scenario ?? '',
   );
 const foreign = foreignMatch && {
@@ -95,6 +95,30 @@ function countingProxy() {
     return undefined;
   }, handler);
 }
+/**
+ * Formatting and coercion consult these members of an ordinary object, so a read
+ * of any of them shows the caught value was logged, inspected or stringified.
+ * Proxies cannot show this: util.inspect formats a proxy's target without traps.
+ */
+function countingGetters() {
+  const value = {};
+  for (const key of [
+    Symbol.toPrimitive,
+    Symbol.for('nodejs.util.inspect.custom'),
+    'message',
+    'stack',
+  ]) {
+    Object.defineProperty(value, key, {
+      configurable: true,
+      enumerable: true,
+      get() {
+        foreign.trapCalls += 1;
+        return undefined;
+      },
+    });
+  }
+  return value;
+}
 /** Unbounded non-tail recursion raises the engine's own stack-overflow RangeError. */
 function overflow(depth) {
   return overflow(depth + 1) + 1;
@@ -106,6 +130,7 @@ if (foreign) {
       if (foreign.visits === foreign.visit) {
         foreign.fired += 1;
         if (foreign.thrown === 'foreign') throw countingProxy();
+        if (foreign.thrown === 'getters') throw countingGetters();
         overflow(0);
       }
     }

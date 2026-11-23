@@ -581,6 +581,9 @@ describe('external envelope foreign exception containment', () => {
     'foreign-envelope-preflight',
     'foreign-scope-preflight',
     'foreign-canonical',
+    'getters-envelope-preflight',
+    'getters-scope-preflight',
+    'getters-canonical',
     'recursion-envelope-preflight',
     'recursion-scope-preflight',
     'recursion-canonical',
@@ -599,6 +602,9 @@ describe('external envelope foreign exception containment', () => {
       );
       expect(result.error, result.stderr).toBeUndefined();
       expect(result.status, result.stdout + result.stderr).toBe(0);
+      // A successful probe prints nothing; output means the caught value was logged.
+      expect(result.stdout).toBe('');
+      expect(result.stderr).toBe('');
     }, 35_000);
   }
 });
