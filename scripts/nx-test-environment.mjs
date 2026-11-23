@@ -17,6 +17,10 @@
  *
  * Usage: node scripts/nx-test-environment.mjs [--docker]
  *
+ * Nx caches runtime-input results for the lifetime of a task hasher, which the
+ * Nx daemon keeps until the project graph changes. nx.json therefore sets
+ * `useDaemonProcess: false` so this script runs on every invocation.
+ *
  * @internal
  */
 import { execFileSync } from 'node:child_process';
@@ -46,14 +50,22 @@ const fingerprint = {
   jq: probe('jq', ['--version'], 5_000),
   // `process.env.CI` turns a missing-jq skip into a hard failure.
   ci: process.env['CI'] ? 'set' : 'unset',
+  // Permission-denial cases in libs/core/src/runtime/notify-live-definition.test.ts
+  // skip when running as root.
+  root: process.getuid?.() === 0 ? 'yes' : 'no',
+  // source-incoming-changes and CLI integration suites exec git.
+  git: probe('git', ['--version'], 5_000),
+  // plugins/source-command-poll/src/self-bound.test.ts skips without perl.
+  perl: probe('perl', ['-e', 'print "available"'], 5_000),
 };
 
 if (process.argv.includes('--docker')) {
-  // Mirrors hasDocker() in apps/cli/src/commands/cli.docker.test.ts: the
-  // daemon must answer `docker info`, not merely have its CLI installed.
+  // Mirrors hasDocker() in apps/cli/src/commands/cli.docker.test.ts and
+  // plugins/source-command-poll/src/watchdog-reaping.docker.test.ts: the daemon
+  // must answer `docker info` (5s, the shorter of the two), not merely have its
+  // CLI installed.
   fingerprint.docker =
-    probe('docker', ['info', '--format', '{{.ServerVersion}}'], 10_000) ===
-    'unavailable'
+    probe('docker', ['info'], 5_000) === 'unavailable'
       ? 'unavailable'
       : 'reachable';
 }

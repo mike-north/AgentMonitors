@@ -739,16 +739,22 @@ so a replayed result is one the same inputs would have produced. Nx already hash
 project's files, the declared upstream named inputs, `nx.json`, `.gitignore` and, for these
 script targets, every locked external dependency. The workspace adds:
 
-| Input                                                                                                   | Hashed by                  | Why                                                                                           |
-| ------------------------------------------------------------------------------------------------------- | -------------------------- | --------------------------------------------------------------------------------------------- |
-| `tsconfig.base.json`, `api-extractor.base.json`, `api-extractor.build.json` (`sharedGlobals`)           | every target via `default` | Package tsconfigs and API Extractor configs extend them.                                      |
-| `api-extractor.report.json`                                                                             | `check:api-report`         | The report-mode config.                                                                       |
-| `scripts/test-isolation/**` (`testIsolation`)                                                           | `test`, `test:serial`      | The shared boundary of §2.13.                                                                 |
-| `node scripts/nx-test-environment.mjs` runtime fingerprint (`testEnvironment`)                          | `test`                     | Node version and platform, `jq` availability and `CI` change what suites run or skip (§2.10). |
-| The same fingerprint with `--docker` (`dockerEnvironment`)                                              | `test:serial`              | Docker reachability decides whether the smoke suite runs (§2.11).                             |
-| `apps/cli/src/**/*.ts`, `plugins/**/*.ts`, `docs/specs/008-reliability-process-hygiene.md`              | core `test`                | The signal inventory reads them.                                                              |
-| `agent-plugins/agentmonitors/**`, `scripts/owned-test-group.mjs`, `scripts/owned-worker-terminated.mjs` | CLI `test`, `test:serial`  | CLI suites load them.                                                                         |
-| Root `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`                                            | CLI `test:serial`          | The Docker smoke copies the workspace and installs from them.                                 |
+| Input                                                                                                                                     | Hashed by                              | Why                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `tsconfig.base.json`, `api-extractor.base.json`, `api-extractor.build.json` (`sharedGlobals`)                                             | every target via `default`             | Package tsconfigs and API Extractor configs extend them.                                                                             |
+| `api-extractor.report.json`                                                                                                               | `check:api-report`                     | The report-mode config.                                                                                                              |
+| `scripts/test-isolation/**` (`testIsolation`)                                                                                             | `test`, `test:serial`                  | The shared boundary of §2.13.                                                                                                        |
+| `node scripts/nx-test-environment.mjs` runtime fingerprint (`testEnvironment`)                                                            | `test`                                 | Node version, platform, root vs non-root, and `jq`, `git`, `perl` and `CI` change what suites run or skip (§2.10).                   |
+| The same fingerprint with `--docker` (`dockerEnvironment`)                                                                                | CLI `test:serial`, command-poll `test` | Docker reachability decides whether their Docker suites run (§2.11).                                                                 |
+| Shipped `.ts` under `apps/cli/src` and `plugins/`, plugin `package.json`/`tsconfig.json`, `docs/specs/008-reliability-process-hygiene.md` | core `test`                            | The signal inventory and core's plugin imports read them. Test, test-support and fixture files are excluded, matching the inventory. |
+| `agent-plugins/agentmonitors/**`, `scripts/owned-test-group.mjs`, `scripts/owned-worker-terminated.mjs`                                   | CLI `test`, `test:serial`              | CLI suites load them.                                                                                                                |
+| `scripts/owned-test-group.mjs`                                                                                                            | command-poll `test`                    | `command-ownership.test.ts` imports it.                                                                                              |
+| Root `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `apps/*/package.json`                                                       | CLI `test:serial`                      | The Docker smoke copies the workspace and installs from them.                                                                        |
+
+Runtime inputs are only as fresh as the hasher that evaluates them, and the Nx daemon keeps one
+hasher until the project graph changes. `nx.json` therefore sets `useDaemonProcess: false`, so the
+fingerprint runs on every invocation. Re-enabling the daemon would let a host gaining `jq` or
+Docker replay a result recorded without them.
 
 `build` declares `{projectRoot}/dist`, its sole intended writer. `check:api-report` declares
 `{projectRoot}/temp`. It also re-emits `dist/` before API Extractor runs (see the CI note on
@@ -756,16 +762,20 @@ script targets, every locked external dependency. The workspace adds:
 behind `build` is a tracked follow-up. Cache scope is local (`.nx/cache` per worktree). CI does
 not restore an Nx cache.
 
-A test that reads a file outside its project MUST add that file to its target inputs. The
-`pnpm affected` development path selects projects whose hashed inputs changed since
-`origin/main` (or `NX_BASE`), including uncommitted and untracked files. It runs `build`,
-`check` and `test`, then `check:api-report` serially, and omits `test:serial`. It is not a
-substitute for §2.10. A cache-hit `test:serial` with Docker reachable replays the pinned Docker
-smoke rather than re-running its registry installs; use `NX_SKIP_NX_CACHE=true` for fresh
-execution evidence.
+A test that reads a file outside its project MUST add that file to its target inputs; the
+guard below checks known reads and cannot discover new ones. The `pnpm affected` development
+path selects projects that own, or depend on owners of, files changed since `origin/main` (or
+`NX_BASE`), plus projects whose declared inputs name a changed file. It includes uncommitted and
+untracked files. It runs `build` and `check` (website excluded, as in the root scripts), then
+`test` (website included, as in `pnpm test`), then `check:api-report` serially. It omits
+`test:serial`, `test:scripts`, the workspace lint/format/aipm checks and the packaging checks, so
+it is not a substitute for §2.10. A cache-hit `test:serial` with Docker reachable replays the
+pinned Docker smoke rather than re-running its registry installs; use `NX_SKIP_NX_CACHE=true`
+for fresh execution evidence.
 
-**Verified in:** `scripts/nx-cache-contract.test.ts` reads Nx's own hash plan for these targets
-and checks that the fingerprint reports a missing `jq`, `CI` and unreachable Docker.
+**Verified in:** `scripts/nx-cache-contract.test.ts` reads Nx's own hash plan for these targets,
+checks that the daemon is disabled, and checks that the fingerprint reports missing `jq`, `git`
+and `perl`, `CI`, and unreachable Docker.
 
 ## 3. Required Test Scenarios
 

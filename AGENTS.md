@@ -49,11 +49,13 @@ pnpm test       # fast package suites only; prints omitted suites (not the pre-p
 pnpm check      # package checks (excludes website) + workspace checks + aipm validation
 pnpm nx test @agentmonitors/core                                            # one package
 pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts   # one test file
-pnpm affected   # build/check/test + check:api-report for projects touched since origin/main (incl. uncommitted)
+pnpm affected   # build/check, test, check:api-report for projects changed since origin/main and their dependents
 ```
 
 While iterating, use the focused command for the package you edit, then `pnpm affected`; both reuse
-Nx's local cache. `pnpm affected` omits `test:serial`, so also run it for daemon, process or IPC changes.
+Nx's local cache. `pnpm affected` omits `test:serial`, `test:scripts`, lint/format and packaging checks: also run
+`pnpm test:serial` for daemon, process, IPC, preset or command-lifetime changes, and `pnpm test:scripts`
+for `scripts/` changes.
 Escalate to `pnpm verify` for shared configuration changes (`tsconfig.base.json`, `api-extractor.*.json`,
 `nx.json`, `project.json`, Vitest configs, `scripts/test-isolation/`, root `package.json`, lockfile,
 `pnpm-workspace.yaml`) or whenever the impact is unclear. The cache contract is

@@ -10,7 +10,8 @@
     "dockerSmokeInputs": [
       "{workspaceRoot}/package.json",
       "{workspaceRoot}/pnpm-lock.yaml",
-      "{workspaceRoot}/pnpm-workspace.yaml"
+      "{workspaceRoot}/pnpm-workspace.yaml",
+      "{workspaceRoot}/apps/*/package.json"
     ]
   },
   "targets": {

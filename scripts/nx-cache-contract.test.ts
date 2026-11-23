@@ -8,6 +8,9 @@
  * cover. Each listed file was observed being read (strace of the real suites)
  * or is referenced by the target's compiler or API Extractor configuration.
  *
+ * The file lists are known reads, not a discovery mechanism: a new
+ * cross-project read still needs its own input and case here.
+ *
  * Uses Nx's HashPlanInspector from the pinned Nx version. If an Nx upgrade
  * moves it, this suite fails loudly rather than silently passing.
  *
@@ -15,7 +18,7 @@
  * @see https://nx.dev/docs/kb/configure-inputs
  */
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -77,6 +80,17 @@ beforeAll(async () => {
   }
 }, 120_000);
 
+describe('runtime inputs are re-evaluated on every invocation', () => {
+  // The Nx daemon keeps one task hasher, and its runtime-input results, until
+  // the project graph changes, so a host gaining jq or Docker would replay.
+  it('disables the Nx daemon', () => {
+    const nxJson = JSON.parse(
+      readFileSync(path.join(REPO_ROOT, 'nx.json'), 'utf8'),
+    ) as { useDaemonProcess?: boolean };
+    expect(nxJson.useDaemonProcess).toBe(false);
+  });
+});
+
 describe('shared compiler and API Extractor configuration', () => {
   it.each([
     ['@agentmonitors/core', 'build'],
@@ -109,7 +123,20 @@ describe('test inputs outside the owning project', () => {
         'file:docs/specs/008-reliability-process-hygiene.md',
         'file:apps/cli/src/index.ts',
         'file:plugins/source-command-poll/src/self-bound.ts',
+        'file:plugins/source-api-poll/package.json',
       ]),
+    );
+  });
+
+  it('core tests do not hash test files the signal inventory skips', () => {
+    expect(plan('@agentmonitors/core', 'test')).not.toContain(
+      'file:apps/cli/src/commands/cli.integration.test.ts',
+    );
+  });
+
+  it('command-poll tests hash the owned-process helper they import', () => {
+    expect(plan('@agentmonitors/source-command-poll', 'test')).toContain(
+      'file:scripts/owned-test-group.mjs',
     );
   });
 
@@ -132,6 +159,7 @@ describe('test inputs outside the owning project', () => {
         'file:package.json',
         'file:pnpm-lock.yaml',
         'file:pnpm-workspace.yaml',
+        'file:apps/website/package.json',
       ]),
     );
   });
@@ -141,8 +169,10 @@ describe('host facilities that change what a suite exercises', () => {
   it.each([
     '@agentmonitors/core',
     '@agentmonitors/cli',
-    '@agentmonitors/source-command-poll',
     '@agentmonitors/source-incoming-changes',
+    '@agentmonitors/source-api-poll',
+    '@agentmonitors/source-schedule',
+    '@agentmonitors/source-file-fingerprint',
     'agentmonitors',
   ])('%s:test hashes test isolation and the host fingerprint', (project) => {
     expect(plan(project, 'test')).toEqual(
@@ -154,14 +184,20 @@ describe('host facilities that change what a suite exercises', () => {
     );
   });
 
-  it('the serial suite also hashes Docker reachability', () => {
-    expect(plan('@agentmonitors/cli', 'test:serial')).toEqual(
-      expect.arrayContaining([
-        'file:scripts/test-isolation/config.mjs',
-        DOCKER_ENVIRONMENT,
-      ]),
-    );
-  });
+  it.each([
+    ['@agentmonitors/cli', 'test:serial'],
+    ['@agentmonitors/source-command-poll', 'test'],
+  ])(
+    '%s:%s also hashes Docker reachability (it has a Docker suite)',
+    (p, t) => {
+      expect(plan(p, t)).toEqual(
+        expect.arrayContaining([
+          'file:scripts/test-isolation/config.mjs',
+          DOCKER_ENVIRONMENT,
+        ]),
+      );
+    },
+  );
 });
 
 describe('host fingerprint script', () => {
@@ -186,6 +222,9 @@ describe('host fingerprint script', () => {
         platform: `${process.platform}-${process.arch}`,
         jq: 'unavailable',
         ci: 'unset',
+        root: process.getuid?.() === 0 ? 'yes' : 'no',
+        git: 'unavailable',
+        perl: 'unavailable',
       });
       expect(run(['--docker'], { ...env, CI: 'true' })).toMatchObject({
         jq: 'unavailable',

@@ -5,6 +5,15 @@
     "signalInventoryInputs": [
       "{workspaceRoot}/apps/cli/src/**/*.ts",
       "{workspaceRoot}/plugins/**/*.ts",
+      "!{workspaceRoot}/apps/cli/src/**/*.test.ts",
+      "!{workspaceRoot}/apps/cli/src/**/*.test-support.ts",
+      "!{workspaceRoot}/apps/cli/src/**/fixtures/**",
+      "!{workspaceRoot}/plugins/**/*.test.ts",
+      "!{workspaceRoot}/plugins/**/*.test-support.ts",
+      "!{workspaceRoot}/plugins/**/fixtures/**",
+      "!{workspaceRoot}/plugins/**/test-fixtures/**",
+      "{workspaceRoot}/plugins/*/package.json",
+      "{workspaceRoot}/plugins/*/tsconfig.json",
       "{workspaceRoot}/docs/specs/008-reliability-process-hygiene.md"
     ]
   },

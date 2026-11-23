@@ -15,7 +15,8 @@ Agent Monitors spec set in `docs/specs/`.
 target hashes. Before this, editing `tsconfig.base.json` or a shared API Extractor config
 replayed cached builds and checks, a CLI source edit replayed core's signal-inventory test,
 and a host gaining or losing `jq` or Docker replayed a result recorded with different
-coverage. `pnpm affected` documents the development path; `pnpm verify` remains the gate.
+coverage. The Nx daemon is disabled because it would reuse a stale host fingerprint.
+`pnpm affected` documents the development path; `pnpm verify` remains the gate.
 
 ## 2026-11-16 — Bound internal external-envelope admission
 
