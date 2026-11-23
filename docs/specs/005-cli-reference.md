@@ -771,7 +771,8 @@ monitor's projections into lead sessions. Each projection falls under exactly on
   per-recipient net collapse folded into a newer endpoint before any claim surfaced it (002
   §1.1.7). The session was never shown it. It stays under this count whether or not it is
   later acknowledged (an ack by event ID can reach it), so it is never counted as `claimed` or
-  `acknowledged`.
+  `acknowledged`. A row an older version marked suppressed after it had already been shown keeps
+  that marker and still counts here.
 - `unread` — not suppressed and never claimed.
 - `claimed` — not suppressed, claimed by a delivery and not yet acknowledged. A claim either
   rendered the event itself or covered it with a generic normal/low reminder that names no

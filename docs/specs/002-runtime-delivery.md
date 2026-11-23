@@ -355,9 +355,13 @@ Rules for the payload-form step:
 > delivered. Only intermediates no earlier claim surfaced are suppressed: a `post-compact` recap
 > collapses over every unread event, including claimed-but-unacknowledged ones, and an older
 > sibling that an earlier claim already rendered keeps no suppression marker and stays claimed and
-> unread until acknowledged (#572; `libs/core/src/runtime/explain-net-suppressed.test.ts`). The
-> rendered set and cursor advance are unaffected. `incremental` (explicit opt-out) delivers all in order. The per-recipient cursor still
-> advances to the newest claimed artifact (`markClaimed`) even when intermediates are suppressed.
+> unread until acknowledged. It therefore still counts in later claims' `unreadCounts`. Likewise
+> an endpoint that an earlier claim surfaced keeps the delta it was first claimed with when a
+> later recap re-shows it; it is not recomputed against a cursor that claim already moved to it
+> (#572; `libs/core/src/runtime/explain-net-suppressed.test.ts`). Which events a claim renders
+> and claims, and where the cursor moves, are unaffected by either rule. `incremental` (explicit
+> opt-out) delivers all in order. The per-recipient cursor still advances to the newest claimed
+> artifact (`markClaimed`) even when intermediates are suppressed.
 > The monitor's `baseline-strategy` is persisted on each `monitor_events` row (`baseline_strategy`)
 > so the claim-time decision needs no monitor re-scan.
 > Tested by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
