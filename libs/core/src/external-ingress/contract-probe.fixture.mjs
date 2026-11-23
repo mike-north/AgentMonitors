@@ -104,6 +104,7 @@ function countingGetters() {
   const value = {};
   for (const key of [
     Symbol.toPrimitive,
+    Symbol.toStringTag,
     Symbol.for('nodejs.util.inspect.custom'),
     'message',
     'stack',

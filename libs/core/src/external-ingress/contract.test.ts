@@ -598,7 +598,12 @@ describe('external envelope foreign exception containment', () => {
           ),
           scenario,
         ],
-        { encoding: 'utf8', timeout: 30_000 },
+        // An inherited NODE_OPTIONS could preload code or print warnings to stderr.
+        {
+          encoding: 'utf8',
+          env: { ...process.env, NODE_OPTIONS: '' },
+          timeout: 30_000,
+        },
       );
       expect(result.error, result.stderr).toBeUndefined();
       expect(result.status, result.stdout + result.stderr).toBe(0);
