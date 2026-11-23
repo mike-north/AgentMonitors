@@ -1409,6 +1409,8 @@ unregistered, foreign-workspace and proof-phase controls that still record the l
 
 > **Status: target.** Core publishes envelope admission and identity helpers as building
 > blocks for this capability, including structured validation errors and immutable limits. No runtime, CLI, or daemon method accepts the envelope yet.
+> The durable receipt, object-sequence, and compatibility-marker tables exist in every database
+> (§15, external ingress receipts); writing them remains target behavior.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -1447,8 +1449,8 @@ selects exactly `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
 `objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `scope`, and `state`, excluding
 `resumeToken` and unknown properties, allowing one upstream event to replay from another relay cursor. The
 snapshot object key is `external:` plus canonical JSON for `[source, objectId]`, avoiding delimiter
-collisions. Receipt persistence, ordering decisions, observation mapping, and ingestion remain
-target behavior in §16.1.
+collisions. The receipt storage schema is current (§15); writing receipts, ordering decisions,
+observation mapping, and ingestion remain target behavior in §16.1.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
 `contract-boundaries.test.ts`.
@@ -3476,6 +3478,107 @@ lookup, and refusal of a key owned by another run); partial
 `idx_verify_artifacts_awaiting_cleanup (workspace_path, owner_session_id) WHERE cleanup_requested_at IS NULL`
 (per-tick reconciliation reads only records still awaiting cleanup).
 
+### External ingress receipts (_current schema; target writes_)
+
+> **Status: schema current, writes target.** Every open creates these three tables; no runtime,
+> CLI, or daemon path writes them yet (§2.6). They are additive (`CREATE TABLE` only when absent),
+> so every released database shape opens with its existing rows unchanged.
+
+The tables hold external-event idempotency and ordering state. They are separate from source
+checkpoint state: none shares a row, foreign key, or trigger with `monitor_state`, and `monitor_state`
+gains no column for them. A source's `source_state` remains the only change-detection checkpoint.
+
+#### `external_event_receipts`
+
+One compact receipt per accepted upstream event. The receipt stores identity, ordering, and outcome
+only, never the event's `scope` or `state`.
+
+| Column               | Type             | Notes                                                   |
+| -------------------- | ---------------- | ------------------------------------------------------- |
+| `id`                 | TEXT PK          | ULID                                                    |
+| `workspace_identity` | TEXT NOT NULL    | Canonical workspace identity                            |
+| `monitor_id`         | TEXT NOT NULL    |                                                         |
+| `source`             | TEXT NOT NULL    | Envelope `source`                                       |
+| `upstream_event_id`  | TEXT NOT NULL    | Envelope `upstreamEventId`                              |
+| `semantic_hash`      | TEXT NOT NULL    | Semantic SHA-256 (§2.6)                                 |
+| `object_id`          | TEXT NOT NULL    | Envelope `objectId`                                     |
+| `object_sequence`    | INTEGER NOT NULL | Envelope `objectSequence`                               |
+| `event_kind`         | TEXT NOT NULL    |                                                         |
+| `change_kind`        | TEXT NOT NULL    | `created \| modified \| deleted \| descoped`            |
+| `occurred_at`        | TEXT NOT NULL    | The envelope's RFC 3339 text, unchanged                 |
+| `outcome`            | TEXT NOT NULL    | `materialized \| held \| suppressed \| stale \| failed` |
+| `event_ids`          | TEXT NOT NULL    | JSON array of materialized event IDs; defaults to `[]`  |
+| `attempt_count`      | INTEGER NOT NULL | Defaults to `0`                                         |
+| `last_error`         | TEXT nullable    |                                                         |
+| `next_attempt_at`    | INTEGER nullable | Epoch seconds                                           |
+| `accepted_at`        | INTEGER NOT NULL | Epoch seconds                                           |
+| `materialized_at`    | INTEGER nullable | Epoch seconds                                           |
+| `updated_at`         | INTEGER NOT NULL | Epoch seconds                                           |
+
+Index: unique `idx_external_event_receipt_key (workspace_identity, monitor_id, source, upstream_event_id)`.
+
+#### `external_object_sequences`
+
+The highest accepted producer sequence for one external object, so a stale event cannot regress it.
+
+| Column               | Type             | Notes                                     |
+| -------------------- | ---------------- | ----------------------------------------- |
+| `id`                 | TEXT PK          | ULID                                      |
+| `workspace_identity` | TEXT NOT NULL    |                                           |
+| `monitor_id`         | TEXT NOT NULL    |                                           |
+| `source`             | TEXT NOT NULL    |                                           |
+| `object_id`          | TEXT NOT NULL    |                                           |
+| `highest_sequence`   | INTEGER NOT NULL |                                           |
+| `receipt_id`         | TEXT NOT NULL    | The receipt that set this high-water mark |
+| `upstream_event_id`  | TEXT NOT NULL    | That receipt's upstream event             |
+| `updated_at`         | INTEGER NOT NULL | Epoch seconds                             |
+
+Index: unique `idx_external_object_sequence_key (workspace_identity, monitor_id, source, object_id)`.
+
+#### `database_compatibility_markers`
+
+Forward-only durable capabilities present in the database. A `NULL` workspace identity is the global
+scope; it is distinct from every concrete identity, including the empty string.
+
+| Column               | Type             | Notes                 |
+| -------------------- | ---------------- | --------------------- |
+| `id`                 | TEXT PK          |                       |
+| `workspace_identity` | TEXT nullable    | `NULL` = global scope |
+| `capability`         | TEXT NOT NULL    | Capability name       |
+| `created_at`         | INTEGER NOT NULL | Epoch seconds         |
+
+Indexes: partial unique `idx_database_compatibility_marker_workspace_key (workspace_identity, capability) WHERE workspace_identity IS NOT NULL`
+and partial unique `idx_database_compatibility_marker_global_key (capability) WHERE workspace_identity IS NULL`.
+An earlier index, `idx_database_compatibility_marker_key` on
+`(COALESCE(workspace_identity, ''), capability)`, folded the global scope into the empty-string
+identity. Opening a database that has it drops it before creating the two partial indexes, keeping
+every marker row.
+
+#### Upgrading existing tables
+
+Opening a database that already has any of these tables follows §5.2's carry-or-refuse rule without
+a rebuild. Rows are kept. A column the current schema does not define is carried, and the current
+writer never names it. A missing column that is nullable or has a default is added in place. Each
+named index above is compared with its exact definition; a same-named index with another
+definition is replaced. The open refuses with a `SchemaMigrationError` naming the table, and the
+column when one is identifiable, leaving the database unchanged, when:
+
+- a missing current column is NOT NULL with no default;
+- a carried column is NOT NULL with no default, so no row the current writer inserts would fit;
+- existing rows violate one of the unique indexes above.
+
+#### Concurrent first open
+
+Independent processes may open one fresh database at the same time; each open MUST succeed and
+observe the complete schema, created once. Switching a fresh file to write-ahead logging can report
+`SQLITE_BUSY` without consulting SQLite's busy handler while another process makes the same switch,
+so the open retries that switch for the same 5-second bound as the busy timeout. The schema build
+then runs under one immediate transaction (see `createDb`), which serializes the remaining work.
+
+Verified: `libs/core/src/external-ingress/schema.test.ts`; schema in `libs/core/src/inbox/schema.ts`
+(`externalEventReceipts`, `externalObjectSequences`, `databaseCompatibilityMarkers`); DDL and
+migration in `libs/core/src/inbox/db.ts` (`migrateExternalIngressTables`, `enableWriteAheadLog`).
+
 ### `inbox_items`
 
 Legacy inbox table. Driven by `InboxService`, not by the runtime tick loop (§12).
@@ -3650,7 +3753,8 @@ to validate their existing independent contracts.
 `validateExternalEventEnvelope` admits only the complete
 `agentmonitors.external-event.v1` field set. Unknown fields, including instructions,
 urgency, notify policy and local filesystem paths, MUST be refused. The package-root
-validator exposes admission only; ingestion, persistence and routing remain target behavior.
+validator exposes admission only. The receipt storage tables exist (§15); writing receipts,
+ingestion and routing remain target behavior.
 
 The validator MUST preflight encoded size before canonical JSON validation,
 normalization or fingerprinting. Its descriptor walk counts exact escaped UTF-8
