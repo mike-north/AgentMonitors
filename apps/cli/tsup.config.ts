@@ -12,6 +12,7 @@ export default defineConfig({
   banner: {
     js: '#!/usr/bin/env node',
   },
+  // SQLite remains external; native command admission uses our vendored payload.
   noExternal: [/^(?!better-sqlite3|bindings|file-uri-to-path)/],
   external: ['better-sqlite3', 'bindings', 'file-uri-to-path'],
 });

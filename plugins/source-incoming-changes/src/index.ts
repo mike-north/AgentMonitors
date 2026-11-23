@@ -85,22 +85,20 @@ function isIncomingChangesState(value: unknown): value is IncomingChangesState {
 // Git helpers — all use execFileSync with an args array (no shell injection)
 // ---------------------------------------------------------------------------
 
+/** Static guidance avoids forwarding raw Git stderr or authored secret/control text. */
+const REF_UNAVAILABLE_MESSAGE =
+  'incoming-changes: could not resolve the configured ref to a commit. Check watch.cwd (an accessible Git repository), watch.branch (default HEAD), and that git is installed. No baseline was established or advanced; continuous monitoring will retry.';
+
 /** 64 MiB — large enough for monorepo diffs and large text files. */
 const MAX_BUFFER = 64 * 1024 * 1024;
 
 /**
- * Resolve the current commit SHA for the given branch (or HEAD).
- *
- * Fix 1 (option injection): `--end-of-options` terminates git option parsing
- * before the user-supplied `branch` value so a value like `--help` or
- * `--git-dir=...` is treated as a ref name rather than a flag.
- *
- * Note on output format: `git rev-parse --end-of-options <ref>` echoes the
- * literal string `--end-of-options` as its first output line, followed by the
- * resolved SHA.  We therefore take the LAST non-empty line of stdout.
- *
- * Returns `undefined` if the resolution fails (not a git repo, unknown ref).
- * The caller is responsible for deciding how to handle the absence.
+ * Resolve the authored revision unchanged to one object ID, then separately
+ * peel that ID to a commit. Appending syntax to an authored expression can
+ * change a path or search regex instead of checking its type (e.g. HEAD:path
+ * or :/message). Only a complete validated ID is safe to extend with ^{commit}.
+ * The option terminator prevents authored refs from changing Git's invocation;
+ * failures leave the last successful source checkpoint authoritative.
  */
 function tryResolveCurrentRef(
   cwd: string,
@@ -108,23 +106,25 @@ function tryResolveCurrentRef(
 ): string | undefined {
   const ref = branch ?? 'HEAD';
   try {
-    // Fix 1: --end-of-options prevents a branch value like "--help" from being
-    //        interpreted as a git flag.
-    // Fix 2: maxBuffer prevents ENOBUFS on pathologically large output.
-    const raw = execFileSync('git', ['rev-parse', '--end-of-options', ref], {
-      cwd,
-      encoding: 'utf-8',
-      maxBuffer: MAX_BUFFER,
-    });
-    // Take only the last non-empty line — the echoed --end-of-options token
-    // appears as an earlier line in some git versions.
-    const sha = raw
-      .trim()
-      .split('\n')
-      .filter((l) => l !== '--end-of-options')
-      .at(-1)
-      ?.trim();
-    return sha !== undefined && sha.length > 0 ? sha : undefined;
+    // Each invocation must resolve exactly one complete object, in either Git
+    // hash format. Never treat echoed arguments or multi-object output as state.
+    const resolveObjectId = (revision: string): string | undefined => {
+      const sha = execFileSync(
+        'git',
+        ['rev-parse', '--verify', '--end-of-options', revision],
+        {
+          cwd,
+          encoding: 'utf-8',
+          maxBuffer: MAX_BUFFER,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        },
+      ).trim();
+      return /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(sha) ? sha : undefined;
+    };
+    const objectId = resolveObjectId(ref);
+    return objectId === undefined
+      ? undefined
+      : resolveObjectId(`${objectId}^{commit}`);
   } catch {
     return undefined;
   }
@@ -190,11 +190,11 @@ function tryGetDiffEntries(
       cwd,
       encoding: 'buffer',
       maxBuffer: MAX_BUFFER,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch {
-    // Fix 4: a gc'd prev SHA, a history-rewritten range, or any other git
-    //   error causes a graceful re-baseline rather than a throw that would
-    //   propagate up and halt the runtime tick loop.
+    // A missing previous object cannot provide a delta. Rebaseline quietly at
+    // the verified current commit; this is distinct from an unavailable ref.
     return undefined;
   }
 
@@ -251,6 +251,7 @@ function getFileContent(
       cwd,
       encoding: 'buffer',
       maxBuffer: MAX_BUFFER,
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     // Omit snapshot text for binary files
     if (content.includes(0)) return undefined;
@@ -369,11 +370,12 @@ const source: ObservationSource = {
     try {
       const { paths, branch, cwd } = parseScopeConfig(config);
 
-      // Fix 4: if current-ref resolution fails (not a repo, unknown branch),
-      // return an empty result without nextState rather than throwing.
+      // Unavailable input is an observation failure, never a successful empty
+      // baseline. The runtime isolates the rejection and retries with its last
+      // good source and notify state; diagnostics are never emitted as source events.
       const currentRef = tryResolveCurrentRef(cwd, branch);
       if (currentRef === undefined) {
-        return Promise.resolve({ observations: [] });
+        throw new Error(REF_UNAVAILABLE_MESSAGE);
       }
 
       // Baseline run: no valid prior state — record the current SHA and return

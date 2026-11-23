@@ -38,13 +38,13 @@ import type {
 
 The interface definition (verified: `libs/core/src/observation/types.ts`):
 
-| Member                     | Kind                         | Required | Description                                                                                                                 |
-| -------------------------- | ---------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
-| `name`                     | `readonly string`            | Yes      | Unique kebab-case plugin name. Matches `watch.type` in `MONITOR.md`.                                                        |
-| `scopeSchema`              | `readonly JsonSchema`        | Yes      | JSON Schema fragment describing this source's per-source config (the `watch:` block minus `type`).                          |
-| `stateful`                 | `readonly boolean?`          | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent.                         |
-| `observe(config, context)` | `Promise<ObservationResult>` | Yes      | One-shot observation: check for changes and return any observations.                                                        |
-| `watch?(config, context)`  | `AsyncIterable<Observation>` | No       | Optional continuous watch mode, driven by the runtime for sources that implement it (NP4). Stops on `context.signal` abort. |
+| Member                     | Kind                               | Required | Description                                                                                                                 |
+| -------------------------- | ---------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------- |
+| `name`                     | `readonly string`                  | Yes      | Unique kebab-case plugin name. Matches `watch.type` in `MONITOR.md`.                                                        |
+| `scopeSchema`              | `readonly JsonSchema`              | Yes      | JSON Schema fragment describing this source's per-source config (the `watch:` block minus `type`).                          |
+| `stateful`                 | `readonly boolean?`                | No       | If `true`, the first successful call establishes a baseline (PP6). Defaults to `false` when absent.                         |
+| `observe(config, context)` | `Promise<ObservationResult>`       | Yes      | One-shot observation: check for changes and return any observations.                                                        |
+| `watch?(config, context)`  | `AsyncIterable<ObservationResult>` | No       | Optional continuous watch mode, driven by the runtime for sources that implement it (NP4). Stops on `context.signal` abort. |
 
 `JsonSchema` is typed as `Record<string, unknown>`, making it a plain object describing a JSON Schema fragment.
 
@@ -71,10 +71,10 @@ The interface definition (verified: `libs/core/src/observation/types.ts`):
 
 ### 2.3 Observation result
 
-`observe()` returns an `ObservationResult`:
+`observe()` returns and `watch()` yields an `ObservationResult`:
 
 - `observations: Observation[]` — zero or more source observations.
-- `nextState?: unknown` — optional source-owned persisted state to use in the next cycle.
+- `nextState?: unknown` — optional source-owned restart state committed with this finite batch. Omitted/undefined preserves the prior baseline; null resets to the existing empty-state representation `{}`.
 - `outcome?: "rebaselined" | "no-files-matched"` — optional diagnostic for a zero-observation run
   that is meaningfully different from ordinary `no-change`. The runtime records it in
   `observation_history` only when the source returned zero observations and emitted nothing.
@@ -118,9 +118,18 @@ event-materialization consequences are specified in
 [002 §4.1](./002-runtime-delivery.md) and [002 §5.1](./002-runtime-delivery.md). Verified:
 `libs/core/src/observation/types.ts`, `libs/core/src/runtime/service.ts`.
 
+A watch yield is a complete finite batch whose observations and checkpoint commit together before
+Interpret or the next pull. `ObservationContext.checkpoint` is removed; independent checkpoint
+writes and legacy bare-observation yields are unsupported. This is a breaking plugin migration,
+accepted by the user on 2026-11-01 to prevent advancing a checkpoint past unadmitted observations.
+Use `yield { observations: [...], nextState }`, or an empty array for a state-only batch. Do not split
+one checkpoint's covered observations across future yields. Whole-admission failure stops the
+iterator and preserves its old restart baseline. See [002 §2.4](./002-runtime-delivery.md#24-watch-mode-source-state-checkpointing)
+for the decision rationale, failure contract and migration examples.
+
 ### 2.4 Stateful sources
 
-If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). On subsequent calls, the stored state is available via `context.previousState`.
+If `stateful` is `true`, the first successful `observe()` call **MAY** return an empty `observations` array while storing an initial baseline in `nextState`. That is not an error case — it is how baseline-then-detect sources work (PP6). A CLI initial baseline requires non-nullish `nextState`; zero observations alone do not establish one. State remains source-owned and may be a primitive; the CLI MUST NOT require an object or SHA shape. A `no-files-matched` diagnostic takes precedence over this baseline check. On subsequent calls, the stored state is available via `context.previousState`.
 
 `file-fingerprint`, `api-poll`, `command-poll`, and `incoming-changes` all declare `stateful: true`. `schedule` does not declare `stateful` (defaults to `false`).
 
@@ -470,6 +479,15 @@ When a previously seen file's hash changes, the source emits one `Observation` p
 - `snapshot`: `{ filePath, previousHash, currentHash }`
 - `snapshotText`: file content as UTF-8 string, **only if the file contains no null bytes** (`!content.includes(0)` where `content` is a `Buffer`)
 
+The fingerprint, binary classification and textual snapshot MUST use the same byte sample.
+The source checks file identity, size and nanosecond modification/change timestamps before and
+after reading. A detected metadata change fails the entire observation without advancing its
+checkpoint; the next scheduled call uses the prior baseline. Reported size need not equal the
+readable byte count (virtual files may report zero while returning contents). There is no internal
+retry or settling timer. A stable empty or partial file is legitimate input: this check cannot
+infer a writer's future intent, and does not promise atomicity against undetectable concurrent
+writes. Verified: `plugins/source-file-fingerprint/src/read-consistency.test.ts`.
+
 ### 3.3 Change kinds
 
 After the baseline run, the source classifies every observed transition and sets the observation's
@@ -760,10 +778,10 @@ monitor, it MUST skip that monitor's `observe()` call (G5/NP4, [002 §2.3](./002
 1. The source re-computes the SHA-256 fingerprint of the affected file(s).
 2. It compares against the in-memory fingerprint state (the same `FingerprintState` shape as
    `nextState` in §3.2).
-3. For each changed, created, or deleted path, it **yields** one `Observation` through the
-   `AsyncIterable<Observation>` exactly as `observe()` would, using the same observation shape
-   (§3.2), change-kind classification (§3.3), and salience policy (§3.4).
-4. It updates the in-memory fingerprint state.
+3. It collects changed, created, or deleted paths into the finite `observations` array, using the
+   same observation shape (§3.2), change-kind classification (§3.3), and salience policy (§3.4).
+4. It yields `{ observations, nextState }`, associating the resulting fingerprint state with exactly
+   that batch. The runtime commits both before requesting a newer batch.
 
 A small internal coalesce window (~50–100 ms) MAY be applied before emitting, to absorb
 editor atomic-save sequences (write-tmp → rename) as a single change event. This is an
@@ -859,40 +877,23 @@ insufficient.
 auto` with watcher init forced to fail MUST see the monitor switch to polling AND a warning
 > visible in its explain output.
 
-### 3.10 Periodic source-state checkpointing during watch (TARGET)
+### 3.10 Source-state batches during watch (TARGET)
 
-> **Status: target.** Part of the §3.8 event-driven feature. This section describes a new core
-> contract addition (also specified in [002 §2.4](./002-runtime-delivery.md)) required for
-> mid-watch crash safety. All rules here are target.
+> **Status: target for file-fingerprint.** The event-driven source feature in §3.8 must adopt the
+> current core batch contract in [002 §2.4](./002-runtime-delivery.md#24-watch-mode-source-state-checkpointing).
+> No bundled source implements continuous watch yet.
 
-While `watch()` is running, the in-memory fingerprint state advances with every OS event —
-but without periodic persistence, a mid-watch daemon crash would lose that state. On restart the
-daemon would re-observe from the last persisted baseline and re-emit observations for changes that
-had already been delivered and acknowledged, creating duplicate deliveries.
+The fingerprint state associated with a finite batch of file observations is yielded as that
+batch's `nextState`. It must not include changes whose observations are deferred to another batch.
+The runtime persists the fingerprint baseline and observations together before optional Interpret.
+A checkpoint-only reconciliation yields `{ observations: [], nextState }`; it may not bypass pending
+source observations. Do not use an out-of-band callback or rely on warning-and-continue after a
+failed state write: whole-admission failure closes the iterator and preserves the old baseline.
 
-To prevent this, `file-fingerprint`'s `watch()` implementation MUST periodically checkpoint its
-updated fingerprint state back to the runtime using the watch-checkpoint mechanism specified in
-[002 §2.4](./002-runtime-delivery.md). The checkpoint carries the current `FingerprintState` as
-`nextState` so the runtime can persist it durably — respecting the G14 durable-write-before-Interpret
-ordering ([002 §1.1.8](./002-runtime-delivery.md)) — before any downstream pipeline work.
-
-> **Why this is a core-contract addition.** Today ([002 §2.3](./002-runtime-delivery.md)), the
-> runtime leaves `sourceState` untouched while a watcher is running (source state is only advanced
-> by `observe()` returning `nextState`). Watch-mode checkpointing requires the runtime to accept an
-> out-of-band state write from an active watcher. The new `context`-level callback or periodic
-> `{ observation, nextState }` checkpoint shape is the mechanism for this write-back; its exact
-> TypeScript shape is specified in [002 §2.4](./002-runtime-delivery.md).
-
-A checkpoint interval of approximately the `interval` field (or the default 30s if omitted) is
-a reasonable default. The checkpoint MUST be durable before the runtime interprets the accompanying
-observation (G14 ordering). If the checkpoint write fails, `watch()` SHOULD treat this as a
-transient error, log a warning, and continue watching — a failed checkpoint is not cause to abort
-the watcher.
-
-> **Test implication.** A test that (a) starts a watcher, (b) triggers file changes that are
-> observed and yielded, (c) simulates a daemon crash before the next checkpoint, and (d) restarts the
-> daemon MUST see the reconcile-on-start pass (§3.8) report only the changes that occurred
-> _after_ the last checkpoint — not re-report changes that were delivered before the crash.
+On restart, reconciliation begins from the last committed baseline. A crash before admission
+requires replay of that batch; a crash after admission must find its events or recovery obligations
+along with the advanced baseline. A source that intentionally lags checkpoints can replay already
+admitted changes, so this contract does not promise exactly-once acquisition or delivery.
 
 ## 4. Bundled Source: `api-poll`
 
@@ -1318,7 +1319,11 @@ Required field: `paths` (array of strings — path prefixes or globs passed to `
 
 ### 6.2 Behavior
 
-`incoming-changes` is `stateful: true`. The first call resolves the current commit SHA via `git rev-parse`, stores it as `nextState: { ref: '<sha>' }`, and returns an empty `observations` array — this is the baseline run; it does **not** report the existing tree as changed.
+`incoming-changes` is `stateful: true`. The first call resolves the authored revision unchanged
+via `git rev-parse --verify --end-of-options <ref>` to one complete object ID, then separately
+resolves `<object-id>^{commit}` to a commit SHA. It stores that SHA as `nextState: { ref: '<sha>' }`
+and returns an empty `observations` array. This is the baseline run; it does **not** report the
+existing tree as changed.
 
 On subsequent calls, the source:
 
@@ -1348,11 +1353,44 @@ with `git ls-remote origin refs/heads/<branch>` (§11.8).
 
 ### 6.5 Error resilience
 
-- If `git rev-parse` fails (not a git repo, unknown branch, option-injection guard triggered), `observe()` returns `{ observations: [] }` with no `nextState` — it silently waits for the repo/branch to become valid.
-- If `git diff` fails (e.g., the stored SHA was gc'd or history-rewritten), `observe()` re-baselines: it returns `{ observations: [], nextState: { ref: currentRef } }` and starts fresh from the current ref.
-- `git show` failures (per-file snapshot fetch) are silenced and result in `snapshotText` being absent; the observation is still emitted.
+**Current**, resolving the previous silent-wait rule per [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474) (Refs #305):
 
-These guards ensure a source error does not propagate to the runtime tick loop.
+- Current-ref resolution MUST verify one commit object. Commit-ish expressions and annotated tags
+  peeling to commits are accepted; tree/blob objects, unknown refs, option-looking invalid refs,
+  inaccessible/non-repository cwd, and unavailable Git reject with an ordinary source `Error`.
+  Arguments use an array with an option terminator; SHA-1 and SHA-256 object IDs are supported.
+  Resolve the authored expression **unchanged** to a single complete object ID before adding
+  commit-peeling syntax to that validated ID. Appending `^{commit}` directly to authored input
+  can change a file path (`HEAD:payload`) or a commit-search regex (`:/Initial`) instead of
+  verifying object type. For example, tracking files `payload` and `payload^{commit}` MUST NOT
+  allow `HEAD:payload` to establish a blob baseline. Conversely, `:/Initial` MUST retain its
+  ordinary Git meaning and baseline the matching commit, even when it differs from HEAD.
+  HEAD, full object IDs, annotated commit tags and extended single-commit expressions remain
+  valid. This preserves [Git revision syntax](https://git-scm.com/docs/gitrevisions); it is object
+  verification, not a restriction to branch-name syntax.
+
+- The exact error message is:
+
+  > incoming-changes: could not resolve the configured ref to a commit. Check watch.cwd (an accessible Git repository), watch.branch (default HEAD), and that git is installed. No baseline was established or advanced; continuous monitoring will retry.
+
+  This static single-line message contains no raw child stderr or interpolated configuration.
+  The runtime isolates it as `errored`, keeps the last-good source and notify state, and retries
+  automatically. It emits no synthetic source event. On recovery, diff from the last-good SHA;
+  if no baseline ever succeeded, establish the first baseline without emitting the existing tree.
+
+- If `git diff` fails (e.g., the stored SHA was gc'd), `observe()` re-baselines quietly:
+  `{ observations: [], nextState: { ref: currentRef }, outcome: 'rebaselined' }`. A history rewrite
+  whose old commit remains diffable produces the ordinary net diff, not an automatic rebaseline.
+- `git show` failures (per-file snapshot fetch) remain nonfatal and omit `snapshotText`; the
+  observation is still emitted. Resolve, diff and show explicitly capture child stderr and MUST
+  NOT leak it to the terminal, including when an error is caught.
+
+No public unavailable outcome, schema or stored-state migration is introduced. Source consumers
+that previously assumed resolution always fulfilled must now handle the existing rejection
+contract. The runtime already does so. Its existing error path leaves the scheduling timestamp
+unchanged (due monitors retry each daemon tick; #559 tracks that retry cost). Held debounce and
+rollup work still flushes at its own deadline or window while the source fails
+([002 §2.6](./002-runtime-delivery.md)). Already-materialized events remain deliverable.
 
 ## 7. Source Registry, Validation, and Schema Generation
 
@@ -1514,7 +1552,8 @@ directly (`execFile` semantics, `shell: false`): there is no word-splitting, glo
 injection surface, and what executes is exactly what the author wrote, token for token. This is the
 decision for #81's first open question; a bare-string `command` (which would imply implicit shell
 word-splitting) is rejected — an author who needs shell features writes them into a script and polls
-the script.
+the script. Like plain spawn, Linux glibc may run a shebang-less executable with `/bin/sh`
+(§11.2); argv elements remain separate literal arguments and are never joined as shell source.
 
 **Shell features are opt-in, not implicit.** An author who genuinely needs a pipeline or shell
 operator spawns a shell _explicitly_ in argv form — `command: ['sh', '-c', 'git status -sb | grep ahead']`
@@ -1542,6 +1581,178 @@ SIGKILL after a 5s grace). `stdout` capture is capped at **1 MiB**; output beyon
 discarded and the result is marked `truncated: true` (a truncated result still diffs — but see the
 validation note in §11.7).
 
+**POSIX commands are self-bounding** ([008 §3.3](./008-reliability-process-hygiene.md), #470).
+An asynchronous launcher starts an in-group watchdog through a short-lived intermediate. It waits
+for the timer-armed acknowledgement, reaps the intermediate and drains its IPC channel before replacing itself with the
+authored command. The watchdog is reparented within the same group, never a waitable child of the
+authored command; commands that reap all children can finish normally.
+**Current Linux adoption contract:** when the observer is namespace PID 1 or is already a child
+subreaper, it MUST reap only its own reported watchdogs. The watchdog writes its PID, current parent and `/proc`
+start time directly to a dedicated private observer pipe, completing partial writes and closing
+that descriptor before it arms any deadline. The pipe passes through both intermediates without
+sharing the admission-status stream: an elapsed watchdog deadline cannot kill the messengers
+before they forward its identity. Registration can arrive before adoption; that exact lifetime
+remains pending while its reported intermediate still owns it. On a Linux arming failure the
+intermediate drains and reaps its unarmed watchdog before reporting failure, including when
+registration itself could not be completed. Before every `waitpid(pid, WNOHANG)`, the observer MUST verify
+that this exact lifetime is a zombie child of itself in the launcher's original group and session.
+Missing, unreadable or changed identity MUST withhold the wait. It MUST NOT use wildcard waits,
+signal while reaping, or reap when neither PID 1 nor a subreaper; macOS is unchanged. For example,
+a reported PID that has been recycled or is still running cannot be waited on. Private watchdog
+registration does not establish journal ownership or signal authority. The reaper polls only
+outstanding reported lifetimes with an unreferenced timer, retiring it when none remain. It never
+installs a general child-exit handler or enables subreaping on the caller. Verified by
+`watchdog-reaper.test.ts` (identity, state, pending adoption and eligibility refusal),
+`watchdog-registration.test.ts` (registration before timers and unarmed-child failure reaping),
+`watchdog-reaping.test.ts`
+(real Linux subreaper and libuv exit statuses), and `watchdog-reaping.docker.test.ts` (12 bounded
+observations as PID 1 without an init, zero remaining `/proc` zombies).
+The command retains its PID, process group and
+inherited ownership mark; argv remains literal. Values containing NUL bytes fail before execution
+rather than being truncated at the native string boundary. Executable paths retain their authored
+spelling, including relative paths and kernel symlink/`..` traversal. The command cwd is set before
+lookup. Linux calls libc `execvpe`: glibc's ENOEXEC fallback to `/bin/sh`
+matches plain spawn on the same libc. macOS retries EINTR, continues PATH search after
+EACCES/ENOENT/ENOTDIR, and stops on other errnos (including ENOEXEC). At exhaustion, EACCES takes
+precedence if encountered; otherwise the last errno is reported. Names containing `/` bypass PATH;
+empty PATH components use the bare filename. The authored program starts with the default signal
+dispositions and empty signal mask of a normal spawn, including SIGPIPE/SIGXFSZ. Internal Node
+startup must not change an admitted authored command's resource limits: every soft/hard
+pair matches a plain spawn from the same running parent. Node startup can raise its own soft
+`RLIMIT_NOFILE`, but never changes its hard limit. The source synchronously captures the
+parent's soft and hard open-file values directly with native `getrlimit` through the
+package's vendored binding, loaded lazily and cached per process on supported POSIX hosts.
+Resource capture and Linux watchdog reaping share one parent-side native binding and libc handle;
+adding reaping must not initialize a second binding or change the captured budget.
+The 16-byte native pair is encoded as exact BigInt decimal strings or platform-specific
+`unlimited` over the configuration pipe, including finite values above 2^53. Capture does
+not generate diagnostics or write files; its work does not scale with sockets, handles or
+workers. Linux binding admission reads `/proc/self/maps` once before requiring the binary,
+accepting only a file-backed `libc.so.6` or `libc-2.N.so` with no musl-shaped
+name in any path or synthetic label segment (the fail-closed rule in §11.2). Unreadable, empty or ambiguous evidence refuses
+with `glibc is required`; no diagnostic report or subprocess runs. The native glibc
+symbol is checked only after this admission.
+After watchdog arming, the launcher reads the native pair and refuses a hard-field mismatch
+against the captured value: Node never changes that field, so drift is unexpected. It keeps
+the native hard bytes, restores the exact soft value and reads back both fields through
+native `getrlimit`/`setrlimit` before exec. Other limits pass through unchanged; the watchdog
+keeps its own limits. Failed binding load or capture refuses execution before spawn with
+`RLIMIT_NOFILE` and the operation; native read/restore failures include errno. A hard-field
+or read-back mismatch also refuses execution. Each refusal retains the previous baseline.
+Capture follows committed ownership admission; a capture failure adds no PID suspicion and
+leaves the committed life mark available to the existing reconciliation path. Verified:
+`resource-limits.test.ts` compares every native resource pair with plain spawn on macOS/Linux,
+including macOS large soft/hard values and symbolic infinity, and exercises native load/read
+failures, no reports/writes, binding reuse and a one-second observation with a link-local UDP
+peer, more than 1,000 handles and a busy worker. `self-bound.test.ts` verifies
+watchdog-before-restore ordering, native restore failures and hard-field/read-back mismatches.
+Internal Node
+helpers use absolute Node and native-module paths and need only the command-life mark in their
+startup environment. Authored and inherited variables, including `PATH`, `HOME`, `TMPDIR` and `NODE_OPTIONS`, never enter
+helper startup environments. The complete intended command environment travels only over the
+configuration pipe and reaches native exec as envp (apart from the ownership-mark override), so
+helper program size does not reduce the environment budget accepted by plain spawn. Linux installs
+the authored PATH at the native boundary because libc `execvpe` searches its caller's PATH. The launcher calls libc
+through the packaged native binding, with a separate close-on-exec status pipe. Before execution,
+it clears close-on-exec and nonblocking mode on stdin/stdout/stderr using the platform's
+variadic `fcntl` ABI. It reads both descriptor and status flags back, preserving access mode,
+append mode and all unrelated status flags. Authored native I/O has plain spawn's blocking
+semantics even when Node helper startup changed those flags; stdin remains `/dev/null`
+under the source's ordinary ignored-input configuration. A failed flag operation, failed
+read-back, surviving close-on-exec flag or surviving `O_NONBLOCK` refuses
+execution with `Could not retain command stdio` and preserves the prior baseline. Frames are written
+completely, retrying short writes. Missing frames, trailing partial bytes, unknown frame kinds and
+invalid schemas fail closed and retain the prior baseline; valid frames may span multiple reads. An
+unwritable error status terminates the helper by signal so it cannot become an authored result. Both
+ESM and CJS consumers resolve that binding relative to the source package itself. Native-load
+failures explain that platform native exec support could not be loaded and retain the underlying
+error detail. Other startup/initialization failures retain their own error detail without that
+module-loading label. Ordinary exec failures (ENOENT interpreter, EACCES, E2BIG, and ENOEXEC where spawn
+reports it) report errno and a short message naming the program, without a native abort, core file
+or crash report. They preserve failing health and the prior successful baseline (§11.5). Arming
+failure is an execution failure and no authored work runs. No synchronous subprocess, FIFO or
+blocking IPC open runs on `observe()`; Linux native admission performs the single
+synchronous procfs maps read described above. The watchdog's referenced timers send SIGTERM at the absolute
+deadline and SIGKILL after the fixed grace using its own current-group target (`kill(0, …)`). Its
+continued membership supplies identity safety, independent of daemon liveness and command stdio.
+Once a normally completed finite observation has captured its output, it releases the whole original
+group through the watchdog, including any remaining background work. Timeout failures retain the
+full kill grace; after observation settlement the caller-side control channel is unreferenced so a
+finished consumer can exit during that grace. The watchdog retains its own referenced timers. Daemon
+EOF alone never releases the bound. This also covers background descendants that close every
+inherited descriptor. Re-sessioned descendants remain restart-sweep work. Windows command admission is
+unsupported and refused before spawn; the retained Windows cleanup path is not an admission fallback.
+
+Restart cleanup preserves a group's independent bound when a member is uncertain and
+current evidence identifies a watchdog: the same life mark plus
+`AGENTMONITORS_COMMAND_ROLE=watchdog` in kernel envp, with confirmed process identity.
+Only the watchdog's startup environment receives this role. A role supplies no ownership
+or signal authority. If its mark becomes unreadable during the final check, the verified
+discovery evidence conservatively retains the possible bound and records the reason.
+Several watchdogs are all preserved on uncertainty. If the final snapshot proves every
+known watchdog absent or replaced, cleanup proceeds per process. An authored command may forge the role;
+that can cause withholding (a leak), never a wrong kill. Groups with no verified watchdog,
+including older no-role admissions and re-sessioned marked descendants, retain per-process
+cleanup: reap what can be verified and abstain individually on the rest. Fully verified
+groups are reaped through the unchanged per-process identity gates. The durable sweep
+receipt records each bound-preservation reason
+([008 §4.2](./008-reliability-process-hygiene.md)).
+
+The source factory accepts an optional shutdown signal. Aborting it refuses pending/new
+admissions and forcefully terminates in-flight groups through the identity gate (or their still-live
+watchdog after leader exit), allowing the
+daemon to finish SIGTERM/SIGINT/IPC shutdown without waiting for authored command timeouts.
+
+Koffi 3.3.7 is vendored into both `@agentmonitors/source-command-poll` and
+`@agentmonitors/cli`; neither published manifest depends on `koffi` or `@koromix/*`.
+Each tarball carries the JavaScript wrapper, MIT license, integrity/hash manifest and
+unmodified prebuilt `koffi.node` files for `darwin-arm64`, `darwin-x64`, `linux-x64`
+and `linux-arm64` (glibc only). Refresh with `node scripts/vendor-koffi.mjs` (also
+`pnpm fix:vendor-koffi`). The single version constant controls all five downloads;
+the script verifies each registry `dist.integrity` SHA-512 before extraction and
+records each shipped file's SHA-256 and source. Offline script tests verify these
+bytes and reject tampering.
+
+Our module resolves `../vendor/koffi/load.cjs` relative to its own ESM URL or CJS
+filename, identically in the source package and CLI bundle. The daemon loads it
+lazily for resource-limit capture; the asynchronous launcher also loads it. The
+loader allowlists the platform/architecture and, on Linux, synchronously reads
+`/proc/self/maps` once before loading exactly that package's binary. Admission
+requires an exact file-backed `libc.so.6` or older `libc-2.N.so` basename,
+including deleted real files. Positive evidence must have an absolute filesystem
+pathname. Kernel synthetic or synthetic-looking names (`/memfd:…`, `/dmabuf:…`,
+`/SYSV` plus eight hex digits, `/dev/zero`, `/anon_hugepage`, `/secretmem`, and
+bracketed pseudo-mappings such as `/[aio]` or `[anon:…]`) and nonabsolute/pathless
+records never establish glibc. This also excludes `anon_inode:…`. Device numbers
+do not determine eligibility: container overlays can use anonymous devices for
+real files. Every musl-shaped name (`ld-musl-*.so.1` or `libc.musl-*`) still
+refuses before native loading, even beside real glibc and on synthetic mappings.
+Classification checks every slash-delimited segment and every colon/bracket-delimited
+label segment, including direct `memfd:`, `dmabuf:`, `anon_inode:` and `[anon:…]`
+labels. Wildcards may span these delimiters too, so punctuation inside a legal
+musl name cannot hide it. Musl wildcards include CR, U+2028 and U+2029 retained in names.
+Maps text cannot reliably distinguish caller labels from real paths under a
+synthetic-looking root directory. Such paths cannot establish glibc, but they
+cannot hide musl either. Harmless musl-shaped labels or directory segments cause
+needless refusal by design; ambiguous names must never admit a non-glibc host.
+Unreadable, empty, malformed or unrecognized libc evidence refuses
+with `glibc is required`, including static Node builds without a mapped libc.
+Neither diagnostic reports nor subprocesses supply evidence. After admission,
+the native `gnu_get_libc_version` symbol provides a second consistency check.
+Non-Linux platforms never read maps. `scripts/koffi-loader.test.ts` verifies
+these admission and no-native-load refusals with injected mappings;
+`scripts/vendor-koffi.test.ts` verifies both packaged copies and digests. Koffi's indirect entry point has
+no explicit-native hook, so the refresh script makes a minimal checked shim: replace
+its detect/load stanza with a factory argument, return its exports and close the
+factory. This retains upstream wrapping/version checks while bypassing its native
+search. The watchdog and intermediate need no native binding; they inherit the
+launcher's group and already use embedded programs. Unsupported platforms or
+architectures (including Windows and musl), missing or corrupt binaries fail closed
+with the platform name and underlying error; no unbounded plain spawn or source
+build is attempted. Koffi's build-from-source fallback does not link on macOS 27.3
+with CMake 4.3.4 and Apple clang 21 (`napi_*` undefined), so nothing may rely on it;
+we never trigger it.
+
 **Excess output is drained, never a reason to kill the command** (issue #302). Both `stdout` and
 `stderr` are consumed as they stream, not buffered to completion: `stdout` retains only its leading
 **1 MiB** (`STDOUT_CAP_BYTES`) — the same leading bytes on every capture, so two truncated captures
@@ -1564,11 +1775,34 @@ no orphan). Platform-specific mechanism:
 - **POSIX:** each spawn runs as the leader of its own process group/session (`detached: true`); the
   timeout escalation signals the **negative PID** (`process.kill(-pid, 'SIGTERM')`, then
   `'SIGKILL'` after the grace), which targets the whole group at once.
-- **Windows:** there is no process-group-signal equivalent, and no reliable graceful signal for a
+- **Windows (retained cleanup path; command admission is refused):** there is no process-group-signal equivalent, and no reliable graceful signal for a
   non-console-attached spawned process (`taskkill` without `/F` frequently fails silently for this
   kind of child). The documented choice is `taskkill /PID <pid> /T /F` — forceful and tree-wide —
   issued at both the timeout expiry and the grace follow-up; there is no softer phase to escalate
   from on this platform.
+
+**Every daemon-origin escalation step is identity-verified at signal time** (issue #479,
+[008 §5](./008-reliability-process-hygiene.md)). The SIGTERM step's process-table read starts while
+the direct child is still unreaped, so the members that read lists (pid and start time) are
+confirmed as the command's group even if the command exits before the read completes; the step then
+signals the group (or, if that read found the group already empty, needs no signal). The gate reads the group's membership again the moment the direct child is
+reaped, which confirms processes forked after the SIGTERM step (for example a worker started by a
+TERM trap just before the command exits). Through the grace period the gate keeps reading the
+group's membership every 250 ms, one read at a time, until the SIGKILL follow-up starts; each
+reading that still holds a confirmed member confirms every member it lists, so a TERM-ignoring
+member that forks a process and later exits passes the group on to it. The SIGKILL follow-up
+usually runs after the direct child has been reaped; it is sent if any confirmed member is still in
+the group, and an empty group needs no signal. Only when continuity is lost (the group holds none
+of the processes ever confirmed) or the process table cannot be read is the group left alone: the
+step abstains and writes a warning to the daemon's stderr (the daemon log) naming the group, the
+members it saw and why identity could not be confirmed. Continuity is lost when the group emptied
+and its id was reused, or when, after the direct child has exited, a member forks and exits
+between two consecutive readings (within one 250 ms interval plus one read; the read time grows
+under load, up to the 5 s `ps` cap) while no other confirmed member is alive; in that second case
+the daemon step abstains. The independent watchdog still bounds the original group. The
+daemon-gate residual, and the latency the reads add to each step, are stated
+in [008 §3.1](./008-reliability-process-hygiene.md). On Windows the follow-up
+`taskkill` runs only while the direct child is still unreaped.
 
 Resolution on timeout is driven by the direct child's own `exit` event, never by waiting for its
 stdio streams to `close`. A descendant that inherited stdout/stderr (the `sleep` in the example
@@ -1582,6 +1816,17 @@ The **result** of an execution is `(exitCode, stdout)`. A **nonzero exit code wi
 valid result, not a failure** — many CLIs exit nonzero meaningfully (`grep`, linters, a task CLI
 whose backing app is closed). The failure category is reserved for executions that produce no
 result at all (§11.5).
+
+On macOS, an optional durable command owner also supplies its committed life-token tuple after
+`environment()` resolves. The source passes it through the private launcher configuration, not
+the authored environment. The launcher opens it asynchronously with no-follow and nonblocking semantics, rejects
+non-regular replacements promptly before watchdog arming, and
+checks its fstat device/inode. After the watchdog is armed and the inherited resource-limit pair
+is restored and verified, it clears and verifies `FD_CLOEXEC` on that one descriptor. Every failure
+refuses authored exec and retains the baseline. The extra descriptor deliberately survives into
+commands and ordinary shell children so the restart sweep can prove each restricted PID from its
+own vnode (008 §4.2). The descriptor number is never ownership evidence; the watchdog retains its
+existing environment-based proof, and Linux admission is unchanged.
 
 ### 11.3 Change-detection strategies
 
@@ -1636,7 +1881,7 @@ Mirrors `api-poll` (§4.4–4.5):
 
 ### 11.5 Failure semantics (fail-open as a health signal)
 
-An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …) or `timeout` expiry. Per #81's
+An **execution failure** is: spawn failure (`ENOENT`, `EACCES`, …), lifetime-bound arming failure, shutdown cancellation, or `timeout` expiry. Per #81's
 framing, a failure is information, not something to silently swallow — but it must not spam.
 
 - On failure, prior state is **kept** (no re-baseline, no state loss) — identical in spirit to how
@@ -1725,6 +1970,20 @@ issue #86's AC1–AC7):
   (verified: `apps/cli/src/commands/cli.integration.test.ts` — _"a live daemon kills a backgrounded
   sh -c descendant on tick timeout, and shutdown leaves it dead"_), so the no-orphan property holds
   not just per-call but across the daemon's own shutdown.
+- A real SIGKILLed daemon leaves no live original-group command or descendant past timeout
+  plus grace, including closed command stdio. SIGTERM and SIGINT shutdown leave no in-flight
+  child alive (`apps/cli/src/commands/daemon-restart-sweep.integration.test.ts`).
+- Watchdog timer registration precedes authored work; launcher/timer failure prevents authored
+  side effects and produces failing health. Restricted PATH requires no timeout/mkfifo utility,
+  arming yields to the event loop, and PID/argv/mark/exit status remain intact
+  (`plugins/source-command-poll/src/self-bound.test.ts`).
+- Native stdout/stderr writers drain 8 MiB without EAGAIN, and a piped-stdin admission fixture
+  blocks until delayed input arrives (`stdio-semantics.test.ts`, Perl required). Real native
+  flag priming verifies restoration on all three descriptors without losing append mode;
+  failed status reads, writes, read-backs and retained nonblocking flags prevent authored
+  side effects and preserve the baseline (`self-bound.test.ts`).
+- Process-global test instrumentation and environment changes restore from teardown hooks even
+  if an awaited observation times out; in-test `finally` is not the sole restoration path.
 - Registration + the `init --type command-poll` template + `validate` accepting/rejecting a
   `command-poll` monitor are covered at the CLI layer (AC7: verified:
   `apps/cli/src/commands/cli.integration.test.ts` — _"scaffolds a command-poll monitor that passes

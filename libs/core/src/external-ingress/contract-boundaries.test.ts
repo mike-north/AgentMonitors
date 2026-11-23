@@ -1,3 +1,8 @@
+/**
+ * Consumer bounds and semantic identity for the versioned external envelope.
+ * @see docs/specs/002-runtime-delivery.md section 2.6
+ * @see docs/specs/004-validation-testing.md section 2.14
+ */
 import { describe, expect, it } from 'vitest';
 import {
   canonicalJsonStringify,
@@ -16,12 +21,14 @@ import {
   externalEventSemanticHash,
 } from './identity.js';
 
+/** Mixed-width strings distinguish UTF-8 bytes from character counts at odd boundaries. */
 function exactUtf8(bytes: number): string {
   if (bytes === 0) return '';
   if (bytes === 1) return 'x';
   return `${'x'.repeat(bytes - 2)}é`;
 }
 
+/** Fill the independent scope budget without exceeding per-key or per-value limits. */
 function scopeWithCanonicalBytes(targetBytes: number): ExternalEventScope {
   const scope: Record<string, string[]> = Object.fromEntries(
     Array.from({ length: 4 }, (_, key) => [
@@ -45,6 +52,7 @@ function scopeWithCanonicalBytes(targetBytes: number): ExternalEventScope {
   return scope;
 }
 
+/** State roots count as level one, regardless of nested container transitions. */
 function nestedState(
   levels: number,
   mode: 'object' | 'array' | 'alternating',
@@ -59,6 +67,15 @@ function nestedState(
 }
 
 describe('external ingress exact boundaries', () => {
+  it('refuses writes to every exported limit without weakening admission', () => {
+    for (const key of Object.keys(externalEventLimits)) {
+      const before = Reflect.get(externalEventLimits, key);
+      expect(Reflect.set(externalEventLimits, key, 999999), key).toBe(false);
+      expect(Reflect.get(externalEventLimits, key), key).toBe(before);
+    }
+    expectError(envelope({ monitorId: 'x'.repeat(513) }), 'payload_too_large');
+  });
+
   it('enforces 511/512/513 UTF-8 bytes for every identifier', () => {
     for (const field of [
       'monitorId',
@@ -73,7 +90,7 @@ describe('external ingress exact boundaries', () => {
             .success,
         ).toBe(true);
       }
-      expectError(envelope({ [field]: exactUtf8(513) }), 'invalid_envelope');
+      expectError(envelope({ [field]: exactUtf8(513) }), 'payload_too_large');
     }
   });
 
@@ -89,7 +106,7 @@ describe('external ingress exact boundaries', () => {
       envelope({
         resumeToken: exactUtf8(externalEventLimits.resumeTokenBytes + 1),
       }),
-      'invalid_envelope',
+      'payload_too_large',
     );
     expectError(envelope({ resumeToken: '' }), 'invalid_envelope');
 
@@ -104,7 +121,7 @@ describe('external ingress exact boundaries', () => {
       envelope({
         scope: { [exactUtf8(externalEventLimits.scopeKeyBytes + 1)]: 'v' },
       }),
-      'invalid_envelope',
+      'payload_too_large',
     );
     expect(
       validateExternalEventEnvelope(
@@ -117,7 +134,19 @@ describe('external ingress exact boundaries', () => {
       envelope({
         scope: { key: exactUtf8(externalEventLimits.scopeValueBytes + 1) },
       }),
-      'invalid_envelope',
+      'payload_too_large',
+    );
+  });
+
+  it('accepts sixteen scope values and rejects seventeen independently of byte size', () => {
+    expect(
+      validateExternalEventEnvelope(
+        envelope({ scope: { key: Array(16).fill('v') } }),
+      ).success,
+    ).toBe(true);
+    expectError(
+      envelope({ scope: { key: Array(17).fill('v') } }),
+      'payload_too_large',
     );
   });
 
@@ -182,7 +211,7 @@ describe('external ingress exact boundaries', () => {
       ).toBe(true);
       expectError(
         envelope({ state: nestedState(33, mode) }),
-        'invalid_envelope',
+        'payload_too_large',
       );
     }
     expect(
@@ -234,31 +263,55 @@ describe('external ingress semantic identity', () => {
     );
 
     const mutations = {
-      schema: envelope({ schema: 'agentmonitors.external-event.v2' as never }),
-      monitorId: envelope({ monitorId: 'other-monitor' }),
-      source: envelope({ source: 'other-source' }),
-      upstreamEventId: envelope({ upstreamEventId: 'other-delivery' }),
-      objectId: envelope({ objectId: 'other-object' }),
-      objectSequence: envelope({ objectSequence: 43 }),
-      eventKind: envelope({ eventKind: 'build.completed' }),
-      changeKind: envelope({ changeKind: 'created' }),
-      occurredAt: envelope({ occurredAt: '2026-08-13T18:00:01Z' }),
-      scope: envelope({ scope: { project: 'other/project' } }),
-      state: envelope({ state: { nested: { a: [1, 2], z: 2 }, a: 0, z: 1 } }),
-    } satisfies Record<
-      Exclude<keyof ExternalEventEnvelope, 'resumeToken'>,
-      ExternalEventEnvelope
-    >;
-    expect(Object.keys(mutations).sort()).toEqual(
-      Object.keys(base)
-        .filter((field) => field !== 'resumeToken')
-        .sort(),
-    );
-    for (const changed of Object.values(mutations)) {
-      expect(externalEventSemanticHash(changed)).not.toBe(
-        externalEventSemanticHash(base),
-      );
+      schema: 'agentmonitors.external-event.v2' as never,
+      monitorId: 'other-monitor',
+      source: 'other-source',
+      upstreamEventId: 'other-delivery',
+      objectId: 'other-object',
+      objectSequence: 43,
+      eventKind: 'build.completed',
+      changeKind: 'created',
+      occurredAt: '2026-08-13T18:00:01Z',
+      scope: { project: 'other/project' },
+      state: { nested: { a: [1, 2], z: 2 }, a: 0, z: 1 },
+    } satisfies Omit<ExternalEventEnvelope, 'resumeToken'>;
+    for (const [field, value] of Object.entries(mutations)) {
+      // Each row varies exactly one field, so dropping that field cannot hide
+      // behind a second changed field in the same fixture.
+      expect(
+        externalEventSemanticHash({ ...base, [field]: value }),
+        field,
+      ).not.toBe(externalEventSemanticHash(base));
     }
+    expect(
+      externalEventSemanticHash(
+        envelope({
+          ...base,
+          scope: { ...base.scope, a: ['one', 'two'] },
+        }),
+      ),
+    ).not.toBe(externalEventSemanticHash(base));
+  });
+
+  it('ignores unknown properties outside the closed v1 identity', () => {
+    const base = envelope();
+    const wider = { ...base, extra: 'transport-metadata' };
+    expect(externalEventSemanticHash(wider)).toBe(
+      externalEventSemanticHash(base),
+    );
+  });
+
+  it('pins SHA-256 of the documented eleven-field preimage', () => {
+    // Keys are written in UTF-16 lexical order, with compact JSON punctuation;
+    // the expected digest is independently computed from these literal bytes.
+    const preimage =
+      '{"changeKind":"modified","eventKind":"build.updated","monitorId":"build-health","objectId":"build-group-123","objectSequence":42,"occurredAt":"2026-08-13T18:00:00.000Z","schema":"agentmonitors.external-event.v1","scope":{},"source":"example-build-system","state":{},"upstreamEventId":"delivery-01HX"}';
+    const fixed = envelope({ scope: {}, state: {} });
+    const { resumeToken: _cursor, ...semantic } = fixed;
+    expect(canonicalJsonStringify(semantic)).toBe(preimage);
+    expect(externalEventSemanticHash(fixed)).toBe(
+      '26c08c7be5b2d14c1aa56db8cdd8c9284c66278f1d096c106fb2492396ca94c2',
+    );
   });
 
   it('builds a collision-free source/object tuple key', () => {

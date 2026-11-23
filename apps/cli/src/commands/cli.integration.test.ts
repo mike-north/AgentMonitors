@@ -23,6 +23,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { writeLocalState } from '../local-state.js';
+import { workspacePaths } from '../workspace-paths.js';
 import {
   daemonAvailable,
   callDaemon,
@@ -38,10 +39,34 @@ import {
 } from '../channel-render.js';
 import { escapeShellPath } from '../delivery-event-render.js';
 import {
+  AgentMonitorRuntime,
+  claudeCodeAdapter,
   createDb,
   RuntimeStore,
+  SourceRegistry,
   type StoredObservationEnvelope,
 } from '@agentmonitors/core';
+
+/**
+ * Default-lookup cases must bind inside their own data root, rather than the
+ * production fixed /tmp fallback. That fallback's IPC contract is exercised
+ * separately in daemon-ipc.test.ts through its relocated OS namespace.
+ */
+function expectOwnedDefaultSocket(workspace: string, dataHome: string): void {
+  const previous = process.env['XDG_DATA_HOME'];
+  try {
+    process.env['XDG_DATA_HOME'] = dataHome;
+    expect(workspacePaths(workspace).socket.length).toBeLessThanOrEqual(100);
+  } finally {
+    if (previous === undefined) delete process.env['XDG_DATA_HOME'];
+    else process.env['XDG_DATA_HOME'] = previous;
+  }
+}
+
+/** Keep pathname-limit fixtures directly beneath an explicitly owned short parent. */
+function shortOwnedTempParent(): string {
+  return process.env.AGENTMONITORS_TEST_TEMP_ROOT ?? tmpdir();
+}
 
 const CLI_PATH = path.resolve(__dirname, '../../dist/index.cjs');
 const CLI_PACKAGE_DIR = path.resolve(__dirname, '../..');
@@ -459,11 +484,6 @@ async function startStaticResultDaemon(
 let tempDir: string;
 
 beforeAll(() => {
-  execFileSync('pnpm', ['build'], {
-    cwd: CLI_PACKAGE_DIR,
-    stdio: 'pipe',
-    env: process.env,
-  });
   tempDir = mkdtempSync(path.join(tmpdir(), 'agentmonitors-test-'));
 });
 
@@ -1396,7 +1416,11 @@ describe('init', () => {
       // words — the latter would silently stop testing anything if the
       // rationale were ever reworded.
       expect(monitor).toContain('# urgency overridden via --urgency');
-      expect(monitor).not.toContain('coalesced-until-ack');
+      expect(monitor).not.toContain(
+        type === 'pr-review'
+          ? 'MEMBERSHIP set of PRs'
+          : 'earned by the payload filter',
+      );
 
       const validated = run(['validate', monitorsDir, '--format', 'json'], dir);
       expect(validated.exitCode).toBe(0);
@@ -3196,8 +3220,13 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
       expect(substitutedSocketPath).not.toBe(requestedSocketPath);
       // The substituted socket lives inside an owner-only per-uid directory,
       // never a predictable /tmp/*.sock a peer could connect to (issue #292).
-      expect(substitutedSocketPath).toMatch(
-        /^\/tmp\/agentmonitors-\d+\/agentmonitors-[0-9a-f]{16}\.sock$/,
+      // NODE_OPTIONS carries the shared namespace into the built child; its
+      // actual bind must be inside this test's root even for a forced fallback.
+      expect(path.dirname(substitutedSocketPath)).toBe(
+        path.join(tmpdir(), `agentmonitors-${String(process.getuid?.() ?? 0)}`),
+      );
+      expect(path.basename(substitutedSocketPath)).toMatch(
+        /^agentmonitors-[0-9a-f]{16}\.sock$/,
       );
 
       // Criterion 1 (regression): pre-fix, `resolveSocketPath` had no concept
@@ -3248,8 +3277,11 @@ describe('daemon run — explicit --socket over the AF_UNIX limit (issue #337)',
     const parsed = JSON.parse(result.stdout) as { socketPath: string };
     expect(parsed.socketPath).not.toBe(overLimitSocketPath);
     // Owner-only per-uid fallback directory, not a shared /tmp/*.sock (issue #292).
-    expect(parsed.socketPath).toMatch(
-      /^\/tmp\/agentmonitors-\d+\/agentmonitors-[0-9a-f]{16}\.sock$/,
+    expect(path.dirname(parsed.socketPath)).toBe(
+      path.join(tmpdir(), `agentmonitors-${String(process.getuid?.() ?? 0)}`),
+    );
+    expect(path.basename(parsed.socketPath)).toMatch(
+      /^agentmonitors-[0-9a-f]{16}\.sock$/,
     );
   });
 });
@@ -3546,8 +3578,8 @@ This monitor fires on a schedule.
   // Issue #297: a schedule monitor with an invalid IANA timezone made
   // Intl.DateTimeFormat throw OUTSIDE the per-monitor observe/ingest try/catches
   // — aborting the whole tick before any other monitor ran. This proves the
-  // fix at the `daemon once` surface: the bad monitor is isolated (errored, not
-  // a crash) and a sibling schedule monitor with a valid timezone still fires.
+  // bad config is now rejected by source preflight, while a sibling schedule
+  // monitor with a valid timezone still fires.
   it('isolates an invalid schedule timezone instead of aborting the whole tick, so a sibling monitor still emits', () => {
     const dir = path.join(tempDir, 'once-bad-timezone');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
@@ -3571,7 +3603,10 @@ This monitor has a typo'd timezone.
     expect(result.exitCode).toBe(0);
     // The valid sibling still fires — the tick was NOT aborted.
     expect(result.stdout).toContain('emitted 1 event(s)');
-    expect(result.stdout).toContain('1 errored:');
+    expect(result.stdout).toContain(
+      'aaa-bad-timezone: skipped — scope.timezone:',
+    );
+    expect(result.stdout).not.toContain('1 errored:');
     expect(result.stdout).toContain('aaa-bad-timezone:');
     expect(result.stdout).toContain('Not/AZone');
   });
@@ -3756,7 +3791,7 @@ When files change, review them.
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -3956,7 +3991,7 @@ When files change, review them.
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -4120,7 +4155,7 @@ describe('session list and close', () => {
     mkdirSync(monitorsDir, { recursive: true });
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-sess-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -4197,7 +4232,7 @@ describe('session open --format id (issue #338 item 4)', () => {
     mkdirSync(monitorsDir, { recursive: true });
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-fmtid-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -4434,7 +4469,7 @@ describe('manual daemon socket commands', () => {
   it('manual socket commands report an actionable no-daemon message without a stack trace', () => {
     const ws = mkdtempSync(path.join(tmpdir(), 'agentmon-manual-down-'));
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-down-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'manual-down.db');
@@ -4497,7 +4532,7 @@ When files change, review them.
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hist-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath };
@@ -4562,7 +4597,7 @@ This monitor fires on a schedule.
 
   function deadSocketPath(label: string): string {
     return path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
   }
@@ -4626,8 +4661,8 @@ This monitor fires on a schedule.
 
   // Issue #297: `monitor explain` MUST NOT crash for a monitor whose schedule
   // timezone is invalid — it must render the failure as an actionable
-  // observation-stage diagnostic instead of a raw thrown RangeError.
-  it('explains an invalid schedule timezone as an observation-stage failure instead of crashing', () => {
+  // definition-stage diagnostic from source preflight instead of a raw RangeError.
+  it('explains an invalid schedule timezone as a definition-stage failure instead of crashing', () => {
     const dir = path.join(tempDir, 'explain-bad-timezone');
     const monitorsRoot = path.join(dir, '.claude', 'monitors');
     const monitorsDir = path.join(monitorsRoot, 'bad-tz');
@@ -4670,12 +4705,12 @@ This monitor has a typo'd timezone.
     );
 
     expect(result.exitCode).toBe(0);
-    expect(result.stdout).toContain('✗ Observation:');
-    expect(result.stdout).toContain('Verdict: failure at Observation');
+    expect(result.stdout).toContain('✗ Definition:');
+    expect(result.stdout).toContain('Verdict: failure at Definition');
     // The message must name the true cause (scheduling/timezone), not imply a
     // source observation ran and errored — text output only renders `reason`,
     // so the bad value must be inline (PR #433 review, discussion_r3608549689).
-    expect(result.stdout).toContain('schedule could not be evaluated');
+    expect(result.stdout).toContain('not a valid IANA time zone name');
     expect(result.stdout).toContain('Not/AZone');
   });
 
@@ -4950,6 +4985,66 @@ This monitor has a typo'd timezone.
     expect(rows.every((row) => row.monitorId === 'fires')).toBe(true);
   });
 
+  it('history shows the serializer reason of a not-held observation even when its title is very long (002 §4.7, #570)', async () => {
+    const dir = path.join(tempDir, 'history-not-held-long-title');
+    const monitorsRoot = path.join(dir, '.claude', 'monitors');
+    mkdirSync(path.join(monitorsRoot, 'held'), { recursive: true });
+    writeFileSync(
+      path.join(monitorsRoot, 'held', 'MONITOR.md'),
+      '---\nname: Held\nwatch:\n  type: unserializable-source\n  interval: 1s\nurgency: normal\nnotify:\n  strategy: debounce\n  settle-for: 10s\n---\nInstructions\n',
+      'utf-8',
+    );
+    const dbPath = path.join(dir, 'agentmon.db');
+    // Seed the refusal through the real runtime: no bundled source can emit an
+    // unserializable payload, so a test-only source stands in for one.
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'unserializable-source',
+      stateful: true,
+      scopeSchema: { type: 'object' },
+      observe: () =>
+        Promise.resolve({
+          observations: [
+            {
+              title: '\u001b[31mBad\u001b[0m\nsecond line ' + 'é'.repeat(600),
+              snapshotText: 'bad',
+              objectKey: 'bad',
+              payload: { count: 1n },
+            },
+          ],
+          nextState: { cursor: 1 },
+        }),
+    });
+    const runtime = new AgentMonitorRuntime(
+      new RuntimeStore(createDb(dbPath)),
+      registry,
+      [claudeCodeAdapter],
+    );
+    const tick = await runtime.tick(monitorsRoot, dir);
+    expect(tick.erroredObservations).toHaveLength(1);
+
+    const socketPath = deadSocketPath('history-not-held');
+    const result = runWithEnv(
+      [
+        'monitor',
+        'history',
+        'held',
+        '--socket',
+        socketPath,
+        '--workspace',
+        dir,
+        '--format',
+        'text',
+      ],
+      { AGENTMONITORS_DB: dbPath, AGENTMONITORS_SOCKET: socketPath },
+      dir,
+    );
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toMatch(
+      /was not held for debounce: it cannot be serialized \(Do not know how to serialize a BigInt\)\./u,
+    );
+  });
+
   it('history with the daemon down and NOTHING persisted emits an actionable remediation, not a raw ENOENT', () => {
     const dir = path.join(tempDir, 'history-nodaemon-empty');
     mkdirSync(dir, { recursive: true });
@@ -5037,10 +5132,9 @@ This monitor has a typo'd timezone.
     // Isolated fake HOME + pinned XDG_DATA_HOME (workspacePaths() prefers it
     // over HOME) so the derived per-workspace db lands under a directory this
     // test controls and cleans up, never the developer's real data dir.
-    const fakeHome = mkdtempSync(
-      path.join(tmpdir(), 'agentmon-374-fallback-home-'),
-    );
-    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
+    const xdgDataHome = path.join(fakeHome, 'd');
+    expectOwnedDefaultSocket(dir, xdgDataHome);
     // Enabled, but deliberately NO `db:` value — resolveWorkspaceDbPath must
     // fall to the DERIVED per-workspace db (workspacePaths(dir).db), the exact
     // path this test proves the fallback actually reads.
@@ -5148,7 +5242,7 @@ When source files change, review them.
       {
         AGENTMONITORS_DB: ':memory:',
         AGENTMONITORS_SOCKET: path.join(
-          '/tmp',
+          tmpdir(),
           `agentmon-doctor-banner-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
         ),
       },
@@ -5198,8 +5292,8 @@ Handle it.
 
   function doctorSocket(label: string): string {
     return path.join(
-      '/tmp',
-      `agentmon-doctor-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+      shortOwnedTempParent(),
+      `d-${label.slice(0, 8)}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
   }
 
@@ -5467,8 +5561,10 @@ Handle it.
     expect(doctorText.stdout).toMatch(
       /monitor:terminal-retry.*terminal materialization retry.*retry-outbox=0\/1/u,
     );
-    expect(doctorText.stdout).toContain(
-      'agentmonitors monitor explain terminal-retry',
+    // A symlinked temp root may need an explicit workspace spelling even
+    // when the subprocess starts there; the monitor ID stays positional.
+    expect(doctorText.stdout).toMatch(
+      /`agentmonitors monitor explain(?: --workspace [^`]+)? -- terminal-retry`/u,
     );
 
     const doctorJson = runWithEnv(
@@ -6370,14 +6466,15 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-335-home-'));
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET anywhere below —
     // that is the exact condition that reproduces the study's finding. Pinning
     // XDG_DATA_HOME under fakeHome (rather than leaving it to whatever the
     // ambient shell has set, which `workspacePaths()` prefers over HOME) keeps
     // every derived path — and this cleanup — confined to fakeHome regardless
     // of the developer's real environment.
-    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const xdgDataHome = path.join(fakeHome, 'd');
+    expectOwnedDefaultSocket(dir, xdgDataHome);
     const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
 
     let daemonChild: ReturnType<typeof spawn> | undefined;
@@ -6492,7 +6589,7 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(path.join(tmpdir(), 'agentmon-374-home-'));
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     // Deliberately NO AGENTMONITORS_DB / AGENTMONITORS_SOCKET / --socket
     // anywhere below — that is the exact condition the issue reports. Pinning
     // XDG_DATA_HOME under fakeHome (which `workspacePaths()` prefers over
@@ -6503,7 +6600,8 @@ This monitor fires on a schedule.
     // alike, making the socket cross-check below pass via that shared
     // override without ever exercising per-workspace auto-discovery, and
     // could leak real daemon state outside fakeHome.
-    const xdgDataHome = path.join(fakeHome, '.local', 'share');
+    const xdgDataHome = path.join(fakeHome, 'd');
+    expectOwnedDefaultSocket(dir, xdgDataHome);
     const env = { HOME: fakeHome, XDG_DATA_HOME: xdgDataHome };
 
     let daemonChild: ReturnType<typeof spawn> | undefined;
@@ -6612,16 +6710,14 @@ This monitor fires on a schedule.
       'utf-8',
     );
 
-    const fakeHome = mkdtempSync(
-      path.join(tmpdir(), 'agentmon-335-once-home-'),
-    );
+    const fakeHome = mkdtempSync(path.join(shortOwnedTempParent(), 'h'));
     // Pin XDG_DATA_HOME under fakeHome (it takes priority over HOME in
     // `workspacePaths()`) and use `runWithCleanEnv` so an ambient
     // AGENTMONITORS_DB/AGENTMONITORS_SOCKET/XDG_DATA_HOME in the developer's
     // own shell can't be inherited by either subprocess below.
     const env = {
       HOME: fakeHome,
-      XDG_DATA_HOME: path.join(fakeHome, '.local', 'share'),
+      XDG_DATA_HOME: path.join(fakeHome, 'd'),
     };
 
     try {
@@ -6680,7 +6776,7 @@ When files change, review them.
     );
 
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-explain-apperr-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
 
@@ -6873,7 +6969,7 @@ describe('monitor test', () => {
     run(['init', 'fp-empty', '--dir', monitorsDir], dir);
 
     const monitorFile = path.join(monitorsDir, 'fp-empty', 'MONITOR.md');
-    const result = run(['monitor', 'test', monitorFile], '/tmp');
+    const result = run(['monitor', 'test', monitorFile], tmpdir());
 
     expect(result.exitCode).toBe(1);
     expect(result.stderr).toContain('No files matched');
@@ -6939,7 +7035,7 @@ This monitor has a typo'd timezone.
     const monitorFile = path.join(monitorsDir, 'fp-empty-json', 'MONITOR.md');
     const result = run(
       ['monitor', 'test', monitorFile, '--format', 'json'],
-      '/tmp',
+      tmpdir(),
     );
 
     expect(result.exitCode).toBe(1);
@@ -7296,7 +7392,7 @@ Summarize what changed in the spec/standard docs and whether it affects current 
     // -----------------------------------------------------------------------
     const dbPath = path.join(repo, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-ic-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -7624,7 +7720,7 @@ When files change, review them.
       // factor into this proof either way.
       const dbPath = path.join(tempDir, 'gitignore-proof.db');
       const socketPath = path.join(
-        '/tmp',
+        tmpdir(),
         `agentmon-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const env = {
@@ -7789,7 +7885,7 @@ function bootLazyWorkspace(reapAfterMs: number): {
   );
 
   const socket = path.join(
-    '/tmp',
+    tmpdir(),
     `agentmon-lazy-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
   );
   const db = path.join(ws, 'lazy.db');
@@ -8197,7 +8293,7 @@ describe('lazy daemon lifecycle', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-ssrecap-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'ssrecap.db');
@@ -8326,7 +8422,7 @@ describe('lazy daemon lifecycle', () => {
 
     // Per-workspace socket + db; enable monitoring via .claude/agentmonitors.local.md.
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-steel-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'steel-thread.db');
@@ -8897,7 +8993,7 @@ describe('plugin hooks.json config-drift UAT', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hooksjson.db');
@@ -9146,7 +9242,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hook-deliver.db');
@@ -9312,7 +9408,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hdn-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-normal.db');
@@ -9460,7 +9556,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hdj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-json.db');
@@ -9599,7 +9695,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hdt-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-text.db');
@@ -9722,7 +9818,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd2-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-empty.db');
@@ -9849,7 +9945,7 @@ describe('hook deliver', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-pt-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-pretool.db');
@@ -9955,7 +10051,7 @@ describe('hook deliver', () => {
     }
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-tr-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-trunc.db');
@@ -10105,10 +10201,10 @@ describe('hook deliver', () => {
 // surface the coalesced normal reminder (002 §9.2). The study subject had run an
 // EARLIER turn-interruptible claim (S3 phase 11) that surfaced the reminder AND
 // claimed the event; the second identical claim was then correctly suppressed
-// because the reminder coalesces until acknowledgment. The real defect was the
+// because no fresh work remained. The real defect was the
 // SILENCE — no way to discover why. This test pins both: (1) the reminder
 // surfaces on the first claim; (2) after a claim, the reminder is suppressed and
-// `monitor explain` NAMES the reason (already-claimed / coalesced-until-ack).
+// `monitor explain` NAMES the reason (no-new-work).
 describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333)', () => {
   /**
    * The coalesced reminder body the runtime emits (002 §9.2, issues
@@ -10150,7 +10246,7 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-333-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'issue-333.db');
@@ -10310,14 +10406,16 @@ describe('hook claim normal-urgency reminder + suppression diagnosis (issue #333
       // Suppression is EXPECTED behavior, not a fault.
       expect(delivery?.status).toBe('ok');
       expect(delivery?.reason).toContain('already claimed');
-      expect(delivery?.reason).toContain('coalesced-until-ack');
+      expect(delivery?.reason).toContain(
+        'fresh unclaimed normal event will trigger',
+      );
       const findings = delivery?.details?.reminderSuppression;
       expect(findings).toHaveLength(1);
       expect(findings?.[0]).toMatchObject({
         sessionId: session.id,
         urgency: 'normal',
         lifecycle: 'turn-interruptible',
-        reason: 'already-claimed',
+        reason: 'no-new-work',
       });
     } finally {
       daemon.stop();
@@ -10347,7 +10445,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-unk-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'unknown.db');
@@ -10422,7 +10520,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-cwd-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'cwd.db');
@@ -10496,7 +10594,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-idle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'idle.db');
@@ -10599,7 +10697,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-settle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'settle.db');
@@ -10733,7 +10831,7 @@ describe('hook deliver --debug diagnosis (issue #334)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-334-ident-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'identical.db');
@@ -10923,7 +11021,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
     mkdirSync(path.join(ws, '.claude', 'monitors'), { recursive: true });
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-329-unk-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'unknown.db');
@@ -11028,7 +11126,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-329-settle-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'settle.db');
@@ -11155,7 +11253,7 @@ describe('hook deliver: always-on unknown-session stderr diagnostic (issue #329)
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-329-claim-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'claim.db');
@@ -11288,7 +11386,7 @@ describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr 
       JSON.stringify({
         session_id: 'some-host',
         hook_event_name: 'PreToolUse',
-        cwd: '/tmp',
+        cwd: tmpdir(),
       }),
     );
     expect(result.exitCode).toBe(0);
@@ -11304,7 +11402,7 @@ describe('hook deliver: always-on malformed-payload / unmapped-lifecycle stderr 
     const result = runWithStdinCapture(
       ['hook', 'deliver'],
       {},
-      JSON.stringify({ session_id: 'some-host', cwd: '/tmp' }),
+      JSON.stringify({ session_id: 'some-host', cwd: tmpdir() }),
     );
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toBe('');
@@ -11345,7 +11443,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-ho-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hooks-only.db');
@@ -11562,7 +11660,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-mo-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'multi-object.db');
@@ -11733,7 +11831,7 @@ describe('hooks-only delivery parity (issue #270)', () => {
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-inj-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'inject.db');
@@ -11919,7 +12017,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-cc-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'channel-cycle.db');
@@ -12311,7 +12409,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     // shell-round-trip-safe end to end against a real daemon, not just at the
     // unit level.
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon chcycle [huge] ${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'channel-cycle-huge.db');
@@ -12459,7 +12557,7 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       // assertion above already confirmed byte-for-byte.
       const advertisedCommand = `${extractedCommand ?? ''} --format json`;
       const staleSocket = path.join(
-        '/tmp',
+        tmpdir(),
         `agentmon-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const shimDir = makeAgentmonitorsShimDir();
@@ -12547,7 +12645,7 @@ describe('hook deliver: oversized single-event marker socket scoping (issue #358
     );
 
     const socket = path.join(
-      '/tmp',
+      tmpdir(),
       `agentmon-hd-huge-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const db = path.join(ws, 'hd-huge.db');
@@ -12658,7 +12756,7 @@ describe('hook deliver: oversized single-event marker socket scoping (issue #358
       // own advertised command, already confirmed above.
       const advertisedCommand = `${extractedCommand ?? ''} --format json`;
       const staleSocket = path.join(
-        '/tmp',
+        tmpdir(),
         `agentmon-hd-stale-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
       );
       const shimDir = makeAgentmonitorsShimDir();
@@ -12787,7 +12885,7 @@ describe('ephemeral monitors: watch declare/list/cancel (007 §4 / 005 §14.4)',
 
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `am-watch-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {
@@ -13018,7 +13116,7 @@ Bad schedule scope.
     // diagnosis.
     const dbPath = path.join(dir, 'agentmon.db');
     const socketPath = path.join(
-      '/tmp',
+      tmpdir(),
       `am-parity-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
     );
     const env = {

@@ -1,9 +1,21 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync } from 'node:fs';
+import { Buffer } from 'node:buffer';
+import { withIsolatedTestEnvironment } from './test-isolation/boundary.mjs';
+import { spawn, spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import assert from 'node:assert/strict';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath, URL } from 'node:url';
 import { Project } from 'fixturify-project';
 import { packPackage } from './lib/pack-helpers.mjs';
 import { PACKAGE_DIRS } from './publish-release-packages.mjs';
@@ -57,6 +69,7 @@ export const SOURCE_PLUGINS = [
 ];
 
 const PACKAGE_DEFS = [
+  { name: '@agentmonitors/cli', dir: 'apps/cli' },
   { name: CORE_PACKAGE_NAME, dir: 'libs/core' },
   ...SOURCE_PLUGINS.map(({ packageName, dir }) => ({
     name: packageName,
@@ -97,6 +110,50 @@ function run(command, args, cwd) {
       `Command failed (${result.status ?? 'unknown'}): ${command} ${args.join(' ')}`,
     );
   }
+}
+
+/**
+ * Asserts a fresh install of the packed packages carries no high or critical
+ * advisory in its production dependency tree. Workspace-local pnpm overrides
+ * do not reach a consumer's install, so this audits what a consumer resolves.
+ * Fails loudly (never passes silently) if the registry audit endpoint cannot
+ * be reached or returns anything other than a vulnerability summary.
+ */
+function auditConsumerInstall(projectDir) {
+  const result = spawnSync(
+    NPM_BIN,
+    ['audit', '--omit=dev', '--json', '--registry=https://registry.npmjs.org'],
+    {
+      cwd: projectDir,
+      encoding: 'utf8',
+    },
+  );
+  let report;
+  try {
+    report = JSON.parse(result.stdout);
+  } catch {
+    throw new Error(
+      `npm audit produced no JSON report (exit ${String(result.status)}): ${result.stderr}`,
+    );
+  }
+  const counts = report?.metadata?.vulnerabilities;
+  if (report?.error !== undefined || counts === undefined) {
+    throw new Error(
+      `npm audit could not complete (registry audit endpoint unavailable?): ${JSON.stringify(report?.error ?? report)}`,
+    );
+  }
+  if (counts.high > 0 || counts.critical > 0) {
+    const details = Object.values(report.vulnerabilities ?? {})
+      .filter((v) => v.severity === 'high' || v.severity === 'critical')
+      .map((v) => `${v.name} (${v.severity})`)
+      .join(', ');
+    throw new Error(
+      `Fresh install of the packed packages has high/critical advisories: ${details}`,
+    );
+  }
+  console.log(
+    `npm audit --omit=dev: no high/critical advisories ${JSON.stringify(counts)}`,
+  );
 }
 
 const SMOKE_SCRIPT = `import assert from 'node:assert/strict';
@@ -500,6 +557,229 @@ void runtime;
 void urgency;
 `;
 
+/** Reject metadata and tarball routes, including npm's encoded scoped names. @internal */
+export function isBlockedNativeRequest(url) {
+  const pathname = decodeURIComponent(
+    new URL(url, 'http://registry.local').pathname,
+  );
+  return (
+    pathname === '/koffi' ||
+    pathname.startsWith('/koffi/') ||
+    pathname.startsWith('/@koromix/')
+  );
+}
+
+/**
+ * Async installs leave the local registry proxy responsive. Every metadata route
+ * goes through the barrier; unrelated packages use the public registry normally.
+ */
+function installConsumer(args, projectDir) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(NPM_BIN, ['install', ...args], {
+      cwd: projectDir,
+      stdio: 'inherit',
+    });
+    child.once('error', reject);
+    child.once('close', (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`Consumer install failed: ${code}`)),
+    );
+  });
+}
+
+/** Assert neither hoisted nor nested installations can mask a broken vendored loader. */
+function assertNoInstalledKoffi(projectDir) {
+  function inspect(dir) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue;
+      if (path.basename(dir) === 'node_modules') {
+        assert.notEqual(
+          entry.name,
+          'koffi',
+          'Consumer resolved node_modules/koffi',
+        );
+        assert.notEqual(
+          entry.name,
+          '@koromix',
+          'Consumer resolved node_modules/@koromix',
+        );
+      }
+      inspect(path.join(dir, entry.name));
+    }
+  }
+  inspect(path.join(projectDir, 'node_modules'));
+  assert.equal(existsSync(path.join(projectDir, 'node_modules/koffi')), false);
+  console.log(
+    'Consumer has no node_modules/koffi or @koromix installation (including nested copies).',
+  );
+}
+
+/** Counted events must be successful output changes, never health transitions. @internal */
+export function assertInstalledCommandChange(event) {
+  assert.equal(event.monitorId, 'command-native');
+  assert.match(event.summary, /^Command output changed: /);
+  assert.equal(event.snapshotText, 'two');
+  assert.equal(event.payload.stdout, 'two');
+  assert.equal(event.payload.exitCode, 0);
+  assert.equal(event.payload.error, undefined);
+}
+
+/** Real installed CLI ticks must baseline, observe changed command output, and fire. */
+function smokeInstalledCommandMonitor(projectDir) {
+  const workspace = path.join(projectDir, 'cli-workspace');
+  const monitors = path.join(workspace, '.claude/monitors');
+  const monitor = path.join(monitors, 'command-native');
+  mkdirSync(monitor, { recursive: true });
+  const dbPath = path.join(workspace, 'runtime.sqlite');
+  const watched = path.join(workspace, 'value.txt');
+  writeFileSync(watched, 'one');
+  writeFileSync(
+    path.join(monitor, 'MONITOR.md'),
+    `---
+name: Packaged native command
+watch:
+  type: command-poll
+  command: ${JSON.stringify([process.execPath, '-e', 'process.stdout.write(require("node:fs").readFileSync(process.argv[1], "utf8"))', watched])}
+  interval: 0s
+  timeout: 5s
+urgency: normal
+---
+Report command output changes.
+`,
+  );
+  const cli = path.join(
+    projectDir,
+    'node_modules/@agentmonitors/cli/dist/index.cjs',
+  );
+  function tick(requireHealthy = true) {
+    const result = spawnSync(
+      process.execPath,
+      [
+        cli,
+        'daemon',
+        'once',
+        monitors,
+        '--workspace',
+        workspace,
+        '--format',
+        'json',
+      ],
+      {
+        cwd: workspace,
+        encoding: 'utf8',
+        env: { ...process.env, AGENTMONITORS_DB: dbPath },
+      },
+    );
+    assert.equal(result.status, 0, result.stderr);
+    const tick = JSON.parse(result.stdout);
+    if (requireHealthy)
+      assert.deepEqual(tick.erroredObservations, [], result.stdout);
+    assert.deepEqual(tick.evaluatedMonitors, ['command-native'], result.stdout);
+    return tick;
+  }
+  const baseline = tick();
+  assert.equal(baseline.emittedEventIds.length, 0);
+  writeFileSync(watched, 'two');
+  const changed = tick();
+  assert.equal(changed.emittedEventIds.length, 1, JSON.stringify(changed));
+  // Read the exact persisted event through the installed core's public API.
+  // A failing-health edge also emits one event: count alone cannot prove a fire.
+  const persisted = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '-e',
+      `
+    import { createDb, RuntimeStore } from '@agentmonitors/core';
+    const store = new RuntimeStore(createDb(${JSON.stringify(dbPath)}));
+    console.log(JSON.stringify(store.getEventById(${JSON.stringify(changed.emittedEventIds[0])})));
+  `,
+    ],
+    { cwd: projectDir, encoding: 'utf8' },
+  );
+  assert.equal(persisted.status, 0, persisted.stderr);
+  const event = JSON.parse(persisted.stdout);
+  assertInstalledCommandChange(event);
+  console.log(
+    `Installed agentmonitors command-poll monitor fired on ${process.platform}-${process.arch}: ${JSON.stringify({ tick: changed, event })}`,
+  );
+
+  // Corrupt only this install's selected binding, then run a fresh CLI process.
+  // A direct-spawn fallback would execute the marker and advance the baseline;
+  // successful output alone cannot distinguish it from native admission.
+  const binding = path.join(
+    projectDir,
+    'node_modules/@agentmonitors/cli/vendor/koffi',
+    `${process.platform}-${process.arch}`,
+    'koffi.node',
+  );
+  const original = readFileSync(binding);
+  const marker = path.join(workspace, 'must-not-run');
+  const definition = path.join(monitor, 'MONITOR.md');
+  const healthyDefinition = readFileSync(definition, 'utf8');
+  const refusedCommand = [
+    process.execPath,
+    '-e',
+    'require("node:fs").writeFileSync(process.argv[1], "ran"); process.stdout.write("three")',
+    marker,
+  ];
+  writeFileSync(
+    definition,
+    healthyDefinition.replace(
+      /^ {2}command: .*$/m,
+      `  command: ${JSON.stringify(refusedCommand)}`,
+    ),
+  );
+  try {
+    writeFileSync(binding, 'corrupt native bytes: this cannot load');
+    const refused = tick(false);
+    assert.equal(
+      existsSync(marker),
+      false,
+      'Unusable native binding must refuse authored side effects',
+    );
+    assert.equal(refused.emittedEventIds.length, 1, JSON.stringify(refused));
+    const refusal = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `
+      import { createDb, RuntimeStore } from '@agentmonitors/core';
+      const store = new RuntimeStore(createDb(${JSON.stringify(dbPath)}));
+      console.log(JSON.stringify({
+        event: store.getEventById(${JSON.stringify(refused.emittedEventIds[0])}),
+        state: store.getMonitorState('command-native', ${JSON.stringify(workspace)}).sourceState
+      }));
+    `,
+      ],
+      { cwd: projectDir, encoding: 'utf8' },
+    );
+    assert.equal(refusal.status, 0, refusal.stderr);
+    const { event: failure, state } = JSON.parse(refusal.stdout);
+    assert.match(failure.summary, /^Command failing: /);
+    assert.ok(
+      JSON.stringify(failure).includes(
+        `Native exec support for ${process.platform}-${process.arch} could not be loaded`,
+      ),
+      JSON.stringify(failure),
+    );
+    assert.equal(
+      state.stdout,
+      'two',
+      'Native refusal must preserve the successful comparison baseline',
+    );
+    assert.equal(state.baselined, true);
+    console.log(
+      `Installed CLI refused corrupt native binding, kept baseline, and exposed platform diagnostic: ${JSON.stringify(failure)}`,
+    );
+  } finally {
+    writeFileSync(binding, original);
+    writeFileSync(definition, healthyDefinition);
+  }
+}
+
 async function createStandaloneProject(projectDir) {
   const project = new Project({
     files: {
@@ -551,9 +831,7 @@ async function main() {
   console.log('Building published packages...');
   run(PNPM_BIN, ['build'], REPO_ROOT);
 
-  const projectDir = mkdtempSync(
-    path.join(os.tmpdir(), 'agentmonitors-standalone-consumer-'),
-  );
+  const projectDir = mkdtempSync(path.join(os.tmpdir(), 'sc-'));
   const packDir = path.join(projectDir, 'packed');
   mkdirSync(packDir, { recursive: true });
 
@@ -565,19 +843,78 @@ async function main() {
 
   await createStandaloneProject(projectDir);
 
-  console.log('Installing packed packages into standalone temp project...');
-  run(
-    NPM_BIN,
-    ['install', '--save-dev', 'typescript@5.9.3', '@types/node@22'],
-    projectDir,
+  // The test registry denies native names even when an npm cache could otherwise
+  // hide an accidental dependency. Its cache is empty inside this owned project.
+  const proxy = createServer(async (request, response) => {
+    try {
+      if (isBlockedNativeRequest(request.url)) {
+        response.writeHead(404, { 'content-type': 'application/json' });
+        response.end(
+          JSON.stringify({
+            error: 'Koffi registry access is forbidden in this consumer',
+          }),
+        );
+        return;
+      }
+      const chunks = [];
+      for await (const chunk of request) chunks.push(chunk);
+      const body = Buffer.concat(chunks);
+      const upstream = await globalThis.fetch(
+        `https://registry.npmjs.org${request.url}`,
+        {
+          method: request.method,
+          headers: {
+            'content-type':
+              request.headers['content-type'] ?? 'application/json',
+          },
+          ...(body.length ? { body } : {}),
+        },
+      );
+      response.writeHead(upstream.status, {
+        'content-type':
+          upstream.headers.get('content-type') ?? 'application/json',
+      });
+      response.end(Buffer.from(await upstream.arrayBuffer()));
+    } catch (error) {
+      response.writeHead(502);
+      response.end(String(error));
+    }
+  });
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  const registry = `http://127.0.0.1:${proxy.address().port}`;
+  writeFileSync(
+    path.join(projectDir, '.npmrc'),
+    `registry=${registry}\n@koromix:registry=${registry}\ncache=${path.join(projectDir, 'npm-cache')}\n`,
   );
-  run(NPM_BIN, ['install', ...tarballs], projectDir);
+  try {
+    for (const route of ['/koffi', '/@koromix%2fkoffi-darwin-arm64']) {
+      assert.equal((await globalThis.fetch(`${registry}${route}`)).status, 404);
+    }
+    console.log(
+      'Installing packed packages with koffi and @koromix/* blocked by the consumer registry...',
+    );
+    await installConsumer(
+      ['--save-dev', 'typescript@5.9.3', '@types/node@22'],
+      projectDir,
+    );
+    await installConsumer(tarballs, projectDir);
+  } finally {
+    await new Promise((resolve, reject) =>
+      proxy.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+  assertNoInstalledKoffi(projectDir);
+
+  console.log('Auditing the standalone install (production dependencies)...');
+  auditConsumerInstall(projectDir);
 
   console.log('Running standalone TypeScript check...');
   run(NPM_BIN, ['run', 'check'], projectDir);
 
   console.log('Running standalone runtime smoke...');
   run(NPM_BIN, ['run', 'smoke'], projectDir);
+
+  smokeInstalledCommandMonitor(projectDir);
 
   console.log(
     `Standalone consumer smoke completed successfully in ${projectDir}`,
@@ -587,13 +924,16 @@ async function main() {
 // Only run when invoked directly (`node scripts/test-standalone-consumer.mjs`
 // / `pnpm test:standalone-consumer`), never as a side effect of another
 // script (e.g. the coverage-drift unit test) importing SOURCE_PLUGINS.
-// `argv[1]` is resolved to an absolute path first: `pathToFileURL` on a
-// relative path resolves against `process.cwd()` at call time rather than
-// throwing, so an unresolved relative `argv[1]` could silently mismatch
-// `import.meta.url`.
-const isMainModule =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
+// Compare both canonical paths, including when Node preserves the main-module symlink.
+let isMainModule = false;
+try {
+  isMainModule =
+    process.argv[1] !== undefined &&
+    realpathSync(fileURLToPath(import.meta.url)) ===
+      realpathSync(process.argv[1]);
+} catch {
+  // Importers may supply a non-file argv entry; importing must remain inert.
+}
 if (isMainModule) {
-  await main();
+  await withIsolatedTestEnvironment(main);
 }

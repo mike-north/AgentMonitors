@@ -88,7 +88,7 @@ function openLead(store: RuntimeStore, hostSessionId: string): string {
 
 /**
  * Materialize ONE shared event for {@link OBJECT_KEY} carrying `artifact`,
- * exactly as `processObservation` does, with the given `baselineStrategy`
+ * exactly as `materializeObservation` does, with the given `baselineStrategy`
  * persisted on the event. Returns the event id.
  */
 function materialize(

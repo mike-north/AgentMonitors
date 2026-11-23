@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import {
   closeSync,
   constants as fsConstants,
@@ -86,6 +86,13 @@ export interface SpawnedDaemon {
    */
   pid: number | undefined;
   /**
+   * The spawned child's own handle. It is the identity evidence for any later
+   * cleanup signal (008 §5): while Node holds the child unreaped its pid cannot
+   * have been reused, so a caller must signal through this handle (via core's
+   * `sendVerifiedSignal`), never by the bare {@link pid}.
+   */
+  child: ChildProcess;
+  /**
    * Resolves with the spawn error if the child's `error` event fires (e.g.
    * `ENOENT`/`EACCES` — the OS never actually started the process), or never
    * settles if the child spawns successfully. Lets a caller waiting for the
@@ -152,7 +159,7 @@ export function spawnDetachedDaemon(
       });
     });
     child.unref();
-    return { pid: child.pid, spawnError };
+    return { pid: child.pid, child, spawnError };
   } finally {
     // The child holds its own duplicated descriptor; the parent's copy must be
     // released or a short-lived parent would leak it for its remaining life.

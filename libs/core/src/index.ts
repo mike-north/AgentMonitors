@@ -1,3 +1,10 @@
+// Shell arguments and command boundaries shared by runtime diagnostics and CLI suggestions.
+export {
+  _monitorCommandLine,
+  shellArg,
+  shellSingleQuote,
+} from './commands/shell-arguments.js';
+
 // Schema
 export {
   monitorFrontmatterSchema,
@@ -33,6 +40,7 @@ export type {
 
 // Parser
 export { parseMonitor, parseMonitorFile } from './parser/parse-monitor.js';
+export { readMonitorFileSync } from './parser/read-monitor-file.js';
 export type {
   ParseResult,
   ParseError,
@@ -40,6 +48,35 @@ export type {
 } from './parser/parse-monitor.js';
 export { scanMonitors } from './parser/scan-monitors.js';
 export type { ScanResult, DuplicateMonitorId } from './parser/scan-monitors.js';
+
+// Identity-verified cleanup signals (008 §5): the one gate every cleanup or
+// enforcement signal passes through, shared by the CLI and source plugins so
+// none of them signals a stored pid/pgid without re-verifying it.
+export {
+  describeSignalAbstention,
+  isChildUnreaped,
+  reportSignalAbstention,
+  sendVerifiedSignal,
+  spawnedProcessGroup,
+} from './process/process-identity.js';
+export type {
+  ChildProcessHandle,
+  GroupMembershipTracking,
+  IdentityEvidence,
+  RecordedProcessTarget,
+  SignalAbstention,
+  SignalOutcome,
+  SignalTarget,
+  SpawnedProcessGroupTarget,
+  SpawnedProcessTarget,
+  VerifiedSignalOptions,
+} from './process/process-identity.js';
+export { readProcessTable } from './process/process-table.js';
+export type {
+  ProcessIdentityRecord,
+  ProcessTableReader,
+  ProcessTableReading,
+} from './process/process-table.js';
 
 // Local-data permission model (issue #292): owner-only enforcement shared by
 // core persistence and the CLI's socket/lock/coordination artifacts, so the
@@ -71,10 +108,9 @@ export type {
   EnqueuePayload,
 } from './inbox/types.js';
 
-// Source-neutral local external-ingress contract
+// Versioned source-neutral envelope admission and semantic identity.
 export {
   EXTERNAL_EVENT_SCHEMA,
-  canonicalJsonStringify,
   externalEventLimits,
   externalEventReservedScopeKeys,
   validateExternalEventEnvelope,
@@ -84,14 +120,10 @@ export {
   externalEventSemanticHash,
 } from './external-ingress/identity.js';
 export type {
-  ExternalEventDisposition,
   ExternalEventEnvelope,
   ExternalEventEnvelopeValidationResult,
   ExternalEventError,
   ExternalEventErrorCode,
-  ExternalEventIngestInput,
-  ExternalEventIngestResult,
-  ExternalEventOutcome,
   ExternalEventScope,
   ExternalJsonObject,
   ExternalJsonValue,
@@ -149,6 +181,8 @@ export {
 } from './runtime/service.js';
 export {
   MaterializationRetryCapacityError,
+  MaterializationRetryNotFoundError,
+  MaterializationRetryTransitionError,
   RuntimeStore,
 } from './runtime/store.js';
 export { MaterializationRetrySerializationError } from './runtime/retry-envelope.js';
@@ -185,9 +219,9 @@ export type {
   ShapedObservation,
 } from './runtime/shape-stage.js';
 // Hook-deliver debug diagnosis (issue #334): why `hook deliver` surfaced
-// nothing at a given lifecycle — held by the settle window, or a coalesced
-// normal/low reminder suppressed by an already-claimed / partially-claimed
-// unread set. Read-only; never claims or mutates.
+// nothing at a given lifecycle — high work is settling, a fresh normal/low
+// batch is reserved by another transport, or no new work remains. Previously
+// claimed work stays unread without blocking fresh batches. Read-only; never mutates.
 export {
   classifyReminderHold,
   classifySettleWindowHold,
@@ -216,7 +250,15 @@ export type {
   ExternalEventReceiptDecision,
   ExternalEventReceiptOperation,
   ExternalEventReceiptRecord,
+  EphemeralMonitorWork,
+  RegisterVerifyArtifactInput,
+  VerifyArtifactCleanupCause,
+  VerifyArtifactCleanupResult,
+  VerifyArtifactRecord,
+  DoctorMonitorKind,
   DoctorMonitorRollup,
+  HeldNotifyBarrier,
+  HeldNotifyWork,
   DoctorParseError,
   DoctorReportInput,
   ErroredObservation,
@@ -226,6 +268,11 @@ export type {
   MonitorDeliveryState,
   MaterializationRetryQuery,
   MaterializationRetryDiagnostic,
+  MaterializationRetryRepairInput,
+  MaterializationRetryRepairOutcome,
+  MaterializationRetryRepairResult,
+  MaterializationRetrySkipInput,
+  OrphanedMonitorWork,
   MaterializationRetryRecord,
   MaterializationRetryStatus,
   MaterializationRetrySummary,
@@ -253,6 +300,7 @@ export type {
   SessionHookState,
   SkippedMonitor,
   StoredObservationEnvelope,
+  UnretainedObservationLoss,
   WatchHandle,
   UrgencyCounts,
 } from './runtime/types.js';
@@ -262,6 +310,7 @@ export {
   MATERIALIZATION_RETRY_MAX_ATTEMPTS,
   MATERIALIZATION_RETRY_MAX_BYTES,
   MATERIALIZATION_RETRY_MAX_RECORDS,
+  MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH,
 } from './runtime/types.js';
 
 // Adapters
@@ -274,3 +323,11 @@ export type {
   InterpretResult,
   ClaudeInterpretAdapterOptions,
 } from './adapter/interpret.js';
+
+export type { CommandLifeToken } from './process/command-life-token.js';
+export { CommandProcessJournal } from './process/command-process-journal.js';
+export type {
+  CommandProcessOwner,
+  RestartSweepOutcome,
+  RestartSweepResult,
+} from './process/command-process-journal.js';
