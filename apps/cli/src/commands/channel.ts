@@ -585,13 +585,11 @@ export function registerChannelToolHandlers(
  * (006 §4.3).
  */
 async function runChannelServe(options: ChannelServeOptions): Promise<void> {
-  const hostSessionId =
-    options.hostSessionId ?? process.env['CLAUDE_CODE_SESSION_ID'];
-  const workspace = options.workspace ?? process.env['CLAUDE_PROJECT_DIR'];
-  const socketPath = resolveChannelSocketPath(options.socket, workspace);
-  // Reject a bad interval before anything else starts: no MCP handshake, no
-  // daemon contact. Commander supplies the default as a string, so an omitted
-  // flag parses as DEFAULT_POLL_MS here too.
+  // Reject a bad interval before anything else runs. Socket resolution reads
+  // local state, can warn on stderr about an overlong --socket path, and can
+  // probe a legacy daemon socket, so it must come after this check; so must
+  // the MCP handshake. Commander supplies the default as a string, so an
+  // omitted flag parses as DEFAULT_POLL_MS here too.
   const parsedPollMs = parseIntegerOption(
     '--poll-ms',
     options.pollMs,
@@ -602,6 +600,11 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     return;
   }
   const pollMs = parsedPollMs.value;
+
+  const hostSessionId =
+    options.hostSessionId ?? process.env['CLAUDE_CODE_SESSION_ID'];
+  const workspace = options.workspace ?? process.env['CLAUDE_PROJECT_DIR'];
+  const socketPath = resolveChannelSocketPath(options.socket, workspace);
 
   // The low-level Server is the correct API for a channel: it exposes the custom
   // `notification()` and the `experimental['claude/channel']` capability that the

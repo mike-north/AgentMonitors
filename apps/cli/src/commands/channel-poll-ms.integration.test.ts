@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
@@ -75,7 +75,10 @@ afterEach(async () => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function serveWithPollMs(pollMs: string): Promise<ServeResult> {
+function serveWithPollMs(
+  pollMs: string,
+  socket: string = socketPath,
+): Promise<ServeResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -84,7 +87,7 @@ function serveWithPollMs(pollMs: string): Promise<ServeResult> {
         'channel',
         'serve',
         '--socket',
-        socketPath,
+        socket,
         '--workspace',
         root,
         '--host-session-id',
@@ -147,4 +150,47 @@ describe('channel serve --poll-ms validation (issue #306)', () => {
     },
     EXIT_BUDGET_MS + 5_000,
   );
+
+  // Regression: socket resolution used to run before the --poll-ms check. An
+  // explicit --socket past the Unix socket path limit then printed its
+  // fallback warning (and could probe a legacy socket) ahead of the
+  // rejection, so the rejection was no longer the only output.
+  it(
+    'rejects --poll-ms 0 with exactly one stderr line even when --socket is overlong',
+    async () => {
+      const overlongSocket = path.join(root, `${'s'.repeat(120)}.sock`);
+      expect(overlongSocket.length).toBeGreaterThan(104);
+      const result = await serveWithPollMs('0', overlongSocket);
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toBe(
+        'Error: --poll-ms must be a whole number from 100 to 2147483647 (got "0").\n',
+      );
+      expect(result.stdout).toBe('');
+      expect(result.daemonConnections).toBe(0);
+    },
+    EXIT_BUDGET_MS + 5_000,
+  );
+
+  // 005 §13: omitting --poll-ms polls every 3000 ms. Commander supplies the
+  // default as the option's string value, and --help renders that value.
+  it('documents 3000 ms as the --poll-ms default in --help', () => {
+    const result = spawnSync(
+      process.execPath,
+      [CLI_PATH, 'channel', 'serve', '--help'],
+      {
+        cwd: root,
+        env: {
+          ...process.env,
+          HOME: root,
+          XDG_DATA_HOME: path.join(root, 'data'),
+        },
+        encoding: 'utf8',
+        timeout: EXIT_BUDGET_MS,
+      },
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout.replace(/\s+/g, ' ')).toContain(
+      'Delivery poll interval in milliseconds, a whole number from 100 to 2147483647 (default: "3000")',
+    );
+  });
 });
