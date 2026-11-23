@@ -37,12 +37,31 @@ import {
 } from '../channel-ack.js';
 import { getCliVersion } from '../cli-version.js';
 import {
+  MAX_TIMER_DELAY_MS,
+  parseIntegerOption,
+  type IntegerOptionRange,
+} from '../integer-option.js';
+import { reportError } from '../output.js';
+import {
   CHANNEL_HEARTBEAT_TTL_MS,
   removeTransportHeartbeat,
   writeTransportHeartbeat,
 } from '../transport-heartbeat.js';
 
+/** Poll interval used when `--poll-ms` is omitted. */
 const DEFAULT_POLL_MS = 3000;
+
+/**
+ * Accepted `--poll-ms` range. The floor bounds how hard a mistyped value can
+ * drive the daemon: every poll is a socket round trip plus a heartbeat file
+ * write, so 100 ms caps the loop at ten iterations a second. The ceiling is the
+ * largest delay Node's timers honor; beyond it `setTimeout` fires after 1 ms.
+ * @internal
+ */
+export const CHANNEL_POLL_MS_RANGE: IntegerOptionRange = {
+  min: 100,
+  max: MAX_TIMER_DELAY_MS,
+};
 
 interface ChannelServeOptions {
   socket?: string;
@@ -66,7 +85,7 @@ channelCommand
   )
   .option(
     '--poll-ms <ms>',
-    'Delivery poll interval in milliseconds',
+    `Delivery poll interval in milliseconds, a whole number from ${String(CHANNEL_POLL_MS_RANGE.min)} to ${String(CHANNEL_POLL_MS_RANGE.max)}`,
     String(DEFAULT_POLL_MS),
   )
   .option(
@@ -570,7 +589,19 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
     options.hostSessionId ?? process.env['CLAUDE_CODE_SESSION_ID'];
   const workspace = options.workspace ?? process.env['CLAUDE_PROJECT_DIR'];
   const socketPath = resolveChannelSocketPath(options.socket, workspace);
-  const pollMs = Number.parseInt(options.pollMs, 10) || DEFAULT_POLL_MS;
+  // Reject a bad interval before anything else starts: no MCP handshake, no
+  // daemon contact. Commander supplies the default as a string, so an omitted
+  // flag parses as DEFAULT_POLL_MS here too.
+  const parsedPollMs = parseIntegerOption(
+    '--poll-ms',
+    options.pollMs,
+    CHANNEL_POLL_MS_RANGE,
+  );
+  if (!parsedPollMs.ok) {
+    reportError(parsedPollMs.message, false);
+    return;
+  }
+  const pollMs = parsedPollMs.value;
 
   // The low-level Server is the correct API for a channel: it exposes the custom
   // `notification()` and the `experimental['claude/channel']` capability that the
