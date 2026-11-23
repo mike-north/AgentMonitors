@@ -561,6 +561,21 @@ describe('ingress tables follow the store migration rule: carry or refuse', () =
     after.close();
   });
 
+  it('does not report a failure unrelated to existing rows as a row violation', () => {
+    // A view holding the index's name makes creation fail for a reason that
+    // has nothing to do with duplicate rows.
+    const { thrown, after } = openWith((sqlite) => {
+      sqlite.exec(sql`
+        DROP INDEX idx_external_object_sequence_key;
+        CREATE VIEW idx_external_object_sequence_key AS SELECT 1;
+      `);
+    });
+    expect(thrown).toBeInstanceOf(Error);
+    expect(thrown).not.toBeInstanceOf(SchemaMigrationError);
+    expect((thrown as Error).message).toMatch(/already/);
+    after.close();
+  });
+
   it('refuses, naming the table and column, when an existing table lacks a required column', () => {
     const { thrown, schemaBefore, after } = openWith((sqlite) => {
       // Rebuild the sequence table by hand without `receipt_id`: a shape the
