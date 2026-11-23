@@ -1,7 +1,13 @@
 {
   "$schema": "https://nx.dev/nx-schema.json",
+  "useDaemonProcess": false,
   "namedInputs": {
-    "default": ["{projectRoot}/**/*"],
+    "sharedGlobals": [
+      "{workspaceRoot}/tsconfig.base.json",
+      "{workspaceRoot}/api-extractor.base.json",
+      "{workspaceRoot}/api-extractor.build.json"
+    ],
+    "default": ["{projectRoot}/**/*", "sharedGlobals"],
     "production": [
       "default",
       "!{projectRoot}/**/*.test.ts",
@@ -9,7 +15,19 @@
       "!{projectRoot}/**/vitest.config.ts",
       "!{projectRoot}/**/__integration__/**"
     ],
-    "testIsolation": ["{workspaceRoot}/scripts/test-isolation/**/*"]
+    "testIsolation": ["{workspaceRoot}/scripts/test-isolation/**/*"],
+    "testEnvironment": [
+      "{workspaceRoot}/scripts/nx-test-environment.mjs",
+      {
+        "runtime": "node scripts/nx-test-environment.mjs"
+      }
+    ],
+    "dockerEnvironment": [
+      "{workspaceRoot}/scripts/nx-test-environment.mjs",
+      {
+        "runtime": "node scripts/nx-test-environment.mjs --docker"
+      }
+    ]
   },
   "targetDefaults": {
     "build": {
@@ -20,17 +38,18 @@
     },
     "check": {
       "dependsOn": ["^build"],
-      "cache": true
+      "cache": true,
+      "inputs": ["default", "^default"]
     },
     "test": {
       "dependsOn": ["^build"],
       "cache": true,
-      "inputs": ["default", "^production", "testIsolation"]
+      "inputs": ["default", "^production", "testIsolation", "testEnvironment"]
     },
     "test:serial": {
       "dependsOn": ["^build"],
       "cache": true,
-      "inputs": ["default", "^production", "testIsolation"]
+      "inputs": ["default", "^production", "testIsolation", "dockerEnvironment"]
     },
     "clean": {
       "cache": false
@@ -38,7 +57,12 @@
     "check:api-report": {
       "dependsOn": ["^build"],
       "cache": true,
-      "inputs": ["production", "^production"]
+      "inputs": [
+        "production",
+        "^production",
+        "{workspaceRoot}/api-extractor.report.json"
+      ],
+      "outputs": ["{projectRoot}/temp"]
     },
     "fix:api-report": {
       "dependsOn": ["^build"],
