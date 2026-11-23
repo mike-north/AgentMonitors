@@ -2512,14 +2512,14 @@ export class AgentMonitorRuntime {
     } else if (events.length > 0) {
       const counts = projections.reduce<Record<string, number>>(
         (acc, projection) => {
-          // A row the per-recipient net collapse suppressed carries
-          // `deliveryState: 'claimed'` (it was consumed with its endpoint) but
-          // was never shown to the session, so it gets its own count — the same
-          // `net_suppressed_at` marker delivery's `notNetSuppressed()` excludes.
-          const key =
-            projection.netSuppressed && projection.deliveryState === 'claimed'
-              ? 'netSuppressed'
-              : projection.deliveryState;
+          // A row the per-recipient net collapse suppressed was consumed with
+          // its endpoint but never shown to the session, so it gets its own
+          // count whatever its acknowledgement state (an ack by event ID can
+          // still reach it). It keys on the same `net_suppressed_at` marker
+          // delivery's `notNetSuppressed()` excludes.
+          const key = projection.netSuppressed
+            ? 'netSuppressed'
+            : projection.deliveryState;
           acc[key] = (acc[key] ?? 0) + 1;
           return acc;
         },

@@ -3337,9 +3337,11 @@ export class RuntimeStore {
    * `buildDiff(cursor.baselineContent, newestArtifact, strategy)` (issue #437:
    * strategy-aware — structural for `json-diff`, line-based otherwise) so the
    * delta spans the recipient's cursor → endpoint (not the shared snapshot
-   * baseline). The older same-object events are recorded CLAIMED-BUT-SUPPRESSED
-   * (`net_suppressed_at`): retained for `monitor explain` but excluded from
-   * delivery (unread/pending/recap).
+   * baseline). The older same-object events that no earlier claim surfaced are
+   * recorded CLAIMED-BUT-SUPPRESSED (`net_suppressed_at`): retained for
+   * `monitor explain` but excluded from delivery (unread/pending/recap). An
+   * older sibling an earlier claim already showed (a recap can collapse over
+   * those) is not suppressed; it stays claimed and unread.
    *
    * `incremental` (default / NULL) events always pass through unchanged, in
    * order. Events without a `snapshotText`/`objectKey` (snapshot-less) cannot be
@@ -3416,6 +3418,14 @@ export class RuntimeStore {
    * Record the per-recipient `net`-collapse suppression marker (G10 PR-B,
    * 002 §1.1.7) on the given projections: claimed-but-suppressed intermediates,
    * retained for `monitor explain` but excluded from delivery.
+   *
+   * The collapse suppresses only the recipient's **unclaimed** intermediates.
+   * A projection an earlier claim already surfaced (`first_notified_at` set) —
+   * for example one a later `post-compact` recap folds into a newer endpoint —
+   * was shown to the session, so it keeps no suppression marker and stays
+   * claimed and unread until acknowledged. This must run before
+   * {@link markClaimed} stamps the current claim, which is what makes
+   * `first_notified_at` here mean "claimed before this claim began".
    */
   private markNetSuppressed(sessionId: string, eventIds: string[]): void {
     if (eventIds.length === 0) return;
@@ -3427,6 +3437,7 @@ export class RuntimeStore {
         and(
           eq(sessionEventState.sessionId, sessionId),
           inArray(sessionEventState.eventId, eventIds),
+          isNull(sessionEventState.firstNotifiedAt),
         ),
       )
       .run();
