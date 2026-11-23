@@ -1314,5 +1314,20 @@ with a heap cap and external timeout; trusted descriptor counters installed befo
 import can observe captured traversal. Post-load prototype replacements MUST
 neither execute hooks nor change admission or canonical bytes. An injected
 preflight undercount MUST still fail the independent output-size check.
+
+Each admission catch site (envelope byte preflight, scope byte preflight and
+canonical encoding) MUST contain a foreign thrown value. Isolated, heap-capped,
+externally timed child processes install a trusted descriptor intrinsic before
+import that throws at one chosen site. A thrown proxy whose traps all count, and
+a thrown ordinary object with counting getters for `Symbol.toPrimitive`,
+`Symbol.toStringTag`, the `nodejs.util.inspect.custom` symbol, `message` and
+`stack`, MUST each yield a permanent `invalid_envelope` with zero trap or getter
+calls, no escaping exception and no output on stdout or stderr. The ordinary
+object is needed because `util.inspect` formats a proxy's target without running
+traps. A native stack-overflow `RangeError` thrown at each site MUST be
+contained the same way without changing the production depth limit. Reading a
+property of the caught value, rethrowing it, logging it with `console.error` or
+formatting it with `util.inspect` (including with `customInspect: false`) MUST
+fail one of these cases.
 `libs/core/src/external-ingress/contract.test.ts`
 provides these examples alongside the §16 JSON-policy compatibility cases.
