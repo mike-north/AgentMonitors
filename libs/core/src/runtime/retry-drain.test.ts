@@ -836,3 +836,124 @@ Handle it.
     expect(triggeredRows(f)).toHaveLength(triggeredBefore);
   });
 });
+
+/**
+ * A tick records one `observation_history` row per monitor, and a retry its
+ * drain completes counts in that row's `emitted` (002 §2.7, §15
+ * `observation_history`): `triggered` means at least one event was emitted.
+ */
+describe('history of a tick that drains retained work', () => {
+  beforeEach(() => {
+    clock = stubClock(T0);
+  });
+  let clock: ReturnType<typeof stubClock>;
+
+  function outcomes(runtime: AgentMonitorRuntime) {
+    return runtime
+      .listObservationHistory({ monitorId: 'm' })
+      .map(({ result, observationData }) => ({ result, observationData }));
+  }
+
+  /** Rows written by `tick`, newest first. */
+  async function tickRows(
+    runtime: AgentMonitorRuntime,
+    f: ReturnType<typeof setup>,
+  ) {
+    const before = outcomes(runtime).length;
+    await runtime.tick(f.monitorsDir, f.root);
+    const after = outcomes(runtime);
+    return after.slice(0, after.length - before);
+  }
+
+  it('records a drain-only tick as one triggered row counting the drained events', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], []] }]);
+    const { client, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+    expect(retrySummaries(client)).toEqual(['A', 'B']);
+
+    repair(client, 'A');
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B']);
+  });
+
+  it('adds drained events to the emitted count of the span observed after them', async () => {
+    const f = setup([{ id: 'm', spans: [['A'], ['B', 'C']] }]);
+    const { client, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+
+    repair(client, 'A');
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'triggered', observationData: { observed: 2, emitted: 3 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('still records no-change when nothing drained and nothing new was observed', async () => {
+    const f = setup([{ id: 'm', spans: [['A'], []] }]);
+    const { runtime } = f.open();
+    await runtime.tick(f.monitorsDir, f.root);
+
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'no-change', observationData: { observed: 0, emitted: 0 } },
+    ]);
+  });
+
+  it('records only the errored row for a drain attempt that fails', async () => {
+    const f = setup([{ id: 'm', spans: [['A'], []] }]);
+    const { client, store, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+    const [retry] = store.listMaterializationRetries({ monitorId: 'm' });
+
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringMatching(
+            new RegExp(
+              `^Materialization retry ${String(retry?.id)} failed: .*A write failed`,
+            ),
+          ),
+        },
+      },
+    ]);
+  });
+
+  it('records completed retries before the failure that stops the drain', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], []] }]);
+    const { client, store, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+    const retryB = store
+      .listMaterializationRetries({ monitorId: 'm' })
+      .find(({ envelope }) => envelope.observation.summary === 'B');
+
+    repair(client, 'A');
+    failSummary(client, 'B');
+    clock.advance(2_000);
+    // The failure stays the newest outcome, as for a span whose later sibling fails.
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringMatching(
+            new RegExp(
+              `^Materialization retry ${String(retryB?.id)} failed: .*B write failed`,
+            ),
+          ),
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 1 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A']);
+    expect(retrySummaries(client)).toEqual(['B']);
+  });
+});

@@ -671,8 +671,23 @@ describe('retry Interpret after restart', () => {
         'first-state',
         'second-state',
       ]);
-      // Successful retry history is not asserted here: its audit outcome does not yet
-      // account for the observations committed while draining retained work.
+      // One row for the restart tick: its only emissions are the drained retries
+      // (002 §2.7, §15 `observation_history`).
+      expect(history(restarted)).toEqual([
+        {
+          result: 'triggered',
+          observationData: { observed: 0, emitted: fault.queued.length },
+        },
+        { result: 'errored', observationData: { error: fault.message } },
+        ...(fault.emitted.length === 1
+          ? [
+              {
+                result: 'triggered' as const,
+                observationData: { observed: 2, emitted: 1 },
+              },
+            ]
+          : []),
+      ]);
     });
   }
 });
