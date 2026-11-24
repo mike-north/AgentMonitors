@@ -6,10 +6,12 @@
  */
 import { execFileSync, type ExecFileSyncOptions } from 'node:child_process';
 import {
+  appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -31,6 +33,10 @@ import {
 } from '../daemon-ipc.js';
 import { decodeToon } from '../toon-format.js';
 import { runChannelDeliveryCycle } from './channel.js';
+import {
+  createTranscriptConfirmer,
+  type ChannelPushConfirmer,
+} from '../channel-push-confirmation.js';
 import { claimDeliveryClient } from '../runtime-client.js';
 import {
   buildChannelTruncatedMarker,
@@ -8637,13 +8643,24 @@ describe('channel serve workspace-socket resolution (issue #358)', () => {
     // hooks.json invocation), not an explicit-flag control.
     const hookEnv = { CLAUDE_PROJECT_DIR: ws };
 
+    // The session transcript the hook reports (`transcript_path`): the
+    // channel's host-evidence source (006 §4.5.2). Without one the channel has
+    // nothing to confirm a push against and does not push at all.
+    const transcriptPath = path.join(ws, `${hostSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+
     let client: Client | undefined;
     try {
       // 1. Lazy-boot exactly like the SessionStart hook does.
       const start = runWithStdin(
         ['session', 'start'],
         hookEnv,
-        sessionStartPayload(hostSessionId, ws),
+        JSON.stringify({
+          session_id: hostSessionId,
+          hook_event_name: 'SessionStart',
+          cwd: ws,
+          transcript_path: transcriptPath,
+        }),
         ws,
       );
       expect(start.exitCode).toBe(0);
@@ -8730,6 +8747,287 @@ describe('channel serve workspace-socket resolution (issue #358)', () => {
       rmSync(ws, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// `channel serve` commits only on host confirmation (006 §4.5.2, issue #535)
+//
+// Drives the real `channel serve` subprocess over MCP, with a real daemon and
+// the real SessionStart hook recording the session transcript path. The test
+// plays the host: when a `<channel>` push arrives it either appends the
+// `queue-operation`/`enqueue` entry Claude Code writes when its channel
+// listener accepts an event (a registered listener), or writes nothing (a
+// host that loaded the server without a listener, 006 §12.6).
+// ---------------------------------------------------------------------------
+describe('channel serve host confirmation (issue #535)', () => {
+  interface ServeFixture {
+    ws: string;
+    socket: string;
+    hostSessionId: string;
+    transcriptPath: string;
+    dataHome: string;
+    env: Record<string, string>;
+    watchedFile: string;
+  }
+
+  function serveFixture(label: string): ServeFixture {
+    const ws = mkdtempSync(path.join(tmpdir(), `agentmon-chconf-${label}-`));
+    const monitorsDir = path.join(ws, '.claude', 'monitors', 'watch-file');
+    mkdirSync(monitorsDir, { recursive: true });
+    const watchedFile = path.join(ws, 'watched.txt');
+    writeFileSync(watchedFile, 'hello', 'utf-8');
+    writeFileSync(
+      path.join(monitorsDir, 'MONITOR.md'),
+      [
+        '---',
+        'name: Watch file',
+        'watch:',
+        '  type: file-fingerprint',
+        '  globs:',
+        '    - "watched.txt"',
+        `  cwd: ${JSON.stringify(ws)}`,
+        '  interval: "1s"',
+        'urgency: normal',
+        '---',
+        'watched.txt changed.',
+        '',
+      ].join('\n'),
+      'utf-8',
+    );
+    const socket = path.join(
+      tmpdir(),
+      `agentmon-chconf-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
+    );
+    writeLocalState(ws, {
+      enabled: true,
+      socket,
+      db: path.join(ws, 'chconf.db'),
+      reapAfterMs: 60_000,
+    });
+    const hostSessionId = `chconf-${label}-${String(Date.now())}`;
+    const transcriptPath = path.join(ws, `${hostSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '');
+    const dataHome = path.join(ws, 'data-home');
+    mkdirSync(dataHome, { recursive: true });
+    return {
+      ws,
+      socket,
+      hostSessionId,
+      transcriptPath,
+      dataHome,
+      env: { CLAUDE_PROJECT_DIR: ws, XDG_DATA_HOME: dataHome },
+      watchedFile,
+    };
+  }
+
+  async function startServe(
+    f: ServeFixture,
+    onPush: (meta: Record<string, string>) => void,
+  ): Promise<Client> {
+    const start = runWithStdin(
+      ['session', 'start'],
+      f.env,
+      JSON.stringify({
+        session_id: f.hostSessionId,
+        hook_event_name: 'SessionStart',
+        cwd: f.ws,
+        transcript_path: f.transcriptPath,
+      }),
+      f.ws,
+    );
+    expect(start.exitCode).toBe(0);
+    expect(await daemonAvailable(f.socket)).toBe(true);
+
+    const client = new Client(
+      { name: 'channel-confirmation-uat', version: '0.0.0' },
+      { capabilities: {} },
+    );
+    client.fallbackNotificationHandler = (notification) => {
+      if (notification.method === 'notifications/claude/channel') {
+        const params = notification.params as { meta?: Record<string, string> };
+        onPush(params.meta ?? {});
+      }
+      return Promise.resolve();
+    };
+    await client.connect(
+      new StdioClientTransport({
+        command: 'node',
+        args: [CLI_PATH, 'channel', 'serve', '--poll-ms', '300'],
+        cwd: f.ws,
+        env: {
+          ...Object.fromEntries(
+            Object.entries(process.env).filter(
+              ([key, value]) =>
+                value !== undefined &&
+                key !== 'AGENTMONITORS_SOCKET' &&
+                key !== 'AGENTMONITORS_DB',
+            ) as [string, string][],
+          ),
+          ...f.env,
+          CLAUDE_CODE_SESSION_ID: f.hostSessionId,
+        },
+        stderr: 'ignore',
+      }),
+    );
+    // Let it bind its session and take a baseline poll first.
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    writeFileSync(f.watchedFile, 'hello world', 'utf-8');
+    return client;
+  }
+
+  function sessionEvents(
+    f: ServeFixture,
+  ): { id: string; deliveryState?: string }[] {
+    const sessions = JSON.parse(
+      runWithEnv(
+        ['session', 'list', '--socket', f.socket, '--format', 'json'],
+        f.env,
+        f.ws,
+      ).stdout,
+    ) as { id: string; hostSessionId: string }[];
+    const sessionId =
+      sessions.find((s) => s.hostSessionId === f.hostSessionId)?.id ?? '';
+    return JSON.parse(
+      runWithEnv(
+        [
+          'events',
+          'list',
+          '--session',
+          sessionId,
+          '--format',
+          'json',
+          '--socket',
+          f.socket,
+        ],
+        f.env,
+        f.ws,
+      ).stdout,
+    ) as { id: string; deliveryState?: string }[];
+  }
+
+  function channelRoute(f: ServeFixture): unknown {
+    const registry = path.join(f.dataHome, 'agentmonitors', 'transports');
+    for (const name of readdirSync(registry)) {
+      if (!name.startsWith('channel-')) continue;
+      const record = JSON.parse(
+        readFileSync(path.join(registry, name), 'utf-8'),
+      ) as { hostSessionId?: string; channelRoute?: unknown };
+      if (record.hostSessionId === f.hostSessionId) return record.channelRoute;
+    }
+    return undefined;
+  }
+
+  async function waitFor(check: () => boolean, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (check()) return true;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    return check();
+  }
+
+  async function cleanup(f: ServeFixture, client: Client | undefined) {
+    if (client) {
+      try {
+        await client.close();
+      } catch {
+        // already closed
+      }
+    }
+    try {
+      await callDaemon('stop', {}, { socketPath: f.socket });
+    } catch {
+      // already stopped
+    }
+    rmSync(f.ws, { recursive: true, force: true });
+  }
+
+  it('a push the host records as enqueued is committed and the route reads confirmed', async () => {
+    const f = serveFixture('ok');
+    let client: Client | undefined;
+    const ids: string[] = [];
+    try {
+      client = await startServe(f, (meta) => {
+        const id = meta['delivery_id'] ?? '';
+        ids.push(id);
+        appendFileSync(
+          f.transcriptPath,
+          `${JSON.stringify({
+            type: 'queue-operation',
+            operation: 'enqueue',
+            timestamp: '2026-11-23T17:05:48.034Z',
+            sessionId: f.hostSessionId,
+            content: `<channel source="plugin:agentmonitors:agentmonitors" event_count="1" delivery_id="${id}">\n1. update\n</channel>`,
+          })}\n`,
+        );
+      });
+
+      expect(
+        await waitFor(
+          () => sessionEvents(f).some((e) => e.deliveryState === 'claimed'),
+          15_000,
+        ),
+      ).toBe(true);
+      // Every push carries a fresh delivery id (006 §4.5.2).
+      expect(ids[0]).toMatch(/^[0-9a-f]{32}$/);
+      expect(
+        await waitFor(
+          () =>
+            (channelRoute(f) as { state?: string } | undefined)?.state ===
+            'confirmed',
+          5_000,
+        ),
+      ).toBe(true);
+    } finally {
+      await cleanup(f, client);
+    }
+  }, 40_000);
+
+  it('a push the host never records is released to the hook path, and the channel stops pushing for the rest of its process', async () => {
+    const f = serveFixture('nolistener');
+    let client: Client | undefined;
+    let pushes = 0;
+    try {
+      client = await startServe(f, () => {
+        pushes += 1;
+      });
+
+      expect(await waitFor(() => pushes > 0, 15_000)).toBe(true);
+      // After the confirmation bound, the reservation is released and the
+      // route goes unproven for the rest of this process.
+      expect(
+        await waitFor(
+          () =>
+            (channelRoute(f) as { evidence?: string } | undefined)?.evidence ===
+            'unconfirmed-push',
+          10_000,
+        ),
+      ).toBe(true);
+      expect(channelRoute(f)).toMatchObject({ state: 'unproven' });
+      const events = sessionEvents(f);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.deliveryState).toBe('unread');
+      // No re-push every poll.
+      const pushesAfterRelease = pushes;
+      await new Promise((resolve) => setTimeout(resolve, 1_500));
+      expect(pushes).toBe(pushesAfterRelease);
+      // The hook path delivers it.
+      const deliver = runWithStdin(
+        ['hook', 'deliver'],
+        f.env,
+        JSON.stringify({
+          session_id: f.hostSessionId,
+          hook_event_name: 'UserPromptSubmit',
+          cwd: f.ws,
+        }),
+        f.ws,
+      );
+      expect(deliver.exitCode).toBe(0);
+      expect(deliver.stdout).toContain('additionalContext');
+    } finally {
+      await cleanup(f, client);
+    }
+  }, 45_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -11975,6 +12273,56 @@ describe('hooks-only delivery parity (issue #270)', () => {
 // pre-fix claim-before-push ordering (the row would already be claimed) and
 // passes with the fix.
 // ---------------------------------------------------------------------------
+/**
+ * A stand-in for a Claude Code session's transcript, the channel's host
+ * evidence (006 §4.5.2). `accepting(push)` wraps a push so that, after it
+ * resolves, the "host" appends the `queue-operation`/`enqueue` entry Claude
+ * Code writes when its channel listener accepts an event — the shape recorded
+ * in real channel sessions. A push NOT wrapped models a host with no listener:
+ * the call resolves and nothing is written (006 §12.6). The confirmer is the
+ * real transcript reader, so these tests exercise the actual file path.
+ */
+type ChannelPush = Parameters<typeof runChannelDeliveryCycle>[2];
+
+function hostTranscript(dir: string): {
+  confirmer: ChannelPushConfirmer;
+  transcriptPath: string;
+  appendEnqueue: (deliveryId: string) => void;
+  accepting: (push: ChannelPush) => ChannelPush;
+} {
+  const hostSessionId = `transcript-${Math.random().toString(16).slice(2)}`;
+  const transcriptPath = path.join(dir, `${hostSessionId}.jsonl`);
+  writeFileSync(
+    transcriptPath,
+    `${JSON.stringify({ type: 'user', message: { content: 'hello' } })}\n`,
+  );
+  const appendEnqueue = (deliveryId: string): void => {
+    appendFileSync(
+      transcriptPath,
+      `${JSON.stringify({
+        type: 'queue-operation',
+        operation: 'enqueue',
+        timestamp: '2026-11-23T17:05:48.034Z',
+        sessionId: hostSessionId,
+        content: `<channel source="plugin:agentmonitors:agentmonitors" event_count="1" delivery_id="${deliveryId}">\n1. update\n</channel>`,
+      })}\n`,
+    );
+  };
+  return {
+    confirmer: createTranscriptConfirmer(hostSessionId, {
+      resolveTranscriptPath: () => transcriptPath,
+      boundMs: 1_500,
+      pollMs: 50,
+    }),
+    transcriptPath,
+    appendEnqueue,
+    accepting: (push) => async (claim, moreDeferred, deliveryId) => {
+      await push(claim, moreDeferred, deliveryId);
+      appendEnqueue(deliveryId);
+    },
+  };
+}
+
 describe('channel reserve → commit/release delivery cycle (issue #300)', () => {
   interface ChannelCycleFixture {
     ws: string;
@@ -12139,17 +12487,19 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     rmSync(f.ws, { recursive: true, force: true });
   }
 
-  it('successful push commits the claim: rows become claimed (surfaced), deduped from the hook path, still unacknowledged', async () => {
+  it('a push the host confirms commits the claim: rows become claimed (surfaced), deduped from the hook path, still unacknowledged (006 §4.5.2)', async () => {
     const f = await setupChannelCycle('ok');
     try {
+      const host = hostTranscript(f.ws);
       let pushed: unknown;
       const outcome = await runChannelDeliveryCycle(
         f.sessionId,
         f.socket,
-        (claim) => {
+        host.accepting((claim) => {
           pushed = claim;
           return Promise.resolve();
-        },
+        }),
+        host.confirmer,
       );
 
       expect(outcome).toBe('surfaced');
@@ -12167,11 +12517,99 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     }
   }, 30_000);
 
+  // Issue #535: a host that loads the channel server as a plain MCP server
+  // (no channel listener) resolves `notification()` normally and drops the
+  // event (006 §12.6), writing no `enqueue` entry. The push "succeeds", so the
+  // channel must not let that success hide the event from the hook path:
+  // duplicates are acceptable, silent loss is not.
+  it('a push the host silently drops (no enqueue entry) leaves the event claimable by the hook path (issue #535)', async () => {
+    const f = await setupChannelCycle('nolistener');
+    try {
+      const host = hostTranscript(f.ws);
+      // The push resolves, exactly as `mcp.notification()` does when the host
+      // never registered a channel listener — and the transcript gets nothing.
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        () => Promise.resolve(),
+        host.confirmer,
+      );
+
+      expect(outcome).toBe('unconfirmed');
+      expect(deliveryStateOf(f)).toBe('unread');
+      const hookClaim = await claimDeliveryClient(
+        f.sessionId,
+        'turn-interruptible',
+        f.socket,
+      );
+      expect(hookClaim).not.toBeNull();
+      expect(unreadCount(f)).toBe(1);
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  it('with no host evidence source, the channel reserves and pushes nothing and the hook path delivers (issue #535)', async () => {
+    const f = await setupChannelCycle('nosource');
+    try {
+      let pushes = 0;
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        () => {
+          pushes += 1;
+          return Promise.resolve();
+        },
+        createTranscriptConfirmer('nosource-session', {
+          resolveTranscriptPath: () => undefined,
+        }),
+      );
+
+      expect(outcome).toBe('no-confirmation-source');
+      expect(pushes).toBe(0);
+      expect(
+        await claimDeliveryClient(f.sessionId, 'turn-interruptible', f.socket),
+      ).not.toBeNull();
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
+  it('a confirmation that arrives after the bound is a duplicate, never a loss: the event was released to the hook path (issue #535, PP1)', async () => {
+    const f = await setupChannelCycle('late');
+    try {
+      const host = hostTranscript(f.ws);
+      let lateId = '';
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        (_claim, _more, deliveryId) => {
+          lateId = deliveryId;
+          return Promise.resolve();
+        },
+        host.confirmer,
+      );
+      expect(outcome).toBe('unconfirmed');
+      // The host records the enqueue only now, after the channel gave up.
+      host.appendEnqueue(lateId);
+
+      expect(deliveryStateOf(f)).toBe('unread');
+      expect(
+        await claimDeliveryClient(f.sessionId, 'turn-interruptible', f.socket),
+      ).not.toBeNull();
+    } finally {
+      await teardown(f);
+    }
+  }, 30_000);
+
   it('rejected push releases the reservation: the event stays unclaimed and the hook path still surfaces it (regression: pre-fix this was permanently consumed)', async () => {
     const f = await setupChannelCycle('reject');
     try {
-      const outcome = await runChannelDeliveryCycle(f.sessionId, f.socket, () =>
-        Promise.reject(new Error('MCP transport disconnected')),
+      const outcome = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        () => Promise.reject(new Error('MCP transport disconnected')),
+        hostTranscript(f.ws).confirmer,
       );
 
       expect(outcome).toBe('push-failed');
@@ -12195,17 +12633,24 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
     }
   }, 30_000);
 
-  it('retry after a rejected push: the next cycle re-reserves and commits the same delivery', async () => {
+  it('retry after a rejected push: the next cycle re-reserves and commits the same delivery once the host confirms it', async () => {
     const f = await setupChannelCycle('retry');
     try {
-      const failed = await runChannelDeliveryCycle(f.sessionId, f.socket, () =>
-        Promise.reject(new Error('MCP transport disconnected')),
+      const host = hostTranscript(f.ws);
+      const failed = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        () => Promise.reject(new Error('MCP transport disconnected')),
+        host.confirmer,
       );
       expect(failed).toBe('push-failed');
       expect(deliveryStateOf(f)).toBe('unread');
 
-      const retried = await runChannelDeliveryCycle(f.sessionId, f.socket, () =>
-        Promise.resolve(),
+      const retried = await runChannelDeliveryCycle(
+        f.sessionId,
+        f.socket,
+        host.accepting(() => Promise.resolve()),
+        host.confirmer,
       );
       expect(retried).toBe('surfaced');
       expect(deliveryStateOf(f)).toBe('claimed');
@@ -12221,16 +12666,18 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       // push, before commit). It must find nothing — the row is leased, so the
       // two transports cannot both surface it (006 §4.5).
       let concurrentClaim: unknown = 'unset';
+      const host = hostTranscript(f.ws);
       const outcome = await runChannelDeliveryCycle(
         f.sessionId,
         f.socket,
-        async () => {
+        host.accepting(async () => {
           concurrentClaim = await claimDeliveryClient(
             f.sessionId,
             'turn-interruptible',
             f.socket,
           );
-        },
+        }),
+        host.confirmer,
       );
 
       expect(outcome).toBe('surfaced');
@@ -12277,10 +12724,11 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
           };
         }[];
       } | null = null;
+      const host = hostTranscript(f.ws);
       const outcome = await runChannelDeliveryCycle(
         f.sessionId,
         f.socket,
-        async () => {
+        host.accepting(async () => {
           // The channel's reservation is held here (before commit) — the row
           // is leased, not claimed. `explainMonitor` must now distinguish it
           // from a truly claimed row: `reserved-in-flight`, claimedCount 0,
@@ -12315,7 +12763,8 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
             f.ws,
           );
           expect(ackAll.exitCode).toBe(0);
-        },
+        }),
+        host.confirmer,
       );
 
       expect(outcome).toBe('surfaced');
@@ -12487,14 +12936,20 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       let outcome: string | undefined;
       let renderedContent = '';
       const settleDeadline = Date.now() + 25_000;
+      const host = hostTranscript(ws);
       while (Date.now() < settleDeadline) {
-        outcome = await runChannelDeliveryCycle(sessionId, socket, (claim) => {
-          renderedContent = renderChannelEvent(claim, {
-            moreDeferred: false,
-            socketPath: socket,
-          }).content;
-          return Promise.resolve();
-        });
+        outcome = await runChannelDeliveryCycle(
+          sessionId,
+          socket,
+          host.accepting((claim) => {
+            renderedContent = renderChannelEvent(claim, {
+              moreDeferred: false,
+              socketPath: socket,
+            }).content;
+            return Promise.resolve();
+          }),
+          host.confirmer,
+        );
         if (outcome === 'surfaced') break;
         expect(outcome).toBe('idle'); // no other outcome is expected while polling
         await new Promise((resolve) => setTimeout(resolve, 500));
@@ -12522,10 +12977,15 @@ describe('channel reserve → commit/release delivery cycle (issue #300)', () =>
       // tail: the cycle goes idle, proving commit really did stick (not just
       // that a mock said so).
       let pushAfterCommitCallCount = 0;
-      const second = await runChannelDeliveryCycle(sessionId, socket, () => {
-        pushAfterCommitCallCount += 1;
-        return Promise.resolve();
-      });
+      const second = await runChannelDeliveryCycle(
+        sessionId,
+        socket,
+        () => {
+          pushAfterCommitCallCount += 1;
+          return Promise.resolve();
+        },
+        host.confirmer,
+      );
       expect(second).toBe('idle');
       expect(pushAfterCommitCallCount).toBe(0);
 

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { Command } from 'commander';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -10,7 +11,10 @@ import type {
   DeliveryEventSummary,
   DeliveryReservation,
 } from '@agentmonitors/core';
-import { claudeCodeAdapter } from '@agentmonitors/core';
+import {
+  CHANNEL_DELIVERY_ID_META_KEY,
+  claudeCodeAdapter,
+} from '@agentmonitors/core';
 import {
   acknowledgeEventsClient,
   commitDeliveryClient,
@@ -47,6 +51,11 @@ import {
   removeTransportHeartbeat,
   writeTransportHeartbeat,
 } from '../transport-heartbeat.js';
+import {
+  createTranscriptConfirmer,
+  type ChannelPushConfirmer,
+} from '../channel-push-confirmation.js';
+import { ChannelRoute } from '../channel-route.js';
 
 /** Poll interval used when `--poll-ms` is omitted. */
 const DEFAULT_POLL_MS = 3000;
@@ -155,21 +164,45 @@ export function resolveChannelSocketPath(
 export type ChannelDeliveryOutcome =
   /** Nothing pending to surface this poll. */
   | 'idle'
-  /** A claim was pushed and committed (surfaced, deduped from the hook path). */
+  /**
+   * No usable host evidence source for this session (006 §4.5.2), so nothing
+   * was reserved or pushed: a push that could never be confirmed would only be
+   * released again. The hook path delivers.
+   */
+  | 'no-confirmation-source'
+  /** The host confirmed the push and the claim was committed (deduped from the hook path). */
   | 'surfaced'
   /** A claim was reserved but the push rejected; the reservation was released. */
   | 'push-failed'
   /**
-   * The push was delivered, but the commit did not land: the reservation was
-   * already gone (its lease expired during a slow/hung push, or the daemon
-   * restarted and dropped its in-memory lease). The rows were never marked
-   * claimed, so they stay eligible for re-delivery via the hook path or the next
-   * poll. This makes channel delivery **at-least-once** in this rare window (a
-   * possible duplicate surface) — never at-most-once (a lost delivery), which is
-   * the safe direction. Distinct from `surfaced` so a caller never mistakes it
-   * for a committed claim.
+   * The push call resolved, but the host never confirmed it within the bound
+   * (006 §4.5.2) — typically a host that loaded the channel without a
+   * listener and dropped the event (006 §12.6). The reservation was released,
+   * so the rows return to pending and the hook path delivers them. If the host
+   * did surface it after all, the result is a duplicate, never a loss (PP1).
+   */
+  | 'unconfirmed'
+  /**
+   * The host confirmed the push, but the commit did not land: the reservation
+   * was already gone (the daemon restarted and dropped its in-memory lease, or
+   * the lease expired). The rows were never marked claimed, so they stay
+   * eligible for re-delivery via the hook path or the next poll. This makes
+   * channel delivery **at-least-once** in this rare window (a possible
+   * duplicate surface) — never at-most-once (a lost delivery), which is the
+   * safe direction. Distinct from `surfaced` so a caller never mistakes it for
+   * a committed claim.
    */
   | 'surfaced-uncommitted';
+
+/**
+ * Mint the identifier one push carries in its `delivery_id` meta (006
+ * §4.5.2). 128 random bits as lowercase hex: unique per push, and made only of
+ * characters no tag escaping can alter, so the host's rendered copy matches
+ * byte for byte.
+ */
+export function mintChannelDeliveryId(): string {
+  return randomBytes(16).toString('hex');
+}
 
 /**
  * Upper bound on how many times {@link reserveSizedChannelDelivery} will
@@ -441,60 +474,85 @@ export async function reserveSizedChannelDelivery(
 }
 
 /**
- * One reserve → push → commit/release delivery cycle for a bound session (006
- * §4, issue #300).
+ * One reserve → push → confirm → commit/release delivery cycle for a bound
+ * session (006 §4.5.1, §4.5.2; issues #300, #535).
  *
- * Reserves the pending `turn-interruptible` delivery — which leases the rows so
- * the hook transport will not double-surface them (006 §4.5) — pushes the claim
- * via `push`, and COMMITS the claim only after the push resolves. If `push`
- * rejects (an MCP disconnect/rejection), the reservation is RELEASED so the rows
- * stay unclaimed and re-deliver via the hook transport or the next poll — a
- * transient failure never consumes the delivery. The rows are never
- * acknowledged by this path (BP2); a committed claim only means "was surfaced".
+ * A resolved push is not evidence that anything surfaced: a host that loaded
+ * the channel server without a channel listener drops the event and still
+ * reports success (006 §12.6). The cycle therefore commits only on **host
+ * confirmation**:
+ *
+ * 1. Mint a delivery id and start a confirmation with `confirmer` BEFORE
+ *    reserving. If there is no confirmer, or it has no usable evidence source
+ *    for this session, nothing is reserved or pushed
+ *    (`'no-confirmation-source'`) — the hook path delivers.
+ * 2. Reserve the pending `turn-interruptible` delivery, which leases the rows
+ *    so the hook transport will not double-surface them (006 §4.5).
+ * 3. Push the claim with its delivery id. A rejected push RELEASES the
+ *    reservation (`'push-failed'`).
+ * 4. Wait for the host to confirm this push. Confirmed → COMMIT (the rows
+ *    become claimed, deduped from the hook path). Not confirmed within the
+ *    bound → RELEASE (`'unconfirmed'`): the rows return to pending and the
+ *    hook path delivers them. A late confirmation can at most duplicate a
+ *    delivery, never lose one (PP1).
+ *
+ * The rows are never acknowledged by this path (BP2); a committed claim only
+ * means "the host accepted it into the session".
  *
  * **Bounded reservation (006 §5.5, issue #442).** {@link
  * reserveSizedChannelDelivery} sizes (and, if the preview↔reserve race leaves
- * an oversized or mismatched claim, re-sizes) the reservation so the
- * reserved/claimed set is sized to what `push` will actually render — the
- * claimed set still equals the rendered set (006 §5.5) — and any settled-high
- * events that do not fit stay pending, re-delivering on a later poll. `push`
- * receives a second `moreDeferred` flag so the renderer can signpost that more
- * is pending.
+ * an oversized or mismatched claim, re-sizes) the reservation so the claimed
+ * set equals the rendered set; `push` receives `moreDeferred` so the renderer
+ * can signpost that more is pending.
  *
- * Reserve/commit/release IPC errors propagate to the caller (the poll loop maps
- * them to "daemon unreachable → drop the cached session"); a `push` rejection is
- * handled here (release + `'push-failed'`), not thrown. The `push` seam is what
- * the integration test injects to exercise the success and disconnect paths
- * without a live Claude Code MCP host (channels are research-preview, §4/§6).
+ * Reserve/commit IPC errors propagate to the caller (the poll loop maps them
+ * to "daemon unreachable → drop the cached session"); push rejection and
+ * missing confirmation are handled here, not thrown. Release after a failed or
+ * unconfirmed push is best-effort: if it also fails, the reservation
+ * self-expires. `push` and `confirmer` are the seams the tests inject to drive
+ * every path without a live Claude Code host.
  */
 export async function runChannelDeliveryCycle(
   boundSession: string,
   socketPath: string,
-  push: (claim: DeliveryClaim, moreDeferred: boolean) => Promise<void>,
+  push: (
+    claim: DeliveryClaim,
+    moreDeferred: boolean,
+    deliveryId: string,
+  ) => Promise<void>,
+  confirmer?: ChannelPushConfirmer,
 ): Promise<ChannelDeliveryOutcome> {
+  const deliveryId = mintChannelDeliveryId();
+  const pending = confirmer?.begin(deliveryId);
+  if (!pending) return 'no-confirmation-source';
+
   const sized = await reserveSizedChannelDelivery(boundSession, socketPath);
   if (!sized) return 'idle';
   const { reservation, moreDeferred } = sized;
-  try {
-    await push(reservation.claim, moreDeferred);
-  } catch {
-    // Push rejected/disconnected: release the reservation so the leased rows
-    // return to pending and re-deliver via the hook path or the next poll (006
-    // §4, issue #300). NEVER commit here — committing an unsurfaced claim is the
-    // delivery-loss bug this cycle exists to prevent. Release is best-effort: if
-    // it also fails (daemon unreachable), the reservation self-expires.
-    await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
+  const release = (): Promise<unknown> =>
+    releaseDeliveryClient(reservation.reservationId, socketPath).catch(
       () => undefined,
     );
+
+  try {
+    await push(reservation.claim, moreDeferred, deliveryId);
+  } catch {
+    // Push rejected/disconnected: NEVER commit — committing an unsurfaced
+    // claim is the delivery-loss bug this cycle exists to prevent.
+    await release();
     return 'push-failed';
   }
-  // Surfaced successfully: commit the claim now (the rows become claimed / "was
-  // surfaced", deduped from the hook transport — 006 §4.5). Claim is not ack (BP2).
-  // commit returns null when the reservation was already gone (lease expired
-  // during a slow/hung push, or the daemon restarted): the push already
-  // happened, but the rows were never claimed, so they stay eligible for
-  // re-delivery (at-least-once). Report that honestly rather than a false
-  // 'surfaced' — we must NOT claim success for a delivery that was not committed.
+
+  // A confirmer that throws has proven nothing: treat it as unconfirmed.
+  const confirmed = await pending.wait().catch(() => false);
+  if (!confirmed) {
+    await release();
+    return 'unconfirmed';
+  }
+
+  // commit returns null when the reservation was already gone (the daemon
+  // restarted, or the lease expired): the host has the event, but the rows were
+  // never claimed, so they stay eligible for re-delivery (at-least-once).
   const committed = await commitDeliveryClient(
     reservation.reservationId,
     socketPath,
@@ -676,6 +734,13 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   // Track the last delivery across refreshes: each write is a whole record, so
   // omitting this would erase a previously-reported delivery on the next poll.
   let lastDeliveryAt: Date | undefined;
+  // Whether this process's pushes are proven to reach the session (006
+  // §4.5.2). Reported in every heartbeat so `doctor`/`verify` can say
+  // confirmed / unproven from evidence rather than from "connected".
+  const route = new ChannelRoute();
+  // The Claude adapter's evidence source: the session transcript a hook
+  // recorded for this host session.
+  const confirmer = createTranscriptConfirmer(hostSessionId);
   // Set the instant EOF/shutdown begins (before the heartbeat record is
   // removed) and checked by every heartbeat write below. Without this, a poll
   // already in flight when EOF arrives settles AFTER the EOF handler removes
@@ -693,6 +758,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
       startedAt,
       ...(sessionId ? { sessionId } : {}),
       ...(lastDeliveryAt ? { lastDeliveryAt } : {}),
+      channelRoute: route.snapshot(),
     });
   };
   // Write immediately on startup, before the first poll: a channel server that
@@ -716,36 +782,66 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
   );
   heartbeatTimer.unref();
 
+  const recordOutcome = (outcome: ChannelDeliveryOutcome): void => {
+    switch (outcome) {
+      case 'idle':
+        return;
+      case 'no-confirmation-source':
+        route.noEvidenceSource();
+        return;
+      case 'push-failed':
+        route.unconfirmed('push-failed');
+        return;
+      case 'unconfirmed':
+        route.unconfirmed('unconfirmed-push');
+        process.stderr.write(
+          'agentmonitors channel: the host did not confirm a push; the hook path delivers for the rest of this channel process.\n',
+        );
+        return;
+      case 'surfaced':
+      case 'surfaced-uncommitted':
+        // Both mean the host confirmed it holds the event; only the durable
+        // claim differs.
+        lastDeliveryAt = new Date();
+        route.confirmed(lastDeliveryAt);
+        if (outcome === 'surfaced-uncommitted') {
+          // Rare: confirmed, but the reservation lapsed before commit, so the
+          // rows stay eligible for re-delivery (at-least-once). stdout is the
+          // JSON-RPC channel and must not be written to.
+          process.stderr.write(
+            'agentmonitors channel: push confirmed but commit did not land; rows remain eligible for re-delivery.\n',
+          );
+        }
+        return;
+    }
+  };
+
   const poll = async (): Promise<void> => {
     try {
       const boundSession = await resolveSession();
-      const outcome = await runChannelDeliveryCycle(
-        boundSession,
-        socketPath,
-        (claim, moreDeferred) => {
-          const { content, meta } = renderChannelEvent(claim, {
-            moreDeferred,
-            socketPath,
-          });
-          return mcp.notification({
-            method: 'notifications/claude/channel',
-            params: { content, meta },
-          });
-        },
-      );
-      if (outcome === 'surfaced' || outcome === 'surfaced-uncommitted') {
-        // Both outcomes mean the push actually reached the host; only the
-        // durable claim differs. `lastDelivery` answers "is this transport
-        // delivering", not "did the bookkeeping land", so both count.
-        lastDeliveryAt = new Date();
-      }
-      if (outcome === 'surfaced-uncommitted') {
-        // Rare: the push landed but the reservation lapsed before commit, so the
-        // rows stay eligible for re-delivery (at-least-once). Note it on stderr;
-        // stdout is the JSON-RPC channel and must not be written to.
-        process.stderr.write(
-          'agentmonitors channel: push delivered but commit did not land; rows remain eligible for re-delivery.\n',
+      // Unproven for the rest of this process after an unconfirmed push: the
+      // hook path delivers everything, exactly as in hooks-only mode (006
+      // §4.5.2), and nothing is reserved here.
+      if (route.canPush) {
+        const outcome = await runChannelDeliveryCycle(
+          boundSession,
+          socketPath,
+          (claim, moreDeferred, deliveryId) => {
+            const { content, meta } = renderChannelEvent(claim, {
+              moreDeferred,
+              socketPath,
+            });
+            return mcp.notification({
+              method: 'notifications/claude/channel',
+              params: {
+                content,
+                meta: { ...meta, [CHANNEL_DELIVERY_ID_META_KEY]: deliveryId },
+              },
+            });
+          },
+          confirmer,
         );
+        recordOutcome(outcome);
       }
     } catch {
       // Reserve/commit/release IPC failed → daemon unreachable / socket missing:

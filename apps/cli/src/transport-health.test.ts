@@ -35,6 +35,11 @@ const WORKSPACE = '/repos/agentmonitors';
 const SOCKET = '/data/agentmonitors/workspaces/abc123/agentmonitors.sock';
 const CLI_VERSION = '1.4.0';
 const HOST_SESSION = 'host-session-1';
+const CONFIRMED_ROUTE = {
+  state: 'confirmed',
+  evidence: 'confirmed-push',
+  lastConfirmedAt: '2026-07-19T11:59:50.000Z',
+} as const;
 
 function heartbeat(
   transport: TransportName,
@@ -55,6 +60,9 @@ function heartbeat(
     startedAt: '2026-07-19T11:00:00.000Z',
     updatedAt: '2026-07-19T11:59:55.000Z',
     ttlMs: CHANNEL_HEARTBEAT_TTL_MS,
+    // A healthy channel is one whose pushes the host has confirmed (006
+    // §4.5.2); the unproven states are constructed explicitly below.
+    ...(transport === 'channel' ? { channelRoute: CONFIRMED_ROUTE } : {}),
     ...overrides,
   };
 }
@@ -129,22 +137,109 @@ describe('computeTransportHealth', () => {
       expect(find(health.transports, 'channel').healthy).toBe(true);
     });
 
-    it('does not let the unprovable channel-registration caveat mark the channel unhealthy', () => {
-      // The host never tells the server whether its channel capability was
-      // honored, so this caveat is always present on a live channel. If it
-      // counted as a defect, a perfectly working channel would read as broken
-      // on every single run — the definition of crying wolf.
+    it('reports a host-confirmed channel route without any route problem (006 §4.5.2)', () => {
       const health = computeTransportHealth(input());
       const channel = find(health.transports, 'channel');
 
-      expect(codesOf(channel)).toContain('channel-registration-unverified');
-      expect(channel.healthy).toBe(true);
-      expect(health.deliverable).toBe(true);
-      expect(
-        channel.problems.find(
-          (problem) => problem.code === 'channel-registration-unverified',
-        )?.remediation,
-      ).toContain('--dangerously-load-development-channels');
+      expect(codesOf(channel)).not.toContain('channel-route-unproven');
+      expect(channel.route).toEqual({
+        state: 'confirmed',
+        evidence: 'confirmed-push',
+        lastConfirmedAt: '2026-07-19T11:59:50.000Z',
+      });
+      expect(find(health.transports, 'hook').route).toBeUndefined();
+    });
+  });
+
+  // Issue #535 / 006 §4.5.2: "connected" is not evidence. Only a push the host
+  // confirmed proves the channel reaches the session; until then the channel
+  // must not count as a listening method, and the hook path delivers.
+  describe('channel route unproven (issue #535)', () => {
+    const unprovenChannel = (
+      evidence:
+        | 'no-push-yet'
+        | 'no-transcript'
+        | 'unconfirmed-push'
+        | 'push-failed',
+    ) =>
+      heartbeat('channel', { channelRoute: { state: 'unproven', evidence } });
+
+    it.each([
+      'no-push-yet',
+      'no-transcript',
+      'unconfirmed-push',
+      'push-failed',
+    ] as const)(
+      'an unproven route (%s) is reported, disqualifies the channel, and leaves the hook path as the listening method',
+      (evidence) => {
+        const health = computeTransportHealth(
+          input({ heartbeats: [heartbeat('hook'), unprovenChannel(evidence)] }),
+        );
+        const channel = find(health.transports, 'channel');
+
+        expect(codesOf(channel)).toContain('channel-route-unproven');
+        expect(channel.healthy).toBe(false);
+        expect(channel.route).toEqual({ state: 'unproven', evidence });
+        expect(health.deliveryWillReachThisSession).toBe('hook');
+        // Hooks still listen, so this alone does not fail delivery.
+        expect(health.deliverable).toBe(true);
+      },
+    );
+
+    it('a host that did not confirm a push names the development-channels remedy', () => {
+      const health = computeTransportHealth(
+        input({
+          heartbeats: [heartbeat('hook'), unprovenChannel('unconfirmed-push')],
+        }),
+      );
+      const problem = find(health.transports, 'channel').problems.find(
+        (candidate) => candidate.code === 'channel-route-unproven',
+      );
+      expect(problem?.detail).toContain('the host did not confirm a push');
+      expect(problem?.detail).toContain('for the rest of this channel process');
+      expect(problem?.remediation).toContain(
+        '--dangerously-load-development-channels plugin:agentmonitors@agentmonitors',
+      );
+    });
+
+    it('a channel-only workspace with an unproven route has no proven listening method', () => {
+      const health = computeTransportHealth(
+        input({ heartbeats: [unprovenChannel('no-push-yet')] }),
+      );
+      expect(health.deliveryWillReachThisSession).toBe('none');
+      expect(health.deliverable).toBe(false);
+    });
+
+    it('a channel heartbeat from a build without host confirmation reads as unproven, never confirmed', () => {
+      const legacy = heartbeat('channel');
+      delete legacy.channelRoute;
+      const health = computeTransportHealth(
+        input({ heartbeats: [heartbeat('hook'), legacy] }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(channel.route).toEqual({
+        state: 'unproven',
+        evidence: 'unreported',
+      });
+      expect(codesOf(channel)).toContain('channel-route-unproven');
+      expect(health.deliveryWillReachThisSession).toBe('hook');
+    });
+
+    it('a stale channel is reported as stale, not additionally as unproven', () => {
+      const health = computeTransportHealth(
+        input({
+          heartbeats: [
+            heartbeat('hook'),
+            heartbeat('channel', {
+              updatedAt: '2026-07-19T11:00:00.000Z',
+              channelRoute: { state: 'unproven', evidence: 'no-push-yet' },
+            }),
+          ],
+        }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(codesOf(channel)).toContain('heartbeat-stale');
+      expect(codesOf(channel)).not.toContain('channel-route-unproven');
     });
   });
 
@@ -1210,7 +1305,7 @@ describe('computeTransportHealth', () => {
       // pre-upgrade version until the next prompt) — the exact cry-wolf
       // outcome issue #373 exists to prevent, and it directly contradicted the
       // hook remediation's own "No action needed" wording. This must behave
-      // like `channel-registration-unverified`: present, but never the reason
+      // like any advisory: present, but never the reason
       // a transport (or the overall verdict) is unhealthy/undeliverable.
       const health = computeTransportHealth(
         input({

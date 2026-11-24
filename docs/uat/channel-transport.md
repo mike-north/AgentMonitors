@@ -6,8 +6,9 @@ a headless test runner, and channels may be org-disabled entirely (006 §6). It 
 on **manual UAT**: a human (or an agent with a real Claude Code session) runs this recipe and
 records the result below. Run this recipe before treating the channel path as regression-safe, and
 whenever `apps/cli/src/commands/channel.ts`, `apps/cli/src/channel-ack.ts`,
-`apps/cli/src/channel-render.ts`, or the plugin's [`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json)
-change.
+`apps/cli/src/channel-render.ts`, `apps/cli/src/channel-push-confirmation.ts`,
+`libs/core/src/adapter/claude-transcript.ts`, or the plugin's
+[`.mcp.json`](../../agent-plugins/agentmonitors/.mcp.json) change.
 
 This complements, but does not replace, the automated coverage that already exists:
 
@@ -59,6 +60,7 @@ so it does not exercise the new precedence one way or the other).
 | 11–12 (ack)             | `agentmon_ack` acknowledges the event in-session and `events list` reflects the acknowledged state                                                                               | 006 §4.3                                      |
 | 12a–12c (push failure)  | A transient channel disconnect does **not** consume the delivery: the event stays `unread`/unclaimed and the hook path still surfaces it (reserve → release fallback)            | 006 §4.5.1 (issue #300)                       |
 | 13–16 (blocked channel) | With the MCP server disabled, hook delivery still occurs and the channel's absence is a silent no-op                                                                             | 006 §6 / NP-CH                                |
+| 17–22 (confirmation)    | Claude Code writes an `enqueue` transcript entry for a channel push only when the session registered a channel listener, and the channel commits only on that entry              | 006 §4.5.2 / §12.6 (issue #535)               |
 
 ## Prerequisites
 
@@ -154,11 +156,17 @@ servers, on top of the `CLAUDE_PROJECT_DIR`/`CLAUDE_CODE_SESSION_ID` it injects 
 now agree on `$SOCK` without editing the plugin's `.mcp.json`. **Launch Claude Code from this same
 shell** (the one that just ran `export`) so the environment variable is inherited.
 
-**4. Open a real Claude Code session in this project:**
+**4. Open a real Claude Code session in this project, with the channel registered:**
 
 ```bash
-claude
+claude --dangerously-load-development-channels plugin:agentmonitors@agentmonitors
 ```
+
+The flag (or the plugin being on the approved channel allowlist) is what makes Claude Code register
+the plugin's MCP server as a **channel**. Without it the server still connects, but the host drops
+every push, writes nothing to the transcript for it, and the channel never confirms a push — so
+steps 9–10 below would show the event delivered by the hook path instead (006 §4.5.2, §12.6). Part C
+checks exactly that difference.
 
 This fires the `SessionStart` hook (`agentmonitors session start`), which lazy-boots the daemon at
 `$SOCK` and registers the session (006 §5.6). It also causes Claude Code to spawn the plugin's
@@ -245,8 +253,9 @@ that exported `AGENTMONITORS_SOCKET`; if the workaround is **not** applied and t
 that is a genuine channel-transport regression (not the fixed #358) — capture the diagnostics in
 [Failure capture](#failure-capture) before filing.
 
-**9. Confirm the underlying rows are `claimed`, not `acknowledged`, by the push alone (BP2).** From
-the project directory:
+**9. Confirm the underlying rows are `claimed`, not `acknowledged`, by the confirmed push alone
+(BP2).** The channel commits the claim only after it finds the host's `enqueue` transcript entry for
+the push (006 §4.5.2), within ~5s of the push. From the project directory:
 
 ```bash
 agentmonitors events list --session <agentmon-session-id> --unread
@@ -406,6 +415,102 @@ agentmonitors daemon status --format json
 **Expected observation:** `"running": true`, a nonzero session/event count, no anomaly — the daemon
 and hook-state transport are completely unaffected by the missing channel.
 
+## Part C — host confirmation of a channel push (006 §4.5.2, issue #535)
+
+A channel push that resolves is not evidence: a host that loaded the channel server without a
+channel listener drops the event and still reports success (006 §12.6). The channel therefore
+commits a delivery only once Claude Code's session transcript shows a `queue-operation` entry with
+operation `enqueue` whose `<channel>` tag carries the push's `delivery_id`. This part checks the
+premise directly — **only a session with a registered channel writes that entry** — and then checks
+the channel's behaviour on both sides of it.
+
+Steps 17–19 use the standalone probe in
+[`apps/cli/test-fixtures/channel-enqueue-probe`](../../apps/cli/test-fixtures/channel-enqueue-probe/),
+so they need no daemon, monitor or plugin. Run A costs no model turn if you type nothing; run B
+costs one short turn, because the event wakes the idle session.
+
+**17. Point a scratch MCP config at the probe** (run from the repository root, so `$PWD` resolves
+the probe's absolute path):
+
+```bash
+PROBE_DIR="$(mktemp -d /tmp/am-probe.XXXXXX)"
+cat > "$PROBE_DIR/probe.mcp.json" << EOF
+{"mcpServers":{"amprobe":{"command":"node",
+  "args":["$PWD/apps/cli/test-fixtures/channel-enqueue-probe/channel-probe.mjs"],
+  "env":{"PROBE_LOG":"$PROBE_DIR/probe.log"}}}}
+EOF
+mkdir -p "$PROBE_DIR/a" "$PROBE_DIR/b"
+```
+
+**18. Run A — unflagged.** Start a session. The new folder first shows the workspace-trust dialog:
+accept it. Then type nothing, wait 10 seconds, and `/exit`:
+
+```bash
+cd "$PROBE_DIR/a" && claude --strict-mcp-config --mcp-config "$PROBE_DIR/probe.mcp.json"
+```
+
+**19. Run B — flagged.** The same, with the probe registered as a development channel:
+
+```bash
+cd "$PROBE_DIR/b" && claude --strict-mcp-config --mcp-config "$PROBE_DIR/probe.mcp.json" \
+  --dangerously-load-development-channels server:amprobe
+```
+
+Then look each run's id up across all transcripts. `probe.log` holds one `pushed delivery_id=<id>`
+line per run, in run order (A first). A dropped event never reaches the transcript, so its id
+appears nowhere:
+
+```bash
+cat "$PROBE_DIR/probe.log"
+for id in $(sed -n 's/.*pushed delivery_id=//p' "$PROBE_DIR/probe.log"); do
+  echo "== $id"
+  grep -rh --include='*.jsonl' "$id" ~/.claude/projects | grep '"type":"queue-operation"' \
+    || echo "(no queue-operation entry)"
+done
+```
+
+**Expected observation:**
+
+- **Run A:** `probe.log` shows the push, and its id prints `(no queue-operation entry)`: no
+  transcript holds an `enqueue` for it. The session shows no sign of the event.
+- **Run B:** its id prints **one** `{"type":"queue-operation","operation":"enqueue",…}` line whose
+  `content` begins `<channel source="amprobe" delivery_id="<id>">` (possibly followed by a
+  `remove` line for the same content). In the session the event arrives as a channel-origin turn
+  and Claude replies `probe seen`.
+
+**Failure mode:** if run A writes an `enqueue` entry for the id, the premise of 006 §4.5.2 is false
+for this Claude Code version: an unflagged session would confirm pushes it never surfaced. Stop and
+report it with the Claude Code version and both transcript lines. If run B writes nothing, check
+that channels are available on your plan and provider (006 §6) before treating it as a regression.
+
+**20. The plugin, unflagged.** In the Part A test project, start `claude` **without** the
+development-channels flag, then repeat steps 6–8 (trigger, wait, materialize). Within one poll plus
+~5s of the event settling:
+
+```bash
+agentmonitors events list --session <agentmon-session-id>
+agentmonitors doctor
+```
+
+**Expected observation:** the event stays `"deliveryState": "unread"` (the unconfirmed push was
+released, not committed); `doctor`'s `channel:` row ends with `route=unproven(unconfirmed-push)`,
+followed by `! [channel-route-unproven] … the host did not confirm a push …`; and the verdict
+delivers via `hook`. Submitting any prompt then surfaces the event through the `UserPromptSubmit`
+hook. The channel attempts no further pushes for the rest of that channel process.
+
+**21. The plugin, flagged.** Restart with the flag from step 4 and repeat steps 6–9.
+
+**Expected observation:** the event becomes `"deliveryState": "claimed"` within ~5s of the push,
+`doctor`'s `channel:` row ends with `route=confirmed(<ISO time>)` with no `[channel-route-unproven]`
+line, and step 10's replayed hook payload produces empty stdout (dedup).
+
+**22. `verify` stays out of it.** In either plugin session, from the Part A project
+(`~/am-channel-uat`, whose monitor is `watch-file`), run `agentmonitors verify watch-file`.
+
+**Expected observation:** after `PASS`, a line `Channel route: confirmed (…)` (flagged) or
+`Channel route: unproven (…)` (unflagged), ending `This pass does not by itself prove the channel
+route.` — verify proves delivery through an isolated session, never through the host channel.
+
 ## Failure capture
 
 When a step doesn't match its expected observation, capture these before filing:
@@ -444,9 +549,9 @@ session, end to end — has not yet been executed. With #358 fixed, whoever runs
 expect every step, including step 8's raw `<channel>` push, to pass as documented **without**
 applying step 3's now-optional workaround — that is the clean run that confirms the fix.
 
-| Date | Claude Code version | `agentmonitors` CLI version | Plugin version | Step 1–4 (setup) | Step 5–9 (push) | Step 10 (dedup) | Step 11–12 (ack) | Step 12a–12c (push failure) | Step 13–16 (blocked channel) | Notes |
-| ---- | ------------------- | --------------------------- | -------------- | ---------------- | --------------- | --------------- | ---------------- | --------------------------- | ---------------------------- | ----- |
-|      |                     |                             |                |                  |                 |                 |                  |                             |                              |       |
+| Date | Claude Code version | `agentmonitors` CLI version | Plugin version | Step 1–4 (setup) | Step 5–9 (push) | Step 10 (dedup) | Step 11–12 (ack) | Step 12a–12c (push failure) | Step 13–16 (blocked channel) | Step 17–19 (probe A/B) | Step 20–22 (confirmation) | Notes |
+| ---- | ------------------- | --------------------------- | -------------- | ---------------- | --------------- | --------------- | ---------------- | --------------------------- | ---------------------------- | ---------------------- | ------------------------- | ----- |
+|      |                     |                             |                |                  |                 |                 |                  |                             |                              |                        |                           |       |
 
 Fill one row per run. Record pass/fail per step group (not just overall), the exact
 `agentmonitors --version` and Claude Code version, and the plugin version from

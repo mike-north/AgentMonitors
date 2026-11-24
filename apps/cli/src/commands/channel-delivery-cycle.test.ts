@@ -32,6 +32,7 @@ import {
   reserveSizedChannelDelivery,
   runChannelDeliveryCycle,
 } from './channel.js';
+import type { ChannelPushConfirmer } from '../channel-push-confirmation.js';
 import {
   buildChannelTruncatedMarker,
   CHANNEL_DEFERRED_MARKER,
@@ -69,6 +70,20 @@ const RESERVATION: DeliveryReservation = {
 
 const okPush = () => Promise.resolve();
 
+/**
+ * A host that confirms every push (006 §4.5.2). The confirmation seam is what
+ * these branching tests hold constant; the transcript reader itself is
+ * covered in `channel-push-confirmation.test.ts` and end to end in the
+ * integration suite.
+ */
+const confirming: ChannelPushConfirmer = {
+  begin: () => ({ wait: () => Promise.resolve(true) }),
+};
+/** A host that never confirms: the push resolves, no evidence appears. */
+const neverConfirming: ChannelPushConfirmer = {
+  begin: () => ({ wait: () => Promise.resolve(false) }),
+};
+
 function makeEvent(
   overrides: Partial<DeliveryEventSummary> = {},
 ): DeliveryEventSummary {
@@ -102,7 +117,12 @@ describe('runChannelDeliveryCycle branching (issue #300)', () => {
     reserveMock.mockResolvedValue(null);
     const push = vi.fn(okPush);
 
-    const outcome = await runChannelDeliveryCycle('session-1', '/sock', push);
+    const outcome = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      push,
+      confirming,
+    );
 
     expect(outcome).toBe('idle');
     expect(push).not.toHaveBeenCalled();
@@ -110,23 +130,33 @@ describe('runChannelDeliveryCycle branching (issue #300)', () => {
     expect(releaseMock).not.toHaveBeenCalled();
   });
 
-  it('commits after a successful push and reports "surfaced"', async () => {
+  it('commits after a host-confirmed push and reports "surfaced"', async () => {
     reserveMock.mockResolvedValue(RESERVATION);
     commitMock.mockResolvedValue(CLAIM);
 
-    const outcome = await runChannelDeliveryCycle('session-1', '/sock', okPush);
+    const outcome = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      okPush,
+      confirming,
+    );
 
     expect(outcome).toBe('surfaced');
     expect(commitMock).toHaveBeenCalledWith('r-1', '/sock');
     expect(releaseMock).not.toHaveBeenCalled();
   });
 
-  it('reports "surfaced-uncommitted" when the push succeeded but commit returned null (does NOT claim success)', async () => {
+  it('reports "surfaced-uncommitted" when the push was confirmed but commit returned null (does NOT claim success)', async () => {
     reserveMock.mockResolvedValue(RESERVATION);
     // Reservation lapsed/daemon restarted → commit finds nothing to commit.
     commitMock.mockResolvedValue(null);
 
-    const outcome = await runChannelDeliveryCycle('session-1', '/sock', okPush);
+    const outcome = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      okPush,
+      confirming,
+    );
 
     expect(outcome).toBe('surfaced-uncommitted');
     expect(commitMock).toHaveBeenCalledWith('r-1', '/sock');
@@ -140,7 +170,12 @@ describe('runChannelDeliveryCycle branching (issue #300)', () => {
     releaseMock.mockResolvedValue(undefined);
     const push = vi.fn(() => Promise.reject(new Error('MCP disconnected')));
 
-    const outcome = await runChannelDeliveryCycle('session-1', '/sock', push);
+    const outcome = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      push,
+      confirming,
+    );
 
     expect(outcome).toBe('push-failed');
     expect(releaseMock).toHaveBeenCalledWith('r-1', '/sock');
@@ -156,15 +191,84 @@ describe('runChannelDeliveryCycle branching (issue #300)', () => {
     // The reservation self-expires if release can't reach the daemon; the cycle
     // must not throw out of the poll on this path.
     await expect(
-      runChannelDeliveryCycle('session-1', '/sock', push),
+      runChannelDeliveryCycle('session-1', '/sock', push, confirming),
     ).resolves.toBe('push-failed');
+  });
+
+  // Issue #535: a resolved push is not evidence (006 §12.6). Without host
+  // confirmation the reservation is released, never committed.
+  it('releases and reports "unconfirmed" when the push resolves but the host never confirms it (issue #535)', async () => {
+    reserveMock.mockResolvedValue(RESERVATION);
+    releaseMock.mockResolvedValue(undefined);
+
+    const outcome = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      okPush,
+      neverConfirming,
+    );
+
+    expect(outcome).toBe('unconfirmed');
+    expect(releaseMock).toHaveBeenCalledWith('r-1', '/sock');
+    expect(commitMock).not.toHaveBeenCalled();
+  });
+
+  it('treats a confirmation that throws as unconfirmed (issue #535)', async () => {
+    reserveMock.mockResolvedValue(RESERVATION);
+    releaseMock.mockResolvedValue(undefined);
+    const throwing: ChannelPushConfirmer = {
+      begin: () => ({ wait: () => Promise.reject(new Error('EIO')) }),
+    };
+
+    await expect(
+      runChannelDeliveryCycle('session-1', '/sock', okPush, throwing),
+    ).resolves.toBe('unconfirmed');
+    expect(commitMock).not.toHaveBeenCalled();
+  });
+
+  it('reserves and pushes nothing without a usable evidence source (issue #535)', async () => {
+    const push = vi.fn(okPush);
+    const noSource: ChannelPushConfirmer = { begin: () => undefined };
+
+    expect(
+      await runChannelDeliveryCycle('session-1', '/sock', push, noSource),
+    ).toBe('no-confirmation-source');
+    expect(await runChannelDeliveryCycle('session-1', '/sock', push)).toBe(
+      'no-confirmation-source',
+    );
+    expect(reserveMock).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+  });
+
+  it('pushes a fresh lowercase-hex delivery id each cycle, the same one the confirmation waits for (006 §4.5.2)', async () => {
+    reserveMock.mockResolvedValue(RESERVATION);
+    commitMock.mockResolvedValue(CLAIM);
+    const begun: string[] = [];
+    const pushed: string[] = [];
+    const recording: ChannelPushConfirmer = {
+      begin: (id) => {
+        begun.push(id);
+        return { wait: () => Promise.resolve(true) };
+      },
+    };
+    const push = (_claim: DeliveryClaim, _more: boolean, id: string) => {
+      pushed.push(id);
+      return Promise.resolve();
+    };
+
+    await runChannelDeliveryCycle('session-1', '/sock', push, recording);
+    await runChannelDeliveryCycle('session-1', '/sock', push, recording);
+
+    expect(pushed).toEqual(begun);
+    expect(pushed[0]).toMatch(/^[0-9a-f]{32}$/);
+    expect(pushed[0]).not.toBe(pushed[1]);
   });
 
   it('propagates a reserve IPC failure (poll loop maps it to a dropped session)', async () => {
     reserveMock.mockRejectedValue(new Error('daemon unreachable'));
 
     await expect(
-      runChannelDeliveryCycle('session-1', '/sock', okPush),
+      runChannelDeliveryCycle('session-1', '/sock', okPush, confirming),
     ).rejects.toThrow('daemon unreachable');
   });
 });
@@ -220,7 +324,12 @@ describe('runChannelDeliveryCycle bounded reservation (006 §5.5, issue #442)', 
       return Promise.resolve();
     };
 
-    const first = await runChannelDeliveryCycle('session-1', '/sock', push);
+    const first = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      push,
+      confirming,
+    );
 
     expect(first).toBe('surfaced');
     // Sized to 2, not 3: the third block did not fit under the ceiling.
@@ -248,7 +357,12 @@ describe('runChannelDeliveryCycle bounded reservation (006 §5.5, issue #442)', 
     });
     commitMock.mockResolvedValueOnce(secondClaim);
 
-    const second = await runChannelDeliveryCycle('session-1', '/sock', push);
+    const second = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      push,
+      confirming,
+    );
 
     expect(second).toBe('surfaced');
     // The single remaining event fits alone → reserved in full, nothing left
@@ -269,7 +383,12 @@ describe('runChannelDeliveryCycle bounded reservation (006 §5.5, issue #442)', 
     reserveMock.mockResolvedValueOnce(RESERVATION);
     commitMock.mockResolvedValueOnce(CLAIM);
 
-    const outcome = await runChannelDeliveryCycle('session-1', '/sock', okPush);
+    const outcome = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      okPush,
+      confirming,
+    );
 
     expect(outcome).toBe('surfaced');
     expect(reserveMock).toHaveBeenCalledWith(
@@ -797,7 +916,7 @@ describe('reserveSizedChannelDelivery mismatch-release failure propagation (issu
     const push = vi.fn(okPush);
 
     await expect(
-      runChannelDeliveryCycle('session-1', '/sock', push),
+      runChannelDeliveryCycle('session-1', '/sock', push, confirming),
     ).rejects.toThrow('daemon unreachable');
 
     expect(push).not.toHaveBeenCalled();
@@ -847,7 +966,12 @@ describe('runChannelDeliveryCycle oversized single-event commit (issue #442, rou
       return Promise.resolve();
     };
 
-    const first = await runChannelDeliveryCycle('session-1', '/sock', push);
+    const first = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      push,
+      confirming,
+    );
 
     expect(first).toBe('surfaced');
     expect(commitMock).toHaveBeenCalledWith('r-huge', '/sock');
@@ -871,7 +995,12 @@ describe('runChannelDeliveryCycle oversized single-event commit (issue #442, rou
     reserveMock.mockResolvedValueOnce(null);
     const push2 = vi.fn(okPush);
 
-    const second = await runChannelDeliveryCycle('session-1', '/sock', push2);
+    const second = await runChannelDeliveryCycle(
+      'session-1',
+      '/sock',
+      push2,
+      confirming,
+    );
 
     // The omitted tail does NOT surface on this later poll: the cycle is
     // idle, not "surfaced" again.
@@ -1065,7 +1194,7 @@ describe('reserveSizedChannelDelivery post-reservation preview failure (issue #4
     const push = vi.fn(okPush);
 
     await expect(
-      runChannelDeliveryCycle('session-1', '/sock', push),
+      runChannelDeliveryCycle('session-1', '/sock', push, confirming),
     ).rejects.toThrow('daemon unreachable');
 
     expect(push).not.toHaveBeenCalled();

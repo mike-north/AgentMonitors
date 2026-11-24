@@ -16,6 +16,11 @@ export interface HookPayload {
   hook_event_name?: string;
   /** Workspace path for this invocation. */
   cwd?: string;
+  /**
+   * Absolute path of the session's transcript. Recorded (path only) as the
+   * channel's confirmation source (006 §4.5.2); its contents are never read here.
+   */
+  transcript_path?: string;
 }
 
 /**
@@ -71,6 +76,8 @@ export async function readHookPayload(): Promise<HookPayload> {
     if (eventName !== undefined) payload.hook_event_name = eventName;
     const cwd = pickString('cwd');
     if (cwd !== undefined) payload.cwd = cwd;
+    const transcriptPath = pickString('transcript_path');
+    if (transcriptPath !== undefined) payload.transcript_path = transcriptPath;
     return payload;
   } catch {
     return {};

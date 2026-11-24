@@ -161,6 +161,21 @@ export type ChangeDetectionStrategy = 'json-diff' | 'text-diff' | 'exit-code' | 
 export type ChangeKind = 'created' | 'modified' | 'deleted' | 'descoped';
 
 // @public
+export const CHANNEL_DELIVERY_ID_META_KEY = "delivery_id";
+
+// @public
+export interface ChannelPushConfirmationQuery {
+    deliveryId: string;
+    hostSessionId: string;
+}
+
+// @public
+export interface ChannelPushScanResult {
+    confirmed: boolean;
+    consumedBytes: number;
+}
+
+// @public
 export interface ChildProcessHandle {
     readonly exitCode: number | null;
     // (undocumented)
@@ -744,7 +759,13 @@ export type InterpretResult = {
 export function invalidTimezoneError(watchConfig: Record<string, unknown>, scopeSchema: JsonSchema): string | undefined;
 
 // @public
+export function isChannelDeliveryId(value: string): boolean;
+
+// @public
 export function isChildUnreaped(handle: ChildProcessHandle): boolean;
+
+// @public
+export function isClaudeTranscriptPathForSession(transcriptPath: string, hostSessionId: string): boolean;
 
 // @public
 export function isErrnoException(error: unknown): error is NodeJS.ErrnoException;
@@ -1776,6 +1797,9 @@ export interface RuntimeTickResult {
     // (undocumented)
     skippedMonitors: SkippedMonitor[];
 }
+
+// @public
+export function scanClaudeTranscriptForChannelPush(appended: Uint8Array, query: ChannelPushConfirmationQuery): ChannelPushScanResult;
 
 // @public
 export function scanMonitors(baseDir: string): Promise<ScanResult>;

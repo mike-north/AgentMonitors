@@ -44,8 +44,8 @@ describe('readHookPayload', () => {
           session_id: 's1',
           hook_event_name: 'UserPromptSubmit',
           cwd: '/ws',
-          // extra fields the CLI does not consume are ignored
           transcript_path: '/t.jsonl',
+          // extra fields the CLI does not consume are ignored
           tool_name: 'Bash',
         }),
       ),
@@ -54,7 +54,17 @@ describe('readHookPayload', () => {
       session_id: 's1',
       hook_event_name: 'UserPromptSubmit',
       cwd: '/ws',
+      // The channel's confirmation source (006 §4.5.2).
+      transcript_path: '/t.jsonl',
     });
+  });
+
+  it('drops a non-string transcript_path', async () => {
+    setStdin(
+      pipedStdin(JSON.stringify({ session_id: 's1', transcript_path: 42 })),
+    );
+    const payload = await readHookPayload();
+    expect(payload.transcript_path).toBeUndefined();
   });
 
   it('drops a non-string session_id (trust-boundary guard)', async () => {

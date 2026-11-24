@@ -9,6 +9,41 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — Channel commits only host-confirmed pushes (006 §4.2, §4.5, §4.5.1, §4.5.2, §12.4, §12.6; 005 §10.4, §12.2, §13, §15, §16; 002 §7) — Refs #535
+
+A channel push call that resolves is not evidence that anything surfaced. A session started
+without a channel listener drops the event, and the channel still marked the rows claimed, so the
+hook path skipped them as cross-transport duplicates and the events never reached the agent.
+
+- **006 §4.5.2 (new, current).** Each push carries a fresh `delivery_id` (§4.2). The channel
+  commits only once the Claude Code session transcript shows a `queue-operation` `enqueue` entry
+  whose `<channel>` tag carries that identifier, appended after the push and within 5 seconds.
+  Otherwise it releases the rows to the hook path. Reading is read-only, limited to bytes appended
+  since the push, capped at 8 MiB and never stores or logs content; the parsing lives in the Claude
+  adapter. A model-facing probe is ruled out. §4.5 and §4.5.1 step 3 now commit on confirmation,
+  not on a resolved push.
+- **Route state.** After an unconfirmed or failed push the channel stops pushing for the rest of
+  its process; released rows are re-delivered by the hook path, not by a later channel poll (§4.5.1).
+  With no recorded transcript location it does not push. The heartbeat reports the route
+  (`channelRoute`).
+- **Transcript location record.** It is pruned 14 days after its `observedAt`. An unchanged report
+  refreshes `observedAt` hourly, so a long-lived session keeps its record. The transcript is opened
+  without blocking, so a FIFO swapped over it reads as unconfirmed.
+- **005.** `session start` and `hook deliver` record the hook payload's `transcript_path` (path only).
+  `doctor`'s `channel-route-unproven` replaces the `channel-registration-unverified` advisory: an
+  unproven channel is not a listening method, but it does not fail its own check (the verdict
+  fails if nothing else listens). Channel rows gain a `route=` token and JSON `route`. `verify`
+  ends with a `Channel route:` line and JSON `channelRoute`, and says a pass does not by itself
+  prove the channel route.
+- **006 §12.6** no longer describes the registration gap as an unverifiable advisory with a future
+  probe; it points at §4.5.2.
+- **Supersedes the #535 target text** in the "confirmed channel commits (target)" entry below.
+  §4.5.2 is current. With no recorded transcript location, the channel does not push, rather than
+  releasing an unconfirmed push. A failed push, or losing the evidence after a confirmed push,
+  also marks the route unproven. Roadmap G22 no longer lists #535. 002 §7 states that only a
+  confirmed push writes `firstNotifiedAt` and `lastClaimAt`. 005 counts
+  `channel-session-unmatched` as the second advisory code, after `version-skew`.
+
 ## 2026-11-23 — Per-recipient cursors never move backward (002 §1.1.2, §7, §15) — Refs #298
 
 A claim advanced the recipient's object cursor to the newest event in that claim, even when an

@@ -414,6 +414,36 @@ describe('isTransportHeartbeat', () => {
   it('rejects a non-string optional field rather than ignoring it', () => {
     expect(isTransportHeartbeat({ ...valid, hostSessionId: 7 })).toBe(false);
   });
+
+  // 006 §4.5.2: the channel route is evidence `doctor` reports, so a malformed
+  // one must not pass as a valid record (it could read as "confirmed").
+  it('accepts a well-formed channel route and rejects a malformed one', () => {
+    const channel = { ...valid, transport: 'channel' };
+    expect(
+      isTransportHeartbeat({
+        ...channel,
+        channelRoute: {
+          state: 'confirmed',
+          evidence: 'confirmed-push',
+          lastConfirmedAt: '2026-07-19T00:00:00.000Z',
+        },
+      }),
+    ).toBe(true);
+    expect(
+      isTransportHeartbeat({
+        ...channel,
+        channelRoute: { state: 'unproven', evidence: 'unconfirmed-push' },
+      }),
+    ).toBe(true);
+    for (const channelRoute of [
+      'confirmed',
+      { state: 'maybe', evidence: 'no-push-yet' },
+      { state: 'confirmed', evidence: 'trust-me' },
+      { state: 'confirmed', evidence: 'confirmed-push', lastConfirmedAt: 1 },
+    ]) {
+      expect(isTransportHeartbeat({ ...channel, channelRoute })).toBe(false);
+    }
+  });
 });
 
 describe('writeTransportHeartbeat lastDeliveryAt merge (issue #425 review)', () => {

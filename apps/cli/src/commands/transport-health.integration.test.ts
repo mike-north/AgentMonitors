@@ -7,6 +7,8 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
+  readdirSync,
   rmSync,
   renameSync,
   writeFileSync,
@@ -1202,4 +1204,173 @@ This monitor fires on a schedule.
       await daemon.waitForExit();
     }
   }, 30_000);
+
+  // --- Channel route from host evidence (006 §4.5.2, issue #535) ------------
+  // "Connected" is not evidence: a channel counts as a listening method only
+  // once the host confirmed one of its pushes. These drive the real `doctor`
+  // against the route a channel heartbeat reports.
+  it('reports an unproven channel route as its own problem and delivers via hook (issue #535)', async () => {
+    const fixture = transportFixture('route-unproven');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      openLeadSession(fixture);
+      seedHeartbeat(fixture, 'hook');
+      seedHeartbeat(fixture, 'channel', {
+        channelRoute: { state: 'unproven', evidence: 'unconfirmed-push' },
+      });
+
+      const text = runWithEnv(
+        ['doctor', '--workspace', fixture.dir],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(text.stdout).toContain('route=unproven(unconfirmed-push)');
+      expect(text.stdout).toContain('[channel-route-unproven]');
+      expect(text.stdout).toContain('the host did not confirm a push');
+      expect(text.stdout).toContain(
+        '--dangerously-load-development-channels plugin:agentmonitors@agentmonitors',
+      );
+      expect(text.stdout).toContain(
+        'delivery to active sessions in this workspace → via hook',
+      );
+      expect(text.stdout).not.toContain('channel-registration-unverified');
+      // The hook path listens, so an unproven channel alone does not fail
+      // doctor: the channel row passes with a note, and nothing else fails.
+      expect(text.stdout).not.toContain('NOT deliverable');
+      expect(text.stdout).toContain('✓ transport:channel');
+      expect(text.stdout).toContain(
+        'route unproven, so not counted as listening',
+      );
+      expect(text.stdout).not.toContain('✗ transport:channel');
+      expect(text.exitCode).toBe(0);
+
+      const json = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      const payload = JSON.parse(json.stdout) as {
+        transports: {
+          name: string;
+          healthy: boolean;
+          route?: { state: string; evidence: string };
+        }[];
+        deliveryWillReachThisSession: string;
+      };
+      const channel = payload.transports.find((t) => t.name === 'channel');
+      expect(channel?.route).toEqual({
+        state: 'unproven',
+        evidence: 'unconfirmed-push',
+      });
+      expect(channel?.healthy).toBe(false);
+      expect(payload.deliveryWillReachThisSession).toBe('hook');
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  it('fails the delivery verdict when an unproven channel is the only transport (issue #535)', async () => {
+    const fixture = transportFixture('route-unproven-alone');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      openLeadSession(fixture);
+      seedHeartbeat(fixture, 'channel', {
+        channelRoute: { state: 'unproven', evidence: 'unconfirmed-push' },
+      });
+
+      const result = runWithEnv(
+        ['doctor', '--workspace', fixture.dir],
+        fixture.env,
+        fixture.dir,
+      );
+      // Nothing proven listens, so nothing reaches the session: the verdict
+      // says so, even though the channel row itself is not the failure.
+      expect(result.stdout).toContain(
+        'delivery to active sessions in this workspace → via none',
+      );
+      expect(result.stdout).toContain('✗ delivery-verdict');
+      expect(result.exitCode).toBe(1);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  it('reports a host-confirmed channel route and counts the channel as listening (issue #535)', async () => {
+    const fixture = transportFixture('route-confirmed');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      openLeadSession(fixture);
+      seedHeartbeat(fixture, 'hook');
+      const confirmedAt = '2026-11-23T17:05:48.034Z';
+      seedHeartbeat(fixture, 'channel', {
+        channelRoute: {
+          state: 'confirmed',
+          evidence: 'confirmed-push',
+          lastConfirmedAt: confirmedAt,
+        },
+      });
+
+      const text = runWithEnv(
+        ['doctor', '--workspace', fixture.dir],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(text.stdout).toContain(`route=confirmed(${confirmedAt})`);
+      expect(text.stdout).not.toContain('[channel-route-unproven]');
+      expect(text.stdout).toContain(
+        'delivery to active sessions in this workspace → via both',
+      );
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
+  it('`hook deliver` records the session transcript path (path only) as the channel confirmation source (issue #535)', () => {
+    const fixture = transportFixture('evidence-record');
+    const hostSessionId = 'evidence-record-session';
+    const transcriptPath = path.join(fixture.dir, `${hostSessionId}.jsonl`);
+    writeFileSync(transcriptPath, '{"type":"user","secret":"do-not-copy"}\n');
+
+    const deliver = runWithStdin(
+      ['hook', 'deliver'],
+      fixture.env,
+      JSON.stringify({
+        session_id: hostSessionId,
+        hook_event_name: 'UserPromptSubmit',
+        cwd: fixture.dir,
+        transcript_path: transcriptPath,
+      }),
+      fixture.dir,
+    );
+    expect(deliver.exitCode).toBe(0);
+
+    const dir = path.join(fixture.dataHome, 'agentmonitors', 'host-evidence');
+    const files = readdirSync(dir);
+    expect(files).toHaveLength(1);
+    const stored = readFileSync(path.join(dir, files[0] ?? ''), 'utf-8');
+    expect(JSON.parse(stored)).toMatchObject({
+      hostSessionId,
+      transcriptPath,
+    });
+    // Nothing from the transcript itself is copied.
+    expect(stored).not.toContain('do-not-copy');
+  });
 });
