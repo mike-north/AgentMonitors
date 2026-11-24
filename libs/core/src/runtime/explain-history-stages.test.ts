@@ -181,6 +181,8 @@ Handle it.
         )
         .run(MONITOR_ID, root, Math.ceil(clockTime / 1_000) + 1);
     },
+    /** Test-only native SQL, used to install and clear history-write faults. */
+    exec: (sql: string) => client.exec(sql),
     /** Remove the fault {@link failSummary} installed for `summary`. */
     repairSummary(summary: string) {
       client.exec(`DROP TRIGGER fail_${summary}`);
@@ -433,6 +435,46 @@ describe('explain attributes history rows to the stage that owns them (#591)', (
     // records a drain report; the source is not called.
     await f.tick();
     expect(f.oldestRetry()?.attemptCount).toBe(1);
+
+    const report = await f.explain();
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'failure',
+      reason: 'Source observation failed: upstream is down',
+    });
+  });
+
+  it('the span that retained work is not read as a source failure after an attempt changes its last error', async () => {
+    const f = fixture([[obs('A')], [obs('B')]]);
+    await retainA(f);
+    // The next attempt fails differently, so the retry's last error no longer
+    // matches the span's own row, and no unmarked `errored` row precedes it.
+    f.repairSummary('A');
+    f.failSummary('A', 'A write failed differently');
+    await f.tick();
+    expect(f.oldestRetry()?.attemptCount).toBe(1);
+
+    const report = await f.explain();
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'ok',
+      reason: RETAINED_WORK_PAUSE,
+    });
+  });
+
+  it('a source failure in the retaining tick fails Observation when the flush could not record its own failure', async () => {
+    const f = fixture(
+      [[obs('A')], new Error('upstream is down')],
+      'notify:\n  strategy: debounce\n  settle-for: 10s\n',
+    );
+    await f.tick(2_000);
+    f.failSummary('A');
+    // The flush's `errored` row is best-effort (002 §2): make it fail, so the
+    // source's row is the retaining tick's only row.
+    f.exec(`CREATE TRIGGER drop_flush_row BEFORE INSERT ON observation_history
+      WHEN json_extract(NEW.observation_data, '$.error') = 'A write failed'
+      BEGIN SELECT RAISE(ABORT, 'history write failed'); END;`);
+    await f.tick(30_000);
+    f.exec('DROP TRIGGER drop_flush_row');
+    expect(f.oldestRetry()?.attemptCount).toBe(0);
 
     const report = await f.explain();
     expect(stage(report, 'observation')).toMatchObject({

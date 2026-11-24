@@ -1143,11 +1143,14 @@ function isUnmarkedErrored(entry: ClassifiedHistoryRow | undefined): boolean {
  *
  * - its error is a retry's recorded last error: the span stores the failure
  *   both as that row and as the initial last error of the retry it queued; or
- * - otherwise, every retry was attempted (replacing that last error) and the
+ * - otherwise, the oldest retry was attempted (replacing that last error) and the
  *   row is not directly preceded by another unmarked `errored` row, which is
  *   how 002 §2.6 orders the flush's failure and the source's.
  *
- * Only rows in the explained history window are read.
+ * Only rows in the explained history window are read. A source failure whose
+ * error, under the safe-text rule, equals a retry's last error reads as the
+ * span's own failure, and so as the pause; 005 §6 lists this and the other
+ * limits of reading these unmarked rows.
  */
 function retainingTickSourceFailure(
   history: readonly ClassifiedHistoryRow[],
