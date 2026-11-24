@@ -764,6 +764,72 @@ The real-CLI/live-daemon cases in
 `apps/cli/src/commands/held-notify.integration.test.ts` enforce this outcome and
 rejected-definition debounce/rollup text/JSON parity.
 
+**Which history rows each stage reads (current, #591).** History holds more than source
+outcomes: lost observations (002 §2) and the retained-work drain's reports (002 §2.7) are
+`errored` rows too, though no source call failed. Explain classifies every row in the
+`--history-limit` window once, by what it records, and each stage reads only the kinds it owns:
+
+| Kind               | Rows                                                                                                                                              | Read by                                 |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| source outcome     | `triggered` with observations, `suppressed`, `no-change`, `no-files-matched`, `rebaselined`, and any `errored` row with none of the markers below | Observation                             |
+| released work      | `triggered` with `observed: 0`: held work flushed, or retained work drained, with no new source input (002 §2.6, §2.7)                            | Observation (`ok`)                      |
+| admission loss     | `errored` with `notRetained: true` or `holdRefused: true` (002 §2, §4.7)                                                                          | Materialization, as an outstanding drop |
+| skipped-retry loss | `errored` with `skipped: true` (002 §2.7)                                                                                                         | Materialization, as an outstanding drop |
+| retry drain        | `errored` whose error starts `Materialization retry <id>` followed by `failed: `, `could not be discarded ` or `stopped after ` (002 §2.7)        | Materialization, as retained work       |
+| unrecognized       | any other `result`                                                                                                                                | no stage                                |
+
+Materialization reads its kinds through the store's outstanding-drop query and the retry outbox,
+not through the window, so a loss stays reported after newer rows push it out. History records no
+separate marker for retry-drain rows; the runtime writes their errors through one builder and
+explain recognizes the same opening. An `errored` row the runtime writes for any other failure
+(scheduling, ingest, a held flush, Interpret, a notify edit) carries no marker either, so it reads
+as a source outcome, as before.
+
+The Observation stage reports the newest row in the window that is not `unrecognized`:
+
+- No history at all: `failure`, `No observation history has been recorded for this monitor.`
+- While the monitor holds retained work (pending or terminal), whatever the newest row: `ok`,
+  `The source is not called while retained materialization work remains (002 §2.7); the
+Materialization stage reports that work.` The rows written meanwhile are the admitting span's
+  failure and the drain's reports, and none of them is a source call.
+- A source outcome: the reasons above (`Source observation failed: <error>`, `healthy` for
+  `no-change`/`rebaselined`, and so on), unchanged.
+- Released work: `ok`, `Held or retained work was materialized without new source input (observed 0).`
+- An admission loss: `ok`, `The source’s latest call returned observations the runtime could not
+keep; the Materialization stage reports the loss.`
+- A skipped-retry loss: `ok`, `No source outcome has been recorded since a terminal retry was
+skipped; the Materialization stage reports the loss, and the source is called again on the
+monitor’s next due tick.`
+- A retry-drain report with no retained work left: `ok`, `No source outcome has been recorded
+since the monitor’s retained work drained; the source is called again on the monitor’s next due
+tick.`
+- Only unrecognized rows: `pending`, `No recent observation history row records an outcome this
+version recognizes.`
+
+These Observation outcomes are `ok` so that the stage owning the row wins the verdict. A
+`no-change`/`rebaselined` Observation is `healthy` for the downstream stages only when it is a
+source outcome and no retained work remains. Materialization's retained-work reasons end in
+`Last error: <displayed error>`, the oldest such retry's last error under 002 §10.7's display
+rule: `<n> observation(s) are durably queued for materialization retry. Last error: …` while it
+is pending, and the terminal reason with its repairs followed by `Last error: …`. Text prints each
+stage's reason verbatim, so text and JSON agree.
+
+For example, right after `monitor retry skip`, text shows:
+
+```diff
+-✗ Observation: Source observation failed: native fault on watcher Retry skipped after 5 failed attempts.
++✓ Observation: No source outcome has been recorded since a terminal retry was skipped; the Materialization stage reports the loss, and the source is called again on the monitor’s next due tick.
+ ✗ Materialization: 1 observation(s) were dropped because the runtime could not keep them; the newest, an observation (<path>, "<title>"), failed: native fault on watcher Retry skipped after 5 failed attempts.
+-Verdict: failure at Observation - Source observation failed: native fault on watcher Retry skipped after 5 failed attempts.
++Verdict: failure at Materialization - 1 observation(s) were dropped because the runtime could not keep them; …
+```
+
+Verified: `libs/core/src/runtime/explain-history.test.ts` (each kind),
+`libs/core/src/runtime/explain-history-stages.test.ts` (a skip explained at once, a span whose
+only observations a hold refused, a failed retry attempt, a terminal pause, released work and a
+genuine source failure, before and after retained work drains) and, through the built CLI in text
+and JSON, `apps/cli/src/retry-repair.test.ts`.
+
 **Delivery counts (current, #572).** The delivery stage's reason and JSON `details` count the
 monitor's projections into lead sessions. Each projection falls under exactly one count:
 
