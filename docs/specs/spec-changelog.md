@@ -19,6 +19,14 @@ later span's batch row adds them to `emitted` and becomes `triggered`; otherwise
 stays the newest. Failed drain attempts record what they did before. A watcher's drain is
 unchanged and records no batch row.
 
+## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
+
+002 §9.2 now states the rule and why it holds: decide time requires pending ⊂ unread, and a
+session-wide acknowledgement skips rows an outstanding reservation holds. It records the two accepted
+windows: a scoped acknowledgement of every reserved row between reservation and push, and a host
+showing a notification it queued before the acknowledgement. Behavior is unchanged; regression tests
+in `delivery-reservations.test.ts` pin it.
+
 ## 2026-11-23 — Cover foreign exceptions at envelope admission catch sites (002 §16.1; 004 §6.1) — Refs #649
 
 004 §6.1 now requires isolated coverage of each envelope admission catch site: envelope
@@ -48,6 +56,40 @@ replayed cached builds and checks, a CLI source edit replayed core's signal-inve
 and a host gaining or losing `jq` or Docker replayed a result recorded with different
 coverage. The Nx daemon is disabled because it would reuse a stale host fingerprint.
 `pnpm affected` documents the development path; `pnpm verify` remains the gate.
+
+## 2026-11-23 — `monitor explain` counts net-suppressed rows separately
+
+005 `monitor explain` now defines each delivery count. Rows the per-recipient net collapse
+suppressed (002 §1.1.7) were stored as `claimed` and so inflated that count even though the
+session never saw them; they are now reported under their own `netSuppressed` count, which an
+ack by event ID no longer moves into `acknowledged`. The 005 text also states that `claimed`
+includes rows covered only by a generic normal/low reminder.
+
+002 §1.1.7 now states that the collapse suppresses only intermediates no earlier claim
+surfaced. A `post-compact` recap over claimed-but-unacknowledged rows had been marking rows the
+session was already shown as suppressed; those rows now stay claimed and unread until
+acknowledged, so they also stay in later claims' `unreadCounts`. A recap that re-shows an
+endpoint an earlier claim surfaced now keeps that endpoint's first-claimed delta; it had been
+recomputing it against a cursor already at the endpoint and rendering it with no diff. Which
+events are rendered and claimed, and the cursor advance, are unchanged. 005 notes that rows
+marked suppressed by older versions after being shown keep counting as `netSuppressed`. Output
+shape is otherwise unchanged. Implementation now matches the described behavior.
+
+## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
+
+Envelope admission refuses own `__proto__` keys throughout producer scope/state, including
+nested array members, while general canonical JSON continues to preserve ordinary data keys.
+Leap-second syntax accepts every UTC month end and equivalent offset spellings; timestamp
+validation does not depend on a leap-second announcement table.
+
+## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.15) — Refs #481
+
+Core now exports the strict `agentmonitors.external-event.v1` envelope validator,
+JSON value types, semantic SHA-256 helper over the closed v1 field set, collision-free
+source/object key, and structured validation error types. Exact UTF-8 size, scope, JSON-depth,
+timestamp, and sequence bounds are enforced without echoing state in failures. This change exposes
+the contract only: durable receipts, runtime ingestion, daemon IPC, and CLI submission remain target
+behavior in future changes.
 
 ## 2026-11-16 — Bound internal external-envelope admission
 

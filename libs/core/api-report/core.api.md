@@ -484,6 +484,79 @@ export interface EventQuery {
     workspacePath?: string;
 }
 
+// @public
+export const EXTERNAL_EVENT_SCHEMA: "agentmonitors.external-event.v1";
+
+// @public
+export type ExternalEventEnvelope = {
+    schema: typeof EXTERNAL_EVENT_SCHEMA;
+    monitorId: string;
+    source: string;
+    upstreamEventId: string;
+    objectId: string;
+    objectSequence: number;
+    eventKind: string;
+    changeKind: 'created' | 'modified' | 'deleted' | 'descoped';
+    occurredAt: string;
+    resumeToken: string;
+    scope: ExternalEventScope;
+    state: ExternalJsonObject;
+};
+
+// @public
+export type ExternalEventEnvelopeValidationResult = {
+    success: true;
+    envelope: ExternalEventEnvelope;
+    canonicalJson: string;
+    envelopeBytes: number;
+} | {
+    success: false;
+    error: ExternalEventError;
+};
+
+// @public
+export interface ExternalEventError {
+    code: ExternalEventErrorCode;
+    message: string;
+    retryable: boolean;
+}
+
+// @public
+export type ExternalEventErrorCode = /** The envelope schema version is unsupported. */ 'unsupported_schema' | /** The envelope violates the versioned schema. */ 'invalid_envelope' | /** A byte, cardinality or container-depth limit was exceeded. */ 'payload_too_large';
+
+// @public
+export const externalEventLimits: Readonly<{
+    readonly envelopeBytes: 262144;
+    readonly identifierBytes: 512;
+    readonly resumeTokenBytes: 2048;
+    readonly scopeKeys: 32;
+    readonly scopeBytes: 32768;
+    readonly scopeKeyBytes: 64;
+    readonly scopeValuesPerKey: 16;
+    readonly scopeValueBytes: 512;
+    readonly stateDepth: 32;
+}>;
+
+// @public
+export function externalEventObjectKey(source: string, objectId: string): string;
+
+// @public
+export const externalEventReservedScopeKeys: readonly ["ingressSource", "eventKind", "changeKind", "upstreamEventId", "objectSequence", "occurredAt"];
+
+// @public
+export type ExternalEventScope = Record<string, string | string[]>;
+
+// @public
+export function externalEventSemanticHash(envelope: ExternalEventEnvelope): string;
+
+// @public
+export type ExternalJsonObject = Record<string, ExternalJsonValue>;
+
+// @public
+export type ExternalJsonValue = null | boolean | number | string | ExternalJsonValue[] | {
+    [key: string]: ExternalJsonValue;
+};
+
 // @public (undocumented)
 export function fingerprintText(content: string): string;
 
@@ -1965,6 +2038,9 @@ export interface UrgentItem {
 
 // @public
 export function validateCelPredicate(expression: string): string | undefined;
+
+// @public
+export function validateExternalEventEnvelope(input: unknown): ExternalEventEnvelopeValidationResult;
 
 // @public
 export function validatePayloadTransform(transform: PayloadTransform): string | undefined;
