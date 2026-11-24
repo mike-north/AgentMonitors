@@ -7,7 +7,9 @@
  * @see ../../../../docs/specs/002-runtime-delivery.md (§15 `database_compatibility_markers`)
  * @see ../../../../docs/specs/004-validation-testing.md (§2.14)
  */
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createDb, type InboxDb } from '../inbox/db.js';
@@ -136,6 +138,57 @@ describe('opening a database marked by a newer version', () => {
     );
     expect(snapshot(dbPath)).toEqual(before);
   });
+
+  it('refuses a marker a newer version commits while the open waits for the write lock', async () => {
+    // The first, lock-free check runs before the marker commits; only the
+    // check inside the schema transaction can see it.
+    const dbPath = databaseWithMarkers([]);
+    const child = spawn(
+      process.execPath,
+      [
+        '--experimental-transform-types',
+        '--import',
+        path.resolve('src/runtime/__fixtures__/typescript-loader.ts'),
+        path.resolve(
+          'src/external-ingress/__fixtures__/newer-marker-writer.ts',
+        ),
+        dbPath,
+        '750',
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    const killTimer = setTimeout(() => child.kill('SIGKILL'), 20_000);
+    const exited = new Promise<number | null>((resolve) => {
+      child.once('exit', (code) => {
+        clearTimeout(killTimer);
+        resolve(code);
+      });
+    });
+    let errors = '';
+    child.stderr.on('data', (chunk) => {
+      errors += String(chunk);
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let output = '';
+        child.stdout.on('data', (chunk) => {
+          output += String(chunk);
+          if (output.includes('READY\n')) resolve();
+        });
+        void exited.then((code) => {
+          reject(new Error(`writer exited early (${String(code)}): ${errors}`));
+        });
+      });
+
+      expect(() => createDb(dbPath)).toThrow(
+        'holds capability "durable-ingress-v2", written by a newer version',
+      );
+      expect(await exited).toBe(0);
+    } finally {
+      child.kill('SIGKILL');
+      await exited;
+    }
+  }, 30_000);
 
   it('opens again once the unknown marker is gone', () => {
     const dbPath = databaseWithMarkers([['/workspace', 'durable-ingress-v2']]);
