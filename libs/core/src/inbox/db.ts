@@ -170,17 +170,97 @@ export function createDb(dbPath: string): InboxDb {
 }
 
 /**
+ * How long one open waits for another connection's lock: the connection's
+ * busy timeout, and the total time {@link enableWriteAheadLog} may spend
+ * switching a fresh file to write-ahead logging.
+ */
+const BUSY_TIMEOUT_MS = 5000;
+
+/** Pause between attempts to switch a contended fresh file to WAL. */
+const WAL_RETRY_PAUSE_MS = 5;
+
+/**
+ * The time source {@link enableWriteAheadLog} measures its deadline with and
+ * pauses between attempts on. Production uses the wall clock; tests substitute
+ * a virtual one to pin the bound without real waiting.
+ *
+ * @internal
+ */
+export interface WalSwitchClock {
+  now(): number;
+  sleep(ms: number): void;
+}
+
+const SYSTEM_CLOCK: WalSwitchClock = {
+  now: () => Date.now(),
+  sleep: (ms) => {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  },
+};
+
+/**
+ * Put the database in write-ahead-log mode, waiting out a concurrent opener
+ * for at most `timeoutMs` in total.
+ *
+ * Switching a rollback-journal file to WAL needs an exclusive lock. When
+ * another connection holds a lock, SQLite's busy handler waits for it; but
+ * while another connection is making the same switch, SQLite can report
+ * `SQLITE_BUSY` at once without consulting the handler. Two processes
+ * first-opening one fresh file therefore race here, before the schema
+ * transaction can serialize them, so a busy switch is retried.
+ *
+ * Both kinds of wait share one deadline: each attempt's busy timeout is set to
+ * the time left before it, so an attempt that blocks in the busy handler can
+ * never carry the step past `timeoutMs`. The connection's busy timeout is
+ * restored to {@link BUSY_TIMEOUT_MS} afterwards. Once one opener has switched
+ * the file, WAL mode persists and later attempts succeed immediately.
+ *
+ * @internal
+ */
+export function enableWriteAheadLog(
+  sqlite: Pick<BetterSQLiteClient, 'pragma'>,
+  clock: WalSwitchClock = SYSTEM_CLOCK,
+  timeoutMs: number = BUSY_TIMEOUT_MS,
+): void {
+  const deadline = clock.now() + timeoutMs;
+  try {
+    for (;;) {
+      const remaining = Math.max(1, Math.ceil(deadline - clock.now()));
+      sqlite.pragma(`busy_timeout = ${String(remaining)}`);
+      try {
+        // The resulting mode is not checked, as before: an in-memory database
+        // reports `memory`, and a file SQLite cannot put in WAL keeps working
+        // in its rollback-journal mode.
+        sqlite.pragma('journal_mode = WAL');
+        return;
+      } catch (error) {
+        if (!isSqliteBusy(error) || clock.now() >= deadline) throw error;
+        clock.sleep(Math.min(WAL_RETRY_PAUSE_MS, deadline - clock.now()));
+      }
+    }
+  } finally {
+    sqlite.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
+  }
+}
+
+/** True for SQLite's `SQLITE_BUSY` family (including extended busy codes). */
+function isSqliteBusy(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === 'string' && code.startsWith('SQLITE_BUSY');
+}
+
+/**
  * Open the SQLite connection and materialize the schema. Extracted from
  * {@link createDb} so the whole synchronous open+build can run inside a
  * restricted-umask window for on-disk databases.
  */
 function buildDb(dbPath: string): InboxDb {
   const sqlite = new Database(dbPath);
-  sqlite.pragma('journal_mode = WAL');
-  sqlite.pragma('foreign_keys = ON');
   // Wait for a concurrent first-open's migration transaction to commit rather
   // than failing with SQLITE_BUSY (see `buildSchema`'s immediate transaction).
-  sqlite.pragma('busy_timeout = 5000');
+  sqlite.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
+  enableWriteAheadLog(sqlite);
+  sqlite.pragma('foreign_keys = ON');
 
   /*
    * This cast is deliberate.
@@ -481,6 +561,8 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
         next_attempt_at, created_at, id
       )
   `);
+
+  migrateExternalIngressTables(sqlite);
 
   db.run(sql`
     CREATE TABLE IF NOT EXISTS session_event_state (
@@ -1247,4 +1329,270 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 /** Narrow to an array, or `[]` for any non-array. */
 function asArray(value: unknown): unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Compact idempotency receipts for source-neutral external events (002 §15).
+ * Kept apart from `monitor_state`: a receipt records that one upstream event
+ * was decided, never a source's change-detection checkpoint.
+ */
+const EXTERNAL_EVENT_RECEIPT_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'id', definition: 'TEXT PRIMARY KEY' },
+  { name: 'workspace_identity', definition: 'TEXT NOT NULL' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'source', definition: 'TEXT NOT NULL' },
+  { name: 'upstream_event_id', definition: 'TEXT NOT NULL' },
+  { name: 'semantic_hash', definition: 'TEXT NOT NULL' },
+  { name: 'object_id', definition: 'TEXT NOT NULL' },
+  { name: 'object_sequence', definition: 'INTEGER NOT NULL' },
+  { name: 'event_kind', definition: 'TEXT NOT NULL' },
+  { name: 'change_kind', definition: 'TEXT NOT NULL' },
+  { name: 'occurred_at', definition: 'TEXT NOT NULL' },
+  { name: 'outcome', definition: 'TEXT NOT NULL' },
+  { name: 'event_ids', definition: "TEXT NOT NULL DEFAULT '[]'" },
+  { name: 'attempt_count', definition: 'INTEGER NOT NULL DEFAULT 0' },
+  { name: 'last_error', definition: 'TEXT' },
+  { name: 'next_attempt_at', definition: 'INTEGER' },
+  { name: 'accepted_at', definition: 'INTEGER NOT NULL' },
+  { name: 'materialized_at', definition: 'INTEGER' },
+  { name: 'updated_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** The highest accepted producer sequence for one external object (002 §15). */
+const EXTERNAL_OBJECT_SEQUENCE_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'id', definition: 'TEXT PRIMARY KEY' },
+  { name: 'workspace_identity', definition: 'TEXT NOT NULL' },
+  { name: 'monitor_id', definition: 'TEXT NOT NULL' },
+  { name: 'source', definition: 'TEXT NOT NULL' },
+  { name: 'object_id', definition: 'TEXT NOT NULL' },
+  { name: 'highest_sequence', definition: 'INTEGER NOT NULL' },
+  { name: 'receipt_id', definition: 'TEXT NOT NULL' },
+  { name: 'upstream_event_id', definition: 'TEXT NOT NULL' },
+  { name: 'updated_at', definition: 'INTEGER NOT NULL' },
+];
+
+/**
+ * Forward-only durable capabilities present in a database (002 §15). A `NULL`
+ * workspace identity is the global scope, distinct from any concrete identity,
+ * including the empty string.
+ */
+const DATABASE_COMPATIBILITY_MARKER_COLUMNS: readonly ColumnDefinition[] = [
+  { name: 'id', definition: 'TEXT PRIMARY KEY' },
+  { name: 'workspace_identity', definition: 'TEXT' },
+  { name: 'capability', definition: 'TEXT NOT NULL' },
+  { name: 'created_at', definition: 'INTEGER NOT NULL' },
+];
+
+/** A named index the current schema owns, with its exact definition. */
+interface IndexDefinition {
+  readonly name: string;
+  readonly table: string;
+  readonly sql: string;
+}
+
+/**
+ * The external-ingress tables in creation order, with the indexes each owns.
+ * The marker table keeps global and concrete identities under two partial
+ * unique indexes so `NULL` and `''` never collide.
+ */
+const EXTERNAL_INGRESS_TABLES: readonly {
+  readonly table: string;
+  readonly columns: readonly ColumnDefinition[];
+  readonly indexes: readonly IndexDefinition[];
+}[] = [
+  {
+    table: 'database_compatibility_markers',
+    columns: DATABASE_COMPATIBILITY_MARKER_COLUMNS,
+    indexes: [
+      {
+        name: 'idx_database_compatibility_marker_workspace_key',
+        table: 'database_compatibility_markers',
+        sql:
+          'CREATE UNIQUE INDEX idx_database_compatibility_marker_workspace_key ' +
+          'ON database_compatibility_markers (workspace_identity, capability) ' +
+          'WHERE workspace_identity IS NOT NULL',
+      },
+      {
+        name: 'idx_database_compatibility_marker_global_key',
+        table: 'database_compatibility_markers',
+        sql:
+          'CREATE UNIQUE INDEX idx_database_compatibility_marker_global_key ' +
+          'ON database_compatibility_markers (capability) ' +
+          'WHERE workspace_identity IS NULL',
+      },
+    ],
+  },
+  {
+    table: 'external_event_receipts',
+    columns: EXTERNAL_EVENT_RECEIPT_COLUMNS,
+    indexes: [
+      {
+        name: 'idx_external_event_receipt_key',
+        table: 'external_event_receipts',
+        sql:
+          'CREATE UNIQUE INDEX idx_external_event_receipt_key ' +
+          'ON external_event_receipts ' +
+          '(workspace_identity, monitor_id, source, upstream_event_id)',
+      },
+    ],
+  },
+  {
+    table: 'external_object_sequences',
+    columns: EXTERNAL_OBJECT_SEQUENCE_COLUMNS,
+    indexes: [
+      {
+        name: 'idx_external_object_sequence_key',
+        table: 'external_object_sequences',
+        sql:
+          'CREATE UNIQUE INDEX idx_external_object_sequence_key ' +
+          'ON external_object_sequences ' +
+          '(workspace_identity, monitor_id, source, object_id)',
+      },
+    ],
+  },
+];
+
+/**
+ * The compatibility-marker index written before global and concrete identities
+ * were split. Its `COALESCE(workspace_identity, '')` key folds the global scope
+ * into the empty-string identity, so it must not survive alongside the partial
+ * indexes that replace it.
+ */
+const LEGACY_COMPATIBILITY_MARKER_INDEX =
+  'idx_database_compatibility_marker_key';
+
+/**
+ * Create or upgrade the external-ingress tables under the schema-build
+ * immediate transaction. These tables are additive: no rebuild is needed, so
+ * an existing table keeps its rows and any column the current schema does not
+ * define, which the current writer never names (002 §5.2's carry rule). It is
+ * refused instead, with a {@link SchemaMigrationError} that rolls the whole
+ * open back, when the current writer could not use it:
+ *
+ * - a current column is missing and cannot be added in place (NOT NULL with no
+ *   default); a missing nullable or defaulted column is added;
+ * - a carried column is NOT NULL with no default, so every new row the current
+ *   writer inserts would fail;
+ * - existing rows violate a unique index the current schema requires.
+ *
+ * Indexes the current schema owns are compared with their exact definitions; a
+ * same-named index with another definition is replaced. The legacy marker index
+ * is dropped before the partial marker indexes are created.
+ */
+function migrateExternalIngressTables(sqlite: BetterSQLiteClient): void {
+  for (const { table, columns, indexes } of EXTERNAL_INGRESS_TABLES) {
+    if (tableExists(sqlite, table)) {
+      reconcileAdditiveColumns(sqlite, table, columns);
+    } else {
+      sqlite.exec(createTableSql(table, columns));
+    }
+    if (table === 'database_compatibility_markers') {
+      sqlite.exec(
+        `DROP INDEX IF EXISTS ${quoteIdentifier(LEGACY_COMPATIBILITY_MARKER_INDEX)}`,
+      );
+    }
+    for (const index of indexes) ensureIndex(sqlite, index);
+  }
+}
+
+/**
+ * Bring an existing additive table's columns up to `columns`, or refuse it.
+ * See {@link migrateExternalIngressTables} for the rule.
+ */
+function reconcileAdditiveColumns(
+  sqlite: BetterSQLiteClient,
+  table: string,
+  columns: readonly ColumnDefinition[],
+): void {
+  const live = sqlite.pragma(`table_xinfo(${table})`) as LiveColumn[];
+  const liveNames = new Set(live.map((column) => column.name.toLowerCase()));
+  const currentNames = new Set(
+    columns.map((column) => column.name.toLowerCase()),
+  );
+
+  for (const column of live) {
+    if (currentNames.has(column.name.toLowerCase()) || column.hidden !== 0) {
+      continue;
+    }
+    if (column.notnull !== 0 && column.dflt_value === null) {
+      throw new SchemaMigrationError(
+        table,
+        column.name,
+        'is NOT NULL without a default, so no row the current schema writes could be inserted',
+        {
+          remedy:
+            'Give the column a default or rebuild the table without it (or restore the database), and the open will then proceed.',
+        },
+      );
+    }
+  }
+
+  for (const column of columns) {
+    if (liveNames.has(column.name.toLowerCase())) continue;
+    const definition = column.definition.toUpperCase();
+    const addable =
+      !definition.includes('PRIMARY KEY') &&
+      (!definition.includes('NOT NULL') || definition.includes('DEFAULT'));
+    if (!addable) {
+      throw new SchemaMigrationError(
+        table,
+        column.name,
+        'is missing, and the current schema requires it with no default to fill existing rows',
+        {
+          remedy:
+            'Restore the database, or rebuild the table with the column, and the open will then proceed.',
+        },
+      );
+    }
+    addColumnIfMissing(sqlite, table, column.name, column.definition);
+  }
+}
+
+/** Collapse whitespace so equivalent stored and declared index SQL compare equal. */
+function normalizeIndexSql(text: string): string {
+  return text
+    .replace(/\s+/g, ' ')
+    .replace(/\s*([(),])\s*/g, '$1')
+    .trim()
+    .toLowerCase();
+}
+
+/**
+ * Make `index` exist with exactly its declared definition, replacing a
+ * same-named index that differs. Existing rows that violate a unique index stop
+ * the open with a {@link SchemaMigrationError} naming the table and index.
+ */
+function ensureIndex(sqlite: BetterSQLiteClient, index: IndexDefinition): void {
+  const stored = sqlite
+    .prepare<
+      [string],
+      { sql: string | null }
+    >(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?`)
+    .get(index.name);
+  if (stored !== undefined) {
+    if (normalizeIndexSql(stored.sql ?? '') === normalizeIndexSql(index.sql)) {
+      return;
+    }
+    sqlite.exec(`DROP INDEX ${quoteIdentifier(index.name)}`);
+  }
+  try {
+    sqlite.exec(index.sql);
+  } catch (error) {
+    // Only a constraint failure means existing rows violate the index; any
+    // other error is not about the data and propagates as it is.
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code !== 'string' || !code.startsWith('SQLITE_CONSTRAINT')) {
+      throw error;
+    }
+    throw new SchemaMigrationError(
+      index.table,
+      undefined,
+      `existing rows violate the index ${index.name} the current schema requires`,
+      {
+        cause: error,
+        remedy:
+          'Remove or repair the duplicate rows (or restore the database), and the open will then proceed.',
+      },
+    );
+  }
 }

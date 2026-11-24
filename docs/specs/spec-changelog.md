@@ -9,6 +9,19 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — External event receipt storage schema (002 §2.6, §15, §16.1; 004 §2.15) — Refs #481
+
+002 §15 now specifies the `external_event_receipts`, `external_object_sequences`, and
+`database_compatibility_markers` tables every open creates, with their keys, epoch-second
+timestamps, and separation from `monitor_state`. Writing them remains target behavior. Opening a
+database with the earlier `COALESCE` marker index drops it and keeps every marker, so global and
+empty-string identities no longer collide. Existing ingress tables follow 002 §5.2's
+carry-or-refuse rule: extra columns are carried, missing nullable or defaulted columns are added,
+and a shape the current writer cannot use refuses with the database unchanged. Concurrent first
+opens of one fresh file now all succeed: the switch to write-ahead logging retries a busy result,
+with retries and busy-handler waits sharing one 5-second deadline, instead of failing before the
+schema transaction. 004 §2.15 lists the required scenarios.
+
 ## 2026-11-23 — `monitor explain` attributes each history row to its own stage (002 §10.7; 005 §6) — Refs #591
 
 The Observation stage used to read the newest `observation_history` row whatever it recorded. A

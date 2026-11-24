@@ -786,12 +786,45 @@ from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-cont
 unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
 non-finite numbers. Validation errors contain only stable safe text and never echo external state.
 
-This surface currently proves the public contract only. A later change adds receipt persistence and
-the runtime mutation boundary; callers cannot ingest an envelope through the runtime, daemon, or CLI
-yet.
+This surface currently proves the public contract and the receipt storage schema only. A later
+change writes receipts and adds the runtime mutation boundary; callers cannot ingest an envelope
+through the runtime, daemon, or CLI yet.
+
+The receipt storage schema ([002 §15](./002-runtime-delivery.md#15-persistence-schema-appendix),
+external ingress receipts) requires these scenarios, each against a real on-disk database:
+
+- **Fresh shape.** The receipt, object-sequence, and marker keys refuse a duplicate and admit a change
+  to any single key column; global, empty-string, and concrete marker identities stay distinct.
+  Timestamp fixtures use epoch seconds.
+- **Earlier marker index.** A database holding the earlier `COALESCE` marker index, a persisted global
+  marker, receipt and sequence rows, and runtime sessions/events is reopened through `createDb()`
+  without dropping any table. Every row survives, the earlier index is gone, both partial indexes
+  have the specified columns and `WHERE` clauses, and a global and an empty-string marker for one
+  capability coexist. A second open changes nothing.
+- **Carry or refuse.** An extra column is carried with its values; a missing defaulted or nullable
+  column is added; an equivalent index stored with other formatting is kept; a differing same-named
+  index is replaced. A missing NOT NULL column without a default, a carried NOT NULL column without a
+  default, and rows that violate a required unique index each refuse with `SchemaMigrationError`,
+  leaving the schema unchanged.
+- **Separation.** `monitor_state` keeps exactly its specified columns, no ingress table references it
+  or carries trigger links, and writes on either side leave the other unchanged.
+- **Concurrent first open.** Several independent processes released together against one fresh
+  path all succeed, each observes the complete schema, and the file passes `integrity_check` in WAL
+  mode. Each child process runs every trial, released through per-trial barriers, so the race costs
+  the opens rather than process startup. Children have bounded lifetimes and are killed and awaited
+  on failure.
+- **Bounded WAL switch.** Opening a fresh rollback-journal file while another connection holds an
+  exclusive lock waits for it and then fails with `SQLITE_BUSY` within 5 seconds plus a small margin.
+  Under a virtual clock, immediate busy results that use up most of the bound, followed by a held
+  lock, still end the switch within the bound and restore the busy timeout.
+
+Removing the earlier-index drop, recreating a table instead of migrating it, skipping the immediate
+schema transaction, removing the WAL retry, or letting one attempt wait past the deadline MUST each
+fail one of these tests.
 
 **Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
-`contract-boundaries.test.ts`, `admission-safety.test.ts`, and `public-contract.test.ts`.
+`contract-boundaries.test.ts`, `admission-safety.test.ts`, `public-contract.test.ts`, and
+`schema.test.ts`.
 The public consumer suite exercises ESM/CJS exports and compiles against the trimmed
 package declarations. A fixed eleven-field canonical preimage pins the SHA-256 value;
 each identity-field mutation varies only that field. Runtime mutation of every limit
