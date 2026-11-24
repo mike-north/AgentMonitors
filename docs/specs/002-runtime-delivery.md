@@ -2476,7 +2476,7 @@ its urgency's next delivery point (§9), and cycles repeat until acknowledged.
   `claim-ttl-ms` from the target workspace's existing coordination file; all daemon and offline
   runtime construction paths share that resolution. It is a positive safe integer in milliseconds,
   validated and loaded when opening the store; a running daemon must be restarted after edits.
-  Coordination-only operations preserve raw policy text without applying it, so lifecycle operations
+  Coordination-only operations preserve the complete policy field line, including whitespace, without applying it, so lifecycle operations
   against an existing runtime and disabled-workspace quick exits do not validate replacement policy.
   Storage workspace selects policy independently of any optional observation-history query filter.
   Absence uses the default. SDK callers may supply `RuntimeStore`'s `claimTtlMs` constructor option.

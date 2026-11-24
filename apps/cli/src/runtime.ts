@@ -15,7 +15,8 @@ import { SourceRegistry } from '@agentmonitors/core';
 /** Applying policy belongs to store construction, never session/socket coordination. */
 function parseClaimTtlMs(raw: string | undefined): number | undefined {
   if (raw === undefined) return undefined;
-  const value = Number(raw);
+  // The coordination representation retains the original complete field line.
+  const value = Number(raw.slice(raw.indexOf(':') + 1).trim());
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
       'claim-ttl-ms must be a positive safe integer in milliseconds',

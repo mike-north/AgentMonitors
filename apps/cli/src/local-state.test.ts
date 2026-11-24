@@ -175,9 +175,9 @@ describe('workspace claim TTL', () => {
         '---\nenabled: true\nclaim-ttl-ms: 60000\n---\n',
       );
       const state = readLocalState(ws);
-      expect(state.claimTtlMs).toBe('60000');
+      expect(state.claimTtlMs).toBe('claim-ttl-ms: 60000');
       writeLocalState(ws, { ...state, socket: '/example.sock' });
-      expect(readLocalState(ws).claimTtlMs).toBe('60000');
+      expect(readLocalState(ws).claimTtlMs).toBe('claim-ttl-ms: 60000');
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
@@ -204,9 +204,9 @@ describe('workspace claim TTL', () => {
           `---\nenabled: true\nclaim-ttl-ms: ${value}\n---\n`,
         );
         const state = readLocalState(ws);
-        expect(state.claimTtlMs).toBe(value);
+        expect(state.claimTtlMs).toBe(`claim-ttl-ms: ${value}`);
         writeLocalState(ws, { ...state, socket: '/rewritten.sock' });
-        expect(readLocalState(ws).claimTtlMs).toBe(value);
+        expect(readLocalState(ws).claimTtlMs).toBe(`claim-ttl-ms: ${value}`);
         expect(
           readFileSync(
             path.join(ws, '.claude', 'agentmonitors.local.md'),
@@ -219,3 +219,31 @@ describe('workspace claim TTL', () => {
     },
   );
 });
+
+/** Policy field fidelity includes its separator, indentation and trailing whitespace. */
+it.each(['claim-ttl-ms: 0 \t', '\tclaim-ttl-ms \t:\t60000  \t'])(
+  'preserves the complete policy field bytes %j while normalizing other fields',
+  (policyLine) => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'claim-bytes-'));
+    const file = path.join(ws, '.claude', 'agentmonitors.local.md');
+    try {
+      mkdirSync(path.dirname(file));
+      writeFileSync(
+        file,
+        `---\nenabled: true \t\nsocket: /example.sock \t\n${policyLine}\n---\n`,
+      );
+      const state = readLocalState(ws);
+      expect(state.enabled).toBe(true);
+      expect(state.socket).toBe('/example.sock');
+      writeLocalState(ws, state);
+      const lines = readFileSync(file, 'utf8').split('\n');
+      expect(lines.find((line) => line.includes('claim-ttl-ms'))).toBe(
+        policyLine,
+      );
+      expect(lines).toContain('enabled: true');
+      expect(lines).toContain('socket: /example.sock');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  },
+);

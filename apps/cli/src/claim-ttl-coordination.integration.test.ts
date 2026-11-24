@@ -162,7 +162,7 @@ it('ends a live session after invalid policy edits and preserves that unapplied 
       statePath,
       readFileSync(statePath, 'utf8').replace(
         'claim-ttl-ms: 60000',
-        'claim-ttl-ms: 0',
+        'claim-ttl-ms: 0 \t',
       ),
     );
     const end = await execute(['session', 'end'], root, payload);
@@ -178,7 +178,7 @@ it('ends a live session after invalid policy edits and preserves that unapplied 
     ).toBe('dormant');
     const restart = await execute(['session', 'start'], root, payload);
     expect(restart.code, restart.stderr).toBe(0);
-    expect(readFileSync(statePath, 'utf8')).toContain('claim-ttl-ms: 0\n');
+    expect(readFileSync(statePath, 'utf8')).toContain('claim-ttl-ms: 0 \t\n');
     expect(() => createRuntime(dbPath, undefined, undefined, root)).toThrow(
       'claim-ttl-ms must be a positive safe integer in milliseconds',
     );

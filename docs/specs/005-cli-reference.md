@@ -1635,7 +1635,9 @@ claim-ttl-ms: 60000
 `claim-ttl-ms` is a **positive safe integer in milliseconds** (`60000` means one minute).
 When constructing a runtime/store, zero, negative, fractional and nonnumeric values are rejected
 with an error naming the setting; they never silently fall back to the default. Coordination-only
-reads and rewrites preserve the raw scalar without validating or applying it. Thus editing a bad
+reads and rewrites preserve the complete policy-field line byte for byte, including separator and
+trailing whitespace, without validating or applying it. Runtime composition trims/interprets only
+the value after the colon. Other coordination fields retain their existing normalization. Thus editing a bad
 replacement does not prevent session start/end against an already-running daemon, and a disabled
 workspace still takes its silent lifecycle quick exit. Precedence is the target workspace's
 `claim-ttl-ms`, when present, then **1,800,000 ms (30 minutes)**. There is no claim-TTL CLI flag or

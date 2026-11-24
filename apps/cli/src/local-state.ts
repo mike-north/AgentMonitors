@@ -11,7 +11,7 @@ export interface LocalState {
   socket?: string;
   db?: string;
   reapAfterMs?: number;
-  /** Unapplied claim-ttl-ms scalar text, preserved even when invalid; only runtime construction validates it. */
+  /** Complete unapplied claim-ttl-ms field line, including whitespace; only runtime construction interprets it. */
   claimTtlMs?: string;
   /**
    * ISO timestamp of the most recent time THIS workspace's own lazy-boot
@@ -52,12 +52,14 @@ function parseFrontmatter(raw: string): Record<string, unknown> | null {
     const colonIdx = line.indexOf(':');
     if (colonIdx === -1) continue;
     const key = line.slice(0, colonIdx).trim();
-    const rawVal = line.slice(colonIdx + 1).trim();
-    // Coordination must preserve policy text without interpreting it: an edit
-    // for the next runtime must not prevent an existing session from ending.
+    // Preserve the entire policy field for coordination, including separator
+    // and trailing bytes. Only runtime composition interprets its value.
     if (key === 'claim-ttl-ms') {
-      data[key] = rawVal;
-    } else if (rawVal === 'true') {
+      data[key] = line;
+      continue;
+    }
+    const rawVal = line.slice(colonIdx + 1).trim();
+    if (rawVal === 'true') {
       data[key] = true;
     } else if (rawVal === 'false') {
       data[key] = false;
@@ -115,7 +117,7 @@ export function writeLocalState(
   const lines = [
     '---',
     `enabled: ${String(state.enabled)}`,
-    ...(claimTtlMs !== undefined ? [`claim-ttl-ms: ${claimTtlMs}`] : []),
+    ...(claimTtlMs !== undefined ? [claimTtlMs] : []),
     ...(state.socket ? [`socket: ${state.socket}`] : []),
     ...(state.db ? [`db: ${state.db}`] : []),
     `reap-after-ms: ${String(state.reapAfterMs ?? DEFAULT_REAP_AFTER_MS)}`,
