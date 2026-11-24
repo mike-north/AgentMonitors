@@ -3337,9 +3337,12 @@ export class RuntimeStore {
    * `buildDiff(cursor.baselineContent, newestArtifact, strategy)` (issue #437:
    * strategy-aware — structural for `json-diff`, line-based otherwise) so the
    * delta spans the recipient's cursor → endpoint (not the shared snapshot
-   * baseline). The older same-object events are recorded CLAIMED-BUT-SUPPRESSED
-   * (`net_suppressed_at`): retained for `monitor explain` but excluded from
-   * delivery (unread/pending/recap).
+   * baseline). An endpoint an earlier claim already surfaced keeps the delta it
+   * was first claimed with. The older same-object events that no earlier claim surfaced are
+   * recorded CLAIMED-BUT-SUPPRESSED (`net_suppressed_at`): retained for
+   * `monitor explain` but excluded from delivery (unread/pending/recap). An
+   * older sibling an earlier claim already showed (a recap can collapse over
+   * those) is not suppressed; it stays claimed and unread.
    *
    * `incremental` (default / NULL) events always pass through unchanged, in
    * order. Events without a `snapshotText`/`objectKey` (snapshot-less) cannot be
@@ -3377,11 +3380,21 @@ export class RuntimeStore {
     // group ("missed nothing") is left byte-identical to what materialization
     // recorded — the degenerate case where `net` ≡ `incremental`, so a baseline
     // event with a NULL delta is not rewritten to an empty diff.
+    //
+    // An endpoint this recipient already claimed (a recap re-showing it before
+    // acknowledgement) keeps the delta it was first claimed with: that claim
+    // moved the cursor to this endpoint, so recomputing now would span nothing.
+    // Read before {@link markClaimed} stamps the current claim.
+    const alreadyClaimed = this.claimedEventIds(
+      sessionId,
+      view.delivered.map((event) => event.id),
+    );
     for (const event of view.delivered) {
       if (
         event.baselineStrategy !== 'net' ||
         event.snapshotText === null ||
-        event.objectKey === null
+        event.objectKey === null ||
+        alreadyClaimed.has(event.id)
       )
         continue;
       const key = view.groupKeyByEventId.get(event.id);
@@ -3413,9 +3426,37 @@ export class RuntimeStore {
   }
 
   /**
+   * The subset of `eventIds` this recipient has already claimed
+   * (`first_notified_at` set), i.e. surfaced by an earlier claim.
+   */
+  private claimedEventIds(sessionId: string, eventIds: string[]): Set<string> {
+    if (eventIds.length === 0) return new Set();
+    const rows = asInternalDb(this.db)
+      .select({ eventId: sessionEventState.eventId })
+      .from(sessionEventState)
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          inArray(sessionEventState.eventId, eventIds),
+          isNotNull(sessionEventState.firstNotifiedAt),
+        ),
+      )
+      .all();
+    return new Set(rows.map((row) => row.eventId));
+  }
+
+  /**
    * Record the per-recipient `net`-collapse suppression marker (G10 PR-B,
    * 002 §1.1.7) on the given projections: claimed-but-suppressed intermediates,
    * retained for `monitor explain` but excluded from delivery.
+   *
+   * The collapse suppresses only the recipient's **unclaimed** intermediates.
+   * A projection an earlier claim already surfaced (`first_notified_at` set) —
+   * for example one a later `post-compact` recap folds into a newer endpoint —
+   * was shown to the session, so it keeps no suppression marker and stays
+   * claimed and unread until acknowledged. This must run before
+   * {@link markClaimed} stamps the current claim, which is what makes
+   * `first_notified_at` here mean "claimed before this claim began".
    */
   private markNetSuppressed(sessionId: string, eventIds: string[]): void {
     if (eventIds.length === 0) return;
@@ -3427,6 +3468,7 @@ export class RuntimeStore {
         and(
           eq(sessionEventState.sessionId, sessionId),
           inArray(sessionEventState.eventId, eventIds),
+          isNull(sessionEventState.firstNotifiedAt),
         ),
       )
       .run();

@@ -352,8 +352,16 @@ Rules for the payload-form step:
 > otherwise, per [§5.2](#52-snapshots-and-diffs)) when the group actually collapsed — and records
 > the older intermediates **claimed-but-suppressed** (`session_event_state.net_suppressed_at`):
 > retained and explainable via `monitor explain` ([§10.7](#107-monitor-pipeline-diagnosis)), never
-> delivered. `incremental` (explicit opt-out) delivers all in order. The per-recipient cursor still
-> advances to the newest claimed artifact (`markClaimed`) even when intermediates are suppressed.
+> delivered. Only intermediates no earlier claim surfaced are suppressed: a `post-compact` recap
+> collapses over every unread event, including claimed-but-unacknowledged ones, and an older
+> sibling that an earlier claim already rendered keeps no suppression marker and stays claimed and
+> unread until acknowledged. It therefore still counts in later claims' `unreadCounts`. Likewise
+> an endpoint that an earlier claim surfaced keeps the delta it was first claimed with when a
+> later recap re-shows it; it is not recomputed against a cursor that claim already moved to it
+> (#572; `libs/core/src/runtime/explain-net-suppressed.test.ts`). Which events a claim renders
+> and claims, and where the cursor moves, are unaffected by either rule. `incremental` (explicit
+> opt-out) delivers all in order. The per-recipient cursor still advances to the newest claimed
+> artifact (`markClaimed`) even when intermediates are suppressed.
 > The monitor's `baseline-strategy` is persisted on each `monitor_events` row (`baseline_strategy`)
 > so the claim-time decision needs no monitor re-scan.
 > Tested by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
