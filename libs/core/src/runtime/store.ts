@@ -540,7 +540,10 @@ function rowToExternalEventReceipt(
       eventKind: row.eventKind,
       occurredAt: row.occurredAt,
     },
-    identifiers: {},
+    identifiers: {
+      'workspace identity': row.workspaceIdentity,
+      'receipt id': row.id,
+    },
     integers: {
       'object sequence': row.objectSequence,
       'attempt count': row.attemptCount,
@@ -645,17 +648,7 @@ interface ExternalObjectRoute {
 function rowToExternalObjectSequence(
   route: ExternalObjectRoute,
   row: typeof externalObjectSequences.$inferSelect,
-  receipt:
-    | Pick<
-        typeof externalEventReceipts.$inferSelect,
-        | 'workspaceIdentity'
-        | 'monitorId'
-        | 'source'
-        | 'objectId'
-        | 'upstreamEventId'
-        | 'objectSequence'
-      >
-    | undefined,
+  receipt: ExternalReceiptRouteFields | undefined,
 ): ExternalObjectSequenceRecord {
   const fail = (rule: string) =>
     invalidStoredRow('external object sequence for the requested object', rule);
@@ -845,6 +838,40 @@ function normalizeExternalReceiptCompletion(
  * transaction; entries live only while an operation's callback runs.
  */
 const externalReceiptInFlightByClient = new WeakMap<object, Set<string>>();
+
+/** The receipt fields a high-water mark's coherence check compares. */
+type ExternalReceiptRouteFields = Pick<
+  typeof externalEventReceipts.$inferSelect,
+  | 'workspaceIdentity'
+  | 'monitorId'
+  | 'source'
+  | 'objectId'
+  | 'upstreamEventId'
+  | 'objectSequence'
+>;
+
+/**
+ * The receipt each running operation's callback is accepting, by receipt id,
+ * per connection. Its high-water mark is reserved before the callback runs,
+ * but the receipt row is written only after the callback returns, so a
+ * sequence read from inside the callback checks the mark against this entry.
+ * Entries live only while the callback runs.
+ */
+const externalReceiptReservationsByClient = new WeakMap<
+  object,
+  Map<string, ExternalReceiptRouteFields>
+>();
+
+function externalReceiptReservations(
+  client: object,
+): Map<string, ExternalReceiptRouteFields> {
+  let reservations = externalReceiptReservationsByClient.get(client);
+  if (!reservations) {
+    reservations = new Map();
+    externalReceiptReservationsByClient.set(client, reservations);
+  }
+  return reservations;
+}
 
 function externalReceiptsInFlight(client: object): Set<string> {
   let inFlight = externalReceiptInFlightByClient.get(client);
@@ -1187,6 +1214,7 @@ export class RuntimeStore {
     const receiptAcceptedAt = new Date(acceptedAt.getTime());
     const db = asInternalDb(this.db);
     const inFlight = externalReceiptsInFlight(db.$client);
+    const reservations = externalReceiptReservations(db.$client);
     const identity = JSON.stringify([
       normalizedInput.workspaceIdentity,
       envelope.monitorId,
@@ -1238,6 +1266,14 @@ export class RuntimeStore {
           let materializedAt: Date | null = null;
           if (!stale) {
             inFlight.add(identity);
+            reservations.set(receiptId, {
+              workspaceIdentity: normalizedInput.workspaceIdentity,
+              monitorId: envelope.monitorId,
+              source: envelope.source,
+              objectId: envelope.objectId,
+              upstreamEventId: envelope.upstreamEventId,
+              objectSequence: envelope.objectSequence,
+            });
             let completion: unknown;
             try {
               completion = operation({
@@ -1246,6 +1282,7 @@ export class RuntimeStore {
               });
             } finally {
               inFlight.delete(identity);
+              reservations.delete(receiptId);
             }
             const normalized = normalizeExternalReceiptCompletion(
               completion,
@@ -1370,7 +1407,13 @@ export class RuntimeStore {
         .from(externalEventReceipts)
         .where(eq(externalEventReceipts.id, row.receiptId))
         .get();
-      return rowToExternalObjectSequence(route, row, receipt);
+      // Inside a receipt operation's callback the mark names the receipt being
+      // accepted, which is written only after the callback returns.
+      return rowToExternalObjectSequence(
+        route,
+        row,
+        receipt ?? externalReceiptReservations(db.$client).get(row.receiptId),
+      );
     })();
   }
 

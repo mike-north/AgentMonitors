@@ -178,6 +178,46 @@ describe('materialization retry outbox', () => {
     }
   });
 
+  // The other route fields the capture reads: each is read once, and the row
+  // carries the first value. A second read anywhere in admission (envelope
+  // match, capacity grouping, insertion or marker) changes the read count.
+  it.each([
+    [
+      'monitorId',
+      ['shifting-monitor', 'other-monitor', 'third-monitor'],
+      (record: { monitorId: string }) => record.monitorId,
+    ],
+    [
+      'sourceName',
+      ['test-source', 'other-source', 'third-source'],
+      (record: { sourceName: string }) => record.sourceName,
+    ],
+    [
+      'error',
+      ['first failure', 'second failure', 'third failure'],
+      (record: { lastError: string | null }) => record.lastError,
+    ],
+  ] as const)(
+    'reads the retry %s once and stores the value it read',
+    (field, values, stored) => {
+      const store = new RuntimeStore(createDb(':memory:'));
+      let reads = 0;
+      const shifting = input('shifting-monitor', 'shifting-object');
+      Object.defineProperty(shifting, field, {
+        enumerable: true,
+        get: () => values[Math.min(reads++, values.length - 1)],
+      });
+
+      const [record] = store.enqueueMaterializationRetries([shifting], NOW);
+
+      expect(reads).toBe(1);
+      expect(record && stored(record)).toBe(values[0]);
+      expect(
+        store.listMaterializationRetries({ workspacePath: '/workspace' }),
+      ).toHaveLength(1);
+    },
+  );
+
   it('rolls back a whole multi-route admission when a marker write fails, then admits on retry', () => {
     // 002 §15: every route is marked in the same outbox transaction, so a
     // failed marker write leaves no retained rows and no marker behind.

@@ -123,6 +123,30 @@ describe('reading receipt status', () => {
       `Stored external event receipt ${receiptId} is invalid: monitor id is not a valid envelope value.`,
     );
   });
+
+  // 002 §2.6.2: both reads require a non-empty workspace identity and receipt
+  // id. A read whose own argument matches the empty stored value must still
+  // refuse it rather than return it.
+  it.each([
+    ['receipt id', 'id', (receiptId: string) => ['/workspace-a', ''] as const],
+    [
+      'workspace identity',
+      'workspace_identity',
+      (receiptId: string) => ['', receiptId] as const,
+    ],
+  ])('refuses a stored receipt with an empty %s', (name, column, readArgs) => {
+    const dbPath = receiptScratchDb();
+    const store = new RuntimeStore(createDb(dbPath));
+    const receiptId = accept(store, receiptInput());
+    const raw = new Database(dbPath);
+    raw.exec(`UPDATE external_event_receipts SET ${column} = ''`);
+    raw.close();
+
+    const [workspace, id] = readArgs(receiptId);
+    expect(() => store.externalEventReceiptStatus(workspace, id)).toThrow(
+      new RegExp(`is invalid: ${name} is not a non-empty string\\.$`),
+    );
+  });
 });
 
 describe('reading an object sequence', () => {
@@ -280,6 +304,27 @@ describe('reading an object sequence', () => {
       );
     });
 
+    it('a receipt with the same fields in another workspace', () => {
+      // The receipt is looked up by id alone, so only its workspace tells this
+      // workspace's mark apart from another workspace's identical receipt.
+      const dbPath = receiptScratchDb();
+      const store = new RuntimeStore(createDb(dbPath));
+      accept(store, receiptInput());
+      const other = accept(store, receiptInput({}, '/workspace-b'));
+      const raw = new Database(dbPath);
+      raw
+        .prepare(
+          `UPDATE external_object_sequences SET receipt_id = ?
+           WHERE workspace_identity = '/workspace-a'`,
+        )
+        .run(other);
+      raw.close();
+
+      expect(() => readSequence(store, ROUTE)).toThrow(
+        'Stored external object sequence for the requested object is invalid: it does not match the receipt that set it.',
+      );
+    });
+
     it('rejects the combined corruption first reported against this read', () => {
       const store = storedThenCorrupted(
         sequenceUpdate(
@@ -290,6 +335,84 @@ describe('reading an object sequence', () => {
         /^Stored external object sequence for the requested object is invalid: /,
       );
     });
+  });
+});
+
+describe('reading an object sequence from inside a receipt operation', () => {
+  // The mark is reserved before the callback runs and its receipt is written
+  // after it returns, so the callback sees a mark naming the receipt it is
+  // accepting. That is a state this store writes, not corruption.
+  it('returns the mark the enclosing operation reserved', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+    let inside: unknown;
+    let reservedId = '';
+    const decision = store.withExternalEventReceipt(
+      receiptInput(),
+      ({ receiptId }) => {
+        reservedId = receiptId;
+        inside = readSequence(store, ROUTE);
+        return {
+          outcome: 'materialized',
+          eventIds: [RECEIPT_EVENT_ID],
+          materializedAt: RECEIPT_MATERIALIZED_AT,
+        };
+      },
+      RECEIPT_NOW,
+    );
+
+    expect(decision.decision).toBe('accepted');
+    const expected = {
+      ...ROUTE,
+      highestSequence: 42,
+      receiptId: reservedId,
+      upstreamEventId: 'delivery-42',
+      updatedAt: RECEIPT_NOW,
+    };
+    expect(inside).toEqual(expected);
+    expect(readSequence(store, ROUTE)).toEqual(expected);
+  });
+
+  it('forgets the reservation when the operation rolls back', () => {
+    const store = new RuntimeStore(createDb(':memory:'));
+    expect(() =>
+      store.withExternalEventReceipt(
+        receiptInput(),
+        () => {
+          throw new Error('work failed');
+        },
+        RECEIPT_NOW,
+      ),
+    ).toThrow('work failed');
+    expect(readSequence(store, ROUTE)).toBeNull();
+  });
+
+  it('still refuses a mark naming a receipt nothing is accepting', () => {
+    // Only the enclosing operation's own receipt is recognized: a mark that
+    // names any other missing receipt is refused inside the callback too.
+    const db = createDb(':memory:');
+    const store = new RuntimeStore(db);
+    let refusal: unknown;
+    store.withExternalEventReceipt(
+      receiptInput(),
+      () => {
+        clientOf(db)
+          .prepare(
+            `UPDATE external_object_sequences SET receipt_id = 'missing-receipt'`,
+          )
+          .run();
+        try {
+          readSequence(store, ROUTE);
+        } catch (error) {
+          refusal = error;
+        }
+        return { outcome: 'suppressed' };
+      },
+      RECEIPT_NOW,
+    );
+    expect(refusal).toBeInstanceOf(Error);
+    expect((refusal as Error).message).toBe(
+      'Stored external object sequence for the requested object is invalid: it does not match the receipt that set it.',
+    );
   });
 });
 
