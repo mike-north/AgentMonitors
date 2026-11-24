@@ -732,7 +732,52 @@ byte-identical to establish preservation with foreign-write exclusions; every
 excluded file and PID MUST be named. Whole-installation byte identity remains a
 separate reported outcome. A partial test run is insufficient.
 
-### 2.14 External-ingress envelope validation
+### 2.14 Nx cache contract (current)
+
+**Current, normative:** a cacheable Nx target MUST hash every input that can change its result,
+so a replayed result is one the same inputs would have produced. Nx already hashes the owning
+project's files, the declared upstream named inputs, `nx.json`, `.gitignore` and, for these
+script targets, every locked external dependency. The workspace adds:
+
+| Input                                                                                                                                     | Hashed by                              | Why                                                                                                                                  |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `tsconfig.base.json`, `api-extractor.base.json`, `api-extractor.build.json` (`sharedGlobals`)                                             | every target via `default`             | Package tsconfigs and API Extractor configs extend them.                                                                             |
+| `api-extractor.report.json`                                                                                                               | `check:api-report`                     | The report-mode config.                                                                                                              |
+| `scripts/test-isolation/**` (`testIsolation`)                                                                                             | `test`, `test:serial`                  | The shared boundary of §2.13.                                                                                                        |
+| `node scripts/nx-test-environment.mjs` runtime fingerprint (`testEnvironment`)                                                            | `test`                                 | Node version, platform, root vs non-root, and `jq`, `git`, `perl` and `CI` change what suites run or skip (§2.10).                   |
+| The same fingerprint with `--docker` (`dockerEnvironment`)                                                                                | CLI `test:serial`, command-poll `test` | Docker reachability decides whether their Docker suites run (§2.11).                                                                 |
+| Shipped `.ts` under `apps/cli/src` and `plugins/`, plugin `package.json`/`tsconfig.json`, `docs/specs/008-reliability-process-hygiene.md` | core `test`                            | The signal inventory and core's plugin imports read them. Test, test-support and fixture files are excluded, matching the inventory. |
+| `agent-plugins/agentmonitors/**`, `scripts/owned-test-group.mjs`, `scripts/owned-worker-terminated.mjs`                                   | CLI `test`, `test:serial`              | CLI suites load them.                                                                                                                |
+| `scripts/owned-test-group.mjs`                                                                                                            | command-poll `test`                    | `command-ownership.test.ts` imports it.                                                                                              |
+| Root `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `apps/*/package.json`                                                       | CLI `test:serial`                      | The Docker smoke copies the workspace and installs from them.                                                                        |
+
+Runtime inputs are only as fresh as the hasher that evaluates them, and the Nx daemon keeps one
+hasher until the project graph changes. `nx.json` therefore sets `useDaemonProcess: false`, so the
+fingerprint runs on every invocation. Re-enabling the daemon would let a host gaining `jq` or
+Docker replay a result recorded without them.
+
+`build` declares `{projectRoot}/dist`, its sole intended writer. `check:api-report` declares
+`{projectRoot}/temp`. It also re-emits `dist/` before API Extractor runs (see the CI note on
+`--parallel=1`), so it is a known second writer of identical declarations. Consolidating it
+behind `build` is a tracked follow-up. Cache scope is local (`.nx/cache` per worktree). CI does
+not restore an Nx cache.
+
+A test that reads a file outside its project MUST add that file to its target inputs; the
+guard below checks known reads and cannot discover new ones. The `pnpm affected` development
+path selects projects that own, or depend on owners of, files changed since `origin/main` (or
+`NX_BASE`), plus projects whose declared inputs name a changed file. It includes uncommitted and
+untracked files. It runs `build` and `check` (website excluded, as in the root scripts), then
+`test` (website included, as in `pnpm test`), then `check:api-report` serially. It omits
+`test:serial`, `test:scripts`, the workspace lint/format/aipm checks and the packaging checks, so
+it is not a substitute for §2.10. A cache-hit `test:serial` with Docker reachable replays the
+pinned Docker smoke rather than re-running its registry installs; use `NX_SKIP_NX_CACHE=true`
+for fresh execution evidence.
+
+**Verified in:** `scripts/nx-cache-contract.test.ts` reads Nx's own hash plan for these targets,
+checks that the daemon is disabled, and checks that the fingerprint reports missing `jq`, `git`
+and `perl`, `CI`, and unreachable Docker.
+
+### 2.15 External-ingress envelope validation
 
 The exported `validateExternalEventEnvelope()` helper is the validation boundary for the
 source-neutral `agentmonitors.external-event.v1` contract. It validates the complete JSON value
@@ -1345,5 +1390,20 @@ with a heap cap and external timeout; trusted descriptor counters installed befo
 import can observe captured traversal. Post-load prototype replacements MUST
 neither execute hooks nor change admission or canonical bytes. An injected
 preflight undercount MUST still fail the independent output-size check.
+
+Each admission catch site (envelope byte preflight, scope byte preflight and
+canonical encoding) MUST contain a foreign thrown value. Isolated, heap-capped,
+externally timed child processes install a trusted descriptor intrinsic before
+import that throws at one chosen site. A thrown proxy whose traps all count, and
+a thrown ordinary object with counting getters for `Symbol.toPrimitive`,
+`Symbol.toStringTag`, the `nodejs.util.inspect.custom` symbol, `message` and
+`stack`, MUST each yield a permanent `invalid_envelope` with zero trap or getter
+calls, no escaping exception and no output on stdout or stderr. The ordinary
+object is needed because `util.inspect` formats a proxy's target without running
+traps. A native stack-overflow `RangeError` thrown at each site MUST be
+contained the same way without changing the production depth limit. Reading a
+property of the caught value, rethrowing it, logging it with `console.error` or
+formatting it with `util.inspect` (including with `customInspect: false`) MUST
+fail one of these cases.
 `libs/core/src/external-ingress/contract.test.ts`
 provides these examples alongside the §16 JSON-policy compatibility cases.

@@ -1,7 +1,7 @@
 {
   "name": "@agentmonitors/source-command-poll",
   "description": "Local-command polling and change detection for Agent Monitors",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "engines": {
     "node": ">=24"
   },
@@ -35,11 +35,23 @@
     "fix:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json"
   },
   "nx": {
+    "namedInputs": {
+      "ownedProcessHelpers": [
+        "{workspaceRoot}/scripts/owned-test-group.mjs"
+      ]
+    },
     "targets": {
       "test": {
         "dependsOn": [
           "^build",
           "build"
+        ],
+        "inputs": [
+          "default",
+          "^production",
+          "testIsolation",
+          "dockerEnvironment",
+          "ownedProcessHelpers"
         ]
       }
     }
