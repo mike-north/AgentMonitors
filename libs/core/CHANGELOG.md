@@ -1,5 +1,42 @@
 # @agentmonitors/core
 
+## 0.16.0
+
+### Minor Changes
+
+- a66ccec: Report held debounce and rollup observations in monitor explain and doctor even
+  when the current definition is rejected. Include counts, stored pacing and repair
+  guidance, and keep downstream stages pending while earlier work awaits release.
+
+  Distinguish definition rejection, source availability, owner inactivity and
+  retired declarations with an additive release-barrier field derived from tick's
+  read-only predicates. Describe retained retry and captured-data prerequisites
+  without promising that an overdue batch must flush on the next tick.
+
+### Patch Changes
+
+- f01f2da: Keep net-collapse claims aligned with the rendered delivery. A high-urgency interrupt leaves
+  newer normal versions of the same object pending, while independent monitor reminders still
+  coalesce. Recaps claim only the net groups represented within their event limit, preserving
+  unseen work for later delivery and across restarts.
+- 3a00022: Reap orphaned command processes on macOS after a daemon restart using kernel environment evidence, with the same boot, ownership and process identity checks as Linux. Argument text never proves ownership. Batch discovery and signal verification through one asynchronous stock `/usr/bin/osascript -l JavaScript` helper per sweep, and batch terminal checks and durable receipt writes to keep startup bounded. No Homebrew tools or native addons are required.
+
+  Use Foundation-owned buffers to call sysctl without developer tools. Record conservative abstentions with reasons when the helper is unavailable or a process environment cannot be read. Treat empty or padded argv entries, process-title rewrites and an unproven envp boundary as per-PID unreadability rather than silently reporting the process unmarked.
+
+  Skip only the exact all-NUL executable-path alignment established by XNU for 64-bit macOS; any extra NUL still makes an empty first argument unreadable. Treat synchronous helper startup failures, including argument/environment size exhaustion, as unavailable evidence with a reason. Bound each parse to sysctl's returned byte count so shorter replies cannot inherit ownership evidence from a previous PID's buffer.
+
+- 4249d1f: Refuse non-regular command life tokens promptly before execution and recover command admission after a failed journal commit, preserving committed ownership and unrelated replacement files.
+- c425397: Retain command group attribution discovered at the restart sweep limit and confirm empty
+  nonce-only lives before retiring them, preserving accountability for late descendants.
+- 4249d1f: Reap orphaned stock macOS shell and curl commands after a daemon restart using each process's own inherited, journaled vnode. Preserve fail-closed ownership checks, watchdog bounds, and authored-command resource limits.
+- e1331c8: Identify watchdog roles in command ownership evidence. Preserve a command group's watchdog when restart cleanup cannot verify a group member. Record why the group bound remains active and retain per-process ownership checks for fully verified cleanup.
+
+  Keep per-process cleanup for groups without verified watchdogs, reconcile late forks beside terminal identities, and bound restart terminal scans and durable receipt writes.
+
+  Commit preservation decisions before awaiting unrelated terminal evidence, keeping receipt writes bounded. Persist invalid stored PID diagnostics before further identity queries.
+
+  Keep blocking receipt writes after every signal has used the final identity snapshot, before terminal queries begin.
+
 ## 0.15.0
 
 ### Minor Changes
