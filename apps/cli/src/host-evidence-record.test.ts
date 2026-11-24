@@ -136,6 +136,21 @@ describe('host transcript record', () => {
     expect(readHostTranscriptPath(other)).toBe(`/a/${other}.jsonl`);
   });
 
+  // The reaper ages a readable record by its `observedAt`, not its file's
+  // mtime: a file touched recently still goes once its last report is old.
+  it('reaps by the last report a record carries, not by its file mtime', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const t0 = new Date('2026-11-01T00:00:00.000Z').getTime();
+    const other = 'b7f2c1d0-0000-4000-8000-0000000000ff';
+    recordAt(SESSION, `/a/${SESSION}.jsonl`, t0);
+    for (const name of readdirSync(hostEvidenceDir())) {
+      const touched = new Date(t0 + 15 * DAY);
+      utimesSync(path.join(hostEvidenceDir(), name), touched, touched);
+    }
+    recordAt(other, `/a/${other}.jsonl`, t0 + 15 * DAY);
+    expect(readHostTranscriptPath(SESSION)).toBeUndefined();
+  });
+
   it('treats a corrupt or tampered record as no record', () => {
     recordHostTranscriptPath(SESSION, `/a/${SESSION}.jsonl`);
     const [name] = readdirSync(hostEvidenceDir());

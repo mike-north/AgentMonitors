@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -156,18 +156,33 @@ describe('createTranscriptConfirmer (006 §4.5.2)', () => {
   // Review of PR #660 (issue #535): a FIFO renamed over the transcript after
   // the push began made the blocking open wait for a writer that never comes,
   // wedging the whole channel process. It must read as unconfirmed instead.
+  //
+  // A blocked synchronous open also stalls this test's own worker, so vitest's
+  // timeout could never fire. A writer that opens the FIFO after 3 seconds
+  // bounds the regression instead: a blocking open then ends late, and the
+  // elapsed-time assertion fails rather than the test hanging.
   it.skipIf(process.platform === 'win32')(
     'is unconfirmed, without blocking, if a FIFO replaces the transcript while waiting',
     async () => {
+      let writer: ChildProcess | undefined;
       const pending = confirmer({
         onPoll: (poll) => {
           if (poll === 1) {
             unlinkSync(transcript);
             execFileSync('mkfifo', [transcript]);
+            writer = spawn('sh', ['-c', 'sleep 3; exec 3>"$0"', transcript], {
+              stdio: 'ignore',
+            });
           }
         },
       }).begin(ID);
-      await expect(pending?.wait()).resolves.toBe(false);
+      const started = Date.now();
+      try {
+        await expect(pending?.wait()).resolves.toBe(false);
+        expect(Date.now() - started).toBeLessThan(2_000);
+      } finally {
+        writer?.kill('SIGKILL');
+      }
     },
   );
 
