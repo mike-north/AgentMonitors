@@ -37,6 +37,12 @@ hook path skipped them as cross-transport duplicates and the events never reache
   prove the channel route.
 - **006 §12.6** no longer describes the registration gap as an unverifiable advisory with a future
   probe; it points at §4.5.2.
+- **Supersedes the #535 target text** in the "confirmed channel commits (target)" entry below.
+  §4.5.2 is current. With no recorded transcript location, the channel does not push, rather than
+  releasing an unconfirmed push. A failed push, or losing the evidence after a confirmed push,
+  also marks the route unproven. Roadmap G22 no longer lists #535. 002 §7 states that only a
+  confirmed push writes `firstNotifiedAt` and `lastClaimAt`. 005 counts
+  `channel-session-unmatched` as the second advisory code, after `version-skew`.
 
 ## 2026-11-23 — Per-recipient cursors never move backward (002 §1.1.2, §7, §15) — Refs #298
 

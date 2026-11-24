@@ -1929,10 +1929,6 @@ the host confirmed, and the heartbeat reports the route's state. Until a push is
 health surface treats the channel as **not listening** and raises `channel-route-unproven` with the
 dev-flag remediation; the hook path delivers meanwhile. A model-facing probe is ruled out (§4.5.2).
 
-> **Target (Refs #535):** the server's own view still cannot tell, but the host's session transcript
-> can. [§4.5.2](#452-commit-only-on-host-confirmed-surfacing-target) replaces the advisory with
-> per-push confirmation from host evidence, and rules out a model-facing probe.
-
 ### 12.7 A hold's `claimedEventIds` is optional, and neither its absence nor emptiness is ever an ack-all fallback (issue #425 review, rounds 7–8)
 
 `HookDeliveryHold.claimedEventIds` (round 6, §12.4 item 3 / 005 §15 "reminders-suppressed") is

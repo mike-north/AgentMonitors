@@ -2317,13 +2317,13 @@ If no other transport listens, the verdict is `via none` and `delivery-verdict` 
 The remediation for an unconfirmed or failed push names
 `claude --dangerously-load-development-channels plugin:agentmonitors@agentmonitors`.
 
-**Target (Refs #462): `channel-session-unmatched` becomes the third advisory code, and the exit code
+**Target (Refs #462): `channel-session-unmatched` becomes the second advisory code, and the exit code
 agrees with the verdict.** A channel record whose session is no longer an active lead is normally a
 leftover from an ended session, which expires within the channel heartbeat TTL. Reported as a
 blocking problem, it made `doctor` print a healthy delivery verdict and still exit 1 after ordinary
 session churn. Target contract:
 
-- `channel-session-unmatched` is reported but never blocking, like the two codes above. It never
+- `channel-session-unmatched` is reported but never blocking, like `version-skew` above. It never
   sets a transport's `fail` status on its own.
 - `doctor`'s exit status **MUST** agree with the delivery verdict line: whenever the verdict reports
   delivery as deliverable, no delivery-transport check may fail. A genuinely wrong binding, where the
