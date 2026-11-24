@@ -775,23 +775,43 @@ outcomes: lost observations (002 §2) and the retained-work drain's reports (002
 | released work      | `triggered` with `observed: 0`: held work flushed, or retained work drained, with no new source input (002 §2.6, §2.7)                            | Observation (`ok`)                      |
 | admission loss     | `errored` with `notRetained: true` or `holdRefused: true` (002 §2, §4.7)                                                                          | Materialization, as an outstanding drop |
 | skipped-retry loss | `errored` with `skipped: true` (002 §2.7)                                                                                                         | Materialization, as an outstanding drop |
-| retry drain        | `errored` whose error starts `Materialization retry <id>` followed by `failed: `, `could not be discarded ` or `stopped after ` (002 §2.7)        | Materialization, as retained work       |
+| retry drain        | `errored` whose error starts `Materialization retry <ULID>` followed by `failed: `, `could not be discarded ` or `stopped after ` (002 §2.7)      | Materialization, as retained work       |
 | unrecognized       | any other `result`                                                                                                                                | no stage                                |
 
 Materialization reads its kinds through the store's outstanding-drop query and the retry outbox,
-not through the window, so a loss stays reported after newer rows push it out. History records no
-separate marker for retry-drain rows; the runtime writes their errors through one builder and
-explain recognizes the same opening. An `errored` row the runtime writes for any other failure
-(scheduling, ingest, a held flush, Interpret, a notify edit) carries no marker either, so it reads
-as a source outcome, as before.
+not through the window, so a loss stays reported after newer rows push it out.
+
+Two limits follow from what history records:
+
+- **Unmarked runtime failures.** An `errored` row the runtime writes for any other failure
+  (scheduling, ingest, a held flush, Interpret, a notify edit) carries no marker, so it reads as a
+  source outcome, as before.
+- **Drain text.** Retry-drain rows carry no marker either. The runtime writes their errors through
+  one builder, and explain recognizes the same opening, with the retry id in its ULID form. A
+  source error that opens the same way, ULID included, therefore reads as a drain report. Explain
+  cannot check that the outbox held that retry when the row was written: a retry leaves the outbox
+  when it completes, and history does not record outbox state.
 
 The Observation stage reports the newest row in the window that is not `unrecognized`:
 
 - No history at all: `failure`, `No observation history has been recorded for this monitor.`
-- While the monitor holds retained work (pending or terminal), whatever the newest row: `ok`,
-  `The source is not called while retained materialization work remains (002 §2.7); the
-Materialization stage reports that work.` The rows written meanwhile are the admitting span's
-  failure and the drain's reports, and none of them is a source call.
+- While the monitor holds retained work (pending or terminal): no tick calls the source except
+  the one that retained the work (002 §2.7). The ticks after it write only drain reports, skipped
+  retries and released work, so the retaining tick's newest row is the newest row of any other
+  kind. If that row is an unmarked `errored` row and is not the retaining span's own
+  materialization failure, it is that tick's source failure. A held flush retained on a failing
+  source call records the source's row after the flush's rows (002 §2.6), and the stage reports it
+  as a source outcome (`failure`, `Source observation failed: <error>`). Otherwise, the stage
+  reports `ok`, `The source is not called while retained materialization work remains (002 §2.7);
+the Materialization stage reports that work.` The span records its failure both as its
+  `errored` row and as the initial last error of the retry it queued. The row is the span's own
+  failure when its error (stored with the retry's safe-text rule) equals some retry's last error.
+  If no retry matches, the row is a source failure when the oldest retry has no attempt yet.
+  Once every retry has been attempted, the row is a source failure only in 002 §2.6's order:
+  directly preceded by another unmarked `errored` row, the flush's failure. These rows are read
+  from the explained window. A retaining tick that has left the window reads as the pause. A
+  span with no events whose previous tick's source failed can look like that order once every
+  retry has been attempted and the last error has changed. It then reads as a source failure.
 - A source outcome: the reasons above (`Source observation failed: <error>`, `healthy` for
   `no-change`/`rebaselined`, and so on), unchanged.
 - Released work: `ok`, `Held or retained work was materialized without new source input (observed 0).`
@@ -826,9 +846,11 @@ For example, right after `monitor retry skip`, text shows:
 
 Verified: `libs/core/src/runtime/explain-history.test.ts` (each kind),
 `libs/core/src/runtime/explain-history-stages.test.ts` (a skip explained at once, a span whose
-only observations a hold refused, a failed retry attempt, a terminal pause, released work and a
-genuine source failure, before and after retained work drains) and, through the built CLI in text
-and JSON, `apps/cli/src/retry-repair.test.ts`.
+only observations a hold refused, a failed retry attempt, a terminal pause, released work, a
+genuine source failure before and after retained work drains, a source failure in the tick whose
+held flush retained work (002 §2.6) before and after a later attempt, the retaining span before any
+attempt, and rows with an unknown outcome) and, through the built CLI in text and JSON,
+`apps/cli/src/retry-repair.test.ts`.
 
 **Delivery counts (current, #572).** The delivery stage's reason and JSON `details` count the
 monitor's projections into lead sessions. Each projection falls under exactly one count:

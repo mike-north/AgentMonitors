@@ -20,6 +20,10 @@ loss, skipped-retry loss, retry drain, unrecognized); Observation reads only sou
 released work, and reports the retained-work pause while the outbox holds work. Losses and drain
 reports stay with Materialization, whose retained-work reasons now end in the oldest retry's last
 error. A genuine source failure fails Observation as before. What history records is unchanged.
+While retained work remains, a source failure recorded by the tick that retained it still fails
+Observation: a held flush retained on a failing source call records the source's row last (002
+§2.6). A retry-drain report is recognized only with a ULID retry id. 005 §6 names the limits of
+reading unmarked rows.
 
 ## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
 
