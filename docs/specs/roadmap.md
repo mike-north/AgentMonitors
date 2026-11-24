@@ -337,7 +337,7 @@ Interpret → Deliver → [React]`:
   - A claim that is never acknowledged stays claimed forever.
   - `doctor` can report a deliverable verdict and still exit 1 on a leftover channel record.
   - A channel push to a session with no channel listener is committed as claimed, so the hook path
-    skips it and the agent never sees it.
+    skips it, and the agent sees it only in a later recap.
 - **Target:**
   - Session liveness by host process, with suspension and resume
     ([002 §6.3](./002-runtime-delivery.md), [007 §4.4](./007-agent-facing-interaction.md)).
