@@ -13,14 +13,18 @@ Agent Monitors spec set in `docs/specs/`.
 
 002 §2.6.2 specifies two store reads: receipt status within one exact workspace, and an object's
 high-water record by all four route dimensions. Both refuse a stored row that breaks the shared
-field rules, which check every envelope-derived field with the envelope validator, and a
-high-water row must match the receipt that set it. 002 §15 now has the
+field rules, which check every envelope-derived field with the envelope validator and require
+non-empty local identifiers, and a high-water row must match the receipt that set it, in the same
+workspace. Inside a receipt operation's callback, the mark it reserved reads back instead of being
+reported as corrupt. 002 §15 now has the
 `durable-ingress-v1` marker written with nonempty held debounce or rollup state and with every
 materialization retry route, in the same transaction as that work; the held-state decision follows
 the serialized state that is stored. Refusing a database that holds a capability this version does
 not know moves from target to current: the open fails with an error naming the capability and a
-newer version, before writing anything. Versions released before markers existed still do not check
-them. 004 §2.14 lists the required scenarios.
+newer version, before writing anything. Uncheckpointed WAL frames are checked through a read-only
+connection and are never checkpointed by a refusal, and a refusal inside the schema transaction
+restores a rollback-journal file's mode. Versions released before markers existed still do not
+check them. 004 §2.14 lists the required scenarios.
 
 ## 2026-11-23 — External event receipt operation (002 §2.6, §2.6.1, §15, §16.1; 004 §2.14, §3.4.3) — Refs #481
 

@@ -1538,8 +1538,12 @@ Both reads hydrate stored rows by the same field rules: every value copied from 
 local identifier (workspace identity, receipt ID) is a non-empty string; every sequence and count a
 non-negative safe integer; every timestamp a valid date. A receipt must
 also meet §2.6.1's outcome rules. A high-water row must also be coherent: its key is the requested
-route, and the receipt it names exists on that route with the same upstream event and an object
-sequence equal to the mark. A sequence row and its receipt are read in one transaction. A row that
+route, and the receipt it names exists on that route, in the same workspace, with the same upstream
+event and an object sequence equal to the mark. A sequence row and its receipt are read in one
+transaction. Inside a receipt operation's callback (§2.6.1), the mark that operation reserved names
+the receipt it is accepting, which is written only after the callback returns. A read there checks
+the mark against that receipt instead, so the mark is returned, not refused; a mark naming any other
+missing receipt is still refused. A row that
 breaks any rule is refused with an error naming the row and the broken rule, never stored content;
 it is never returned.
 
@@ -3654,9 +3658,26 @@ Opening or migrating a database creates the table but writes no marker.
 knows, at every scope. Opening a database whose markers name any other capability fails with an
 error that names each unknown capability, says a newer version of Agent Monitors wrote it, and says
 the database was left unchanged. The check runs before the open writes anything, the journal-mode
-switch included, and again inside the schema transaction. A refused open leaves the schema, rows,
-markers and journal mode as they were. A version released before markers existed does not check
-them; using one on a marked database remains unsupported.
+switch included, and again inside the schema transaction, which catches a marker a newer version
+commits while the open waits for the write lock.
+
+A refused open leaves the main file, the `-wal`, the schema, rows, markers and journal mode as they
+were. Only the `-shm` shared-memory index, which every reader rewrites and SQLite rebuilds from the
+WAL, may change.
+
+- **Uncheckpointed WAL frames.** A `-wal` can hold committed frames that were never checkpointed,
+  for example after a newer daemon was killed. When a `-wal` exists, the first check therefore runs
+  on a separate read-only connection, which never checkpoints or deletes the WAL. Without one, the
+  read-write connection checks and removes the sidecars it created when it closes.
+- **Refusal inside the schema transaction.** The transaction rolls back. A file that was in a
+  rollback-journal mode is switched back to it. A file already in WAL mode is closed while a
+  read-only connection stays open, so the refused connection is not the last and does not checkpoint
+  a newer writer's frames into the main file.
+- **Known gap.** If another connection still has a rollback-journal file open in WAL mode when the
+  refusal comes, SQLite cannot leave WAL mode, and the file stays in it.
+
+A version released before markers existed does not check them; using one on a marked database
+remains unsupported.
 
 | Column               | Type             | Notes                 |
 | -------------------- | ---------------- | --------------------- |

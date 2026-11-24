@@ -385,8 +385,10 @@ const KNOWN_DATABASE_CAPABILITIES: ReadonlySet<string> = new Set([
 
 /**
  * Opening refused because the database holds a forward-only capability this
- * version does not know (002 §15). Thrown before the open writes anything, so
- * the database is left exactly as it was. Not re-exported from the package
+ * version does not know (002 §15). Thrown either before the open writes
+ * anything, or from the schema transaction after the journal-mode switch, which
+ * the refusal undoes, so the database is left as it was (only the rebuildable
+ * `-shm` index may change). Not re-exported from the package
  * entry point: callers see it as an `Error` thrown by `createDb`.
  *
  * @internal
