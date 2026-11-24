@@ -2420,6 +2420,11 @@ Verified: `libs/core/src/runtime/store.ts` — `openSession()` (lines 102–152)
 
 > **Status: current** (Refs #312). Added so [007 §4.4](./007-agent-facing-interaction.md)'s
 > ephemeral monitors reap on a session going dormant, not only on an explicit close.
+>
+> **To be replaced by [§6.3](#63-session-liveness-by-host-process-and-suspension-target) (Refs #396).**
+> Inactivity does not show that a session has gone. An agent may legitimately wait, with no hook
+> activity, until a delivery arrives and then act on it; this trigger reaps that agent's watches at
+> the point it most needs them.
 
 §6.1 makes a session dormant on an **explicit** close (the `session close` verb, driven by the host's
 session-end hook). A session can also go away **without** an explicit close — the host crashes, the
@@ -2451,6 +2456,72 @@ Verified: `libs/core/src/runtime/service.ts` — `reapDormantSessions()` (called
 `libs/core/src/runtime/store.ts` — `staleActiveSessions()`. Proven by the
 `reaps on per-session dormancy by inactivity` and `does NOT reap a session that is still within the
 dormancy window` cases in `libs/core/src/runtime/ephemeral-monitors.test.ts`.
+
+### 6.3 Session liveness by host process, and suspension (_target_)
+
+> **Status: target** (Refs #396). Replaces the inactivity trigger of [§6.2](#62-per-session-dormancy-current).
+
+A session is **alive while its host process is alive**. Activity, or its absence, is never a
+liveness signal.
+
+- **Liveness evidence.** When a session is opened or resumed, the adapter records the identity of
+  the host process that owns it: a process id plus evidence that rules out process-id reuse, such as
+  the process start time. The daemon decides liveness by checking that this exact process still
+  exists. The check **MUST NOT** send anything into the host's conversation. A liveness probe that
+  costs model input is out of contract, because after the host's prompt-cache window expires every
+  probe would resend the whole conversation.
+- **No inactivity reap.** While the host process is alive, the runtime **MUST NOT** make the session
+  dormant, suspend its ephemeral monitors or reap them, however long the session goes without a
+  hook or claim.
+- **Explicit end.** A session end reported by the host ([§6.1](#61-session-identity)) — for Claude
+  the `SessionEnd` hook, which also fires on `/clear` — reaps the session's ephemeral monitors as
+  today ([007 §4.4](./007-agent-facing-interaction.md)). This stays the primary reap path; it is the
+  only one while the host lives.
+- **Host loss without an end.** When the recorded host process is gone and no end was reported, as
+  after a crash or a killed host, the session becomes **suspended**. Its ephemeral monitors stop
+  observing; they are not reaped. Suspension keeps their durable state: source state, snapshots,
+  per-recipient cursors, delivery rows and held notify work ([§6.4](#64-held-notify-work-when-an-ephemeral-declaration-retires-or-suspends-target)).
+- **Resume.** Opening the session again with the same `(adapter, hostSessionId)`, such as a host
+  resume, records the new host process and re-arms its suspended ephemeral monitors. Each source
+  resumes from its own durable state, so changes made while suspended are observed on the next
+  tick rather than lost.
+- **Final expiry.** A suspended session that is never resumed is retired by the retention policy for
+  ephemeral records (Refs #395), not by a liveness timer. Retirement reaps its ephemeral monitors.
+- **Unknown liveness.** If the adapter cannot identify a host process, the session's ephemeral
+  monitors are kept until an explicit end or retention retires them. The runtime **MUST NOT** fall
+  back to an inactivity timer.
+
+**Where suspension appears.** Suspension is a session status. Sessions gain a third status,
+`suspended`, beside `active` and `dormant`, and `session list` shows it. An ephemeral monitor owned
+by a suspended session reports the watch status `suspended` in `watch list`, `monitor explain` and
+`doctor`, so a reader can tell "paused until resume" from "running" and from "reaped".
+
+Suspension is per session, like §6.2's dormancy, and is distinct from the daemon-wide idle
+self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server). For that rule a
+suspended session is not active: it has no host to deliver to, so it does not keep the daemon
+alive. Its durable state survives the daemon stopping, and a resume re-arms it.
+
+### 6.4 Held notify work when an ephemeral declaration retires or suspends (_target_)
+
+> **Status: target** (Refs #636).
+
+Notify work that the runtime has accepted for an ephemeral monitor, such as a debounce batch or a
+rollup window, **MUST NOT** be held indefinitely or discarded silently when the declaration stops
+being evaluated.
+
+- **Cancellation** (`watch cancel`): the held work is recorded with an explicit terminal
+  disposition, _discarded on cancel_, at the moment of cancellation. The agent asked to stop
+  watching, so the work is not delivered after the cancel. The disposition is durable and appears in
+  `monitor explain` and `doctor`.
+- **Suspension** ([§6.3](#63-session-liveness-by-host-process-and-suspension-target)): the held work
+  is kept with its original acceptance and timing. On resume it is released through the normal
+  notify timing. A deadline that passed while suspended releases on the first tick after resume.
+- **Explicit session end, or retention retiring a suspended session**: the held work is recorded
+  with an explicit terminal disposition, _discarded on retirement_, durable and visible in the same
+  way as a cancellation.
+- After a cancellation, an explicit end or a retirement, no "held" entry may remain for the retired
+  declaration in `doctor` or `monitor explain`. Suspension is not retirement, so its held work stays
+  visible as held.
 
 ## 7. Unread, Claimed, and Acknowledged
 
@@ -2892,7 +2963,8 @@ monitor through the persisted pipeline state and returns stages for:
 
 1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
-3. Observation: recent `observation_history` rows and latest outcome
+3. Observation: the newest `observation_history` row that describes a source call, or the pause
+   while retained work remains (005 §6, "Which history rows each stage reads")
 4. Notify state: accepted debounce/rollup batches and active throttle suppression in
    `monitor_state.notify_state`, including accepted batches beside definition failures
 5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
@@ -2944,8 +3016,10 @@ of the two were recorded; the error uses the display rule above. `details.unreta
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
 retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
 `failure` until every drop is superseded (§2): a quiet tick, a notify hold, an observe failure or
-events for other keys leave it failing. The observation stage still describes the newest history
-row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
+events for other keys leave it failing. The observation stage reads only rows that describe a
+source call: a drop row, a skipped retry's row and the retained-work drain's reports belong to
+Materialization, and while retained work remains the source is not called, so Observation reports
+that pause instead (005 §6, "Which history rows each stage reads", #591). Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
 real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
 (Refs #497, #575).
 
