@@ -1532,8 +1532,11 @@ neither writes.
   `objectId`, `highestSequence`, `receiptId` (the receipt that set the mark), `upstreamEventId` and
   `updatedAt`. All four dimensions must match; a row differing in any one is another route.
 
-Both reads hydrate stored rows by the same field rules: every identifier is a non-empty string,
-every sequence and count a non-negative safe integer, every timestamp a valid date. A receipt must
+Both reads hydrate stored rows by the same field rules: every value copied from an envelope
+(`monitorId`, `source`, `upstreamEventId`, `objectId`, and for a receipt also `eventKind` and
+`occurredAt`) is one envelope admission accepts, checked by the envelope validator itself; every
+local identifier (workspace identity, receipt ID) is a non-empty string; every sequence and count a
+non-negative safe integer; every timestamp a valid date. A receipt must
 also meet §2.6.1's outcome rules. A high-water row must also be coherent: its key is the requested
 route, and the receipt it names exists on that route with the same upstream event and an object
 sequence equal to the mark. A sequence row and its receipt are read in one transaction. A row that
