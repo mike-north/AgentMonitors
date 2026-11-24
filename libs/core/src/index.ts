@@ -108,6 +108,27 @@ export type {
   EnqueuePayload,
 } from './inbox/types.js';
 
+// Versioned source-neutral envelope admission and semantic identity.
+export {
+  EXTERNAL_EVENT_SCHEMA,
+  externalEventLimits,
+  externalEventReservedScopeKeys,
+  validateExternalEventEnvelope,
+} from './external-ingress/contract.js';
+export {
+  externalEventObjectKey,
+  externalEventSemanticHash,
+} from './external-ingress/identity.js';
+export type {
+  ExternalEventEnvelope,
+  ExternalEventEnvelopeValidationResult,
+  ExternalEventError,
+  ExternalEventErrorCode,
+  ExternalEventScope,
+  ExternalJsonObject,
+  ExternalJsonValue,
+} from './external-ingress/contract.js';
+
 // Observation sources
 export { SourceRegistry } from './observation/registry.js';
 export { generateMonitorSchema } from './observation/schema-generator.js';
