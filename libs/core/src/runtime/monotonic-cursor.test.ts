@@ -36,6 +36,7 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.restoreAllMocks();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop();
     if (dir) rmSync(dir, { recursive: true, force: true });
@@ -401,5 +402,102 @@ describe('per-recipient cursors are monotonic (issue #298)', () => {
     expect(cursor?.baselineSnapshotId).toBe(eventA3);
     const eventC = materialize(store, 'a4', 'normal', at(4));
     expect(recipientDelta(store, lead, eventC)).toBe('- 1: a3\n+ 1: a4');
+  });
+
+  /** The raw cursor row for {@link OBJECT_KEY}, including its stored position. */
+  function rawCursor(
+    client: Database.Database,
+    sessionId: string,
+  ): Record<string, unknown> | undefined {
+    return client
+      .prepare<[string], Record<string, unknown>>(
+        `SELECT baseline_snapshot_id, baseline_content,
+                baseline_event_created_at, baseline_event_sequence
+           FROM session_object_cursor WHERE session_id = ?`,
+      )
+      .get(sessionId);
+  }
+
+  it('the stored position keeps the cursor in place after its baseline event row is gone', () => {
+    const db = createDb(freshDbPath());
+    const client = (db as unknown as { $client: Database.Database }).$client;
+    const store = new RuntimeStore(db);
+    const lead = openLead(store, 'sess-1');
+
+    materialize(store, 'a0', 'normal', at(0));
+    claim(store, lead, store.pendingEventsForSession(lead), 'turn-idle');
+    materialize(store, 'a1', 'normal', at(1));
+    const eventA2 = materialize(store, 'a2', 'high', at(2));
+    claim(
+      store,
+      lead,
+      store.pendingEventsForSession(lead, 'high'),
+      'turn-interruptible',
+    );
+    const before = rawCursor(client, lead);
+    expect(before?.['baseline_snapshot_id']).toBe(eventA2);
+    expect(before?.['baseline_event_created_at']).toBe(
+      Math.floor(at(2).getTime() / 1000),
+    );
+    expect(before?.['baseline_event_sequence']).not.toBeNull();
+
+    // Remove every trace of a2's event row; the cursor keeps only its copy of
+    // a2's position.
+    client.pragma('foreign_keys = OFF');
+    client
+      .prepare('DELETE FROM session_event_state WHERE event_id = ?')
+      .run(eventA2);
+    client
+      .prepare('DELETE FROM monitor_snapshots WHERE event_id = ?')
+      .run(eventA2);
+    client.prepare('DELETE FROM monitor_events WHERE id = ?').run(eventA2);
+
+    // Claiming the older a1 must leave the cursor, and its position, at a2.
+    claim(
+      store,
+      lead,
+      store.pendingEventsForSession(lead, 'normal'),
+      'turn-idle',
+    );
+    expect(rawCursor(client, lead)).toEqual(before);
+  });
+
+  it('a concurrent advance between reading the cursor and refreshing its position is not undone', () => {
+    const dbPath = freshDbPath();
+    const store = new RuntimeStore(createDb(dbPath));
+    const other = new RuntimeStore(createDb(dbPath));
+    const lead = openLead(store, 'sess-1');
+
+    const eventA0 = materialize(store, 'a0', 'normal', at(0));
+    claim(store, lead, store.pendingEventsForSession(lead), 'turn-idle');
+    const eventA1 = materialize(store, 'a1', 'normal', at(1));
+    const eventA2 = materialize(store, 'a2', 'high', at(2));
+
+    // While this store claims a1 it reads the cursor at a0. Just as it looks up
+    // a0's position, another writer claims the newer a2 and moves the cursor.
+    const internals = store as unknown as {
+      eventOrderPosition: (
+        eventId: string | null,
+      ) => { createdAt: Date; sequence: number } | null;
+    };
+    const lookUp = internals.eventOrderPosition.bind(store);
+    let interleaved = false;
+    vi.spyOn(internals, 'eventOrderPosition').mockImplementation((eventId) => {
+      if (eventId === eventA0 && !interleaved) {
+        interleaved = true;
+        other.markClaimed(lead, [eventA2], 'turn-interruptible');
+      }
+      return lookUp(eventId);
+    });
+
+    store.markClaimed(lead, [eventA1], 'turn-idle');
+    expect(interleaved).toBe(true);
+
+    expect(
+      store.getSessionObjectCursor(lead, MONITOR_ID, OBJECT_KEY, WORKSPACE)
+        ?.baselineSnapshotId,
+    ).toBe(eventA2);
+    const eventC = materialize(store, 'a3', 'normal', at(3));
+    expect(recipientDelta(store, lead, eventC)).toBe('- 1: a2\n+ 1: a3');
   });
 });
