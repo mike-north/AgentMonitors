@@ -410,12 +410,6 @@ export class NewerDatabaseCapabilityError extends Error {
 }
 
 /**
- * Throw {@link NewerDatabaseCapabilityError} when any compatibility marker
- * names a capability outside {@link KNOWN_DATABASE_CAPABILITIES}. Only reads:
- * a database without the marker table (fresh, or written before it existed)
- * passes, and markers of every workspace scope count.
- */
-/**
  * {@link refuseUnknownCapabilities} through a separate read-only connection,
  * which reads uncheckpointed WAL frames but never checkpoints or deletes the
  * WAL when it closes. Only the shared-memory index, which SQLite rebuilds from
@@ -431,6 +425,12 @@ function refuseUnknownCapabilitiesReadOnly(dbPath: string): void {
   }
 }
 
+/**
+ * Throw {@link NewerDatabaseCapabilityError} when any compatibility marker
+ * names a capability outside {@link KNOWN_DATABASE_CAPABILITIES}. Only reads:
+ * a database without the marker table (fresh, or written before it existed)
+ * passes, and markers of every workspace scope count.
+ */
 function refuseUnknownCapabilities(sqlite: BetterSQLiteClient): void {
   const table = sqlite
     .prepare<

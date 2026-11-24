@@ -373,17 +373,41 @@ describe('reading an object sequence from inside a receipt operation', () => {
   });
 
   it('forgets the reservation when the operation rolls back', () => {
-    const store = new RuntimeStore(createDb(':memory:'));
+    const db = createDb(':memory:');
+    const store = new RuntimeStore(db);
+    let rolledBackId = '';
     expect(() =>
       store.withExternalEventReceipt(
         receiptInput(),
-        () => {
+        ({ receiptId }) => {
+          rolledBackId = receiptId;
           throw new Error('work failed');
         },
         RECEIPT_NOW,
       ),
     ).toThrow('work failed');
     expect(readSequence(store, ROUTE)).toBeNull();
+
+    // A mark that names the rolled-back receipt, with every field matching
+    // it, names a receipt that does not exist. The reservation ended with its
+    // callback, so the read must refuse the mark rather than accept it.
+    clientOf(db)
+      .prepare(
+        `INSERT INTO external_object_sequences
+           (id, workspace_identity, monitor_id, source, object_id, highest_sequence,
+            receipt_id, upstream_event_id, updated_at)
+         VALUES ('planted-mark', ?, ?, ?, ?, 42, ?, 'delivery-42', 0)`,
+      )
+      .run(
+        ROUTE.workspaceIdentity,
+        ROUTE.monitorId,
+        ROUTE.source,
+        ROUTE.objectId,
+        rolledBackId,
+      );
+    expect(() => readSequence(store, ROUTE)).toThrow(
+      'Stored external object sequence for the requested object is invalid: it does not match the receipt that set it.',
+    );
   });
 
   it('still refuses a mark naming a receipt nothing is accepting', () => {
