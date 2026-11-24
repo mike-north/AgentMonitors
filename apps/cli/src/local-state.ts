@@ -11,8 +11,8 @@ export interface LocalState {
   socket?: string;
   db?: string;
   reapAfterMs?: number;
-  /** Store-wide claim-cycle lifetime in milliseconds; absent uses the core default. */
-  claimTtlMs?: number;
+  /** Unapplied claim-ttl-ms scalar text, preserved even when invalid; only runtime construction validates it. */
+  claimTtlMs?: string;
   /**
    * ISO timestamp of the most recent time THIS workspace's own lazy-boot
    * (`session start`'s check-then-spawn) gave up waiting for the daemon to
@@ -53,7 +53,11 @@ function parseFrontmatter(raw: string): Record<string, unknown> | null {
     if (colonIdx === -1) continue;
     const key = line.slice(0, colonIdx).trim();
     const rawVal = line.slice(colonIdx + 1).trim();
-    if (rawVal === 'true') {
+    // Coordination must preserve policy text without interpreting it: an edit
+    // for the next runtime must not prevent an existing session from ending.
+    if (key === 'claim-ttl-ms') {
+      data[key] = rawVal;
+    } else if (rawVal === 'true') {
       data[key] = true;
     } else if (rawVal === 'false') {
       data[key] = false;
@@ -66,17 +70,7 @@ function parseFrontmatter(raw: string): Record<string, unknown> | null {
   return data;
 }
 
-/** A malformed claim policy must never silently select a different lifetime. */
-function validateClaimTtlMs(value: unknown): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(
-      'claim-ttl-ms must be a positive safe integer in milliseconds',
-    );
-  }
-  return value;
-}
-
-/** Read the per-project coordination file. Absent/unparseable → disabled; a malformed claim TTL is an explicit error. */
+/** Read coordination only. Absent/unparseable → disabled; claim policy remains unapplied raw text. */
 export function readLocalState(workspacePath: string): LocalState {
   let raw: string;
   try {
@@ -94,8 +88,8 @@ export function readLocalState(workspacePath: string): LocalState {
   const reap = data['reap-after-ms'];
   return {
     enabled: data['enabled'] === true,
-    ...(data['claim-ttl-ms'] !== undefined
-      ? { claimTtlMs: validateClaimTtlMs(data['claim-ttl-ms']) }
+    ...(typeof data['claim-ttl-ms'] === 'string'
+      ? { claimTtlMs: data['claim-ttl-ms'] }
       : {}),
     ...(typeof data['socket'] === 'string' ? { socket: data['socket'] } : {}),
     ...(typeof data['db'] === 'string' ? { db: data['db'] } : {}),
@@ -111,10 +105,7 @@ export function writeLocalState(
   workspacePath: string,
   state: LocalState,
 ): void {
-  const claimTtlMs =
-    state.claimTtlMs === undefined
-      ? undefined
-      : validateClaimTtlMs(state.claimTtlMs);
+  const claimTtlMs = state.claimTtlMs;
   const target = filePath(workspacePath);
   // `.claude/` belongs to the host tool, so we do not force its mode; only the
   // coordination file we own is made owner-only (issue #292). It records the
@@ -124,9 +115,7 @@ export function writeLocalState(
   const lines = [
     '---',
     `enabled: ${String(state.enabled)}`,
-    ...(claimTtlMs !== undefined
-      ? [`claim-ttl-ms: ${String(claimTtlMs)}`]
-      : []),
+    ...(claimTtlMs !== undefined ? [`claim-ttl-ms: ${claimTtlMs}`] : []),
     ...(state.socket ? [`socket: ${state.socket}`] : []),
     ...(state.db ? [`db: ${state.db}`] : []),
     `reap-after-ms: ${String(state.reapAfterMs ?? DEFAULT_REAP_AFTER_MS)}`,

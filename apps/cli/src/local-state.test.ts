@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { readLocalState, writeLocalState } from './local-state.js';
@@ -169,16 +175,26 @@ describe('workspace claim TTL', () => {
         '---\nenabled: true\nclaim-ttl-ms: 60000\n---\n',
       );
       const state = readLocalState(ws);
-      expect(state.claimTtlMs).toBe(60000);
+      expect(state.claimTtlMs).toBe('60000');
       writeLocalState(ws, { ...state, socket: '/example.sock' });
-      expect(readLocalState(ws).claimTtlMs).toBe(60000);
+      expect(readLocalState(ws).claimTtlMs).toBe('60000');
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
   });
 
-  it.each(['0', '-1', '1.5', 'Infinity', 'true', 'nope', ''])(
-    'rejects invalid duration %j with a named diagnostic',
+  it.each([
+    '0',
+    '-1',
+    '1.5',
+    'Infinity',
+    'true',
+    'nope',
+    '',
+    '"60000"',
+    '9007199254740992',
+  ])(
+    'preserves unapplied raw claim policy %j across coordination rewrites',
     (value) => {
       const ws = mkdtempSync(path.join(tmpdir(), 'claim-setting-'));
       try {
@@ -187,9 +203,16 @@ describe('workspace claim TTL', () => {
           path.join(ws, '.claude', 'agentmonitors.local.md'),
           `---\nenabled: true\nclaim-ttl-ms: ${value}\n---\n`,
         );
-        expect(() => readLocalState(ws)).toThrow(
-          'claim-ttl-ms must be a positive safe integer in milliseconds',
-        );
+        const state = readLocalState(ws);
+        expect(state.claimTtlMs).toBe(value);
+        writeLocalState(ws, { ...state, socket: '/rewritten.sock' });
+        expect(readLocalState(ws).claimTtlMs).toBe(value);
+        expect(
+          readFileSync(
+            path.join(ws, '.claude', 'agentmonitors.local.md'),
+            'utf8',
+          ),
+        ).toContain(`claim-ttl-ms: ${value}\n`);
       } finally {
         rmSync(ws, { recursive: true, force: true });
       }

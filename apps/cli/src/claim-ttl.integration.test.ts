@@ -214,7 +214,7 @@ it.each(['doctor', 'explain', 'history', 'rearm', 'skip'] as const)(
                 dbPath,
               );
             case 'history':
-              return listObservationHistoryInProcess(input, dbPath);
+              return listObservationHistoryInProcess(input, dbPath, root);
             case 'rearm':
               return rearmRetryInProcess(input, dbPath);
             case 'skip':

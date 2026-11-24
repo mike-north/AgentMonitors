@@ -563,6 +563,10 @@ export async function explainMonitorInProcess(
  * bypassing the daemon socket. Fallback for {@link listObservationHistoryClient}
  * when the daemon is unreachable. Issue #150.
  *
+ * `storageWorkspace` selects the database's claim policy independently of
+ * `query.workspacePath`, which is only an optional audit filter. An unscoped
+ * query must remain unscoped while using the workspace that selected storage.
+ *
  * `dbPath` is the workspace-resolved database path ({@link
  * resolveWorkspaceDbPath} in `workspace-db-path.ts`) — the SAME db `doctor`
  * reads (issue #374). Required (not optional, matching {@link
@@ -574,13 +578,9 @@ export async function explainMonitorInProcess(
 export function listObservationHistoryInProcess(
   query: ObservationHistoryQuery,
   dbPath: string,
+  storageWorkspace: string,
 ): ObservationHistoryRecord[] {
-  const runtime = createRuntime(
-    dbPath,
-    undefined,
-    undefined,
-    query.workspacePath,
-  );
+  const runtime = createRuntime(dbPath, undefined, undefined, storageWorkspace);
   return runtime.listObservationHistory(query);
 }
 

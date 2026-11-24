@@ -12,6 +12,18 @@ import { resolveDbPath } from './db-path.js';
 import { resolveSocketPath } from './daemon-ipc.js';
 import { SourceRegistry } from '@agentmonitors/core';
 
+/** Applying policy belongs to store construction, never session/socket coordination. */
+function parseClaimTtlMs(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      'claim-ttl-ms must be a positive safe integer in milliseconds',
+    );
+  }
+  return value;
+}
+
 /**
  * Compose one store with the target workspace's persisted claim policy. Every
  * daemon and offline reader uses this boundary, including callers outside the
@@ -23,7 +35,7 @@ export function createRuntime(
   shutdownSignal?: AbortSignal,
   workspacePath = process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd(),
 ): AgentMonitorRuntime {
-  const { claimTtlMs } = readLocalState(workspacePath);
+  const claimTtlMs = parseClaimTtlMs(readLocalState(workspacePath).claimTtlMs);
   const db = createDb(dbPath);
   const registry = new SourceRegistry();
   registerCoreSources(registry, commandOwner, shutdownSignal);

@@ -1633,12 +1633,17 @@ claim-ttl-ms: 60000
 ```
 
 `claim-ttl-ms` is a **positive safe integer in milliseconds** (`60000` means one minute).
-Zero, negative, fractional and nonnumeric values are rejected with an error naming the setting;
-they never silently fall back to the default. Precedence is the target workspace's
+When constructing a runtime/store, zero, negative, fractional and nonnumeric values are rejected
+with an error naming the setting; they never silently fall back to the default. Coordination-only
+reads and rewrites preserve the raw scalar without validating or applying it. Thus editing a bad
+replacement does not prevent session start/end against an already-running daemon, and a disabled
+workspace still takes its silent lifecycle quick exit. Precedence is the target workspace's
 `claim-ttl-ms`, when present, then **1,800,000 ms (30 minutes)**. There is no claim-TTL CLI flag or
 environment override. Database/socket overrides select storage/transport; they do not override
 this policy. Explicit workspace arguments and hook workspace context select the coordination file;
-unscoped runtime composition uses `CLAUDE_PROJECT_DIR`, then the current directory.
+unscoped runtime composition uses `CLAUDE_PROJECT_DIR`, then the current directory. Offline
+`monitor history` without `--workspace` selects storage and policy from cwd while leaving its
+history query unscoped; `CLAUDE_PROJECT_DIR` does not select a different policy for that database.
 
 The policy applies store-wide, across all urgency bands. Daemon run (including lazy/detached
 startup), daemon once, and in-process CLI readers including doctor/explain resolve the same
