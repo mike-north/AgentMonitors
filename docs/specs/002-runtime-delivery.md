@@ -1320,7 +1320,10 @@ them, `no-change` when nothing drained or arrived, a failed attempt's lone `erro
 completed retries recorded before the failure that stops the drain, a drain on a tick where the
 monitor is not due, the drained row ahead of the `errored` row of a source failure, a terminal
 retry, a schedule error and an ingest that throws, and a `no-files-matched` or `rebaselined`
-source outcome kept on the `triggered` row and diagnosed by `explainMonitor`. Its `held work
+source outcome kept on the `triggered` row and diagnosed by `explainMonitor`. Its `history of a
+tick that drains retained work, then resumes a retained poll result` case drains a retry a second
+runtime on the same database queued, then admits a poll result held back by a blocked notify edit
+(§4.6), and records one `triggered` row counting both. Its `held work
 waits behind retained work while the source fails` cases count the drained retry in the held
 flush row written beside a source failure, and record it ahead of a failed held flush and a
 blocked notify edit. `verify-artifact-ownership-retry-drain.test.ts` records it ahead of a failed

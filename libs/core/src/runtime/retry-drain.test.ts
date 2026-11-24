@@ -1098,14 +1098,9 @@ describe('history of a tick that drains retained work', () => {
 
     repair(client, 'A');
     clock.advance(2_000);
-    const result = await runtime.tick(f.monitorsDir, f.root);
-    expect(result.skippedMonitors).toEqual([
-      expect.objectContaining({ monitorId: 'm' }),
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
     ]);
-    expect(outcomes(runtime)[0]).toEqual({
-      result: 'triggered',
-      observationData: { observed: 0, emitted: 2 },
-    });
     expect(eventSummaries(client)).toEqual(['A', 'B']);
     // The source was not asked for C: the monitor was not due.
     expect(f.calls).toHaveLength(1);
@@ -1215,5 +1210,162 @@ describe('history of a tick that drains retained work', () => {
         reason: expect.stringContaining('matched zero files'),
       }),
     );
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * A poll result retained behind a blocked notify edit (002 §4.6) is admitted
+ * on a later tick, after that tick's drain. Its span row counts the drained
+ * retry too, so the tick writes one row, not two (002 §2.7 **History**). The
+ * retry is queued by a second runtime on the same database, as a `daemon once`
+ * beside a running daemon would.
+ */
+describe('history of a tick that drains retained work, then resumes a retained poll result', () => {
+  it('counts the drained retry in the resumed result row', async () => {
+    const clock = stubClock(T0);
+    const root = mkdtempSync(
+      path.join(tmpdir(), 'agentmon-retry-drain-resume-'),
+    );
+    tempRoots.push(root);
+    const dir = path.join(root, 'monitors');
+    mkdirSync(dir);
+    const file = path.join(dir, 'held.md');
+    const dbPath = path.join(root, 'state.sqlite');
+    const open = () => {
+      const db = createDb(dbPath);
+      const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+      clients.push(client);
+      return { client, store: new RuntimeStore(db) };
+    };
+    const { client, store } = open();
+    const started = deferred<undefined>();
+    const pending = deferred<ObservationResult>();
+    let calls = 0;
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'handoff-source',
+      stateful: true,
+      scopeSchema: { type: 'object' },
+      observe() {
+        calls += 1;
+        if (calls === 1)
+          return Promise.resolve({
+            observations: [
+              {
+                title: 'A',
+                summary: 'A',
+                snapshotText: 'A',
+                objectKey: 'objA',
+              },
+            ],
+            nextState: { cursor: 1 },
+          });
+        if (calls === 2) {
+          started.resolve(undefined);
+          return pending.promise;
+        }
+        return Promise.resolve({ observations: [], nextState: { cursor: 99 } });
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry, [
+      claudeCodeAdapter,
+    ]);
+    openSession(runtime, root, 'owner');
+    const state = () => store.getMonitorState('held', root);
+    const edit = (notify: string) => {
+      writeFileSync(
+        file,
+        md`---
+watch:
+  type: handoff-source
+  interval: 1h
+baseline-strategy: incremental
+${notify}---
+Handle it.
+`,
+      );
+    };
+    const rows = () =>
+      runtime
+        .listObservationHistory({ monitorId: 'held' })
+        .map(({ result, observationData }) => ({ result, observationData }));
+
+    try {
+      // A is held; a second poll then waits in the source.
+      edit('notify:\n  strategy: debounce\n  settle-for: 1h\n');
+      await runtime.tick(dir, root);
+      store.setMonitorState('held', root, {
+        ...state(),
+        lastObservationAt: new Date('2000-01-01T00:00:00Z'),
+      });
+      const slow = runtime.tick(dir, root);
+      await started.promise;
+
+      // Dropping the debounce releases A, and that write fails: the edit is
+      // blocked, so the poll's result B is retained in process.
+      edit('');
+      client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
+        BEGIN SELECT RAISE(FAIL, 'owned edit fault'); END`);
+      await runtime.tick(dir, root);
+      pending.resolve({
+        observations: [
+          { title: 'B', summary: 'B', snapshotText: 'B', objectKey: 'objB' },
+        ],
+        nextState: { cursor: 2 },
+      });
+      await slow;
+      expect(state().sourceState).toEqual({ cursor: 1 });
+      client.exec('DROP TRIGGER fault');
+
+      // A second runtime reconciles the edit (A is emitted) and admits C,
+      // whose write fails, so C is retained in the outbox. Its source keeps
+      // the baseline, so B still applies to it.
+      const other = open();
+      const otherRegistry = new SourceRegistry();
+      otherRegistry.register({
+        name: 'handoff-source',
+        stateful: true,
+        scopeSchema: { type: 'object' },
+        observe: () =>
+          Promise.resolve({
+            observations: [
+              {
+                title: 'C',
+                summary: 'C',
+                snapshotText: 'C',
+                objectKey: 'objC',
+              },
+            ],
+            nextState: { cursor: 1 },
+          }),
+      });
+      failSummary(other.client, 'C');
+      await new AgentMonitorRuntime(other.store, otherRegistry, [
+        claudeCodeAdapter,
+      ]).tick(dir, root);
+      expect(retrySummaries(client)).toEqual(['C']);
+      repair(other.client, 'C');
+      other.client.close();
+
+      // The recovery tick drains C, then resumes B: one row counts both.
+      clock.advance(600_000);
+      const before = rows().length;
+      await runtime.tick(dir, root);
+      const after = rows();
+      expect(after.slice(0, after.length - before)).toEqual([
+        { result: 'triggered', observationData: { observed: 1, emitted: 2 } },
+      ]);
+      expect(eventSummaries(client)).toEqual(['A', 'C', 'B']);
+    } finally {
+      pending.resolve({ observations: [] });
+    }
   });
 });
