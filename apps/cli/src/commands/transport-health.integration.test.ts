@@ -1247,6 +1247,7 @@ This monitor fires on a schedule.
         'route unproven, so not counted as listening',
       );
       expect(text.stdout).not.toContain('✗ transport:channel');
+      expect(text.exitCode).toBe(0);
 
       const json = runWithEnv(
         ['doctor', '--workspace', fixture.dir, '--format', 'json'],

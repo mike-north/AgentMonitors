@@ -9,6 +9,7 @@ import {
   readFileSync,
   readdirSync,
   rmSync,
+  utimesSync,
   writeFileSync,
   mkdirSync,
 } from 'node:fs';
@@ -24,6 +25,25 @@ import {
 const SESSION = 'b7f2c1d0-0000-4000-8000-000000000002';
 let dataRoot: string;
 let previous: string | undefined;
+
+/**
+ * Record at a simulated time: the record's clock AND, when this call really
+ * wrote the file, its mtime are set to `at`, as if the write happened then.
+ */
+function recordAt(
+  hostSessionId: string,
+  transcriptPath: string,
+  at: number,
+): void {
+  recordHostTranscriptPath(hostSessionId, transcriptPath, new Date(at));
+  for (const name of readdirSync(hostEvidenceDir())) {
+    if (!name.includes(hostSessionId)) continue;
+    const file = path.join(hostEvidenceDir(), name);
+    if (readFileSync(file, 'utf-8').includes(new Date(at).toISOString())) {
+      utimesSync(file, new Date(at), new Date(at));
+    }
+  }
+}
 
 beforeEach(() => {
   dataRoot = mkdtempSync(path.join(tmpdir(), 'agentmon-evidence-'));
@@ -78,6 +98,42 @@ describe('host transcript record', () => {
       'schemaVersion',
       'transcriptPath',
     ]);
+  });
+
+  // Review of PR #660 (issue #535): an unchanged report skipped the write, so
+  // a record aged from its FIRST report and a session still prompting after
+  // 14 days lost it as soon as another session's write ran the reaper.
+  it('a session that keeps reporting the same path keeps its record past the retention age', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const t0 = new Date('2026-11-01T00:00:00.000Z').getTime();
+    const own = `/a/${SESSION}.jsonl`;
+    const other = 'b7f2c1d0-0000-4000-8000-0000000000ff';
+    recordAt(SESSION, own, t0);
+    recordAt(SESSION, own, t0 + 13 * DAY);
+    recordAt(other, `/a/${other}.jsonl`, t0 + 15 * DAY);
+    expect(readHostTranscriptPath(SESSION)).toBe(own);
+  });
+
+  it('an unchanged report within the hour does not rewrite the record', () => {
+    const t0 = new Date('2026-11-01T00:00:00.000Z').getTime();
+    const own = `/a/${SESSION}.jsonl`;
+    recordHostTranscriptPath(SESSION, own, new Date(t0));
+    recordHostTranscriptPath(SESSION, own, new Date(t0 + 10 * 60 * 1000));
+    const [name] = readdirSync(hostEvidenceDir());
+    const stored = JSON.parse(
+      readFileSync(path.join(hostEvidenceDir(), name ?? ''), 'utf-8'),
+    ) as { observedAt: string };
+    expect(stored.observedAt).toBe(new Date(t0).toISOString());
+  });
+
+  it('reaps a record whose session stopped reporting more than 14 days ago', () => {
+    const DAY = 24 * 60 * 60 * 1000;
+    const t0 = new Date('2026-11-01T00:00:00.000Z').getTime();
+    const other = 'b7f2c1d0-0000-4000-8000-0000000000ff';
+    recordAt(SESSION, `/a/${SESSION}.jsonl`, t0);
+    recordAt(other, `/a/${other}.jsonl`, t0 + 15 * DAY);
+    expect(readHostTranscriptPath(SESSION)).toBeUndefined();
+    expect(readHostTranscriptPath(other)).toBe(`/a/${other}.jsonl`);
   });
 
   it('treats a corrupt or tampered record as no record', () => {

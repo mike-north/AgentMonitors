@@ -15,6 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -151,6 +152,24 @@ describe('createTranscriptConfirmer (006 §4.5.2)', () => {
     await expect(pending?.wait()).resolves.toBe(false);
     expect(statSync(transcript).size).toBeLessThan(5_000);
   });
+
+  // Review of PR #660 (issue #535): a FIFO renamed over the transcript after
+  // the push began made the blocking open wait for a writer that never comes,
+  // wedging the whole channel process. It must read as unconfirmed instead.
+  it.skipIf(process.platform === 'win32')(
+    'is unconfirmed, without blocking, if a FIFO replaces the transcript while waiting',
+    async () => {
+      const pending = confirmer({
+        onPoll: (poll) => {
+          if (poll === 1) {
+            unlinkSync(transcript);
+            execFileSync('mkfifo', [transcript]);
+          }
+        },
+      }).begin(ID);
+      await expect(pending?.wait()).resolves.toBe(false);
+    },
+  );
 
   it('is unconfirmed if the transcript disappears while waiting', async () => {
     const pending = confirmer({

@@ -89,10 +89,17 @@ const defaultSleep = (ms: number): Promise<void> =>
     setTimeout(resolve, ms);
   });
 
-/** `O_NOFOLLOW` where the platform has it; elsewhere the `lstat` check stands alone. */
+/**
+ * Read-only, never following a symlink, and never blocking: `O_NONBLOCK` makes
+ * opening a FIFO swapped over the transcript return at once, so the `fstat`
+ * check rejects it instead of the open waiting for a writer and stalling the
+ * whole channel process. Where the platform lacks a flag, the `lstat` and
+ * `fstat` checks stand alone.
+ */
 const OPEN_FLAGS =
   constants.O_RDONLY |
-  (typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0);
+  (typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0) |
+  (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0);
 
 /** The transcript's current size, or `undefined` if it is not a regular file. */
 function regularFileSize(transcriptPath: string): number | undefined {
