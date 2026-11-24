@@ -827,6 +827,72 @@ describe('monitor retry without a daemon', () => {
     );
   }, 30_000);
 
+  it('explains a skip right after it as a Materialization loss, the same in text and JSON (#591)', async () => {
+    const id = await seedRetry({});
+    expect((await run(repairArgs('skip', id, '--format', 'json'))).code).toBe(
+      0,
+    );
+    const explainArgs = (format: string) => [
+      'monitor',
+      'explain',
+      MONITOR,
+      '--dir',
+      monitors,
+      '--workspace',
+      root,
+      '--socket',
+      socketPath,
+      '--format',
+      format,
+    ];
+    const json = await run(explainArgs('json'));
+    const text = await run(explainArgs('text'));
+    expect([json.code, text.code]).toEqual([0, 0]);
+    const report = JSON.parse(json.stdout) as {
+      stages: { id: string; label: string; status: string; reason: string }[];
+      verdict: { stage: string; status: string; reason: string };
+    };
+
+    // 005 §6 "Which history rows each stage reads": the skip's row is a loss,
+    // read by Materialization; no source call failed.
+    const observation = report.stages.find(({ id: s }) => s === 'observation');
+    expect(observation).toMatchObject({
+      status: 'ok',
+      reason:
+        'No source outcome has been recorded since a terminal retry was skipped; the Materialization stage reports the loss, and the source is called again on the monitor’s next due tick.',
+    });
+    expect(report.verdict).toMatchObject({
+      stage: 'materialization',
+      status: 'failure',
+    });
+    expect(report.verdict.reason).toMatch(
+      /Retry skipped after 5 failed attempts\.$/u,
+    );
+
+    // 005 §6: text prints one `<glyph> <label>: <reason>` line per stage and
+    // the verdict, so both formats carry the same diagnosis.
+    const glyph: Record<string, string> = {
+      ok: '✓',
+      healthy: '○',
+      pending: '⏳',
+      failure: '✗',
+    };
+    const lines = text.stdout.split('\n');
+    for (const stage of report.stages) {
+      const line = `${glyph[stage.status] ?? '?'} ${stage.label}: `;
+      if (stage.id === 'scheduling') {
+        // Its due time moves with the 1s interval between the two runs.
+        expect(lines.some((printed) => printed.startsWith(line))).toBe(true);
+      } else {
+        expect(lines).toContain(`${line}${stage.reason}`);
+      }
+    }
+    expect(lines).toContain(
+      `Verdict: failure at Materialization - ${report.verdict.reason}`,
+    );
+    expect(text.stdout).not.toContain('Source observation failed');
+  }, 30_000);
+
   it('prints a skip hint that runs verbatim from another directory, quoted and scoped to the workspace', async () => {
     // A workspace path with spaces whose definitions sit in its own
     // `.claude/monitors`, and a monitor id with a single quote.

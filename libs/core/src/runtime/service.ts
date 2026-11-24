@@ -73,6 +73,11 @@ import {
 } from './held-notify-diagnosis.js';
 import { serializeRetryEnvelope } from './retry-envelope.js';
 import {
+  classifyHistory,
+  retryDrainReport,
+  type ClassifiedHistoryRow,
+} from './explain-history.js';
+import {
   isVerifyScratchObjectKey,
   verifyScratchRunId,
 } from './verify-scratch-key.js';
@@ -1065,7 +1070,10 @@ function terminalRetryMessage(
     retry.id,
     retry.workspacePath,
   );
-  return `Materialization retry ${retry.id} stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed or skipped. Retry it with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`. Last error: ${retry.lastError ?? 'unknown'}`;
+  return retryDrainReport(
+    retry.id,
+    `stopped after ${String(retry.attemptCount)} failed attempts; newer input waits until it is re-armed or skipped. Retry it with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`. Last error: ${retry.lastError ?? 'unknown'}`,
+  );
 }
 
 /**
@@ -1085,7 +1093,135 @@ function terminalRetriesReason(
     oldest.id,
     workspacePath,
   );
-  return `${head} Retry ${oldest.id} with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`.`;
+  return withLastRetryError(
+    `${head} Retry ${oldest.id} with \`${rearm}\`, or give it up as a recorded loss with \`${skip}\`.`,
+    summary,
+    'terminal',
+  );
+}
+
+/**
+ * Append the oldest `status` retry's last error to a retained-work reason
+ * (005 §6 `monitor explain`), so Materialization states why its work is
+ * retained. The error uses explain's display rule (002 §10.7).
+ */
+function withLastRetryError(
+  reason: string,
+  summary: MaterializationRetrySummary,
+  status: MaterializationRetryDiagnostic['status'],
+): string {
+  const oldest = summary.records.find((record) => record.status === status);
+  const error = displayObservationError(oldest?.lastError);
+  return error ? `${reason} Last error: ${error}` : reason;
+}
+
+/**
+ * The Observation stage for the newest history row it reads (005 §6, "Which
+ * history rows each stage reads"), when no retained work pauses the source.
+ * Only a `source-outcome` row can report a failed source call; a loss or a
+ * drain report says which stage owns it instead.
+ */
+function observationStage(subject: ClassifiedHistoryRow): MonitorExplainStage {
+  const { row } = subject;
+  switch (subject.kind) {
+    case 'source-outcome':
+      return sourceOutcomeStage(row);
+    case 'released-work':
+      return explainStage(
+        'observation',
+        'ok',
+        'Held or retained work was materialized without new source input (observed 0).',
+        row.observationData,
+      );
+    case 'admission-loss':
+      return explainStage(
+        'observation',
+        'ok',
+        'The source’s latest call returned observations the runtime could not keep; the Materialization stage reports the loss.',
+        row.observationData,
+      );
+    case 'skipped-retry-loss':
+      return explainStage(
+        'observation',
+        'ok',
+        'No source outcome has been recorded since a terminal retry was skipped; the Materialization stage reports the loss, and the source is called again on the monitor’s next due tick.',
+        row.observationData,
+      );
+    case 'retry-drain':
+      return explainStage(
+        'observation',
+        'ok',
+        'No source outcome has been recorded since the monitor’s retained work drained; the source is called again on the monitor’s next due tick.',
+        row.observationData,
+      );
+    case 'unrecognized':
+      return explainStage(
+        'observation',
+        'pending',
+        'No recent observation history row records an outcome this version recognizes.',
+      );
+    default: {
+      const unhandled: never = subject.kind;
+      return unhandled;
+    }
+  }
+}
+
+/** The Observation stage for a source call's own outcome (005 §6, 002 §10.7). */
+function sourceOutcomeStage(
+  row: ObservationHistoryRecord,
+): MonitorExplainStage {
+  switch (row.result) {
+    case 'errored': {
+      const error = displayObservationError(row.observationData['error']);
+      return explainStage(
+        'observation',
+        'failure',
+        error
+          ? `Source observation failed: ${error}`
+          : 'The most recent source observation errored.',
+        row.observationData,
+      );
+    }
+    case 'no-change':
+      // A genuinely quiet tick is healthy, not a fault (issue #94): the watched
+      // target simply hasn't changed. Render distinctly from a real failure.
+      return explainStage(
+        'observation',
+        'healthy',
+        'Source ran, observed 0 changes — your watched target genuinely hasn’t changed (not a bug).',
+        row.observationData,
+      );
+    case 'no-files-matched':
+      return explainStage(
+        'observation',
+        'failure',
+        'The source ran but matched zero files; check the monitor globs and cwd.',
+        row.observationData,
+      );
+    case 'rebaselined':
+      // The source advanced its baseline without computing a delta (e.g. a
+      // force-pushed/gc'd ref). No change was emitted, which is healthy — not a
+      // fault (issue #94).
+      return explainStage(
+        'observation',
+        'healthy',
+        'Source rebaselined and emitted no change — your watched target is being tracked, nothing to report (not a bug).',
+        row.observationData,
+      );
+    case 'triggered':
+    case 'suppressed':
+      return explainStage(
+        'observation',
+        'ok',
+        `The latest observation outcome was ${row.result}.`,
+        row.observationData,
+      );
+    default: {
+      const unhandled: never = row.result;
+      return unhandled;
+    }
+  }
 }
 
 /** A retry's operator-safe metadata: never its envelope or payload. */
@@ -2293,8 +2429,21 @@ export class AgentMonitorRuntime {
       workspacePath,
       limit: historyLimit,
     });
-    const latestObservation = observations[0];
-    if (!latestObservation) {
+    // Each row is classified once by what it records (005 §6, "Which history
+    // rows each stage reads"). Losses and retained-work drain reports are
+    // `errored` rows, but they belong to Materialization, never to a failed
+    // source call (issue #591).
+    const history = classifyHistory(observations);
+    const subject = history.find(({ kind }) => kind !== 'unrecognized');
+    // While retained work remains the source is not called at all (002 §2.7),
+    // so no history row can describe a current source outcome.
+    const retainedWork =
+      materializationRetries.pending + materializationRetries.terminal > 0;
+    const latestSourceOutcome =
+      !retainedWork && subject?.kind === 'source-outcome'
+        ? subject.row
+        : undefined;
+    if (observations.length === 0) {
       stages.push(
         explainStage(
           'observation',
@@ -2302,69 +2451,33 @@ export class AgentMonitorRuntime {
           'No observation history has been recorded for this monitor.',
         ),
       );
-    } else if (latestObservation.result === 'errored') {
-      const error = displayObservationError(
-        latestObservation.observationData['error'],
-      );
-      stages.push(
-        explainStage(
-          'observation',
-          'failure',
-          error
-            ? `Source observation failed: ${error}`
-            : 'The most recent source observation errored.',
-          latestObservation.observationData,
-        ),
-      );
-    } else if (latestObservation.result === 'no-change') {
-      // A genuinely quiet tick is healthy, not a fault (issue #94): the watched
-      // target simply hasn't changed. Render distinctly from a real failure.
-      stages.push(
-        explainStage(
-          'observation',
-          'healthy',
-          'Source ran, observed 0 changes — your watched target genuinely hasn’t changed (not a bug).',
-          latestObservation.observationData,
-        ),
-      );
-    } else if (latestObservation.result === 'no-files-matched') {
-      stages.push(
-        explainStage(
-          'observation',
-          'failure',
-          'The source ran but matched zero files; check the monitor globs and cwd.',
-          latestObservation.observationData,
-        ),
-      );
-    } else if (latestObservation.result === 'rebaselined') {
-      // The source advanced its baseline without computing a delta (e.g. a
-      // force-pushed/gc'd ref). No change was emitted, which is healthy — not a
-      // fault (issue #94).
-      stages.push(
-        explainStage(
-          'observation',
-          'healthy',
-          'Source rebaselined and emitted no change — your watched target is being tracked, nothing to report (not a bug).',
-          latestObservation.observationData,
-        ),
-      );
-    } else {
+    } else if (retainedWork) {
       stages.push(
         explainStage(
           'observation',
           'ok',
-          `The latest observation outcome was ${latestObservation.result}.`,
-          latestObservation.observationData,
+          'The source is not called while retained materialization work remains (002 §2.7); the Materialization stage reports that work.',
+          subject?.row.observationData,
         ),
       );
+    } else if (!subject) {
+      stages.push(
+        explainStage(
+          'observation',
+          'pending',
+          'No recent observation history row records an outcome this version recognizes.',
+        ),
+      );
+    } else {
+      stages.push(observationStage(subject));
     }
 
     // A healthy/idle observation means the watched target genuinely hasn't
     // changed (issue #94): the absence of downstream events/projections is the
     // *expected* outcome, not a fault, so the later stages must not render ✗.
     const observationHealthy =
-      latestObservation?.result === 'no-change' ||
-      latestObservation?.result === 'rebaselined';
+      latestSourceOutcome?.result === 'no-change' ||
+      latestSourceOutcome?.result === 'rebaselined';
 
     const notifyState = runtimeState.notifyState;
     const suppressedUntil = notifyState.suppressedUntil
@@ -2448,7 +2561,11 @@ export class AgentMonitorRuntime {
         explainStage(
           'materialization',
           'pending',
-          `${String(materializationRetries.pending)} observation(s) are durably queued for materialization retry.`,
+          withLastRetryError(
+            `${String(materializationRetries.pending)} observation(s) are durably queued for materialization retry.`,
+            materializationRetries,
+            'pending',
+          ),
           { ...materializationRetries },
         ),
       );
@@ -5010,7 +5127,7 @@ export class AgentMonitorRuntime {
           continue;
         }
         const cause = errorMessage(retryError);
-        let message = `Materialization retry ${retry.id} failed: ${cause}`;
+        let message = retryDrainReport(retry.id, `failed: ${cause}`);
         try {
           // Backoff starts at this attempt, not at the tick's start.
           this.store.markMaterializationRetryFailed(retry.id, cause);
@@ -5050,7 +5167,10 @@ export class AgentMonitorRuntime {
       this.store.discardRetiredVerifyArtifactRetry(retry.id);
       return undefined;
     } catch (discardError) {
-      const message = `Materialization retry ${retry.id} could not be discarded after its verify artifact's cleanup took effect: ${errorMessage(discardError)}`;
+      const message = retryDrainReport(
+        retry.id,
+        `could not be discarded after its verify artifact's cleanup took effect: ${errorMessage(discardError)}`,
+      );
       this.recordErroredHistory(
         monitorId,
         workspacePath,
