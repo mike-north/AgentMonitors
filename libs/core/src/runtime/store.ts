@@ -263,6 +263,50 @@ function safeRetryError(message: string): string {
 }
 
 /**
+ * One retry input's route, read exactly once. Admission uses only this
+ * capture after it is taken, so an input whose properties are accessors or
+ * change between reads cannot charge capacity to one route, insert into
+ * another and mark a third.
+ */
+interface CapturedRetryRoute {
+  workspacePath: string | null;
+  monitorId: string;
+  sourceName: string;
+  envelope: EnqueueMaterializationRetryInput['envelope'];
+  /** The sanitized diagnostic that is stored. */
+  lastError: string;
+}
+
+function captureRetryRoute(
+  input: EnqueueMaterializationRetryInput,
+): CapturedRetryRoute {
+  const workspacePath: unknown = input.workspacePath;
+  const monitorId: unknown = input.monitorId;
+  const sourceName: unknown = input.sourceName;
+  const envelope = input.envelope;
+  const error: unknown = input.error;
+  if (workspacePath !== null && typeof workspacePath !== 'string') {
+    throw new Error('Retry workspace route must be a string or null.');
+  }
+  if (typeof monitorId !== 'string' || monitorId.length === 0) {
+    throw new Error('Retry monitor route must be a non-empty string.');
+  }
+  if (typeof sourceName !== 'string' || sourceName.length === 0) {
+    throw new Error('Retry source route must be a non-empty string.');
+  }
+  if (typeof error !== 'string') {
+    throw new Error('Retry failure text must be a string.');
+  }
+  return {
+    workspacePath,
+    monitorId,
+    sourceName,
+    envelope,
+    lastError: safeRetryError(error),
+  };
+}
+
+/**
  * SQLite stores retry timestamps in whole seconds. Round deadlines upward so
  * persistence never shortens a backoff; the extra wait is less than one second.
  */
@@ -341,14 +385,49 @@ const EXTERNAL_RECEIPT_CHANGE_KINDS: ReadonlySet<string> = new Set<
 >(['created', 'modified', 'deleted', 'descoped']);
 
 /**
- * A stored receipt row that cannot be a state this store ever writes. Thrown
- * instead of returning a typed record that would misdescribe durable work. The
- * message names the receipt and the broken rule only, never stored content.
+ * A stored external-ingress row that cannot be a state this store ever
+ * writes. Thrown instead of returning a typed record that would misdescribe
+ * durable work. The message names the row and the broken rule only, never
+ * stored content.
  */
+function invalidStoredRow(row: string, rule: string): Error {
+  return new Error(`Stored ${row} is invalid: ${rule}.`);
+}
+
 function invalidStoredReceipt(receiptId: string, rule: string): Error {
-  return new Error(
-    `Stored external event receipt ${receiptId} is invalid: ${rule}.`,
-  );
+  return invalidStoredRow(`external event receipt ${receiptId}`, rule);
+}
+
+/**
+ * The field rules every stored external-ingress row must meet before either
+ * read exposes it as a typed record (receipts and object sequences alike):
+ * each identifier a non-empty string, each count or sequence a non-negative
+ * safe integer, each timestamp a valid date. SQLite enforces none of these, so
+ * a corrupt or hand-edited row fails here instead of reaching a caller.
+ */
+interface StoredRowFields {
+  identifiers: Readonly<Record<string, unknown>>;
+  integers: Readonly<Record<string, unknown>>;
+  times: Readonly<Record<string, unknown>>;
+}
+
+function validateStoredRowFields(
+  fail: (rule: string) => Error,
+  fields: StoredRowFields,
+): void {
+  for (const [name, value] of Object.entries(fields.identifiers)) {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw fail(`${name} is not a non-empty string`);
+    }
+  }
+  for (const [name, value] of Object.entries(fields.integers)) {
+    if (!isNonNegativeSafeInteger(value)) {
+      throw fail(`${name} is not a non-negative safe integer`);
+    }
+  }
+  for (const [name, value] of Object.entries(fields.times)) {
+    if (!isValidDate(value)) throw fail(`${name} is not a valid time`);
+  }
 }
 
 function isValidDate(value: unknown): value is Date {
@@ -388,15 +467,21 @@ function rowToExternalEventReceipt(
   ) {
     throw invalidStoredReceipt(id, 'unknown change kind');
   }
-  if (!isNonNegativeSafeInteger(row.objectSequence)) {
-    throw invalidStoredReceipt(id, 'object sequence is not a safe integer');
-  }
-  if (!isNonNegativeSafeInteger(row.attemptCount)) {
-    throw invalidStoredReceipt(id, 'attempt count is not a safe integer');
-  }
-  if (!isValidDate(row.acceptedAt) || !isValidDate(row.updatedAt)) {
-    throw invalidStoredReceipt(id, 'acceptance or update time is invalid');
-  }
+  validateStoredRowFields((rule) => invalidStoredReceipt(id, rule), {
+    identifiers: {
+      'monitor id': row.monitorId,
+      source: row.source,
+      'upstream event id': row.upstreamEventId,
+      'object id': row.objectId,
+      'event kind': row.eventKind,
+      'occurrence time': row.occurredAt,
+    },
+    integers: {
+      'object sequence': row.objectSequence,
+      'attempt count': row.attemptCount,
+    },
+    times: { 'acceptance time': row.acceptedAt, 'update time': row.updatedAt },
+  });
   const nextAttemptAt = row.nextAttemptAt ?? null;
   if (nextAttemptAt !== null && !isValidDate(nextAttemptAt)) {
     throw invalidStoredReceipt(id, 'next attempt time is invalid');
@@ -412,7 +497,10 @@ function rowToExternalEventReceipt(
       'event ids are not unique non-empty strings',
     );
   }
-  const lastError = row.lastError ?? null;
+  const lastError: unknown = row.lastError ?? null;
+  if (lastError !== null && typeof lastError !== 'string') {
+    throw invalidStoredReceipt(id, 'last error is not text');
+  }
 
   if (outcome === 'materialized') {
     if (eventIds.length === 0 || materializedAt === null) {
@@ -473,6 +561,81 @@ function rowToExternalEventReceipt(
   };
 }
 
+/** The exact four-dimension key of one object's sequence (002 §15). */
+interface ExternalObjectRoute {
+  workspaceIdentity: string;
+  monitorId: string;
+  source: string;
+  objectId: string;
+}
+
+/**
+ * Hydrate a stored high-water row for the route it was read by, with the same
+ * field rules as a receipt ({@link validateStoredRowFields}). The row must
+ * also be coherent: its key is exactly the requested route, and the receipt it
+ * names exists on that route with the same upstream event and an object
+ * sequence equal to the high-water mark, because the receipt operation writes
+ * the two together. Anything else fails closed.
+ */
+function rowToExternalObjectSequence(
+  route: ExternalObjectRoute,
+  row: typeof externalObjectSequences.$inferSelect,
+  receipt:
+    | Pick<
+        typeof externalEventReceipts.$inferSelect,
+        | 'workspaceIdentity'
+        | 'monitorId'
+        | 'source'
+        | 'objectId'
+        | 'upstreamEventId'
+        | 'objectSequence'
+      >
+    | undefined,
+): ExternalObjectSequenceRecord {
+  const fail = (rule: string) =>
+    invalidStoredRow('external object sequence for the requested object', rule);
+  validateStoredRowFields(fail, {
+    identifiers: {
+      'workspace identity': row.workspaceIdentity,
+      'monitor id': row.monitorId,
+      source: row.source,
+      'object id': row.objectId,
+      'receipt id': row.receiptId,
+      'upstream event id': row.upstreamEventId,
+    },
+    integers: { 'highest sequence': row.highestSequence },
+    times: { 'update time': row.updatedAt },
+  });
+  if (
+    row.workspaceIdentity !== route.workspaceIdentity ||
+    row.monitorId !== route.monitorId ||
+    row.source !== route.source ||
+    row.objectId !== route.objectId
+  ) {
+    throw fail('its key is not the requested route');
+  }
+  if (
+    receipt?.workspaceIdentity !== route.workspaceIdentity ||
+    receipt.monitorId !== route.monitorId ||
+    receipt.source !== route.source ||
+    receipt.objectId !== route.objectId ||
+    receipt.upstreamEventId !== row.upstreamEventId ||
+    receipt.objectSequence !== row.highestSequence
+  ) {
+    throw fail('it does not match the receipt that set it');
+  }
+  return {
+    workspaceIdentity: row.workspaceIdentity,
+    monitorId: row.monitorId,
+    source: row.source,
+    objectId: row.objectId,
+    highestSequence: row.highestSequence,
+    receiptId: row.receiptId,
+    upstreamEventId: row.upstreamEventId,
+    updatedAt: row.updatedAt,
+  };
+}
+
 function externalReceiptKey(input: ExternalEventReceiptInput) {
   return and(
     eq(externalEventReceipts.workspaceIdentity, input.workspaceIdentity),
@@ -524,6 +687,12 @@ function writeCompatibilityMarker(
     .run();
 }
 
+/**
+ * Whether serialized notification state holds a debounce or rollup batch with
+ * at least one observation: durable held work an older version would not
+ * deliver, so its route needs the compatibility marker. Callers pass the
+ * parsed form of the exact JSON that is stored.
+ */
 function containsNonemptyHeldNotificationState(value: unknown): boolean {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
@@ -1081,40 +1250,62 @@ export class RuntimeStore {
     return row ? rowToExternalEventReceipt(row) : null;
   }
 
-  /** Read the high-water mark for one exact workspace/monitor/source/object route. */
+  /**
+   * Read the high-water mark for one exact workspace/monitor/source/object
+   * route. Every dimension must match; another workspace, monitor, source or
+   * object is indistinguishable from a missing row.
+   *
+   * @throws Error when the stored row, or the receipt it names, is not a state
+   * this store writes; such a row is reported, never returned.
+   */
   externalObjectSequence(
     workspaceIdentity: string,
     monitorId: string,
     source: string,
     objectId: string,
   ): ExternalObjectSequenceRecord | null {
-    const row = asInternalDb(this.db)
-      .select()
-      .from(externalObjectSequences)
-      .where(
-        and(
-          eq(externalObjectSequences.workspaceIdentity, workspaceIdentity),
-          eq(externalObjectSequences.monitorId, monitorId),
-          eq(externalObjectSequences.source, source),
-          eq(externalObjectSequences.objectId, objectId),
-        ),
-      )
-      .get();
-    return row
-      ? {
-          workspaceIdentity: row.workspaceIdentity,
-          monitorId: row.monitorId,
-          source: row.source,
-          objectId: row.objectId,
-          highestSequence: row.highestSequence,
-          receiptId: row.receiptId,
-          upstreamEventId: row.upstreamEventId,
-          updatedAt: row.updatedAt,
-        }
-      : null;
+    const route = { workspaceIdentity, monitorId, source, objectId };
+    const db = asInternalDb(this.db);
+    // One read transaction, so the high-water row and its receipt come from
+    // the same committed state.
+    return db.$client.transaction(() => {
+      const row = db
+        .select()
+        .from(externalObjectSequences)
+        .where(
+          and(
+            eq(externalObjectSequences.workspaceIdentity, workspaceIdentity),
+            eq(externalObjectSequences.monitorId, monitorId),
+            eq(externalObjectSequences.source, source),
+            eq(externalObjectSequences.objectId, objectId),
+          ),
+        )
+        .get();
+      if (!row) return null;
+      const receipt = db
+        .select({
+          workspaceIdentity: externalEventReceipts.workspaceIdentity,
+          monitorId: externalEventReceipts.monitorId,
+          source: externalEventReceipts.source,
+          objectId: externalEventReceipts.objectId,
+          upstreamEventId: externalEventReceipts.upstreamEventId,
+          objectSequence: externalEventReceipts.objectSequence,
+        })
+        .from(externalEventReceipts)
+        .where(eq(externalEventReceipts.id, row.receiptId))
+        .get();
+      return rowToExternalObjectSequence(route, row, receipt);
+    })();
   }
 
-  /** Test whether an exact global or workspace route contains forward-only durable work. */
+  /**
+   * Whether the exact global (`null`) or workspace route carries the
+   * `durable-ingress-v1` compatibility marker, meaning it holds forward-only
+   * durable work. Used to verify marker writes; not part of the public store
+   * contract.
+   *
+   * @internal
+   */
   hasDatabaseCompatibilityMarker(workspaceIdentity: string | null): boolean {
     return (
       asInternalDb(this.db)
@@ -1491,6 +1682,15 @@ export class RuntimeStore {
     };
   }
 
+  /**
+   * Persist one monitor's source and notification state. Persisting a
+   * nonempty held debounce or rollup batch also marks its workspace route
+   * forward-only (002 §15), in the same immediate transaction as the state.
+   *
+   * Each field of `state` is read once and serialized once; whether the marker
+   * is needed is decided from that serialized value, the exact state that is
+   * stored, never by inspecting the caller's object a second time.
+   */
   setMonitorState(
     monitorId: string,
     workspacePath: string | null,
@@ -1502,6 +1702,12 @@ export class RuntimeStore {
   ): void {
     const now = new Date();
     const db = asInternalDb(this.db);
+    const lastObservationAt = state.lastObservationAt ?? null;
+    const sourceState = JSON.stringify(state.sourceState ?? {});
+    const notifyState = JSON.stringify(state.notifyState ?? {});
+    const marksRoute = containsNonemptyHeldNotificationState(
+      parseJson<unknown>(notifyState, null),
+    );
     db.$client
       .transaction(() => {
         const existing = db
@@ -1513,10 +1719,10 @@ export class RuntimeStore {
         if (existing) {
           db.update(monitorState)
             .set({
-              lastObservationAt: state.lastObservationAt ?? null,
+              lastObservationAt,
               lastFingerprint: null,
-              sourceState: JSON.stringify(state.sourceState ?? {}),
-              notifyState: JSON.stringify(state.notifyState ?? {}),
+              sourceState,
+              notifyState,
               updatedAt: now,
             })
             .where(eq(monitorState.id, existing.id))
@@ -1527,18 +1733,16 @@ export class RuntimeStore {
               id: ulid(),
               monitorId,
               workspacePath,
-              lastObservationAt: state.lastObservationAt ?? null,
+              lastObservationAt,
               lastFingerprint: null,
-              sourceState: JSON.stringify(state.sourceState ?? {}),
-              notifyState: JSON.stringify(state.notifyState ?? {}),
+              sourceState,
+              notifyState,
               updatedAt: now,
             })
             .run();
         }
 
-        if (containsNonemptyHeldNotificationState(state.notifyState)) {
-          writeCompatibilityMarker(db, workspacePath, now);
-        }
+        if (marksRoute) writeCompatibilityMarker(db, workspacePath, now);
       })
       .immediate();
   }
@@ -1564,17 +1768,21 @@ export class RuntimeStore {
     if (inputs.length === 0) return [];
     const db = asInternalDb(this.db);
     const prepared = inputs.map((input) => {
+      // Read each route field once. Validation, capacity, insertion and the
+      // compatibility marker all use this capture, so an accessor on the input
+      // cannot route one step differently from another.
+      const route = captureRetryRoute(input);
       // Validate the entire value domain before route reads can invoke an
       // accessor or proxy supplied inside the envelope.
-      const envelope = serializeRetryEnvelope(input.envelope);
-      if (input.envelope.monitor.id !== input.monitorId) {
+      const envelope = serializeRetryEnvelope(route.envelope);
+      if (route.envelope.monitor.id !== route.monitorId) {
         throw new Error('Retry envelope monitor id does not match its route.');
       }
-      if (input.envelope.monitor.frontmatter.watch.type !== input.sourceName) {
+      if (route.envelope.monitor.frontmatter.watch.type !== route.sourceName) {
         throw new Error('Retry envelope source does not match its route.');
       }
       return {
-        input,
+        route,
         id: materializationRetryUlid(now.getTime()),
         envelope,
         envelopeBytes: Buffer.byteLength(envelope, 'utf8'),
@@ -1594,12 +1802,12 @@ export class RuntimeStore {
         >();
         for (const item of prepared) {
           const key = JSON.stringify([
-            item.input.workspacePath,
-            item.input.monitorId,
+            item.route.workspacePath,
+            item.route.monitorId,
           ]);
           const addition = additions.get(key) ?? {
-            monitorId: item.input.monitorId,
-            workspacePath: item.input.workspacePath,
+            monitorId: item.route.monitorId,
+            workspacePath: item.route.workspacePath,
             count: 0,
             bytes: 0,
           };
@@ -1630,15 +1838,15 @@ export class RuntimeStore {
             .values({
               id: item.id,
               admissionSequence: this.reserveAdmissionSequence(),
-              workspacePath: item.input.workspacePath,
-              monitorId: item.input.monitorId,
-              sourceName: item.input.sourceName,
+              workspacePath: item.route.workspacePath,
+              monitorId: item.route.monitorId,
+              sourceName: item.route.sourceName,
               envelope: item.envelope,
               envelopeBytes: item.envelopeBytes,
               attemptCount: 0,
               status: 'pending',
               nextAttemptAt,
-              lastError: safeRetryError(item.input.error),
+              lastError: item.route.lastError,
               createdAt: now,
               updatedAt: now,
             })

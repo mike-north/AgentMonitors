@@ -104,4 +104,56 @@ describe('public external receipt operation', () => {
       `),
     ).toEqual([]);
   });
+
+  it('reads a receipt and its object sequence through the ESM and CJS entry points', () => {
+    const cjs = createRequire(import.meta.url)(
+      '@agentmonitors/core',
+    ) as typeof core;
+    for (const api of [core, cjs]) {
+      const store = new api.RuntimeStore(api.createDb(':memory:'));
+      const accepted = store.withExternalEventReceipt(receiptInput(), () => ({
+        outcome: 'held',
+      }));
+      if (accepted.decision !== 'accepted') throw new Error('not accepted');
+      expect(
+        store.externalEventReceiptStatus(
+          '/workspace-a',
+          accepted.receipt.receiptId,
+        ),
+      ).toEqual(accepted.receipt);
+      expect(
+        store.externalObjectSequence(
+          '/workspace-a',
+          'build-health',
+          'example-build-system',
+          'build-group-123',
+        ),
+      ).toMatchObject({
+        highestSequence: 42,
+        receiptId: accepted.receipt.receiptId,
+      });
+    }
+  });
+
+  it('publishes the sequence record exactly and keeps the marker check internal', () => {
+    expect(
+      consumerDiagnostics(tsSource`
+        import { RuntimeStore, createDb } from '@agentmonitors/core';
+        import type {
+          ExternalEventReceiptRecord,
+          ExternalObjectSequenceRecord,
+        } from '@agentmonitors/core';
+        type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
+        const store = new RuntimeStore(createDb(':memory:'));
+        const sequence = store.externalObjectSequence('/w', 'm', 's', 'o');
+        const exactSequence: Same<typeof sequence, ExternalObjectSequenceRecord | null> = true;
+        const exactMark: Same<ExternalObjectSequenceRecord['highestSequence'], number> = true;
+        const exactTime: Same<ExternalObjectSequenceRecord['updatedAt'], Date> = true;
+        const status = store.externalEventReceiptStatus('/w', 'r');
+        const exactStatus: Same<typeof status, ExternalEventReceiptRecord | null> = true;
+        // @ts-expect-error the marker check is internal
+        store.hasDatabaseCompatibilityMarker(null);
+      `),
+    ).toEqual([]);
+  });
 });

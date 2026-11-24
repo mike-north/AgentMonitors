@@ -619,6 +619,18 @@ export type ExternalJsonValue = null | boolean | number | string | ExternalJsonV
     [key: string]: ExternalJsonValue;
 };
 
+// @public
+export interface ExternalObjectSequenceRecord {
+    highestSequence: number;
+    monitorId: string;
+    objectId: string;
+    receiptId: string;
+    source: string;
+    updatedAt: Date;
+    upstreamEventId: string;
+    workspaceIdentity: string;
+}
+
 // @public (undocumented)
 export function fingerprintText(content: string): string;
 
@@ -1627,6 +1639,8 @@ export class RuntimeStore {
     // @internal
     discardRetiredVerifyArtifactRetry(id: string): boolean;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
+    externalEventReceiptStatus(workspaceIdentity: string, receiptId: string): ExternalEventReceiptRecord | null;
+    externalObjectSequence(workspaceIdentity: string, monitorId: string, source: string, objectId: string): ExternalObjectSequenceRecord | null;
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
     // (undocumented)
@@ -1639,6 +1653,8 @@ export class RuntimeStore {
     getSessionById(id: string): AgentSessionRecord;
     getSessionObjectCursor(sessionId: string, monitorId: string, objectKey: string, workspacePath?: string | null): SessionObjectCursorRecord | null;
     getVerifyArtifact(runId: string): VerifyArtifactRecord | null;
+    // @internal
+    hasDatabaseCompatibilityMarker(workspaceIdentity: string | null): boolean;
     insertEphemeralMonitor(input: {
         id: string;
         sessionId: string;
@@ -1787,7 +1803,6 @@ export class RuntimeStore {
     }): SessionHookState;
     // (undocumented)
     sessionsForWorkspace(workspacePath?: string | null): AgentSessionRecord[];
-    // (undocumented)
     setMonitorState(monitorId: string, workspacePath: string | null, state: {
         sourceState?: unknown;
         notifyState?: unknown;

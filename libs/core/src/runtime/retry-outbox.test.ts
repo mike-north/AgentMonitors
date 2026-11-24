@@ -152,6 +152,62 @@ describe('materialization retry outbox', () => {
     expect(store.hasDatabaseCompatibilityMarker(null)).toBe(true);
   });
 
+  it('routes capacity, the row and the marker by one read of each route field', () => {
+    // A stateful accessor once let one admission charge capacity to one route,
+    // insert into another and mark a third (002 §15: the marker covers the
+    // route that holds the work).
+    const store = new RuntimeStore(createDb(':memory:'));
+    const routes = ['/route-a', '/route-b', '/route-c', '/route-d'];
+    let reads = 0;
+    const shifting = input('shifting-monitor', 'shifting-object');
+    Object.defineProperty(shifting, 'workspacePath', {
+      enumerable: true,
+      get: () => routes[Math.min(reads++, routes.length - 1)] ?? null,
+    });
+
+    const [stored] = store.enqueueMaterializationRetries([shifting], NOW);
+
+    expect(reads).toBe(1);
+    expect(stored?.workspacePath).toBe('/route-a');
+    expect(store.hasDatabaseCompatibilityMarker('/route-a')).toBe(true);
+    for (const other of routes.slice(1)) {
+      expect(store.hasDatabaseCompatibilityMarker(other)).toBe(false);
+      expect(
+        store.listMaterializationRetries({ workspacePath: other }),
+      ).toEqual([]);
+    }
+  });
+
+  it('rolls back a whole multi-route admission when a marker write fails, then admits on retry', () => {
+    // 002 §15: every route is marked in the same outbox transaction, so a
+    // failed marker write leaves no retained rows and no marker behind.
+    const db = createDb(':memory:');
+    const store = new RuntimeStore(db);
+    const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+    client.exec(`
+      CREATE TRIGGER fail_marker BEFORE INSERT ON database_compatibility_markers
+      WHEN NEW.workspace_identity IS NULL
+      BEGIN SELECT RAISE(ABORT, 'injected marker fault'); END
+    `);
+    const batch = () => [
+      input('named-monitor', 'named-object'),
+      input('global-monitor', 'global-object', null),
+    ];
+
+    expect(() => store.enqueueMaterializationRetries(batch(), NOW)).toThrow(
+      'injected marker fault',
+    );
+    expect(store.listMaterializationRetries()).toEqual([]);
+    expect(store.hasDatabaseCompatibilityMarker('/workspace')).toBe(false);
+    expect(store.hasDatabaseCompatibilityMarker(null)).toBe(false);
+
+    client.exec('DROP TRIGGER fail_marker');
+    expect(store.enqueueMaterializationRetries(batch(), NOW)).toHaveLength(2);
+    expect(store.listMaterializationRetries()).toHaveLength(2);
+    expect(store.hasDatabaseCompatibilityMarker('/workspace')).toBe(true);
+    expect(store.hasDatabaseCompatibilityMarker(null)).toBe(true);
+  });
+
   it('serializes competing connections at the exact 256-row boundary', () => {
     const dbPath = scratchDb();
     const firstDb = createDb(dbPath);
