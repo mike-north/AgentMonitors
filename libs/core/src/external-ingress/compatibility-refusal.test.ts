@@ -8,7 +8,7 @@
  * @see ../../../../docs/specs/004-validation-testing.md (§2.14)
  */
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -37,8 +37,41 @@ function snapshot(dbPath: string) {
   };
 }
 
+/**
+ * A current database whose newest marker is still only in uncheckpointed
+ * `-wal` frames, as a newer daemon leaves it after SIGKILL or power loss. The
+ * files are copied while the writer still has them open, so no checkpoint ran.
+ */
+function databaseWithPendingWal(capability: string): string {
+  const source = databaseWithMarkers([['/workspace', 'durable-ingress-v1']]);
+  const writer = new Database(source);
+  writer.pragma('wal_autocheckpoint = 0');
+  writer
+    .prepare(
+      sql`INSERT INTO database_compatibility_markers
+          (id, workspace_identity, capability, created_at)
+          VALUES ('pending-marker', '/pending', ?, 0)`,
+    )
+    .run(capability);
+  const dbPath = receiptScratchDb();
+  for (const suffix of ['', '-wal', '-shm']) {
+    copyFileSync(source + suffix, dbPath + suffix);
+  }
+  writer.close();
+  return dbPath;
+}
+
+/**
+ * Inspection opens use an ordinary connection: on a WAL file without sidecars
+ * a read-only one leaves an empty `-wal` and a `-shm` behind, which would
+ * change the file set the next assertion compares.
+ */
+function inspect(dbPath: string): Database.Database {
+  return new Database(dbPath, { fileMustExist: true });
+}
+
 function markers(dbPath: string) {
-  const raw = new Database(dbPath, { readonly: true });
+  const raw = inspect(dbPath);
   try {
     return raw
       .prepare(
@@ -52,7 +85,7 @@ function markers(dbPath: string) {
 }
 
 function journalMode(dbPath: string): unknown {
-  const raw = new Database(dbPath, { readonly: true });
+  const raw = inspect(dbPath);
   try {
     return raw.pragma('journal_mode', { simple: true });
   } finally {
@@ -126,6 +159,36 @@ describe('opening a database marked by a newer version', () => {
     },
   );
 
+  it('refuses a marker still in uncheckpointed WAL frames without checkpointing or removing the WAL', () => {
+    const dbPath = databaseWithPendingWal('durable-ingress-v2');
+    const before = snapshot(dbPath);
+    expect(before.wal?.length).toBeGreaterThan(0);
+
+    expect(() => createDb(dbPath)).toThrow(
+      'holds capability "durable-ingress-v2", written by a newer version',
+    );
+    // 002 §15: the main file and every pending frame are untouched. Only the
+    // shared-memory index, which any reader rewrites and SQLite rebuilds from
+    // the WAL, may differ.
+    const after = snapshot(dbPath);
+    expect(after.main).toEqual(before.main);
+    expect(after.wal).toEqual(before.wal);
+    expect(after.shm).not.toBeNull();
+    expect(markers(dbPath)).toEqual([
+      { workspace_identity: '/workspace', capability: 'durable-ingress-v1' },
+      { workspace_identity: '/pending', capability: 'durable-ingress-v2' },
+    ]);
+  });
+
+  it('opens a database whose pending WAL frames hold only known markers', () => {
+    const dbPath = databaseWithPendingWal('durable-ingress-v1');
+    closeDb(createDb(dbPath));
+    expect(markers(dbPath)).toEqual([
+      { workspace_identity: '/pending', capability: 'durable-ingress-v1' },
+      { workspace_identity: '/workspace', capability: 'durable-ingress-v1' },
+    ]);
+  });
+
   it('refuses an unknown capability in any marker scope, naming each one', () => {
     const dbPath = databaseWithMarkers([
       [null, 'global-future-v1'],
@@ -139,56 +202,89 @@ describe('opening a database marked by a newer version', () => {
     expect(snapshot(dbPath)).toEqual(before);
   });
 
-  it('refuses a marker a newer version commits while the open waits for the write lock', async () => {
-    // The first, lock-free check runs before the marker commits; only the
-    // check inside the schema transaction can see it.
-    const dbPath = databaseWithMarkers([]);
-    const child = spawn(
-      process.execPath,
-      [
-        '--experimental-transform-types',
-        '--import',
-        path.resolve('src/runtime/__fixtures__/typescript-loader.ts'),
-        path.resolve(
-          'src/external-ingress/__fixtures__/newer-marker-writer.ts',
-        ),
-        dbPath,
-        '750',
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
-    const killTimer = setTimeout(() => child.kill('SIGKILL'), 20_000);
-    const exited = new Promise<number | null>((resolve) => {
-      child.once('exit', (code) => {
-        clearTimeout(killTimer);
-        resolve(code);
-      });
-    });
-    let errors = '';
-    child.stderr.on('data', (chunk) => {
-      errors += String(chunk);
-    });
-    try {
-      await new Promise<void>((resolve, reject) => {
-        let output = '';
-        child.stdout.on('data', (chunk) => {
-          output += String(chunk);
-          if (output.includes('READY\n')) resolve();
-        });
-        void exited.then((code) => {
-          reject(new Error(`writer exited early (${String(code)}): ${errors}`));
-        });
-      });
-
-      expect(() => createDb(dbPath)).toThrow(
-        'holds capability "durable-ingress-v2", written by a newer version',
+  it.each([
+    ['write-ahead-log', 'wal'],
+    ['rollback-journal', 'delete'],
+  ] as const)(
+    'refuses a marker a newer version commits to a %s database while the open waits for the write lock',
+    async (_mode, journal) => {
+      // The first, lock-free check runs before the marker commits; only the
+      // check inside the schema transaction can see it.
+      const dbPath = databaseWithMarkers([], journal);
+      const child = spawn(
+        process.execPath,
+        [
+          '--experimental-transform-types',
+          '--import',
+          path.resolve('src/runtime/__fixtures__/typescript-loader.ts'),
+          path.resolve(
+            'src/external-ingress/__fixtures__/newer-marker-writer.ts',
+          ),
+          dbPath,
+          '750',
+        ],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
       );
-      expect(await exited).toBe(0);
-    } finally {
-      child.kill('SIGKILL');
-      await exited;
-    }
-  }, 30_000);
+      const killTimer = setTimeout(() => child.kill('SIGKILL'), 20_000);
+      const exited = new Promise<number | null>((resolve) => {
+        child.once('exit', (code) => {
+          clearTimeout(killTimer);
+          resolve(code);
+        });
+      });
+      let errors = '';
+      child.stderr.on('data', (chunk) => {
+        errors += String(chunk);
+      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let output = '';
+          child.stdout.on('data', (chunk) => {
+            output += String(chunk);
+            if (output.includes('READY\n')) resolve();
+          });
+          void exited.then((code) => {
+            reject(
+              new Error(`writer exited early (${String(code)}): ${errors}`),
+            );
+          });
+        });
+
+        // In WAL mode the writer's uncommitted marker is not in the main file,
+        // and its commit only appends a WAL frame, so these bytes must survive.
+        const mainAtReady = readFileSync(dbPath);
+
+        expect(() => createDb(dbPath)).toThrow(
+          'holds capability "durable-ingress-v2", written by a newer version',
+        );
+        expect(await exited).toBe(0);
+
+        // 002 §15: the refused open keeps the file's journal mode and does not
+        // checkpoint the newer writer's frames into the main file. Bytes come
+        // first: each inspection open below closes as the last connection and
+        // checkpoints.
+        if (journal === 'wal') {
+          expect(readFileSync(dbPath)).toEqual(mainAtReady);
+          expect(snapshot(dbPath).wal?.length).toBeGreaterThan(0);
+        } else {
+          expect(existsSync(`${dbPath}-wal`)).toBe(false);
+          expect(existsSync(`${dbPath}-shm`)).toBe(false);
+          expect(existsSync(`${dbPath}-journal`)).toBe(false);
+        }
+        expect(journalMode(dbPath)).toBe(journal);
+        expect(markers(dbPath)).toEqual([
+          {
+            workspace_identity: '/workspace',
+            capability: 'durable-ingress-v2',
+          },
+        ]);
+      } finally {
+        child.kill('SIGKILL');
+        await exited;
+      }
+    },
+    30_000,
+  );
 
   it('opens again once the unknown marker is gone', () => {
     const dbPath = databaseWithMarkers([['/workspace', 'durable-ingress-v2']]);

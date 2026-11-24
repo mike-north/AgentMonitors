@@ -3,7 +3,7 @@
  * migration. Filesystem permission migration must precede SQLite ownership of
  * descriptors so external closes cannot invalidate its POSIX lock bookkeeping.
  */
-import { lstatSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import Database, { type Database as BetterSQLiteClient } from 'better-sqlite3';
 import { BetterSQLite3Database, drizzle } from 'drizzle-orm/better-sqlite3';
@@ -256,18 +256,29 @@ function isSqliteBusy(error: unknown): boolean {
  * restricted-umask window for on-disk databases.
  */
 function buildDb(dbPath: string): InboxDb {
+  // Refuse a database a newer version marked before anything here can write
+  // to it. Uncheckpointed WAL frames are durable state too: closing the last
+  // read-write connection would checkpoint them into the main file and delete
+  // the WAL, so when a WAL exists the check runs on a read-only connection,
+  // which never checkpoints. Without a WAL a read-only open would leave new
+  // sidecar files behind, so the read-write connection checks instead and
+  // removes its own sidecars when the refusal closes it.
+  const walPresent = dbPath !== ':memory:' && existsSync(`${dbPath}-wal`);
+  if (walPresent) refuseUnknownCapabilitiesReadOnly(dbPath);
   const sqlite = new Database(dbPath);
   // Wait for a concurrent first-open's migration transaction to commit rather
   // than failing with SQLITE_BUSY (see `buildSchema`'s immediate transaction).
   sqlite.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
   try {
-    // Refuse a database a newer version marked before anything here can write
-    // to it: the journal-mode switch below already rewrites the file header.
-    refuseUnknownCapabilities(sqlite);
+    // The journal-mode switch below already rewrites the file header.
+    if (!walPresent) refuseUnknownCapabilities(sqlite);
   } catch (error) {
     sqlite.close();
     throw error;
   }
+  const journalModeBefore: unknown = sqlite.pragma('journal_mode', {
+    simple: true,
+  });
   enableWriteAheadLog(sqlite);
   sqlite.pragma('foreign_keys = ON');
 
@@ -308,11 +319,59 @@ function buildDb(dbPath: string): InboxDb {
       })
       .immediate();
   } catch (error) {
-    if (error instanceof NewerDatabaseCapabilityError) sqlite.close();
+    if (error instanceof NewerDatabaseCapabilityError) {
+      closeRefusedConnection(sqlite, dbPath, journalModeBefore);
+    }
     throw error;
   }
 
   return db as unknown as InboxDb;
+}
+
+/** Rollback-journal modes a refused open restores after its WAL switch. */
+const RESTORABLE_JOURNAL_MODES: ReadonlySet<unknown> = new Set([
+  'delete',
+  'truncate',
+  'persist',
+]);
+
+/**
+ * Close a connection whose schema transaction refused a newer database,
+ * leaving the file as this open found it (002 §15).
+ *
+ * The refusal comes after the WAL switch. A file that was in a rollback-journal
+ * mode is switched back; the switch's WAL holds nothing, because the refused
+ * transaction rolled back. A file that was already in WAL mode may hold a
+ * newer writer's uncheckpointed frames, so a read-only connection stays open
+ * across the close: this connection is then not the last one and does not
+ * checkpoint them, and the read-only one never does.
+ */
+function closeRefusedConnection(
+  sqlite: BetterSQLiteClient,
+  dbPath: string,
+  journalModeBefore: unknown,
+): void {
+  if (RESTORABLE_JOURNAL_MODES.has(journalModeBefore)) {
+    try {
+      sqlite.pragma(`journal_mode = ${String(journalModeBefore)}`);
+    } catch {
+      // Another connection still has the file open in WAL mode, which blocks
+      // leaving it. The refusal stands; the file stays in WAL mode.
+    }
+    sqlite.close();
+    return;
+  }
+  if (dbPath === ':memory:') {
+    sqlite.close();
+    return;
+  }
+  const guard = new Database(dbPath, { readonly: true, fileMustExist: true });
+  try {
+    guard.prepare('SELECT 1 FROM sqlite_master LIMIT 1').get();
+    sqlite.close();
+  } finally {
+    guard.close();
+  }
 }
 
 /**
@@ -354,6 +413,22 @@ export class NewerDatabaseCapabilityError extends Error {
  * a database without the marker table (fresh, or written before it existed)
  * passes, and markers of every workspace scope count.
  */
+/**
+ * {@link refuseUnknownCapabilities} through a separate read-only connection,
+ * which reads uncheckpointed WAL frames but never checkpoints or deletes the
+ * WAL when it closes. Only the shared-memory index, which SQLite rebuilds from
+ * the WAL, may change.
+ */
+function refuseUnknownCapabilitiesReadOnly(dbPath: string): void {
+  const reader = new Database(dbPath, { readonly: true, fileMustExist: true });
+  try {
+    reader.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
+    refuseUnknownCapabilities(reader);
+  } finally {
+    reader.close();
+  }
+}
+
 function refuseUnknownCapabilities(sqlite: BetterSQLiteClient): void {
   const table = sqlite
     .prepare<
