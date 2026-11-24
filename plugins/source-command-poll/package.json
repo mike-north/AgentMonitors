@@ -35,11 +35,23 @@
     "fix:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json"
   },
   "nx": {
+    "namedInputs": {
+      "ownedProcessHelpers": [
+        "{workspaceRoot}/scripts/owned-test-group.mjs"
+      ]
+    },
     "targets": {
       "test": {
         "dependsOn": [
           "^build",
           "build"
+        ],
+        "inputs": [
+          "default",
+          "^production",
+          "testIsolation",
+          "dockerEnvironment",
+          "ownedProcessHelpers"
         ]
       }
     }
