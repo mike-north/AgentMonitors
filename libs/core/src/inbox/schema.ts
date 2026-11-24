@@ -256,8 +256,19 @@ export const monitorState = sqliteTable('monitor_state', {
  * Seed/advance rules (decided): materialization SEEDS a cursor only when none
  * exists (new recipient = caught up to the pre-event state); it never advances
  * an existing one. `markClaimed` advances the cursor to the artifact of the
- * newest event the recipient just claimed for that object. Cursors persist
- * across dormancy — a resuming session keeps its cursors.
+ * newest event the recipient just claimed for that object, and only when that
+ * event is later in the stable event order (`created_at`, then the private
+ * `monitor_events.sequence`) than the event the cursor already stands at — a
+ * claim of older events never moves a cursor backward. Cursors persist across
+ * dormancy — a resuming session keeps its cursors.
+ *
+ * `baseline_event_created_at` / `baseline_event_sequence` are the stable order
+ * position of the event the baseline came from, copied from `monitor_events`
+ * so the comparison survives that event's removal. Both are NULL when the
+ * baseline is the state BEFORE the recipient's first projected event (a seed
+ * from the prior snapshot) or for a cursor written before these columns
+ * existed whose baseline event is gone: such a cursor has no position, and any
+ * claim advances it.
  */
 export const sessionObjectCursor = sqliteTable('session_object_cursor', {
   id: text('id').primaryKey(),
@@ -267,6 +278,10 @@ export const sessionObjectCursor = sqliteTable('session_object_cursor', {
   workspacePath: text('workspace_path'),
   baselineSnapshotId: text('baseline_snapshot_id'),
   baselineContent: text('baseline_content').notNull().default(''),
+  baselineEventCreatedAt: integer('baseline_event_created_at', {
+    mode: 'timestamp',
+  }),
+  baselineEventSequence: integer('baseline_event_sequence'),
   updatedAt: integer('updated_at', { mode: 'timestamp' }).notNull(),
 });
 

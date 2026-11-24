@@ -890,3 +890,145 @@ describe('opening agent_sessions written by a released version (002 §2.7)', () 
     },
   );
 });
+
+/** `session_object_cursor` as every released version that has it (0.9.0–0.16.0) created it. */
+const CURSORS_RELEASED = sql`
+  CREATE TABLE session_object_cursor (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    monitor_id TEXT NOT NULL,
+    object_key TEXT NOT NULL,
+    workspace_path TEXT,
+    baseline_snapshot_id TEXT,
+    baseline_content TEXT NOT NULL DEFAULT '',
+    updated_at INTEGER NOT NULL
+  );
+  CREATE UNIQUE INDEX idx_session_object_cursor_key
+    ON session_object_cursor (
+      session_id, monitor_id, object_key, COALESCE(workspace_path, '')
+    );
+`;
+
+function cursorRow(
+  index: number,
+  baselineSnapshotId: string | null,
+): Record<string, unknown> {
+  return {
+    id: `01M6BSHAPE00000000000000C${index}`,
+    session_id: `01M6BSHAPE00000000000000A${index}`,
+    monitor_id: `monitor-${index}`,
+    object_key: `object-${index}`,
+    workspace_path: index % 2 === 0 ? null : `/workspace-${index}`,
+    baseline_snapshot_id: baselineSnapshotId,
+    baseline_content: `content ${index}`,
+    updated_at: OBSERVED_AT + 50 + index,
+  };
+}
+
+describe('opening session_object_cursor written by a released version (002 §1.1.2, #298)', () => {
+  it('keeps every cursor and records the stable order position of its baseline event', () => {
+    const dbPath = tempDbPath();
+    seedReleasedShape(dbPath, shapeNamed('0.9.0–0.13.0'));
+    const seeded = rawClient(dbPath);
+    seeded.exec(CURSORS_RELEASED);
+    insertRows(seeded, 'session_object_cursor', [
+      // Advanced at claim: the baseline names event 2.
+      cursorRow(1, '01M6BSHAPE00000000000000E2'),
+      // Seeded from the prior snapshot: no baseline event.
+      cursorRow(2, null),
+      // Names an event that no longer exists.
+      cursorRow(3, '01M6BSHAPE00000000000000E9'),
+    ]);
+    const before = rowsByRowid(seeded, 'session_object_cursor');
+    seeded.close();
+
+    const migrated = openWithCurrentCode(dbPath);
+    const after = rowsByRowid(migrated, 'session_object_cursor');
+    expect(after).toHaveLength(3);
+    // Event 2 was the second row of the released table, so the rebuild gives it
+    // sequence 2 (002 §5.2), and its observation time is OBSERVED_AT + 2.
+    expect(after[0]).toEqual({
+      ...before[0],
+      baseline_event_created_at: OBSERVED_AT + 2,
+      baseline_event_sequence: 2,
+    });
+    expect(after[1]).toEqual({
+      ...before[1],
+      baseline_event_created_at: null,
+      baseline_event_sequence: null,
+    });
+    expect(after[2]).toEqual({
+      ...before[2],
+      baseline_event_created_at: null,
+      baseline_event_sequence: null,
+    });
+    migrated.close();
+
+    // Reopening changes nothing.
+    const reopened = openWithCurrentCode(dbPath);
+    expect(rowsByRowid(reopened, 'session_object_cursor')).toEqual(after);
+  });
+
+  it('after the upgrade, claiming an event older than the cursor baseline leaves the cursor in place', () => {
+    const dbPath = tempDbPath();
+    // A database in the 0.14.0–0.16.0 layout: current event tables, released
+    // cursor table.
+    const writer = new RuntimeStore(createDb(dbPath));
+    const sessionId = writer.openSession({
+      adapter: 'claude-code',
+      hostSessionId: 'host-1',
+      agentIdentity: 'agent-1',
+      role: 'lead',
+      workspacePath: '/ws',
+      hookStatePath: '/hooks/1.json',
+    }).id;
+    const insert = (artifact: string, offset: number): string =>
+      writer.insertEvent(
+        {
+          workspacePath: '/ws',
+          monitorId: 'm',
+          sourceName: 's',
+          urgency: 'normal',
+          title: artifact,
+          body: '',
+          summary: '',
+          payload: {},
+          snapshotMetadata: {},
+          snapshotText: artifact,
+          diffText: null,
+          objectKey: 'o',
+          queryScope: {},
+          tags: [],
+          createdAt: new Date((OBSERVED_AT + offset) * 1000),
+        },
+        { previousContent: null },
+      ).id;
+    const older = insert('a1', 1);
+    const newer = insert('a2', 2);
+    const client = rawClient(dbPath);
+    client.exec(sql`
+      DELETE FROM session_object_cursor;
+      ALTER TABLE session_object_cursor DROP COLUMN baseline_event_created_at;
+      ALTER TABLE session_object_cursor DROP COLUMN baseline_event_sequence;
+    `);
+    insertRows(client, 'session_object_cursor', [
+      {
+        id: '01M6BSHAPE00000000000000C1',
+        session_id: sessionId,
+        monitor_id: 'm',
+        object_key: 'o',
+        workspace_path: '/ws',
+        baseline_snapshot_id: newer,
+        baseline_content: 'a2',
+        updated_at: OBSERVED_AT + 10,
+      },
+    ]);
+    client.close();
+
+    const store = new RuntimeStore(createDb(dbPath));
+    store.markClaimed(sessionId, [older], 'turn-idle');
+    const cursor = store.getSessionObjectCursor(sessionId, 'm', 'o', '/ws');
+    expect(cursor?.baselineSnapshotId).toBe(newer);
+    expect(cursor?.baselineContent).toBe('a2');
+  });
+});

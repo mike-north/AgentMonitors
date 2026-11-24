@@ -523,8 +523,42 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       workspace_path TEXT,
       baseline_snapshot_id TEXT,
       baseline_content TEXT NOT NULL DEFAULT '',
+      baseline_event_created_at INTEGER,
+      baseline_event_sequence INTEGER,
       updated_at INTEGER NOT NULL
     )
+  `);
+
+  // Additive migration (002 §1.1.2): a cursor table created before cursors
+  // recorded their stable event-order position lacks these columns. Add them,
+  // then fill the position of every cursor whose baseline names a retained
+  // event (a claim-advance or a baseline-event seed). A cursor seeded from the
+  // prior snapshot (no baseline event) keeps NULL: no position, so the next
+  // claim advances it, as before.
+  addColumnIfMissing(
+    sqlite,
+    'session_object_cursor',
+    'baseline_event_created_at',
+    'INTEGER',
+  );
+  addColumnIfMissing(
+    sqlite,
+    'session_object_cursor',
+    'baseline_event_sequence',
+    'INTEGER',
+  );
+  db.run(sql`
+    UPDATE session_object_cursor
+       SET baseline_event_created_at = (
+             SELECT created_at FROM monitor_events
+              WHERE monitor_events.id = session_object_cursor.baseline_snapshot_id
+           ),
+           baseline_event_sequence = (
+             SELECT sequence FROM monitor_events
+              WHERE monitor_events.id = session_object_cursor.baseline_snapshot_id
+           )
+     WHERE baseline_event_sequence IS NULL
+       AND baseline_snapshot_id IN (SELECT id FROM monitor_events)
   `);
 
   // Unique on the cursor key. SQLite treats NULLs as DISTINCT in a UNIQUE index,

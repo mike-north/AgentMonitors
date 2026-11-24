@@ -94,6 +94,30 @@ The single most important structural fact in this model is the **seam** between 
   _identical_ baseline (and therefore would compute the identical span) MAY be deduplicated — the
   per-recipient work is multiplied only where baselines genuinely differ (capability C15).
 
+**Cursors never move backward.** A recipient's cursor stands at the greatest event already surfaced
+to it for that object, in the stable event order of
+[§1.1.7](#117-baseline-strategy-per-recipient-diff-semantics-current) (persisted `created_at`, then
+the private `monitor_events.sequence` tie-break). Delivery surfaces events out of that order — a
+`high` event at `turn-interruptible` before an older `normal` or `low` one at idle (§9), or a
+`post-compact` recap of older unread rows (§9.4) — so a claim may contain only events older than one
+an earlier claim already showed. Such a claim leaves the cursor where it is; a claim moves it only to
+an event later in the order, and a claim of the event it already stands at changes nothing. The next
+per-recipient delta therefore always spans from the greatest event already surfaced, never replaying
+a change the recipient has seen. The cursor stores that event's order position
+(`baseline_event_created_at`, `baseline_event_sequence`, §15), so the comparison survives restarts and
+does not depend on the event row being retained. When the baseline event is retained, its position is
+re-read before each comparison, so a cursor moved by a writer that did not record positions is
+compared at the event it actually holds. A cursor seeded from the state before the
+recipient's first projected event has no position, and its first claim advances it.
+
+> Verified: `RuntimeStore.advanceSessionObjectCursor` (`libs/core/src/runtime/store.ts`) compares the
+> claimed event's position with the stored one inside the `UPDATE` predicate. Proven by
+> `libs/core/src/runtime/monotonic-cursor.test.ts` (high before normal, low and recap after newer
+> claims, repeated claims, restart between claims, equal-second tie-break in both claim orders, later-committed event with
+> an earlier observation time, a cursor moved without its position) and
+> `libs/core/src/inbox/db.released-shapes.test.ts` (upgrade of a
+> released cursor table).
+
 This seam is what makes fan-out cheap: the expensive shared work (acquire, reduce, render, settle)
 runs once; only the genuinely per-baseline work multiplies. It is the structural reason a single
 monitor can serve a whole fleet without recomputing its observation per session
@@ -2504,7 +2528,7 @@ being evaluated.
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):
 
 - **Unread:** `acknowledgedAt IS NULL` in `session_event_state`. The session has not acknowledged the event.
-- **Claimed (pending → notified):** `firstNotifiedAt IS NOT NULL`. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (events where `firstNotifiedAt IS NULL` and `acknowledgedAt IS NULL`).
+- **Claimed (pending → notified):** `firstNotifiedAt IS NOT NULL`. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (events where `firstNotifiedAt IS NULL` and `acknowledgedAt IS NULL`). `firstNotifiedAt` records the **first** claim and is never overwritten: a repeat claim of the same row (a recap, or a row re-surfaced before acknowledgement) updates only `lastClaimAt` and `lastClaimLifecycle`. Every claim, first or repeat, advances the recipient's object cursor only forward (§1.1.2).
 - **Acknowledged:** `acknowledgedAt IS NOT NULL`. The session explicitly marked the event read.
 
 This distinction matters because a claimed event may still need user or agent attention later.
@@ -3426,16 +3450,25 @@ Per-session delivery tracking for each projected event. Drives the unread/claime
 
 The per-recipient baseline cursor (G10, [§1.1.2](#112-the-shared--per-recipient-seam)). One row per `(session_id, monitor_id, object_key, workspace_path)`: the last shaped artifact this recipient was caught up to, the anchor its per-recipient Diff spans FROM. Unique on the four key columns (`COALESCE(workspace_path, '')` collapses the global/`NULL` case). `baseline_content` is denormalized (the full artifact text) so a recipient's baseline is prune-immune. Survives daemon restart (BP1); session-keyed so isolation is structural.
 
-| Column                 | Type             | Notes                                                 |
-| ---------------------- | ---------------- | ----------------------------------------------------- |
-| `id`                   | TEXT PK          | ULID                                                  |
-| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                             |
-| `monitor_id`           | TEXT NOT NULL    |                                                       |
-| `object_key`           | TEXT NOT NULL    |                                                       |
-| `workspace_path`       | TEXT nullable    | `NULL` = global                                       |
-| `baseline_snapshot_id` | TEXT nullable    | The event/snapshot the baseline came from (diagnosis) |
-| `baseline_content`     | TEXT NOT NULL    | Denormalized full artifact (defaults to `''`)         |
-| `updated_at`           | INTEGER NOT NULL | Set on seed and on each claim-advance                 |
+| Column                      | Type             | Notes                                                 |
+| --------------------------- | ---------------- | ----------------------------------------------------- |
+| `id`                        | TEXT PK          | ULID                                                  |
+| `session_id`                | TEXT NOT NULL    | FK to `agent_sessions.id`                             |
+| `monitor_id`                | TEXT NOT NULL    |                                                       |
+| `object_key`                | TEXT NOT NULL    |                                                       |
+| `workspace_path`            | TEXT nullable    | `NULL` = global                                       |
+| `baseline_snapshot_id`      | TEXT nullable    | The event/snapshot the baseline came from (diagnosis) |
+| `baseline_content`          | TEXT NOT NULL    | Denormalized full artifact (defaults to `''`)         |
+| `baseline_event_created_at` | INTEGER nullable | Baseline event's `created_at`; see below              |
+| `baseline_event_sequence`   | INTEGER nullable | Baseline event's `monitor_events.sequence`; see below |
+| `updated_at`                | INTEGER NOT NULL | Set on seed and on each claim-advance                 |
+
+`baseline_event_created_at` and `baseline_event_sequence` are the stable order position (§1.1.7) of
+the event the baseline came from, copied so the monotonic comparison (§1.1.2) does not need that
+event row. Both are `NULL` for a cursor seeded from the state before the recipient's first projected
+event. The columns are additive: opening a database whose cursor table lacks them adds them and fills
+the position of each cursor whose `baseline_snapshot_id` names a retained event; any other cursor
+keeps `NULL` and its next claim advances it.
 
 Verified: `libs/core/src/inbox/schema.ts` (`sessionObjectCursor`), `libs/core/src/inbox/db.ts` (DDL + unique index + additive `diff_text` migration), `libs/core/src/runtime/store.ts` (`getSessionObjectCursor` / `seedSessionObjectCursor` / `advanceSessionObjectCursor`).
 
