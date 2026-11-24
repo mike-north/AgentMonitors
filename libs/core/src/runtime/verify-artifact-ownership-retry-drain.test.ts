@@ -432,6 +432,46 @@ describe('the tick drain drops retained work for a retired verify artifact', () 
     expect(f.observeCalls()).toBe(2);
   });
 
+  it('records retries drained before a failed discard ahead of its errored row (002 §2.7)', async () => {
+    const f = pollSetup((root) => [
+      [
+        { summary: 'L', objectKey: 'L' },
+        { summary: 'S', objectKey: scratchKey(root, RUN) },
+      ],
+      [{ summary: 'B', objectKey: 'B' }],
+    ]);
+    registerArtifact(f.runtime, f.root, RUN, scratchKey(f.root, RUN));
+    failSummary(f.client, 'L');
+    await f.runtime.tick(f.monitorsDir, f.root);
+    expect(retryCount(f.client)).toBe(2);
+
+    // L completes; removing S's row fails, so S's discard cannot commit.
+    f.runtime.requestVerifyArtifactCleanup({ runId: RUN });
+    repair(f.client, 'L');
+    f.client.exec(`CREATE TRIGGER fail_s_delete
+      BEFORE DELETE ON materialization_retry_outbox
+      WHEN json_extract(OLD.envelope, '$.observation.summary') = 'S' BEGIN
+      SELECT RAISE(ABORT, 'outbox delete failed'); END;`);
+    const before = f.runtime.listObservationHistory({ monitorId: MONITOR_ID });
+    clock.advance(2_000);
+    await f.runtime.tick(f.monitorsDir, f.root);
+    const after = f.runtime.listObservationHistory({ monitorId: MONITOR_ID });
+    expect(
+      after
+        .slice(0, after.length - before.length)
+        .map(({ result, observationData }) => ({ result, observationData })),
+    ).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringContaining('could not be discarded') as string,
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 1 } },
+    ]);
+    expect(monitorEventSummaries(f.client, MONITOR_ID)).toEqual(['L']);
+  });
+
   /**
    * Controls: the drop is exact. Each retained retry below has no cleanup
    * authority of its own, so it drains and materializes normally, even when

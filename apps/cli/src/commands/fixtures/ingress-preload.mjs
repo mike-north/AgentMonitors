@@ -496,6 +496,8 @@ globalThis.__ingressTestAttach = (Registry, Runtime) => {
     'ingest',
     'flushHeldNotifyWork',
     'drainMaterializationRetries',
+    // A tick's drained-retry history row when no span row counted it (002 §2.7).
+    'recordDrainedHistory',
     'reconcileNotifyEdit',
   ]) {
     const original = Runtime.prototype[name];

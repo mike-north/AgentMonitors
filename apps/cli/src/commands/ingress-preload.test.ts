@@ -38,6 +38,7 @@ function probe(
       ingest() { ${ingress} }
       flushHeldNotifyWork() {}
       drainMaterializationRetries() {}
+      recordDrainedHistory() {}
       reconcileNotifyEdit() {}
       watchMonitors() {}
       rearmMaterializationRetry() { ${boundary === 'rearmMaterializationRetry' ? body : ''} }
