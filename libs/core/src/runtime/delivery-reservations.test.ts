@@ -434,3 +434,68 @@ describe('diagnostics and hook-state are lease-aware (issue #300)', () => {
     expect(deliveryState(h)).toBe('acknowledged');
   });
 });
+
+/**
+ * A reminder is never delivered for a session with no unread rows (issue #473,
+ * 002 §9.2). Decide time requires pending ⊂ unread, and ack-all skips rows an
+ * outstanding reservation holds, so a session-wide acknowledgement cannot empty
+ * a reminder between reservation and push.
+ *
+ * @see docs/specs/002-runtime-delivery.md §7 (unread / claimed / acknowledged)
+ * @see docs/specs/002-runtime-delivery.md §9.2 (generic reminders)
+ */
+describe('a reminder is never delivered for a session with no unread rows (issue #473)', () => {
+  it('#473: ack-all between reserve and commit leaves the reserved row unread, and the reminder reports at least one unread', () => {
+    const h = makeHarness({ urgency: 'normal' });
+
+    const reservation = h.runtime.reserveDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    );
+    if (!reservation) throw new Error('expected a reservation');
+    // 002 §9.2: the reminder's count is the session's unread total at decide time.
+    expect(reservation.claim.unreadCounts.total).toBeGreaterThanOrEqual(1);
+
+    h.runtime.acknowledgeSession(h.sessionId);
+
+    // 002 §7: the reserved row was not acknowledged, so it is still unread.
+    expect(deliveryState(h)).toBe('unread');
+    expect(unreadCount(h)).toBe(1);
+
+    h.runtime.commitDelivery(reservation.reservationId);
+    // Committed means surfaced (claimed), never acknowledged (002 §7).
+    expect(deliveryState(h)).toBe('claimed');
+    expect(unreadCount(h)).toBe(1);
+  });
+
+  it('#473: a hook claim followed by ack-all leaves nothing for the next claim to deliver', () => {
+    const h = makeHarness({ urgency: 'normal' });
+
+    const first = h.runtime.claimDelivery(h.sessionId, 'turn-interruptible');
+    expect(first).not.toBeNull();
+
+    h.runtime.acknowledgeSession(h.sessionId);
+
+    expect(unreadCount(h)).toBe(0);
+    expect(
+      h.runtime.claimDelivery(h.sessionId, 'turn-interruptible'),
+    ).toBeNull();
+  });
+
+  it('#473: reserve, ack-all, then release makes the protected row deliverable as a reminder with one unread', () => {
+    const h = makeHarness({ urgency: 'normal' });
+
+    const reservation = h.runtime.reserveDelivery(
+      h.sessionId,
+      'turn-interruptible',
+    );
+    if (!reservation) throw new Error('expected a reservation');
+    h.runtime.acknowledgeSession(h.sessionId);
+    h.runtime.releaseDelivery(reservation.reservationId);
+
+    const next = h.runtime.claimDelivery(h.sessionId, 'turn-interruptible');
+    expect(next).not.toBeNull();
+    expect(next?.events).toHaveLength(0);
+    expect(next?.unreadCounts.total).toBe(1);
+  });
+});

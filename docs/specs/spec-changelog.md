@@ -9,7 +9,7 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-11-23 — External event receipt storage schema (002 §2.6, §15, §16.1; 004 §2.14) — Refs #481
+## 2026-11-23 — External event receipt storage schema (002 §2.6, §15, §16.1; 004 §2.15) — Refs #481
 
 002 §15 now specifies the `external_event_receipts`, `external_object_sequences`, and
 `database_compatibility_markers` tables every open creates, with their keys, epoch-second
@@ -20,7 +20,63 @@ carry-or-refuse rule: extra columns are carried, missing nullable or defaulted c
 and a shape the current writer cannot use refuses with the database unchanged. Concurrent first
 opens of one fresh file now all succeed: the switch to write-ahead logging retries a busy result,
 with retries and busy-handler waits sharing one 5-second deadline, instead of failing before the
-schema transaction. 004 §2.14 lists the required scenarios.
+schema transaction. 004 §2.15 lists the required scenarios.
+
+## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
+
+002 §9.2 now states the rule and why it holds: decide time requires pending ⊂ unread, and a
+session-wide acknowledgement skips rows an outstanding reservation holds. It records the two accepted
+windows: a scoped acknowledgement of every reserved row between reservation and push, and a host
+showing a notification it queued before the acknowledgement. Behavior is unchanged; regression tests
+in `delivery-reservations.test.ts` pin it.
+
+## 2026-11-23 — Cover foreign exceptions at envelope admission catch sites (002 §16.1; 004 §6.1) — Refs #649
+
+004 §6.1 now requires isolated coverage of each envelope admission catch site: envelope
+byte preflight, scope byte preflight and canonical encoding. A counting proxy, an
+ordinary object with counting coercion and inspection getters, and a native
+stack-overflow `RangeError`, thrown there from a descriptor intrinsic installed before
+import, must yield permanent `invalid_envelope` with no escape, no output and no
+inspection of the thrown value. The ordinary object covers logging and `util.inspect`,
+which format a proxy's target without running its traps. Validator behavior is unchanged; this records existing guarantees
+as required scenarios.
+
+## 2026-11-23 — Strict `channel serve --poll-ms` validation (005 §13) — Refs #306
+
+`--poll-ms` previously went through `parseInt(value) || 3000`, so negative values, partly
+numeric strings and fractions were silently truncated, out-of-range values reached
+`setTimeout` (which clamps them to 1 ms), and an explicit `0` became the default. The flag now
+accepts only plain decimal digits from 100 to 2147483647. Any other value is rejected with a
+one-line stderr diagnostic and exit code 1 before the MCP server starts. Omitting the flag
+still means 3000 ms. A shared CLI parser (`apps/cli/src/integer-option.ts`) holds the rule;
+other numeric flags keep their current ranges.
+
+## 2026-11-23 — Nx cache contract for package targets
+
+004 §2.14 records which root configs, cross-project files and host facilities each cached
+target hashes. Before this, editing `tsconfig.base.json` or a shared API Extractor config
+replayed cached builds and checks, a CLI source edit replayed core's signal-inventory test,
+and a host gaining or losing `jq` or Docker replayed a result recorded with different
+coverage. The Nx daemon is disabled because it would reuse a stale host fingerprint.
+`pnpm affected` documents the development path; `pnpm verify` remains the gate.
+
+## 2026-11-23 — `monitor explain` counts net-suppressed rows separately
+
+005 `monitor explain` now defines each delivery count. Rows the per-recipient net collapse
+suppressed (002 §1.1.7) were stored as `claimed` and so inflated that count even though the
+session never saw them; they are now reported under their own `netSuppressed` count, which an
+ack by event ID no longer moves into `acknowledged`. The 005 text also states that `claimed`
+includes rows covered only by a generic normal/low reminder.
+
+002 §1.1.7 now states that the collapse suppresses only intermediates no earlier claim
+surfaced. A `post-compact` recap over claimed-but-unacknowledged rows had been marking rows the
+session was already shown as suppressed; those rows now stay claimed and unread until
+acknowledged, so they also stay in later claims' `unreadCounts`. A recap that re-shows an
+endpoint an earlier claim surfaced now keeps that endpoint's first-claimed delta; it had been
+recomputing it against a cursor already at the endpoint and rendering it with no diff. Which
+events are rendered and claimed, and the cursor advance, are unchanged. 005 notes that rows
+marked suppressed by older versions after being shown keep counting as `netSuppressed`. Output
+shape is otherwise unchanged. Implementation now matches the described behavior.
 
 ## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
 
@@ -29,7 +85,7 @@ nested array members, while general canonical JSON continues to preserve ordinar
 Leap-second syntax accepts every UTC month end and equivalent offset spellings; timestamp
 validation does not depend on a leap-second announcement table.
 
-## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.14) — Refs #481
+## 2026-11-16 — Versioned source-neutral external-event contract is public (002 §2.6, 004 §2.15) — Refs #481
 
 Core now exports the strict `agentmonitors.external-event.v1` envelope validator,
 JSON value types, semantic SHA-256 helper over the closed v1 field set, collision-free

@@ -7,7 +7,7 @@
  * state.
  *
  * @see ../../../../docs/specs/002-runtime-delivery.md (§15, external ingress tables)
- * @see ../../../../docs/specs/004-validation-testing.md (§2.14)
+ * @see ../../../../docs/specs/004-validation-testing.md (§2.15)
  * @see https://www.sqlite.org/partialindex.html
  * @see https://www.sqlite.org/wal.html#concurrency
  */

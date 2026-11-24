@@ -352,8 +352,16 @@ Rules for the payload-form step:
 > otherwise, per [§5.2](#52-snapshots-and-diffs)) when the group actually collapsed — and records
 > the older intermediates **claimed-but-suppressed** (`session_event_state.net_suppressed_at`):
 > retained and explainable via `monitor explain` ([§10.7](#107-monitor-pipeline-diagnosis)), never
-> delivered. `incremental` (explicit opt-out) delivers all in order. The per-recipient cursor still
-> advances to the newest claimed artifact (`markClaimed`) even when intermediates are suppressed.
+> delivered. Only intermediates no earlier claim surfaced are suppressed: a `post-compact` recap
+> collapses over every unread event, including claimed-but-unacknowledged ones, and an older
+> sibling that an earlier claim already rendered keeps no suppression marker and stays claimed and
+> unread until acknowledged. It therefore still counts in later claims' `unreadCounts`. Likewise
+> an endpoint that an earlier claim surfaced keeps the delta it was first claimed with when a
+> later recap re-shows it; it is not recomputed against a cursor that claim already moved to it
+> (#572; `libs/core/src/runtime/explain-net-suppressed.test.ts`). Which events a claim renders
+> and claims, and where the cursor moves, are unaffected by either rule. `incremental` (explicit
+> opt-out) delivers all in order. The per-recipient cursor still advances to the newest claimed
+> artifact (`markClaimed`) even when intermediates are suppressed.
 > The monitor's `baseline-strategy` is persisted on each `monitor_events` row (`baseline_strategy`)
 > so the claim-time decision needs no monitor re-scan.
 > Tested by `libs/core/src/runtime/net-per-recipient.test.ts` (away-across-N → one net delta + 2
@@ -2579,6 +2587,20 @@ unread events and acknowledge handled work; it does not identify every item that
 existing transport-owned action steps remain in force. Older unread claims are included in unread
 queries and counts; a new reminder does not erase them or certify their completion.
 
+**A reminder is never delivered for a session with no unread rows.** A reminder's count is the session's
+unread total at decide time, and the decision builds a reminder only when its pending batch is
+non-empty. Pending rows are a subset of unread rows under identical suppression filters, so a freshly
+decided reminder always reports at least one unread row. That stays true through the reserve → push →
+commit window because a session-wide acknowledgement (no explicit event ids) skips every row an
+outstanding reservation holds (§7). The skipped rows remain unread, and a released reservation makes
+them deliverable again. Two windows are accepted: a scoped acknowledgement that names every reserved
+row between reservation and push, which is an explicit choice by the caller and is not lease-filtered;
+and a host that shows a notification it queued before the agent acknowledged the rows, which the
+daemon cannot recall once pushed.
+
+Verified: `libs/core/src/runtime/delivery-reservations.test.ts` pins the session-wide acknowledgement
+skip, the hook claim → acknowledge → next-claim case and the release path (issue #473).
+
 Verified: `libs/core/src/runtime/reminder-progress.test.ts` covers new batches through direct hook
 claims and channel reserve/commit, per-session isolation, lease commit/release/expiry, and high settle
 coalescing. `reminder-diagnosis.test.ts`, `hook-delivery-diagnosis.test.ts` and
@@ -3816,3 +3838,7 @@ Canonical scope boundaries cover short and control escapes independently of the
 larger envelope bound. Refusal cases replace error constructors and error
 membership hooks after import and require zero calls with unchanged error codes.
 An injected undercount exercises the final output-size check.
+Each catch site also contains a foreign value thrown from a descriptor intrinsic
+installed before import: a counting proxy, an ordinary object with counting
+coercion and inspection getters, and a native stack-overflow `RangeError` each
+yield `invalid_envelope` without escaping, output or inspection of the thrown value.
