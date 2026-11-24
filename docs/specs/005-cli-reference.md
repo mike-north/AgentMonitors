@@ -807,11 +807,29 @@ the Materialization stage reports that work.` The span records its failure both 
   `errored` row and as the initial last error of the retry it queued. The row is the span's own
   failure when its error (stored with the retry's safe-text rule) equals some retry's last error.
   If no retry matches, the row is a source failure when the oldest retry has no attempt yet.
-  Once every retry has been attempted, the row is a source failure only in 002 §2.6's order:
-  directly preceded by another unmarked `errored` row, the flush's failure. These rows are read
-  from the explained window. A retaining tick that has left the window reads as the pause. A
-  span with no events whose previous tick's source failed can look like that order once every
-  retry has been attempted and the last error has changed. It then reads as a source failure.
+  Once the oldest retry has been attempted, the row is a source failure only in 002 §2.6's
+  order: directly preceded by another unmarked `errored` row, the flush's failure.
+
+  These rows are read heuristically, with these limits:
+  - **Window.** The rows are read from the explained `--history-limit` window, and each later
+    failed attempt or terminal tick adds a drain report to it. At the default of 10, the retaining
+    tick's source failure leaves the window after about eight further drain reports; from then on
+    the stage reports the pause.
+  - **Equal text.** A source failure whose error, under the safe-text rule, equals a retry's last
+    error reads as the span's own failure, and so as the pause. Under that rule, control
+    characters (line breaks included) become spaces and only the first 1,024 UTF-16 code units
+    count.
+  - **Missing flush row.** A retaining tick whose flush could not write its own best-effort
+    failure row leaves only the source's row. That row fails the stage until the oldest retry is
+    attempted, and then reads as the pause.
+  - **Reverse misread.** A span with no events whose previous tick's source failed looks like
+    002 §2.6's order once the oldest retry has been attempted and its last error has changed. Its
+    own failure row then reads as a source failure.
+
+  Accepting a last-error match only when no unmarked `errored` row precedes the row would close
+  the equal-text gap, but it would turn the reverse misread into one that holds before any
+  attempt as well, so explain does not do it.
+
 - A source outcome: the reasons above (`Source observation failed: <error>`, `healthy` for
   `no-change`/`rebaselined`, and so on), unchanged.
 - Released work: `ok`, `Held or retained work was materialized without new source input (observed 0).`
@@ -848,8 +866,9 @@ Verified: `libs/core/src/runtime/explain-history.test.ts` (each kind),
 `libs/core/src/runtime/explain-history-stages.test.ts` (a skip explained at once, a span whose
 only observations a hold refused, a failed retry attempt, a terminal pause, released work, a
 genuine source failure before and after retained work drains, a source failure in the tick whose
-held flush retained work (002 §2.6) before and after a later attempt, the retaining span before any
-attempt, and rows with an unknown outcome) and, through the built CLI in text and JSON,
+held flush retained work (002 §2.6) before and after a later attempt and when the flush could not
+record its own failure, the retaining span before and after an attempt that changes its last error,
+and rows with an unknown outcome) and, through the built CLI in text and JSON,
 `apps/cli/src/retry-repair.test.ts`.
 
 **Delivery counts (current, #572).** The delivery stage's reason and JSON `details` count the
