@@ -1,5 +1,72 @@
 # @agentmonitors/cli
 
+## 0.13.1
+
+### Patch Changes
+
+- a008829: `channel serve --poll-ms` now accepts only a whole number from 100 to 2147483647. Negative, zero, fractional, partly numeric or out-of-range values are rejected with a one-line error and exit code 1 before the MCP server starts, instead of being silently truncated or replaced by the default. Omitting the flag still polls every 3000 ms.
+- 2090673: Preserve kernel executable-path traversal and authored environment values during command admission, retain failing health and the previous baseline on exec failure, reject unrepresentable NUL bytes without truncating argv or environment values, restore native signal dispositions and masks, report ordinary exec errno without native crashes, isolate helpers from authored and inherited Node options while preserving them for the command, keep native binding lookup relative to each published module format, and release settled callers while independent watchdog deadlines remain armed.
+
+  Write admission status frames completely and reject incomplete or invalid status without replacing a successful baseline. Match platform spawn PATH search, relative executable spelling and errno precedence, including glibc's executable-format fallback. Explain platform native-support load failures with underlying detail. Ship Koffi 3.3.7 JavaScript, MIT license and macOS arm64/x64 and Linux glibc arm64/x64 prebuilds inside both packages, so CLI installation no longer requires `koffi` or `@koromix/*` from the user's registry. Load the selected binary relative to our package; unsupported platforms (including Windows and musl), missing or corrupt binaries refuse commands without plain-spawn or source-build fallback. Refresh with `node scripts/vendor-koffi.mjs`, verifying registry SHA-512 integrity and committed per-file SHA-256 hashes.
+
+  Use absolute runtime paths and start helpers with only the command-life mark in their environment, delivering the complete command environment through the configuration pipe so helper startup does not reduce the environment budget accepted by plain spawn. Keep initialization failures distinct from native-module load failures. Reparent the watchdog through a successfully reaped intermediate before exec, so commands can wait for all their own children without waiting for the watchdog. Preserve its process group, independent deadline, mark and restart accounting.
+
+  Restore blocking I/O on stdin, stdout and stderr before native execution. Clear only
+  `O_NONBLOCK` with the platform's variadic `fcntl` ABI, preserve unrelated status flags,
+  and verify each read-back. Refuse execution and retain the previous baseline if any status
+  operation fails or nonblocking mode survives.
+
+- a66ccec: Report held debounce and rollup observations in monitor explain and doctor even
+  when the current definition is rejected. Include counts, stored pacing and repair
+  guidance, and keep downstream stages pending while earlier work awaits release.
+
+  Distinguish definition rejection, source availability, owner inactivity and
+  retired declarations with an additive release-barrier field derived from tick's
+  read-only predicates. Describe retained retry and captured-data prerequisites
+  without promising that an overdue batch must flush on the next tick.
+
+- 3a00022: Reap orphaned command processes on macOS after a daemon restart using kernel environment evidence, with the same boot, ownership and process identity checks as Linux. Argument text never proves ownership. Batch discovery and signal verification through one asynchronous stock `/usr/bin/osascript -l JavaScript` helper per sweep, and batch terminal checks and durable receipt writes to keep startup bounded. No Homebrew tools or native addons are required.
+
+  Use Foundation-owned buffers to call sysctl without developer tools. Record conservative abstentions with reasons when the helper is unavailable or a process environment cannot be read. Treat empty or padded argv entries, process-title rewrites and an unproven envp boundary as per-PID unreadability rather than silently reporting the process unmarked.
+
+  Skip only the exact all-NUL executable-path alignment established by XNU for 64-bit macOS; any extra NUL still makes an empty first argument unreadable. Treat synchronous helper startup failures, including argument/environment size exhaustion, as unavailable evidence with a reason. Bound each parse to sysctl's returned byte count so shorter replies cannot inherit ownership evidence from a previous PID's buffer.
+
+- 413db36: Refuse Linux native execution before loading the binding when mapped libraries do not establish glibc or include musl. Unreadable or ambiguous evidence fails closed without diagnostic reports or subprocesses.
+- 90a76c7: Require real glibc evidence before loading native command support on Linux. Synthetic or synthetic-looking mappings cannot establish glibc; musl-shaped path or label segments always refuse, including harmless synthetic labels beside real glibc. Ambiguous names deliberately cause refusal rather than admitting a non-glibc host.
+- 8e5723a: Reap known adopted watchdog zombies when bounded command observations run as Linux PID 1 or a child subreaper, preserving libuv child exit statuses.
+- 4249d1f: Refuse non-regular command life tokens promptly before execution and recover command admission after a failed journal commit, preserving committed ownership and unrelated replacement files.
+- c425397: Retain command group attribution discovered at the restart sweep limit and confirm empty
+  nonce-only lives before retiring them, preserving accountability for late descendants.
+- 4249d1f: Reap orphaned stock macOS shell and curl commands after a daemon restart using each process's own inherited, journaled vnode. Preserve fail-closed ownership checks, watchdog bounds, and authored-command resource limits.
+- 2090673: Bound macOS and Linux command groups with a watchdog armed before command execution, so timeout cleanup survives daemon death and closed output streams. Release remaining background work when a finite observation completes. Preserve command ownership for restart reconciliation and terminate in-flight command groups on graceful daemon shutdown. The command source factory accepts an optional shutdown signal.
+- e1331c8: Identify watchdog roles in command ownership evidence. Preserve a command group's watchdog when restart cleanup cannot verify a group member. Record why the group bound remains active and retain per-process ownership checks for fully verified cleanup.
+
+  Keep per-process cleanup for groups without verified watchdogs, reconcile late forks beside terminal identities, and bound restart terminal scans and durable receipt writes.
+
+  Commit preservation decisions before awaiting unrelated terminal evidence, keeping receipt writes bounded. Persist invalid stored PID diagnostics before further identity queries.
+
+  Keep blocking receipt writes after every signal has used the final identity snapshot, before terminal queries begin.
+
+- Updated dependencies [2090673]
+- Updated dependencies [a66ccec]
+- Updated dependencies [f01f2da]
+- Updated dependencies [3a00022]
+- Updated dependencies [413db36]
+- Updated dependencies [90a76c7]
+- Updated dependencies [8e5723a]
+- Updated dependencies [4249d1f]
+- Updated dependencies [c425397]
+- Updated dependencies [b798ae8]
+- Updated dependencies [4249d1f]
+- Updated dependencies [2090673]
+- Updated dependencies [e1331c8]
+  - @agentmonitors/source-command-poll@0.7.0
+  - @agentmonitors/core@0.16.0
+  - @agentmonitors/source-api-poll@0.6.2
+  - @agentmonitors/source-file-fingerprint@0.5.2
+  - @agentmonitors/source-incoming-changes@0.4.2
+  - @agentmonitors/source-schedule@0.3.2
+
 ## 0.13.0
 
 ### Minor Changes
