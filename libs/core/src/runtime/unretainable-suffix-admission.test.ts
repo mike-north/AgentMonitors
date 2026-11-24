@@ -717,7 +717,8 @@ const RETAINED_SUFFIX = 10;
 
 describe('a dropped observation stays visible in explain and doctor', () => {
   // A drop must never be less visible than a recoverable failure (002 §10.7,
-  // 005 doctor rollup): both fail explain's verdict and doctor's monitor check.
+  // 005 doctor rollup): a drop fails explain's verdict, and a retained failure
+  // is pending at Materialization with its error, which it owns (005 §6, #591).
   for (const [name, fault, dropped] of [
     [
       `retained (a ${String(RETAINED_SUFFIX)}-record suffix, which fits)`,
@@ -726,7 +727,7 @@ describe('a dropped observation stays visible in explain and doctor', () => {
     ],
     ['dropped (a suffix one over capacity)', FAULT_LABEL, true],
   ] as const) {
-    it(`fails explain and doctor for a ${name} failure`, async () => {
+    it(`reports a ${name} failure at Materialization in explain and doctor`, async () => {
       const f = fixture('poll', (cursor) =>
         cursor === 0
           ? observations(0, OVER_CAPACITY_SPAN)
@@ -737,7 +738,10 @@ describe('a dropped observation stays visible in explain and doctor', () => {
       await f.runtime.tick(f.monitorsDir, f.root);
 
       const explained = await explain(f);
-      expect(explained.verdict.status).toBe('failure');
+      expect(explained.verdict).toMatchObject({
+        stage: 'materialization',
+        status: dropped ? 'failure' : 'pending',
+      });
       expect(explained.verdict.reason).toContain(`native fault on ${fault}`);
       const rollup = await doctorRollup(f);
       if (dropped) {

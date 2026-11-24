@@ -764,6 +764,113 @@ The real-CLI/live-daemon cases in
 `apps/cli/src/commands/held-notify.integration.test.ts` enforce this outcome and
 rejected-definition debounce/rollup text/JSON parity.
 
+**Which history rows each stage reads (current, #591).** History holds more than source
+outcomes: lost observations (002 §2) and the retained-work drain's reports (002 §2.7) are
+`errored` rows too, though no source call failed. Explain classifies every row in the
+`--history-limit` window once, by what it records, and each stage reads only the kinds it owns:
+
+| Kind               | Rows                                                                                                                                                                                                                                                           | Read by                                 |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- |
+| source outcome     | `triggered` with observations, `suppressed`, `no-change`, `no-files-matched`, `rebaselined`, a `triggered` row with `observed: 0` whose `sourceOutcome` is `no-files-matched` or `rebaselined` (002 §15), and any `errored` row with none of the markers below | Observation                             |
+| released work      | any other `triggered` row with `observed: 0`: held work flushed, or retained work drained, with no new source input (002 §2.6, §2.7)                                                                                                                           | Observation (`ok`)                      |
+| admission loss     | `errored` with `notRetained: true` or `holdRefused: true` (002 §2, §4.7)                                                                                                                                                                                       | Materialization, as an outstanding drop |
+| skipped-retry loss | `errored` with `skipped: true` (002 §2.7)                                                                                                                                                                                                                      | Materialization, as an outstanding drop |
+| retry drain        | `errored` whose error starts `Materialization retry <ULID>` followed by `failed: `, `could not be discarded ` or `stopped after ` (002 §2.7)                                                                                                                   | Materialization, as retained work       |
+| unrecognized       | any other `result`                                                                                                                                                                                                                                             | no stage                                |
+
+Materialization reads its kinds through the store's outstanding-drop query and the retry outbox,
+not through the window, so a loss stays reported after newer rows push it out.
+
+Two limits follow from what history records:
+
+- **Unmarked runtime failures.** An `errored` row the runtime writes for any other failure
+  (scheduling, ingest, a held flush, Interpret, a notify edit) carries no marker, so it reads as a
+  source outcome, as before.
+- **Drain text.** Retry-drain rows carry no marker either. The runtime writes their errors through
+  one builder, and explain recognizes the same opening, with the retry id in its ULID form. A
+  source error that opens the same way, ULID included, therefore reads as a drain report. Explain
+  cannot check that the outbox held that retry when the row was written: a retry leaves the outbox
+  when it completes, and history does not record outbox state.
+
+The Observation stage reports the newest row in the window that is not `unrecognized`:
+
+- No history at all: `failure`, `No observation history has been recorded for this monitor.`
+- While the monitor holds retained work (pending or terminal): no tick calls the source except
+  the one that retained the work (002 §2.7). The ticks after it write only drain reports, skipped
+  retries and released work, so the retaining tick's newest row is the newest row of any other
+  kind. If that row is an unmarked `errored` row and is not the retaining span's own
+  materialization failure, it is that tick's source failure. A held flush retained on a failing
+  source call records the source's row after the flush's rows (002 §2.6), and the stage reports it
+  as a source outcome (`failure`, `Source observation failed: <error>`). Otherwise, the stage
+  reports `ok`, `The source is not called while retained materialization work remains (002 §2.7);
+the Materialization stage reports that work.` The span records its failure both as its
+  `errored` row and as the initial last error of the retry it queued. The row is the span's own
+  failure when its error (stored with the retry's safe-text rule) equals some retry's last error.
+  If no retry matches, the row is a source failure when the oldest retry has no attempt yet.
+  Once the oldest retry has been attempted, the row is a source failure only in 002 §2.6's
+  order: directly preceded by another unmarked `errored` row, the flush's failure.
+
+  These rows are read heuristically, with these limits:
+  - **Window.** The rows are read from the explained `--history-limit` window, and each later
+    failed attempt or terminal tick adds a drain report to it. At the default of 10, the retaining
+    tick's source failure leaves the window after about eight further drain reports; from then on
+    the stage reports the pause.
+  - **Equal text.** A source failure whose error, under the safe-text rule, equals a retry's last
+    error reads as the span's own failure, and so as the pause. Under that rule, control
+    characters (line breaks included) become spaces and only the first 1,024 UTF-16 code units
+    count.
+  - **Missing flush row.** A retaining tick whose flush could not write its own best-effort
+    failure row leaves only the source's row. That row fails the stage until the oldest retry is
+    attempted, and then reads as the pause.
+  - **Reverse misread.** A span with no events whose previous tick's source failed looks like
+    002 §2.6's order once the oldest retry has been attempted and its last error has changed. Its
+    own failure row then reads as a source failure.
+
+  Accepting a last-error match only when no unmarked `errored` row precedes the row would close
+  the equal-text gap, but it would turn the reverse misread into one that holds before any
+  attempt as well, so explain does not do it.
+
+- A source outcome: the reasons above (`Source observation failed: <error>`, `healthy` for
+  `no-change`/`rebaselined`, and so on), unchanged.
+- Released work: `ok`, `Held or retained work was materialized without new source input (observed 0).`
+- An admission loss: `ok`, `The source’s latest call returned observations the runtime could not
+keep; the Materialization stage reports the loss.`
+- A skipped-retry loss: `ok`, `No source outcome has been recorded since a terminal retry was
+skipped; the Materialization stage reports the loss, and the source is called again on the
+monitor’s next due tick.`
+- A retry-drain report with no retained work left: `ok`, `No source outcome has been recorded
+since the monitor’s retained work drained; the source is called again on the monitor’s next due
+tick.`
+- Only unrecognized rows: `pending`, `No recent observation history row records an outcome this
+version recognizes.`
+
+These Observation outcomes are `ok` so that the stage owning the row wins the verdict. A
+`no-change`/`rebaselined` Observation is `healthy` for the downstream stages only when it is a
+source outcome and no retained work remains. Materialization's retained-work reasons end in
+`Last error: <displayed error>`, the oldest such retry's last error under 002 §10.7's display
+rule: `<n> observation(s) are durably queued for materialization retry. Last error: …` while it
+is pending, and the terminal reason with its repairs followed by `Last error: …`. Text prints each
+stage's reason verbatim, so text and JSON agree.
+
+For example, right after `monitor retry skip`, text shows:
+
+```diff
+-✗ Observation: Source observation failed: native fault Retry skipped after 5 failed attempts.
++✓ Observation: No source outcome has been recorded since a terminal retry was skipped; the Materialization stage reports the loss, and the source is called again on the monitor’s next due tick.
+ ✗ Materialization: 1 observation(s) were dropped because the runtime could not keep them; the newest, an observation (<path>, "<title>"), failed: native fault Retry skipped after 5 failed attempts.
+-Verdict: failure at Observation - Source observation failed: native fault Retry skipped after 5 failed attempts.
++Verdict: failure at Materialization - 1 observation(s) were dropped because the runtime could not keep them; …
+```
+
+Verified: `libs/core/src/runtime/explain-history.test.ts` (each kind),
+`libs/core/src/runtime/explain-history-stages.test.ts` (a skip explained at once, a span whose
+only observations a hold refused, a failed retry attempt, a terminal pause, released work, a
+genuine source failure before and after retained work drains, a source failure in the tick whose
+held flush retained work (002 §2.6) before and after a later attempt and when the flush could not
+record its own failure, the retaining span before and after an attempt that changes its last error,
+and rows with an unknown outcome) and, through the built CLI in text and JSON,
+`apps/cli/src/retry-repair.test.ts`.
+
 **Delivery counts (current, #572).** The delivery stage's reason and JSON `details` count the
 monitor's projections into lead sessions. Each projection falls under exactly one count:
 
@@ -2176,6 +2283,21 @@ for up to its full 24h TTL after every release (it only refreshes on the next pr
 blocking made `doctor` exit non-zero for up to a day after every single upgrade, the exact cry-wolf
 outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
 action needed" wording.
+
+**Target (Refs #462): `channel-session-unmatched` becomes the third advisory code, and the exit code
+agrees with the verdict.** A channel record whose session is no longer an active lead is normally a
+leftover from an ended session, which expires within the channel heartbeat TTL. Reported as a
+blocking problem, it made `doctor` print a healthy delivery verdict and still exit 1 after ordinary
+session churn. Target contract:
+
+- `channel-session-unmatched` is reported but never blocking, like the two codes above. It never
+  sets a transport's `fail` status on its own.
+- `doctor`'s exit status **MUST** agree with the delivery verdict line: whenever the verdict reports
+  delivery as deliverable, no delivery-transport check may fail. A genuinely wrong binding, where the
+  channel is the only route and it serves another session, already makes the verdict
+  undeliverable, so that case still fails.
+- The same rule covers `channel-lead-uncovered`, which fails in the same churn scenario. While the
+  hook path delivers to that lead, it is reported but not blocking.
 
 The section closes with a single verdict line: `delivery to active sessions in this workspace → via
 {hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is
