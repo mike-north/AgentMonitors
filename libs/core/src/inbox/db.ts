@@ -17,6 +17,7 @@ import {
   restrictExistingPathMode,
   withRestrictedUmask,
 } from '../security/local-permissions.js';
+import { DURABLE_INGRESS_COMPATIBILITY_MARKER } from '../runtime/types.js';
 import * as schema from './schema.js';
 
 type InternalInboxDb = BetterSQLite3Database<typeof schema> & {
@@ -259,6 +260,14 @@ function buildDb(dbPath: string): InboxDb {
   // Wait for a concurrent first-open's migration transaction to commit rather
   // than failing with SQLITE_BUSY (see `buildSchema`'s immediate transaction).
   sqlite.pragma(`busy_timeout = ${String(BUSY_TIMEOUT_MS)}`);
+  try {
+    // Refuse a database a newer version marked before anything here can write
+    // to it: the journal-mode switch below already rewrites the file header.
+    refuseUnknownCapabilities(sqlite);
+  } catch (error) {
+    sqlite.close();
+    throw error;
+  }
   enableWriteAheadLog(sqlite);
   sqlite.pragma('foreign_keys = ON');
 
@@ -289,13 +298,79 @@ function buildDb(dbPath: string): InboxDb {
   // the first to commit and then observe the already-migrated schema — so it
   // cannot double-DROP a just-migrated table or race an ALTER into a
   // "duplicate column name" error.
-  sqlite
-    .transaction(() => {
-      buildSchema(db, sqlite);
-    })
-    .immediate();
+  try {
+    sqlite
+      .transaction(() => {
+        // Checked again under the write lock: a newer version may have marked
+        // the database after the first check and before this transaction.
+        refuseUnknownCapabilities(sqlite);
+        buildSchema(db, sqlite);
+      })
+      .immediate();
+  } catch (error) {
+    if (error instanceof NewerDatabaseCapabilityError) sqlite.close();
+    throw error;
+  }
 
   return db as unknown as InboxDb;
+}
+
+/**
+ * Every forward-only capability this version understands. A database marker
+ * naming anything else was written by a newer version, whose durable state
+ * this version could misread or silently drop, so opening it is refused.
+ */
+const KNOWN_DATABASE_CAPABILITIES: ReadonlySet<string> = new Set([
+  DURABLE_INGRESS_COMPATIBILITY_MARKER,
+]);
+
+/**
+ * Opening refused because the database holds a forward-only capability this
+ * version does not know (002 §15). Thrown before the open writes anything, so
+ * the database is left exactly as it was. Not re-exported from the package
+ * entry point: callers see it as an `Error` thrown by `createDb`.
+ *
+ * @internal
+ */
+export class NewerDatabaseCapabilityError extends Error {
+  /** The unknown capabilities, sorted. */
+  readonly capabilities: readonly string[];
+
+  constructor(capabilities: readonly string[]) {
+    const names = capabilities.map((name) => JSON.stringify(name)).join(', ');
+    super(
+      `Cannot open this database: it holds capability ${names}, written by a ` +
+        'newer version of Agent Monitors that this version does not support. ' +
+        'Upgrade Agent Monitors to open it. The database was left unchanged.',
+    );
+    this.name = 'NewerDatabaseCapabilityError';
+    this.capabilities = capabilities;
+  }
+}
+
+/**
+ * Throw {@link NewerDatabaseCapabilityError} when any compatibility marker
+ * names a capability outside {@link KNOWN_DATABASE_CAPABILITIES}. Only reads:
+ * a database without the marker table (fresh, or written before it existed)
+ * passes, and markers of every workspace scope count.
+ */
+function refuseUnknownCapabilities(sqlite: BetterSQLiteClient): void {
+  const table = sqlite
+    .prepare<
+      [],
+      { name: string }
+    >("SELECT name FROM sqlite_master WHERE type = 'table' " + "AND name = 'database_compatibility_markers'")
+    .get();
+  if (table === undefined) return;
+  const unknown = sqlite
+    .prepare<[], { capability: unknown }>(
+      'SELECT DISTINCT capability FROM database_compatibility_markers',
+    )
+    .all()
+    .map(({ capability }) => String(capability))
+    .filter((capability) => !KNOWN_DATABASE_CAPABILITIES.has(capability))
+    .sort();
+  if (unknown.length > 0) throw new NewerDatabaseCapabilityError(unknown);
 }
 
 /**
