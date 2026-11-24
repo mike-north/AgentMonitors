@@ -445,15 +445,16 @@ The channel therefore surfaces each claim in three steps, per poll:
    `hook.commit`): now mark the reserved rows claimed ("was surfaced", BP2 — still **not**
    acknowledged, SP4). A push call that merely resolves is not confirmation. On a **failed /
    disconnected** or **unconfirmed** push, **release** (`releaseDelivery` → `hook.release`): drop the
-   lease so the rows return to `pending`, where the hook transport (or the next poll) re-delivers them.
+   lease so the rows return to `pending`, where the hook transport re-delivers them. The channel
+   itself does not retry: after such a push it stops pushing for the rest of its process (§4.5.2).
 
 Guarantees this establishes (issue #300):
 
 - **No claim before surfacing.** `first_notified_at` is written only at commit, so a claim timestamp
   is always truthful ("was surfaced").
 - **Failed pushes fall back.** A released (or self-expired) reservation leaves the rows `pending`, so
-  a transient MCP disconnect costs at most one poll — the hook transport delivers durably regardless
-  (§6/§6.1), and the next channel poll retries.
+  the hook transport delivers them durably (§6/§6.1). The channel does not retry them: a failed or
+  unconfirmed push ends its pushing for the rest of its process (§4.5.2).
 - **Successful sends stay deduplicated only once the commit resolves non-null.** The lease (during
   the push) hides the rows from the hook transport for the in-flight window, but that hiding becomes
   a durable claim only after `commitDelivery` resolves **non-null**; a **null** resolution means the
@@ -535,10 +536,12 @@ conversation.
   `<dataRoot>/agentmonitors/host-evidence/claude-transcript-<sanitized host session id>.json`
   (`{schemaVersion, hostSessionId, transcriptPath, observedAt}`), accepting it only when it is
   absolute and names `<hostSessionId>.jsonl`. A later hook replaces the record (for example after
-  the host moves the transcript), and records older than 14 days are pruned. The channel reads the
-  record for its bound session when it pushes.
-- **Read-only and bounded.** The adapter opens the transcript read-only, refuses a symlink or
-  non-regular file, reads only bytes appended since the push, inspects only `queue-operation`
+  the host moves the transcript). An unchanged report refreshes `observedAt` once it is an hour old,
+  and a record is pruned 14 days after its `observedAt`, so only sessions that stopped reporting are
+  pruned. The channel reads the record for its bound session when it pushes.
+- **Read-only and bounded.** The adapter opens the transcript read-only and without blocking, refuses
+  a symlink or non-regular file (including one swapped in while it waits, such as a FIFO), reads only
+  bytes appended since the push, inspects only `queue-operation`
   entries, and stops after 8 MiB. It never stores, logs or forwards transcript content beyond the
   match. A transcript that shrinks, disappears or cannot be read leaves the push unconfirmed.
 - **No evidence means unproven, never loss.** If no transcript location is recorded or the file

@@ -23,8 +23,12 @@ hook path skipped them as cross-transport duplicates and the events never reache
   adapter. A model-facing probe is ruled out. §4.5 and §4.5.1 step 3 now commit on confirmation,
   not on a resolved push.
 - **Route state.** After an unconfirmed or failed push the channel stops pushing for the rest of
-  its process. With no recorded transcript location it does not push. The heartbeat reports the
-  route (`channelRoute`).
+  its process; released rows are re-delivered by the hook path, not by a later channel poll (§4.5.1).
+  With no recorded transcript location it does not push. The heartbeat reports the route
+  (`channelRoute`).
+- **Transcript location record.** It is pruned 14 days after its `observedAt`. An unchanged report
+  refreshes `observedAt` hourly, so a long-lived session keeps its record. The transcript is opened
+  without blocking, so a FIFO swapped over it reads as unconfirmed.
 - **005.** `session start` and `hook deliver` record the hook payload's `transcript_path` (path only).
   `doctor`'s `channel-route-unproven` replaces the `channel-registration-unverified` advisory: an
   unproven channel is not a listening method, but it does not fail its own check (the verdict

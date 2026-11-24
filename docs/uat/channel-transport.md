@@ -442,7 +442,8 @@ EOF
 mkdir -p "$PROBE_DIR/a" "$PROBE_DIR/b"
 ```
 
-**18. Run A — unflagged.** Start a session, type nothing, wait 10 seconds, then `/exit`:
+**18. Run A — unflagged.** Start a session. The new folder first shows the workspace-trust dialog:
+accept it. Then type nothing, wait 10 seconds, and `/exit`:
 
 ```bash
 cd "$PROBE_DIR/a" && claude --strict-mcp-config --mcp-config "$PROBE_DIR/probe.mcp.json"
@@ -503,7 +504,8 @@ hook. The channel attempts no further pushes for the rest of that channel proces
 `doctor`'s `channel:` row ends with `route=confirmed(<ISO time>)` with no `[channel-route-unproven]`
 line, and step 10's replayed hook payload produces empty stdout (dedup).
 
-**22. `verify` stays out of it.** In either session, run `agentmonitors verify watch-file`.
+**22. `verify` stays out of it.** In either plugin session, from the Part A project
+(`~/am-channel-uat`, whose monitor is `watch-file`), run `agentmonitors verify watch-file`.
 
 **Expected observation:** after `PASS`, a line `Channel route: confirmed (…)` (flagged) or
 `Channel route: unproven (…)` (unflagged), ending `This pass does not by itself prove the channel
