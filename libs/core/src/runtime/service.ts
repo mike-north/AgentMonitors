@@ -285,6 +285,21 @@ function monitorIdFromFilePath(filePath: string): string {
     : path.parse(filePath).name;
 }
 
+/**
+ * The source outcome a history row reports: its `result`, except that a
+ * `triggered` row whose events came from retained or held work carries the
+ * source's own `no-files-matched` or `rebaselined` as `sourceOutcome` (002 §15).
+ */
+function latestObservationOutcome(
+  row: ObservationHistoryRecord,
+): ObservationHistoryRecord['result'] {
+  const sourceOutcome = row.observationData['sourceOutcome'];
+  return row.result === 'triggered' &&
+    (sourceOutcome === 'no-files-matched' || sourceOutcome === 'rebaselined')
+    ? sourceOutcome
+    : row.result;
+}
+
 function explainStage(
   id: MonitorExplainStageId,
   status: MonitorExplainStageStatus,
@@ -2315,6 +2330,11 @@ export class AgentMonitorRuntime {
       limit: historyLimit,
     });
     const latestObservation = observations[0];
+    // A `triggered` row keeps the source's own outcome when the tick's events
+    // came from retained or held work (002 §15); explain diagnoses the source.
+    const observationOutcome = latestObservation
+      ? latestObservationOutcome(latestObservation)
+      : undefined;
     if (!latestObservation) {
       stages.push(
         explainStage(
@@ -2337,7 +2357,7 @@ export class AgentMonitorRuntime {
           latestObservation.observationData,
         ),
       );
-    } else if (latestObservation.result === 'no-change') {
+    } else if (observationOutcome === 'no-change') {
       // A genuinely quiet tick is healthy, not a fault (issue #94): the watched
       // target simply hasn't changed. Render distinctly from a real failure.
       stages.push(
@@ -2348,7 +2368,7 @@ export class AgentMonitorRuntime {
           latestObservation.observationData,
         ),
       );
-    } else if (latestObservation.result === 'no-files-matched') {
+    } else if (observationOutcome === 'no-files-matched') {
       stages.push(
         explainStage(
           'observation',
@@ -2357,7 +2377,7 @@ export class AgentMonitorRuntime {
           latestObservation.observationData,
         ),
       );
-    } else if (latestObservation.result === 'rebaselined') {
+    } else if (observationOutcome === 'rebaselined') {
       // The source advanced its baseline without computing a delta (e.g. a
       // force-pushed/gc'd ref). No change was emitted, which is healthy — not a
       // fault (issue #94).
@@ -5855,6 +5875,13 @@ export class AgentMonitorRuntime {
             emitted: emittedCount,
             ...(notRetainedCount > 0 ? { notRetainedCount } : {}),
             ...(notHeld > 0 ? { notHeld } : {}),
+            // A `triggered` row would otherwise hide what the source reported
+            // on a tick whose emissions came from elsewhere (002 §15).
+            ...(emittedCount > 0 &&
+            observed === 0 &&
+            options.sourceOutcome !== undefined
+              ? { sourceOutcome: options.sourceOutcome }
+              : {}),
           },
         });
       } catch {

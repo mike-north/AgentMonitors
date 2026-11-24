@@ -17,7 +17,9 @@ emitted: 0 }`. A tick now records one outcome row per monitor that counts the dr
 later span's batch row adds them to `emitted` and becomes `triggered`; otherwise the tick records
 `triggered` `{ observed: 0, emitted: <drained count> }`. An `errored` row written in the same tick
 stays the newest. Failed drain attempts record what they did before. A watcher's drain is
-unchanged and records no batch row.
+unchanged and records no batch row. When the source returned nothing and reported
+`no-files-matched` or `rebaselined` on such a tick, the `triggered` row carries it as
+`sourceOutcome`, and `monitor explain` reports it as it would the plain outcome.
 
 ## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
 
