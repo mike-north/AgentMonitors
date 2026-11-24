@@ -76,6 +76,7 @@ import {
   classifyHistory,
   retryDrainReport,
   type ClassifiedHistoryRow,
+  type HistoryRowKind,
 } from './explain-history.js';
 import {
   isVerifyScratchObjectKey,
@@ -1113,6 +1114,59 @@ function withLastRetryError(
   const oldest = summary.records.find((record) => record.status === status);
   const error = displayObservationError(oldest?.lastError);
   return error ? `${reason} Last error: ${error}` : reason;
+}
+
+/** Kinds only a tick after the one that retained the work can write (002 §2.7). */
+const LATER_TICK_HISTORY_KINDS: ReadonlySet<HistoryRowKind> = new Set([
+  'retry-drain',
+  'skipped-retry-loss',
+  'released-work',
+  'unrecognized',
+]);
+
+function isUnmarkedErrored(entry: ClassifiedHistoryRow | undefined): boolean {
+  return entry?.kind === 'source-outcome' && entry.row.result === 'errored';
+}
+
+/**
+ * The source failure, if any, of the tick that retained the monitor's work
+ * (005 §6, "Which history rows each stage reads"). While retained work remains
+ * no tick calls the source (002 §2.7), but the retaining tick may have: a held
+ * flush retained on a failing source call records the source's `errored` row
+ * after the flush's own rows (002 §2.6), and that failure must still fail the
+ * Observation stage. Returns `undefined` when the retaining tick's newest row
+ * is the span's own materialization failure (002 §2), which is no source call.
+ *
+ * Later ticks write only drain reports, skips and released work, so the
+ * retaining tick's newest row is the first row of any other kind. When it is
+ * an unmarked `errored` row, it is the span's own failure if:
+ *
+ * - its error is a retry's recorded last error: the span stores the failure
+ *   both as that row and as the initial last error of the retry it queued; or
+ * - otherwise, every retry was attempted (replacing that last error) and the
+ *   row is not directly preceded by another unmarked `errored` row, which is
+ *   how 002 §2.6 orders the flush's failure and the source's.
+ *
+ * Only rows in the explained history window are read.
+ */
+function retainingTickSourceFailure(
+  history: readonly ClassifiedHistoryRow[],
+  summary: MaterializationRetrySummary,
+): ObservationHistoryRecord | undefined {
+  const [newest, older] = history.filter(
+    ({ kind }) => !LATER_TICK_HISTORY_KINDS.has(kind),
+  );
+  if (!newest || !isUnmarkedErrored(newest)) return undefined;
+  const error = newest.row.observationData['error'];
+  const recorded = typeof error === 'string' ? safeDiagnosticText(error) : '';
+  if (summary.records.some(({ lastError }) => lastError === recorded)) {
+    return undefined;
+  }
+  // A span is only admitted into an empty outbox (002 §2.7), so the oldest
+  // retry is its failing observation. Unattempted, it still holds the span's
+  // failure; this row does not match it, so it is a source failure.
+  if (summary.records[0]?.attemptCount === 0) return newest.row;
+  return isUnmarkedErrored(older) ? newest.row : undefined;
 }
 
 /**
@@ -2435,12 +2489,16 @@ export class AgentMonitorRuntime {
     // source call (issue #591).
     const history = classifyHistory(observations);
     const subject = history.find(({ kind }) => kind !== 'unrecognized');
-    // While retained work remains the source is not called at all (002 §2.7),
-    // so no history row can describe a current source outcome.
+    // While retained work remains no tick calls the source (002 §2.7), except
+    // the tick that retained it, whose source failure still fails this stage.
     const retainedWork =
       materializationRetries.pending + materializationRetries.terminal > 0;
-    const latestSourceOutcome =
-      !retainedWork && subject?.kind === 'source-outcome'
+    const retainedSourceFailure = retainedWork
+      ? retainingTickSourceFailure(history, materializationRetries)
+      : undefined;
+    const latestSourceOutcome = retainedWork
+      ? retainedSourceFailure
+      : subject?.kind === 'source-outcome'
         ? subject.row
         : undefined;
     if (observations.length === 0) {
@@ -2451,6 +2509,8 @@ export class AgentMonitorRuntime {
           'No observation history has been recorded for this monitor.',
         ),
       );
+    } else if (retainedSourceFailure) {
+      stages.push(sourceOutcomeStage(retainedSourceFailure));
     } else if (retainedWork) {
       stages.push(
         explainStage(

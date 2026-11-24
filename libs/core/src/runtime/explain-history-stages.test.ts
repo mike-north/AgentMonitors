@@ -168,6 +168,19 @@ Handle it.
         BEFORE INSERT ON monitor_events WHEN NEW.summary = '${summary}' BEGIN
         SELECT RAISE(ABORT, '${message}'); END;`);
     },
+    /**
+     * Record a history row whose `result` this version does not know, newer
+     * than every other row, as a newer writer could leave behind.
+     */
+    recordUnknownOutcome() {
+      client
+        .prepare(
+          `INSERT INTO observation_history
+             (id, monitor_id, workspace_path, source_name, observation_data, result, created_at)
+           VALUES ('ZZZZZZZZZZZZZZZZZZZZZZZZZZ', ?, ?, 'stage-source', '{}', 'deferred', ?)`,
+        )
+        .run(MONITOR_ID, root, Math.ceil(clockTime / 1_000) + 1);
+    },
     /** Remove the fault {@link failSummary} installed for `summary`. */
     repairSummary(summary: string) {
       client.exec(`DROP TRIGGER fail_${summary}`);
@@ -370,6 +383,106 @@ describe('explain attributes history rows to the stage that owns them (#591)', (
     expect(stage(report, 'observation')).toMatchObject({
       status: 'failure',
       reason: 'Source observation failed: upstream is down',
+    });
+  });
+
+  it('a source failure in the tick whose held flush retained work still fails the Observation stage (002 §2.6)', async () => {
+    const f = fixture(
+      [[obs('A')], new Error('upstream is down')],
+      'notify:\n  strategy: debounce\n  settle-for: 10s\n',
+    );
+    // `A` waits in the debounce batch.
+    await f.tick(2_000);
+    // The next due tick's source call fails, so the held batch flushes
+    // (002 §2.6); the flush's write fails and retains `A`. The source's
+    // `errored` row is written after the flush.
+    f.failSummary('A');
+    const failed = await f.tick(30_000);
+    expect(failed.erroredObservations.map(({ message }) => message)).toEqual(
+      expect.arrayContaining(['upstream is down', 'A write failed']),
+    );
+    expect(f.oldestRetry()?.status).toBe('pending');
+
+    const report = await f.explain();
+    // 002 §2.6: "the newest history row, and monitor explain's observation
+    // stage (§10.7), still report the failing source".
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'failure',
+      reason: 'Source observation failed: upstream is down',
+    });
+    expect(report.verdict).toMatchObject({
+      stage: 'observation',
+      status: 'failure',
+    });
+    expect(stage(report, 'materialization')).toMatchObject({
+      status: 'pending',
+      reason:
+        '1 observation(s) are durably queued for materialization retry. Last error: A write failed',
+    });
+  });
+
+  it('that source failure still fails the Observation stage after a later retry attempt fails', async () => {
+    const f = fixture(
+      [[obs('A')], new Error('upstream is down')],
+      'notify:\n  strategy: debounce\n  settle-for: 10s\n',
+    );
+    await f.tick(2_000);
+    f.failSummary('A', 'A write failed again');
+    await f.tick(30_000);
+    // The next tick only drains (002 §2.7): its attempt fails the same way and
+    // records a drain report; the source is not called.
+    await f.tick();
+    expect(f.oldestRetry()?.attemptCount).toBe(1);
+
+    const report = await f.explain();
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'failure',
+      reason: 'Source observation failed: upstream is down',
+    });
+  });
+
+  it('the span that retained work is not read as a source failure before any retry attempt', async () => {
+    const f = fixture([[obs('A')], [obs('B')]]);
+    await retainA(f);
+    expect(f.oldestRetry()?.attemptCount).toBe(0);
+
+    const report = await f.explain();
+    // The newest row is the span's own materialization failure (002 §2), not
+    // a source call: the source returned `A`.
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'ok',
+      reason: RETAINED_WORK_PAUSE,
+    });
+    expect(report.verdict).toMatchObject({
+      stage: 'materialization',
+      status: 'pending',
+    });
+  });
+
+  it('Observation skips a newer row with an outcome this version does not know', async () => {
+    const f = fixture([[]]);
+    await f.tick();
+    f.recordUnknownOutcome();
+
+    const report = await f.explain();
+    // 005 §6: Observation reads the newest row that is not unrecognized; here
+    // the quiet tick's `no-change` row.
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'healthy',
+      reason:
+        'Source ran, observed 0 changes — your watched target genuinely hasn’t changed (not a bug).',
+    });
+  });
+
+  it('Observation is pending when every row has an outcome this version does not know', async () => {
+    const f = fixture([]);
+    f.recordUnknownOutcome();
+
+    const report = await f.explain();
+    expect(stage(report, 'observation')).toMatchObject({
+      status: 'pending',
+      reason:
+        'No recent observation history row records an outcome this version recognizes.',
     });
   });
 });

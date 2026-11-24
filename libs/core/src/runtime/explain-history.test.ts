@@ -15,6 +15,8 @@ import {
 import type { ObservationHistoryRecord, ObservationOutcome } from './types.js';
 
 const CREATED_AT = new Date('2026-08-13T18:00:00.000Z');
+/** A retry id in the outbox's ULID form (002 §15 `materialization_retry_outbox`). */
+const RETRY_ID = '01KZY525945N0RNDBXW9736H9A';
 
 function row(
   result: ObservationOutcome,
@@ -81,17 +83,27 @@ describe('classifyHistoryRow', () => {
   });
 
   it.each([
-    retryDrainReport('r1', 'failed: A write failed'),
+    retryDrainReport(RETRY_ID, 'failed: A write failed'),
     retryDrainReport(
-      'r1',
+      RETRY_ID,
       "could not be discarded after its verify artifact's cleanup took effect: busy",
     ),
     retryDrainReport(
-      'r1',
+      RETRY_ID,
       'stopped after 5 failed attempts; newer input waits',
     ),
   ])('the drain report %j is a retry-drain row (002 §2.7)', (error) => {
     expect(classifyHistoryRow(row('errored', { error }))).toBe('retry-drain');
+  });
+
+  it('a source error that opens like a drain report without a retry id is a source outcome', () => {
+    expect(
+      classifyHistoryRow(
+        row('errored', {
+          error: 'Materialization retry upstream failed: 503 from api',
+        }),
+      ),
+    ).toBe('source-outcome');
   });
 
   it('a source error that only mentions a retry is still a source outcome', () => {

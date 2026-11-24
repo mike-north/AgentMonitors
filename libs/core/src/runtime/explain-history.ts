@@ -59,10 +59,17 @@ export interface ClassifiedHistoryRow {
  * The opening of every error the retained-work drain records (002 §2.7). The
  * runtime writes these messages through {@link retryDrainReport}, and
  * {@link classifyHistoryRow} recognizes them by the same opening, so the two
- * cannot drift apart.
+ * cannot drift apart. The retry id is a ULID (26 Crockford base32 characters),
+ * as the outbox mints every retry id.
+ *
+ * History records no marker for these rows, so a source error that opens the
+ * same way, ULID included, reads as a drain report (005 §6). Whether the
+ * outbox held that retry when the row was written cannot be checked: a retry
+ * leaves the outbox when it completes, and history does not record outbox
+ * state.
  */
 const RETRY_DRAIN_REPORT_PATTERN =
-  /^Materialization retry \S+ (?:failed: |could not be discarded |stopped after )/u;
+  /^Materialization retry [0-9A-HJKMNP-TV-Z]{26} (?:failed: |could not be discarded |stopped after )/u;
 
 /**
  * Build a retained-work drain report (002 §2.7): `Materialization retry <id>`
