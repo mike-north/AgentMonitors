@@ -2529,6 +2529,20 @@ unread events and acknowledge handled work; it does not identify every item that
 existing transport-owned action steps remain in force. Older unread claims are included in unread
 queries and counts; a new reminder does not erase them or certify their completion.
 
+**A reminder is never delivered for a session with no unread rows.** A reminder's count is the session's
+unread total at decide time, and the decision builds a reminder only when its pending batch is
+non-empty. Pending rows are a subset of unread rows under identical suppression filters, so a freshly
+decided reminder always reports at least one unread row. That stays true through the reserve → push →
+commit window because a session-wide acknowledgement (no explicit event ids) skips every row an
+outstanding reservation holds (§7). The skipped rows remain unread, and a released reservation makes
+them deliverable again. Two windows are accepted: a scoped acknowledgement that names every reserved
+row between reservation and push, which is an explicit choice by the caller and is not lease-filtered;
+and a host that shows a notification it queued before the agent acknowledged the rows, which the
+daemon cannot recall once pushed.
+
+Verified: `libs/core/src/runtime/delivery-reservations.test.ts` pins the session-wide acknowledgement
+skip, the hook claim → acknowledge → next-claim case and the release path (issue #473).
+
 Verified: `libs/core/src/runtime/reminder-progress.test.ts` covers new batches through direct hook
 claims and channel reserve/commit, per-session isolation, lease commit/release/expiry, and high settle
 coalescing. `reminder-diagnosis.test.ts`, `hook-delivery-diagnosis.test.ts` and
