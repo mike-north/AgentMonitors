@@ -61,6 +61,7 @@ export default tseslint.config(
       'libs/core/src/external-ingress/contract-probe.fixture.mjs',
       'apps/cli/src/commands/fixtures/owned-capture-group.mjs',
       'apps/cli/src/commands/fixtures/ingress-preload.mjs',
+      'apps/cli/test-fixtures/**/*.mjs',
     ],
     ...tseslint.configs.disableTypeChecked,
     languageOptions: {

@@ -2346,6 +2346,8 @@ For each projected event, the runtime tracks session-specific delivery state via
 
 This distinction matters because a claimed event may still need user or agent attention later.
 
+"Surfaced" means the host received it. A transport that cannot see the host directly claims only on host evidence: the channel transport commits a claim only after the host confirms the push ([006 §4.5.2](./006-agent-integration.md), issue #535).
+
 Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
 
 ## 8. Hook State

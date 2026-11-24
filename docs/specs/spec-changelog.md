@@ -9,6 +9,31 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-23 — Channel commits only host-confirmed pushes (006 §4.2, §4.5, §4.5.1, §4.5.2, §12.4, §12.6; 005 §10.4, §12.2, §13, §15, §16; 002 §7) — Refs #535
+
+A channel push call that resolves is not evidence that anything surfaced. A session started
+without a channel listener drops the event, and the channel still marked the rows claimed, so the
+hook path skipped them as cross-transport duplicates and the events never reached the agent.
+
+- **006 §4.5.2 (new, current).** Each push carries a fresh `delivery_id` (§4.2). The channel
+  commits only once the Claude Code session transcript shows a `queue-operation` `enqueue` entry
+  whose `<channel>` tag carries that identifier, appended after the push and within 5 seconds.
+  Otherwise it releases the rows to the hook path. Reading is read-only, limited to bytes appended
+  since the push, capped at 8 MiB and never stores or logs content; the parsing lives in the Claude
+  adapter. A model-facing probe is ruled out. §4.5 and §4.5.1 step 3 now commit on confirmation,
+  not on a resolved push.
+- **Route state.** After an unconfirmed or failed push the channel stops pushing for the rest of
+  its process. With no recorded transcript location it does not push. The heartbeat reports the
+  route (`channelRoute`).
+- **005.** `session start` and `hook deliver` record the hook payload's `transcript_path` (path only).
+  `doctor`'s `channel-route-unproven` replaces the `channel-registration-unverified` advisory: an
+  unproven channel is not a listening method, but it does not fail its own check (the verdict
+  fails if nothing else listens). Channel rows gain a `route=` token and JSON `route`. `verify`
+  ends with a `Channel route:` line and JSON `channelRoute`, and says a pass does not by itself
+  prove the channel route.
+- **006 §12.6** no longer describes the registration gap as an unverifiable advisory with a future
+  probe; it points at §4.5.2.
+
 ## 2026-11-23 — Cover foreign exceptions at envelope admission catch sites (002 §16.1; 004 §6.1) — Refs #649
 
 004 §6.1 now requires isolated coverage of each envelope admission catch site: envelope

@@ -1449,6 +1449,13 @@ daemon at <socket>` (issue #420 P3). Silent success was a dead end that forced a
 - The **CLI command** exits **0** on a quick-exit (no `session_id`, or monitoring not enabled) and on success (with or without recap output). A genuine failure — the daemon not starting within the boot timeout, or a `session.open`/reserve/commit/write error — is reported to **stderr** and exits **non-zero** (`reportError(…, false)` sets `process.exitCode = 1`).
 - The **plugin hook wrapper** (`agent-plugins/agentmonitors/hooks/hooks.json`) runs the command as `agentmonitors session start || true`, so the **hook invocation** is best-effort from Claude Code's perspective — a CLI failure never disrupts the session. The best-effort property is the wrapper's, not the command's.
 
+**Transcript location (issue #535).** When the hook payload carries `transcript_path`, `session start` records
+that path, and only the path, as the evidence source the channel confirms its pushes against
+([006 §4.5.2](./006-agent-integration.md)). The record is
+`<dataRoot>/agentmonitors/host-evidence/claude-transcript-<sanitized host session id>.json`. A path
+that is not absolute or does not name `<session_id>.jsonl` is ignored, and recording never fails
+the command. Transcript content is never read here.
+
 **Designed for use as a `SessionStart` hook** (see 006 §5.6). Claude Code does not need the daemon to be pre-started.
 
 ### §10.5 `session end` — Deregister session
@@ -1817,6 +1824,13 @@ are not acknowledged, so the event stays unread and re-discoverable via `events 
 Over-cap context is truncated at a code-point boundary with an explicit `[truncated …]` marker; the
 truncated-away events stay unread (claiming ≠ acking) and are likewise re-discoverable.
 
+**Transcript location (issue #535).** When the hook payload carries `transcript_path`, `hook deliver` (when monitoring is enabled) records
+that path, and only the path, as the evidence source the channel confirms its pushes against
+([006 §4.5.2](./006-agent-integration.md)). The record is
+`<dataRoot>/agentmonitors/host-evidence/claude-transcript-<sanitized host session id>.json`. A path
+that is not absolute or does not name `<session_id>.jsonl` is ignored, and recording never fails
+the command. Transcript content is never read here.
+
 See [006 §5](./006-agent-integration.md) for the full transport spec and hook registration examples.
 
 ---
@@ -1869,7 +1883,15 @@ rendered into a `<channel>` event (006 §4.2). It also exposes the **`agentmon_a
 calls it with `event_ids` (or none, to ack all unread except any rows leased by in-flight delivery
 reservations — see §11.2's exception) and it routes through `events.ack` for the
 bound session (006 §4.3). It reuses the claim path, so claimed-state and cross-transport dedup with
-the hook-state surface are automatic. A missing/unreachable daemon is handled quietly (the hook-state
+the hook-state surface are automatic.
+
+**Host confirmation (issue #535).** Each poll reserves a claim, pushes it with a fresh `delivery_id`
+in its meta, and commits it only once the session transcript shows that Claude Code enqueued that
+push (006 §4.5.2, matched within 5 seconds). A push the host does not confirm is released, so the
+hook path delivers the rows, and the channel stops pushing for the rest of its process with one
+stderr note. When no transcript location is recorded for the session yet (no hook has run), the
+channel does not push that poll. The heartbeat reports the resulting route (`confirmed` or
+`unproven`), which `doctor` (§15) and `verify` (§16) show. A missing/unreachable daemon is handled quietly (the hook-state
 path still delivers durably); the server shuts down when stdin closes (MCP disconnect). With no host
 session id it stays connected (the ack tool reports an error if called) but does not poll.
 
@@ -2099,20 +2121,20 @@ arrives — with completely different causes and fixes. `doctor` therefore print
 transports** section above the checks, built from the transport heartbeats each transport writes
 (006 §12), and reports each cause **distinctly**; a generic "unhealthy" is explicitly not acceptable:
 
-| Problem code                      | Means                                                                                                                                      |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `daemon-unreachable`              | No daemon for this workspace: nothing can deliver, however healthy the transports                                                          |
-| `workspace-mismatch`              | This session's transport is bound to a **different workspace** than the monitors                                                           |
-| `socket-mismatch`                 | Same workspace, but bound to a different (usually dead) daemon socket                                                                      |
-| `environment-mismatch`            | The transport resolved a different `HOME` / data root, so it reads a different db                                                          |
-| `reminders-suppressed`            | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3)                                                     |
-| `heartbeat-stale`                 | A transport registered but its lease lapsed — presumed killed without cleanup                                                              |
-| `channel-session-unmatched`       | A channel server is running for this workspace but serves no ACTIVE lead session here — somebody else's listener                           |
-| `channel-lead-uncovered`          | At least one OTHER active lead session has no matching channel heartbeat at all, even though this one does                                 |
-| `hook-lead-uncovered`             | At least one active lead session has no matching hook heartbeat at all, even though another active lead's does                             |
-| `version-skew`                    | Advisory: a long-lived transport is still serving an older CLI build than this one                                                         |
-| `channel-registration-unverified` | Advisory: the host never confirms channel registration; prove delivery end to end                                                          |
-| `delivery-diagnosis-unavailable`  | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below) |
+| Problem code                     | Means                                                                                                                                         |
+| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `daemon-unreachable`             | No daemon for this workspace: nothing can deliver, however healthy the transports                                                             |
+| `workspace-mismatch`             | This session's transport is bound to a **different workspace** than the monitors                                                              |
+| `socket-mismatch`                | Same workspace, but bound to a different (usually dead) daemon socket                                                                         |
+| `environment-mismatch`           | The transport resolved a different `HOME` / data root, so it reads a different db                                                             |
+| `reminders-suppressed`           | Transports are up but reminders are **muted** by `coalesced-until-ack` (002 §9.2/§9.3)                                                        |
+| `heartbeat-stale`                | A transport registered but its lease lapsed — presumed killed without cleanup                                                                 |
+| `channel-session-unmatched`      | A channel server is running for this workspace but serves no ACTIVE lead session here — somebody else's listener                              |
+| `channel-lead-uncovered`         | At least one OTHER active lead session has no matching channel heartbeat at all, even though this one does                                    |
+| `hook-lead-uncovered`            | At least one active lead session has no matching hook heartbeat at all, even though another active lead's does                                |
+| `version-skew`                   | Advisory: a long-lived transport is still serving an older CLI build than this one                                                            |
+| `channel-route-unproven`         | The channel server is running, but the host has confirmed none of its pushes (006 §4.5.2); not a listening method, and the hook path delivers |
+| `delivery-diagnosis-unavailable` | The daemon's suppression check itself failed for one or more lead sessions — **not** the same as "checked, nothing suppressed" (see below)    |
 
 **`pipelineProblems[]` (issue #425 review, round 4).** Pipeline-wide problems appear in **two**
 places in `--json`, deliberately: once in the top-level `pipelineProblems[]`, and again inside
@@ -2135,7 +2157,7 @@ as if they were independent failures.
 a failed call was silently dropped, leaving the returned diagnosis set indistinguishable from "the
 check ran and found nothing suppressed". `deliverable` then read `true` even though whether a
 suppression was active had never actually been answered — a false green. `delivery-diagnosis-unavailable`
-makes that distinction explicit and, unlike the two advisory codes above, IS blocking: `deliverable`
+makes that distinction explicit and, unlike the advisory code above, IS blocking: `deliverable`
 can never be `true` while it is present, precisely because "unknown" must not be reported as "healthy".
 
 **A hold with untrustworthy `claimedEventIds` is also `delivery-diagnosis-unavailable` (issue #425
@@ -2149,14 +2171,25 @@ avoid. An empty array is untrustworthy here too (round 8): an `already-claimed`/
 hold necessarily claims at least one event, so `[]` can only come from a malformed or hand-built
 value, not from a real suppression. See 006 §12.7.
 
-`version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
-are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,
-or the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
+`version-skew` is the **advisory, non-blocking** code: it is reported when present, but counts toward
+neither a transport's `healthy` field, its `fail` status, nor the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
 informational because the hook transport's heartbeat legitimately carries the pre-upgrade CLI version
 for up to its full 24h TTL after every release (it only refreshes on the next prompt) — treating it as
 blocking made `doctor` exit non-zero for up to a day after every single upgrade, the exact cry-wolf
 outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
 action needed" wording.
+
+**Channel route (issue #535).** A running channel's row ends with a route token:
+`route=confirmed(<ISO time of the last confirmed push>)` or `route=unproven(<evidence>)`, where the
+evidence is `no-push-yet`, `no-transcript`, `unconfirmed-push`, `push-failed`, or `unreported` (a
+channel server from a build that predates host confirmation). The channel counts as a listening
+method only while its route is confirmed; otherwise the row carries `channel-route-unproven` and
+the transport is not `healthy`. That code does **not** fail the `transport:channel` check, which
+passes with the note `(route unproven, so not counted as listening; the hook path delivers)`: an
+unproven route is the ordinary state of a session started without the development-channels flag.
+If no other transport listens, the verdict is `via none` and `delivery-verdict` fails instead.
+The remediation for an unconfirmed or failed push names
+`claude --dangerously-load-development-channels plugin:agentmonitors@agentmonitors`.
 
 The section closes with a single verdict line: `delivery to active sessions in this workspace → via
 {hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is
@@ -2389,6 +2422,11 @@ remediation on failures), and a closing `Summary: <n> passed, <n> failed, <n> sk
       },
       "version": "<string | null>",
       "lastDelivery": "<iso8601 | null>",
+      "route": {
+        "state": "confirmed | unproven",
+        "evidence": "no-push-yet | no-transcript | unconfirmed-push | push-failed | confirmed-push | unreported",
+        "lastConfirmedAt": "<iso8601 | absent>"
+      },
       "problems": [
         {
           "code": "<problem code>",
@@ -2747,6 +2785,13 @@ budget; an explicit `--timeout-ms` keeps its own value as the hard total cap thr
 line naming the failing stage (and, for `daemon-died`, the daemon's own output). Progress lines go to
 stderr; the report goes to stdout.
 
+The report ends with the workspace's channel route (issue #535, 006 §4.5.2), read from the live
+channel heartbeats: `Channel route: not running (hooks deliver).`,
+`Channel route: unproven (no push confirmed by the host; hooks deliver).`, or
+`Channel route: confirmed (the host confirmed a push in this channel process).` On a **PASS** the
+line adds ` This pass does not by itself prove the channel route.`: `verify` proves delivery
+through its own isolated session, never through the host's channel.
+
 **JSON (`--format json`):** a stable machine shape.
 
 ```json
@@ -2766,12 +2811,14 @@ stderr; the report goes to stdout.
   },
   "additionalContext": "<string | null>",
   "daemonStderr": "<string | null>",
-  "elapsedMs": 3200
+  "elapsedMs": 3200,
+  "channelRoute": "not-running|unproven|confirmed|null"
 }
 ```
 
 `failure` is `null` on success; `additionalContext` is the delivered proof on success and `null` on
-failure.
+failure. `channelRoute` is the workspace's channel route as above; it never affects `ok` or the exit
+code.
 
 ### Exit codes
 
