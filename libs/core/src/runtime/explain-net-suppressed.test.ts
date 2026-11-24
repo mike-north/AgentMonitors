@@ -115,6 +115,19 @@ Handle net-mon changes.
     vi.advanceTimersByTime(60_000);
     await runtime.tick(monitorsDir, workspace);
   };
+  /**
+   * Like `emit`, but on a short clock: the event settles about 2.25 s after
+   * its observation, so it can still sit inside the high-urgency claim settle
+   * window (`highUrgencyClaimSettleMs`, 15 s) when the next claim runs.
+   */
+  const emitQuickly = async (version: string) => {
+    vi.advanceTimersByTime(1_000);
+    snapshot = version;
+    await runtime.tick(monitorsDir, workspace);
+    snapshot = undefined;
+    vi.advanceTimersByTime(1_250);
+    await runtime.tick(monitorsDir, workspace);
+  };
   const deliveryCounts = async () => {
     const report = await runtime.explainMonitor({
       monitorId: 'net-mon',
@@ -142,6 +155,7 @@ Handle net-mon changes.
     runtime,
     session,
     emit,
+    emitQuickly,
     deliveryCounts,
     allEventIds,
     shownSummaries,
@@ -273,5 +287,30 @@ describe('net collapse across successive recaps', () => {
 
     expect(h.shownWithDiffs('post-compact')).toEqual([v2ToV4]);
     expect(h.shownWithDiffs('post-compact')).toEqual([v2ToV4]);
+  });
+
+  it('re-anchors an unclaimed endpoint to a cursor that moved after it was projected (#572)', async () => {
+    const h = setup('net');
+    await h.emit('v0');
+    expect(h.shownSummaries('turn-interruptible')).toEqual(['v0']);
+    // v1 settles; 20 s later v2 and v3 arrive about 2.25 s apart. Both are
+    // projected while the cursor still sits at v0.
+    await h.emitQuickly('v1');
+    vi.advanceTimersByTime(20_000);
+    await h.emitQuickly('v2');
+    await h.emitQuickly('v3');
+    // Only v1 is past the high-urgency claim settle window, so this claim
+    // takes v1 alone and moves the cursor to v1 while v2 and v3 stay unread.
+    expect(h.shownSummaries('turn-interruptible')).toEqual(['v1']);
+
+    vi.advanceTimersByTime(20_000);
+    // The v2 + v3 group collapses to its endpoint, v3.
+    expect(h.shownSummaries('turn-interruptible')).toEqual(['v3']);
+
+    // The cursor sat at v1 when v3 was claimed, so v3's delta is v1 → v3,
+    // not the v0 → v3 delta it was projected with. Every recap shows it.
+    const v1ToV3 = { summary: 'v3', diffText: '- 1: v1\n+ 1: v3' };
+    expect(h.shownWithDiffs('post-compact')).toEqual([v1ToV3]);
+    expect(h.shownWithDiffs('post-compact')).toEqual([v1ToV3]);
   });
 });
