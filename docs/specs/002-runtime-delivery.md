@@ -1477,7 +1477,9 @@ upstream_event_id)` and the same semantic hash is returned as `duplicate`; a dif
    marker are written.
 
 Any error, from `operation` or from any write, rolls the whole transaction back: no receipt, no
-sequence change, no marker, and none of the operation's writes. The same event can then be retried.
+sequence change, no marker, and none of the operation's writes. The store's in-memory record of the
+last event's projected sessions is restored too, so it never names recipients of a rolled-back
+event. The same event can then be retried.
 
 **Callback boundary.** `operation` MUST be synchronous and write through the store's connection. A
 returned promise or other thenable is refused and rolls back; writes after its first `await` would
@@ -1497,6 +1499,9 @@ returned only if it is a state the store writes:
 
 - the outcome and change kind are known;
 - the sequence and attempt count are non-negative integers and the timestamps are valid;
+- the stored envelope fields (`monitorId`, `source`, `upstreamEventId`, `objectId`, `eventKind`,
+  `occurredAt`) are values envelope admission accepts (§2.6), checked by the envelope validator
+  itself, so `occurredAt` is RFC 3339 and identifiers are non-empty and within their byte bound;
 - `materialized` has unique event IDs, a materialization time, and no scheduled retry;
 - any other outcome has no event IDs and no materialization time;
 - `stale` has no retry state;
