@@ -38,6 +38,37 @@ afterEach(() => {
   }
 });
 
+/** Validation skips must remain visible even when a continuous tick emits nothing. */
+it('logs the config diagnostic for an otherwise silent continuous tick', async () => {
+  const root = tempDir();
+  const monitorsDir = path.join(root, 'monitors');
+  mkdirSync(monitorsDir);
+  const socketPath = path.join(root, 'daemon.sock');
+  const diagnostic =
+    'scope/value: Instance type "number" is invalid. Expected "string".';
+  vi.spyOn(AgentMonitorRuntime.prototype, 'tick').mockResolvedValue({
+    evaluatedMonitors: [],
+    emittedEventIds: [],
+    erroredObservations: [],
+    skippedMonitors: [{ monitorId: 'invalid', validationError: diagnostic }],
+  });
+  const log = vi.spyOn(console, 'log').mockImplementation(() => {
+    // Inspect the daemon summary without printing expected output.
+  });
+  const loop = runLoop(monitorsDir, root, 20, socketPath, 0, ':memory:');
+  try {
+    // Real IPC owns loop shutdown; poll only because server startup is asynchronous.
+    await vi.waitFor(() =>
+      expect(log).toHaveBeenCalledWith(
+        `Emitted 0 event(s) from 0 monitor(s).\n  invalid: skipped — ${diagnostic}`,
+      ),
+    );
+  } finally {
+    await callDaemon('stop', {}, { socketPath });
+    await loop;
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Issue #398: the idle-reaping block ran outside the tick's error boundary,
 // so a transient error there (e.g. `runtime.listSessions()` hitting a brief
@@ -489,7 +520,7 @@ describe('terminateSpawnedDetachedDaemon (round-2 finding 3611470928)', () => {
   const spawnedChildren: ChildProcess[] = [];
 
   /** A real child that stays alive until signalled. */
-  function spawnLongLivedChild(): number {
+  function spawnLongLivedChild(): ChildProcess {
     const child = spawn(
       process.execPath,
       ['-e', 'setInterval(() => {}, 1000)'],
@@ -498,22 +529,27 @@ describe('terminateSpawnedDetachedDaemon (round-2 finding 3611470928)', () => {
       },
     );
     spawnedChildren.push(child);
-    const pid = child.pid;
-    if (pid === undefined) throw new Error('child was not assigned a pid');
-    return pid;
+    if (child.pid === undefined)
+      throw new Error('child was not assigned a pid');
+    return child;
   }
 
   /** A real child that IGNORES SIGTERM, forcing the SIGKILL escalation. */
-  function spawnUnkillableChild(): number {
+  function spawnUnkillableChild(): ChildProcess {
     const child = spawn(
       process.execPath,
       ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"],
       { stdio: 'ignore' },
     );
     spawnedChildren.push(child);
-    const pid = child.pid;
-    if (pid === undefined) throw new Error('child was not assigned a pid');
-    return pid;
+    if (child.pid === undefined)
+      throw new Error('child was not assigned a pid');
+    return child;
+  }
+
+  function pidOf(child: ChildProcess): number {
+    if (child.pid === undefined) throw new Error('child has no pid');
+    return child.pid;
   }
 
   function isAlive(pid: number): boolean {
@@ -525,7 +561,13 @@ describe('terminateSpawnedDetachedDaemon (round-2 finding 3611470928)', () => {
     }
   }
 
+  async function waitForExit(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    await new Promise<void>((resolve) => child.once('exit', () => resolve()));
+  }
+
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const child of spawnedChildren.splice(0)) {
       try {
         child.kill('SIGKILL');
@@ -536,10 +578,11 @@ describe('terminateSpawnedDetachedDaemon (round-2 finding 3611470928)', () => {
   });
 
   it('terminates a live child and confirms it is actually gone', async () => {
-    const pid = spawnLongLivedChild();
+    const child = spawnLongLivedChild();
+    const pid = pidOf(child);
     expect(isAlive(pid)).toBe(true);
 
-    await expect(terminateSpawnedDetachedDaemon(pid)).resolves.toBe(true);
+    await expect(terminateSpawnedDetachedDaemon(child)).resolves.toBe(true);
 
     // The contract is "confirmed gone", not "signal sent".
     expect(isAlive(pid)).toBe(false);
@@ -548,44 +591,70 @@ describe('terminateSpawnedDetachedDaemon (round-2 finding 3611470928)', () => {
   // A wedged daemon that swallows SIGTERM would otherwise keep holding the
   // socket after we told the user it was gone.
   it('escalates to SIGKILL when the child ignores SIGTERM', async () => {
-    const pid = spawnUnkillableChild();
+    const child = spawnUnkillableChild();
+    const pid = pidOf(child);
     expect(isAlive(pid)).toBe(true);
 
     // A short grace window so the escalation is exercised promptly.
-    await expect(terminateSpawnedDetachedDaemon(pid, 300, 25)).resolves.toBe(
+    await expect(terminateSpawnedDetachedDaemon(child, 300, 25)).resolves.toBe(
       true,
     );
 
     expect(isAlive(pid)).toBe(false);
   });
 
-  it('is a no-op that reports success when no pid was ever assigned', async () => {
+  it('is a no-op that reports success when no child was ever started', async () => {
     await expect(terminateSpawnedDetachedDaemon(undefined)).resolves.toBe(true);
   });
 
-  it('reports success for a pid that has already exited', async () => {
-    const pid = spawnLongLivedChild();
-    process.kill(pid, 'SIGKILL');
-    // Wait for the OS to actually reap it before asserting the no-op path.
-    const deadline = Date.now() + 2_000;
-    while (isAlive(pid) && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+  it('reports success for a child that has already exited', async () => {
+    const child = spawnLongLivedChild();
+    child.kill('SIGKILL');
+    await waitForExit(child);
 
-    await expect(terminateSpawnedDetachedDaemon(pid)).resolves.toBe(true);
+    await expect(terminateSpawnedDetachedDaemon(child)).resolves.toBe(true);
+  });
+
+  // Issue #479 (008 §5): once our child has exited, its pid may already name
+  // unrelated work. The OS cannot be made to recycle a specific pid on demand,
+  // so the recycled state is reproduced exactly as the cleanup sees it: the
+  // handle of a child we spawned that has been reaped, whose recorded pid is
+  // now held by a different live process. Before the fix, cleanup signalled
+  // the bare pid and would have terminated that process.
+  it('never signals a recorded pid after our child has exited, even when that pid is now a live, unrelated process', async () => {
+    const ours = spawnLongLivedChild();
+    ours.kill('SIGKILL');
+    await waitForExit(ours);
+    const unrelated = spawnLongLivedChild();
+    const unrelatedPid = pidOf(unrelated);
+    const recycledHandle = {
+      pid: unrelatedPid,
+      exitCode: ours.exitCode,
+      signalCode: ours.signalCode,
+      kill: vi.fn(() => true),
+    };
+    const killSpy = vi.spyOn(process, 'kill');
+
+    await expect(
+      terminateSpawnedDetachedDaemon(recycledHandle, 300, 25),
+    ).resolves.toBe(true);
+
+    expect(recycledHandle.kill).not.toHaveBeenCalled();
+    expect(killSpy).not.toHaveBeenCalledWith(unrelatedPid, expect.anything());
+    expect(isAlive(unrelatedPid)).toBe(true);
   });
 
   // The guard that keeps a concurrent lazy-boot daemon safe: this helper is
-  // only ever handed OUR pid, so a proven-different serving pid is never
+  // only ever handed OUR child, so a proven-different serving pid is never
   // signalled. Proven here by terminating one child while a second stands in
   // for the daemon that won the socket race.
   it('never signals a process it was not given — a different serving pid survives', async () => {
-    const ourPid = spawnLongLivedChild();
-    const otherServingPid = spawnLongLivedChild();
+    const ours = spawnLongLivedChild();
+    const otherServingPid = pidOf(spawnLongLivedChild());
 
-    await expect(terminateSpawnedDetachedDaemon(ourPid)).resolves.toBe(true);
+    await expect(terminateSpawnedDetachedDaemon(ours)).resolves.toBe(true);
 
-    expect(isAlive(ourPid)).toBe(false);
+    expect(isAlive(pidOf(ours))).toBe(false);
     expect(isAlive(otherServingPid)).toBe(true);
   });
 });

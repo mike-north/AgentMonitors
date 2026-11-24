@@ -43,12 +43,32 @@ When you change behavior, update the matching numbered doc and add a
 ## Commands
 
 ```bash
+pnpm verify     # pre-push gate: CI portable checks/suites and publish dry-run
 pnpm build      # build publishable packages (Nx; build deps first)
-pnpm test       # run all suites (vitest)
-pnpm check      # type-check every package + eslint + prettier
+pnpm test       # fast package suites only; prints omitted suites (not the pre-push gate)
+pnpm check      # package checks (excludes website) + workspace checks + aipm validation
 pnpm nx test @agentmonitors/core                                            # one package
 pnpm --filter @agentmonitors/core exec vitest run src/runtime/service.test.ts   # one test file
 ```
+
+Use `pnpm verify` before pushing from macOS/Linux (POSIX shell). After `pnpm install --frozen-lockfile` with Node 24 and
+the pinned pnpm, it sequentially runs build, check, API-report validation, fast tests,
+serial daemon tests, script tests, standalone-consumer tests, fresh-install hook E2E,
+and publish dry-run. Packaging tests need registry network access; the dry-run does not
+publish. Nx dependency ordering and caching still apply; use
+`NX_SKIP_NX_CACHE=true pnpm verify` when fresh execution evidence is required.
+
+CI-only coverage: GitHub checkout/toolchain setup and change filters; Windows native
+installation on a Windows runner; the separately filtered website build/link job.
+Docker smoke is included in `test:serial` but self-skips without a reachable Docker daemon,
+so a local pass without Docker does not verify that CI coverage. `apps/website` remains
+excluded from root build/check/format/lint; its CI link check does not validate copy-paste
+commands or semantic documentation correctness. Website changes need separate verification.
+The independent live advisory audit runs separately via `pnpm check:dependency-audit`;
+audit fixture/floor tests in `test:scripts` do not run that live gate. Local missing-jq
+preset reductions are reported skips; CI requires jq.
+See [004 §2.10](docs/specs/004-validation-testing.md#210-repository-pre-push-gate) for the
+gate contract and the website decision still reserved for a human.
 
 Note: every published TypeScript package (`@agentmonitors/core`, `plugins/source-*`) has a checked-in
 API report (`<package>/api-report/*.api.md`). Changing a package's **public** API requires

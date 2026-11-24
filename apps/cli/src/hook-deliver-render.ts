@@ -304,16 +304,11 @@ function appendMarkerWithinCap(
  * The one-line acknowledge instruction appended to the body-injection header
  * (issue #434). A body-injection delivery (settled high-urgency events, or the
  * `post-compact` recap) CLAIMS the events it renders — but claiming is not
- * acknowledgment (BP2 / SP4), and until the recipient acknowledges, the
- * `coalesced-until-ack` rule (002 §9.2) suppresses only the reminder for the
- * band(s) the claimed events actually belong to (006 §5.1.1) — a `high`-only
- * claim never suppresses a `normal`/`low` reminder, but a mixed-band recap
- * that also claims an old `normal`/`low` event DOES suppress that band's next
- * reminder until it too is acknowledged. The delivered payload used to name
- * no way to acknowledge, so an agent that fully handled the work still left the
- * claimed band silently muted — the remediation lived only in `monitor explain`,
- * which nobody runs while things appear fine. This line closes that loop, in
- * the delivered context itself.
+ * acknowledgment (BP2 / SP4). Explicit acknowledgment records handled work and
+ * removes it from unread recaps. Fresh normal/low batches remain eligible even
+ * while these claims remain unread, so acknowledgment is not a prerequisite
+ * for later reminders. Keeping the instruction in the delivered context lets
+ * the recipient close the work without discovering a separate diagnostic tool.
  *
  * **Scoped to the CLAIMED batch, not "ack everything" (PR #445 review,
  * finding 1).** `agentmonitors events ack --session <id>` with no

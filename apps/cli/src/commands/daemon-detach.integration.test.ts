@@ -56,7 +56,7 @@ function makeWorkspace(label: string): Workspace {
   // Keep the socket short and out of the (possibly deep) temp workspace path
   // so it stays under the platform's sun_path limit.
   const socket = path.join(
-    '/tmp',
+    tmpdir(),
     `am389-${label}-${Date.now()}-${Math.random().toString(16).slice(2)}.sock`,
   );
   const ws: Workspace = {

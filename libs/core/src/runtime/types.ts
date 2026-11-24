@@ -1,3 +1,4 @@
+/** Shared runtime contracts for durable monitor work, session delivery, and diagnostics. */
 import type {
   MonitorDefinition,
   NotifyConfig,
@@ -6,10 +7,7 @@ import type {
 import type { ephemeralMonitorStatus } from '../inbox/schema.js';
 import type { Observation } from '../observation/types.js';
 import type { DuplicateMonitorId } from '../parser/scan-monitors.js';
-import type {
-  ExternalEventIngestInput,
-  ExternalEventOutcome,
-} from '../external-ingress/contract.js';
+import type { ExternalEventEnvelope } from '../external-ingress/contract.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
 
 export type AgentLifecycleEvent =
@@ -156,6 +154,25 @@ export interface MonitorEventRecord {
   queryScope: Record<string, string | string[]>;
   tags: string[];
   createdAt: Date;
+  /**
+   * A short content fingerprint of the parts of the monitor's definition that
+   * decide what an event is (`urgency`, `urgencyMax`, the body, `name`, `watch`
+   * except scheduling keys such as `interval`, `shape`, `payload` and
+   * `baseline-strategy`; 002 §5.3) AS IT WAS at materialization time
+   * (issue #451), computed by {@link definitionFingerprint} over the same
+   * `StoredObservationEnvelope.monitor` snapshot `urgency`/`title`/`body` were
+   * already captured from — never recomputed from the live monitor at delivery
+   * time. Lets a diagnostic (`monitor explain`) compare a pending event's
+   * fingerprint against the CURRENT monitor's fingerprint and say "this pending
+   * event predates the current definition" without re-deriving or altering the
+   * event's own already-correct `urgency`/`title`/`body`. `null` on legacy rows
+   * materialized before this field existed — treated as "unknown", never
+   * flagged as stale (no false positive from an absent baseline). Optional on
+   * WRITE (`insertEvent` input) — a caller that doesn't compute one (tests,
+   * or a future writer that predates this field) simply omits it and the row
+   * persists NULL — but always present (possibly `null`) on READ.
+   */
+  definitionFingerprint?: string | null;
   /**
    * The requesting session's delivery state for this event (002 §7):
    * `unread` (not acknowledged), `claimed` (surfaced at least once at a
@@ -474,6 +491,47 @@ export interface DoctorDeliveryCounts {
 }
 
 /**
+ * Observations of one monitor that the runtime dropped for good, and that are
+ * still outstanding because nothing has superseded them (002 §2). One rule
+ * covers every kind of drop: an observation the retry outbox could not retain
+ * with its ordered suffix ("Admission outcomes when the outbox cannot retain a
+ * suffix"), an observation a debounce or rollup hold refused because it
+ * cannot be serialized (002 §4.7), and the observation of a terminal retry an
+ * operator skipped (002 §2.7). A drop with an object key
+ * is superseded only by a later event of the same monitor, workspace and
+ * object key; a drop without one, only by a later span of that monitor in that
+ * workspace that materializes an event and drops nothing. Quiet ticks, notify
+ * holds, observe failures and restarts supersede nothing.
+ *
+ * Read from the durable `observation_history` rows that record those drops, so
+ * it survives restarts and reads the same with or without a daemon. Every text
+ * field is the bounded, control-normalized metadata stored on the newest drop
+ * row; the observation's payload is never part of it.
+ */
+export interface UnretainedObservationLoss {
+  /** How many drops of this monitor in this workspace are still outstanding, across every span and kind. */
+  count: number;
+  /** When the newest outstanding drop was recorded. */
+  recordedAt: Date;
+  /**
+   * The newest drop's error: the materialization error followed by
+   * `Not retained for retry: <reason>` for an outbox drop, the refusal
+   * message for a hold refusal (002 §4.7), or the retry's last error followed
+   * by `Retry skipped after <n> failed attempts[: <reason>].` for a skipped
+   * terminal retry (002 §2.7).
+   */
+  error: string;
+  /** The newest dropped observation's 1-based position in its span, when recorded (never for a hold refusal or a skipped retry). */
+  position?: number;
+  /** How many observations that span dispatched, when recorded (never for a hold refusal or a skipped retry). */
+  spanSize?: number;
+  /** The newest dropped observation's source `objectKey`, when it had one. */
+  objectKey?: string;
+  /** The newest dropped observation's source `title`, when it had one. */
+  title?: string;
+}
+
+/**
  * A per-monitor health rollup produced by
  * {@link AgentMonitorRuntime.doctorReport}. Every field is derived from durable
  * state (persisted observation history, `monitor_events`, and session
@@ -517,10 +575,20 @@ export interface DoctorMonitorRollup {
   /** Delivery-state tallies across this workspace's lead-session projections. */
   delivery: DoctorDeliveryCounts;
   /**
-   * Durable failed observations awaiting retry or operator repair. Optional
-   * for compatibility with reports returned by older daemons.
+   * Durable failed observations awaiting retry or operator repair. Duplicated
+   * ids omit this summary: their one outbox belongs to the report's orphaned
+   * groups instead of being attributed to each conflicting definition.
+   * Optional for compatibility with reports returned by older daemons.
    */
   materializationRetries?: MaterializationRetrySummary;
+  /**
+   * Present while this monitor has an outstanding dropped observation (one the
+   * retry outbox could not retain, or one a hold refused); absent once every
+   * drop is superseded (see {@link UnretainedObservationLoss}), and in reports
+   * from older daemons. Duplicated ids omit it: their loss belongs to the
+   * report's orphaned groups, like their retained work.
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
 }
 
 /** A parse-level failure attributed to a monitor id (or file path fallback). */
@@ -554,6 +622,12 @@ export interface DoctorReportInput {
  * top of it.
  */
 export interface MonitorDoctorReport {
+  /**
+   * Accepted notify batches, scoped to this workspace and independent of current
+   * definition validity or existence. Each strategy's batch appears once.
+   * Optional for compatibility with reports returned by older daemons.
+   */
+  heldNotifyWork?: HeldNotifyWork[];
   generatedAt: Date;
   monitorsDir: string;
   /**
@@ -567,6 +641,22 @@ export interface MonitorDoctorReport {
   monitorsDirExists: boolean;
   /** Every discovered monitor's rollup (both valid and invalid definitions). */
   monitors: DoctorMonitorRollup[];
+  /**
+   * Recovery obligations of ids with no usable definition (removed,
+   * parse-failed or duplicated persistent definitions, and retired ephemeral
+   * monitors): retained outboxes and outstanding unretained-observation
+   * losses. These are not synthetic monitor definitions. Each id's obligations
+   * appear in exactly one place: here, on its monitor rollup, or in
+   * {@link MonitorDoctorReport.ephemeralMonitorWork}. Ordered by monitor id.
+   * Optional for compatibility with older daemon reports.
+   */
+  orphanedMonitorWork?: OrphanedMonitorWork[];
+  /**
+   * Recovery obligations of live ephemeral monitors, attributed to them rather
+   * than reported as orphaned. Ordered by monitor id. Optional for
+   * compatibility with older daemon reports.
+   */
+  ephemeralMonitorWork?: EphemeralMonitorWork[];
   /** Count of discovered monitors that failed validation. */
   invalidCount: number;
   /** Monitor-id collisions across the tree (001 §4). */
@@ -595,6 +685,52 @@ export interface MonitorRuntimeState {
   lastObservationAt?: Date;
   sourceState?: unknown;
   notifyState: NotifyRuntimeState;
+}
+
+/**
+ * The first known release prerequisite in tick order, separate from pacing.
+ * `none` means no current barrier was found, not a guarantee against concurrent
+ * edits, source failures or storage failures during a later tick.
+ * @public
+ */
+export type HeldNotifyBarrier =
+  | 'none'
+  | 'definition-rejected'
+  | 'source-unavailable'
+  | 'owner-inactive'
+  | 'declaration-retired'
+  | 'workspace-mismatch'
+  | 'declaration-invalid'
+  | 'retained-work'
+  | 'capture-invalid';
+
+/**
+ * Accepted observations waiting for notify pacing, distinct from materialized
+ * events and retry outboxes. Counts and timing come from the persisted batch;
+ * definition repair permits release but does not bypass pacing or retry order.
+ * @public
+ */
+export interface HeldNotifyWork {
+  /** Monitor route within the report's workspace, even without a usable definition. */
+  monitorId: string;
+  /** The persisted batch's pacing strategy; throttle never retains observations. */
+  strategy: 'debounce' | 'rollup';
+  /** Accepted envelopes in this batch, not source observations in the latest tick. */
+  observations: number;
+  /** Whether a missing, ambiguous or rejected persistent definition (including an unresolved source) prevents this batch's release. */
+  blockedByDefinition: boolean;
+  /** First known release prerequisite; false definition blockage alone never implies eligibility. */
+  releaseBarrier: HeldNotifyBarrier;
+  /** Shared text/structured explanation of what permits release. */
+  reason: string;
+  /** Debounce settle deadline as stored, including elapsed deadlines awaiting a tick. */
+  dueAt?: string;
+  /** Whether the debounce deadline has elapsed at report generation. */
+  overdue?: boolean;
+  /** Rollup cron from the captured definition; `unknown` for unavailable legacy metadata. */
+  window?: string;
+  /** Captured rollup timezone, default UTC; `unknown` when legacy metadata is unavailable. */
+  timezone?: string;
 }
 
 export interface PendingDebounceState {
@@ -648,8 +784,44 @@ export interface StoredObservationEnvelope {
   effectiveUrgency: Urgency;
 }
 
-/** Capability persisted once a workspace contains forward-only durable work. @public */
+/**
+ * Capability recorded once a workspace's database holds durable external-event
+ * receipts, so a version that predates them can recognize the database as
+ * forward-only. @internal
+ */
 export const DURABLE_INGRESS_COMPATIBILITY_MARKER = 'durable-ingress-v1';
+
+/**
+ * One validated external event and the local workspace it belongs to, as the
+ * receipt operation accepts it. The workspace identity is the canonical
+ * daemon-owned identity that scopes the receipt key; it is never returned.
+ * @public
+ */
+export interface ExternalEventReceiptInput {
+  /** Canonical local workspace identity; part of the receipt key. */
+  workspaceIdentity: string;
+  /** The external event, validated again by the operation before any write. */
+  envelope: ExternalEventEnvelope;
+}
+
+/**
+ * Durable state of an external-event receipt.
+ *
+ * - `materialized`: normal Agent Monitors events were committed.
+ * - `held`: a supported notify delay captured the event durably.
+ * - `suppressed`: local shaping policy deliberately produced no event.
+ * - `stale`: a newer or equal object sequence had already been accepted, so
+ *   no work ran.
+ * - `failed`: deferred materialization exhausted its automatic retries. Only a
+ *   later retry transition records it; acceptance never does.
+ * @public
+ */
+export type ExternalEventReceiptOutcome =
+  | 'materialized'
+  | 'held'
+  | 'suppressed'
+  | 'stale'
+  | 'failed';
 
 /**
  * Safe receipt metadata; deliberately excludes workspace identity, semantic
@@ -672,11 +844,11 @@ export interface ExternalEventReceiptRecord {
   /** Source-defined semantic event label. */
   eventKind: string;
   /** Agent Monitors change classification. */
-  changeKind: ExternalEventIngestInput['envelope']['changeKind'];
+  changeKind: ExternalEventEnvelope['changeKind'];
   /** Original RFC 3339 producer timestamp. */
   occurredAt: string;
   /** Current durable receipt outcome. */
-  outcome: ExternalEventOutcome;
+  outcome: ExternalEventReceiptOutcome;
   /** Correlated Agent Monitors event IDs, empty before materialization. */
   eventIds: string[];
   /** Deferred materialization failures recorded so far. */
@@ -723,8 +895,10 @@ export interface ExternalEventReceiptContext {
 
 /**
  * Durable consequence produced inside a new receipt's acceptance transaction.
- * Materialized work requires at least one event ID; other outcomes cannot carry
- * event correlation or a materialization timestamp.
+ * Materialized work requires at least one event ID; `held` and `suppressed`
+ * cannot carry event correlation or a materialization timestamp. `failed` and
+ * `stale` are not initial outcomes: the operation records `stale` itself, and
+ * only an exhausted deferred retry records `failed`.
  * @public
  */
 export type ExternalEventReceiptCompletion =
@@ -737,8 +911,8 @@ export type ExternalEventReceiptCompletion =
       materializedAt?: Date;
     }
   | {
-      /** A supported delay held work, policy suppressed it, or retries failed. */
-      outcome: 'held' | 'suppressed' | 'failed';
+      /** A supported delay held the work, or local policy suppressed it. */
+      outcome: 'held' | 'suppressed';
       /** Non-materialized outcomes cannot claim event correlation. */
       eventIds?: never;
       /** Non-materialized outcomes cannot claim a materialization time. */
@@ -748,9 +922,25 @@ export type ExternalEventReceiptCompletion =
 /**
  * Synchronous durable work for a genuinely new, non-stale receipt.
  *
- * The operation runs inside the same immediate transaction as receipt and
- * sequence persistence. It is not invoked for duplicate, conflict, or stale
- * decisions. Throwing rolls back both callback writes and receipt state.
+ * Boundary rules:
+ *
+ * - It runs inside the same immediate transaction as the receipt, the object's
+ *   high-water sequence and the compatibility marker, after the sequence is
+ *   already reserved. It is never invoked for duplicate, conflict or stale
+ *   decisions.
+ * - It MUST be synchronous and write through the same database connection. A
+ *   returned promise (any thenable) is refused and the transaction rolls back;
+ *   work after its first `await` would run outside the transaction, so it is
+ *   never durable work.
+ * - Throwing rolls back the callback's writes together with the receipt,
+ *   sequence and marker.
+ * - It may accept other external events re-entrantly. A nested call runs in the
+ *   outer transaction and commits or rolls back with it. Because the outer
+ *   sequence is reserved first, a nested event for the same object at or below
+ *   it is `stale`, and a higher one advances the high-water mark, which the outer
+ *   call never lowers afterwards. A nested call for the exact identity being
+ *   accepted (workspace, monitor, source, upstream event) is refused with an
+ *   error.
  * @public
  */
 export type ExternalEventReceiptOperation = (
@@ -788,6 +978,13 @@ export const MATERIALIZATION_RETRY_DELAYS_MS = [
 ] as const;
 /** Attempts after which a retry becomes terminal and requires re-arm. @public */
 export const MATERIALIZATION_RETRY_MAX_ATTEMPTS = 5;
+/**
+ * Longest operator reason a skipped retry records, in characters after
+ * trimming. A skip with a longer reason is refused, so the recorded loss
+ * always keeps the retry's last error and the skip note in full alongside it.
+ * @public
+ */
+export const MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH = 200;
 
 /** Durable lifecycle state for one failed materialization. @public */
 export type MaterializationRetryStatus = 'pending' | 'terminal';
@@ -803,8 +1000,8 @@ export interface MaterializationRetryRecord {
   /** Trusted observation-source route captured at enqueue time. */
   sourceName: string;
   /**
-   * Restored observation. Enqueue rejects non-JSON-safe nested data instead of
-   * silently changing it; `observedAt` is restored as a Date.
+   * Restored supported plain-data observation. Detectable unsupported nested
+   * data is rejected at enqueue; `observedAt` is restored as a Date.
    */
   envelope: StoredObservationEnvelope;
   /** UTF-8 bytes occupied by the serialized envelope. */
@@ -831,7 +1028,17 @@ export interface EnqueueMaterializationRetryInput {
   monitorId: string;
   /** Trusted source route; must match the envelope's watch type. */
   sourceName: string;
-  /** Failed observation to persist losslessly for a later attempt. */
+  /**
+   * Failed observation to persist losslessly for a later attempt. Callers must
+   * supply ordinary data records and dense arrays of JSON primitives (excluding
+   * negative zero). Built-in/class instances, even with replaced prototypes, are
+   * outside this domain. `observedAt` is the sole Date leaf and must be valid,
+   * have Date.prototype, and have no own properties.
+   * Detectable violations (including proxies, accessors, cycles and intrinsic
+   * brands exposed by Node) raise a serialization domain error. Validation is
+   * not authentication of object provenance or unobservable private state;
+   * callers remain responsible for the plain-data precondition.
+   */
   envelope: StoredObservationEnvelope;
   /** Failure text to sanitize and persist as bounded operator diagnostics. */
   error: string;
@@ -851,6 +1058,73 @@ export interface MaterializationRetryQuery {
   limit?: number;
 }
 
+/**
+ * What kind of monitor an id with recovery obligations belongs to: a
+ * `persistent` monitor is authored as a `MONITOR.md` definition; an
+ * `ephemeral` monitor was declared by an agent session (`ephemeral:` id) and
+ * never had a definition file.
+ * @public
+ */
+export type DoctorMonitorKind = 'persistent' | 'ephemeral';
+
+/**
+ * Recovery obligations of a monitor id that has no usable definition in the
+ * doctor's workspace: a persistent monitor whose `MONITOR.md` was removed, no
+ * longer parses, or is duplicated, or an ephemeral monitor that was cancelled
+ * or reaped. It holds the id's retained retry work and its outstanding
+ * unretained-observation loss; each field is present only when there is
+ * something to report, and at least one always is. The containing doctor
+ * report supplies its workspace; captured source/configuration metadata is
+ * deliberately not reconstructed.
+ * @public
+ */
+export interface OrphanedMonitorWork {
+  /** Durable route identity needed to inspect the obligations. */
+  monitorId: string;
+  /**
+   * `persistent` for a directory-defined id, `ephemeral` for a retired
+   * ephemeral monitor (a live one is reported in
+   * {@link MonitorDoctorReport.ephemeralMonitorWork} instead).
+   */
+  monitorKind: DoctorMonitorKind;
+  /** Retained retry work, present only while the outbox holds records; never envelopes. */
+  materializationRetries?: MaterializationRetrySummary;
+  /**
+   * Present while the id has an outstanding dropped observation (one the
+   * retry outbox could not retain, or one a hold refused).
+   */
+  unretainedObservationLoss?: UnretainedObservationLoss;
+}
+
+/**
+ * Recovery obligations of a live (`active`) ephemeral monitor whose rows are
+ * in the doctor's workspace. Ephemeral monitors have no `MONITOR.md`, so they
+ * have no rollup in {@link MonitorDoctorReport.monitors}; their obligations
+ * are attributed to them here rather than reported as orphaned. Each field is
+ * present only when there is something to report, and at least one always is.
+ * @public
+ */
+export interface EphemeralMonitorWork {
+  /** The ephemeral monitor's `ephemeral:<sessionId>/<ulid>` id. */
+  monitorId: string;
+  /** The AgentMon session that declared it and can cancel it. */
+  sessionId: string;
+  /** Retained retry work, present only while the outbox holds records; never envelopes. */
+  materializationRetries?: MaterializationRetrySummary;
+  /** Present while the monitor has an outstanding dropped observation. */
+  unretainedObservationLoss?: UnretainedObservationLoss;
+  /**
+   * Present only while the monitor's persisted scope fails the source's scope
+   * preflight, the same check every tick applies. The tick then skips the
+   * watch, and an ephemeral scope cannot be edited, so the work above can
+   * never be superseded. Cancelling the watch and declaring it again with a
+   * valid scope restores observation, but the new declaration gets a new id,
+   * so this id's outstanding drop and retained work stay reported under its
+   * retired id. Absent when the scope is accepted.
+   */
+  validationError?: string;
+}
+
 /** Operator-safe retry metadata that never contains an envelope or payload. @public */
 export interface MaterializationRetryDiagnostic {
   /** Stable retry id used by the operator re-arm flow. */
@@ -867,6 +1141,68 @@ export interface MaterializationRetryDiagnostic {
   createdAt: Date;
   /** Time of the most recent failed attempt or operator re-arm. */
   updatedAt: Date;
+}
+
+/**
+ * Names one retained retry for an operator repair
+ * ({@link AgentMonitorRuntime.rearmMaterializationRetry},
+ * {@link AgentMonitorRuntime.skipMaterializationRetry}): the record id that
+ * retry diagnostics list, and the workspace/monitor route it belongs to. A
+ * retry of another monitor or workspace is treated as not found, so a
+ * mistyped route never repairs someone else's work. @public
+ */
+export interface MaterializationRetryRepairInput {
+  /** The monitor whose outbox holds the retry. */
+  monitorId: string;
+  /** The retry's record id, as `monitor explain` and `doctor` list it. */
+  retryId: string;
+  /** The exact workspace the retry was admitted in. */
+  workspacePath: string;
+}
+
+/** A skip names its retry like a re-arm and may say why it is given up. @public */
+export interface MaterializationRetrySkipInput extends MaterializationRetryRepairInput {
+  /**
+   * Optional operator note, recorded with the loss after the retry's last
+   * error. Stored as a single-line diagnostic; at most
+   * {@link MATERIALIZATION_RETRY_SKIP_REASON_MAX_LENGTH} characters after
+   * trimming, or the skip is refused.
+   */
+  reason?: string;
+}
+
+/**
+ * What an operator repair did to a terminal retry (002 §2.7, §2.8):
+ *
+ * - `rearmed`: the retry is back on automatic retry, its attempts reset;
+ * - `skipped`: the retry is removed and its observation is recorded as an
+ *   outstanding loss (002 §2);
+ * - `verify-artifact-cleanup`: the retry is removed and nothing is recorded,
+ *   because its observation is a verify artifact whose cleanup authority is in
+ *   effect (002 §2.8). Dropping it is the cleanup its owner asked for, not lost
+ *   work, so either repair removes it this way instead of re-arming it or
+ *   recording a loss.
+ *
+ * @public
+ */
+export type MaterializationRetryRepairOutcome =
+  | 'rearmed'
+  | 'skipped'
+  | 'verify-artifact-cleanup';
+
+/**
+ * The result of an operator repair of a terminal retry
+ * ({@link AgentMonitorRuntime.rearmMaterializationRetry},
+ * {@link AgentMonitorRuntime.skipMaterializationRetry}). @public
+ */
+export interface MaterializationRetryRepairResult {
+  /** What the repair did; see {@link MaterializationRetryRepairOutcome}. */
+  outcome: MaterializationRetryRepairOutcome;
+  /**
+   * The retry's safe metadata: as it is after a re-arm, or as it was when it
+   * was removed.
+   */
+  retry: MaterializationRetryDiagnostic;
 }
 
 /** Aggregate and bounded record-level diagnostics for one retry outbox. @public */
@@ -931,34 +1267,39 @@ export interface ErroredObservation {
 }
 
 /**
- * A monitor that was found but skipped on a tick because its interval has not
- * yet elapsed since the last observation. Surfaced so callers (e.g. daemon
- * once) can distinguish "skipped, not yet due" from "no monitors found".
+ * A monitor paused before observation: either its cadence is not due, or its
+ * source config is invalid. Validation skips have no due time: correcting the
+ * config, rather than waiting, allows observation to resume with retained state.
  *
- * @see docs/specs/002-runtime-delivery.md §2.4
+ * @see docs/specs/002-runtime-delivery.md §2.5
  */
-export interface SkippedMonitor {
-  monitorId: string;
-  /** The earliest time at which this monitor will be due for its next tick. */
-  nextDueAt: Date;
-}
+export type SkippedMonitor =
+  | {
+      monitorId: string;
+      /** The earliest time at which this valid monitor is due again. */
+      nextDueAt: Date;
+      validationError?: never;
+    }
+  | {
+      monitorId: string;
+      /** The same joined source-config diagnostics reported by `validate`. */
+      validationError: string;
+      nextDueAt?: never;
+    };
 
 /**
  * Summary returned by a single `AgentMonitorRuntime.tick()` call.
  *
- * Note: errored monitors (whose `observe()` threw, whose `ingest()` failed, or
- * whose due retry-outbox work failed) are still included in
- * `evaluatedMonitors` — they were attempted even though their outcome is
- * `errored` rather than `triggered`/`suppressed`/`no-change`. A successful due
- * retry drain is also an evaluation, including when its captured monitor has
- * since been removed. Errors are additionally listed in
- * `erroredObservations`, populated from the same path that writes an `errored`
- * row to `observation_history`, so the tick itself can report the failure
- * rather than silently print `emitted 0`.
+ * Note: errored monitors (whose `observe()` threw, or whose `ingest()` failed)
+ * are still included in `evaluatedMonitors` — they were attempted even though
+ * their outcome is `errored` rather than `triggered`/`suppressed`/`no-change`.
+ * They are additionally listed in `erroredObservations`, populated from the
+ * same path that writes an `errored` row to `observation_history`, so the tick
+ * itself can report the failure rather than silently print `emitted 0`.
  *
- * Monitors found in the directory but skipped because their interval has not
- * elapsed are listed in `skippedMonitors` so callers can distinguish
- * "skipped, not yet due" from "no monitors found" (issue #152).
+ * Monitors with invalid source config or a cadence that is not yet due are
+ * listed in `skippedMonitors`, distinguishing a config requiring correction
+ * from a valid monitor waiting to run and from an empty monitor directory.
  */
 export interface RuntimeTickResult {
   evaluatedMonitors: string[];
@@ -979,9 +1320,60 @@ export interface WatchHandle {
   stop(): Promise<void>;
 }
 
+/**
+ * One notify dispatch decision over a batch of observations.
+ *
+ * `emitted` proceeds to materialization now; `nextState` is the notify state to
+ * persist, including any debounce/rollup hold. `notHeld` lists observations a
+ * hold refused because their envelope cannot be serialized into
+ * `monitor_state.notify_state` (002 §4.7): they are neither emitted nor held,
+ * and the caller records each as outstanding loss and reports it.
+ *
+ * @internal
+ */
 export interface NotifyDispatchResult {
   emitted: StoredObservationEnvelope[];
   nextState: NotifyRuntimeState;
+  notHeld: NotHeldObservation[];
+}
+
+/**
+ * An observation a debounce or rollup hold refused at acceptance because its
+ * envelope cannot be serialized (002 §4.7). `message` is the complete,
+ * single-line outcome text: it names the observation, the hold strategy and
+ * the serializer's reason.
+ *
+ * A refusal is loss (002 §2): admission records it with the same drop identity
+ * as an observation the retry outbox could not retain, at its place in the
+ * span's dispatched order.
+ *
+ * @internal
+ */
+export interface NotHeldObservation {
+  observation: Observation;
+  message: string;
+  /**
+   * The index in the same dispatch's `emitted` list at which this refusal is
+   * recorded: every envelope before it is of an observation older than the
+   * refusal, and every envelope from it on is of a newer one. Admission
+   * records the loss after the first `emittedBefore` envelopes and before the
+   * rest, so only an event of a newer observation of the same key supersedes
+   * it.
+   *
+   * The envelopes before it are held work flushed when its settle window had
+   * already elapsed, siblings that arrived before it and went straight to
+   * materialization, and, when an escalation later in the dispatch flushes the
+   * debounce batch (002 §4.1), the observations that batch held at the moment
+   * of refusal. A flushed batch keeps arrival order, so those held envelopes
+   * are the first ones of the flush, and observations held after the refusal
+   * follow them. A rollup refusal is always 0: rollup refuses only when its
+   * window does not fire, and then it emits nothing.
+   *
+   * The count is over the dispatched list. When admission drops retired
+   * verify artifacts from that list (002 §2.8), it re-counts the position over
+   * the envelopes it keeps.
+   */
+  emittedBefore: number;
 }
 
 export interface RuntimeStatus {
@@ -1009,9 +1401,8 @@ export interface RuntimeStatus {
  *   (2) A dispatched observation failed deterministic materialization inside
  *       `ingest()` (tick or watch path). Earlier committed siblings remain
  *       events; the failed envelope and every later sibling are durably queued
- *       before source/notify state advances. `emittedEventIds` therefore names
- *       only committed events, and the monitor pauses until oldest-first drain
- *       succeeds or terminalizes.
+ *       before the batch source checkpoint and notify state advance.
+ *       `emittedEventIds` therefore names only committed events.
  *   In both cases the audit write itself is best-effort: a `recordObservationHistory`
  *   failure is swallowed so a failing audit row can never re-abort the tick.
  * - `rebaselined`: the source advanced its baseline without computing a delta
@@ -1087,4 +1478,72 @@ export function defaultNotifyConfigForUrgency(
     };
   }
   return undefined;
+}
+
+/**
+ * Why cleanup authority took effect for a registered verify artifact (002
+ * §2.8): the owner asked for cleanup after its proof, or the owner session was
+ * no longer active (closed, reaped as stale, or missing) when the runtime
+ * reconciled it.
+ *
+ * @public
+ */
+export type VerifyArtifactCleanupCause = 'owner-request' | 'owner-inactive';
+
+/**
+ * Durable, exact ownership of one synthetic artifact a `verify` run created
+ * against a persistent workspace daemon (issue #562, 002 §2.8). The record
+ * names one object key in one monitor and workspace. It is retained without
+ * expiry: once cleanup has taken effect the runtime keeps that exact key out of
+ * every later session, and the retained key cannot be registered again.
+ *
+ * @public
+ */
+export interface VerifyArtifactRecord {
+  /** The verify run's random token; one record per run. */
+  runId: string;
+  /** The verify run's throwaway lead session. */
+  ownerSessionId: string;
+  /** The workspace whose daemon owns the artifact; ownership never crosses workspaces. */
+  workspacePath: string;
+  /** The monitor the run verified; the filter is scoped to it. */
+  monitorId: string;
+  /** The exact scratch path, which carries {@link VerifyArtifactRecord.runId}. */
+  objectKey: string;
+  /** When the run registered ownership, before creating the artifact. */
+  registeredAt: Date;
+  /** When cleanup authority was first recorded; never cleared once set. */
+  cleanupRequestedAt: Date | null;
+  /** Why cleanup authority took effect; `null` while the run is still in its proof phase. */
+  cleanupCause: VerifyArtifactCleanupCause | null;
+}
+
+/**
+ * Register exact ownership of a verify scratch artifact before creating it
+ * (002 §2.8). `objectKey` must be a verify scratch path whose token equals
+ * `runId`; real watched paths are refused.
+ *
+ * @public
+ */
+export interface RegisterVerifyArtifactInput {
+  /** The run's random 12-hex-digit token, embedded in `objectKey`. */
+  runId: string;
+  /** The run's own active lead session in `workspacePath`. */
+  ownerSessionId: string;
+  /** The workspace whose daemon owns the artifact. */
+  workspacePath: string;
+  /** The monitor being verified; filtering is scoped to it. */
+  monitorId: string;
+  /** The exact scratch path the run is about to create. */
+  objectKey: string;
+  /** Registration time; defaults to the current clock. */
+  now?: Date;
+}
+
+/** The outcome of a verify artifact cleanup request (002 §2.8). @public */
+export interface VerifyArtifactCleanupResult {
+  /** The record after the request; unchanged when cleanup was already recorded. */
+  artifact: VerifyArtifactRecord;
+  /** Events for the exact key that this request retracted. */
+  retractedEventCount: number;
 }
