@@ -304,7 +304,7 @@ function hasReadOnlyIntrinsicState(value: object): boolean {
   return false;
 }
 
-/** A plain-data JSON value; negative zero canonicalizes to zero. @internal */
+/** A plain-data JSON value; negative zero canonicalizes to zero. @public */
 export type ExternalJsonValue =
   | null
   | boolean
@@ -313,7 +313,7 @@ export type ExternalJsonValue =
   | ExternalJsonValue[]
   | { [key: string]: ExternalJsonValue };
 
-/** A string-keyed plain-data record, including null-prototype records. @internal */
+/** A string-keyed plain-data record, including null-prototype records. @public */
 export type ExternalJsonObject = Record<string, ExternalJsonValue>;
 
 /** Encode one occurrence, tracking only ancestors so shared children remain valid. */

@@ -1,5 +1,51 @@
 # @agentmonitors/source-command-poll
 
+## 0.7.0
+
+### Minor Changes
+
+- 2090673: Bound macOS and Linux command groups with a watchdog armed before command execution, so timeout cleanup survives daemon death and closed output streams. Release remaining background work when a finite observation completes. Preserve command ownership for restart reconciliation and terminate in-flight command groups on graceful daemon shutdown. The command source factory accepts an optional shutdown signal.
+
+### Patch Changes
+
+- 2090673: Preserve kernel executable-path traversal and authored environment values during command admission, retain failing health and the previous baseline on exec failure, reject unrepresentable NUL bytes without truncating argv or environment values, restore native signal dispositions and masks, report ordinary exec errno without native crashes, isolate helpers from authored and inherited Node options while preserving them for the command, keep native binding lookup relative to each published module format, and release settled callers while independent watchdog deadlines remain armed.
+
+  Write admission status frames completely and reject incomplete or invalid status without replacing a successful baseline. Match platform spawn PATH search, relative executable spelling and errno precedence, including glibc's executable-format fallback. Explain platform native-support load failures with underlying detail. Ship Koffi 3.3.7 JavaScript, MIT license and macOS arm64/x64 and Linux glibc arm64/x64 prebuilds inside both packages, so CLI installation no longer requires `koffi` or `@koromix/*` from the user's registry. Load the selected binary relative to our package; unsupported platforms (including Windows and musl), missing or corrupt binaries refuse commands without plain-spawn or source-build fallback. Refresh with `node scripts/vendor-koffi.mjs`, verifying registry SHA-512 integrity and committed per-file SHA-256 hashes.
+
+  Use absolute runtime paths and start helpers with only the command-life mark in their environment, delivering the complete command environment through the configuration pipe so helper startup does not reduce the environment budget accepted by plain spawn. Keep initialization failures distinct from native-module load failures. Reparent the watchdog through a successfully reaped intermediate before exec, so commands can wait for all their own children without waiting for the watchdog. Preserve its process group, independent deadline, mark and restart accounting.
+
+  Restore blocking I/O on stdin, stdout and stderr before native execution. Clear only
+  `O_NONBLOCK` with the platform's variadic `fcntl` ABI, preserve unrelated status flags,
+  and verify each read-back. Refuse execution and retain the previous baseline if any status
+  operation fails or nonblocking mode survives.
+
+- 413db36: Refuse Linux native execution before loading the binding when mapped libraries do not establish glibc or include musl. Unreadable or ambiguous evidence fails closed without diagnostic reports or subprocesses.
+- 90a76c7: Require real glibc evidence before loading native command support on Linux. Synthetic or synthetic-looking mappings cannot establish glibc; musl-shaped path or label segments always refuse, including harmless synthetic labels beside real glibc. Ambiguous names deliberately cause refusal rather than admitting a non-glibc host.
+- 8e5723a: Reap known adopted watchdog zombies when bounded command observations run as Linux PID 1 or a child subreaper, preserving libuv child exit statuses.
+- 4249d1f: Refuse non-regular command life tokens promptly before execution and recover command admission after a failed journal commit, preserving committed ownership and unrelated replacement files.
+- b798ae8: Preserve exact parent open-file limits when starting bounded commands, including finite
+  values above 2^53 and unlimited. Read the native soft/hard pair directly through the
+  vendored binding without diagnostic reports or filesystem writes. After watchdog arming,
+  verify the inherited hard field, restore the soft value and read back the full pair.
+  Report an execution error and retain the prior baseline if capture or restoration fails.
+- 4249d1f: Reap orphaned stock macOS shell and curl commands after a daemon restart using each process's own inherited, journaled vnode. Preserve fail-closed ownership checks, watchdog bounds, and authored-command resource limits.
+- e1331c8: Identify watchdog roles in command ownership evidence. Preserve a command group's watchdog when restart cleanup cannot verify a group member. Record why the group bound remains active and retain per-process ownership checks for fully verified cleanup.
+
+  Keep per-process cleanup for groups without verified watchdogs, reconcile late forks beside terminal identities, and bound restart terminal scans and durable receipt writes.
+
+  Commit preservation decisions before awaiting unrelated terminal evidence, keeping receipt writes bounded. Persist invalid stored PID diagnostics before further identity queries.
+
+  Keep blocking receipt writes after every signal has used the final identity snapshot, before terminal queries begin.
+
+- Updated dependencies [a66ccec]
+- Updated dependencies [f01f2da]
+- Updated dependencies [3a00022]
+- Updated dependencies [4249d1f]
+- Updated dependencies [c425397]
+- Updated dependencies [4249d1f]
+- Updated dependencies [e1331c8]
+  - @agentmonitors/core@0.16.0
+
 ## 0.6.0
 
 ### Minor Changes
