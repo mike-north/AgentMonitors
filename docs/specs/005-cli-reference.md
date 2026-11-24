@@ -2170,6 +2170,8 @@ session churn. Target contract:
   delivery as deliverable, no delivery-transport check may fail. A genuinely wrong binding, where the
   channel is the only route and it serves another session, already makes the verdict
   undeliverable, so that case still fails.
+- The same rule covers `channel-lead-uncovered`, which fails in the same churn scenario. While the
+  hook path delivers to that lead, it is reported but not blocking.
 
 The section closes with a single verdict line: `delivery to active sessions in this workspace → via
 {hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is

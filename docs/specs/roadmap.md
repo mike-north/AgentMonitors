@@ -336,6 +336,8 @@ Interpret → Deliver → [React]`:
   - Held notify work of a cancelled or reaped ephemeral monitor stays held forever.
   - A claim that is never acknowledged stays claimed forever.
   - `doctor` can report a deliverable verdict and still exit 1 on a leftover channel record.
+  - A channel push to a session with no channel listener is committed as claimed, so the hook path
+    skips it and the agent never sees it.
 - **Target:**
   - Session liveness by host process, with suspension and resume
     ([002 §6.3](./002-runtime-delivery.md), [007 §4.4](./007-agent-facing-interaction.md)).
@@ -343,15 +345,17 @@ Interpret → Deliver → [React]`:
   - Claim expiry ([002 §7.1](./002-runtime-delivery.md)).
   - `channel-session-unmatched` is advisory, and the exit code agrees with the verdict
     ([005](./005-cli-reference.md), doctor section).
+  - A channel commit requires host confirmation from the session transcript, with no model-facing
+    probe ([006 §4.5.2](./006-agent-integration.md)).
 - **Governs:** [002](./002-runtime-delivery.md) §6.3, §6.4, §7.1; [007](./007-agent-facing-interaction.md) §4.4;
-  [005](./005-cli-reference.md) doctor; PP1, SP4 ([000](./000-principles.md)).
+  [006](./006-agent-integration.md) §4.5.2, §12.6; [005](./005-cli-reference.md) doctor; PP1, SP4 ([000](./000-principles.md)).
 - **Files (anticipated):**
   - `libs/core/src/runtime/service.ts` (`reapDormantSessions`, ephemeral cancel);
   - `libs/core/src/runtime/store.ts`;
   - `libs/core/src/adapter/claude.ts`;
   - `libs/core/src/inbox/schema.ts`;
   - `apps/cli/src/commands/{session,hook,channel,doctor}.ts`.
-- **Proof:** the success criteria of #396, #636, #468 and #462 (milestone "M3 — Delivery is
+- **Proof:** the success criteria of #396, #636, #468, #462 and #535 (milestone "M3 — Delivery is
   honest on Claude").
 
 ## Test gaps

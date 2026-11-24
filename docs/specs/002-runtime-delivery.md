@@ -2375,8 +2375,15 @@ liveness signal.
   monitors are kept until an explicit end or retention retires them. The runtime **MUST NOT** fall
   back to an inactivity timer.
 
+**Where suspension appears.** Suspension is a session status. Sessions gain a third status,
+`suspended`, beside `active` and `dormant`, and `session list` shows it. An ephemeral monitor owned
+by a suspended session reports the watch status `suspended` in `watch list`, `monitor explain` and
+`doctor`, so a reader can tell "paused until resume" from "running" and from "reaped".
+
 Suspension is per session, like §6.2's dormancy, and is distinct from the daemon-wide idle
-self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server).
+self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server). For that rule a
+suspended session is not active: it has no host to deliver to, so it does not keep the daemon
+alive. Its durable state survives the daemon stopping, and a resume re-arms it.
 
 ### 6.4 Held notify work when an ephemeral declaration retires or suspends (_target_)
 
@@ -2396,8 +2403,9 @@ being evaluated.
 - **Explicit session end, or retention retiring a suspended session**: the held work is recorded
   with an explicit terminal disposition, _discarded on retirement_, durable and visible in the same
   way as a cancellation.
-- After any of these, no "held" entry may remain for a retired declaration in `doctor` or
-  `monitor explain`.
+- After a cancellation, an explicit end or a retirement, no "held" entry may remain for the retired
+  declaration in `doctor` or `monitor explain`. Suspension is not retirement, so its held work stays
+  visible as held.
 
 ## 7. Unread, Claimed, and Acknowledged
 
@@ -2409,26 +2417,30 @@ For each projected event, the runtime tracks session-specific delivery state via
 
 This distinction matters because a claimed event may still need user or agent attention later.
 
+Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
+
 ### 7.1 Claim expiry (_target_)
 
 > **Status: target** (Refs #468; origin #434).
 
-A claim that is not followed by an acknowledgement within the **claim TTL** expires: the event
-returns from claimed to unread and becomes deliverable again. This adds one edge to the three-state
-model, claimed → unread. Expiry never acknowledges. An acknowledgement keeps its meaning,
-"handled", and delivery becomes at-least-once without relying on the agent to acknowledge.
+Today a claimed event is never surfaced again: claims select only pending events, so an event the
+agent saw but never handled stays unread and silent until a recap. Claim expiry closes that gap. A
+claim that is not followed by an acknowledgement within the **claim TTL** expires: the event goes
+from claimed back to **pending** (unclaimed), so the next claim includes it again. The event stays
+unread throughout, because unread means "not acknowledged". This adds one edge to the model,
+claimed → pending. Expiry never acknowledges. An acknowledgement keeps its meaning, "handled", and
+delivery becomes at-least-once without relying on the agent to acknowledge.
 
 - The claim TTL is one configurable duration. Its default is an implementation choice, documented
   with the CLI ([005](./005-cli-reference.md)).
-- Expiry is computed from the durable claim time, so it behaves the same across daemon restarts.
+- The TTL is measured from the event's durable claim time, `firstNotifiedAt` for the first claim
+  and the most recent re-claim time after an expiry, so it behaves the same across daemon
+  restarts. Each expiry starts a new claim cycle; expiry repeats until the event is acknowledged.
 - An expired event follows its own urgency's delivery rules again ([§9](#9-delivery-lifecycles)).
-  Expiry also releases the `coalesced-until-ack` mute that the claim held.
 - In-flight delivery leases (`reserved-in-flight`) are a separate mechanism, already
   self-resolving, and are unaffected by claim expiry.
 - A long task may therefore see an event delivered twice. That is accepted: a duplicate costs less
   than a missed event.
-
-Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
 
 ## 8. Hook State
 
