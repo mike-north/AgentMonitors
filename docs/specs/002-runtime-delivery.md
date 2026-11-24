@@ -1410,8 +1410,9 @@ unregistered, foreign-workspace and proof-phase controls that still record the l
 > **Status: target.** Core publishes envelope admission and identity helpers as building
 > blocks for this capability, including structured validation errors and immutable limits. No runtime, CLI, or daemon method accepts the envelope yet.
 > The durable receipt tables exist in every database (§15, external ingress receipts), and core
-> publishes the receipt operation that writes them (§2.6.1). No runtime, CLI, or daemon path calls
-> it, so receipt persistence for ingested events remains target behavior.
+> publishes the receipt operation that writes them (§2.6.1) and the reads that return them
+> (§2.6.2). No runtime, CLI, or daemon path calls them, so receipt persistence for ingested events
+> remains target behavior.
 
 `agentmonitors.external-event.v1` represents one producer-reconstructed current-state snapshot. Its
 required top-level fields are `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
@@ -1450,8 +1451,8 @@ selects exactly `schema`, `monitorId`, `source`, `upstreamEventId`, `objectId`,
 `objectSequence`, `eventKind`, `changeKind`, `occurredAt`, `scope`, and `state`, excluding
 `resumeToken` and unknown properties, allowing one upstream event to replay from another relay cursor. The
 snapshot object key is `external:` plus canonical JSON for `[source, objectId]`, avoiding delimiter
-collisions. The receipt storage schema (§15) and the receipt operation (§2.6.1) are current;
-observation mapping and ingestion remain target behavior in §16.1.
+collisions. The receipt storage schema (§15), the receipt operation (§2.6.1) and the receipt
+reads (§2.6.2) are current; observation mapping and ingestion remain target behavior in §16.1.
 
 Verified: `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`, and
 `contract-boundaries.test.ts`.
@@ -1512,6 +1513,30 @@ accepts and runs `operation`; the rest observe `duplicate`.
 Verified: `libs/core/src/external-ingress/persistence.test.ts` and
 `receipt-public-contract.test.ts`; `libs/core/src/runtime/store.ts`
 (`withExternalEventReceipt`, `reserveExternalObjectSequence`).
+
+#### 2.6.2 Receipt and sequence reads (_current primitive; target ingestion_)
+
+Two reads return what the receipt operation stored. Both are scoped to one exact workspace, and
+neither writes.
+
+- `RuntimeStore.externalEventReceiptStatus(workspaceIdentity, receiptId)` returns the receipt with
+  that ID in that workspace, in the returned-receipt shape of §2.6.1, or `null`. Another workspace's
+  receipt is indistinguishable from a missing one.
+- `RuntimeStore.externalObjectSequence(workspaceIdentity, monitorId, source, objectId)` returns the
+  high-water record for exactly that route, or `null`: `workspaceIdentity`, `monitorId`, `source`,
+  `objectId`, `highestSequence`, `receiptId` (the receipt that set the mark), `upstreamEventId` and
+  `updatedAt`. All four dimensions must match; a row differing in any one is another route.
+
+Both reads hydrate stored rows by the same field rules: every identifier is a non-empty string,
+every sequence and count a non-negative safe integer, every timestamp a valid date. A receipt must
+also meet §2.6.1's outcome rules. A high-water row must also be coherent: its key is the requested
+route, and the receipt it names exists on that route with the same upstream event and an object
+sequence equal to the mark. A sequence row and its receipt are read in one transaction. A row that
+breaks any rule is refused with an error naming the row and the broken rule, never stored content;
+it is never returned.
+
+Verified: `libs/core/src/external-ingress/persistence-queries.test.ts`;
+`libs/core/src/runtime/store.ts` (`externalEventReceiptStatus`, `externalObjectSequence`).
 
 ## 3. Persisted Monitor State
 
@@ -3539,8 +3564,8 @@ lookup, and refusal of a key owned by another run); partial
 ### External ingress receipts (_current schema and store operation; target ingestion_)
 
 > **Status: schema and store operation current, ingestion target.** Every open creates these three
-> tables, and `RuntimeStore.withExternalEventReceipt()` writes them (§2.6.1). No runtime, CLI, or
-> daemon path calls it yet. The tables are additive (`CREATE TABLE` only when absent), so every
+> tables, `RuntimeStore.withExternalEventReceipt()` writes them (§2.6.1), and two store reads
+> return them (§2.6.2). No runtime, CLI, or daemon path calls these yet. The tables are additive (`CREATE TABLE` only when absent), so every
 > released database shape opens with its existing rows unchanged.
 
 The tables hold external-event idempotency and ordering state. They are separate from source
@@ -3581,7 +3606,8 @@ Index: unique `idx_external_event_receipt_key (workspace_identity, monitor_id, s
 
 The highest accepted producer sequence for one external object, so a stale event cannot regress it.
 It is reserved before an accepted event's durable work runs and only ever raised (§2.6.1); stale
-receipts do not change it. Another monitor or workspace advances independently.
+receipts do not change it. Another workspace, monitor, source or object advances independently, and
+`externalObjectSequence()` reads it only by all four (§2.6.2).
 
 | Column               | Type             | Notes                                     |
 | -------------------- | ---------------- | ----------------------------------------- |
@@ -3600,10 +3626,29 @@ Index: unique `idx_external_object_sequence_key (workspace_identity, monitor_id,
 #### `database_compatibility_markers`
 
 Forward-only durable capabilities present in the database. A `NULL` workspace identity is the global
-scope; it is distinct from every concrete identity, including the empty string. The receipt
-operation writes `durable-ingress-v1` for a workspace once, in the same transaction as that
-workspace's first receipt. Opening or migrating a database creates the table but writes no marker.
-Using an older binary on a database that holds a marker is unsupported.
+scope; it is distinct from every concrete identity, including the empty string.
+`durable-ingress-v1` marks a route that holds durable work a version without it would misread or
+drop. It is written once per route, always in the same transaction as the work it protects, so the
+two commit or roll back together:
+
+- the receipt operation marks the event's workspace with its first accepted receipt (§2.6.1);
+- `RuntimeStore.setMonitorState()` marks the monitor's workspace route (global when `NULL`) when the
+  stored notification state holds a debounce or rollup batch with at least one observation. Whether
+  to mark is decided from the serialized state that is stored, never from a second reading of the
+  caller's object. Empty batches and other notification state do not mark;
+- materialization retry admission marks the workspace route of every retained row, each read once
+  from its input. A failure on any route rolls the whole admission back. An empty admission does not
+  mark.
+
+Opening or migrating a database creates the table but writes no marker.
+
+**Refusing a newer database (_current_).** `durable-ingress-v1` is the only capability this version
+knows, at every scope. Opening a database whose markers name any other capability fails with an
+error that names each unknown capability, says a newer version of Agent Monitors wrote it, and says
+the database was left unchanged. The check runs before the open writes anything, the journal-mode
+switch included, and again inside the schema transaction. A refused open leaves the schema, rows,
+markers and journal mode as they were. A version released before markers existed does not check
+them; using one on a marked database remains unsupported.
 
 | Column               | Type             | Notes                 |
 | -------------------- | ---------------- | --------------------- |
@@ -3642,9 +3687,11 @@ a lock, an attempt waits in the busy handler instead. Retries and busy-handler w
 deadline: the switch gives up with `SQLITE_BUSY` at most 5 seconds after it starts. The schema build
 then runs under one immediate transaction (see `createDb`), which serializes the remaining work.
 
-Verified: `libs/core/src/external-ingress/schema.test.ts`; schema in `libs/core/src/inbox/schema.ts`
-(`externalEventReceipts`, `externalObjectSequences`, `databaseCompatibilityMarkers`); DDL and
-migration in `libs/core/src/inbox/db.ts` (`migrateExternalIngressTables`, `enableWriteAheadLog`).
+Verified: `libs/core/src/external-ingress/schema.test.ts`, `compatibility-refusal.test.ts` and
+`persistence-queries.test.ts`, and `libs/core/src/runtime/retry-outbox.test.ts`; schema in
+`libs/core/src/inbox/schema.ts` (`externalEventReceipts`, `externalObjectSequences`,
+`databaseCompatibilityMarkers`); DDL, migration and refusal in `libs/core/src/inbox/db.ts`
+(`migrateExternalIngressTables`, `enableWriteAheadLog`, `refuseUnknownCapabilities`).
 
 ### `inbox_items`
 
@@ -3820,8 +3867,8 @@ to validate their existing independent contracts.
 `validateExternalEventEnvelope` admits only the complete
 `agentmonitors.external-event.v1` field set. Unknown fields, including instructions,
 urgency, notify policy and local filesystem paths, MUST be refused. The package-root
-validator exposes admission only. The receipt storage tables (§15) and the receipt operation
-(§2.6.1) are current; ingestion and routing remain target behavior.
+validator exposes admission only. The receipt storage tables (§15), the receipt operation
+(§2.6.1) and the receipt reads (§2.6.2) are current; ingestion and routing remain target behavior.
 
 The validator MUST preflight encoded size before canonical JSON validation,
 normalization or fingerprinting. Its descriptor walk counts exact escaped UTF-8

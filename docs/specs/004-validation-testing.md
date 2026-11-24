@@ -741,8 +741,10 @@ from [002 §2.6](./002-runtime-delivery.md#26-source-neutral-external-event-cont
 unknown fields, custom/accessor objects, cycles, sparse arrays, invalid timestamps, and unsafe or
 non-finite numbers. Validation errors contain only stable safe text and never echo external state.
 
-This surface proves the public contract, the receipt storage schema, and the receipt operation
-([002 §2.6.1](./002-runtime-delivery.md#261-receipt-operation-current-primitive-target-ingestion)).
+This surface proves the public contract, the receipt storage schema, the receipt operation
+([002 §2.6.1](./002-runtime-delivery.md#261-receipt-operation-current-primitive-target-ingestion)),
+and the receipt reads
+([002 §2.6.2](./002-runtime-delivery.md#262-receipt-and-sequence-reads-current-primitive-target-ingestion)).
 Callers cannot ingest an envelope through the runtime, daemon, or CLI yet.
 
 The receipt operation requires these scenarios, against real SQLite:
@@ -774,6 +776,40 @@ The receipt operation requires these scenarios, against real SQLite:
 Reading the sequence before the callback and writing it after, dropping the rollback on a callback
 throw, accepting a replay with different content, or accepting an older sequence MUST each fail one
 of these tests.
+
+The receipt reads and the compatibility markers
+([002 §15](./002-runtime-delivery.md#15-persistence-schema-appendix), `database_compatibility_markers`)
+require these scenarios, against real SQLite:
+
+- **Receipt status.** The stored receipt is returned with exactly the 002 §2.6.1 fields and no
+  state, scope, resume token, or workspace identity. Another workspace's receipt and a missing one
+  both read as `null`. A corrupt stored receipt is refused, not returned.
+- **Exact route.** Two workspaces on one database read their own sequences, also from a second
+  connection. For each of the four dimensions, a same-workspace sibling differing only there
+  advances on its own, and a value no row has there reads as `null`.
+- **Corrupt sequence.** A non-numeric, negative, or fractional mark, an empty receipt or upstream
+  event ID, an unreadable time, a receipt ID that names no receipt, and a mark, upstream event, or
+  route its receipt does not carry are each refused with the broken rule, never returned.
+- **Held notification marker.** A nonempty debounce or rollup batch marks its exact route (global
+  when `NULL`); empty batches do not. A `toJSON` that removes its batch after serializing still
+  marks, because the decision follows the stored state. An aborted marker write leaves the earlier
+  state and no marker, and a retry then commits both.
+- **Retry marker.** Named and global retry routes are marked; an empty admission is not. A
+  workspace accessor that changes between reads is read once: capacity, row, and marker share that
+  route. An aborted marker write on one route of a multi-route admission leaves no rows and no
+  marker, and a retry then admits all of it.
+- **Newer database refused.** A write-ahead-log or rollback-journal database holding an unknown
+  capability is refused with an error naming that capability and a newer version. Every byte of the
+  file and its sidecars, the markers, and the journal mode are unchanged, and unknown capabilities
+  at the global and empty-string scopes are named too. Once the unknown marker is gone, the database
+  opens.
+- **Known markers open.** `durable-ingress-v1` at the global, empty-string, and concrete scopes, and
+  a global marker under the earlier `COALESCE` index, open and are kept.
+
+Dropping any one route predicate from the sequence read, returning a sequence row without
+validation, deciding the notification marker from the caller's object, reading the retry route more
+than once, removing the monitor-state transaction, dropping the retry marker write, or removing
+either capability check MUST each fail one of these tests.
 
 The receipt storage schema ([002 §15](./002-runtime-delivery.md#15-persistence-schema-appendix),
 external ingress receipts) requires these scenarios, each against a real on-disk database:
@@ -809,7 +845,9 @@ fail one of these tests.
 
 **Verified in:** `libs/core/src/external-ingress/json.test.ts`, `contract.test.ts`,
 `contract-boundaries.test.ts`, `admission-safety.test.ts`, `public-contract.test.ts`,
-`schema.test.ts`, `persistence.test.ts`, and `receipt-public-contract.test.ts`.
+`schema.test.ts`, `persistence.test.ts`, `persistence-queries.test.ts`,
+`compatibility-refusal.test.ts`, and `receipt-public-contract.test.ts`, with retry markers in
+`libs/core/src/runtime/retry-outbox.test.ts`.
 The public consumer suite exercises ESM/CJS exports and compiles against the trimmed
 package declarations. A fixed eleven-field canonical preimage pins the SHA-256 value;
 each identity-field mutation varies only that field. Runtime mutation of every limit
@@ -1162,17 +1200,21 @@ always fits the Unix socket limit.
 
 ### 3.4.3 External-ingress contract
 
-| Scenario                                                         | Coverage                                                                                                                                                        |
-| ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                          |
-| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                           |
-| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope).        |
-| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).              |
-| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).                   |
-| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                                |
-| Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` — replay from a reopened database, conflict, equal and older sequences, re-entrant ordering, and exact receipt/high-water rows). |
-| Receipt acceptance and durable callback work roll back together  | Covered (`persistence.test.ts` — callback failure and an aborted write at every step leave every table unchanged; a retry then succeeds).                       |
-| Compatibility migration preserves existing data                  | Covered (`schema.test.ts` — upgrade from the earlier marker index keeps every row and distinguishes global, empty, and concrete marker identities).             |
+| Scenario                                                         | Coverage                                                                                                                                                                                                                                                    |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Synthetic non-PR current-state envelope validates                | Covered (`libs/core/src/external-ingress/contract.test.ts` — accepts a build-system event and returns canonical JSON).                                                                                                                                      |
+| Missing, extra, or unsupported schema fields fail safely         | Covered (`contract.test.ts` — exact top-level field and schema cases; error text does not echo the rejected payload).                                                                                                                                       |
+| Identifier, scope, state-depth, and envelope bounds are exact    | Covered (`contract-boundaries.test.ts` — exact/+1 multibyte UTF-8 values, cardinality, 32-level object/array paths, 32 KiB scope, and 256 KiB envelope).                                                                                                    |
+| Non-JSON values and invalid RFC3339/sequence values are rejected | Covered (`json.test.ts`, `contract.test.ts`, and `contract-boundaries.test.ts` — descriptors, runtime types, timestamps, and safe-integer bounds).                                                                                                          |
+| Canonical JSON and semantic hashing are deterministic            | Covered (`json.test.ts` and `contract-boundaries.test.ts` — object permutations, array order, and a mutation table for every semantic field).                                                                                                               |
+| External source/object keys cannot collide                       | Covered (`contract-boundaries.test.ts` — delimiter and JSON-looking source/object tuples produce distinct keys).                                                                                                                                            |
+| Receipt replay/conflict and stale ordering are durable           | Covered (`persistence.test.ts` — replay from a reopened database, conflict, equal and older sequences, re-entrant ordering, and exact receipt/high-water rows).                                                                                             |
+| Receipt acceptance and durable callback work roll back together  | Covered (`persistence.test.ts` — callback failure and an aborted write at every step leave every table unchanged; a retry then succeeds).                                                                                                                   |
+| Receipt and sequence reads stay in one exact route               | Covered (`persistence-queries.test.ts` — two workspaces on one database, and a same-workspace sibling and a missing value for each of the four sequence dimensions).                                                                                        |
+| Corrupt stored receipts and sequences are refused                | Covered (`persistence-queries.test.ts` — each invalid field and each mismatch with the setting receipt is refused, naming the rule).                                                                                                                        |
+| Forward-only state marks its route in the same transaction       | Covered (`persistence-queries.test.ts` and `libs/core/src/runtime/retry-outbox.test.ts` — nonempty held batches and retry routes mark, empty ones do not, one read of caller input decides, and an aborted marker write rolls the state or admission back). |
+| A database marked by a newer version is refused unchanged        | Covered (`compatibility-refusal.test.ts` — WAL and rollback-journal files keep every byte and their journal mode; every known marker scope still opens).                                                                                                    |
+| Compatibility migration preserves existing data                  | Covered (`schema.test.ts` — upgrade from the earlier marker index keeps every row and distinguishes global, empty, and concrete marker identities).                                                                                                         |
 
 ### 3.5 CLI behavior
 
