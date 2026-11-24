@@ -285,6 +285,21 @@ function monitorIdFromFilePath(filePath: string): string {
     : path.parse(filePath).name;
 }
 
+/**
+ * The source outcome a history row reports: its `result`, except that a
+ * `triggered` row whose events came from retained or held work carries the
+ * source's own `no-files-matched` or `rebaselined` as `sourceOutcome` (002 §15).
+ */
+function latestObservationOutcome(
+  row: ObservationHistoryRecord,
+): ObservationHistoryRecord['result'] {
+  const sourceOutcome = row.observationData['sourceOutcome'];
+  return row.result === 'triggered' &&
+    (sourceOutcome === 'no-files-matched' || sourceOutcome === 'rebaselined')
+    ? sourceOutcome
+    : row.result;
+}
+
 function explainStage(
   id: MonitorExplainStageId,
   status: MonitorExplainStageStatus,
@@ -808,6 +823,27 @@ interface MaterializationSpanOptions {
   sourceOutcome?: 'rebaselined' | 'no-files-matched';
   /** Restricts ephemeral monitor projections to their declaring session. */
   ephemeralSessionId?: string;
+  /**
+   * Retries the same tick's drain completed for this monitor (002 §2.7). The
+   * span's batch row counts them, so the tick records one row, not two.
+   */
+  drained?: DrainedHistory;
+}
+
+/**
+ * Events a tick's retained-work drain committed for one monitor that no
+ * `observation_history` row counts yet (002 §2.7, §15). A tick records one
+ * outcome row per monitor: the batch row of a span admitted later in the same
+ * tick absorbs the count, and otherwise
+ * {@link AgentMonitorRuntime.recordDrainedHistory} writes it as its own
+ * `triggered` row. Either way the count is then zero, so it is never recorded
+ * twice. Ticks only; a watcher's drain is not a tick and records no batch row.
+ */
+interface DrainedHistory {
+  monitorId: string;
+  workspacePath: string;
+  sourceName: string;
+  count: number;
 }
 
 /** Deterministic span result; interpretation may use it only after outer commit. */
@@ -2294,6 +2330,11 @@ export class AgentMonitorRuntime {
       limit: historyLimit,
     });
     const latestObservation = observations[0];
+    // A `triggered` row keeps the source's own outcome when the tick's events
+    // came from retained or held work (002 §15); explain diagnoses the source.
+    const observationOutcome = latestObservation
+      ? latestObservationOutcome(latestObservation)
+      : undefined;
     if (!latestObservation) {
       stages.push(
         explainStage(
@@ -2316,7 +2357,7 @@ export class AgentMonitorRuntime {
           latestObservation.observationData,
         ),
       );
-    } else if (latestObservation.result === 'no-change') {
+    } else if (observationOutcome === 'no-change') {
       // A genuinely quiet tick is healthy, not a fault (issue #94): the watched
       // target simply hasn't changed. Render distinctly from a real failure.
       stages.push(
@@ -2327,7 +2368,7 @@ export class AgentMonitorRuntime {
           latestObservation.observationData,
         ),
       );
-    } else if (latestObservation.result === 'no-files-matched') {
+    } else if (observationOutcome === 'no-files-matched') {
       stages.push(
         explainStage(
           'observation',
@@ -2336,7 +2377,7 @@ export class AgentMonitorRuntime {
           latestObservation.observationData,
         ),
       );
-    } else if (latestObservation.result === 'rebaselined') {
+    } else if (observationOutcome === 'rebaselined') {
       // The source advanced its baseline without computing a delta (e.g. a
       // force-pushed/gc'd ref). No change was emitted, which is healthy — not a
       // fault (issue #94).
@@ -4312,8 +4353,10 @@ export class AgentMonitorRuntime {
     sourceName: string,
     message: string,
     acc: TickAccumulator,
+    drainedHistory?: DrainedHistory,
   ): void {
     acc.erroredObservations.push({ monitorId: id, message });
+    this.recordDrainedHistory(drainedHistory);
     try {
       this.store.recordObservationHistory({
         monitorId: id,
@@ -4449,6 +4492,7 @@ export class AgentMonitorRuntime {
     workspacePath: string,
     acc: TickAccumulator,
     ephemeralSessionId?: string,
+    drainedHistory?: DrainedHistory,
   ): Promise<boolean> {
     this.setWatchPolicy(monitor.id, workspacePath, null, monitor.filePath);
     const sourceName = monitor.frontmatter.watch.type;
@@ -4496,6 +4540,7 @@ export class AgentMonitorRuntime {
                     monitorId: monitor.id,
                     message,
                   }),
+                ...(drainedHistory ? { drained: drainedHistory } : {}),
               },
             );
           } finally {
@@ -4518,6 +4563,7 @@ export class AgentMonitorRuntime {
             sourceName,
             `Deferred observation failed after notify reconciliation committed: ${error instanceof Error ? error.message : String(error)}`,
             acc,
+            drainedHistory,
           );
         }
       }
@@ -4540,6 +4586,7 @@ export class AgentMonitorRuntime {
               sourceName,
               `Interpret failed after notify edit committed: ${error instanceof Error ? error.message : String(error)}`,
               acc,
+              drainedHistory,
             );
           }
         }
@@ -4552,6 +4599,7 @@ export class AgentMonitorRuntime {
         sourceName,
         `Notify edit blocked; accepted holds retained: ${error instanceof Error ? error.message : String(error)}`,
         acc,
+        drainedHistory,
       );
       return false;
     }
@@ -4589,13 +4637,49 @@ export class AgentMonitorRuntime {
     }
   }
 
-  /** Evaluate one leased scope; concurrent rescans may reconcile it while observe is in flight. */
+  /**
+   * Evaluate one leased scope; concurrent rescans may reconcile it while
+   * observe is in flight. Retries the tick drains count in the monitor's one
+   * outcome row for the tick (002 §2.7, §15): a later span's batch row absorbs
+   * them, and any count no row absorbed is recorded when the tick leaves.
+   */
   private async evaluateOwnedMonitorOnTick(
     monitor: MonitorDefinition,
     source: ObservationSource,
     now: Date,
     workspacePath: string,
     acc: TickAccumulator,
+    ephemeralSessionId?: string,
+  ): Promise<void> {
+    const drainedHistory: DrainedHistory = {
+      monitorId: monitor.id,
+      workspacePath,
+      sourceName: monitor.frontmatter.watch.type,
+      count: 0,
+    };
+    try {
+      await this.evaluateMonitorTickOutcome(
+        monitor,
+        source,
+        now,
+        workspacePath,
+        acc,
+        drainedHistory,
+        ephemeralSessionId,
+      );
+    } finally {
+      this.recordDrainedHistory(drainedHistory);
+    }
+  }
+
+  /** The body of {@link evaluateOwnedMonitorOnTick}, which owns `drainedHistory`. */
+  private async evaluateMonitorTickOutcome(
+    monitor: MonitorDefinition,
+    source: ObservationSource,
+    now: Date,
+    workspacePath: string,
+    acc: TickAccumulator,
+    drainedHistory: DrainedHistory,
     ephemeralSessionId?: string,
   ): Promise<void> {
     const key = JSON.stringify([workspacePath, monitor.id]);
@@ -4633,10 +4717,13 @@ export class AgentMonitorRuntime {
         workspacePath,
         now,
         ephemeralSessionId,
+        drainedHistory,
       );
       acc.emittedEventIds.push(...drained.emittedEventIds);
       if (drained.attempted) acc.evaluated.push(monitor.id);
       if (drained.blocked) {
+        // No span follows; completed retries are recorded ahead of the block.
+        this.recordDrainedHistory(drainedHistory);
         this.reportBlockedDrain(monitor, workspacePath, drained.blocked, acc);
         return;
       }
@@ -4647,6 +4734,7 @@ export class AgentMonitorRuntime {
         workspacePath,
         acc,
         ephemeralSessionId,
+        drainedHistory,
       ))
     ) {
       return;
@@ -4674,6 +4762,7 @@ export class AgentMonitorRuntime {
         monitorId: monitor.id,
         message: schedule.error,
       });
+      this.recordDrainedHistory(drainedHistory);
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4714,11 +4803,13 @@ export class AgentMonitorRuntime {
             now,
             workspacePath,
             ephemeralSessionId,
+            drainedHistory,
           ),
           monitor.id,
           workspacePath,
           sourceName,
           acc,
+          drainedHistory,
         );
       }
 
@@ -4780,6 +4871,7 @@ export class AgentMonitorRuntime {
         now,
         workspacePath,
         ephemeralSessionId,
+        drainedHistory,
       );
       this.pollAdmissions.delete(key);
       this.wakeNotifyPolicy(key);
@@ -4789,9 +4881,11 @@ export class AgentMonitorRuntime {
         workspacePath,
         sourceName,
         acc,
+        drainedHistory,
       );
       // The source failure is recorded after any flush, so it stays the
       // newest outcome: progress on held work never reads as a healthy source.
+      this.recordDrainedHistory(drainedHistory);
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4830,6 +4924,7 @@ export class AgentMonitorRuntime {
         sourceName,
         'Notify admission blocked; returned observation retained until reconciliation succeeds.',
         acc,
+        drainedHistory,
       );
       return;
     }
@@ -4858,6 +4953,7 @@ export class AgentMonitorRuntime {
           ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
           onNotHeld: (message) =>
             acc.erroredObservations.push({ monitorId: monitor.id, message }),
+          drained: drainedHistory,
         },
       );
       // Deterministic admission ran synchronously in that call; relinquish the
@@ -4882,6 +4978,7 @@ export class AgentMonitorRuntime {
       }
       const message = errorMessage(ingestError);
       acc.erroredObservations.push({ monitorId: monitor.id, message });
+      this.recordDrainedHistory(drainedHistory);
       try {
         this.store.recordObservationHistory({
           monitorId: monitor.id,
@@ -4915,6 +5012,7 @@ export class AgentMonitorRuntime {
     workspacePath: string,
     now: Date,
     restrictToSessionId?: string,
+    drained?: DrainedHistory,
   ): Promise<RetryDrainResult> {
     const result: RetryDrainResult = { attempted: false, emittedEventIds: [] };
     for (;;) {
@@ -4942,6 +5040,7 @@ export class AgentMonitorRuntime {
           monitorId,
           workspacePath,
           retry,
+          drained,
         );
         if (blocked) return { ...result, blocked };
         continue;
@@ -5005,6 +5104,7 @@ export class AgentMonitorRuntime {
             monitorId,
             workspacePath,
             retry,
+            drained,
           );
           if (blocked) return { ...result, blocked };
           continue;
@@ -5017,6 +5117,9 @@ export class AgentMonitorRuntime {
         } catch (stateError) {
           message += ` Recording the failed attempt also failed: ${errorMessage(stateError)}`;
         }
+        // Retries completed before this one are recorded first, so the
+        // failure stays the newest outcome (002 §2.7).
+        this.recordDrainedHistory(drained);
         this.recordErroredHistory(
           monitorId,
           workspacePath,
@@ -5026,6 +5129,7 @@ export class AgentMonitorRuntime {
         return { ...result, blocked: { kind: 'failed', message } };
       }
       result.emittedEventIds.push(materialized.event.id);
+      if (drained) drained.count += 1;
       // Interpret follows the committed completion, as it does for a span.
       await this.interpretMaterializedObservation(materialized, workspacePath);
     }
@@ -5045,12 +5149,14 @@ export class AgentMonitorRuntime {
     monitorId: string,
     workspacePath: string,
     retry: MaterializationRetryRecord,
+    drained?: DrainedHistory,
   ): RetryDrainBlock | undefined {
     try {
       this.store.discardRetiredVerifyArtifactRetry(retry.id);
       return undefined;
     } catch (discardError) {
       const message = `Materialization retry ${retry.id} could not be discarded after its verify artifact's cleanup took effect: ${errorMessage(discardError)}`;
+      this.recordDrainedHistory(drained);
       this.recordErroredHistory(
         monitorId,
         workspacePath,
@@ -5195,6 +5301,30 @@ export class AgentMonitorRuntime {
     return untilNext > 0 ? untilNext : MATERIALIZATION_RETRY_DELAYS_MS[0];
   }
 
+  /**
+   * Record retries a tick drained that no batch row has counted, as one
+   * best-effort `triggered` row `{ observed: 0, emitted }` (002 §2.7, §15).
+   * Called before the tick writes a later outcome row for the monitor, so an
+   * `errored` row stays the newest, and once when the tick leaves the monitor.
+   * The count is zeroed, so later calls for the same tick write nothing.
+   */
+  private recordDrainedHistory(drained: DrainedHistory | undefined): void {
+    if (!drained || drained.count === 0) return;
+    const emitted = drained.count;
+    drained.count = 0;
+    try {
+      this.store.recordObservationHistory({
+        monitorId: drained.monitorId,
+        workspacePath: drained.workspacePath,
+        sourceName: drained.sourceName,
+        result: 'triggered',
+        observationData: { observed: 0, emitted },
+      });
+    } catch {
+      // Audit is best-effort; the drained events are already committed.
+    }
+  }
+
   /** Best-effort `errored` audit row; a failed write cannot change committed work. */
   private recordErroredHistory(
     monitorId: string,
@@ -5260,6 +5390,8 @@ export class AgentMonitorRuntime {
        * and the span has materialized; an exception it throws is ignored.
        */
       onNotHeld?: (message: string) => void;
+      /** Retries this tick already drained for the monitor (002 §2.7). */
+      drained?: DrainedHistory;
     },
   ): Promise<MaterializationSpanResult> {
     // Pre-filter: a `payload.form: structured` CEL gate that evaluates `false`
@@ -5328,6 +5460,7 @@ export class AgentMonitorRuntime {
           },
           lastObservationAt: now,
         },
+        ...(options.drained ? { drained: options.drained } : {}),
         ...(options.sourceOutcome
           ? { sourceOutcome: options.sourceOutcome }
           : {}),
@@ -5390,6 +5523,7 @@ export class AgentMonitorRuntime {
     now: Date,
     workspacePath: string,
     ephemeralSessionId?: string,
+    drained?: DrainedHistory,
   ): Promise<MaterializationSpanResult> {
     const admitted = runRuntimeTransaction(this.store, () => {
       const current = this.store.getMonitorState(monitor.id, workspacePath);
@@ -5408,6 +5542,7 @@ export class AgentMonitorRuntime {
           lastObservationAt: current.lastObservationAt ?? null,
         },
         ...(ephemeralSessionId !== undefined ? { ephemeralSessionId } : {}),
+        ...(drained ? { drained } : {}),
       };
       return {
         durable: this.admitSpan(monitor, dispatch.emitted, options),
@@ -5446,6 +5581,7 @@ export class AgentMonitorRuntime {
     now: Date,
     workspacePath: string,
     ephemeralSessionId: string | undefined,
+    drained?: DrainedHistory,
   ): Promise<MaterializationSpanResult> {
     const latest = admission.retired
       ? undefined
@@ -5458,6 +5594,7 @@ export class AgentMonitorRuntime {
       now,
       workspacePath,
       ephemeralSessionId,
+      drained,
     );
   }
 
@@ -5473,6 +5610,7 @@ export class AgentMonitorRuntime {
     workspacePath: string,
     sourceName: string,
     acc: TickAccumulator,
+    drainedHistory?: DrainedHistory,
   ): Promise<void> {
     try {
       const flushed = await flush;
@@ -5486,6 +5624,7 @@ export class AgentMonitorRuntime {
     } catch (error) {
       const message = errorMessage(error);
       acc.erroredObservations.push({ monitorId, message });
+      this.recordDrainedHistory(drainedHistory);
       try {
         this.store.recordObservationHistory({
           monitorId,
@@ -5699,7 +5838,9 @@ export class AgentMonitorRuntime {
     options: MaterializationSpanOptions,
   ): Promise<MaterializationSpanResult> {
     const observed = options.observed;
-    const emittedCount = durable.materialized.length;
+    // Retries drained earlier in this tick are this tick's emissions too.
+    const drainedCount = options.drained?.count ?? 0;
+    const emittedCount = durable.materialized.length + drainedCount;
     // Drops this span already recorded in its admission transaction. The batch
     // row carries the count so readers can tell this span did not complete
     // cleanly, even though its row is newer than the drop rows (002 §2).
@@ -5734,11 +5875,19 @@ export class AgentMonitorRuntime {
             emitted: emittedCount,
             ...(notRetainedCount > 0 ? { notRetainedCount } : {}),
             ...(notHeld > 0 ? { notHeld } : {}),
+            // A `triggered` row would otherwise hide what the source reported
+            // on a tick whose emissions came from elsewhere (002 §15).
+            ...(emittedCount > 0 &&
+            observed === 0 &&
+            options.sourceOutcome !== undefined
+              ? { sourceOutcome: options.sourceOutcome }
+              : {}),
           },
         });
       } catch {
         // Audit is best-effort and cannot roll back committed runtime state.
       }
+      if (options.drained) options.drained.count = 0;
     }
     for (const failure of durable.failures.filter(
       ({ auditError }) => auditError,

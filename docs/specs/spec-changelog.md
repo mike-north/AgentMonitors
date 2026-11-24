@@ -22,6 +22,44 @@ opens of one fresh file now all succeed: the switch to write-ahead logging retri
 with retries and busy-handler waits sharing one 5-second deadline, instead of failing before the
 schema transaction. 004 §2.15 lists the required scenarios.
 
+## 2026-11-23 — Session lifetime, held work, claim expiry, doctor exit status and confirmed channel commits (target) — Refs #396, #636, #468, #462, #535
+
+Five target decisions for delivery honesty. Current behaviour is unchanged until each one ships;
+roadmap G22 tracks them.
+
+- **002 §6.3, 007 §4.4 (#396).** A session is alive while its host process is alive. Inactivity is
+  no longer a liveness signal, because an agent may wait for a delivery with no hook activity.
+  Liveness checks are process checks that never reach the model. An explicit end reaps ephemeral
+  monitors. Losing the host without an end suspends them, and a resume re-arms them. Retention, not
+  a timer, retires a session that is never resumed. `suspended` is a session status, and a watch
+  of a suspended session reports `suspended`; a suspended session does not keep the daemon alive.
+  §6.2's inactivity trigger is marked for replacement.
+- **002 §6.4 (#636).** Held notify work is never held forever or discarded silently. A cancel or a
+  retirement records a durable, visible terminal disposition. Suspension keeps the work and
+  releases it on resume.
+- **002 §7.1 (#468).** Claim expiry: a claim that is not acknowledged within a configurable claim
+  TTL goes from claimed back to pending, so it is delivered again; it stays unread. Expiry is
+  measured from the durable claim time. In-flight leases are unaffected. Delivery is at-least-once.
+- **005 doctor (#462).** `channel-session-unmatched` becomes advisory, and `channel-lead-uncovered`
+  does not block while the hook path covers that lead. `doctor`'s exit status agrees with the
+  delivery verdict.
+- **006 §4.5.2, §12.6 (#535).** A channel commits a delivery only when the host confirms the push
+  reached the session. For Claude Code the evidence is the `enqueue` entry the host writes to the
+  session transcript. A model-facing check is ruled out, because it costs a model turn. Without
+  evidence the push is released, the route is marked unproven, and the hook path delivers.
+
+## 2026-11-23 — Drained retries count in the tick's history row (002 §2.7, §15) — Refs #617
+
+A tick whose retry drain completed retained work recorded its events on the tick result but not in
+`observation_history`: the same tick's empty source span then wrote `no-change` `{ observed: 0,
+emitted: 0 }`. A tick now records one outcome row per monitor that counts the drained events. A
+later span's batch row adds them to `emitted` and becomes `triggered`; otherwise the tick records
+`triggered` `{ observed: 0, emitted: <drained count> }`. An `errored` row written in the same tick
+stays the newest. Failed drain attempts record what they did before. A watcher's drain is
+unchanged and records no batch row. When the source returned nothing and reported
+`no-files-matched` or `rebaselined` on such a tick, the `triggered` row carries it as
+`sourceOutcome`, and `monitor explain` reports it as it would the plain outcome.
+
 ## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
 
 002 §9.2 now states the rule and why it holds: decide time requires pending ⊂ unread, and a

@@ -1217,6 +1217,26 @@ Each tick that leaves retained work in place reports it:
 
 Other monitors are unaffected: each monitor drains and pauses on its own outbox.
 
+**History.** The retries a tick's drain completes are that tick's emissions, and the tick records
+them in the monitor's one outcome row in `observation_history` (§15), never in a row of their own
+beside it. (Held work a notify edit releases while it is reconciled, §4.6, keeps its own
+`triggered` row, with `reason: 'notify-policy-edit'`.) When the tick goes on to admit a span (a poll result, or a held-work flush, including
+one beside a failed source call), the span's batch row counts them: `emitted` is the drained
+events plus the span's own, and the row is `triggered`. A tick whose only emissions are drained
+retries, because the source returned nothing, the monitor was not yet due, or it took no newer
+input this tick, records `triggered` `{ observed: 0, emitted: <drained count> }`. It never
+records a `no-change` span row beside separate rows for the drained retries. `triggered` wins
+over the source's own diagnostic, because events were emitted; when the source returned nothing
+and reported `no-files-matched` or `rebaselined`, the row keeps it as `sourceOutcome`, so `monitor
+explain` still diagnoses the source on that tick. When the tick also records an `errored` row for
+the monitor (a failed attempt or discard after completed ones, a terminal retry, a schedule that
+cannot be evaluated, a failed source call, a failed held flush, a blocked notify edit, or an
+ingest that throws), the drained count is recorded first, so the `errored` row stays the newest,
+as it does for a span whose later sibling fails. A failed attempt with nothing completed before it
+records only its `errored` row. `agentmonitors monitor history` therefore shows that a retried event was
+eventually emitted without reading the event log. A continuous watcher's drain is not a tick and
+writes no batch row; its events are on the event log.
+
 **Operator repair.** A terminal row leaves its state only through one of two explicit repairs
 (`AgentMonitorRuntime.rearmMaterializationRetry` / `skipMaterializationRetry`, exposed as
 `agentmonitors monitor retry rearm|skip`, [005 §6](./005-cli-reference.md)). Each names the row by
@@ -1293,7 +1313,23 @@ before a restart drained first in order, exactly once; a same-second session tha
 the retry while an earlier one does; a retained watch batch drained before the next pull; a
 restarted watcher kept closed until a tick drains its batch; held debounce work that stays held
 behind a failing or terminal retry while the source rejects, then flushes after the retry
-completes; and the fallbacks for rows and sessions without positions.
+completes; and the fallbacks for rows and sessions without positions. The same file's
+`history of a tick that drains retained work` cases cover the history rule: a drain-only tick as
+one `triggered` row counting the drained events, drained events added to the span observed after
+them, `no-change` when nothing drained or arrived, a failed attempt's lone `errored` row,
+completed retries recorded before the failure that stops the drain, a drain on a tick where the
+monitor is not due, the drained row ahead of the `errored` row of a source failure, a terminal
+retry, a schedule error and an ingest that throws, and a `no-files-matched` or `rebaselined`
+source outcome kept on the `triggered` row and diagnosed by `explainMonitor`. Its `history of a
+tick that drains retained work, then resumes a retained poll result` case drains a retry a second
+runtime on the same database queued, then admits a poll result held back by a blocked notify edit
+(§4.6), and records one `triggered` row counting both. Its `held work
+waits behind retained work while the source fails` cases count the drained retry in the held
+flush row written beside a source failure, and record it ahead of a failed held flush and a
+blocked notify edit. `verify-artifact-ownership-retry-drain.test.ts` records it ahead of a failed
+discard.
+`libs/core/src/runtime/atomic-ingest-retry.test.ts` (`retry Interpret after restart`) checks the
+same single row after a restart, for each fault in the admission matrix.
 `libs/core/src/inbox/db.released-shapes.test.ts` opens every released `agent_sessions` shape.
 
 ### 2.8 Verify-artifact ownership (_current_)
@@ -2362,6 +2398,11 @@ Verified: `libs/core/src/runtime/store.ts` — `openSession()` (lines 102–152)
 
 > **Status: current** (Refs #312). Added so [007 §4.4](./007-agent-facing-interaction.md)'s
 > ephemeral monitors reap on a session going dormant, not only on an explicit close.
+>
+> **To be replaced by [§6.3](#63-session-liveness-by-host-process-and-suspension-target) (Refs #396).**
+> Inactivity does not show that a session has gone. An agent may legitimately wait, with no hook
+> activity, until a delivery arrives and then act on it; this trigger reaps that agent's watches at
+> the point it most needs them.
 
 §6.1 makes a session dormant on an **explicit** close (the `session close` verb, driven by the host's
 session-end hook). A session can also go away **without** an explicit close — the host crashes, the
@@ -2394,6 +2435,72 @@ Verified: `libs/core/src/runtime/service.ts` — `reapDormantSessions()` (called
 `reaps on per-session dormancy by inactivity` and `does NOT reap a session that is still within the
 dormancy window` cases in `libs/core/src/runtime/ephemeral-monitors.test.ts`.
 
+### 6.3 Session liveness by host process, and suspension (_target_)
+
+> **Status: target** (Refs #396). Replaces the inactivity trigger of [§6.2](#62-per-session-dormancy-current).
+
+A session is **alive while its host process is alive**. Activity, or its absence, is never a
+liveness signal.
+
+- **Liveness evidence.** When a session is opened or resumed, the adapter records the identity of
+  the host process that owns it: a process id plus evidence that rules out process-id reuse, such as
+  the process start time. The daemon decides liveness by checking that this exact process still
+  exists. The check **MUST NOT** send anything into the host's conversation. A liveness probe that
+  costs model input is out of contract, because after the host's prompt-cache window expires every
+  probe would resend the whole conversation.
+- **No inactivity reap.** While the host process is alive, the runtime **MUST NOT** make the session
+  dormant, suspend its ephemeral monitors or reap them, however long the session goes without a
+  hook or claim.
+- **Explicit end.** A session end reported by the host ([§6.1](#61-session-identity)) — for Claude
+  the `SessionEnd` hook, which also fires on `/clear` — reaps the session's ephemeral monitors as
+  today ([007 §4.4](./007-agent-facing-interaction.md)). This stays the primary reap path; it is the
+  only one while the host lives.
+- **Host loss without an end.** When the recorded host process is gone and no end was reported, as
+  after a crash or a killed host, the session becomes **suspended**. Its ephemeral monitors stop
+  observing; they are not reaped. Suspension keeps their durable state: source state, snapshots,
+  per-recipient cursors, delivery rows and held notify work ([§6.4](#64-held-notify-work-when-an-ephemeral-declaration-retires-or-suspends-target)).
+- **Resume.** Opening the session again with the same `(adapter, hostSessionId)`, such as a host
+  resume, records the new host process and re-arms its suspended ephemeral monitors. Each source
+  resumes from its own durable state, so changes made while suspended are observed on the next
+  tick rather than lost.
+- **Final expiry.** A suspended session that is never resumed is retired by the retention policy for
+  ephemeral records (Refs #395), not by a liveness timer. Retirement reaps its ephemeral monitors.
+- **Unknown liveness.** If the adapter cannot identify a host process, the session's ephemeral
+  monitors are kept until an explicit end or retention retires them. The runtime **MUST NOT** fall
+  back to an inactivity timer.
+
+**Where suspension appears.** Suspension is a session status. Sessions gain a third status,
+`suspended`, beside `active` and `dormant`, and `session list` shows it. An ephemeral monitor owned
+by a suspended session reports the watch status `suspended` in `watch list`, `monitor explain` and
+`doctor`, so a reader can tell "paused until resume" from "running" and from "reaped".
+
+Suspension is per session, like §6.2's dormancy, and is distinct from the daemon-wide idle
+self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server). For that rule a
+suspended session is not active: it has no host to deliver to, so it does not keep the daemon
+alive. Its durable state survives the daemon stopping, and a resume re-arms it.
+
+### 6.4 Held notify work when an ephemeral declaration retires or suspends (_target_)
+
+> **Status: target** (Refs #636).
+
+Notify work that the runtime has accepted for an ephemeral monitor, such as a debounce batch or a
+rollup window, **MUST NOT** be held indefinitely or discarded silently when the declaration stops
+being evaluated.
+
+- **Cancellation** (`watch cancel`): the held work is recorded with an explicit terminal
+  disposition, _discarded on cancel_, at the moment of cancellation. The agent asked to stop
+  watching, so the work is not delivered after the cancel. The disposition is durable and appears in
+  `monitor explain` and `doctor`.
+- **Suspension** ([§6.3](#63-session-liveness-by-host-process-and-suspension-target)): the held work
+  is kept with its original acceptance and timing. On resume it is released through the normal
+  notify timing. A deadline that passed while suspended releases on the first tick after resume.
+- **Explicit session end, or retention retiring a suspended session**: the held work is recorded
+  with an explicit terminal disposition, _discarded on retirement_, durable and visible in the same
+  way as a cancellation.
+- After a cancellation, an explicit end or a retirement, no "held" entry may remain for the retired
+  declaration in `doctor` or `monitor explain`. Suspension is not retirement, so its held work stays
+  visible as held.
+
 ## 7. Unread, Claimed, and Acknowledged
 
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):
@@ -2405,6 +2512,29 @@ For each projected event, the runtime tracks session-specific delivery state via
 This distinction matters because a claimed event may still need user or agent attention later.
 
 Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
+
+### 7.1 Claim expiry (_target_)
+
+> **Status: target** (Refs #468; origin #434).
+
+Today a claimed event is never surfaced again: claims select only pending events, so an event the
+agent saw but never handled stays unread and silent until a recap. Claim expiry closes that gap. A
+claim that is not followed by an acknowledgement within the **claim TTL** expires: the event goes
+from claimed back to **pending** (unclaimed), so the next claim includes it again. The event stays
+unread throughout, because unread means "not acknowledged". This adds one edge to the model,
+claimed → pending. Expiry never acknowledges. An acknowledgement keeps its meaning, "handled", and
+delivery becomes at-least-once without relying on the agent to acknowledge.
+
+- The claim TTL is one configurable duration. Its default is an implementation choice, documented
+  with the CLI ([005](./005-cli-reference.md)).
+- The TTL is measured from the event's durable claim time, `firstNotifiedAt` for the first claim
+  and the most recent re-claim time after an expiry, so it behaves the same across daemon
+  restarts. Each expiry starts a new claim cycle; expiry repeats until the event is acknowledged.
+- An expired event follows its own urgency's delivery rules again ([§9](#9-delivery-lifecycles)).
+- In-flight delivery leases (`reserved-in-flight`) are a separate mechanism, already
+  self-resolving, and are unaffected by claim expiry.
+- A long task may therefore see an event delivered twice. That is accepted: a duplicate costs less
+  than a missed event.
 
 ## 8. Hook State
 
@@ -3389,7 +3519,7 @@ This is a documented one-time transition, not a per-tick behavior.
 
 An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
-- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2), and `notHeld` (a positive integer) when a hold refused some of the span's observations (§4.7).
+- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations, and a tick whose retained-work drain completed retries, whose events count in `emitted`; see §2.7 **History**). `observationData` is `{ observed, emitted }`, plus `sourceOutcome` (`no-files-matched` or `rebaselined`) when the source returned no observations and reported that outcome on a tick whose events came from retained or held work, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2), and `notHeld` (a positive integer) when a hold refused some of the span's observations (§4.7).
 - `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`, plus `notHeld: <n>` when a hold refused some of the observations (§4.7). Refused observations count in `observed`, carry their own `errored` drop rows, and are not what makes the span `suppressed`; a span whose only observations were refused writes no batch row. `notHeld` stays separate from `notRetainedCount` (§4.7), but either one marks a span that dropped observations, so its row supersedes no drop (§2).
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.
