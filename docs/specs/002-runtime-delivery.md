@@ -2920,7 +2920,8 @@ monitor through the persisted pipeline state and returns stages for:
 
 1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
-3. Observation: recent `observation_history` rows and latest outcome
+3. Observation: the newest `observation_history` row that describes a source call, or the pause
+   while retained work remains (005 §6, "Which history rows each stage reads")
 4. Notify state: accepted debounce/rollup batches and active throttle suppression in
    `monitor_state.notify_state`, including accepted batches beside definition failures
 5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
@@ -2972,8 +2973,10 @@ of the two were recorded; the error uses the display rule above. `details.unreta
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
 retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
 `failure` until every drop is superseded (§2): a quiet tick, a notify hold, an observe failure or
-events for other keys leave it failing. The observation stage still describes the newest history
-row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
+events for other keys leave it failing. The observation stage reads only rows that describe a
+source call: a drop row, a skipped retry's row and the retained-work drain's reports belong to
+Materialization, and while retained work remains the source is not called, so Observation reports
+that pause instead (005 §6, "Which history rows each stage reads", #591). Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
 real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
 (Refs #497, #575).
 
