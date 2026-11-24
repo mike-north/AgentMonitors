@@ -483,7 +483,12 @@ export function rearmRetryInProcess(
   dbPath: string,
 ): MaterializationRetryRepairResult {
   return normalizeRepairResult(
-    createRuntime(dbPath).rearmMaterializationRetry(input),
+    createRuntime(
+      dbPath,
+      undefined,
+      undefined,
+      input.workspacePath,
+    ).rearmMaterializationRetry(input),
   );
 }
 
@@ -493,7 +498,12 @@ export function skipRetryInProcess(
   dbPath: string,
 ): MaterializationRetryRepairResult {
   return normalizeRepairResult(
-    createRuntime(dbPath).skipMaterializationRetry(input),
+    createRuntime(
+      dbPath,
+      undefined,
+      undefined,
+      input.workspacePath,
+    ).skipMaterializationRetry(input),
   );
 }
 
@@ -512,7 +522,7 @@ export async function daemonTickClient(
   workspacePath?: string,
   dbPath?: string,
 ): Promise<RuntimeTickResult> {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(dbPath, undefined, undefined, workspacePath);
   return await runtime.tick(monitorsDir, workspacePath);
 }
 
@@ -539,7 +549,12 @@ export async function explainMonitorInProcess(
   input: MonitorExplainInput,
   dbPath: string,
 ): Promise<MonitorExplainReport> {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(
+    dbPath,
+    undefined,
+    undefined,
+    input.workspacePath,
+  );
   return await runtime.explainMonitor(input);
 }
 
@@ -560,7 +575,12 @@ export function listObservationHistoryInProcess(
   query: ObservationHistoryQuery,
   dbPath: string,
 ): ObservationHistoryRecord[] {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(
+    dbPath,
+    undefined,
+    undefined,
+    query.workspacePath,
+  );
   return runtime.listObservationHistory(query);
 }
 
@@ -582,7 +602,12 @@ export async function doctorReportInProcess(
   input: DoctorReportInput,
   dbPath: string,
 ): Promise<MonitorDoctorReport> {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(
+    dbPath,
+    undefined,
+    undefined,
+    input.workspacePath,
+  );
   return await runtime.doctorReport(input);
 }
 

@@ -2472,9 +2472,12 @@ A claim not followed by acknowledgment within the claim TTL returns to **pending
 remaining unread. Expiry never acknowledges. Delivery is at-least-once: each expired event follows
 its urgency's next delivery point (§9), and cycles repeat until acknowledged.
 
-- The single configurable duration is `RuntimeStore`'s constructor option `claimTtlMs`, in
-  milliseconds, default **30 minutes**. Like other runtime durations it is configured in-process;
-  the CLI uses the default (005 §12.1).
+- The single store-wide duration defaults to **30 minutes**. The shipped runtime reads
+  `claim-ttl-ms` from the target workspace's existing coordination file; all daemon and offline
+  runtime construction paths share that resolution. It is a positive safe integer in milliseconds,
+  loaded when opening the store; a running daemon must be restarted after edits. Absence uses
+  the default. SDK callers may supply `RuntimeStore`'s `claimTtlMs` constructor option.
+  [005 §12.1](./005-cli-reference.md#121-hook-claim) defines units, validation and precedence.
 - `session_event_state.claim_started_at_ms` stores the start of the current claim cycle with
   millisecond precision. A claim starts a new cycle only if there is no live cycle. A recap within
   the TTL does not renew it. `first_notified_at` remains permanent first-surfaced history for
@@ -2493,7 +2496,8 @@ Verified: `libs/core/src/runtime/store.ts` — `pendingEventsForSession()`,
 `deliveryStateForRow()`, `markClaimed()`; `libs/core/src/inbox/db.ts` additive migration;
 `libs/core/src/runtime/claim-ttl.test.ts` (all urgency boundaries, downtime and restart, repeated
 cycles, acknowledgment, recap, lease independence and cursor ordering);
-`libs/core/src/inbox/db.released-shapes.test.ts` (released claim state and reopen preservation).
+`libs/core/src/inbox/db.released-shapes.test.ts` (released claim state and reopen preservation). Workspace configuration and daemon/offline agreement are verified by
+`apps/cli/src/claim-ttl.integration.test.ts` and `apps/cli/src/local-state.test.ts`.
 
 ## 8. Hook State
 

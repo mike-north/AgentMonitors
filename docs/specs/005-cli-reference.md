@@ -1621,13 +1621,36 @@ agentmonitors hook claim --session <id> --lifecycle <lifecycle> [options]
 
 Claims a pending delivery payload for a session at the specified lifecycle point (`hook.claim` IPC method). Returns `null` if no delivery is pending.
 
-Unacknowledged claims return to pending after **30 minutes**, then follow their urgency's next
-normal delivery point. Expiry never acknowledges. The in-process setting is the `RuntimeStore`
-constructor's `claimTtlMs` option (a positive finite duration in milliseconds), following the
-constructor tuning used for other runtime durations. The daemon and CLI use its default; there is
-no CLI flag. The durable cycle starts at the first claim or the latest claim after expiry, and
-survives restarts and downtime. Recaps within a live cycle do not extend it. In-flight reservation
-leases remain independent. See [002 §7.1](./002-runtime-delivery.md#71-claim-expiry-current).
+Unacknowledged claims return to pending after **30 minutes** by default, then follow their
+urgency's next delivery point. Expiry never acknowledges. Configure the shipped runtime in the
+existing workspace coordination file, `.claude/agentmonitors.local.md`:
+
+```yaml
+---
+enabled: true
+claim-ttl-ms: 60000
+---
+```
+
+`claim-ttl-ms` is a **positive safe integer in milliseconds** (`60000` means one minute).
+Zero, negative, fractional and nonnumeric values are rejected with an error naming the setting;
+they never silently fall back to the default. Precedence is the target workspace's
+`claim-ttl-ms`, when present, then **1,800,000 ms (30 minutes)**. There is no claim-TTL CLI flag or
+environment override. Database/socket overrides select storage/transport; they do not override
+this policy. Explicit workspace arguments and hook workspace context select the coordination file;
+unscoped runtime composition uses `CLAUDE_PROJECT_DIR`, then the current directory.
+
+The policy applies store-wide, across all urgency bands. Daemon run (including lazy/detached
+startup), daemon once, and in-process CLI readers including doctor/explain resolve the same
+workspace file through runtime composition. `enabled` controls automatic startup, not this
+setting's use by explicitly invoked commands. Session coordination rewrites preserve the value.
+Restart a running daemon after editing it: runtimes load policy when opening their store. Omitting
+or deleting the setting restores the default. SDK callers retain the `RuntimeStore` constructor's
+`claimTtlMs` option.
+
+The durable cycle starts at the first claim or the latest claim after expiry and survives restarts
+and downtime. Recaps within a live cycle do not extend it. In-flight reservation leases remain
+independent. See [002 §7.1](./002-runtime-delivery.md#71-claim-expiry-current).
 
 **JSON output (default):**
 

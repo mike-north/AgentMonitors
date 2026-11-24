@@ -157,3 +157,42 @@ describe('local-state', () => {
     }
   });
 });
+
+/** Claim lifetime is workspace coordination policy, preserved across session rewrites. */
+describe('workspace claim TTL', () => {
+  it('round-trips an explicit claim-ttl-ms', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'claim-setting-'));
+    try {
+      mkdirSync(path.join(ws, '.claude'));
+      writeFileSync(
+        path.join(ws, '.claude', 'agentmonitors.local.md'),
+        '---\nenabled: true\nclaim-ttl-ms: 60000\n---\n',
+      );
+      const state = readLocalState(ws);
+      expect(state.claimTtlMs).toBe(60000);
+      writeLocalState(ws, { ...state, socket: '/example.sock' });
+      expect(readLocalState(ws).claimTtlMs).toBe(60000);
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['0', '-1', '1.5', 'Infinity', 'true', 'nope', ''])(
+    'rejects invalid duration %j with a named diagnostic',
+    (value) => {
+      const ws = mkdtempSync(path.join(tmpdir(), 'claim-setting-'));
+      try {
+        mkdirSync(path.join(ws, '.claude'));
+        writeFileSync(
+          path.join(ws, '.claude', 'agentmonitors.local.md'),
+          `---\nenabled: true\nclaim-ttl-ms: ${value}\n---\n`,
+        );
+        expect(() => readLocalState(ws)).toThrow(
+          'claim-ttl-ms must be a positive safe integer in milliseconds',
+        );
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    },
+  );
+});
