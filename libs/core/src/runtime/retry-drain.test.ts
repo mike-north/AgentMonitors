@@ -109,7 +109,15 @@ function cursorSource(
   };
 }
 
-function writeMonitor(monitorsDir: string, id: string, type: string): void {
+/** Extra `watch:` lines for a fixture monitor, each indented under `watch:`. */
+type WatchLines = string;
+
+function writeMonitor(
+  monitorsDir: string,
+  id: string,
+  type: string,
+  watchLines: WatchLines = 'interval: 1s',
+): void {
   mkdirSync(path.join(monitorsDir, id), { recursive: true });
   writeFileSync(
     path.join(monitorsDir, id, 'MONITOR.md'),
@@ -118,7 +126,7 @@ name: ${id}
 watch:
   type: ${type}
   label: ${id}
-  interval: 1s
+  ${watchLines.split('\n').join('\n  ')}
 urgency: normal
 ---
 Handle it.
@@ -127,14 +135,31 @@ Handle it.
   );
 }
 
-/** Real runtime and store over one on-disk database, reopenable for restart. */
-function setup(specs: MonitorSpec[]) {
+interface SetupOptions {
+  /** The source's registered name and every monitor's `watch.type`. */
+  sourceName?: string;
+  /** `watch:` lines besides `type` and `label` (default `interval: 1s`). */
+  watchLines?: WatchLines;
+}
+
+/**
+ * Real runtime and store over one on-disk database, reopenable for restart.
+ * Setting `source.fails` makes every later source call reject; setting
+ * `source.outcome` adds that diagnostic to every later result.
+ */
+function setup(specs: MonitorSpec[], options: SetupOptions = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'agentmon-retry-drain-'));
   tempRoots.push(root);
   const monitorsDir = path.join(root, 'monitors');
-  for (const { id } of specs) writeMonitor(monitorsDir, id, 'drain-source');
+  const sourceName = options.sourceName ?? 'drain-source';
+  for (const { id } of specs)
+    writeMonitor(monitorsDir, id, sourceName, options.watchLines);
   const dbPath = path.join(root, 'runtime.db');
   const calls: { monitor: string; eventsBefore: string[] }[] = [];
+  const source: {
+    fails: boolean;
+    outcome?: 'rebaselined' | 'no-files-matched';
+  } = { fails: false };
 
   const open = () => {
     const db = createDb(dbPath);
@@ -143,13 +168,25 @@ function setup(specs: MonitorSpec[]) {
     clients.push(client);
     const store = new RuntimeStore(db);
     const registry = new SourceRegistry();
-    registry.register(cursorSource(specs, calls, () => eventSummaries(client)));
+    const cursor = cursorSource(specs, calls, () => eventSummaries(client));
+    registry.register({
+      ...cursor,
+      name: sourceName,
+      async observe(config, context) {
+        if (source.fails) {
+          calls.push({ monitor: 'm', eventsBefore: eventSummaries(client) });
+          throw new Error('source unavailable');
+        }
+        const result = await cursor.observe(config, context);
+        return source.outcome ? { ...result, outcome: source.outcome } : result;
+      },
+    });
     const runtime = new AgentMonitorRuntime(store, registry, [
       claudeCodeAdapter,
     ]);
     return { client, store, runtime };
   };
-  return { root, monitorsDir, calls, open };
+  return { root, monitorsDir, calls, source, open };
 }
 
 /** Event summaries in materialization order (the private AUTOINCREMENT key). */
@@ -834,5 +871,501 @@ Handle it.
     expect(f.held()).toEqual(['C']);
     expect(eventSummaries(f.client)).toEqual([]);
     expect(triggeredRows(f)).toHaveLength(triggeredBefore);
+  });
+  /** Rows the next tick writes for `m`, newest first. */
+  async function tickRows(f: ReturnType<typeof heldBesideRetry>) {
+    const rows = () =>
+      f.runtime
+        .listObservationHistory({ monitorId: 'm' })
+        .map(({ result, observationData }) => ({ result, observationData }));
+    const before = rows().length;
+    await f.runtime.tick(f.monitorsDir, f.root);
+    const after = rows();
+    return after.slice(0, after.length - before);
+  }
+
+  it('counts the drained retry in the held flush row written beside a source failure (002 §2.7)', async () => {
+    const f = heldBesideRetry();
+    await retainAWhileCIsHeld(f);
+
+    repair(f.client, 'A');
+    clock.advance(600_000);
+    expect(await tickRows(f)).toEqual([
+      { result: 'errored', observationData: { error: 'source unavailable' } },
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+    expect(eventSummaries(f.client)).toEqual(['A', 'C']);
+  });
+
+  it('records the drained retry before the errored row of a held flush that fails', async () => {
+    const f = heldBesideRetry();
+    await retainAWhileCIsHeld(f);
+
+    repair(f.client, 'A');
+    f.client.exec(`CREATE TRIGGER fail_state BEFORE UPDATE ON monitor_state
+      BEGIN SELECT RAISE(ABORT, 'state write failed'); END;`);
+    clock.advance(600_000);
+    expect(await tickRows(f)).toEqual([
+      { result: 'errored', observationData: { error: 'source unavailable' } },
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringContaining('state write failed'),
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 1 } },
+    ]);
+    expect(eventSummaries(f.client)).toEqual(['A']);
+    expect(f.held()).toEqual(['C']);
+  });
+
+  it('records the drained retry before the errored row of a notify edit that is blocked', async () => {
+    const f = heldBesideRetry();
+    await retainAWhileCIsHeld(f);
+    f.failing.source = false;
+
+    // Dropping the debounce releases C at reconciliation, and C's write fails.
+    repair(f.client, 'A');
+    failSummary(f.client, 'C');
+    writeMonitor(f.monitorsDir, 'm', 'drain-source');
+    clock.advance(600_000);
+    expect(await tickRows(f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringContaining('Notify edit blocked'),
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 1 } },
+    ]);
+    expect(eventSummaries(f.client)).toEqual(['A']);
+    expect(f.held()).toEqual(['C']);
+  });
+});
+
+/**
+ * A tick records one `observation_history` row per monitor, and a retry its
+ * drain completes counts in that row's `emitted` (002 §2.7, §15
+ * `observation_history`): `triggered` means at least one event was emitted.
+ */
+describe('history of a tick that drains retained work', () => {
+  beforeEach(() => {
+    clock = stubClock(T0);
+  });
+  let clock: ReturnType<typeof stubClock>;
+
+  function outcomes(runtime: AgentMonitorRuntime) {
+    return runtime
+      .listObservationHistory({ monitorId: 'm' })
+      .map(({ result, observationData }) => ({ result, observationData }));
+  }
+
+  /** Rows written by `tick`, newest first. */
+  async function tickRows(
+    runtime: AgentMonitorRuntime,
+    f: ReturnType<typeof setup>,
+  ) {
+    const before = outcomes(runtime).length;
+    await runtime.tick(f.monitorsDir, f.root);
+    const after = outcomes(runtime);
+    return after.slice(0, after.length - before);
+  }
+
+  it('records a drain-only tick as one triggered row counting the drained events', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], []] }]);
+    const { client, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+    expect(retrySummaries(client)).toEqual(['A', 'B']);
+
+    repair(client, 'A');
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B']);
+  });
+
+  it('adds drained events to the emitted count of the span observed after them', async () => {
+    const f = setup([{ id: 'm', spans: [['A'], ['B', 'C']] }]);
+    const { client, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+
+    repair(client, 'A');
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'triggered', observationData: { observed: 2, emitted: 3 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B', 'C']);
+  });
+
+  it('still records no-change when nothing drained and nothing new was observed', async () => {
+    const f = setup([{ id: 'm', spans: [['A'], []] }]);
+    const { runtime } = f.open();
+    await runtime.tick(f.monitorsDir, f.root);
+
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'no-change', observationData: { observed: 0, emitted: 0 } },
+    ]);
+  });
+
+  it('records only the errored row for a drain attempt that fails', async () => {
+    const f = setup([{ id: 'm', spans: [['A'], []] }]);
+    const { client, store, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+    const [retry] = store.listMaterializationRetries({ monitorId: 'm' });
+
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringMatching(
+            new RegExp(
+              `^Materialization retry ${String(retry?.id)} failed: .*A write failed`,
+            ),
+          ),
+        },
+      },
+    ]);
+  });
+
+  it('records completed retries before the failure that stops the drain', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], []] }]);
+    const { client, store, runtime } = f.open();
+    failSummary(client, 'A');
+    await runtime.tick(f.monitorsDir, f.root);
+    const retryB = store
+      .listMaterializationRetries({ monitorId: 'm' })
+      .find(({ envelope }) => envelope.observation.summary === 'B');
+
+    repair(client, 'A');
+    failSummary(client, 'B');
+    clock.advance(2_000);
+    // The failure stays the newest outcome, as for a span whose later sibling fails.
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringMatching(
+            new RegExp(
+              `^Materialization retry ${String(retryB?.id)} failed: .*B write failed`,
+            ),
+          ),
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 1 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A']);
+    expect(retrySummaries(client)).toEqual(['B']);
+  });
+  /** Retain A and B: A's write fails, so its whole span is queued. */
+  async function retainAB(f: ReturnType<typeof setup>) {
+    const opened = f.open();
+    failSummary(opened.client, 'A');
+    await opened.runtime.tick(f.monitorsDir, f.root);
+    expect(retrySummaries(opened.client)).toEqual(['A', 'B']);
+    return opened;
+  }
+
+  const sourceUnavailable = {
+    result: 'errored',
+    observationData: { error: 'source unavailable' },
+  };
+
+  it('records drained retries before the errored row of a source that then fails', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], ['C']] }]);
+    const { client, runtime } = await retainAB(f);
+
+    repair(client, 'A');
+    f.source.fails = true;
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      sourceUnavailable,
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B']);
+  });
+
+  it('records a drain on a tick where the monitor is not yet due', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], ['C']] }], {
+      watchLines: 'interval: 1h',
+    });
+    const { client, runtime } = await retainAB(f);
+
+    repair(client, 'A');
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B']);
+    // The source was not asked for C: the monitor was not due.
+    expect(f.calls).toHaveLength(1);
+  });
+
+  it('records drained retries before the errored row of a terminal retry behind them', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], ['C']] }]);
+    const { client, runtime } = await retainAB(f);
+
+    repair(client, 'A');
+    client.exec(`UPDATE materialization_retry_outbox SET status = 'terminal'
+      WHERE json_extract(envelope, '$.observation.summary') = 'B'`);
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringMatching(
+            /^Materialization retry \S+ stopped after/,
+          ),
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 1 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A']);
+  });
+
+  it('records drained retries before the errored row of a schedule that cannot be evaluated', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], ['C']] }], {
+      sourceName: 'schedule',
+      watchLines: "cron: '* * * * *'\ntimezone: UTC",
+    });
+    const { client, runtime } = await retainAB(f);
+
+    repair(client, 'A');
+    writeMonitor(
+      f.monitorsDir,
+      'm',
+      'schedule',
+      "cron: '* * * * *'\ntimezone: Not/AZone",
+    );
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: { error: expect.stringContaining('Not/AZone') },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+  });
+
+  it('records drained retries before the errored row of an ingest that throws', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], ['C']] }]);
+    const { client, runtime } = await retainAB(f);
+
+    repair(client, 'A');
+    client.exec(`CREATE TRIGGER fail_state BEFORE UPDATE ON monitor_state
+      BEGIN SELECT RAISE(ABORT, 'state write failed'); END;`);
+    clock.advance(2_000);
+    expect(await tickRows(runtime, f)).toEqual([
+      {
+        result: 'errored',
+        observationData: {
+          error: expect.stringContaining('state write failed'),
+        },
+      },
+      { result: 'triggered', observationData: { observed: 0, emitted: 2 } },
+    ]);
+    expect(eventSummaries(client)).toEqual(['A', 'B']);
+  });
+
+  it.each(['no-files-matched', 'rebaselined'] as const)(
+    'keeps a %s source outcome on the triggered row of a tick that drained retries',
+    async (outcome) => {
+      const f = setup([{ id: 'm', spans: [['A', 'B'], []] }]);
+      const { client, runtime } = await retainAB(f);
+
+      repair(client, 'A');
+      f.source.outcome = outcome;
+      clock.advance(2_000);
+      expect(await tickRows(runtime, f)).toEqual([
+        {
+          result: 'triggered',
+          observationData: { observed: 0, emitted: 2, sourceOutcome: outcome },
+        },
+      ]);
+    },
+  );
+
+  it('explains a drained tick whose source matched no files as an observation failure', async () => {
+    const f = setup([{ id: 'm', spans: [['A', 'B'], []] }]);
+    const { client, runtime } = await retainAB(f);
+
+    repair(client, 'A');
+    f.source.outcome = 'no-files-matched';
+    clock.advance(2_000);
+    await runtime.tick(f.monitorsDir, f.root);
+    const report = await runtime.explainMonitor({
+      monitorsDir: f.monitorsDir,
+      monitorId: 'm',
+      workspacePath: f.root,
+    });
+    expect(report.stages).toContainEqual(
+      expect.objectContaining({
+        id: 'observation',
+        status: 'failure',
+        reason: expect.stringContaining('matched zero files'),
+      }),
+    );
+  });
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+/**
+ * A poll result retained behind a blocked notify edit (002 §4.6) is admitted
+ * on a later tick, after that tick's drain. Its span row counts the drained
+ * retry too, so the tick writes one row, not two (002 §2.7 **History**). The
+ * retry is queued by a second runtime on the same database, as a `daemon once`
+ * beside a running daemon would.
+ */
+describe('history of a tick that drains retained work, then resumes a retained poll result', () => {
+  it('counts the drained retry in the resumed result row', async () => {
+    const clock = stubClock(T0);
+    const root = mkdtempSync(
+      path.join(tmpdir(), 'agentmon-retry-drain-resume-'),
+    );
+    tempRoots.push(root);
+    const dir = path.join(root, 'monitors');
+    mkdirSync(dir);
+    const file = path.join(dir, 'held.md');
+    const dbPath = path.join(root, 'state.sqlite');
+    const open = () => {
+      const db = createDb(dbPath);
+      const client = (db as unknown as { $client: BetterSQLiteClient }).$client;
+      clients.push(client);
+      return { client, store: new RuntimeStore(db) };
+    };
+    const { client, store } = open();
+    const started = deferred<undefined>();
+    const pending = deferred<ObservationResult>();
+    let calls = 0;
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'handoff-source',
+      stateful: true,
+      scopeSchema: { type: 'object' },
+      observe() {
+        calls += 1;
+        if (calls === 1)
+          return Promise.resolve({
+            observations: [
+              {
+                title: 'A',
+                summary: 'A',
+                snapshotText: 'A',
+                objectKey: 'objA',
+              },
+            ],
+            nextState: { cursor: 1 },
+          });
+        if (calls === 2) {
+          started.resolve(undefined);
+          return pending.promise;
+        }
+        return Promise.resolve({ observations: [], nextState: { cursor: 99 } });
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry, [
+      claudeCodeAdapter,
+    ]);
+    openSession(runtime, root, 'owner');
+    const state = () => store.getMonitorState('held', root);
+    const edit = (notify: string) => {
+      writeFileSync(
+        file,
+        md`---
+watch:
+  type: handoff-source
+  interval: 1h
+baseline-strategy: incremental
+${notify}---
+Handle it.
+`,
+      );
+    };
+    const rows = () =>
+      runtime
+        .listObservationHistory({ monitorId: 'held' })
+        .map(({ result, observationData }) => ({ result, observationData }));
+
+    try {
+      // A is held; a second poll then waits in the source.
+      edit('notify:\n  strategy: debounce\n  settle-for: 1h\n');
+      await runtime.tick(dir, root);
+      store.setMonitorState('held', root, {
+        ...state(),
+        lastObservationAt: new Date('2000-01-01T00:00:00Z'),
+      });
+      const slow = runtime.tick(dir, root);
+      await started.promise;
+
+      // Dropping the debounce releases A, and that write fails: the edit is
+      // blocked, so the poll's result B is retained in process.
+      edit('');
+      client.exec(`CREATE TRIGGER fault BEFORE INSERT ON monitor_events
+        BEGIN SELECT RAISE(FAIL, 'owned edit fault'); END`);
+      await runtime.tick(dir, root);
+      pending.resolve({
+        observations: [
+          { title: 'B', summary: 'B', snapshotText: 'B', objectKey: 'objB' },
+        ],
+        nextState: { cursor: 2 },
+      });
+      await slow;
+      expect(state().sourceState).toEqual({ cursor: 1 });
+      client.exec('DROP TRIGGER fault');
+
+      // A second runtime reconciles the edit (A is emitted) and admits C,
+      // whose write fails, so C is retained in the outbox. Its source keeps
+      // the baseline, so B still applies to it.
+      const other = open();
+      const otherRegistry = new SourceRegistry();
+      otherRegistry.register({
+        name: 'handoff-source',
+        stateful: true,
+        scopeSchema: { type: 'object' },
+        observe: () =>
+          Promise.resolve({
+            observations: [
+              {
+                title: 'C',
+                summary: 'C',
+                snapshotText: 'C',
+                objectKey: 'objC',
+              },
+            ],
+            nextState: { cursor: 1 },
+          }),
+      });
+      failSummary(other.client, 'C');
+      await new AgentMonitorRuntime(other.store, otherRegistry, [
+        claudeCodeAdapter,
+      ]).tick(dir, root);
+      expect(retrySummaries(client)).toEqual(['C']);
+      repair(other.client, 'C');
+      other.client.close();
+
+      // The recovery tick drains C, then resumes B: one row counts both.
+      clock.advance(600_000);
+      const before = rows().length;
+      await runtime.tick(dir, root);
+      const after = rows();
+      expect(after.slice(0, after.length - before)).toEqual([
+        { result: 'triggered', observationData: { observed: 1, emitted: 2 } },
+      ]);
+      expect(eventSummaries(client)).toEqual(['A', 'C', 'B']);
+    } finally {
+      pending.resolve({ observations: [] });
+    }
   });
 });
