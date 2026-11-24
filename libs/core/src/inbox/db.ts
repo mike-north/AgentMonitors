@@ -572,6 +572,21 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
       )
   `);
 
+  // Bootstrap once from the original claim, never the last recap. Subsequent
+  // opens must preserve a later re-claim's cycle start. The surrounding schema
+  // transaction makes column creation and backfill atomic across openers.
+  if (!tableHasColumn(sqlite, 'session_event_state', 'claim_started_at_ms')) {
+    addColumnIfMissing(
+      sqlite,
+      'session_event_state',
+      'claim_started_at_ms',
+      'INTEGER',
+    );
+    sqlite.exec(`UPDATE session_event_state
+      SET claim_started_at_ms = first_notified_at * 1000
+      WHERE first_notified_at IS NOT NULL`);
+  }
+
   // Additive migration (G10, 002 §1.1.2): a `session_event_state` table created
   // before G10 lacks the per-recipient `diff_text` column. Add it if missing so
   // pre-existing durable DBs stay forward-compatible; legacy rows keep a NULL

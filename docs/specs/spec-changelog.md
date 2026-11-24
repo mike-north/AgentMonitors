@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-24 — Claim expiry is current (002 §7.1, 005 §12.1) — Refs #468
+
+Unacknowledged claims return to pending at a configurable TTL (default 30 minutes), without
+acknowledgment. Durable millisecond claim-cycle starts survive restarts, while permanent
+first-surfaced history and monotonic cursors remain intact. Recaps do not renew a live cycle.
+In-flight leases remain separate. Released databases gain an additive, one-time backfill.
+Boundary, urgency, restart/downtime, acknowledgment, repeated-cycle, lease and cursor tests verify
+002 §7.1; 005 documents the in-process `RuntimeStore` setting and CLI default.
+
 ## 2026-11-23 — Per-recipient cursors never move backward (002 §1.1.2, §7, §15) — Refs #298
 
 A claim advanced the recipient's object cursor to the newest event in that claim, even when an

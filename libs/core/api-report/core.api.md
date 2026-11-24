@@ -1537,7 +1537,9 @@ export interface RuntimeStatus {
 
 // @public (undocumented)
 export class RuntimeStore {
-    constructor(db: InboxDb);
+    constructor(db: InboxDb, options?: {
+        claimTtlMs?: number;
+    });
     // (undocumented)
     acknowledgeEvents(sessionId: string, eventIds: string[]): void;
     activeObjectSuppressions(workspacePath: string | undefined, now: Date): {

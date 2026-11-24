@@ -1032,3 +1032,71 @@ describe('opening session_object_cursor written by a released version (002 §1.1
     expect(cursor?.baselineContent).toBe('a2');
   });
 });
+
+it('upgrades released claim state with its original durable claim time, preserving history on reopen', () => {
+  const dbPath = tempDbPath();
+  const legacy = rawClient(dbPath);
+  // Released 0.13.0 delivery tracking, before claim-cycle timestamps existed.
+  legacy.exec(sql`
+    CREATE TABLE session_event_state (
+      id TEXT PRIMARY KEY, session_id TEXT NOT NULL, event_id TEXT NOT NULL,
+      first_notified_at INTEGER, acknowledged_at INTEGER, last_claim_at INTEGER,
+      last_claim_lifecycle TEXT, diff_text TEXT, interpret_decision TEXT,
+      interpret_reason TEXT, interpret_digest TEXT, net_suppressed_at INTEGER,
+      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+    );
+    INSERT INTO session_event_state VALUES
+      ('claimed', 'session', 'event', 100, NULL, 120, 'post-compact', '- 1: a', NULL, NULL, NULL, NULL, 90, 120),
+      ('pending', 'session', 'other', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 90, 90),
+      ('acked', 'session', 'done', 100, 110, 100, 'turn-idle', NULL, NULL, NULL, NULL, NULL, 90, 110);
+  `);
+  legacy.close();
+  const upgraded = openWithCurrentCode(dbPath);
+  expect(
+    upgraded
+      .prepare(
+        'SELECT id, first_notified_at, claim_started_at_ms, acknowledged_at FROM session_event_state ORDER BY id',
+      )
+      .all(),
+  ).toEqual([
+    {
+      id: 'acked',
+      first_notified_at: 100,
+      claim_started_at_ms: 100000,
+      acknowledged_at: 110,
+    },
+    {
+      id: 'claimed',
+      first_notified_at: 100,
+      claim_started_at_ms: 100000,
+      acknowledged_at: null,
+    },
+    {
+      id: 'pending',
+      first_notified_at: null,
+      claim_started_at_ms: null,
+      acknowledged_at: null,
+    },
+  ]);
+  expect(
+    upgraded
+      .prepare(
+        "SELECT diff_text, last_claim_at FROM session_event_state WHERE id = 'claimed'",
+      )
+      .get(),
+  ).toEqual({ diff_text: '- 1: a', last_claim_at: 120 });
+  upgraded
+    .prepare(
+      "UPDATE session_event_state SET claim_started_at_ms = 500000 WHERE id = 'claimed'",
+    )
+    .run();
+  upgraded.close();
+  const reopened = openWithCurrentCode(dbPath);
+  expect(
+    reopened
+      .prepare(
+        "SELECT claim_started_at_ms FROM session_event_state WHERE id = 'claimed'",
+      )
+      .get(),
+  ).toEqual({ claim_started_at_ms: 500000 });
+});

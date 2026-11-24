@@ -186,6 +186,9 @@ export const sessionEventState = sqliteTable('session_event_state', {
   sessionId: text('session_id').notNull(),
   eventId: text('event_id').notNull(),
   firstNotifiedAt: integer('first_notified_at', { mode: 'timestamp' }),
+  // Start of the current durable claim cycle, independent of first-surfaced
+  // history and recap metadata. Milliseconds preserve exact TTL boundaries.
+  claimStartedAt: integer('claim_started_at_ms', { mode: 'timestamp_ms' }),
   acknowledgedAt: integer('acknowledged_at', { mode: 'timestamp' }),
   lastClaimAt: integer('last_claim_at', { mode: 'timestamp' }),
   lastClaimLifecycle: text('last_claim_lifecycle'),

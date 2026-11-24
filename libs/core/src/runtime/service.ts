@@ -3239,7 +3239,7 @@ export class AgentMonitorRuntime {
   }
 
   /**
-   * Pending (not-yet-claimed) events for a session's claim decision, MINUS any
+   * Pending events (never claimed or expired) for a session's decision, MINUS any
    * currently leased by an outstanding reservation (006 §4, issue #300). Leased
    * rows are hidden from the claim decision so a concurrent hook claim does not
    * surface an event the channel is mid-surfacing (cross-transport dedup, 006

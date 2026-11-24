@@ -1621,6 +1621,14 @@ agentmonitors hook claim --session <id> --lifecycle <lifecycle> [options]
 
 Claims a pending delivery payload for a session at the specified lifecycle point (`hook.claim` IPC method). Returns `null` if no delivery is pending.
 
+Unacknowledged claims return to pending after **30 minutes**, then follow their urgency's next
+normal delivery point. Expiry never acknowledges. The in-process setting is the `RuntimeStore`
+constructor's `claimTtlMs` option (a positive finite duration in milliseconds), following the
+constructor tuning used for other runtime durations. The daemon and CLI use its default; there is
+no CLI flag. The durable cycle starts at the first claim or the latest claim after expiry, and
+survives restarts and downtime. Recaps within a live cycle do not extend it. In-flight reservation
+leases remain independent. See [002 §7.1](./002-runtime-delivery.md#71-claim-expiry-current).
+
 **JSON output (default):**
 
 ```json

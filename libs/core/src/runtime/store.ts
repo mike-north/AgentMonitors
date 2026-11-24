@@ -315,12 +315,23 @@ export class MaterializationRetryCapacityError extends Error {
   }
 }
 
-function deliveryStateForRow(row: {
-  firstNotifiedAt: Date | null;
-  acknowledgedAt: Date | null;
-}): MonitorDeliveryState {
-  if (row.acknowledgedAt) return 'acknowledged';
-  if (row.firstNotifiedAt) return 'claimed';
+/** Report effective delivery state without consuming or renewing a claim cycle. */
+function deliveryStateForRow(
+  row: {
+    claimStartedAt: Date | null;
+    acknowledgedAt: Date | null;
+  },
+  claimTtlMs: number,
+): MonitorDeliveryState {
+  if (row.acknowledgedAt) {
+    return 'acknowledged';
+  }
+  if (
+    row.claimStartedAt &&
+    Date.now() - row.claimStartedAt.getTime() < claimTtlMs
+  ) {
+    return 'claimed';
+  }
   return 'unread';
 }
 
@@ -479,10 +490,26 @@ function scopeMatches(
 
 export class RuntimeStore {
   /**
+   * Claim lifetime is evaluated against durable cycle starts on every read.
+   * Expiry changes eligibility, never acknowledgment or first-surfaced history.
+   */
+  private readonly claimTtlMs: number;
+
+  /**
    * Share this connection's writer boundary with internal runtime edit drains
    * and register the runtime-owned admission span runner.
    */
-  constructor(private readonly db: InboxDb) {
+  constructor(
+    private readonly db: InboxDb,
+    options: {
+      /** Lifetime of an unacknowledged claim cycle; defaults to 30 minutes. */
+      claimTtlMs?: number;
+    } = {},
+  ) {
+    this.claimTtlMs = options.claimTtlMs ?? 30 * 60_000;
+    if (!Number.isFinite(this.claimTtlMs) || this.claimTtlMs <= 0) {
+      throw new Error('claimTtlMs must be a positive finite duration');
+    }
     registerStoreWriter(this, db);
     // Runtime-owned spans compose store operations without adding executable
     // callbacks to the published store API. Cache visibility follows the outer
@@ -2022,8 +2049,8 @@ export class RuntimeStore {
             // it can report per-session delivery state (issue #338). `--unread`
             // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
             // claimed-but-unacknowledged events; this field lets a caller tell
-            // those apart from a genuinely never-surfaced event.
-            deliveryState: deliveryStateForRow(row.state),
+            // those apart from pending work, including expired claim cycles.
+            deliveryState: deliveryStateForRow(row.state, this.claimTtlMs),
           }))
       : asInternalDb(this.db)
           .select()
@@ -2764,7 +2791,7 @@ export class RuntimeStore {
       sessionId: session.id,
       sessionRole: session.role,
       sessionStatus: session.status,
-      deliveryState: deliveryStateForRow(state),
+      deliveryState: deliveryStateForRow(state, this.claimTtlMs),
       workspacePath: session.workspacePath ?? null,
       createdAt: state.createdAt,
       ...(state.firstNotifiedAt
@@ -2858,7 +2885,13 @@ export class RuntimeStore {
         and(
           ...conditions,
           isNull(sessionEventState.acknowledgedAt),
-          isNull(sessionEventState.firstNotifiedAt),
+          or(
+            isNull(sessionEventState.claimStartedAt),
+            lte(
+              sessionEventState.claimStartedAt,
+              new Date(Date.now() - this.claimTtlMs),
+            ),
+          ),
           notInterpretSuppressed(),
           notNetSuppressed(),
         ),
@@ -3408,7 +3441,7 @@ export class RuntimeStore {
           ? { diffText: projectionDiff }
           : {}),
         ...(row.state && supplied?.deliveryState !== undefined
-          ? { deliveryState: deliveryStateForRow(row.state) }
+          ? { deliveryState: deliveryStateForRow(row.state, this.claimTtlMs) }
           : {}),
       };
     });
@@ -3545,7 +3578,7 @@ export class RuntimeStore {
    * A projection an earlier claim already surfaced (`first_notified_at` set) —
    * for example one a later `post-compact` recap folds into a newer endpoint —
    * was shown to the session, so it keeps no suppression marker and stays
-   * claimed and unread until acknowledged. This must run before
+   * unread until acknowledged, with expired cycles eligible again. This must run before
    * {@link markClaimed} stamps the current claim, which is what makes
    * `first_notified_at` here mean "claimed before this claim began".
    */
@@ -3594,10 +3627,14 @@ export class RuntimeStore {
     asInternalDb(this.db)
       .update(sessionEventState)
       .set({
-        // The first claim time is kept once set; a repeat claim (a recap, or a
-        // capped preview re-surfacing the row) updates only the last-claim
-        // metadata (002 §7).
+        // First-surfaced history never changes, including across expired
+        // cycles. Latest-claim metadata remains separate from cycle lifetime.
         firstNotifiedAt: sql`COALESCE(${sessionEventState.firstNotifiedAt}, ${Math.floor(now.getTime() / 1000)})`,
+        // Recaps within a live cycle do not extend its lifetime. An expired
+        // cycle starts anew only when a delivery actually commits a claim.
+        claimStartedAt: sql`CASE WHEN ${sessionEventState.claimStartedAt} IS NULL
+          OR ${sessionEventState.claimStartedAt} <= ${now.getTime() - this.claimTtlMs}
+          THEN ${now.getTime()} ELSE ${sessionEventState.claimStartedAt} END`,
         lastClaimAt: now,
         lastClaimLifecycle: lifecycle,
         updatedAt: now,
