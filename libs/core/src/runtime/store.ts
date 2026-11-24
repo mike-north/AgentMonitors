@@ -12,6 +12,7 @@ import {
   inArray,
   isNotNull,
   isNull,
+  lt,
   lte,
   ne,
   notExists,
@@ -2173,6 +2174,7 @@ export class RuntimeStore {
       input.workspacePath,
     );
     if (existing) return;
+    const position = this.eventOrderPosition(input.baselineSnapshotId);
     asInternalDb(this.db)
       .insert(sessionObjectCursor)
       .values({
@@ -2183,9 +2185,31 @@ export class RuntimeStore {
         workspacePath: input.workspacePath,
         baselineSnapshotId: input.baselineSnapshotId,
         baselineContent: input.baselineContent,
+        baselineEventCreatedAt: position?.createdAt ?? null,
+        baselineEventSequence: position?.sequence ?? null,
         updatedAt: new Date(),
       })
       .run();
+  }
+
+  /**
+   * The stable event-order position (002 §1.1.7: persisted `created_at`, then
+   * the private `monitor_events.sequence`) of the event with public id
+   * `eventId`, or `null` when `eventId` is null or names no retained event.
+   */
+  private eventOrderPosition(
+    eventId: string | null,
+  ): { createdAt: Date; sequence: number } | null {
+    if (eventId === null) return null;
+    const row = asInternalDb(this.db)
+      .select({
+        createdAt: monitorEvents.createdAt,
+        sequence: monitorEvents.sequence,
+      })
+      .from(monitorEvents)
+      .where(eq(monitorEvents.id, eventId))
+      .get();
+    return row ?? null;
   }
 
   /**
@@ -2193,6 +2217,18 @@ export class RuntimeStore {
    * — the recipient was just shown this state, so its NEXT diff should span FROM
    * here. Called from {@link markClaimed}. Upserts so an advance can also create
    * the cursor if a legacy claim path never seeded one.
+   *
+   * Monotonic (002 §1.1.2): when `baselineSnapshotId` names a materialized
+   * event, the cursor moves only if that event is later in the stable event
+   * order (`created_at`, then `sequence`) than the event the cursor already
+   * stands at. Claiming an older event — a normal event surfaced after a newer
+   * high one, or a recap of older unread rows — leaves the cursor in place. A
+   * cursor with no recorded position (seeded before the recipient's first event,
+   * or written before positions were recorded and its event is gone) always
+   * advances. The stored position is first re-read from the cursor's baseline
+   * event when that event is retained, so a cursor moved by a writer that did
+   * not record positions is compared at the event it actually holds. A `baselineSnapshotId` that names no event carries no position:
+   * the cursor is set to it unconditionally and its position cleared.
    */
   advanceSessionObjectCursor(input: {
     sessionId: string;
@@ -2203,6 +2239,7 @@ export class RuntimeStore {
     baselineContent: string;
   }): void {
     const db = asInternalDb(this.db);
+    const position = this.eventOrderPosition(input.baselineSnapshotId);
     const existing = this.getSessionObjectCursor(
       input.sessionId,
       input.monitorId,
@@ -2211,22 +2248,74 @@ export class RuntimeStore {
     );
     const now = new Date();
     if (existing) {
+      const key = and(
+        eq(sessionObjectCursor.sessionId, input.sessionId),
+        eq(sessionObjectCursor.monitorId, input.monitorId),
+        eq(sessionObjectCursor.objectKey, input.objectKey),
+        input.workspacePath == null
+          ? isNull(sessionObjectCursor.workspacePath)
+          : eq(sessionObjectCursor.workspacePath, input.workspacePath),
+      );
+      // The stored position is a copy of the baseline event's position. A writer
+      // that predates the position columns can move the cursor without updating
+      // them, leaving a position older than the baseline it now holds. Re-read
+      // the position from the baseline event whenever that event is retained,
+      // so the comparison below is against the event the cursor actually stands
+      // at. Guarded on `baseline_snapshot_id` so a concurrent advance is not
+      // overwritten.
+      if (existing.baselineSnapshotId !== null) {
+        const current = this.eventOrderPosition(existing.baselineSnapshotId);
+        if (current !== null) {
+          db.update(sessionObjectCursor)
+            .set({
+              baselineEventCreatedAt: current.createdAt,
+              baselineEventSequence: current.sequence,
+            })
+            .where(
+              and(
+                key,
+                eq(
+                  sessionObjectCursor.baselineSnapshotId,
+                  existing.baselineSnapshotId,
+                ),
+              ),
+            )
+            .run();
+        }
+      }
+      // The order check is part of the UPDATE's own predicate, so a concurrent
+      // writer that already moved the cursor further cannot be overwritten by a
+      // stale read here.
+      const onlyIfLater =
+        position === null
+          ? undefined
+          : or(
+              isNull(sessionObjectCursor.baselineEventSequence),
+              isNull(sessionObjectCursor.baselineEventCreatedAt),
+              lt(
+                sessionObjectCursor.baselineEventCreatedAt,
+                position.createdAt,
+              ),
+              and(
+                eq(
+                  sessionObjectCursor.baselineEventCreatedAt,
+                  position.createdAt,
+                ),
+                lt(
+                  sessionObjectCursor.baselineEventSequence,
+                  position.sequence,
+                ),
+              ),
+            );
       db.update(sessionObjectCursor)
         .set({
           baselineSnapshotId: input.baselineSnapshotId,
           baselineContent: input.baselineContent,
+          baselineEventCreatedAt: position?.createdAt ?? null,
+          baselineEventSequence: position?.sequence ?? null,
           updatedAt: now,
         })
-        .where(
-          and(
-            eq(sessionObjectCursor.sessionId, input.sessionId),
-            eq(sessionObjectCursor.monitorId, input.monitorId),
-            eq(sessionObjectCursor.objectKey, input.objectKey),
-            input.workspacePath == null
-              ? isNull(sessionObjectCursor.workspacePath)
-              : eq(sessionObjectCursor.workspacePath, input.workspacePath),
-          ),
-        )
+        .where(onlyIfLater === undefined ? key : and(key, onlyIfLater))
         .run();
       return;
     }
@@ -2239,6 +2328,8 @@ export class RuntimeStore {
         workspacePath: input.workspacePath,
         baselineSnapshotId: input.baselineSnapshotId,
         baselineContent: input.baselineContent,
+        baselineEventCreatedAt: position?.createdAt ?? null,
+        baselineEventSequence: position?.sequence ?? null,
         updatedAt: now,
       })
       .run();
@@ -3503,7 +3594,10 @@ export class RuntimeStore {
     asInternalDb(this.db)
       .update(sessionEventState)
       .set({
-        firstNotifiedAt: now,
+        // The first claim time is kept once set; a repeat claim (a recap, or a
+        // capped preview re-surfacing the row) updates only the last-claim
+        // metadata (002 §7).
+        firstNotifiedAt: sql`COALESCE(${sessionEventState.firstNotifiedAt}, ${Math.floor(now.getTime() / 1000)})`,
         lastClaimAt: now,
         lastClaimLifecycle: lifecycle,
         updatedAt: now,
@@ -3517,8 +3611,9 @@ export class RuntimeStore {
       .run();
 
     // Advance this recipient's per-object baseline cursor (G10, 002 §1.1.2): the
-    // cursor means "the last artifact this recipient was actually shown", so a
-    // claim moves it to the artifact of the NEWEST claimed event for each object.
+    // cursor means "the latest artifact this recipient was shown", so a claim
+    // moves it to the artifact of the NEWEST claimed event for each object —
+    // never backward past an event an earlier claim already surfaced.
     // Only snapshot-bearing events carry an artifact to advance to.
     this.advanceCursorsForClaimedEvents(sessionId, eventIds);
   }

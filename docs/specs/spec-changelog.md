@@ -38,6 +38,61 @@ hook path skipped them as cross-transport duplicates and the events never reache
 - **006 §12.6** no longer describes the registration gap as an unverifiable advisory with a future
   probe; it points at §4.5.2.
 
+## 2026-11-23 — Per-recipient cursors never move backward (002 §1.1.2, §7, §15) — Refs #298
+
+A claim advanced the recipient's object cursor to the newest event in that claim, even when an
+earlier claim had already surfaced a newer event (a `high` event claimed at `turn-interruptible`
+before an older `normal` one at idle, or a recap of older unread rows). The cursor then moved
+backward and the next delta replayed changes the recipient had already seen. 002 §1.1.2 now states
+that a cursor moves only to an event later in the stable event order (`created_at`, then
+`monitor_events.sequence`). The cursor stores that position in two additive columns (§15), filled on
+upgrade from its baseline event and re-read from that event before each comparison while it is
+retained. 002 §7 now states that `firstNotifiedAt` keeps the first claim time;
+a repeat claim updates only the last-claim fields.
+
+## 2026-11-23 — `monitor explain` attributes each history row to its own stage (002 §10.7; 005 §6) — Refs #591
+
+The Observation stage used to read the newest `observation_history` row whatever it recorded. A
+skipped terminal retry, an observation a hold refused, a failed retry attempt and a terminal pause
+all write `errored` rows, so right after one of them explain reported `Source observation failed`
+and put the verdict at Observation, though the source was fine. 005 §6 now lists which rows each
+stage reads. Explain classifies every row once, by kind (source outcome, released work, admission
+loss, skipped-retry loss, retry drain, unrecognized); Observation reads only source outcomes and
+released work, and reports the retained-work pause while the outbox holds work. Losses and drain
+reports stay with Materialization, whose retained-work reasons now end in the oldest retry's last
+error. A genuine source failure fails Observation as before. What history records is unchanged.
+While retained work remains, a source failure recorded by the tick that retained it still fails
+Observation: a held flush retained on a failing source call records the source's row last (002
+§2.6). A retry-drain report is recognized only with a ULID retry id. 005 §6 names the limits of
+reading unmarked rows. A drained tick's `triggered` row that keeps the source's own
+`no-files-matched` or `rebaselined` as `sourceOutcome` is a source outcome, not released work.
+
+## 2026-11-23 — Session lifetime, held work, claim expiry, doctor exit status and confirmed channel commits (target) — Refs #396, #636, #468, #462, #535
+
+Five target decisions for delivery honesty. Current behaviour is unchanged until each one ships;
+roadmap G22 tracks them.
+
+- **002 §6.3, 007 §4.4 (#396).** A session is alive while its host process is alive. Inactivity is
+  no longer a liveness signal, because an agent may wait for a delivery with no hook activity.
+  Liveness checks are process checks that never reach the model. An explicit end reaps ephemeral
+  monitors. Losing the host without an end suspends them, and a resume re-arms them. Retention, not
+  a timer, retires a session that is never resumed. `suspended` is a session status, and a watch
+  of a suspended session reports `suspended`; a suspended session does not keep the daemon alive.
+  §6.2's inactivity trigger is marked for replacement.
+- **002 §6.4 (#636).** Held notify work is never held forever or discarded silently. A cancel or a
+  retirement records a durable, visible terminal disposition. Suspension keeps the work and
+  releases it on resume.
+- **002 §7.1 (#468).** Claim expiry: a claim that is not acknowledged within a configurable claim
+  TTL goes from claimed back to pending, so it is delivered again; it stays unread. Expiry is
+  measured from the durable claim time. In-flight leases are unaffected. Delivery is at-least-once.
+- **005 doctor (#462).** `channel-session-unmatched` becomes advisory, and `channel-lead-uncovered`
+  does not block while the hook path covers that lead. `doctor`'s exit status agrees with the
+  delivery verdict.
+- **006 §4.5.2, §12.6 (#535).** A channel commits a delivery only when the host confirms the push
+  reached the session. For Claude Code the evidence is the `enqueue` entry the host writes to the
+  session transcript. A model-facing check is ruled out, because it costs a model turn. Without
+  evidence the push is released, the route is marked unproven, and the hook path delivers.
+
 ## 2026-11-23 — Drained retries count in the tick's history row (002 §2.7, §15) — Refs #617
 
 A tick whose retry drain completed retained work recorded its events on the tick result but not in

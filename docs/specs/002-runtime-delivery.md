@@ -94,6 +94,30 @@ The single most important structural fact in this model is the **seam** between 
   _identical_ baseline (and therefore would compute the identical span) MAY be deduplicated — the
   per-recipient work is multiplied only where baselines genuinely differ (capability C15).
 
+**Cursors never move backward.** A recipient's cursor stands at the greatest event already surfaced
+to it for that object, in the stable event order of
+[§1.1.7](#117-baseline-strategy-per-recipient-diff-semantics-current) (persisted `created_at`, then
+the private `monitor_events.sequence` tie-break). Delivery surfaces events out of that order — a
+`high` event at `turn-interruptible` before an older `normal` or `low` one at idle (§9), or a
+`post-compact` recap of older unread rows (§9.4) — so a claim may contain only events older than one
+an earlier claim already showed. Such a claim leaves the cursor where it is; a claim moves it only to
+an event later in the order, and a claim of the event it already stands at changes nothing. The next
+per-recipient delta therefore always spans from the greatest event already surfaced, never replaying
+a change the recipient has seen. The cursor stores that event's order position
+(`baseline_event_created_at`, `baseline_event_sequence`, §15), so the comparison survives restarts and
+does not depend on the event row being retained. When the baseline event is retained, its position is
+re-read before each comparison, so a cursor moved by a writer that did not record positions is
+compared at the event it actually holds. A cursor seeded from the state before the
+recipient's first projected event has no position, and its first claim advances it.
+
+> Verified: `RuntimeStore.advanceSessionObjectCursor` (`libs/core/src/runtime/store.ts`) compares the
+> claimed event's position with the stored one inside the `UPDATE` predicate. Proven by
+> `libs/core/src/runtime/monotonic-cursor.test.ts` (high before normal, low and recap after newer
+> claims, repeated claims, restart between claims, equal-second tie-break in both claim orders, later-committed event with
+> an earlier observation time, a cursor moved without its position) and
+> `libs/core/src/inbox/db.released-shapes.test.ts` (upgrade of a
+> released cursor table).
+
 This seam is what makes fan-out cheap: the expensive shared work (acquire, reduce, render, settle)
 runs once; only the genuinely per-baseline work multiplies. It is the structural reason a single
 monitor can serve a whole fleet without recomputing its observation per session
@@ -2396,6 +2420,11 @@ Verified: `libs/core/src/runtime/store.ts` — `openSession()` (lines 102–152)
 
 > **Status: current** (Refs #312). Added so [007 §4.4](./007-agent-facing-interaction.md)'s
 > ephemeral monitors reap on a session going dormant, not only on an explicit close.
+>
+> **To be replaced by [§6.3](#63-session-liveness-by-host-process-and-suspension-target) (Refs #396).**
+> Inactivity does not show that a session has gone. An agent may legitimately wait, with no hook
+> activity, until a delivery arrives and then act on it; this trigger reaps that agent's watches at
+> the point it most needs them.
 
 §6.1 makes a session dormant on an **explicit** close (the `session close` verb, driven by the host's
 session-end hook). A session can also go away **without** an explicit close — the host crashes, the
@@ -2428,12 +2457,78 @@ Verified: `libs/core/src/runtime/service.ts` — `reapDormantSessions()` (called
 `reaps on per-session dormancy by inactivity` and `does NOT reap a session that is still within the
 dormancy window` cases in `libs/core/src/runtime/ephemeral-monitors.test.ts`.
 
+### 6.3 Session liveness by host process, and suspension (_target_)
+
+> **Status: target** (Refs #396). Replaces the inactivity trigger of [§6.2](#62-per-session-dormancy-current).
+
+A session is **alive while its host process is alive**. Activity, or its absence, is never a
+liveness signal.
+
+- **Liveness evidence.** When a session is opened or resumed, the adapter records the identity of
+  the host process that owns it: a process id plus evidence that rules out process-id reuse, such as
+  the process start time. The daemon decides liveness by checking that this exact process still
+  exists. The check **MUST NOT** send anything into the host's conversation. A liveness probe that
+  costs model input is out of contract, because after the host's prompt-cache window expires every
+  probe would resend the whole conversation.
+- **No inactivity reap.** While the host process is alive, the runtime **MUST NOT** make the session
+  dormant, suspend its ephemeral monitors or reap them, however long the session goes without a
+  hook or claim.
+- **Explicit end.** A session end reported by the host ([§6.1](#61-session-identity)) — for Claude
+  the `SessionEnd` hook, which also fires on `/clear` — reaps the session's ephemeral monitors as
+  today ([007 §4.4](./007-agent-facing-interaction.md)). This stays the primary reap path; it is the
+  only one while the host lives.
+- **Host loss without an end.** When the recorded host process is gone and no end was reported, as
+  after a crash or a killed host, the session becomes **suspended**. Its ephemeral monitors stop
+  observing; they are not reaped. Suspension keeps their durable state: source state, snapshots,
+  per-recipient cursors, delivery rows and held notify work ([§6.4](#64-held-notify-work-when-an-ephemeral-declaration-retires-or-suspends-target)).
+- **Resume.** Opening the session again with the same `(adapter, hostSessionId)`, such as a host
+  resume, records the new host process and re-arms its suspended ephemeral monitors. Each source
+  resumes from its own durable state, so changes made while suspended are observed on the next
+  tick rather than lost.
+- **Final expiry.** A suspended session that is never resumed is retired by the retention policy for
+  ephemeral records (Refs #395), not by a liveness timer. Retirement reaps its ephemeral monitors.
+- **Unknown liveness.** If the adapter cannot identify a host process, the session's ephemeral
+  monitors are kept until an explicit end or retention retires them. The runtime **MUST NOT** fall
+  back to an inactivity timer.
+
+**Where suspension appears.** Suspension is a session status. Sessions gain a third status,
+`suspended`, beside `active` and `dormant`, and `session list` shows it. An ephemeral monitor owned
+by a suspended session reports the watch status `suspended` in `watch list`, `monitor explain` and
+`doctor`, so a reader can tell "paused until resume" from "running" and from "reaped".
+
+Suspension is per session, like §6.2's dormancy, and is distinct from the daemon-wide idle
+self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-server). For that rule a
+suspended session is not active: it has no host to deliver to, so it does not keep the daemon
+alive. Its durable state survives the daemon stopping, and a resume re-arms it.
+
+### 6.4 Held notify work when an ephemeral declaration retires or suspends (_target_)
+
+> **Status: target** (Refs #636).
+
+Notify work that the runtime has accepted for an ephemeral monitor, such as a debounce batch or a
+rollup window, **MUST NOT** be held indefinitely or discarded silently when the declaration stops
+being evaluated.
+
+- **Cancellation** (`watch cancel`): the held work is recorded with an explicit terminal
+  disposition, _discarded on cancel_, at the moment of cancellation. The agent asked to stop
+  watching, so the work is not delivered after the cancel. The disposition is durable and appears in
+  `monitor explain` and `doctor`.
+- **Suspension** ([§6.3](#63-session-liveness-by-host-process-and-suspension-target)): the held work
+  is kept with its original acceptance and timing. On resume it is released through the normal
+  notify timing. A deadline that passed while suspended releases on the first tick after resume.
+- **Explicit session end, or retention retiring a suspended session**: the held work is recorded
+  with an explicit terminal disposition, _discarded on retirement_, durable and visible in the same
+  way as a cancellation.
+- After a cancellation, an explicit end or a retirement, no "held" entry may remain for the retired
+  declaration in `doctor` or `monitor explain`. Suspension is not retirement, so its held work stays
+  visible as held.
+
 ## 7. Unread, Claimed, and Acknowledged
 
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):
 
 - **Unread:** `acknowledgedAt IS NULL` in `session_event_state`. The session has not acknowledged the event.
-- **Claimed (pending → notified):** `firstNotifiedAt IS NOT NULL`. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (events where `firstNotifiedAt IS NULL` and `acknowledgedAt IS NULL`).
+- **Claimed (pending → notified):** `firstNotifiedAt IS NOT NULL`. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (events where `firstNotifiedAt IS NULL` and `acknowledgedAt IS NULL`). `firstNotifiedAt` records the **first** claim and is never overwritten: a repeat claim of the same row (a recap, or a row re-surfaced before acknowledgement) updates only `lastClaimAt` and `lastClaimLifecycle`. Every claim, first or repeat, advances the recipient's object cursor only forward (§1.1.2).
 - **Acknowledged:** `acknowledgedAt IS NOT NULL`. The session explicitly marked the event read.
 
 This distinction matters because a claimed event may still need user or agent attention later.
@@ -2441,6 +2536,29 @@ This distinction matters because a claimed event may still need user or agent at
 "Surfaced" means the host received it. A transport that cannot see the host directly claims only on host evidence: the channel transport commits a claim only after the host confirms the push ([006 §4.5.2](./006-agent-integration.md), issue #535).
 
 Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
+
+### 7.1 Claim expiry (_target_)
+
+> **Status: target** (Refs #468; origin #434).
+
+Today a claimed event is never surfaced again: claims select only pending events, so an event the
+agent saw but never handled stays unread and silent until a recap. Claim expiry closes that gap. A
+claim that is not followed by an acknowledgement within the **claim TTL** expires: the event goes
+from claimed back to **pending** (unclaimed), so the next claim includes it again. The event stays
+unread throughout, because unread means "not acknowledged". This adds one edge to the model,
+claimed → pending. Expiry never acknowledges. An acknowledgement keeps its meaning, "handled", and
+delivery becomes at-least-once without relying on the agent to acknowledge.
+
+- The claim TTL is one configurable duration. Its default is an implementation choice, documented
+  with the CLI ([005](./005-cli-reference.md)).
+- The TTL is measured from the event's durable claim time, `firstNotifiedAt` for the first claim
+  and the most recent re-claim time after an expiry, so it behaves the same across daemon
+  restarts. Each expiry starts a new claim cycle; expiry repeats until the event is acknowledged.
+- An expired event follows its own urgency's delivery rules again ([§9](#9-delivery-lifecycles)).
+- In-flight delivery leases (`reserved-in-flight`) are a separate mechanism, already
+  self-resolving, and are unaffected by claim expiry.
+- A long task may therefore see an event delivered twice. That is accepted: a duplicate costs less
+  than a missed event.
 
 ## 8. Hook State
 
@@ -2828,7 +2946,8 @@ monitor through the persisted pipeline state and returns stages for:
 
 1. Definition: scanned `MONITOR.md`, source resolution, and source scope validation
 2. Scheduling: persisted `monitor_state.last_observation_at`, due state, and next due time
-3. Observation: recent `observation_history` rows and latest outcome
+3. Observation: the newest `observation_history` row that describes a source call, or the pause
+   while retained work remains (005 §6, "Which history rows each stage reads")
 4. Notify state: accepted debounce/rollup batches and active throttle suppression in
    `monitor_state.notify_state`, including accepted batches beside definition failures
 5. Materialization: an outstanding dropped observation (§2), then retained retries, then recent
@@ -2880,8 +2999,10 @@ of the two were recorded; the error uses the display rule above. `details.unreta
 `unretainedObservationLoss`, with `recordedAt` as an ISO string. This branch precedes the
 retained-retry branches: retained work can still be recovered and a drop cannot. The stage stays
 `failure` until every drop is superseded (§2): a quiet tick, a notify hold, an observe failure or
-events for other keys leave it failing. The observation stage still describes the newest history
-row. Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
+events for other keys leave it failing. The observation stage reads only rows that describe a
+source call: a drop row, a skipped retry's row and the retained-work drain's reports belong to
+Materialization, and while retained work remains the source is not called, so Observation reports
+that pause instead (005 §6, "Which history rows each stage reads", #591). Verified: `unretainable-suffix-admission.test.ts`, `hold-refusal-loss.test.ts` and, through a
 real `daemon run` socket after a quiet scheduled tick, `apps/cli/src/retry-diagnostics.test.ts`
 (Refs #497, #575).
 
@@ -3331,16 +3452,25 @@ Per-session delivery tracking for each projected event. Drives the unread/claime
 
 The per-recipient baseline cursor (G10, [§1.1.2](#112-the-shared--per-recipient-seam)). One row per `(session_id, monitor_id, object_key, workspace_path)`: the last shaped artifact this recipient was caught up to, the anchor its per-recipient Diff spans FROM. Unique on the four key columns (`COALESCE(workspace_path, '')` collapses the global/`NULL` case). `baseline_content` is denormalized (the full artifact text) so a recipient's baseline is prune-immune. Survives daemon restart (BP1); session-keyed so isolation is structural.
 
-| Column                 | Type             | Notes                                                 |
-| ---------------------- | ---------------- | ----------------------------------------------------- |
-| `id`                   | TEXT PK          | ULID                                                  |
-| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                             |
-| `monitor_id`           | TEXT NOT NULL    |                                                       |
-| `object_key`           | TEXT NOT NULL    |                                                       |
-| `workspace_path`       | TEXT nullable    | `NULL` = global                                       |
-| `baseline_snapshot_id` | TEXT nullable    | The event/snapshot the baseline came from (diagnosis) |
-| `baseline_content`     | TEXT NOT NULL    | Denormalized full artifact (defaults to `''`)         |
-| `updated_at`           | INTEGER NOT NULL | Set on seed and on each claim-advance                 |
+| Column                      | Type             | Notes                                                 |
+| --------------------------- | ---------------- | ----------------------------------------------------- |
+| `id`                        | TEXT PK          | ULID                                                  |
+| `session_id`                | TEXT NOT NULL    | FK to `agent_sessions.id`                             |
+| `monitor_id`                | TEXT NOT NULL    |                                                       |
+| `object_key`                | TEXT NOT NULL    |                                                       |
+| `workspace_path`            | TEXT nullable    | `NULL` = global                                       |
+| `baseline_snapshot_id`      | TEXT nullable    | The event/snapshot the baseline came from (diagnosis) |
+| `baseline_content`          | TEXT NOT NULL    | Denormalized full artifact (defaults to `''`)         |
+| `baseline_event_created_at` | INTEGER nullable | Baseline event's `created_at`; see below              |
+| `baseline_event_sequence`   | INTEGER nullable | Baseline event's `monitor_events.sequence`; see below |
+| `updated_at`                | INTEGER NOT NULL | Set on seed and on each claim-advance                 |
+
+`baseline_event_created_at` and `baseline_event_sequence` are the stable order position (§1.1.7) of
+the event the baseline came from, copied so the monotonic comparison (§1.1.2) does not need that
+event row. Both are `NULL` for a cursor seeded from the state before the recipient's first projected
+event. The columns are additive: opening a database whose cursor table lacks them adds them and fills
+the position of each cursor whose `baseline_snapshot_id` names a retained event; any other cursor
+keeps `NULL` and its next claim advances it.
 
 Verified: `libs/core/src/inbox/schema.ts` (`sessionObjectCursor`), `libs/core/src/inbox/db.ts` (DDL + unique index + additive `diff_text` migration), `libs/core/src/runtime/store.ts` (`getSessionObjectCursor` / `seedSessionObjectCursor` / `advanceSessionObjectCursor`).
 
