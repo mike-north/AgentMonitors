@@ -744,6 +744,77 @@ describe('a failure anywhere leaves no receipt, sequence change, marker or event
   );
 });
 
+describe('a rolled-back receipt leaves the projection cache as it was', () => {
+  // insertEvent records the event's recipients in memory, outside SQLite
+  // rollback (002 §2.6.1: any error rolls the whole operation back). Without a
+  // restore, the cache would name the recipients of an event that no longer
+  // exists after the receipt rolls back.
+  it.each([
+    ['an invalid completion', null],
+    ['an aborted receipt write', 'external_event_receipts'],
+    ['an aborted marker write', 'database_compatibility_markers'],
+  ] as const)('after %s', (_case, faultTable) => {
+    const { store, client } = openStore();
+    const committedLead = store.openSession({
+      adapter: 'claude',
+      hostSessionId: 'host-b',
+      workspacePath: '/workspace-b',
+      role: 'lead',
+      agentIdentity: 'lead-b',
+      hookStatePath: '/hook-state-b.json',
+    });
+    store.openSession({
+      adapter: 'claude',
+      hostSessionId: 'host-a',
+      workspacePath: '/workspace-a',
+      role: 'lead',
+      agentIdentity: 'lead-a',
+      hookStatePath: '/hook-state-a.json',
+    });
+    // A committed event in another workspace sets the cache to its own lead.
+    accepted(
+      store.withExternalEventReceipt(
+        receiptInput({ upstreamEventId: 'delivery-b' }, '/workspace-b'),
+        materialize(
+          store,
+          receiptInput({ upstreamEventId: 'delivery-b' }, '/workspace-b'),
+        ),
+        RECEIPT_NOW,
+      ),
+    );
+    expect(store.projectedSessionIdsForLastEvent()).toEqual([committedLead.id]);
+
+    const input = receiptInput();
+    if (faultTable !== null) {
+      client.exec(sql`
+        CREATE TEMP TRIGGER injected_fault BEFORE INSERT ON main.${faultTable}
+        BEGIN SELECT RAISE(ABORT, 'injected fault'); END
+      `);
+    }
+    const work = materialize(store, input);
+    expect(() =>
+      store.withExternalEventReceipt(
+        input,
+        faultTable === null
+          ? (context) => {
+              work(context);
+              // Materialized work must name its events; this rolls back.
+              return { outcome: 'materialized', eventIds: [] } as never;
+            }
+          : work,
+        later(1),
+      ),
+    ).toThrow();
+
+    expect(
+      store
+        .listEvents({})
+        .filter((event) => event.workspacePath === '/workspace-a'),
+    ).toEqual([]);
+    expect(store.projectedSessionIdsForLastEvent()).toEqual([committedLead.id]);
+  });
+});
+
 describe('hydrating a stored receipt fails closed on an impossible state', () => {
   function storedThenCorrupted(update: string) {
     const { dbPath, store } = openStore();
@@ -809,6 +880,58 @@ describe('hydrating a stored receipt fails closed on an impossible state', () =>
       /PRIVATE|private-relay-cursor|workspace-a/,
     );
     expect(work).not.toHaveBeenCalled();
+  });
+
+  // 002 §2.6.1: stored envelope fields must be values envelope admission
+  // accepts (002 §2.6), checked by the envelope validator itself.
+  it.each([
+    [
+      'an occurrence time that is not RFC 3339',
+      `occurred_at = 'yesterday'`,
+      'occurrence time',
+    ],
+    ['an empty occurrence time', `occurred_at = ''`, 'occurrence time'],
+    [
+      'an impossible calendar date',
+      `occurred_at = '2026-02-30T00:00:00Z'`,
+      'occurrence time',
+    ],
+    ['an empty event kind', `event_kind = ''`, 'event kind'],
+    [
+      'an event kind over the identifier bound',
+      `event_kind = substr(hex(zeroblob(257)), 1, 513)`,
+      'event kind',
+    ],
+    ['an empty object id', `object_id = ''`, 'object id'],
+  ])('refuses %s, naming the field', (_case, update, field) => {
+    const store = storedThenCorrupted(update);
+    expect(() =>
+      store.withExternalEventReceipt(
+        receiptInput(),
+        () => ({ outcome: 'held' }),
+        later(1),
+      ),
+    ).toThrow(
+      new RegExp(
+        `^Stored external event receipt \\S+ is invalid: ${field} is not a valid envelope value\\.$`,
+      ),
+    );
+  });
+
+  it('hydrates a stored leap-second occurrence time the envelope accepts', () => {
+    const store = storedThenCorrupted(
+      `occurred_at = '2016-12-31T23:59:60Z', event_kind = 'build.updated'`,
+    );
+    expect(
+      store.withExternalEventReceipt(
+        receiptInput(),
+        () => ({ outcome: 'held' }),
+        later(1),
+      ),
+    ).toMatchObject({
+      decision: 'duplicate',
+      receipt: { occurredAt: '2016-12-31T23:59:60Z' },
+    });
   });
 
   it('hydrates a coherent failed receipt recorded after exhausted retries', () => {
