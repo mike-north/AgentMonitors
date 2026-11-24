@@ -40,8 +40,17 @@ export type FailureKind =
   | 'delivery-empty'
   | 'setup';
 
+/**
+ * The workspace's channel route, read-only, from the channel heartbeats (006
+ * §4.5.2). verify never pushes on the host channel — it proves delivery
+ * through an isolated session — so its own PASS says nothing about this.
+ */
+export type VerifyChannelRoute = 'not-running' | 'unproven' | 'confirmed';
+
 export interface VerifyResult {
   ok: boolean;
+  /** Omitted when the route was not read (e.g. a setup failure). */
+  channelRoute?: VerifyChannelRoute;
   monitorId: string;
   stages: Stage[];
   failure?: { kind: FailureKind; message: string };
@@ -49,6 +58,12 @@ export interface VerifyResult {
   daemonStderr?: string;
   elapsedMs: number;
 }
+
+const CHANNEL_ROUTE_TEXT: Record<VerifyChannelRoute, string> = {
+  'not-running': 'not running (hooks deliver)',
+  unproven: 'unproven (no push confirmed by the host; hooks deliver)',
+  confirmed: 'confirmed (the host confirmed a push in this channel process)',
+};
 
 const STATUS_GLYPH: Record<StageStatus, string> = {
   pass: '✓',
@@ -82,7 +97,8 @@ export function renderVerifyText(result: VerifyResult): string {
         lines.push(`  ${line}`);
       }
     }
-  } else if (result.failure) {
+  }
+  if (!result.ok && result.failure) {
     const failedStage = result.stages.find((stage) => stage.status === 'fail');
     lines.push(
       `FAIL  ${failedStage ? `${failedStage.name} — ` : ''}${result.failure.message}`,
@@ -95,6 +111,17 @@ export function renderVerifyText(result: VerifyResult): string {
       }
     }
   }
+  if (result.channelRoute) {
+    // verify proves delivery through an isolated session, never through the
+    // host channel, so its PASS must not be read as channel health (006 §4.5.2).
+    lines.push('');
+    lines.push(
+      `Channel route: ${CHANNEL_ROUTE_TEXT[result.channelRoute]}.` +
+        (result.ok
+          ? ' This pass does not by itself prove the channel route.'
+          : ''),
+    );
+  }
   return lines.join('\n');
 }
 
@@ -106,6 +133,7 @@ export function renderVerifyJson(result: VerifyResult): string {
       monitorId: result.monitorId,
       stages: result.stages,
       failure: result.failure ?? null,
+      channelRoute: result.channelRoute ?? null,
       additionalContext: result.additionalContext ?? null,
       daemonStderr: result.daemonStderr ?? null,
       elapsedMs: result.elapsedMs,

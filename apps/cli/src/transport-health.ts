@@ -10,6 +10,7 @@ import {
   type TransportHeartbeat,
   type TransportName,
 } from './transport-heartbeat.js';
+import type { ChannelRouteEvidence } from './channel-route.js';
 
 /**
  * "What is the listening method for THIS session, and is it actually
@@ -75,8 +76,13 @@ export type TransportProblemCode =
   | 'heartbeat-stale'
   /** A long-lived transport is running an older CLI than this one. */
   | 'version-skew'
-  /** The channel is up, but host-side channel registration is unprovable here. */
-  | 'channel-registration-unverified'
+  /**
+   * The channel server is running, but no push from it has been confirmed by
+   * the host (006 §4.5.2): no push yet, no session transcript to confirm
+   * against, or the host did not confirm a push. Disqualifies the channel as a
+   * listening method; the hook path delivers meanwhile.
+   */
+  | 'channel-route-unproven'
   /**
    * (c') Whether reminders are suppressed could not be determined for one or
    * more lead sessions — the daemon's `hook.diagnose` call failed (e.g. an
@@ -146,7 +152,6 @@ export function isSharedProblem(code: TransportProblemCode): boolean {
  * `heartbeatProblems` for why each one specifically must not cry wolf).
  */
 const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
-  'channel-registration-unverified',
   'version-skew',
 ];
 
@@ -164,6 +169,19 @@ const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
  */
 export function disqualifiesFromListening(code: TransportProblemCode): boolean {
   return !isSharedProblem(code) && !ADVISORY_PROBLEM_CODES.includes(code);
+}
+
+/**
+ * Whether a problem fails its transport's own `doctor` check. Every problem
+ * that disqualifies a transport from listening does, except
+ * `channel-route-unproven`: an unproven route is the ordinary state of a
+ * session started without a channel listener, and the hook path delivers
+ * meanwhile (006 §4.5.2). It removes the channel from the reach, so if no
+ * other transport listens the delivery verdict fails instead; it never fails
+ * the channel row by itself.
+ */
+export function failsTransportCheck(code: TransportProblemCode): boolean {
+  return disqualifiesFromListening(code) && code !== 'channel-route-unproven';
 }
 
 export interface TransportProblem {
@@ -197,7 +215,62 @@ export interface TransportStatus {
   version?: string;
   /** ISO 8601, or `null` when this transport has never delivered. */
   lastDelivery: string | null;
+  /**
+   * Channel only: whether the channel's pushes are confirmed to reach the
+   * session, from host evidence (006 §4.5.2). `unreported` means the server
+   * predates host confirmation and cannot prove its route.
+   */
+  route?: ChannelRouteReport;
   problems: TransportProblem[];
+}
+
+/** The channel route as `doctor`/`verify` report it (006 §4.5.2). */
+export interface ChannelRouteReport {
+  state: 'confirmed' | 'unproven';
+  evidence: ChannelRouteEvidence | 'unreported';
+  lastConfirmedAt?: string;
+}
+
+/** The route a channel heartbeat reports, treating an absent field as unproven. */
+export function channelRouteOf(
+  heartbeat: TransportHeartbeat,
+): ChannelRouteReport {
+  const route = heartbeat.channelRoute;
+  if (!route) return { state: 'unproven', evidence: 'unreported' };
+  return {
+    state: route.state,
+    evidence: route.evidence,
+    ...(route.lastConfirmedAt
+      ? { lastConfirmedAt: route.lastConfirmedAt }
+      : {}),
+  };
+}
+
+/**
+ * The channel route as one `key=value` token for a transport line, e.g.
+ * `route=confirmed(2026-11-23T17:05:48.034Z)` or `route=unproven(unconfirmed-push)`.
+ */
+export function channelRouteLabel(route: ChannelRouteReport): string {
+  return route.state === 'confirmed'
+    ? `route=confirmed(${route.lastConfirmedAt ?? 'unknown'})`
+    : `route=unproven(${route.evidence})`;
+}
+
+/** Why an unproven route is unproven, in one clause. */
+function unprovenReason(evidence: ChannelRouteReport['evidence']): string {
+  switch (evidence) {
+    case 'no-push-yet':
+    case 'confirmed-push':
+      return 'no push has been confirmed by the host yet';
+    case 'no-transcript':
+      return 'the session transcript is unknown or unreadable, so no push can be confirmed and the channel is not pushing';
+    case 'unconfirmed-push':
+      return 'the host did not confirm a push, which is what a host that loaded the channel without a listener does';
+    case 'push-failed':
+      return 'a push to the host failed';
+    case 'unreported':
+      return 'this channel server predates host confirmation and cannot prove its pushes arrive';
+  }
 }
 
 /** Which listening method will actually reach this session right now. */
@@ -755,23 +828,31 @@ function heartbeatProblems(
   }
 
   if (transport === 'channel' && !stale) {
-    // Not a defect we can observe: the host never tells the server whether its
-    // `claude/channel` capability was honored, so a server outside the approved
-    // allowlist (or started without the development-channels flag) connects
-    // normally, resolves `notification()` normally, and has its events dropped
-    // with no error. Report it as an explicitly-unverifiable caveat rather than
-    // either asserting health we cannot prove or crying wolf about a problem
-    // that is usually absent.
-    problems.push({
-      code: 'channel-registration-unverified',
-      detail:
-        `${session}The channel server is connected, but whether the host actually ` +
-        'registered it as a channel cannot be observed from this side: Claude ' +
-        'Code drops channel events silently, with no error to the server, when ' +
-        'the plugin is loaded as a plain MCP server. Confirm delivery end to ' +
-        'end rather than trusting "connected".',
-      remediation: `Prove it with \`agentmonitors verify <monitor>\`. If channel events never arrive, start the session with \`claude ${CHANNEL_DEV_FLAG}\` (or add the plugin to the approved channel allowlist); the hook transport keeps delivering meanwhile.`,
-    });
+    // Evidence, not "connected" (006 §4.5.2): only a push the host confirmed
+    // proves this channel reaches the session. Anything else is unproven, and
+    // the hook path delivers meanwhile.
+    const route = channelRouteOf(heartbeat);
+    if (route.state !== 'confirmed') {
+      const stuck =
+        route.evidence === 'unconfirmed-push' ||
+        route.evidence === 'push-failed';
+      problems.push({
+        code: 'channel-route-unproven',
+        detail:
+          `${session}The channel server is running, but its route is unproven: ` +
+          `${unprovenReason(route.evidence)}. ` +
+          (stuck
+            ? 'The hook path delivers for the rest of this channel process.'
+            : 'The hook path delivers until a push is confirmed.'),
+        remediation: stuck
+          ? `Start Claude Code with \`claude ${CHANNEL_DEV_FLAG}\` (or add the plugin to the approved channel allowlist) so the host registers the channel; the hook transport keeps delivering meanwhile.`
+          : route.evidence === 'unreported'
+            ? 'Start a new Claude Code session so the channel server respawns on the current build; the hook transport keeps delivering meanwhile.'
+            : 'No action needed: the first delivery the host confirms proves the route. If it stays unproven, start Claude Code with `claude ' +
+              CHANNEL_DEV_FLAG +
+              '`; the hook transport keeps delivering meanwhile.',
+      });
+    }
   }
 
   return problems;
@@ -911,6 +992,7 @@ function buildTransport(
     },
     version: heartbeat.version,
     lastDelivery: heartbeat.lastDeliveryAt ?? null,
+    ...(transport === 'channel' ? { route: channelRouteOf(heartbeat) } : {}),
     problems,
   };
 }

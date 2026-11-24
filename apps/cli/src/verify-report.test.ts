@@ -144,3 +144,41 @@ describe('renderVerifyJson', () => {
     );
   });
 });
+
+// 006 §4.5.2: verify proves delivery through an isolated session, never the
+// host channel, so it reports the channel route separately and says its PASS
+// does not prove it.
+describe('verify channel route line (issue #535)', () => {
+  it.each([
+    ['not-running', 'Channel route: not running (hooks deliver).'],
+    [
+      'unproven',
+      'Channel route: unproven (no push confirmed by the host; hooks deliver).',
+    ],
+    [
+      'confirmed',
+      'Channel route: confirmed (the host confirmed a push in this channel process).',
+    ],
+  ] as const)('states the %s route after a PASS', (channelRoute, line) => {
+    const text = renderVerifyText({ ...passResult, channelRoute });
+    expect(text).toContain(
+      `${line} This pass does not by itself prove the channel route.`,
+    );
+  });
+
+  it('omits the route line when the route was not read', () => {
+    expect(renderVerifyText(passResult)).not.toContain('Channel route:');
+  });
+
+  it('reports the route in JSON, null when not read', () => {
+    const withRoute = JSON.parse(
+      renderVerifyJson({ ...passResult, channelRoute: 'unproven' }),
+    ) as Record<string, unknown>;
+    expect(withRoute['channelRoute']).toBe('unproven');
+    const without = JSON.parse(renderVerifyJson(passResult)) as Record<
+      string,
+      unknown
+    >;
+    expect(without['channelRoute']).toBeNull();
+  });
+});

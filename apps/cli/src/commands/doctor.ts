@@ -44,10 +44,11 @@ import {
 } from '../transport-heartbeat.js';
 import {
   computeTransportHealth,
-  disqualifiesFromListening,
+  failsTransportCheck,
   isSharedProblem,
   type DeliveryTransportHealth,
   type TransportStatus,
+  channelRouteLabel,
 } from '../transport-health.js';
 
 /**
@@ -763,19 +764,29 @@ function transportChecks(
     }
 
     // A transport row reports only the problems that transport OWNS. Three
-    // categories are excluded: the unprovable channel-registration caveat and
-    // version-skew (both advisories, never defects — see `transport-health.ts`
-    // for why crying wolf on either would make a working transport read as
-    // broken on every run/upgrade), and pipeline-wide problems like a down
+    // categories are excluded: version-skew (an advisory, never a defect — see
+    // `transport-health.ts` for why crying wolf on it would make a working
+    // transport read as broken after every upgrade), an unproven channel route
+    // (it removes the channel from the reach, and the verdict fails if nothing
+    // else listens — see `failsTransportCheck`), and pipeline-wide problems like a down
     // daemon or muted reminders, which the `delivery-verdict` check below
     // reports once instead of repeating them on every row as if they were
     // independent failures.
     const blocking = transport.problems.filter((problem) =>
-      disqualifiesFromListening(problem.code),
+      failsTransportCheck(problem.code),
     );
 
     if (blocking.length === 0) {
-      checks.push({ name, status: 'pass', detail: summary });
+      const unproven = transport.problems.some(
+        (problem) => problem.code === 'channel-route-unproven',
+      );
+      checks.push({
+        name,
+        status: 'pass',
+        detail: unproven
+          ? `${summary}  (route unproven, so not counted as listening; the hook path delivers)`
+          : summary,
+      });
       continue;
     }
     checks.push({
@@ -852,7 +863,10 @@ function transportLine(transport: TransportStatus): string {
     return `${transport.name}: not reporting`;
   }
   const state = transport.running ? 'running' : 'stale';
-  return `${transport.name}: ${state}  ${transportSummary(transport)}`;
+  const route = transport.route
+    ? `  ${channelRouteLabel(transport.route)}`
+    : '';
+  return `${transport.name}: ${state}  ${transportSummary(transport)}${route}`;
 }
 
 function renderText(
@@ -962,6 +976,7 @@ function toJson(
       boundTo: transport.boundTo ?? null,
       version: transport.version ?? null,
       lastDelivery: transport.lastDelivery,
+      ...(transport.route ? { route: transport.route } : {}),
       problems: transport.problems.map((problem) => ({
         code: problem.code,
         detail: problem.detail,

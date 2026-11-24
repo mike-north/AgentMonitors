@@ -3,6 +3,7 @@ import { readFileSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { writePrivateFileAtomic } from '@agentmonitors/core';
+import type { ChannelRouteSnapshot } from './channel-route.js';
 import { getCliVersion } from './cli-version.js';
 import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
 
@@ -116,6 +117,12 @@ export interface TransportHeartbeat {
   ttlMs: number;
   /** When this transport last surfaced a delivery (ISO 8601), if ever. */
   lastDeliveryAt?: string;
+  /**
+   * Channel only: whether this process's pushes are confirmed to reach the
+   * session, from host evidence (006 §4.5.2). Absent from records written by
+   * builds that predate host confirmation; a reader treats that as unproven.
+   */
+  channelRoute?: ChannelRouteSnapshot;
 }
 
 /**
@@ -159,7 +166,7 @@ export function transportRegistryDir(): string {
  * unsanitized) key makes every distinct input map to a distinct filename
  * regardless of what the cleaned prefix collapses to.
  */
-function sanitizeKey(key: string): string {
+export function sanitizeKey(key: string): string {
   const cleaned = key.replaceAll(/[^A-Za-z0-9._-]/g, '_').slice(0, 96);
   const base = cleaned.length > 0 ? cleaned : 'unknown';
   const suffix = createHash('sha256').update(key).digest('hex').slice(0, 8);
@@ -228,6 +235,7 @@ export interface WriteHeartbeatInput {
   startedAt?: Date;
   ttlMs?: number;
   lastDeliveryAt?: Date;
+  channelRoute?: ChannelRouteSnapshot;
   /** Injectable for tests; defaults to now. */
   now?: Date;
 }
@@ -309,6 +317,7 @@ export function writeTransportHeartbeat(
         ? CHANNEL_HEARTBEAT_TTL_MS
         : HOOK_HEARTBEAT_TTL_MS),
     ...(lastDeliveryAt ? { lastDeliveryAt } : {}),
+    ...(input.channelRoute ? { channelRoute: input.channelRoute } : {}),
   };
 
   try {
@@ -418,8 +427,47 @@ export function isTransportHeartbeat(
     'sessionId',
     'lastDeliveryAt',
   ] as const;
-  return optionalStrings.every(
-    (key) => record[key] === undefined || typeof record[key] === 'string',
+  if (
+    !optionalStrings.every(
+      (key) => record[key] === undefined || typeof record[key] === 'string',
+    )
+  ) {
+    return false;
+  }
+  return (
+    record['channelRoute'] === undefined ||
+    isChannelRouteSnapshot(record['channelRoute'])
+  );
+}
+
+const CHANNEL_ROUTE_EVIDENCE: readonly string[] = [
+  'no-push-yet',
+  'no-transcript',
+  'unconfirmed-push',
+  'push-failed',
+  'confirmed-push',
+];
+
+/** Whether a value is a well-formed {@link ChannelRouteSnapshot}. */
+export function isChannelRouteSnapshot(
+  value: unknown,
+): value is ChannelRouteSnapshot {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const route = value as Record<string, unknown>;
+  if (route['state'] !== 'confirmed' && route['state'] !== 'unproven') {
+    return false;
+  }
+  if (
+    typeof route['evidence'] !== 'string' ||
+    !CHANNEL_ROUTE_EVIDENCE.includes(route['evidence'])
+  ) {
+    return false;
+  }
+  return (
+    route['lastConfirmedAt'] === undefined ||
+    typeof route['lastConfirmedAt'] === 'string'
   );
 }
 

@@ -26,6 +26,7 @@ import {
   type HookDeliveryOutput,
 } from '../hook-deliver-render.js';
 import { readHookPayload } from '../hook-payload.js';
+import { recordHostTranscriptPath } from '../host-evidence-record.js';
 import { writeTransportHeartbeat } from '../transport-heartbeat.js';
 import {
   isManualDaemonConnectionError,
@@ -801,6 +802,10 @@ Diagnosis:
           debug(describeWorkspaceDisabled(workspacePath));
           return;
         }
+
+        // Path only: refreshes the channel's confirmation source after a
+        // `/clear` or resume moved the session to a new transcript (006 §4.5.2).
+        recordHostTranscriptPath(hostSessionId, payload.transcript_path);
 
         // Require an EXPLICIT per-workspace socket (flag or `.local.md`). If
         // neither is present, bail rather than letting resolveSocketPath fall

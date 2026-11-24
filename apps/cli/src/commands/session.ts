@@ -20,6 +20,7 @@ import { readLocalState, writeLocalState } from '../local-state.js';
 import { workspacePaths } from '../workspace-paths.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
 import { readHookPayload } from '../hook-payload.js';
+import { recordHostTranscriptPath } from '../host-evidence-record.js';
 import {
   renderMonitoringDisabledAdvisory,
   type HookDeliveryOutput,
@@ -275,6 +276,9 @@ export async function runSessionStartAction(): Promise<void> {
     }
     return;
   }
+
+  // Path only: the channel's confirmation source for this session (006 §4.5.2).
+  recordHostTranscriptPath(hostSessionId, payload.transcript_path);
 
   const paths = workspacePaths(workspacePath);
   // Resolve the socket up-front through the SAME transform `daemon run` applies

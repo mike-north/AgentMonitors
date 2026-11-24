@@ -64,8 +64,14 @@ import {
   renderVerifyText,
   type Stage,
   type StageName,
+  type VerifyChannelRoute,
   type VerifyResult,
 } from '../verify-report.js';
+import {
+  isHeartbeatStale,
+  readTransportHeartbeats,
+} from '../transport-heartbeat.js';
+import { channelRouteOf } from '../transport-health.js';
 
 /**
  * Append the failure stage for a mid-run daemon crash. It names the stage that
@@ -1606,7 +1612,13 @@ export const verifyCommand = new Command('verify')
           triggerCmd: options.triggerCmd,
         });
 
-        console.log(json ? renderVerifyJson(result) : renderVerifyText(result));
+        const reported = {
+          ...result,
+          channelRoute: workspaceChannelRoute(workspace, new Date()),
+        };
+        console.log(
+          json ? renderVerifyJson(reported) : renderVerifyText(reported),
+        );
         if (!result.ok) process.exitCode = 1;
       } catch (error) {
         if (error instanceof DaemonDied) {
@@ -1638,3 +1650,27 @@ export const verifyCommand = new Command('verify')
       }
     },
   );
+
+/**
+ * The workspace's channel route as the channel servers report it (006
+ * §4.5.2): `confirmed` if any live channel for this workspace has had a push
+ * confirmed by the host, `unproven` if one is running without that, otherwise
+ * `not-running`. Read-only: verify never pushes on the host channel.
+ */
+function workspaceChannelRoute(
+  workspace: string,
+  now: Date,
+): VerifyChannelRoute {
+  const live = readTransportHeartbeats().filter(
+    (heartbeat) =>
+      heartbeat.transport === 'channel' &&
+      path.resolve(heartbeat.workspacePath) === path.resolve(workspace) &&
+      !isHeartbeatStale(heartbeat, now),
+  );
+  if (live.length === 0) return 'not-running';
+  return live.some(
+    (heartbeat) => channelRouteOf(heartbeat).state === 'confirmed',
+  )
+    ? 'confirmed'
+    : 'unproven';
+}
