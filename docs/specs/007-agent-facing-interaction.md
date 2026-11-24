@@ -264,6 +264,14 @@ An ephemeral monitor's lifetime is **bound to its declaring session's lifetime**
   session that vanished without an explicit close. (The daemon's own idle self-termination,
   [002 §10.2](./002-runtime-delivery.md), is a **different** concern: it reaps the _daemon_ after all
   active sessions for a workspace hit zero, not an individual session.)
+  **Target (Refs #396):** the inactivity trigger is replaced by host-process liveness
+  ([002 §6.3](./002-runtime-delivery.md)). While the host process lives, an ephemeral monitor is
+  never reaped for inactivity, so an agent can declare a watch and wait for it as long as it needs.
+  On an explicit session end it is reaped as above. If the host process is lost without an end, the
+  monitor is **suspended**, not reaped: observation stops, its durable state is kept, and it
+  re-arms when the session resumes. This narrows the "reaping is terminal" rule to ends,
+  cancellations and retention; suspension is not a reap. Held notify work follows
+  [002 §6.4](./002-runtime-delivery.md).
 - an agent **MAY** cancel it earlier (`agentmonitors watch cancel <id>`), which reaps it immediately;
 - while the session lives, the ephemeral monitor and its durable state (source state, snapshots,
   per-recipient cursors, unread/claimed/acknowledged rows) **MUST survive a daemon restart and a
@@ -458,6 +466,9 @@ reviewer can pin it before build:
   has not advanced for at least `DEFAULT_SESSION_DORMANCY_MS` (default 30 min) is transitioned to
   `dormant` at the start of the next tick, and its ephemeral monitors are reaped — distinct from the
   daemon-wide idle self-termination of [002 §10.2](./002-runtime-delivery.md).
+  **Revisited (Refs #396):** inactivity proved to be the wrong signal, because a live agent waiting
+  for a delivery makes no hook calls. The target replaces it with host-process liveness and
+  suspension ([002 §6.3](./002-runtime-delivery.md)).
 - **Ephemeral-id scheme (§4.3). RESOLVED (Refs #312).** Reserved prefix
   `ephemeral:<sessionId>/<ulid>` — collision-proof against directory-derived persistent ids by the
   mandatory `/` (see §4.3).

@@ -409,6 +409,8 @@ Both transports key off the same `session_event_state`. When the channel transpo
 delivery it marks the underlying rows **claimed** (BP2), so the hook-state transport sees them
 already claimed and suppresses the duplicate reminder. No new dedup mechanism is required — the
 existing claimed state ([002 §7](./002-runtime-delivery.md)) is the dedup boundary across transports.
+Target: a channel commit requires host confirmation that the push surfaced
+([§4.5.2](#452-commit-only-on-host-confirmed-surfacing-target), Refs #535).
 
 While a channel push is **in flight** — reserved but not yet committed (§4.5.1) — its rows are
 **leased**: hidden from the hook transport's claim decision exactly as a claimed row would be, so the
@@ -483,6 +485,52 @@ runtime (§6.1), and losing a lease (daemon restart, or a crashed/hung reserve t
 releases) is the **safe** direction — the rows simply return to `pending` for the hook path (PP1).
 A reservation self-expires after a short ceiling so a holder that neither commits nor releases cannot
 hide rows from the hook transport indefinitely.
+
+### 4.5.2 Commit only on host-confirmed surfacing (_target_)
+
+> **Status: target** (Refs #535). Today a channel commits as soon as the push call resolves (§4.5.1
+> step 3), which is not evidence that anything surfaced (§12.6).
+
+A resolved push call proves nothing: a host that loaded the channel server without a channel
+listener drops the event and still reports success. A channel commit **MUST** therefore rest on
+**host evidence** that the push reached the session, and the evidence **MUST NOT** cost a model
+turn. A model-facing probe, such as a check event the agent must answer through a tool, is out of
+contract: it spends input tokens, and after the host's prompt-cache window it resends the whole
+conversation.
+
+- **The confirmation step.** Step 3 of §4.5.1 becomes: push, then wait for the host adapter to
+  confirm that the session received this push. Commit only on confirmation. If no confirmation
+  arrives within a short bound, inside the reservation's own ceiling, **release**, so the hook path
+  delivers the rows (§6.1). A confirmation that arrives after the release can at most duplicate a
+  delivery, never lose one (PP1).
+- **Matching a push.** Each push carries a unique delivery identifier in its notification
+  metadata (§4.2), including generic reminders that name no events. Confirmation matches on that
+  identifier, never on content alone.
+- **Claude Code evidence.** The Claude adapter confirms from the session transcript, whose path the
+  host passes to every hook (`transcript_path`). When Claude Code accepts a channel event into a
+  session, it appends a `queue-operation` entry with operation `enqueue` whose content is the
+  rendered event, followed later by the model receiving it (a channel-origin user turn after
+  `dequeue`, or a queued-command attachment after `remove`). The `enqueue` entry carrying the push's
+  delivery identifier is the confirmation. A host with no listener writes no such entry. The
+  transcript format is undocumented host behaviour, so reading it belongs to the Claude adapter
+  (`libs/core/src/adapter/claude.ts` and its CLI wiring), never to the runtime core.
+- **Read-only and narrow.** The adapter only reads the transcript, reads only bytes appended since
+  the push, inspects only `queue-operation` entries, and never stores, logs or forwards transcript
+  content beyond the match.
+- **No evidence means unproven, never loss.** If the transcript path is unknown, the file cannot be
+  read, or its entries are not in a recognised shape, the push is unconfirmed and released. After an
+  unconfirmed push the channel marks its route **unproven** for the rest of its process and stops
+  pushing real deliveries, so a session without a listener is not re-pushed every poll and a session
+  whose evidence cannot be read does not see each event twice. The hook path delivers everything
+  while the route is unproven, exactly as hooks-only mode does. A new channel process starts
+  unproven again and proves the route on its first confirmed push.
+- **Other hosts.** A host adapter with no confirmation source never confirms, so its channel route
+  stays unproven and the hook path delivers. Adding channel delivery for a new host means adding that
+  host's confirmation source.
+- **Reporting.** `doctor` and `verify` report the channel route from this evidence: _confirmed_ (a
+  push in this process was confirmed), _unproven_ (no push yet, or the last one unconfirmed), or
+  _not running_. The `channel-registration-unverified` advisory (§12.6) is replaced by this
+  evidence-based state. `verify` states that its pass does not by itself prove the channel route.
 
 ### 4.6 Content safety
 
@@ -1846,6 +1894,10 @@ health it cannot prove or crying wolf about a condition that is usually absent: 
 channel unhealthy, and it points at `agentmonitors verify` (an end-to-end proof) plus the dev-flag
 remediation. A future active probe — emit a synthetic channel event, confirm the claim/ack lands back
 in the store within a bound — would upgrade this from advisory to detection.
+
+> **Target (Refs #535):** the server's own view still cannot tell, but the host's session transcript
+> can. [§4.5.2](#452-commit-only-on-host-confirmed-surfacing-target) replaces the advisory with
+> per-push confirmation from host evidence, and rules out a model-facing probe.
 
 ### 12.7 A hold's `claimedEventIds` is optional, and neither its absence nor emptiness is ever an ack-all fallback (issue #425 review, rounds 7–8)
 
