@@ -817,10 +817,10 @@ stage's reason verbatim, so text and JSON agree.
 For example, right after `monitor retry skip`, text shows:
 
 ```diff
--✗ Observation: Source observation failed: native fault on watcher Retry skipped after 5 failed attempts.
+-✗ Observation: Source observation failed: native fault Retry skipped after 5 failed attempts.
 +✓ Observation: No source outcome has been recorded since a terminal retry was skipped; the Materialization stage reports the loss, and the source is called again on the monitor’s next due tick.
- ✗ Materialization: 1 observation(s) were dropped because the runtime could not keep them; the newest, an observation (<path>, "<title>"), failed: native fault on watcher Retry skipped after 5 failed attempts.
--Verdict: failure at Observation - Source observation failed: native fault on watcher Retry skipped after 5 failed attempts.
+ ✗ Materialization: 1 observation(s) were dropped because the runtime could not keep them; the newest, an observation (<path>, "<title>"), failed: native fault Retry skipped after 5 failed attempts.
+-Verdict: failure at Observation - Source observation failed: native fault Retry skipped after 5 failed attempts.
 +Verdict: failure at Materialization - 1 observation(s) were dropped because the runtime could not keep them; …
 ```
 
