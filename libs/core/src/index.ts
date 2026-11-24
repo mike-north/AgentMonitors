@@ -289,6 +289,16 @@ export {
 
 // Adapters
 export { claudeCodeAdapter } from './adapter/claude.js';
+export {
+  CHANNEL_DELIVERY_ID_META_KEY,
+  isChannelDeliveryId,
+  isClaudeTranscriptPathForSession,
+  scanClaudeTranscriptForChannelPush,
+} from './adapter/claude-transcript.js';
+export type {
+  ChannelPushConfirmationQuery,
+  ChannelPushScanResult,
+} from './adapter/claude-transcript.js';
 export type { AgentRuntimeAdapter } from './adapter/types.js';
 export { createClaudeInterpretAdapter } from './adapter/interpret.js';
 export type {
