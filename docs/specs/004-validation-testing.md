@@ -764,9 +764,12 @@ The receipt operation requires these scenarios, against real SQLite:
   their writes rolled back.
 - **Fault injection.** Aborting the callback's event or snapshot write, the receipt write, the first
   or a raised high-water write, or the marker write leaves every table unchanged, and a retry then
-  succeeds.
+  succeeds. After an invalid completion or an aborted receipt or marker write following a
+  materialized event, the projected-session cache still names the last committed event's lead.
 - **Hydration.** Each impossible stored state listed in 002 §2.6.1 is refused without echoing stored
-  content; a coherent `failed` receipt hydrates.
+  content, including an occurrence time that is not RFC 3339 or is an impossible date, and an empty
+  or oversized event kind or object ID, each naming its field. A coherent `failed` receipt and a
+  leap-second occurrence time hydrate.
 - **Marker.** One `durable-ingress-v1` marker per workspace, with its exact identity and time.
 - **Concurrency.** Independent processes accepting one event at once: exactly one accepts and runs
   its work, the rest get `duplicate`, and one receipt, sequence, and event remain.
@@ -774,7 +777,8 @@ The receipt operation requires these scenarios, against real SQLite:
   marker constant is not exported.
 
 Reading the sequence before the callback and writing it after, dropping the rollback on a callback
-throw, accepting a replay with different content, or accepting an older sequence MUST each fail one
+throw, accepting a replay with different content, accepting an older sequence, not restoring the
+projected-session cache on rollback, or skipping the stored envelope field check MUST each fail one
 of these tests.
 
 The receipt reads and the compatibility markers

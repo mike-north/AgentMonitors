@@ -120,7 +120,7 @@ describe('reading receipt status', () => {
     expect(() =>
       store.externalEventReceiptStatus('/workspace-a', receiptId),
     ).toThrow(
-      `Stored external event receipt ${receiptId} is invalid: monitor id is not a non-empty string.`,
+      `Stored external event receipt ${receiptId} is invalid: monitor id is not a valid envelope value.`,
     );
   });
 });
@@ -246,7 +246,7 @@ describe('reading an object sequence', () => {
       [
         'an empty upstream event id',
         [sequenceUpdate(`upstream_event_id = ''`)],
-        'upstream event id is not a non-empty string',
+        'upstream event id is not a valid envelope value',
       ],
       [
         'an unreadable update time',

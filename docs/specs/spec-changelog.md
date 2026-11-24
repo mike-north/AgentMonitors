@@ -29,7 +29,9 @@ workspace compatibility marker, and the callback's durable work together, or rol
 The high-water mark is reserved before the callback runs and only ever raised, so re-entrant
 acceptance from the callback cannot lower it or collide on its key. A nested call for the identity
 being accepted is refused. The callback must be synchronous. `failed` is no longer an initial
-outcome. Stored receipts are returned only when their fields form a state the store writes. The
+outcome. A rollback also restores the in-memory record of the last event's projected sessions.
+Stored receipts are returned only when their fields form a state the store writes, with stored
+envelope fields checked by the envelope validator. The
 public receipt types resolve without internal envelope types. Ingestion through the runtime,
 daemon, or CLI remains target. 004 §2.14 lists the required scenarios.
 

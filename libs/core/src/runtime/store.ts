@@ -69,7 +69,11 @@ import {
   sessionObjectCursor,
   verifyArtifacts,
 } from '../inbox/schema.js';
-import { validateExternalEventEnvelope } from '../external-ingress/contract.js';
+import {
+  EXTERNAL_EVENT_SCHEMA,
+  validateExternalEventEnvelope,
+} from '../external-ingress/contract.js';
+import type { ExternalEventEnvelope } from '../external-ingress/contract.js';
 import { externalEventSemanticHash } from '../external-ingress/identity.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
 import { registerRuntimeTransaction } from './runtime-transaction.js';
@@ -399,13 +403,58 @@ function invalidStoredReceipt(receiptId: string, rule: string): Error {
 }
 
 /**
+ * A valid envelope whose fields are replaced one at a time by stored values,
+ * so each stored envelope value is checked by the envelope validator's own
+ * rules (002 §2.6) rather than a second copy of them.
+ */
+const STORED_FIELD_PROBE: ExternalEventEnvelope = {
+  schema: EXTERNAL_EVENT_SCHEMA,
+  monitorId: 'monitor',
+  source: 'source',
+  upstreamEventId: 'event',
+  objectId: 'object',
+  objectSequence: 0,
+  eventKind: 'kind',
+  changeKind: 'created',
+  occurredAt: '1970-01-01T00:00:00Z',
+  resumeToken: 'cursor',
+  scope: {},
+  state: {},
+};
+
+/** Envelope text fields that stored external-ingress rows copy. */
+type StoredEnvelopeTextField =
+  | 'monitorId'
+  | 'source'
+  | 'upstreamEventId'
+  | 'objectId'
+  | 'eventKind'
+  | 'occurredAt';
+
+/** The name each envelope text field has in a refusal. */
+const STORED_ENVELOPE_FIELD_NAMES: Readonly<
+  Record<StoredEnvelopeTextField, string>
+> = {
+  monitorId: 'monitor id',
+  source: 'source',
+  upstreamEventId: 'upstream event id',
+  objectId: 'object id',
+  eventKind: 'event kind',
+  occurredAt: 'occurrence time',
+};
+
+/**
  * The field rules every stored external-ingress row must meet before either
  * read exposes it as a typed record (receipts and object sequences alike):
- * each identifier a non-empty string, each count or sequence a non-negative
- * safe integer, each timestamp a valid date. SQLite enforces none of these, so
- * a corrupt or hand-edited row fails here instead of reaching a caller.
+ * each value copied from an envelope is one envelope admission accepts,
+ * checked by the envelope validator; each local identifier (workspace
+ * identity, receipt id) a non-empty string; each count or sequence a
+ * non-negative safe integer; each timestamp a valid date. SQLite enforces none
+ * of these, so a corrupt or hand-edited row fails here instead of reaching a
+ * caller.
  */
 interface StoredRowFields {
+  envelope: Readonly<Partial<Record<StoredEnvelopeTextField, unknown>>>;
   identifiers: Readonly<Record<string, unknown>>;
   integers: Readonly<Record<string, unknown>>;
   times: Readonly<Record<string, unknown>>;
@@ -415,6 +464,20 @@ function validateStoredRowFields(
   fail: (rule: string) => Error,
   fields: StoredRowFields,
 ): void {
+  for (const [field, value] of Object.entries(fields.envelope) as [
+    StoredEnvelopeTextField,
+    unknown,
+  ][]) {
+    if (
+      typeof value !== 'string' ||
+      !validateExternalEventEnvelope({ ...STORED_FIELD_PROBE, [field]: value })
+        .success
+    ) {
+      throw fail(
+        `${STORED_ENVELOPE_FIELD_NAMES[field]} is not a valid envelope value`,
+      );
+    }
+  }
   for (const [name, value] of Object.entries(fields.identifiers)) {
     if (typeof value !== 'string' || value.length === 0) {
       throw fail(`${name} is not a non-empty string`);
@@ -443,8 +506,9 @@ function isNonNegativeSafeInteger(value: unknown): value is number {
  * have written (SQLite enforces no outcome or kind domain). Rules by outcome:
  *
  * - every receipt: a known outcome and change kind, a non-negative integer
- *   object sequence and attempt count, valid accepted/updated times, and an
- *   optional valid next-attempt time;
+ *   object sequence and attempt count, valid accepted/updated times, an
+ *   optional valid next-attempt time, and envelope text fields (identifiers,
+ *   event kind, RFC 3339 occurrence time) the envelope validator accepts;
  * - `materialized`: one or more unique event IDs and a materialization time,
  *   and no scheduled retry;
  * - every other outcome: no event IDs and no materialization time;
@@ -468,14 +532,15 @@ function rowToExternalEventReceipt(
     throw invalidStoredReceipt(id, 'unknown change kind');
   }
   validateStoredRowFields((rule) => invalidStoredReceipt(id, rule), {
-    identifiers: {
-      'monitor id': row.monitorId,
+    envelope: {
+      monitorId: row.monitorId,
       source: row.source,
-      'upstream event id': row.upstreamEventId,
-      'object id': row.objectId,
-      'event kind': row.eventKind,
-      'occurrence time': row.occurredAt,
+      upstreamEventId: row.upstreamEventId,
+      objectId: row.objectId,
+      eventKind: row.eventKind,
+      occurredAt: row.occurredAt,
     },
+    identifiers: {},
     integers: {
       'object sequence': row.objectSequence,
       'attempt count': row.attemptCount,
@@ -595,13 +660,15 @@ function rowToExternalObjectSequence(
   const fail = (rule: string) =>
     invalidStoredRow('external object sequence for the requested object', rule);
   validateStoredRowFields(fail, {
+    envelope: {
+      monitorId: row.monitorId,
+      source: row.source,
+      objectId: row.objectId,
+      upstreamEventId: row.upstreamEventId,
+    },
     identifiers: {
       'workspace identity': row.workspaceIdentity,
-      'monitor id': row.monitorId,
-      source: row.source,
-      'object id': row.objectId,
       'receipt id': row.receiptId,
-      'upstream event id': row.upstreamEventId,
     },
     integers: { 'highest sequence': row.highestSequence },
     times: { 'update time': row.updatedAt },
@@ -1127,103 +1194,112 @@ export class RuntimeStore {
       envelope.upstreamEventId,
     ]);
 
-    return db.$client
-      .transaction((): ExternalEventReceiptDecision => {
-        // A nested call for the identity this connection is already accepting
-        // would otherwise find no receipt yet and race its own outer call.
-        if (inFlight.has(identity)) {
-          throw new Error(
-            'This external event is already being accepted by an enclosing receipt operation.',
-          );
-        }
-        const existing = db
-          .select()
-          .from(externalEventReceipts)
-          .where(externalReceiptKey(normalizedInput))
-          .get();
-        if (existing) {
-          if (existing.semanticHash !== semanticHash) {
+    // insertEvent's projection cache is in memory, outside SQLite rollback. A
+    // callback that materialized an event before the receipt rolled back must
+    // not leave the cache naming recipients of an event that no longer exists.
+    const previousProjectedSessionIds = this.lastProjectedSessionIds;
+    try {
+      return db.$client
+        .transaction((): ExternalEventReceiptDecision => {
+          // A nested call for the identity this connection is already accepting
+          // would otherwise find no receipt yet and race its own outer call.
+          if (inFlight.has(identity)) {
+            throw new Error(
+              'This external event is already being accepted by an enclosing receipt operation.',
+            );
+          }
+          const existing = db
+            .select()
+            .from(externalEventReceipts)
+            .where(externalReceiptKey(normalizedInput))
+            .get();
+          if (existing) {
+            if (existing.semanticHash !== semanticHash) {
+              return {
+                decision: 'conflict',
+                existingReceiptId: existing.id,
+              };
+            }
             return {
-              decision: 'conflict',
-              existingReceiptId: existing.id,
+              decision: 'duplicate',
+              receipt: rowToExternalEventReceipt(existing),
             };
           }
-          return {
-            decision: 'duplicate',
-            receipt: rowToExternalEventReceipt(existing),
-          };
-        }
 
-        const receiptId = externalReceiptUlid(receiptAcceptedAt.getTime());
-        const stale = !reserveExternalObjectSequence(
-          db,
-          normalizedInput,
-          receiptId,
-          receiptAcceptedAt,
-        );
-        let outcome: ExternalEventReceiptOutcome = 'stale';
-        let eventIds: string[] = [];
-        let materializedAt: Date | null = null;
-        if (!stale) {
-          inFlight.add(identity);
-          let completion: unknown;
-          try {
-            completion = operation({
-              receiptId,
-              acceptedAt: new Date(receiptAcceptedAt.getTime()),
-            });
-          } finally {
-            inFlight.delete(identity);
-          }
-          const normalized = normalizeExternalReceiptCompletion(
-            completion,
+          const receiptId = externalReceiptUlid(receiptAcceptedAt.getTime());
+          const stale = !reserveExternalObjectSequence(
+            db,
+            normalizedInput,
+            receiptId,
             receiptAcceptedAt,
           );
-          outcome = normalized.outcome;
-          eventIds = normalized.eventIds;
-          materializedAt = normalized.materializedAt;
-        }
+          let outcome: ExternalEventReceiptOutcome = 'stale';
+          let eventIds: string[] = [];
+          let materializedAt: Date | null = null;
+          if (!stale) {
+            inFlight.add(identity);
+            let completion: unknown;
+            try {
+              completion = operation({
+                receiptId,
+                acceptedAt: new Date(receiptAcceptedAt.getTime()),
+              });
+            } finally {
+              inFlight.delete(identity);
+            }
+            const normalized = normalizeExternalReceiptCompletion(
+              completion,
+              receiptAcceptedAt,
+            );
+            outcome = normalized.outcome;
+            eventIds = normalized.eventIds;
+            materializedAt = normalized.materializedAt;
+          }
 
-        db.insert(externalEventReceipts)
-          .values({
-            id: receiptId,
-            workspaceIdentity: normalizedInput.workspaceIdentity,
-            monitorId: envelope.monitorId,
-            source: envelope.source,
-            upstreamEventId: envelope.upstreamEventId,
-            semanticHash,
-            objectId: envelope.objectId,
-            objectSequence: envelope.objectSequence,
-            eventKind: envelope.eventKind,
-            changeKind: envelope.changeKind,
-            occurredAt: envelope.occurredAt,
-            outcome,
-            eventIds: JSON.stringify(eventIds),
-            acceptedAt: receiptAcceptedAt,
-            materializedAt,
-            updatedAt: receiptAcceptedAt,
-          })
-          .run();
+          db.insert(externalEventReceipts)
+            .values({
+              id: receiptId,
+              workspaceIdentity: normalizedInput.workspaceIdentity,
+              monitorId: envelope.monitorId,
+              source: envelope.source,
+              upstreamEventId: envelope.upstreamEventId,
+              semanticHash,
+              objectId: envelope.objectId,
+              objectSequence: envelope.objectSequence,
+              eventKind: envelope.eventKind,
+              changeKind: envelope.changeKind,
+              occurredAt: envelope.occurredAt,
+              outcome,
+              eventIds: JSON.stringify(eventIds),
+              acceptedAt: receiptAcceptedAt,
+              materializedAt,
+              updatedAt: receiptAcceptedAt,
+            })
+            .run();
 
-        writeCompatibilityMarker(
-          db,
-          normalizedInput.workspaceIdentity,
-          receiptAcceptedAt,
-        );
-        const inserted = db
-          .select()
-          .from(externalEventReceipts)
-          .where(eq(externalEventReceipts.id, receiptId))
-          .get();
-        if (!inserted) {
-          throw new Error('External event receipt was not persisted.');
-        }
-        return {
-          decision: 'accepted',
-          receipt: rowToExternalEventReceipt(inserted),
-        };
-      })
-      .immediate();
+          writeCompatibilityMarker(
+            db,
+            normalizedInput.workspaceIdentity,
+            receiptAcceptedAt,
+          );
+          const inserted = db
+            .select()
+            .from(externalEventReceipts)
+            .where(eq(externalEventReceipts.id, receiptId))
+            .get();
+          if (!inserted) {
+            throw new Error('External event receipt was not persisted.');
+          }
+          return {
+            decision: 'accepted',
+            receipt: rowToExternalEventReceipt(inserted),
+          };
+        })
+        .immediate();
+    } catch (error) {
+      this.lastProjectedSessionIds = previousProjectedSessionIds;
+      throw error;
+    }
   }
 
   /**
