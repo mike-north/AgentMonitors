@@ -22,6 +22,7 @@
  * @see ../../../../docs/specs/002-runtime-delivery.md §9 (delivery lifecycles)
  */
 import { mkdtempSync, rmSync } from 'node:fs';
+import type Database from 'better-sqlite3';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -270,7 +271,7 @@ describe('per-recipient cursors are monotonic (issue #298)', () => {
     expect(recipientDelta(restarted, lead, eventC)).toBe('- 1: a2\n+ 1: a3');
   });
 
-  it('same-second events order by the materialization sequence tie-break', () => {
+  it('same-second events order by the materialization sequence tie-break (older claimed last)', () => {
     const store = new RuntimeStore(createDb(freshDbPath()));
     const lead = openLead(store, 'sess-1');
 
@@ -326,5 +327,79 @@ describe('per-recipient cursors are monotonic (issue #298)', () => {
 
     const eventC = materialize(store, 'c', 'normal', at(6));
     expect(recipientDelta(store, lead, eventC)).toBe('- 1: b\n+ 1: c');
+  });
+
+  it('same-second events order by the materialization sequence tie-break (newer claimed last advances)', () => {
+    const store = new RuntimeStore(createDb(freshDbPath()));
+    const lead = openLead(store, 'sess-1');
+
+    materialize(store, 'a0', 'normal', at(0));
+    claim(store, lead, store.pendingEventsForSession(lead), 'turn-idle');
+
+    // A and B share one persisted second; B was materialized after A, so B is
+    // later in the stable order. A is claimed first, then B must still advance
+    // the cursor even though its `created_at` equals the cursor's.
+    materialize(store, 'a1', 'normal', at(5));
+    materialize(store, 'a2', 'high', at(5));
+
+    claim(
+      store,
+      lead,
+      store.pendingEventsForSession(lead, 'normal'),
+      'turn-idle',
+    );
+    claim(
+      store,
+      lead,
+      store.pendingEventsForSession(lead, 'high'),
+      'turn-interruptible',
+    );
+
+    const eventC = materialize(store, 'a3', 'normal', at(6));
+    expect(recipientDelta(store, lead, eventC)).toBe('- 1: a2\n+ 1: a3');
+  });
+
+  it('a cursor moved by a writer that does not record positions is re-read from its baseline event', () => {
+    const dbPath = freshDbPath();
+    const db = createDb(dbPath);
+    const client = (db as unknown as { $client: Database.Database }).$client;
+    const store = new RuntimeStore(db);
+    const lead = openLead(store, 'sess-1');
+
+    materialize(store, 'a0', 'normal', at(0));
+    claim(store, lead, store.pendingEventsForSession(lead), 'turn-idle');
+    materialize(store, 'a1', 'normal', at(1));
+    const eventA2 = materialize(store, 'a2', 'normal', at(2));
+    const eventA3 = materialize(store, 'a3', 'high', at(3));
+
+    // A writer from before cursors recorded positions advances the cursor to a3
+    // and leaves the stored position at a0.
+    client
+      .prepare(
+        `UPDATE session_object_cursor
+            SET baseline_snapshot_id = ?, baseline_content = ?, updated_at = ?
+          WHERE session_id = ?`,
+      )
+      .run(eventA3, 'a3', Math.floor(at(3).getTime() / 1000), lead);
+
+    // Claiming a2 (older than a3) must not move the cursor back.
+    claim(
+      store,
+      lead,
+      store
+        .pendingEventsForSession(lead, 'normal')
+        .filter((event) => event.id === eventA2),
+      'turn-idle',
+    );
+
+    const cursor = store.getSessionObjectCursor(
+      lead,
+      MONITOR_ID,
+      OBJECT_KEY,
+      WORKSPACE,
+    );
+    expect(cursor?.baselineSnapshotId).toBe(eventA3);
+    const eventC = materialize(store, 'a4', 'normal', at(4));
+    expect(recipientDelta(store, lead, eventC)).toBe('- 1: a3\n+ 1: a4');
   });
 });

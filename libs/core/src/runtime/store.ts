@@ -2225,7 +2225,9 @@ export class RuntimeStore {
    * high one, or a recap of older unread rows — leaves the cursor in place. A
    * cursor with no recorded position (seeded before the recipient's first event,
    * or written before positions were recorded and its event is gone) always
-   * advances. A `baselineSnapshotId` that names no event carries no position:
+   * advances. The stored position is first re-read from the cursor's baseline
+   * event when that event is retained, so a cursor moved by a writer that did
+   * not record positions is compared at the event it actually holds. A `baselineSnapshotId` that names no event carries no position:
    * the cursor is set to it unconditionally and its position cleared.
    */
   advanceSessionObjectCursor(input: {
@@ -2254,6 +2256,33 @@ export class RuntimeStore {
           ? isNull(sessionObjectCursor.workspacePath)
           : eq(sessionObjectCursor.workspacePath, input.workspacePath),
       );
+      // The stored position is a copy of the baseline event's position. A writer
+      // that predates the position columns can move the cursor without updating
+      // them, leaving a position older than the baseline it now holds. Re-read
+      // the position from the baseline event whenever that event is retained,
+      // so the comparison below is against the event the cursor actually stands
+      // at. Guarded on `baseline_snapshot_id` so a concurrent advance is not
+      // overwritten.
+      if (existing.baselineSnapshotId !== null) {
+        const current = this.eventOrderPosition(existing.baselineSnapshotId);
+        if (current !== null) {
+          db.update(sessionObjectCursor)
+            .set({
+              baselineEventCreatedAt: current.createdAt,
+              baselineEventSequence: current.sequence,
+            })
+            .where(
+              and(
+                key,
+                eq(
+                  sessionObjectCursor.baselineSnapshotId,
+                  existing.baselineSnapshotId,
+                ),
+              ),
+            )
+            .run();
+        }
+      }
       // The order check is part of the UPDATE's own predicate, so a concurrent
       // writer that already moved the cursor further cannot be overwritten by a
       // stale read here.

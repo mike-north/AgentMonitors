@@ -105,14 +105,17 @@ an event later in the order, and a claim of the event it already stands at chang
 per-recipient delta therefore always spans from the greatest event already surfaced, never replaying
 a change the recipient has seen. The cursor stores that event's order position
 (`baseline_event_created_at`, `baseline_event_sequence`, §15), so the comparison survives restarts and
-does not depend on the event row being retained. A cursor seeded from the state before the
+does not depend on the event row being retained. When the baseline event is retained, its position is
+re-read before each comparison, so a cursor moved by a writer that did not record positions is
+compared at the event it actually holds. A cursor seeded from the state before the
 recipient's first projected event has no position, and its first claim advances it.
 
 > Verified: `RuntimeStore.advanceSessionObjectCursor` (`libs/core/src/runtime/store.ts`) compares the
 > claimed event's position with the stored one inside the `UPDATE` predicate. Proven by
 > `libs/core/src/runtime/monotonic-cursor.test.ts` (high before normal, low and recap after newer
-> claims, repeated claims, restart between claims, equal-second tie-break, later-committed event with
-> an earlier observation time) and `libs/core/src/inbox/db.released-shapes.test.ts` (upgrade of a
+> claims, repeated claims, restart between claims, equal-second tie-break in both claim orders, later-committed event with
+> an earlier observation time, a cursor moved without its position) and
+> `libs/core/src/inbox/db.released-shapes.test.ts` (upgrade of a
 > released cursor table).
 
 This seam is what makes fan-out cheap: the expensive shared work (acquire, reduce, render, settle)

@@ -17,7 +17,8 @@ before an older `normal` one at idle, or a recap of older unread rows). The curs
 backward and the next delta replayed changes the recipient had already seen. 002 §1.1.2 now states
 that a cursor moves only to an event later in the stable event order (`created_at`, then
 `monitor_events.sequence`). The cursor stores that position in two additive columns (§15), filled on
-upgrade from its baseline event. 002 §7 now states that `firstNotifiedAt` keeps the first claim time;
+upgrade from its baseline event and re-read from that event before each comparison while it is
+retained. 002 §7 now states that `firstNotifiedAt` keeps the first claim time;
 a repeat claim updates only the last-claim fields.
 
 ## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
