@@ -128,7 +128,7 @@ describe('reading receipt status', () => {
   // id. A read whose own argument matches the empty stored value must still
   // refuse it rather than return it.
   it.each([
-    ['receipt id', 'id', (receiptId: string) => ['/workspace-a', ''] as const],
+    ['receipt id', 'id', (_receiptId: string) => ['/workspace-a', ''] as const],
     [
       'workspace identity',
       'workspace_identity',
