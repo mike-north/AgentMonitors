@@ -23,7 +23,20 @@ error. A genuine source failure fails Observation as before. What history record
 While retained work remains, a source failure recorded by the tick that retained it still fails
 Observation: a held flush retained on a failing source call records the source's row last (002
 §2.6). A retry-drain report is recognized only with a ULID retry id. 005 §6 names the limits of
-reading unmarked rows.
+reading unmarked rows. A drained tick's `triggered` row that keeps the source's own
+`no-files-matched` or `rebaselined` as `sourceOutcome` is a source outcome, not released work.
+
+## 2026-11-23 — Drained retries count in the tick's history row (002 §2.7, §15) — Refs #617
+
+A tick whose retry drain completed retained work recorded its events on the tick result but not in
+`observation_history`: the same tick's empty source span then wrote `no-change` `{ observed: 0,
+emitted: 0 }`. A tick now records one outcome row per monitor that counts the drained events. A
+later span's batch row adds them to `emitted` and becomes `triggered`; otherwise the tick records
+`triggered` `{ observed: 0, emitted: <drained count> }`. An `errored` row written in the same tick
+stays the newest. Failed drain attempts record what they did before. A watcher's drain is
+unchanged and records no batch row. When the source returned nothing and reported
+`no-files-matched` or `rebaselined` on such a tick, the `triggered` row carries it as
+`sourceOutcome`, and `monitor explain` reports it as it would the plain outcome.
 
 ## 2026-11-23 — A reminder is never delivered for a session with no unread rows (002 §9.2) — Refs #473
 

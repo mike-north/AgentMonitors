@@ -1217,6 +1217,26 @@ Each tick that leaves retained work in place reports it:
 
 Other monitors are unaffected: each monitor drains and pauses on its own outbox.
 
+**History.** The retries a tick's drain completes are that tick's emissions, and the tick records
+them in the monitor's one outcome row in `observation_history` (§15), never in a row of their own
+beside it. (Held work a notify edit releases while it is reconciled, §4.6, keeps its own
+`triggered` row, with `reason: 'notify-policy-edit'`.) When the tick goes on to admit a span (a poll result, or a held-work flush, including
+one beside a failed source call), the span's batch row counts them: `emitted` is the drained
+events plus the span's own, and the row is `triggered`. A tick whose only emissions are drained
+retries, because the source returned nothing, the monitor was not yet due, or it took no newer
+input this tick, records `triggered` `{ observed: 0, emitted: <drained count> }`. It never
+records a `no-change` span row beside separate rows for the drained retries. `triggered` wins
+over the source's own diagnostic, because events were emitted; when the source returned nothing
+and reported `no-files-matched` or `rebaselined`, the row keeps it as `sourceOutcome`, so `monitor
+explain` still diagnoses the source on that tick. When the tick also records an `errored` row for
+the monitor (a failed attempt or discard after completed ones, a terminal retry, a schedule that
+cannot be evaluated, a failed source call, a failed held flush, a blocked notify edit, or an
+ingest that throws), the drained count is recorded first, so the `errored` row stays the newest,
+as it does for a span whose later sibling fails. A failed attempt with nothing completed before it
+records only its `errored` row. `agentmonitors monitor history` therefore shows that a retried event was
+eventually emitted without reading the event log. A continuous watcher's drain is not a tick and
+writes no batch row; its events are on the event log.
+
 **Operator repair.** A terminal row leaves its state only through one of two explicit repairs
 (`AgentMonitorRuntime.rearmMaterializationRetry` / `skipMaterializationRetry`, exposed as
 `agentmonitors monitor retry rearm|skip`, [005 §6](./005-cli-reference.md)). Each names the row by
@@ -1293,7 +1313,23 @@ before a restart drained first in order, exactly once; a same-second session tha
 the retry while an earlier one does; a retained watch batch drained before the next pull; a
 restarted watcher kept closed until a tick drains its batch; held debounce work that stays held
 behind a failing or terminal retry while the source rejects, then flushes after the retry
-completes; and the fallbacks for rows and sessions without positions.
+completes; and the fallbacks for rows and sessions without positions. The same file's
+`history of a tick that drains retained work` cases cover the history rule: a drain-only tick as
+one `triggered` row counting the drained events, drained events added to the span observed after
+them, `no-change` when nothing drained or arrived, a failed attempt's lone `errored` row,
+completed retries recorded before the failure that stops the drain, a drain on a tick where the
+monitor is not due, the drained row ahead of the `errored` row of a source failure, a terminal
+retry, a schedule error and an ingest that throws, and a `no-files-matched` or `rebaselined`
+source outcome kept on the `triggered` row and diagnosed by `explainMonitor`. Its `history of a
+tick that drains retained work, then resumes a retained poll result` case drains a retry a second
+runtime on the same database queued, then admits a poll result held back by a blocked notify edit
+(§4.6), and records one `triggered` row counting both. Its `held work
+waits behind retained work while the source fails` cases count the drained retry in the held
+flush row written beside a source failure, and record it ahead of a failed held flush and a
+blocked notify edit. `verify-artifact-ownership-retry-drain.test.ts` records it ahead of a failed
+discard.
+`libs/core/src/runtime/atomic-ingest-retry.test.ts` (`retry Interpret after restart`) checks the
+same single row after a restart, for each fault in the admission matrix.
 `libs/core/src/inbox/db.released-shapes.test.ts` opens every released `agent_sessions` shape.
 
 ### 2.8 Verify-artifact ownership (_current_)
@@ -3390,7 +3426,7 @@ This is a documented one-time transition, not a per-tick behavior.
 
 An audit trail of each due monitor's outcome per tick. For every evaluated monitor the runtime writes a row with `monitorId`, `sourceName`, `observationData`, and `result`. The `result` values are:
 
-- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations). `observationData` is `{ observed, emitted }`, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2), and `notHeld` (a positive integer) when a hold refused some of the span's observations (§4.7).
+- `triggered` — ≥1 event was emitted (including a tick that flushes a previously-held debounce batch even when it returned no new observations, and a tick whose retained-work drain completed retries, whose events count in `emitted`; see §2.7 **History**). `observationData` is `{ observed, emitted }`, plus `sourceOutcome` (`no-files-matched` or `rebaselined`) when the source returned no observations and reported that outcome on a tick whose events came from retained or held work, plus `notRetainedCount` (a positive integer) when the span dropped observations the outbox could not retain (§2), and `notHeld` (a positive integer) when a hold refused some of the span's observations (§4.7).
 - `suppressed` — observations were returned but none emitted this tick (throttled or held in a debounce batch). `observationData` is `{ observed, emitted }`, plus `notHeld: <n>` when a hold refused some of the observations (§4.7). Refused observations count in `observed`, carry their own `errored` drop rows, and are not what makes the span `suppressed`; a span whose only observations were refused writes no batch row. `notHeld` stays separate from `notRetainedCount` (§4.7), but either one marks a span that dropped observations, so its row supersedes no drop (§2).
 - `no-change` — the source returned no observations and signalled no special outcome. `observationData` is `{ observed: 0, emitted: 0 }`.
 - `no-files-matched` — the source returned zero observations and signalled that its file-system scope matched zero files. This is distinct from `no-change` because no watched target was actually observed. `observationData` is `{ observed: 0, emitted: 0 }`.

@@ -23,10 +23,12 @@ import type { ObservationHistoryRecord, ObservationOutcome } from './types.js';
  * - `source-outcome` — what a source call produced: a span's batch row
  *   (`triggered` with observations, `suppressed`, `no-change`,
  *   `no-files-matched`, `rebaselined`) or an `errored` row with none of the
- *   markers below. The Observation stage reads it.
- * - `released-work` — a `triggered` row with `observed: 0`: held notify work
- *   flushed, or retained work drained, with no new source input (002 §2.6,
- *   §2.7). Work was materialized; nothing is missing.
+ *   markers below, or a drained tick's `triggered` row that keeps the
+ *   source's own `no-files-matched` or `rebaselined` as `sourceOutcome`
+ *   (002 §15). The Observation stage reads it.
+ * - `released-work` — any other `triggered` row with `observed: 0`: held
+ *   notify work flushed, or retained work drained, with no new source input
+ *   (002 §2.6, §2.7). Work was materialized; nothing is missing.
  * - `admission-loss` — an observation a span dispatched but could not keep:
  *   the outbox could not retain it (`notRetained`) or a hold refused it
  *   (`holdRefused`) (002 §2, §4.7). The source call succeeded. Materialization
@@ -132,7 +134,12 @@ export function classifyHistoryRow(
   }
   if (!isSourceBatchOutcome(row.result)) return 'unrecognized';
   if (row.result === 'triggered' && data['observed'] === 0) {
-    return 'released-work';
+    // The drained tick's source still reported its own outcome (002 §15).
+    const sourceOutcome = data['sourceOutcome'];
+    return sourceOutcome === 'no-files-matched' ||
+      sourceOutcome === 'rebaselined'
+      ? 'source-outcome'
+      : 'released-work';
   }
   return 'source-outcome';
 }

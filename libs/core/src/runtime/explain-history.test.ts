@@ -57,6 +57,29 @@ describe('classifyHistoryRow', () => {
     ).toBe('released-work');
   });
 
+  it.each(['no-files-matched', 'rebaselined'])(
+    'a drained triggered row that keeps the source outcome %s is a source outcome (002 §15)',
+    (sourceOutcome) => {
+      expect(
+        classifyHistoryRow(
+          row('triggered', { observed: 0, emitted: 1, sourceOutcome }),
+        ),
+      ).toBe('source-outcome');
+    },
+  );
+
+  it('a drained triggered row with an unknown sourceOutcome is still released work', () => {
+    expect(
+      classifyHistoryRow(
+        row('triggered', {
+          observed: 0,
+          emitted: 1,
+          sourceOutcome: 'no-change',
+        }),
+      ),
+    ).toBe('released-work');
+  });
+
   it.each([
     [
       'an outbox drop',
