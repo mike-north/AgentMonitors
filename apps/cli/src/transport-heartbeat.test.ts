@@ -13,7 +13,7 @@ import {
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CHANNEL_HEARTBEAT_TTL_MS,
   HOOK_HEARTBEAT_TTL_MS,
@@ -36,11 +36,47 @@ import {
  * Transport heartbeat persistence (issue #425).
  *
  * These run against a REAL filesystem under an isolated `XDG_DATA_HOME` rather
- * than a mocked `fs`: the whole point of the record is that a separate process
+ * than an in-memory `fs`: the whole point of the record is that a separate process
  * (`doctor`) can read what another process (`channel serve` / `hook deliver`)
  * wrote, so a mock that never exercises the shared path, the atomic rename, or
  * the JSON round-trip would prove nothing about the property under test.
  */
+
+/** One-shot scheduling points; all filesystem operations still execute for real. */
+const interleaving = vi.hoisted(
+  (): {
+    afterStat?: () => void;
+    afterRead?: () => void;
+    beforeLink?: () => void;
+  } => ({}),
+);
+
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  return {
+    ...fs,
+    statSync: (...args: Parameters<typeof fs.statSync>) => {
+      const result = fs.statSync(...args);
+      const callback = interleaving.afterStat;
+      delete interleaving.afterStat;
+      callback?.();
+      return result;
+    },
+    readFileSync: (...args: Parameters<typeof fs.readFileSync>) => {
+      const result = fs.readFileSync(...args);
+      const callback = interleaving.afterRead;
+      delete interleaving.afterRead;
+      callback?.();
+      return result;
+    },
+    linkSync: (...args: Parameters<typeof fs.linkSync>) => {
+      const callback = interleaving.beforeLink;
+      delete interleaving.beforeLink;
+      callback?.();
+      return fs.linkSync(...args);
+    },
+  };
+});
 
 let dataHome: string;
 let previousDataHome: string | undefined;
@@ -52,6 +88,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  delete interleaving.afterStat;
+  delete interleaving.afterRead;
+  delete interleaving.beforeLink;
   if (previousDataHome === undefined) {
     delete process.env['XDG_DATA_HOME'];
   } else {
@@ -62,6 +101,94 @@ afterEach(() => {
 
 const WORKSPACE = '/repos/agentmonitors';
 const SOCKET = '/tmp/agentmonitors-test.sock';
+
+describe('heartbeat cleanup preserves concurrent refreshes', () => {
+  it.each(['unreadable', 'stale-valid'] as const)(
+    'retains a fresh replacement of a %s candidate',
+    (kind) => {
+      const now = new Date();
+      const old = new Date(
+        now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+      );
+      const input = {
+        transport: 'channel' as const,
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      };
+      writeTransportHeartbeat({ ...input, now: old });
+      const [name] = readdirSync(transportRegistryDir());
+      if (name === undefined) throw new Error('missing heartbeat');
+      const file = path.join(transportRegistryDir(), name);
+      if (kind === 'unreadable') {
+        writeFileSync(file, '{"schemaVersion":0}');
+        utimesSync(file, old, old);
+      }
+
+      const refresh = vi.fn(() => {
+        const fresh = writeTransportHeartbeat({ ...input, now });
+        expect(canReadHeartbeatRecord(fresh)).toBe(true);
+        expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(fresh);
+      });
+      // Unreadable expiry uses stat; readable expiry uses the parsed lease.
+      // Refresh after that evidence is captured, before cleanup can remove it.
+      if (kind === 'unreadable') interleaving.afterStat = refresh;
+      else interleaving.afterRead = refresh;
+
+      reapExpiredHeartbeats(now);
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(existsSync(file)).toBe(true);
+      expect(readTransportHeartbeats()[0]?.updatedAt).toBe(now.toISOString());
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+    },
+  );
+
+  it('restores without overwriting a newer heartbeat and hides private candidates from readers', () => {
+    const now = new Date();
+    const old = new Date(
+      now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+    );
+    const input = {
+      transport: 'channel' as const,
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+    };
+    writeTransportHeartbeat({ ...input, now: old });
+    const [name] = readdirSync(transportRegistryDir());
+    if (name === undefined) throw new Error('missing heartbeat');
+    const file = path.join(transportRegistryDir(), name);
+    writeFileSync(file, '{"schemaVersion":0}');
+    utimesSync(file, old, old);
+    interleaving.afterStat = () => {
+      expect(writeTransportHeartbeat({ ...input, now })).toBeDefined();
+    };
+    const newest = new Date(now.getTime() + 1000);
+    const publishNewer = vi.fn(() => {
+      // The fresh inode moved aside for rechecking must be invisible to both
+      // registry readers and another writer's opportunistic cleanup.
+      const [privateName] = readdirSync(transportRegistryDir());
+      expect(privateName).toMatch(/\.json\..+\.reap$/);
+      if (privateName === undefined)
+        throw new Error('missing private candidate');
+      expect(readTransportHeartbeatsResult()).toEqual({
+        records: [],
+        newerSchemaPresent: false,
+        readFailed: false,
+      });
+      expect(writeTransportHeartbeat({ ...input, now: newest })).toBeDefined();
+      expect(existsSync(path.join(transportRegistryDir(), privateName))).toBe(
+        true,
+      );
+    });
+    interleaving.beforeLink = publishNewer;
+
+    reapExpiredHeartbeats(now);
+
+    expect(publishNewer).toHaveBeenCalledTimes(1);
+    expect(readTransportHeartbeats()[0]?.updatedAt).toBe(newest.toISOString());
+    expect(readdirSync(transportRegistryDir())).toEqual([name]);
+  });
+});
 
 describe('unreadable heartbeat retention', () => {
   it('allows at least two hook leases before discarding unreadable evidence', () => {

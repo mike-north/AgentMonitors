@@ -1,5 +1,12 @@
-import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  linkSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { writePrivateFileAtomic } from '@agentmonitors/core';
@@ -69,6 +76,7 @@ import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
  * records are skipped, while newer versions also produce a health advisory.
  * No read migrates or deletes files. Write-path cleanup retains all unreadable
  * records until their mtime age exceeds {@link UNREADABLE_HEARTBEAT_REAP_AGE_MS}.
+ * Cleanup rechecks the isolated file and preserves concurrent replacements.
  */
 export const TRANSPORT_HEARTBEAT_SCHEMA_VERSION = 1;
 
@@ -147,6 +155,8 @@ export const HOOK_HEARTBEAT_TTL_MS = 24 * 60 * 60 * 1000;
  * Retain unreadable evidence for two hook leases before write-path cleanup.
  * Uninterpretable payloads cannot supply a trusted timestamp or lease; their
  * filesystem mtime is the retention clock, including after a schema bump.
+ * Expiry applies only to the isolated file rechecked by cleanup, never to a
+ * concurrent replacement at its original path.
  * @internal
  */
 export const UNREADABLE_HEARTBEAT_REAP_AGE_MS = 2 * HOOK_HEARTBEAT_TTL_MS;
@@ -591,25 +601,60 @@ export function reapExpiredHeartbeats(now: Date): void {
     if (!name.endsWith('.json')) continue;
     const filePath = path.join(transportRegistryDir(), name);
     try {
-      const content = readFileSync(filePath, 'utf-8');
-      let parsed: unknown;
+      if (!heartbeatFileExpired(filePath, now)) continue;
+      // Only the private inode is eligible for deletion. Atomic writers can
+      // replace the public path before or after this rename; rechecking the
+      // moved file protects a refresh captured by the rename, while subsequent
+      // writes cannot replace our unique, non-record (.reap) pathname.
+      const privatePath = `${filePath}.${randomUUID()}.reap`;
+      renameSync(filePath, privatePath);
+      let expired = false;
       try {
-        parsed = JSON.parse(content);
+        expired = heartbeatFileExpired(privatePath, now);
       } catch {
-        // Invalid JSON and unreadable payloads share the mtime retention rule.
-        parsed = undefined;
+        // A failed recheck provides no authority to discard this evidence.
       }
-      const expired = canReadHeartbeatRecord(parsed)
-        ? isHeartbeatStale(parsed, now)
-        : now.getTime() - statSync(filePath).mtimeMs >
-          UNREADABLE_HEARTBEAT_REAP_AGE_MS;
-      if (expired) {
-        rmSync(filePath, { force: true });
+      if (!expired) {
+        try {
+          // Publishing with link is no-clobber: a writer that has filled the
+          // public path wins. Rename here would overwrite that newer record.
+          linkSync(privatePath, filePath);
+        } catch (error) {
+          if (
+            typeof error !== 'object' ||
+            error === null ||
+            !('code' in error) ||
+            error.code !== 'EEXIST'
+          ) {
+            // Retain the private file if restoration failed for another reason.
+            continue;
+          }
+        }
       }
+      rmSync(privatePath, { force: true });
     } catch {
       continue;
     }
   }
+}
+
+/**
+ * Judge one file by its compatible lease or, for unreadable content, its mtime.
+ * Callers must isolate the file before relying on this decision for deletion.
+ */
+function heartbeatFileExpired(filePath: string, now: Date): boolean {
+  const content = readFileSync(filePath, 'utf-8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    // Invalid JSON and unreadable payloads share the mtime retention rule.
+    parsed = undefined;
+  }
+  return canReadHeartbeatRecord(parsed)
+    ? isHeartbeatStale(parsed, now)
+    : now.getTime() - statSync(filePath).mtimeMs >
+        UNREADABLE_HEARTBEAT_REAP_AGE_MS;
 }
 
 /**

@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Heartbeat cleanup preserves concurrent refreshes (006 §12.9) — Refs #463
+
+Cleanup rechecks expired candidates under unique private names before deletion, for both compatible
+leases and unreadable mtime retention. A fresh file captured by the move is restored without
+overwriting a concurrent write. Registry scans exclude private cleanup files as well as write temps.
+Real-filesystem regressions cover replacement during each expiry decision and restoration contention.
+
 ## 2026-11-25 — Heartbeat format retention and diagnostics (006 §12.9) — Refs #463
 
 Heartbeat interpretation uses one shape-and-version predicate. Write-path cleanup removes

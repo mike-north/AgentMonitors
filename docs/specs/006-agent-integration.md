@@ -1986,11 +1986,15 @@ is attached, even after the session it serves has gone dormant. The reaping cont
 registry reads and cleanup. Older versions, newer versions and malformed shapes are not interpreted;
 invalid JSON is likewise unreadable. Readers perform no migration or deletion.
 
-Both paths scan registry filenames ending in `.json`; atomic-write `.tmp` files are excluded.
+Both paths scan registry filenames ending in `.json`; atomic-write `.tmp` files and cleanup's
+private `.reap` files are excluded.
 On the write path, readable records expire according to their own `updatedAt` and `ttlMs` lease.
 Unreadable files expire only when their filesystem mtime age is strictly greater than
 `UNREADABLE_HEARTBEAT_REAP_AGE_MS` (48 hours, twice `HOOK_HEARTBEAT_TTL_MS`). Their payload's
 timestamps and lease fields cannot establish retention. Files exactly at the boundary are retained.
+Cleanup moves each expired candidate to a unique private name in the same directory and rechecks
+that file before deleting it. A fresh record captured by the move is restored without overwriting
+an intervening write; concurrent replacements at the public record path are preserved.
 
 A parsed JSON object with an integer schema version greater than this CLI's version produces
 `[heartbeat-newer-schema]`: a transport using a newer record format is present, but this CLI cannot
