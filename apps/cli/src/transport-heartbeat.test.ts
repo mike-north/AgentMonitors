@@ -45,9 +45,10 @@ import {
 /** One-shot scheduling points; all filesystem operations still execute for real. */
 const interleaving = vi.hoisted(
   (): {
-    afterStat?: () => void;
-    afterRead?: () => void;
-    beforeLink?: () => void;
+    afterIdentity?: () => void;
+    afterLstat?: () => void;
+    beforeRemove?: () => void;
+    zeroInode?: boolean;
   } => ({}),
 );
 
@@ -55,25 +56,27 @@ vi.mock('node:fs', async (importOriginal) => {
   const fs = await importOriginal<typeof import('node:fs')>();
   return {
     ...fs,
-    statSync: (...args: Parameters<typeof fs.statSync>) => {
-      const result = fs.statSync(...args);
-      const callback = interleaving.afterStat;
-      delete interleaving.afterStat;
+    fstatSync: (...args: Parameters<typeof fs.fstatSync>) => {
+      const result = fs.fstatSync(...args);
+      const identity = interleaving.zeroInode ? { ...result, ino: 0 } : result;
+      const callback = interleaving.afterIdentity;
+      delete interleaving.afterIdentity;
       callback?.();
-      return result;
+      return identity;
     },
-    readFileSync: (...args: Parameters<typeof fs.readFileSync>) => {
-      const result = fs.readFileSync(...args);
-      const callback = interleaving.afterRead;
-      delete interleaving.afterRead;
+    lstatSync: (...args: Parameters<typeof fs.lstatSync>) => {
+      const result = fs.lstatSync(...args);
+      const identity = interleaving.zeroInode ? { ...result, ino: 0 } : result;
+      const callback = interleaving.afterLstat;
+      delete interleaving.afterLstat;
       callback?.();
-      return result;
+      return identity;
     },
-    linkSync: (...args: Parameters<typeof fs.linkSync>) => {
-      const callback = interleaving.beforeLink;
-      delete interleaving.beforeLink;
+    rmSync: (...args: Parameters<typeof fs.rmSync>) => {
+      const callback = interleaving.beforeRemove;
+      delete interleaving.beforeRemove;
       callback?.();
-      return fs.linkSync(...args);
+      return fs.rmSync(...args);
     },
   };
 });
@@ -88,9 +91,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  delete interleaving.afterStat;
-  delete interleaving.afterRead;
-  delete interleaving.beforeLink;
+  delete interleaving.afterIdentity;
+  delete interleaving.afterLstat;
+  delete interleaving.beforeRemove;
+  delete interleaving.zeroInode;
   if (previousDataHome === undefined) {
     delete process.env['XDG_DATA_HOME'];
   } else {
@@ -102,7 +106,7 @@ afterEach(() => {
 const WORKSPACE = '/repos/agentmonitors';
 const SOCKET = '/tmp/agentmonitors-test.sock';
 
-describe('heartbeat cleanup preserves concurrent refreshes', () => {
+describe('identity-checked heartbeat cleanup', () => {
   it.each(['unreadable', 'stale-valid'] as const)(
     'retains a fresh replacement of a %s candidate',
     (kind) => {
@@ -124,26 +128,114 @@ describe('heartbeat cleanup preserves concurrent refreshes', () => {
         utimesSync(file, old, old);
       }
 
-      const refresh = vi.fn(() => {
-        const fresh = writeTransportHeartbeat({ ...input, now });
-        expect(canReadHeartbeatRecord(fresh)).toBe(true);
-        expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual(fresh);
-      });
-      // Unreadable expiry uses stat; readable expiry uses the parsed lease.
-      // Refresh after that evidence is captured, before cleanup can remove it.
-      if (kind === 'unreadable') interleaving.afterStat = refresh;
-      else interleaving.afterRead = refresh;
+      const refresh = vi.fn(() => writeTransportHeartbeat({ ...input, now }));
+      // Publishing after fstat must not change the descriptor's identity or
+      // payload, but the final path check must notice the different file.
+      interleaving.afterIdentity = refresh;
 
       reapExpiredHeartbeats(now);
 
       expect(refresh).toHaveBeenCalledTimes(1);
+      expect(canReadHeartbeatRecord(refresh.mock.results[0]?.value)).toBe(true);
       expect(existsSync(file)).toBe(true);
       expect(readTransportHeartbeats()[0]?.updatedAt).toBe(now.toISOString());
       expect(readdirSync(transportRegistryDir())).toEqual([name]);
     },
   );
 
-  it('restores without overwriting a newer heartbeat and hides private candidates from readers', () => {
+  it.each([
+    { kind: 'unreadable', zeroInode: false },
+    { kind: 'stale-valid', zeroInode: false },
+    { kind: 'unreadable', zeroInode: true },
+    { kind: 'stale-valid', zeroInode: true },
+  ])(
+    'leaves only the original $kind file after an unlink failure and reaps it on a later pass (zero inode: $zeroInode)',
+    ({ kind, zeroInode }) => {
+      const now = new Date();
+      const old = new Date(
+        now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+      );
+      writeTransportHeartbeat({
+        transport: 'channel',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now: old,
+      });
+      const [name] = readdirSync(transportRegistryDir());
+      if (name === undefined) throw new Error('missing heartbeat');
+      const file = path.join(transportRegistryDir(), name);
+      if (kind === 'unreadable') {
+        writeFileSync(file, '{"schemaVersion":0}');
+        utimesSync(file, old, old);
+      }
+      interleaving.zeroInode = zeroInode;
+      const failUnlink = vi.fn(() => {
+        throw new Error('injected unlink failure');
+      });
+      interleaving.beforeRemove = failUnlink;
+
+      expect(() => reapExpiredHeartbeats(now)).not.toThrow();
+
+      expect(failUnlink).toHaveBeenCalledTimes(1);
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+      reapExpiredHeartbeats(now);
+      expect(readdirSync(transportRegistryDir())).toEqual([]);
+    },
+  );
+
+  it.each(['inode', 'size', 'mtime'] as const)(
+    'detects a changed %s independently of the other identity fields',
+    (changed) => {
+      const now = new Date();
+      const input = {
+        transport: 'channel' as const,
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      };
+      writeTransportHeartbeat({
+        ...input,
+        now: new Date(now.getTime() - CHANNEL_HEARTBEAT_TTL_MS - 1000),
+      });
+      const [name] = readdirSync(transportRegistryDir());
+      if (name === undefined) throw new Error('missing heartbeat');
+      const file = path.join(transportRegistryDir(), name);
+      utimesSync(file, new Date(0), new Date(0));
+      const originalIdentity = statSync(file);
+      // Meaningful inode numbers distinguish equal-size/equal-mtime writes;
+      // filesystems without them must still check both remaining fields.
+      interleaving.zeroInode = changed !== 'inode';
+      const refresh = vi.fn(() => {
+        writeTransportHeartbeat({ ...input, now });
+        if (changed === 'size') {
+          writeFileSync(file, `${readFileSync(file, 'utf8')} `);
+        }
+        if (changed !== 'mtime') {
+          utimesSync(file, new Date(0), new Date(0));
+        }
+      });
+      interleaving.afterIdentity = refresh;
+
+      reapExpiredHeartbeats(now);
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+      expect(readTransportHeartbeats()[0]?.updatedAt).toBe(now.toISOString());
+      if (changed === 'size') {
+        expect(statSync(file).size).toBe(originalIdentity.size + 1);
+        expect(statSync(file).mtimeMs).toBe(0);
+      } else {
+        expect(statSync(file).size).toBe(originalIdentity.size);
+        if (changed === 'inode') {
+          expect(statSync(file).mtimeMs).toBe(0);
+          expect(statSync(file).ino).not.toBe(originalIdentity.ino);
+        } else {
+          expect(statSync(file).mtimeMs).toBeGreaterThan(0);
+        }
+      }
+    },
+  );
+
+  it('recreates a heartbeat on its next write after replacement in the final unlink window', () => {
     const now = new Date();
     const old = new Date(
       now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
@@ -159,33 +251,21 @@ describe('heartbeat cleanup preserves concurrent refreshes', () => {
     const file = path.join(transportRegistryDir(), name);
     writeFileSync(file, '{"schemaVersion":0}');
     utimesSync(file, old, old);
-    interleaving.afterStat = () => {
-      expect(writeTransportHeartbeat({ ...input, now })).toBeDefined();
-    };
-    const newest = new Date(now.getTime() + 1000);
-    const publishNewer = vi.fn(() => {
-      // The fresh inode moved aside for rechecking must be invisible to both
-      // registry readers and another writer's opportunistic cleanup.
-      const [privateName] = readdirSync(transportRegistryDir());
-      expect(privateName).toMatch(/\.json\..+\.reap$/);
-      if (privateName === undefined)
-        throw new Error('missing private candidate');
-      expect(readTransportHeartbeatsResult()).toEqual({
-        records: [],
-        newerSchemaPresent: false,
-        readFailed: false,
-      });
-      expect(writeTransportHeartbeat({ ...input, now: newest })).toBeDefined();
-      expect(existsSync(path.join(transportRegistryDir(), privateName))).toBe(
-        true,
-      );
-    });
-    interleaving.beforeLink = publishNewer;
+    const refresh = vi.fn(() => writeTransportHeartbeat({ ...input, now }));
+    // lstat and unlink are distinct operations. This intentionally exercises
+    // the remaining window rather than claiming the check makes them atomic.
+    interleaving.afterLstat = refresh;
 
     reapExpiredHeartbeats(now);
 
-    expect(publishNewer).toHaveBeenCalledTimes(1);
-    expect(readTransportHeartbeats()[0]?.updatedAt).toBe(newest.toISOString());
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(canReadHeartbeatRecord(refresh.mock.results[0]?.value)).toBe(true);
+    expect(readdirSync(transportRegistryDir())).toEqual([]);
+    const nextWrite = new Date(now.getTime() + CHANNEL_HEARTBEAT_TTL_MS / 3);
+    expect(writeTransportHeartbeat({ ...input, now: nextWrite })).toBeDefined();
+    expect(readTransportHeartbeats()[0]?.updatedAt).toBe(
+      nextWrite.toISOString(),
+    );
     expect(readdirSync(transportRegistryDir())).toEqual([name]);
   });
 });

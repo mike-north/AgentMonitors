@@ -1981,20 +1981,33 @@ is attached, even after the session it serves has gone dormant. The reaping cont
 
 ### 12.9 Schema versions and unreadable records (_current_)
 
+> Verified: `apps/cli/src/transport-heartbeat.ts` (`canReadHeartbeatRecord`,
+> `reapHeartbeatFileIfExpired`, `UNREADABLE_HEARTBEAT_REAP_AGE_MS`);
+> `apps/cli/src/transport-heartbeat.test.ts` ("identity-checked heartbeat cleanup",
+> "unreadable heartbeat retention"); `apps/cli/src/transport-health.test.ts`;
+> `apps/cli/src/commands/transport-health.integration.test.ts` ("keeps unreadable files and reports
+> newer formats without changing exit status", "keeps newer-schema diagnostics advisory with an
+> active lead session").
+
 `TRANSPORT_HEARTBEAT_SCHEMA_VERSION` changes only for incompatible field changes. On a bump,
 `canReadHeartbeatRecord` remains the single shape-and-version interpretation predicate used by
 registry reads and cleanup. Older versions, newer versions and malformed shapes are not interpreted;
 invalid JSON is likewise unreadable. Readers perform no migration or deletion.
 
-Both paths scan registry filenames ending in `.json`; atomic-write `.tmp` files and cleanup's
-private `.reap` files are excluded.
+Both paths scan registry filenames ending in `.json`; atomic-write `.tmp` files are excluded.
 On the write path, readable records expire according to their own `updatedAt` and `ttlMs` lease.
 Unreadable files expire only when their filesystem mtime age is strictly greater than
 `UNREADABLE_HEARTBEAT_REAP_AGE_MS` (48 hours, twice `HOOK_HEARTBEAT_TTL_MS`). Their payload's
 timestamps and lease fields cannot establish retention. Files exactly at the boundary are retained.
-Cleanup moves each expired candidate to a unique private name in the same directory and rechecks
-that file before deleting it. A fresh record captured by the move is restored without overwriting
-an intervening write; concurrent replacements at the public record path are preserved.
+Cleanup reads each candidate through an open descriptor and obtains its device, inode, size and
+mtime from `fstat`. An expired file is unlinked only if a final `lstat` of its path matches that
+identity; if either inode number is zero, size and mtime provide the fallback comparison. A changed
+identity defers cleanup to a later pass. Cleanup creates no files and does not rename records.
+
+The final path check and unlink are separate filesystem operations. A writer publishing in that
+gap can have its new heartbeat removed; the transport's next heartbeat write recreates the record.
+This bounded absence is part of the cleanup contract, rather than a guarantee of synchronization
+with writers. Unlink errors leave the original record in place for a subsequent cleanup attempt.
 
 A parsed JSON object with an integer schema version greater than this CLI's version produces
 `[heartbeat-newer-schema]`: a transport using a newer record format is present, but this CLI cannot

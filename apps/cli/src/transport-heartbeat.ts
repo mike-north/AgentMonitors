@@ -1,11 +1,12 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import {
-  linkSync,
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
   readFileSync,
   readdirSync,
-  renameSync,
   rmSync,
-  statSync,
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -76,7 +77,8 @@ import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
  * records are skipped, while newer versions also produce a health advisory.
  * No read migrates or deletes files. Write-path cleanup retains all unreadable
  * records until their mtime age exceeds {@link UNREADABLE_HEARTBEAT_REAP_AGE_MS}.
- * Cleanup rechecks the isolated file and preserves concurrent replacements.
+ * Cleanup checks the opened file's identity against the path before unlinking;
+ * this check does not synchronize concurrent writers (see {@link reapHeartbeatFileIfExpired}).
  */
 export const TRANSPORT_HEARTBEAT_SCHEMA_VERSION = 1;
 
@@ -155,8 +157,8 @@ export const HOOK_HEARTBEAT_TTL_MS = 24 * 60 * 60 * 1000;
  * Retain unreadable evidence for two hook leases before write-path cleanup.
  * Uninterpretable payloads cannot supply a trusted timestamp or lease; their
  * filesystem mtime is the retention clock, including after a schema bump.
- * Expiry applies only to the isolated file rechecked by cleanup, never to a
- * concurrent replacement at its original path.
+ * Cleanup reads mtime from the opened file and checks path identity before
+ * unlinking; it creates no additional registry files.
  * @internal
  */
 export const UNREADABLE_HEARTBEAT_REAP_AGE_MS = 2 * HOOK_HEARTBEAT_TTL_MS;
@@ -562,8 +564,8 @@ export function readTransportHeartbeatsResult(): ReadTransportHeartbeatsResult {
  * A thin, contract-unchanged wrapper over
  * {@link readTransportHeartbeatsResult} for callers that are fine treating a
  * registry-level read failure the same as "no transports". Diagnostic callers
- * use the richer result to preserve newer-format evidence. The reaper calls
- * {@link readTransportHeartbeatsResult} directly instead.
+ * use the richer result to preserve newer-format evidence. Cleanup reads files
+ * separately so it can also age unreadable payloads by their filesystem mtime.
  */
 export function readTransportHeartbeats(): TransportHeartbeat[] {
   return readTransportHeartbeatsResult().records;
@@ -601,37 +603,7 @@ export function reapExpiredHeartbeats(now: Date): void {
     if (!name.endsWith('.json')) continue;
     const filePath = path.join(transportRegistryDir(), name);
     try {
-      if (!heartbeatFileExpired(filePath, now)) continue;
-      // Only the private inode is eligible for deletion. Atomic writers can
-      // replace the public path before or after this rename; rechecking the
-      // moved file protects a refresh captured by the rename, while subsequent
-      // writes cannot replace our unique, non-record (.reap) pathname.
-      const privatePath = `${filePath}.${randomUUID()}.reap`;
-      renameSync(filePath, privatePath);
-      let expired = false;
-      try {
-        expired = heartbeatFileExpired(privatePath, now);
-      } catch {
-        // A failed recheck provides no authority to discard this evidence.
-      }
-      if (!expired) {
-        try {
-          // Publishing with link is no-clobber: a writer that has filled the
-          // public path wins. Rename here would overwrite that newer record.
-          linkSync(privatePath, filePath);
-        } catch (error) {
-          if (
-            typeof error !== 'object' ||
-            error === null ||
-            !('code' in error) ||
-            error.code !== 'EEXIST'
-          ) {
-            // Retain the private file if restoration failed for another reason.
-            continue;
-          }
-        }
-      }
-      rmSync(privatePath, { force: true });
+      reapHeartbeatFileIfExpired(filePath, now);
     } catch {
       continue;
     }
@@ -639,22 +611,49 @@ export function reapExpiredHeartbeats(now: Date): void {
 }
 
 /**
- * Judge one file by its compatible lease or, for unreadable content, its mtime.
- * Callers must isolate the file before relying on this decision for deletion.
+ * Read and age one opened file, then check that its path still names the same
+ * generation before unlinking. The descriptor pins the judged inode while
+ * atomic writers publish different inodes. Filesystems reporting inode zero
+ * use size and mtime as the available generation evidence.
+ *
+ * This is a best-effort check, not a writer lock: publication after lstat but
+ * before rmSync can still lose that heartbeat until its next write. Cleanup
+ * neither moves records nor creates artifacts that need later recovery; a
+ * failed unlink leaves the original path available to subsequent passes.
  */
-function heartbeatFileExpired(filePath: string, now: Date): boolean {
-  const content = readFileSync(filePath, 'utf-8');
-  let parsed: unknown;
+function reapHeartbeatFileIfExpired(filePath: string, now: Date): void {
+  const fd = openSync(filePath, 'r');
   try {
-    parsed = JSON.parse(content);
-  } catch {
-    // Invalid JSON and unreadable payloads share the mtime retention rule.
-    parsed = undefined;
+    const identity = fstatSync(fd);
+    const content = readFileSync(fd, 'utf-8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      // Invalid JSON and unreadable payloads share the mtime retention rule.
+      parsed = undefined;
+    }
+    const expired = canReadHeartbeatRecord(parsed)
+      ? isHeartbeatStale(parsed, now)
+      : now.getTime() - identity.mtimeMs > UNREADABLE_HEARTBEAT_REAP_AGE_MS;
+    if (!expired) {
+      return;
+    }
+
+    const current = lstatSync(filePath);
+    if (
+      identity.size !== current.size ||
+      identity.mtimeMs !== current.mtimeMs ||
+      (identity.ino !== 0 &&
+        current.ino !== 0 &&
+        (identity.dev !== current.dev || identity.ino !== current.ino))
+    ) {
+      return;
+    }
+    rmSync(filePath, { force: true });
+  } finally {
+    closeSync(fd);
   }
-  return canReadHeartbeatRecord(parsed)
-    ? isHeartbeatStale(parsed, now)
-    : now.getTime() - statSync(filePath).mtimeMs >
-        UNREADABLE_HEARTBEAT_REAP_AGE_MS;
 }
 
 /**

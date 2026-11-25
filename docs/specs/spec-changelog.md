@@ -9,12 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
-## 2026-11-25 — Heartbeat cleanup preserves concurrent refreshes (006 §12.9) — Refs #463
+## 2026-11-25 — Heartbeat cleanup checks file identity (006 §12.9) — Refs #463
 
-Cleanup rechecks expired candidates under unique private names before deletion, for both compatible
-leases and unreadable mtime retention. A fresh file captured by the move is restored without
-overwriting a concurrent write. Registry scans exclude private cleanup files as well as write temps.
-Real-filesystem regressions cover replacement during each expiry decision and restoration contention.
+Cleanup reads lease or retention evidence through a descriptor and compares its file identity with
+the path immediately before unlinking. Changed identities are left for a later pass; no cleanup
+files are created. The final check and unlink are not atomic, so a publication in that window can
+remain absent until the next heartbeat write. Real-filesystem tests cover replacement detection,
+zero-inode fallback, unlink failure and next-write recovery. §12.9 names the verifying code and tests.
 
 ## 2026-11-25 — Heartbeat format retention and diagnostics (006 §12.9) — Refs #463
 

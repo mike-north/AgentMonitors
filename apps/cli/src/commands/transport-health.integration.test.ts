@@ -286,6 +286,59 @@ describe('doctor delivery-transport health (issue #425)', () => {
     expect(result.exitCode).toBe(baseline.exitCode);
     for (const file of files) expect(existsSync(file)).toBe(true);
   });
+  it('keeps newer-schema diagnostics advisory with an active lead session', async () => {
+    const fixture = transportFixture('schema-lead');
+    const daemon = await startDaemon(
+      fixture.monitorsRoot,
+      fixture.dir,
+      fixture.env,
+      fixture.socketPath,
+    );
+    try {
+      openLeadSession(fixture);
+      const args = ['doctor', '--workspace', fixture.dir, '--format', 'json'];
+      const baseline = runWithEnv(args, fixture.env, fixture.dir);
+      expect(baseline.exitCode).toBe(0);
+      const registry = path.join(
+        fixture.dataHome,
+        'agentmonitors',
+        'transports',
+      );
+      mkdirSync(registry, { recursive: true });
+      const file = path.join(registry, 'channel-newer.json');
+      writeFileSync(file, '{"schemaVersion":99}');
+
+      const result = runWithEnv(args, fixture.env, fixture.dir);
+
+      expect(result.exitCode).toBe(baseline.exitCode);
+      expect(result.stdout).toContain('heartbeat-newer-schema');
+      expect(result.stdout).toContain('newer record format');
+      expect(result.stdout).toContain('this CLI cannot read');
+      expect(result.stdout).not.toMatch(
+        /no .*transport has (ever )?reported in/i,
+      );
+      const payload = JSON.parse(result.stdout) as {
+        checks: { name: string; status: string; detail: string }[];
+      };
+      for (const name of ['transport:hook', 'transport:channel']) {
+        expect(payload.checks).toContainEqual(
+          expect.objectContaining({
+            name,
+            status: 'idle',
+            detail: expect.stringContaining('[heartbeat-newer-schema]'),
+          }),
+        );
+      }
+      expect(payload.checks).toContainEqual(
+        expect.objectContaining({ name: 'delivery-verdict', status: 'idle' }),
+      );
+      expect(existsSync(file)).toBe(true);
+    } finally {
+      daemon.stop();
+      await daemon.waitForExit();
+    }
+  }, 30_000);
+
   const SCHEDULE_MONITOR = `---
 name: Heartbeat
 watch:
