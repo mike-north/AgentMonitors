@@ -1,6 +1,6 @@
 ## 2026-06-12 — `command-poll` top-level json-diff ignore paths (003 §11.3)
 
-Resolved issue #106 in [003 §11](./003-source-plugins.md): plain `command-poll` `json-diff`
+Resolved issue #106 in [003 §11](../003-source-plugins.md): plain `command-poll` `json-diff`
 monitors may now set top-level `change-detection.ignore-paths` to remove noisy fields before output
 comparison, without requiring keyed-collection mode.
 

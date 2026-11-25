@@ -24,8 +24,8 @@ current Claude Code hooks docs (<https://code.claude.com/docs/en/hooks.md>). Thr
   acknowledged (`unreadEventsForSession` filters on `acknowledgedAt IS NULL` only), so a
   truncated-away event stays **unread** and re-delivers via the next context event.
 
-Docs updated: [006 §5.0/§5.1/§5.2/§5.3/§5.4/§5.5](./006-agent-integration.md),
-[005 §12.2](./005-cli-reference.md). Tests: stdin-driven `hook deliver` integration tests, a
+Docs updated: [006 §5.0/§5.1/§5.2/§5.3/§5.4/§5.5](../006-agent-integration.md),
+[005 §12.2](../005-cli-reference.md). Tests: stdin-driven `hook deliver` integration tests, a
 truncation-recoverability integration test (truncated-away events still in `events list --unread`),
 and renderer truncation-marker + surrogate-pair unit tests.
 

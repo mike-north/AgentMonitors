@@ -1,6 +1,6 @@
 ## 2026-06-12 — Keyed-collection paths accept bare dotted authoring form (003 §12)
 
-Resolved an authoring compatibility gap in [003 §12](./003-source-plugins.md): keyed-collection
+Resolved an authoring compatibility gap in [003 §12](../003-source-plugins.md): keyed-collection
 `path` and `ignore-paths` now accept either explicit-root dotted paths (`$.items`, `$.duration`) or
 bare root-relative dotted paths (`items`, `duration`). The two forms are equivalent. This preserves
 the original minimal dotted grammar (no wildcards, array indices, filters, or recursive descent)

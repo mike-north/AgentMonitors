@@ -1,7 +1,7 @@
 ## 2026-06-15 — Scheduled-rollup Pace mode formalized as _target_ (001 §3.6, §7.3; 002 §4.4–§4.5; roadmap G12) — Refs #147
 
 Formalizes a resolved decision from the monitoring capability study
-([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+([`docs/product/monitoring-capability-exercises.md`](../../product/monitoring-capability-exercises.md)
 capability C44; resolved §S5.2). Spec-only; all new rules are marked **target**, not current.
 
 - **001 §3.6 — `notify: rollup` authoring surface (target).** The third `notify` strategy,

@@ -13,6 +13,6 @@
   on the diff-failure re-baseline path (the `entries === undefined` branch). The other early-return
   paths (not-a-repo, initial baseline, genuine no-advance) are left unchanged.
 - `agentmonitors monitor history` help text updated to include `rebaselined` in the result legend.
-- [002 §`observation_history`](./002-runtime-delivery.md) and [005 §6](./005-cli-reference.md) updated.
+- [002 §`observation_history`](../002-runtime-delivery.md) and [005 §6](../005-cli-reference.md) updated.
 - Issue: [#56](https://github.com/mike-north/AgentMonitors/issues/56).
 

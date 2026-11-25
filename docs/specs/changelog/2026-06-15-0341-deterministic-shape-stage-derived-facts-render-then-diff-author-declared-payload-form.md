@@ -1,7 +1,7 @@
 ## 2026-06-15 — Deterministic Shape stage: derived facts, render-then-diff, author-declared payload form (001 §5.1–§5.2, 002 §1.1.4–§1.1.6, 003 §2.7) (#144)
 
 Formalizes the **deterministic Shape stage** from the monitoring capability study
-([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+([`docs/product/monitoring-capability-exercises.md`](../../product/monitoring-capability-exercises.md)
 §S1, §S2 areas C/E/G, §S3 Tier 1, §S5 item 5; ledger rows **C41/C42/C43/C46**, with C3/C4/C5/C21 as
 the surrounding Shape area and E8 as the flagship cost story). Spec-only; **every new rule is marked
 target**, not current. Builds directly on the just-formalized pipeline-shape framing (002 §1.1) and

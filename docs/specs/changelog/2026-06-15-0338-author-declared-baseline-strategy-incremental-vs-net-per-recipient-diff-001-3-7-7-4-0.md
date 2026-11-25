@@ -1,9 +1,9 @@
 ## 2026-06-15 — Author-declared baseline strategy: `incremental` vs `net` per-recipient Diff (001 §3.7, §7.4; 002 §1.1.7; roadmap G13) — Refs #146
 
 Formalizes a resolved decision from the monitoring capability study
-([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+([`docs/product/monitoring-capability-exercises.md`](../../product/monitoring-capability-exercises.md)
 §S5.1; ledger rows **C6** and **C7**). Spec-only; all new rules are marked **target**, not current.
-Builds on the per-recipient seam already formalized in [002 §1.1.2](./002-runtime-delivery.md).
+Builds on the per-recipient seam already formalized in [002 §1.1.2](../002-runtime-delivery.md).
 
 - **001 §3.7 — `baseline-strategy` authoring field (target).** A new optional frontmatter field
   with two values: `incremental` (default) — each intermediate observation since the recipient's

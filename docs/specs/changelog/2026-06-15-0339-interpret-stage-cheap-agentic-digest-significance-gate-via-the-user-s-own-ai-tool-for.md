@@ -1,7 +1,7 @@
 ## 2026-06-15 — Interpret stage: cheap agentic digest + significance gate via the user's own AI tool, formalized as _target_ (002 §1.1.8; 006 §2.1; roadmap G14) — Refs #145
 
 Formalizes the **cheap agentic Interpret tier** from the monitoring capability study
-([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+([`docs/product/monitoring-capability-exercises.md`](../../product/monitoring-capability-exercises.md)
 §S4, resolved §S5 item 3; ledger rows **C45/C10/C11/C38/C12**, with E5 as the flagship). Spec-only;
 **every new rule is marked target**, not current. Builds on the locked pipeline order (002 §1.1.1,
 where Interpret is already a named per-recipient stage after Diff, before Deliver), the

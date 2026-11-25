@@ -187,3 +187,6 @@ friction-log.md
 .claude/worktrees/
 .Codex/
 .codex/
+
+# Local assembled spec history needs the specs directory as its relative-link base.
+/docs/specs/spec-history.generated.md

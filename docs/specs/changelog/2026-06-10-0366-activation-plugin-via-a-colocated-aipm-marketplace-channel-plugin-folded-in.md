@@ -7,7 +7,7 @@ The plugin wires the host lifecycle to the already-built CLI verbs — `SessionS
 `agentmonitors session start` then `agentmonitors hook deliver`, `UserPromptSubmit` →
 `agentmonitors hook deliver`, `SessionEnd` → `agentmonitors session end` — and bundles the channel
 MCP and a `setup-monitors` skill. Install once; thereafter a project opts in with project-local
-state (no reinstall per monitor). Documented in [006 §5.6](./006-agent-integration.md).
+state (no reinstall per monitor). Documented in [006 §5.6](../006-agent-integration.md).
 
 - **Folded + retired `channel-plugin/`.** The standalone root `channel-plugin/` is removed; its
   `.mcp.json` (server key `agentmonitors`, preserving the `<channel source="agentmonitors">` tag)

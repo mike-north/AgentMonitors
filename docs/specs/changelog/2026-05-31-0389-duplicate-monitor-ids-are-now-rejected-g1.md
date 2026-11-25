@@ -1,6 +1,6 @@
 ## 2026-05-31 — Duplicate monitor IDs are now rejected (G1)
 
-- Promoted [001 §4](./001-monitor-definition.md) from target to **current**: duplicate
+- Promoted [001 §4](../001-monitor-definition.md) from target to **current**: duplicate
   folder-derived monitor IDs are now a hard error, closing roadmap item G1.
 - `scanMonitors` surfaces collisions via a new `ScanResult.duplicateIds`
   (`DuplicateMonitorId[]`) field; the runtime tick refuses to run on duplicates; `validate`

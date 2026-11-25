@@ -10,6 +10,6 @@
   (`post-compact`) path. The `normal` and `low` paths return `events: []` and are unaffected.
 - `DeliveryEventSummary` is re-exported from the public index; the api-extractor rollup
   (`dist/public.d.ts`) is updated to include the new field.
-- [002 §9.1](./002-runtime-delivery.md) and [002 §9.4](./002-runtime-delivery.md) updated to
-  document the `body` field. [006](./006-agent-integration.md) updated to reflect the enrichment.
+- [002 §9.1](../002-runtime-delivery.md) and [002 §9.4](../002-runtime-delivery.md) updated to
+  document the `body` field. [006](../006-agent-integration.md) updated to reflect the enrichment.
 

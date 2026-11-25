@@ -1381,7 +1381,10 @@ calendar date, the title nonempty, and the date/title pair unique.
 
 `pnpm specs:changelog` validates and assembles history to stdout, descending by
 date, then ascending by filename for equal dates. Generated history is never
-committed. `pnpm check:spec-changelog`, included in `pnpm check` through
+committed. Inline file links are relative to each entry; assembly rebases them to
+`docs/specs/`, restoring migrated destinations to their original text. The ignored
+`docs/specs/spec-history.generated.md` view keeps that base for navigation.
+`pnpm check:spec-changelog`, included in `pnpm check` through
 `check:workspace`, rejects invalid entries, duplicate identities, and dated entry
 headings reintroduced into the stable `spec-changelog.md` index.
 `scripts/spec-changelog.test.ts` checks byte preservation of migrated entries,

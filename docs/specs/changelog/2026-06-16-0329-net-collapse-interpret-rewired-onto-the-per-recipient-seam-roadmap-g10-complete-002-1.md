@@ -1,9 +1,9 @@
 ## 2026-06-16 — `net` collapse + Interpret rewired onto the per-recipient seam; roadmap G10 complete (002 §1.1.2, §1.1.7, §1.1.8) — Refs #182
 
 Implements roadmap **G10 PR-B** (the final G10 PR), moving the right-of-seam stages of
-[002 §1.1](./002-runtime-delivery.md) from the shared baseline onto each recipient's own baseline
-cursor. With PR-A's substrate, this flips [002 §1.1.7](./002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)
-and [§1.1.8](./002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)
+[002 §1.1](../002-runtime-delivery.md) from the shared baseline onto each recipient's own baseline
+cursor. With PR-A's substrate, this flips [002 §1.1.7](../002-runtime-delivery.md#117-baseline-strategy-per-recipient-diff-semantics-current)
+and [§1.1.8](../002-runtime-delivery.md#118-interpret-a-cheap-agentic-digest-via-the-users-own-ai-tool)
 to fully _current_ and **retires roadmap G10**.
 
 - **002 §1.1.7 — `net` collapse is now per-recipient at claim time (Decision Q3).** The shared

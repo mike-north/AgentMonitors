@@ -23,8 +23,8 @@ CLI-only change (no `@agentmonitors/core` public API change; no changeset needed
 
 **Spec updates:**
 
-- [002 §10.2](./002-runtime-delivery.md#102-daemon-run--continuous-loop--unix-socket-server) — lazy
+- [002 §10.2](../002-runtime-delivery.md#102-daemon-run--continuous-loop--unix-socket-server) — lazy
   boot, per-workspace isolation, idle reaping.
-- [005 §9.2](./005-cli-reference.md#92-daemon-run--continuous-loop), [§10.4](./005-cli-reference.md#104-session-start--lazy-boot-daemon-and-register-session),
-  [§10.5](./005-cli-reference.md#105-session-end--deregister-session) — `session start`/`session end` + `--reap-after-ms`.
+- [005 §9.2](../005-cli-reference.md#92-daemon-run--continuous-loop), [§10.4](../005-cli-reference.md#104-session-start--lazy-boot-daemon-and-register-session),
+  [§10.5](../005-cli-reference.md#105-session-end--deregister-session) — `session start`/`session end` + `--reap-after-ms`.
 

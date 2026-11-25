@@ -2,7 +2,7 @@
 
 Implements roadmap **G11**. Both rules were **target**; both are now **current** with `verified:`
 references. Capability study rows C2/C6/C40/C43,
-[§S1, §S4](../product/monitoring-capability-exercises.md).
+[§S1, §S4](../../product/monitoring-capability-exercises.md).
 
 - **003 §2.5 — snapshots-not-diffs, now current.** The contract that sources return current-state
   snapshots + `nextState` and the runtime is the sole producer of the consumer-baseline diff is now

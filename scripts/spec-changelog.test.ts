@@ -5,6 +5,7 @@
  */
 import { execFileSync, spawnSync } from 'node:child_process';
 import {
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -49,7 +50,69 @@ function run(dir: string, mode = '--check') {
   });
 }
 
+/** Check filesystem destinations independently of assembly, leaving URI schemes and anchors alone. */
+function relativeLinks(text: string): string[] {
+  return [...text.matchAll(/\[[^\n]*?\]\(([^)\s]+)\)/gu)]
+    .map((match) => match[1] ?? '')
+    .filter(
+      (target) => target && !/^(?:[a-z][a-z\d+.-]*:|\/|#)/iu.test(target),
+    );
+}
+
+/** Fragments identify sections inside a file; navigation must first reach that file. */
+function missingLinks(text: string, base: string): string[] {
+  return relativeLinks(text).filter(
+    (target) =>
+      !existsSync(
+        path.resolve(base, decodeURIComponent(target.split(/[?#]/u)[0] ?? '')),
+      ),
+  );
+}
+
 describe('spec changelog', () => {
+  it('resolves every relative link from its entry file location', () => {
+    const directory = path.join(root, 'docs/specs/changelog');
+    const missing = readdirSync(directory).flatMap((name) => {
+      const text = readFileSync(path.join(directory, name), 'utf8');
+      return missingLinks(text, directory).map(
+        (target) => `${name}: ${target}`,
+      );
+    });
+    expect(missing).toEqual([]);
+  });
+
+  it('resolves every relative link at the documented generated history location', () => {
+    const index = readFileSync(
+      path.join(root, 'docs/specs/spec-changelog.md'),
+      'utf8',
+    );
+    const location = /pnpm --silent specs:changelog > ([^`\n]+)/u.exec(
+      index,
+    )?.[1];
+    expect(location).toBeDefined();
+    const assembled = run(root, '--assemble');
+    expect(assembled.status, assembled.stderr).toBe(0);
+    expect(relativeLinks(assembled.stdout).length).toBeGreaterThan(0);
+    expect(
+      missingLinks(
+        assembled.stdout,
+        path.dirname(path.resolve(root, location ?? '')),
+      ),
+    ).toEqual([]);
+  });
+
+  it('rebases file links for assembly while retaining fragments, external URLs and anchors', () => {
+    const dir = fixture();
+    entry(
+      dir,
+      'links.md',
+      '## 2026-11-25 — Links\n\n[Spec](../004-validation-testing.md#5) [Product](../../product/roadmap.md) [Sibling](./other.md) [Bare](other.md) [External](https://example.com/x) [Anchor](#detail)\n',
+    );
+    expect(run(dir, '--assemble').stdout).toBe(
+      '# Spec Changelog\n\n## 2026-11-25 — Links\n\n[Spec](./004-validation-testing.md#5) [Product](../product/roadmap.md) [Sibling](./changelog/other.md) [Bare](./changelog/other.md) [External](https://example.com/x) [Anchor](#detail)\n',
+    );
+  });
+
   it('preserves all 387 original headings and bodies byte for byte, with only date sorting', () => {
     const original = gunzipSync(
       readFileSync(

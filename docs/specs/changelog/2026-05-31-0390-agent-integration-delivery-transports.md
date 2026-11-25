@@ -1,6 +1,6 @@
 ## 2026-05-31 — Agent integration & delivery transports
 
-- Added normative [006-agent-integration.md](./006-agent-integration.md): a delivery-**transport**
+- Added normative [006-agent-integration.md](../006-agent-integration.md): a delivery-**transport**
   abstraction behind the adapter seam, covering the current hook-state transport and a **target**
   Claude Code **channel** transport. Recorded as roadmap item G7.
 - Scoped the channel transport's binding model from evidence. A spawned MCP server can recover its

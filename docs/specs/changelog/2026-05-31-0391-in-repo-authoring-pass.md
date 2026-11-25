@@ -2,14 +2,14 @@
 
 The numbered draft set was promoted into `docs/specs/` as the
 canonical contract, verified against the code, and enriched. See
-[maintainer-migration-notes.md](./maintainer-migration-notes.md) for the source mapping.
+[maintainer-migration-notes.md](../maintainer-migration-notes.md) for the source mapping.
 
 ### Structure
 
 - Established `docs/specs/` as the canonical location (previously only referenced as a plan).
-- Added supporting docs: [README.md](./README.md), [glossary.md](./glossary.md),
-  [roadmap.md](./roadmap.md).
-- Added normative [005-cli-reference.md](./005-cli-reference.md) covering the full
+- Added supporting docs: [README.md](../README.md), [glossary.md](../glossary.md),
+  [roadmap.md](../roadmap.md).
+- Added normative [005-cli-reference.md](../005-cli-reference.md) covering the full
   `agentmonitors` command surface.
 
 ### 001-monitor-definition.md
@@ -45,7 +45,7 @@ canonical contract, verified against the code, and enriched. See
 - Mapped each required test scenario to the test file that covers it and flagged the
   uncovered ones (`low` urgency, snapshot persistence/isolation, `validate` failure paths,
   `schema generate` and standalone `session list|close` wiring). Tracked in
-  [roadmap.md](./roadmap.md) as T1–T4.
+  [roadmap.md](../roadmap.md) as T1–T4.
 
 ### Carried forward from the prior draft set (2026-04-06)
 

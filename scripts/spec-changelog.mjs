@@ -5,6 +5,10 @@
  * Assembly sorts dates newest first, then filenames in ascending code-unit order. Migrated
  * names carry their original ordinal, preserving same-date order without a shared counter
  * for future contributions. Output goes only to stdout; the tracked index is never rewritten.
+ * Inline Markdown file links are stored relative to each entry, then rebased to docs/specs/
+ * during assembly. For migrated links this reverses the relocation (../doc becomes ./doc,
+ * ../../product becomes ../product), preserving the original assembled bytes while keeping
+ * individual entries navigable. Other Markdown bytes, URI links and anchors are unchanged.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
@@ -64,6 +68,21 @@ function readEntries(root) {
     .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 }
 
+/** Express entry-relative file destinations from the assembled document's specs directory. */
+function assembleEntry(text) {
+  return text.replace(
+    /(\]\()([^)\s]+)(\))/gu,
+    (match, opening, target, closing) => {
+      if (/^(?:[a-z][a-z\d+.-]*:|\/|#)/iu.test(target)) {
+        return match;
+      }
+      const rebased = path.posix.join('changelog', target);
+      const destination = rebased.startsWith('../') ? rebased : `./${rebased}`;
+      return `${opening}${destination}${closing}`;
+    },
+  );
+}
+
 /** Both modes validate the complete input; assembly cannot silently omit an invalid entry. */
 function main() {
   const mode = process.argv[2];
@@ -75,7 +94,8 @@ function main() {
   const entries = readEntries(process.cwd());
   if (mode === '--assemble') {
     process.stdout.write(
-      '# Spec Changelog\n\n' + entries.map((entry) => entry.text).join(''),
+      '# Spec Changelog\n\n' +
+        entries.map((entry) => assembleEntry(entry.text)).join(''),
     );
   } else {
     console.log(`Spec changelog: ${entries.length} valid entries`);

@@ -14,8 +14,11 @@ Choose a distinct descriptive name; no shared file or sequence number needs edit
 Use a real calendar date and a nonempty title, and end the file with a newline.
 The date and full title together must be unique. The heading records any referenced
 issues and spec sections without adding references that were never specified.
+Use inline Markdown links relative to the entry file, such as `../004-validation-testing.md`.
+Assembly rebases file links to `docs/specs/`, retaining the original historical link text.
 
 Run `pnpm check:spec-changelog` to validate entries. Run `pnpm specs:changelog` to view
 all entries, newest date first, with equal dates ordered by filename. The command writes
-Markdown to stdout; for a local file, use `pnpm --silent specs:changelog > scratch/spec-history.md`
-after creating `scratch/`. Generated history is never committed.
+Markdown to stdout; for a local file with working relative links, use
+`pnpm --silent specs:changelog > docs/specs/spec-history.generated.md`.
+That generated view is ignored by Git and is never committed.

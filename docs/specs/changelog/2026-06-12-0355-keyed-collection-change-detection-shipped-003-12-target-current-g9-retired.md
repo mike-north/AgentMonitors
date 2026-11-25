@@ -1,7 +1,7 @@
 ## 2026-06-12 — Keyed-collection change detection shipped (003 §12 target→current; G9 retired)
 
 The `change-detection.collection` mode now turns a poll source's parsed JSON output into a
-collection of keyed objects, promoting [003 §12](./003-source-plugins.md) from **target** to
+collection of keyed objects, promoting [003 §12](../003-source-plugins.md) from **target** to
 **current** with `verified:` references.
 
 - **Shared core helper.** The per-object diff is implemented **once** as `diffKeyedCollection`

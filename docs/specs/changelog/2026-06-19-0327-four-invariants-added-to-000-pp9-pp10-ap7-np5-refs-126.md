@@ -1,7 +1,7 @@
 ## 2026-06-19 — Four invariants added to 000: PP9, PP10, AP7, NP5 — Refs #126
 
 Ratified in the 2026-06-19 product call. Four new principles added to
-[000 — Principles & Properties](./000-principles.md):
+[000 — Principles & Properties](../000-principles.md):
 
 - **PP9 (agents declare and move on):** An agent may declaratively express monitoring intent but
   performs no watching mechanics itself and never polls or blocks waiting for a signal. The daemon

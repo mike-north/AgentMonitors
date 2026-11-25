@@ -1,7 +1,7 @@
 ## 2026-06-15 — Post-processing pipeline shape + source/runtime diff split formalized as _target_ (002 §1.1, 003 §2.5–§2.6)
 
 Formalizes resolved decisions from the monitoring capability study
-([`docs/product/monitoring-capability-exercises.md`](../product/monitoring-capability-exercises.md)
+([`docs/product/monitoring-capability-exercises.md`](../../product/monitoring-capability-exercises.md)
 §S1, §S4, §S5; ledger rows C40/C6/C43/C15). Spec-only; every new rule is marked **target**, not
 current — the current runtime implements a subset under different names and is reaffirmed, not changed.
 

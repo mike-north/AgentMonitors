@@ -3,7 +3,7 @@
 - The runtime now **isolates per-monitor failures in `tick()`**: if a source's `observe()` throws
   or rejects, the failure is caught, an `errored` observation-history row is recorded, and the tick
   continues to the next due monitor. A single buggy source can no longer abort the entire tick and
-  starve all other monitors ([002 §`observation_history`](./002-runtime-delivery.md)).
+  starve all other monitors ([002 §`observation_history`](../002-runtime-delivery.md)).
 - The same isolation is applied to the **watch path** (`consumeWatch()`): an `ingest()` failure on
   one yielded observation records an `errored` history row and the watcher continues consuming
   subsequent observations. The outer catch (for errors from the async iterator itself) is unchanged.

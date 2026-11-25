@@ -15,9 +15,9 @@
   claims pending deliveries at the given `--lifecycle`, renders, and writes the wire JSON to stdout.
   **Always exits 0** — any internal error is swallowed (a hook that exits non-zero would interrupt
   the user's session). Prints nothing when there is nothing pending.
-- [005 §12.2](./005-cli-reference.md) added (`hook deliver` command reference, flags, wire output,
+- [005 §12.2](../005-cli-reference.md) added (`hook deliver` command reference, flags, wire output,
   always-exit-0 contract).
-- [006 §5](./006-agent-integration.md) added (hook-deliver transport spec: wire contract, behavior
+- [006 §5](../006-agent-integration.md) added (hook-deliver transport spec: wire contract, behavior
   steps, lifecycle-to-delivery mapping, and hook registration examples).
 - `.changeset/hook-deliver-command.md`: `@agentmonitors/cli` minor (new `hook deliver` command).
 

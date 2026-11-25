@@ -1,7 +1,7 @@
 ## 2026-06-11 — `command-poll` source specified as target (003 §11–§13); 003 examples migrated to `watch:` syntax
 
 Issue #81's problem framing is resolved into a normative **target** design (PP7) in
-[003](./003-source-plugins.md):
+[003](../003-source-plugins.md):
 
 - **§11 `command-poll`** — the local-process sibling of `api-poll`. Field-level scope (`command`
   argv array, `cwd`, `env`, `timeout`, `key`, `interval`, `change-detection`), execution model
@@ -22,7 +22,7 @@ Issue #81's problem framing is resolved into a normative **target** design (PP7)
 - **Roadmap:** new items G8 (`command-poll`, P2) and G9 (keyed collections, P3) with proofs.
 - **Migration cleanup:** 003's YAML examples and schema-generation description still used the
   pre-migration `source:`/`scope:` authoring syntax; all examples now use the current
-  `watch: { type, … }` shape ([001 §3.1](./001-monitor-definition.md)) and §7.2 reflects the
+  `watch: { type, … }` shape ([001 §3.1](../001-monitor-definition.md)) and §7.2 reflects the
   actual generated schema (`watch`/`urgency` required, `watch.type` enum + conditional config).
 - Spec-only — no implementation or published-package behavior change, so no changeset.
 

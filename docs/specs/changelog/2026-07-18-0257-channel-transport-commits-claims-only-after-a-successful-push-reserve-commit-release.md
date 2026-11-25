@@ -37,6 +37,6 @@ urgency bands, or the unread/claimed/acknowledged model; the hook transport is u
   in-memory `DeliveryReservationRegistry`) + `hook.reserve` / `hook.commit` / `hook.release` daemon
   IPC; the channel drives them via `runChannelDeliveryCycle`. `claimDelivery` is refactored into a
   pure decide + a mutating apply that both paths share (behavior-preserving for the hook path).
-- **UAT:** [`docs/uat/channel-transport.md`](../uat/channel-transport.md) Part A-2 (steps 12a–12c)
+- **UAT:** [`docs/uat/channel-transport.md`](../../uat/channel-transport.md) Part A-2 (steps 12a–12c)
   adds the transient-push-failure recipe (issue #277).
 

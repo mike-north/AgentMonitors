@@ -1,7 +1,7 @@
 ## 2026-06-16 — Per-recipient baseline seam + per-recipient Diff shipped (roadmap G10 PR-A; 002 §1.1.2, §5.2, §6) — Refs #182
 
 Implements roadmap **G10 PR-A**, moving the per-recipient Diff substrate of
-[002 §1.1.2](./002-runtime-delivery.md#112-the-shared--per-recipient-seam) from _target_ to
+[002 §1.1.2](../002-runtime-delivery.md#112-the-shared--per-recipient-seam) from _target_ to
 _current_. PR-B (rewiring the `net` collapse, §1.1.7, and Interpret, §1.1.8, to span per recipient)
 remains open under G10.
 

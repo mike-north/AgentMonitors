@@ -1,6 +1,6 @@
 ## 2026-08-24 — New numbered doc: 008 — Reliability & Process Hygiene — Refs #504, PR #476
 
-Added [008-reliability-process-hygiene.md](./008-reliability-process-hygiene.md), promoting the
+Added [008-reliability-process-hygiene.md](../008-reliability-process-hygiene.md), promoting the
 product posture of `docs/product/reliability-and-process-hygiene.md` (landed in PR #476) into
 normative, testable spec text: the containment-boundary definition and its five-state
 exhaustiveness (incl. the reported deferred-reconciliation state), spawned-process lifecycle

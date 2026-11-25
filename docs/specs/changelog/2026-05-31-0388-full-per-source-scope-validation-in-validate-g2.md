@@ -1,6 +1,6 @@
 ## 2026-05-31 — Full per-source scope validation in `validate` (G2)
 
-- Promoted [004 §2.2](./004-validation-testing.md) and [001 §8](./001-monitor-definition.md)
+- Promoted [004 §2.2](../004-validation-testing.md) and [001 §8](../001-monitor-definition.md)
   from target to **current**: `validate` now performs full JSON Schema (draft-07) validation of
   each monitor's `scope` against its source's `scopeSchema`, not just required-field presence.
   Closes roadmap G2 (and test gap T3).

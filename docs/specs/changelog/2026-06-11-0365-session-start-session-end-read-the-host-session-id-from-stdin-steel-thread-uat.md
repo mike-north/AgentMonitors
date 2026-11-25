@@ -3,7 +3,7 @@
 **Correction (production bug).** `session start` and `session end` previously read the host session
 id from `process.env['CLAUDE_CODE_SESSION_ID']` and quick-exited when it was absent. That env var
 **does not exist** in a real Claude Code hook invocation (input arrives as JSON on stdin — the same
-issue [`hook deliver`](./006-agent-integration.md) was already corrected for). The effect was severe:
+issue [`hook deliver`](../006-agent-integration.md) was already corrected for). The effect was severe:
 in a real session `session start` returned before booting the daemon, so the session never
 registered, and the entire activation chain (lazy daemon boot + delivery) silently no-opped in
 production. Plan B's tests passed only because they set the env var manually.
@@ -12,7 +12,7 @@ Both commands now read the **stdin hook payload** (006 §5.0): `hostSessionId = 
 (no env fallback), `workspacePath = payload.cwd ?? CLAUDE_PROJECT_DIR ?? process.cwd()`. The shared
 stdin reader (`readHookPayload` + `HookPayload`) is extracted to `apps/cli/src/hook-payload.ts` and
 imported by `hook deliver`, `session start`, and `session end`. Documented in
-[006 §5.0/§5.6](./006-agent-integration.md) and [005 §10.4/§10.5](./005-cli-reference.md).
+[006 §5.0/§5.6](../006-agent-integration.md) and [005 §10.4/§10.5](../005-cli-reference.md).
 
 - **Single-process `SessionStart` (one stdin stream).** A Claude Code hook invocation provides **one**
   stdin stream, and both `session start` and `hook deliver` consume all of stdin via
@@ -22,7 +22,7 @@ imported by `hook deliver`, `session start`, and `session end`. Documented in
   Fixed by folding the recap into `session start`: it reads the payload **once**, registers, then
   claims `post-compact` and prints the rendered `additionalContext` itself. The SessionStart hook
   (`agent-plugins/agentmonitors/hooks/hooks.json`) now runs the single command
-  `agentmonitors session start`. Documented in [006 §5.6](./006-agent-integration.md).
+  `agentmonitors session start`. Documented in [006 §5.6](../006-agent-integration.md).
 - **Steel-thread UAT added** (Plan D Task 4): an end-to-end CLI integration test that drives the
   `UserPromptSubmit` delivery path over **stdin** — a dropped file-fingerprint monitor + a
   watched-file change ends with the agent handed that monitor's own body-instruction as

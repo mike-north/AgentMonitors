@@ -1,7 +1,7 @@
 ## 2026-06-12 — `command-poll` source shipped (003 §11 target→current; G8 retired)
 
 The local-process sibling of `api-poll` is now a bundled source, promoting
-[003 §11](./003-source-plugins.md) from **target** to **current** with `verified:` references.
+[003 §11](../003-source-plugins.md) from **target** to **current** with `verified:` references.
 
 - **New package `@agentmonitors/source-command-poll`** implements §11.1–§11.6 verbatim: argv-only
   `command` spawned directly (`execFile`, `shell: false` — never a shell, so metacharacters pass
