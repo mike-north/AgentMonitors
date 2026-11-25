@@ -10,12 +10,24 @@ import {
   RuntimeStore,
   SourceRegistry,
 } from '@agentmonitors/core';
+import type {
+  DeliveryClaim,
+  MonitorEventRecord,
+  PostMessageInput,
+} from '@agentmonitors/core';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { expect, it, vi } from 'vitest';
 import { callDaemon, createDaemonServer } from '../daemon-ipc.js';
-import { registerChannelToolHandlers } from './channel.js';
+import {
+  registerChannelToolHandlers,
+  runChannelDeliveryCycle,
+} from './channel.js';
+import {
+  reserveRenderAndCommitHookDelivery,
+  writeAndCommitHookDelivery,
+} from './hook.js';
 
 const exec = promisify(execFile);
 const cli = path.resolve(import.meta.dirname, '../../dist/index.cjs');
@@ -30,12 +42,6 @@ it('surfaces unacknowledged posts on schedule and stops after needs-attention', 
       new RuntimeStore(createDb(dbPath)),
       new SourceRegistry(),
     );
-  const run = async (...args: string[]) =>
-    (
-      await exec(process.execPath, [cli, ...args, '--socket', socketPath], {
-        timeout: 5000,
-      })
-    ).stdout.trim();
   const open = (runtime: AgentMonitorRuntime, hostSessionId: string) =>
     runtime.openSession({
       adapter: 'claude-code',
@@ -45,6 +51,8 @@ it('surfaces unacknowledged posts on schedule and stops after needs-attention', 
       workspacePath: root,
     }).id;
 
+  // Exercise the real socket without paying process startup for each clock step.
+  vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(start);
   let runtime = runtimeForDb();
   let server = createDaemonServer({ runtime, socketPath });
@@ -52,50 +60,43 @@ it('surfaces unacknowledged posts on schedule and stops after needs-attention', 
     const session = open(runtime, 'recipient');
     const sibling = open(runtime, 'sibling');
     await server.listen();
-    const post = (body: string) =>
-      run(
-        'post',
-        body,
-        '--session',
-        session,
-        '--require-ack',
-        '--resurface-after-ms',
-        '100',
-        '--max-resurfaces',
-        '1',
+    const post = async (input: Omit<PostMessageInput, 'sessionId'>) =>
+      (
+        await callDaemon<{ eventId: string }>(
+          'messages.post',
+          { sessionId: session, ...input },
+          { socketPath },
+        )
+      ).eventId;
+    const claim = (id = session, lifecycle = 'turn-interruptible') =>
+      callDaemon<DeliveryClaim | null>(
+        'hook.claim',
+        { sessionId: id, lifecycle },
+        { socketPath },
       );
-    const claim = async (
-      id = session,
-      lifecycle = 'turn-interruptible',
-    ): Promise<unknown> =>
-      JSON.parse(
-        await run('hook', 'claim', '--session', id, '--lifecycle', lifecycle),
-      ) as unknown;
-    const list = async (): Promise<unknown> =>
-      JSON.parse(
-        await run('events', 'list', '--session', session, '--format', 'json'),
-      ) as unknown;
+    const list = () =>
+      callDaemon<MonitorEventRecord[]>(
+        'events.list',
+        { sessionId: session },
+        { socketPath },
+      );
+    const policy = {
+      requireAck: true,
+      resurfaceAfterMs: 100,
+      maxResurfaces: 1,
+    };
 
     await expect(
-      run(
-        'post',
-        'invalid',
-        '--session',
-        session,
-        '--resurface-after-ms',
-        '100',
-      ),
+      post({ body: 'invalid', resurfaceAfterMs: 100 }),
     ).rejects.toThrow('Resurfacing options require acknowledgement');
-    const unanswered = await post('Check the release.');
-    const answered = await post('Review the notes.');
-    const coreAnswered = await post('Check the build.');
-    const channelAnswered = await post('Review the changes.');
-    const informational = await run(
-      'post',
-      'The build passed.',
-      '--session',
-      session,
-    );
+    const unanswered = await post({ body: 'Check the release.', ...policy });
+    const answered = await post({ body: 'Review the notes.', ...policy });
+    const coreAnswered = await post({ body: 'Check the build.', ...policy });
+    const channelAnswered = await post({
+      body: 'Review the changes.',
+      ...policy,
+    });
+    const informational = await post({ body: 'The build passed.' });
     expect(await list()).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ id: unanswered, messageState: 'pending' }),
@@ -118,7 +119,11 @@ it('surfaces unacknowledged posts on schedule and stops after needs-attention', 
         expect.objectContaining({ id: unanswered, messageState: 'delivered' }),
       ]),
     );
-    await run('events', 'ack', '--session', session, '--event-ids', answered);
+    await callDaemon(
+      'events.ack',
+      { sessionId: session, eventIds: [answered] },
+      { socketPath },
+    );
 
     runtime.acknowledgeSession(session, [coreAnswered]);
     const channel = new Server(
@@ -228,7 +233,7 @@ it('surfaces unacknowledged posts on schedule and stops after needs-attention', 
     vi.useRealTimers();
     rmSync(root, { recursive: true, force: true });
   }
-}, 30_000);
+}, 5000);
 
 async function withPostSession(
   test: (fixture: {
@@ -472,6 +477,194 @@ it.each(['character limit', 'event limit'])(
   },
   30_000,
 );
+
+it('rejects a workspace key already used for a different post', async () => {
+  await withPostSession(async ({ root, runtime, sessionId, socketPath }) => {
+    const sibling = runtime.openSession({
+      adapter: 'claude-code',
+      hostSessionId: 'sibling',
+      agentIdentity: 'sibling',
+      hookStatePath: path.join(root, 'sibling.json'),
+      workspacePath: root,
+    }).id;
+    const post = (recipient: string, body: string) =>
+      callDaemon(
+        'messages.postScoped',
+        {
+          sessionId: recipient,
+          body,
+          workspacePath: root,
+          key: 'shared',
+        },
+        { socketPath },
+      );
+    const original = await post(sessionId, 'For the recipient');
+    await expect(post(sibling, 'For the sibling')).rejects.toThrow(
+      /key.*different post/i,
+    );
+    await expect(post(sessionId, 'Different content')).rejects.toThrow(
+      /key.*different post/i,
+    );
+    await expect(post(sessionId, 'For the recipient')).resolves.toEqual(
+      original,
+    );
+    expect(runtime.listEvents({ sessionId: sibling })).toEqual([]);
+  });
+});
+
+it.each(['hook', 'channel'])(
+  'never repeats a presented offer after a lost %s commit and post replay',
+  async (transport) => {
+    await withPostSession(async ({ root, runtime, sessionId, socketPath }) => {
+      const input = {
+        sessionId,
+        body: 'Offer once',
+        workspacePath: root,
+        key: 'replay',
+        requireAck: true,
+        resurfaceAfterMs: 100,
+        maxResurfaces: 1,
+      };
+      const start = Date.UTC(2026, 0, 1);
+      vi.setSystemTime(start);
+      const post = (endpoint: string) =>
+        callDaemon<{ eventId: string }>('messages.postScoped', input, {
+          socketPath: endpoint,
+        });
+      const { eventId } = await post(socketPath);
+
+      vi.spyOn(runtime, 'commitDelivery').mockReturnValueOnce(null);
+      if (transport === 'hook') {
+        const flow = await reserveRenderAndCommitHookDelivery(
+          sessionId,
+          'turn-interruptible',
+          socketPath,
+          'UserPromptSubmit',
+        );
+        if (!flow) throw new Error('Expected a hook delivery.');
+        const write = vi.fn((output: NonNullable<typeof flow.output>) => {
+          expect(output.hookSpecificOutput.additionalContext).toContain(
+            eventId,
+          );
+        });
+        await writeAndCommitHookDelivery(flow, write);
+        expect(write).toHaveBeenCalledTimes(1);
+      } else {
+        const push = vi.fn((claim: DeliveryClaim) => {
+          expect(claim.events).toMatchObject([{ eventId }]);
+          return Promise.resolve();
+        });
+        await expect(
+          runChannelDeliveryCycle(sessionId, socketPath, push),
+        ).resolves.toBe('surfaced-uncommitted');
+        expect(push).toHaveBeenCalledTimes(1);
+      }
+
+      const restarted = new AgentMonitorRuntime(
+        new RuntimeStore(createDb(path.join(root, 'runtime.db'))),
+        new SourceRegistry(),
+      );
+      const restartedSocket = path.join(root, 'restarted.sock');
+      const server = createDaemonServer({
+        runtime: restarted,
+        socketPath: restartedSocket,
+      });
+      const claim = () =>
+        callDaemon<DeliveryClaim | null>(
+          'hook.claim',
+          { sessionId, lifecycle: 'turn-interruptible' },
+          { socketPath: restartedSocket },
+        );
+      try {
+        await server.listen();
+        await expect(post(restartedSocket)).resolves.toEqual({ eventId });
+        await expect(claim()).resolves.toBeNull();
+        vi.setSystemTime(start + 100);
+        expect((await claim())?.events).toMatchObject([
+          { eventId, title: expect.stringContaining('resurfaced') },
+        ]);
+      } finally {
+        await server.close();
+      }
+    });
+  },
+);
+
+it('leaves a monitor omitted by the recap character limit pending', async () => {
+  await withPostSession(
+    async ({ root, store, runtime, sessionId, socketPath }) => {
+      runtime.postMessage({ sessionId, body: 'P'.repeat(8000) });
+      const monitor = store.insertEvent({
+        workspacePath: root,
+        monitorId: 'release',
+        sourceName: 'schedule',
+        urgency: 'normal',
+        title: 'Monitor',
+        body: 'Check release',
+        summary: 'Check release',
+        payload: {},
+        snapshotMetadata: {},
+        snapshotText: null,
+        diffText: null,
+        objectKey: null,
+        baselineStrategy: null,
+        queryScope: {},
+        tags: [],
+        createdAt: new Date(),
+      });
+      const flow = await reserveRenderAndCommitHookDelivery(
+        sessionId,
+        'post-compact',
+        socketPath,
+        'SessionStart',
+      );
+      if (!flow) throw new Error('Expected a recap.');
+      await writeAndCommitHookDelivery(flow, (output) => {
+        expect(output.hookSpecificOutput.additionalContext).not.toContain(
+          monitor.id,
+        );
+      });
+      expect(runtime.listEvents({ sessionId })).toContainEqual(
+        expect.objectContaining({ id: monitor.id, deliveryState: 'unread' }),
+      );
+      expect(
+        runtime.claimDelivery(sessionId, 'turn-interruptible')?.urgency,
+      ).toBe('normal');
+    },
+  );
+});
+
+it('ends resurfacing after presenting a truncated required-ack post', async () => {
+  await withPostSession(async ({ sessionId, runtime, socketPath }) => {
+    const start = Date.UTC(2026, 0, 1);
+    vi.setSystemTime(start);
+    const { eventId } = runtime.postMessage({
+      sessionId,
+      body: 'P'.repeat(8000),
+      requireAck: true,
+      resurfaceAfterMs: 100,
+      maxResurfaces: 1,
+    });
+    const flow = await reserveRenderAndCommitHookDelivery(
+      sessionId,
+      'turn-interruptible',
+      socketPath,
+      'UserPromptSubmit',
+    );
+    if (!flow) throw new Error('Expected a hook delivery.');
+    await writeAndCommitHookDelivery(flow, (output) => {
+      expect(output.hookSpecificOutput.additionalContext).toContain(eventId);
+      expect(
+        output.hookSpecificOutput.additionalContext.length,
+      ).toBeLessThanOrEqual(4000);
+    });
+    vi.setSystemTime(start + 100);
+    expect(runtime.claimDelivery(sessionId, 'turn-interruptible')).toBeNull();
+    expect(runtime.listEvents({ sessionId })).toContainEqual(
+      expect.objectContaining({ id: eventId, messageState: 'delivered' }),
+    );
+  });
+});
 
 it('recovers the committed ID when the daemon reply misses the IPC timeout', async () => {
   await withPostSession(async ({ runtime, sessionId, post }) => {

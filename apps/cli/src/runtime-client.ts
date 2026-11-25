@@ -234,6 +234,20 @@ export async function reserveDeliveryClient(
   );
 }
 
+/** Acquire permission to present the rendered direct-post offers once. */
+export async function preparePostDeliveryClient(
+  reservationId: string,
+  socketPath: string,
+  presentedEventIds: string[],
+  truncatedEventId?: string,
+): Promise<boolean> {
+  return await callDaemon<boolean>(
+    'hook.preparePosts',
+    { reservationId, presentedEventIds, truncatedEventId },
+    { socketPath },
+  );
+}
+
 /**
  * Commit a reservation from {@link reserveDeliveryClient} after its claim was
  * surfaced (006 §4, issue #300): the reserved rows become claimed ("was

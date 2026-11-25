@@ -3033,6 +3033,8 @@ no repost. Command errors are reported on stderr with a nonzero exit code.
 - `--key <string>` accepts a nonempty request key and defaults to a fresh key for each invocation.
   Reuse a key within the same workspace to recover the original ID. For example, repeating
   `agentmonitors post --session <id> --key release-check 'Check the release'` returns the same ID.
+  The recipient, text and effective acknowledgement policy must match the original request.
+  A conflicting reuse fails with a nonzero exit.
 - `--workspace <path>` pins the request key to an exact registered workspace path. Use
   `--workspace ''` for the global scope. The default is the recipient's workspace at lookup time.
 - `--require-ack` enables scheduled resurfacing.

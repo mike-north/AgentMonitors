@@ -653,7 +653,11 @@ export function renderHookDeliveryWithCoverage(
   claim: DeliveryClaim | null,
   hookEventName: string,
   options: RenderHookDeliveryOptions = {},
-): { output: HookDeliveryOutput; presentedCount: number } | null {
+): {
+  output: HookDeliveryOutput;
+  presentedCount: number;
+  truncatedEventId?: string;
+} | null {
   if (!claim) return null;
 
   const isRecap = claim.lifecycle === 'post-compact';
@@ -761,6 +765,7 @@ export function renderHookDeliveryWithCoverage(
 
   let additionalContext: string;
   let presentedCount: number;
+  let truncatedEventId: string | undefined;
   if (fit.whole.includedCount === claim.events.length && !moreDeferred) {
     // Every claimed event fits and nothing was deferred → no marker.
     presentedCount = fit.whole.includedCount;
@@ -801,6 +806,7 @@ export function renderHookDeliveryWithCoverage(
     // doubling an identical marker regardless.
     presentedCount = 1;
     const firstEvent = claim.events[0];
+    truncatedEventId = firstEvent?.eventId;
     const firstBlock = firstEvent ? buildEventBlock(firstEvent) : '';
     const soleEventHeader = buildHeader(
       claim.sessionId,
@@ -828,7 +834,11 @@ export function renderHookDeliveryWithCoverage(
       additionalContext,
     },
   };
-  return { output, presentedCount };
+  return {
+    output,
+    presentedCount,
+    ...(truncatedEventId ? { truncatedEventId } : {}),
+  };
 }
 
 /**

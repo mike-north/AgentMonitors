@@ -179,7 +179,10 @@ export {
   AgentMonitorRuntime,
   isVerifyScratchObjectKey,
 } from './runtime/service.js';
-export { postMessageInputSchema } from './runtime/message-policy.js';
+export {
+  POST_MONITOR_ID,
+  postMessageInputSchema,
+} from './runtime/message-policy.js';
 export {
   MaterializationRetryCapacityError,
   MaterializationRetryNotFoundError,

@@ -44,6 +44,7 @@ export class AgentMonitorRuntime {
         eventId: string;
         hookStateRefreshError?: string;
     };
+    preparePostDelivery(reservationId: string, presentedEventIds: readonly string[], truncatedEventId?: string): boolean;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryRepairResult;
@@ -1439,6 +1440,9 @@ export interface PendingRollupState {
 }
 
 // @public
+export const POST_MONITOR_ID = "message/post";
+
+// @public
 export interface PostMessageInput {
     // (undocumented)
     body: string;
@@ -1590,6 +1594,8 @@ export class RuntimeStore {
         baselineSnapshotId: string | null;
         baselineContent: string;
     }): void;
+    // @internal
+    claimPostOffers(sessionId: string, eventIds: string[], lifecycle: string, reservedAtMs: number, truncatedEventId?: string): boolean;
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];

@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Direct post offers survive delivery retries (002 §7.2, 005 §18, 006 §4.5 and §5.5)
+
+Workspace keys recover only the original post request. Hooks and channels consume each presented
+post offer before output so a lost commit cannot repeat the offer. A truncated post stays in
+unread history with no further offers. A bounded recap claims only the monitor groups it shows.
+
 ## 2026-11-25 — Post retries retain their workspace and endpoint (002 §7.2, 005 §18)
 
 A post retry uses the original recipient workspace and daemon endpoint. The workspace's recovery

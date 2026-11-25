@@ -1734,8 +1734,19 @@ export class RuntimeStore {
         this.getSessionById(sessionId).workspacePath ??
         '';
       const existing = db
-        .select({ eventId: postRequests.eventId })
+        .select({
+          eventId: postRequests.eventId,
+          sessionId: sessionEventState.sessionId,
+          body: monitorEvents.body,
+          retryMs: sessionEventState.messageRetryMs,
+          maxResurfaces: sessionEventState.messageMaxResurfaces,
+        })
         .from(postRequests)
+        .leftJoin(monitorEvents, eq(monitorEvents.id, postRequests.eventId))
+        .leftJoin(
+          sessionEventState,
+          eq(sessionEventState.eventId, postRequests.eventId),
+        )
         .where(
           and(
             eq(postRequests.workspacePath, workspacePath),
@@ -1743,7 +1754,19 @@ export class RuntimeStore {
           ),
         )
         .get();
-      if (existing) return { eventId: existing.eventId, created: false };
+      if (existing) {
+        if (
+          existing.sessionId !== sessionId ||
+          existing.body !== body ||
+          existing.retryMs !== retryMs ||
+          existing.maxResurfaces !== maxResurfaces
+        ) {
+          throw new Error(
+            'This request key is already used for a different post in this workspace.',
+          );
+        }
+        return { eventId: existing.eventId, created: false };
+      }
 
       // A replay can recover the original result after the recipient moves.
       // A new write requires the recipient to still belong to the pinned scope.
@@ -3774,7 +3797,52 @@ export class RuntimeStore {
 
   markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void {
     if (eventIds.length === 0) return;
-    const now = new Date();
+    this.writeClaims(sessionId, eventIds, lifecycle, new Date());
+    // Advance only to newer artifacts among the claimed rows.
+    this.advanceCursorsForClaimedEvents(sessionId, eventIds);
+  }
+
+  /**
+   * Atomically consume the presented post offers before writing to the host.
+   * @internal
+   */
+  claimPostOffers(
+    sessionId: string,
+    eventIds: string[],
+    lifecycle: string,
+    reservedAtMs: number,
+    truncatedEventId?: string,
+  ): boolean {
+    if (eventIds.length === 0) return true;
+    return runRuntimeTransaction(this, () => {
+      const now = new Date();
+      const eligible = asInternalDb(this.db)
+        .select({ id: sessionEventState.eventId })
+        .from(sessionEventState)
+        .where(
+          and(
+            eq(sessionEventState.sessionId, sessionId),
+            inArray(sessionEventState.eventId, eventIds),
+            isNotNull(sessionEventState.messageRetryMs),
+            isNull(sessionEventState.acknowledgedAt),
+            // A stale reservation cannot consume a later offer.
+            isPendingPost(Math.min(reservedAtMs, now.getTime())),
+          ),
+        )
+        .all();
+      if (eligible.length !== eventIds.length) return false;
+      this.writeClaims(sessionId, eventIds, lifecycle, now, truncatedEventId);
+      return true;
+    });
+  }
+
+  private writeClaims(
+    sessionId: string,
+    eventIds: string[],
+    lifecycle: string,
+    now: Date,
+    truncatedEventId?: string,
+  ): void {
     asInternalDb(this.db)
       .update(sessionEventState)
       .set({
@@ -3786,6 +3854,7 @@ export class RuntimeStore {
           WHEN ${sessionEventState.messageRetryMs} > 0
             AND ${sessionEventState.messageClaims} <= ${sessionEventState.messageMaxResurfaces}
             AND ${sessionEventState.acknowledgedAt} IS NULL
+            AND ${sessionEventState.eventId} IS NOT ${truncatedEventId ?? null}
           THEN ${now.getTime()} + ${sessionEventState.messageRetryMs}
           ELSE NULL
         END`,
@@ -3815,13 +3884,6 @@ export class RuntimeStore {
         ),
       )
       .run();
-
-    // Advance this recipient's per-object baseline cursor (G10, 002 §1.1.2): the
-    // cursor means "the latest artifact this recipient was shown", so a claim
-    // moves it to the artifact of the NEWEST claimed event for each object —
-    // never backward past an event an earlier claim already surfaced.
-    // Only snapshot-bearing events carry an artifact to advance to.
-    this.advanceCursorsForClaimedEvents(sessionId, eventIds);
   }
 
   /**

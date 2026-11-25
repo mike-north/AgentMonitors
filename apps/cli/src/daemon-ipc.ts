@@ -67,6 +67,7 @@ const daemonMethodSchema = z.enum([
   'hook.claim',
   'hook.reserve',
   'hook.commit',
+  'hook.preparePosts',
   'hook.release',
   'hook.preview',
   'hook.previewReminder',
@@ -190,6 +191,10 @@ const hookReservationParamsSchema = z.object({
 });
 const hookCommitParamsSchema = hookReservationParamsSchema.extend({
   presentedEventIds: z.array(z.string()).optional(),
+});
+const hookPreparePostsParamsSchema = hookReservationParamsSchema.extend({
+  presentedEventIds: z.array(z.string()),
+  truncatedEventId: z.string().optional(),
 });
 const hookDiagnoseParamsSchema = z.object({
   sessionId: z.string(),
@@ -868,6 +873,16 @@ function handleRequest(
           params.sessionId,
           params.lifecycle,
           params.maxEvents,
+        ),
+      );
+    }
+    case 'hook.preparePosts': {
+      const params = hookPreparePostsParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.preparePostDelivery(
+          params.reservationId,
+          params.presentedEventIds,
+          params.truncatedEventId,
         ),
       );
     }

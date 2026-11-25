@@ -1383,11 +1383,11 @@ it('preserves pre-post projections and recovers keyed posts after reopening', ()
 
   const reopened = new RuntimeStore(createDb(dbPath));
   expect(
-    reopened.insertMessageOnce(recipient, 'Replay', 100, 1, 'request'),
+    reopened.insertMessageOnce(recipient, 'Original', 100, 1, 'request'),
   ).toEqual({ eventId: first.eventId, created: false });
-  expect(
-    reopened.insertMessageOnce(sibling, 'Replay', 100, 1, 'request'),
-  ).toEqual({ eventId: first.eventId, created: false });
+  expect(() =>
+    reopened.insertMessageOnce(sibling, 'Original', 100, 1, 'request'),
+  ).toThrow('This request key is already used for a different post');
   expect(
     reopened.insertMessageOnce(
       otherWorkspace,

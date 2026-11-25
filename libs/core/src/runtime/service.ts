@@ -3409,8 +3409,8 @@ export class AgentMonitorRuntime {
    * push the caller {@link releaseDelivery}, returning the rows to the hook path.
    * If the caller does neither, the lease self-expires and the rows re-deliver.
    *
-   * This is what lets the channel transport avoid consuming a delivery on a
-   * transient MCP disconnect: it reserves, pushes, and only then commits.
+   * Monitor events commit after output. Direct posts use
+   * {@link preparePostDelivery} before output to consume each offer once.
    */
   reserveDelivery(
     sessionId: string,
@@ -3418,13 +3418,15 @@ export class AgentMonitorRuntime {
     maxEvents?: number,
   ): DeliveryReservation | null {
     this.store.touchSession(sessionId);
-    const decision = this.decideDelivery(sessionId, lifecycle, maxEvents);
+    const now = new Date();
+    const decision = this.decideDelivery(sessionId, lifecycle, maxEvents, now);
     if (!decision) return null;
     const reservationId = this.reservations.add({
       sessionId: decision.sessionId,
       candidates: decision.candidates,
       isRecap: decision.isRecap,
       claim: decision.claim,
+      reservedAtMs: now.getTime(),
     });
     // Refresh the hook-state projection so it reflects the lease immediately: the
     // reserved rows are now hidden from `pendingForClaim`, so the file stops
@@ -3435,13 +3437,47 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Durably consume the rendered post offers before a transport presents them.
+   * A reservation grants permission once, including across a lost IPC reply.
+   * The later commit still applies the monitor claims after a successful write.
+   */
+  preparePostDelivery(
+    reservationId: string,
+    presentedEventIds: readonly string[],
+    truncatedEventId?: string,
+  ): boolean {
+    const plan = this.reservations.get(reservationId);
+    if (!plan || plan.postsPrepared) return false;
+    const presented = new Set(presentedEventIds);
+    const posts = plan.candidates
+      .filter(
+        (event) =>
+          event.monitorId === POST_MONITOR_ID && presented.has(event.id),
+      )
+      .map((event) => event.id);
+    if (
+      !this.store.claimPostOffers(
+        plan.sessionId,
+        posts,
+        plan.claim.lifecycle,
+        plan.reservedAtMs,
+        truncatedEventId,
+      )
+    ) {
+      return false;
+    }
+    plan.postsPrepared = true;
+    return true;
+  }
+
+  /**
    * Commit a reservation from {@link reserveDelivery} after its claim was
    * surfaced (006 §4, issue #300): apply the deferred claim (mark the reserved
    * rows claimed, "was surfaced" — BP2, not acknowledged), returning the claim.
-   * Returns `null` if the reservation is unknown or already expired — the rows
-   * were never permanently consumed, so a stale commit is a safe no-op (they may
-   * have already re-delivered via the hook path). A bounded recap can pass
-   * the event IDs it presented to leave omitted post offers eligible.
+   * Returns `null` if the reservation is unknown or has expired. A stale
+   * commit leaves uncommitted monitor claims eligible and cannot repeat a
+   * prepared post offer. A bounded recap can pass the event IDs it presented
+   * to leave omitted groups eligible.
    */
   commitDelivery(
     reservationId: string,
@@ -3449,24 +3485,30 @@ export class AgentMonitorRuntime {
   ): DeliveryClaim | null {
     const plan = this.reservations.take(reservationId);
     if (!plan) return null;
+    let candidates = plan.candidates;
+    if (plan.postsPrepared) {
+      candidates = candidates.filter(
+        (event) => event.monitorId !== POST_MONITOR_ID,
+      );
+    }
     if (plan.isRecap && presentedEventIds !== undefined) {
       const presented = new Set(presentedEventIds);
-      const candidates = plan.candidates.filter(
-        (event) =>
-          event.monitorId !== POST_MONITOR_ID || presented.has(event.id),
+      const representedGroups = new Set(
+        plan.candidates
+          .filter((event) => presented.has(event.id))
+          .map(netCollapseGroupKey),
       );
-      this.applyDelivery({ ...plan, candidates });
-    } else {
-      this.applyDelivery(plan);
+      candidates = candidates.filter((event) =>
+        representedGroups.has(netCollapseGroupKey(event)),
+      );
     }
+    this.applyDelivery({ ...plan, candidates });
     return plan.claim;
   }
 
   /**
-   * Release a reservation from {@link reserveDelivery} WITHOUT claiming (006 §4,
-   * issue #300): the push failed or disconnected, so drop the lease and return
-   * the rows to `pending`, where the hook transport (or the next channel poll)
-   * re-delivers them. A no-op for an unknown/expired reservation.
+   * Drop a reservation, returning uncommitted monitor claims and unconsumed
+   * post offers to pending. Unknown and expired reservations are a no-op.
    */
   releaseDelivery(reservationId: string): void {
     const plan = this.reservations.remove(reservationId);
@@ -3565,8 +3607,8 @@ export class AgentMonitorRuntime {
     sessionId: string,
     lifecycle: DeliveryLifecycle,
     maxEvents?: number,
+    now = new Date(),
   ): DeliveryDecision | null {
-    const now = new Date();
     const unreadCounts = {
       low: this.store.unreadEventsForSession(sessionId, 'low').length,
       normal: this.store.unreadEventsForSession(sessionId, 'normal').length,

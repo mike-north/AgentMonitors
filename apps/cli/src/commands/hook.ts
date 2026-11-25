@@ -5,12 +5,14 @@ import type {
   DeliveryLifecycle,
   DeliveryReservation,
 } from '@agentmonitors/core';
+import { POST_MONITOR_ID } from '@agentmonitors/core';
 import { reportError } from '../output.js';
 import {
   claimDeliveryClient,
   commitDeliveryClient,
   diagnoseHookDeliveryClient,
   listSessionsClient,
+  preparePostDeliveryClient,
   previewCoalescedReminderClient,
   previewSettledHighDeliveryClient,
   releaseDeliveryClient,
@@ -452,6 +454,8 @@ export interface HookDeliveryFlowResult {
    * flow, and duplicate delivery — not loss — is the safe direction here).
    */
   commit: () => Promise<DeliveryClaim | null>;
+  /** Acquire permission to write the rendered direct-post offers. */
+  preparePosts?: () => Promise<boolean>;
   /**
    * Release the reservation WITHOUT claiming — the rows return to pending.
    * Callers use this when writing `output` failed: nothing was durably
@@ -517,16 +521,30 @@ export async function reserveRenderAndCommitHookDelivery(
     moreDeferred: sized.moreDeferred,
     socketPath,
   });
-  const presentedCount = rendered?.presentedCount ?? 0;
+  const presentedEvents = claim.events.slice(0, rendered?.presentedCount ?? 0);
   const presentedEventIds =
-    claim.mode === 'recap' && presentedCount < claim.events.length
-      ? claim.events.slice(0, presentedCount).map((event) => event.eventId)
+    claim.mode === 'recap' && presentedEvents.length < claim.events.length
+      ? presentedEvents.map((event) => event.eventId)
       : undefined;
+  const postIds = presentedEvents
+    .filter((event) => event.monitorId === POST_MONITOR_ID)
+    .map((event) => event.eventId);
   return {
     output: rendered?.output ?? null,
     moreDeferred: sized.moreDeferred,
     previewCount: sized.previewCount,
     reservedClaim: sized.reservation.claim,
+    ...(postIds.length > 0
+      ? {
+          preparePosts: () =>
+            preparePostDeliveryClient(
+              reservationId,
+              socketPath,
+              postIds,
+              rendered?.truncatedEventId,
+            ),
+        }
+      : {}),
     commit: () =>
       presentedEventIds
         ? commitDeliveryClient(reservationId, socketPath, presentedEventIds)
@@ -576,6 +594,12 @@ export async function writeAndCommitHookDelivery(
 ): Promise<DeliveryClaim | null> {
   if (flow.output !== null) {
     try {
+      // Direct-post offers must be consumed before the host can see them.
+      if (flow.preparePosts && !(await flow.preparePosts())) {
+        throw new Error(
+          'The reservation no longer permits presentation of these posts.',
+        );
+      }
       await write(flow.output);
     } catch (writeError) {
       await flow.release();
@@ -927,20 +951,9 @@ Diagnosis:
         // and retrying on a mismatch (mirroring the channel transport's
         // `reserveSizedChannelDelivery`/`resolveChannelClaimFit`).
         //
-        // Crucially, the COMMIT — the durable `first_notified_at` mutation
-        // that permanently excludes these rows from ordinary redelivery — now
-        // happens AFTER the rendered output is successfully written, never
-        // before (issue #442, PR #442 round-9 review): committing first left
-        // an at-most-once loss window where a lost commit-RPC response, or a
-        // render/write failure AFTER commit, would durably consume the
-        // delivery while emitting nothing. Rendering off the RESERVATION's
-        // own claim (never a committed one) and deferring commit until after
-        // a successful write means a write failure can still be recovered by
-        // releasing the reservation (nothing durably claimed, rows stay
-        // pending) — and a commit failure/uncertainty after a successful
-        // write only risks a later DUPLICATE delivery, the safe direction,
-        // never a loss. Mirrors the channel transport's reserve → push →
-        // commit ordering (`runChannelDeliveryCycle`, `channel.ts`).
+        // Monitor claim timing starts after a successful write. Direct-post
+        // offers are recorded before writing so a lost commit cannot cause
+        // another presentation of the same offer.
         const flow = await reserveRenderAndCommitHookDelivery(
           match.id,
           lifecycle,
@@ -985,9 +998,8 @@ Diagnosis:
           // propagates as a thrown error to the outer catch below, since
           // whether that row is claimed is genuinely unknown, not resolvable
           // here). The output — if any — was already written, so this is a
-          // safe, intentional duplicate: the rows return to pending and
-          // re-deliver at the next context event (or via a concurrent
-          // channel poll) rather than being lost.
+          // possible duplicate for monitors: their rows return to pending
+          // and can re-deliver. Prepared direct-post offers stay consumed.
           debug(describeCommitLapsed());
         }
         debug(describeClaim(claim ?? reservedClaim));

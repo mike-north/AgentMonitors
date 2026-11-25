@@ -386,6 +386,20 @@ export function renderChannelEvent(
   content: string;
   meta: Record<string, string>;
 } {
+  const { content, meta } = renderChannelEventWithCoverage(claim, options);
+  return { content, meta };
+}
+
+/** Render a channel push and identify the event whose body was truncated. */
+export function renderChannelEventWithCoverage(
+  claim: DeliveryClaim,
+  options: RenderChannelEventOptions = {},
+): {
+  content: string;
+  meta: Record<string, string>;
+  presentedCount: number;
+  truncatedEventId?: string;
+} {
   // Body-injection claim → render the concrete event blocks (title + monitor
   // body + bounded change summary), matching the hook path. Reminder claim (no
   // events) → the coalesced advisory message, kept generic. Boundedness is
@@ -394,6 +408,8 @@ export function renderChannelEvent(
   // defense-in-depth ceiling enforcement (issue #442): sizing upstream cannot
   // rule out every over-cap case (see the doc comment above).
   let content: string;
+  let presentedCount = 0;
+  let truncatedEventId: string | undefined;
   if (claim.events.length > 0) {
     const moreDeferred = options.moreDeferred ?? false;
     const blocks = claim.events.map((event) =>
@@ -426,11 +442,13 @@ export function renderChannelEvent(
     );
     if (fit.whole.includedCount === blocks.length && !moreDeferred) {
       // Every claimed block fits and nothing was deferred → no marker.
+      presentedCount = fit.whole.includedCount;
       content = fit.whole.text + reminderFooter;
     } else if (fit.reserved.includedCount >= 1) {
       // A marker is needed (some claimed blocks did not fit here, and/or the
       // caller deferred more): repack reserving marker room so no INCLUDED
       // block is cut.
+      presentedCount = fit.reserved.includedCount;
       content = fit.reserved.text + CHANNEL_DEFERRED_MARKER + reminderFooter;
     } else {
       // Even the first block alone exceeds (cap − marker): mid-truncate it
@@ -464,6 +482,8 @@ export function renderChannelEvent(
       // {@link MAX_CHANNEL_CONTENT} by `appendMarkerWithinCap`'s
       // marker-length budget, which is computed from the COMBINED marker's
       // actual length.
+      presentedCount = 1;
+      truncatedEventId = claim.events[0]?.eventId;
       const firstBlock = blocks[0] ?? '';
       const truncatedMarker = buildChannelTruncatedMarker(
         claim.sessionId,
@@ -553,5 +573,10 @@ export function renderChannelEvent(
     }
   }
 
-  return { content, meta };
+  return {
+    content,
+    meta,
+    presentedCount,
+    ...(truncatedEventId ? { truncatedEventId } : {}),
+  };
 }

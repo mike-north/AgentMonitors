@@ -2585,8 +2585,9 @@ only in the recipient's session-scoped event list and use the reserved event ide
 
 When the optional request `key` is supplied, the runtime commits the key and event ID in the
 same transaction as the event and projection. Keys are unique within the recipient's workspace.
-A repeat with the same key in that workspace returns the original ID without creating or
-changing a post, even after a restart or when the original session is dormant. Different
+A repeat with the same recipient, body and effective acknowledgement policy returns the original ID
+without creating or changing a post, even after a restart or when the original session is dormant.
+Reusing the key for a different request in that workspace fails. Different
 workspaces can use the same key independently. A keyed request may pin its workspace explicitly.
 The runtime looks for the original ID in that workspace before checking the recipient's current
 registration. A new post requires the recipient to be registered in the selected workspace when
@@ -2601,9 +2602,13 @@ the write transaction runs.
 | `acked`           | The recipient explicitly acknowledged the post.                                                            |
 
 For a post requiring acknowledgement, committing the initial offer or a scheduled resurface
-starts a new deadline using the persisted interval. Committing the final needs-attention offer
-clears the deadline. Each offer uses the same ID and body. A released or expired
-reservation leaves the offer eligible without spending the resurfacing budget. At the deadline
+starts a new deadline using the persisted interval. Consuming a final needs-attention offer or a
+truncated post clears the deadline. The full post remains unread until acknowledged. Each scheduled
+offer uses the same ID and body. Releasing or expiring a reservation before consuming the offer
+leaves it eligible without spending the resurfacing budget. Hooks and channels consume rendered
+offers before sending them to the host
+([006 §4.5.1](./006-agent-integration.md#451-transport-state-semantics-reserve--commit--release)).
+At the deadline
 after the last allowed resurface, the event becomes `needs-attention` and is eligible for one
 final delivery labeled accordingly. It remains visible as `needs-attention` until acknowledged.
 With a zero budget the first deadline after initial delivery makes it `needs-attention`.

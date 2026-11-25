@@ -10,11 +10,12 @@ import type {
   DeliveryEventSummary,
   DeliveryReservation,
 } from '@agentmonitors/core';
-import { claudeCodeAdapter } from '@agentmonitors/core';
+import { POST_MONITOR_ID, claudeCodeAdapter } from '@agentmonitors/core';
 import {
   acknowledgeEventsClient,
   commitDeliveryClient,
   openSessionClient,
+  preparePostDeliveryClient,
   previewCoalescedReminderClient,
   previewSettledHighDeliveryClient,
   releaseDeliveryClient,
@@ -27,6 +28,7 @@ import {
   MAX_CHANNEL_CONTENT,
   packChannelEventsUnderCap,
   renderChannelEvent,
+  renderChannelEventWithCoverage,
   resolveChannelClaimFit,
 } from '../channel-render.js';
 import {
@@ -475,26 +477,47 @@ export async function runChannelDeliveryCycle(
   const sized = await reserveSizedChannelDelivery(boundSession, socketPath);
   if (!sized) return 'idle';
   const { reservation, moreDeferred } = sized;
+  if (
+    reservation.claim.events.some(
+      (event) => event.monitorId === POST_MONITOR_ID,
+    )
+  ) {
+    const rendered = renderChannelEventWithCoverage(reservation.claim, {
+      moreDeferred,
+      socketPath,
+    });
+    const postIds = reservation.claim.events
+      .slice(0, rendered.presentedCount)
+      .filter((event) => event.monitorId === POST_MONITOR_ID)
+      .map((event) => event.eventId);
+    const prepared = await preparePostDeliveryClient(
+      reservation.reservationId,
+      socketPath,
+      postIds,
+      rendered.truncatedEventId,
+    ).catch(async (error: unknown) => {
+      await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
+        () => undefined,
+      );
+      throw error;
+    });
+    if (!prepared) {
+      await releaseDeliveryClient(reservation.reservationId, socketPath);
+      return 'idle';
+    }
+  }
   try {
     await push(reservation.claim, moreDeferred);
   } catch {
-    // Push rejected/disconnected: release the reservation so the leased rows
-    // return to pending and re-deliver via the hook path or the next poll (006
-    // §4, issue #300). NEVER commit here — committing an unsurfaced claim is the
-    // delivery-loss bug this cycle exists to prevent. Release is best-effort: if
-    // it also fails (daemon unreachable), the reservation self-expires.
+    // Release monitor claims after a failed push. Direct-post offers have
+    // already been consumed, and their full text stays available in history.
     await releaseDeliveryClient(reservation.reservationId, socketPath).catch(
       () => undefined,
     );
     return 'push-failed';
   }
-  // Surfaced successfully: commit the claim now (the rows become claimed / "was
-  // surfaced", deduped from the hook transport — 006 §4.5). Claim is not ack (BP2).
-  // commit returns null when the reservation was already gone (lease expired
-  // during a slow/hung push, or the daemon restarted): the push already
-  // happened, but the rows were never claimed, so they stay eligible for
-  // re-delivery (at-least-once). Report that honestly rather than a false
-  // 'surfaced' — we must NOT claim success for a delivery that was not committed.
+  // Commit monitor claims after a successful push. If the reservation
+  // lapsed, those claims can be retried while prepared posts stay consumed.
   const committed = await commitDeliveryClient(
     reservation.reservationId,
     socketPath,
@@ -744,7 +767,7 @@ async function runChannelServe(options: ChannelServeOptions): Promise<void> {
         // rows stay eligible for re-delivery (at-least-once). Note it on stderr;
         // stdout is the JSON-RPC channel and must not be written to.
         process.stderr.write(
-          'agentmonitors channel: push delivered but commit did not land; rows remain eligible for re-delivery.\n',
+          'agentmonitors channel: push delivered but commit did not land; monitor claims may be retried.\n',
         );
       }
     } catch {
