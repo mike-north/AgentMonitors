@@ -2533,12 +2533,21 @@ accounted for, including routes observed for a global owner. Already materialize
 Repeated retirement preserves the first receipt. Receipts survive database reopen and are listed
 independently of active declarations; they do not depend on observation-history retention.
 
+Admission re-reads the ephemeral declaration and its declaring session under the immediate SQLite
+writer transaction, before changing notify state, the source checkpoint or observation clock, or
+materializing events. Both records must still be active and belong together. A result returned by
+an outstanding observation, or an evaluation queued from an earlier declaration list, has no
+admission authority after retirement. Held-work flushes use the same check. SQLite serializes these
+checks and writes with retirement even when the poll and retirement use separate connections.
+
 Verified: `libs/core/src/runtime/service.ts` — `discardRetiringNotifyWork`,
-`cancelEphemeralMonitor`, `closeSession`, `reapDormantSessions`;
+`cancelEphemeralMonitor`, `closeSession`, `reapDormantSessions`, `canAdmitEphemeralWork`,
+`ingest`, `flushHeldNotifyWork`;
 `libs/core/src/runtime/notify-admission-lifetime.test.ts` — both hold kinds across all three
-retirement paths, write-failure rollback, no later emission, and database reopen;
+retirement paths, write-failure rollback, queued evaluations and separate-connection observations,
+writer-lock liveness checks, dormant-owner refusal, no later emission, and database reopen;
 `libs/core/src/runtime/held-notify-report.test.ts` — cancelled receipt diagnosis after reopen
-and interrupted-close atomicity.
+and interrupted-close atomicity, plus real-hold diagnosis beside an existing receipt.
 
 ## 7. Unread, Claimed, and Acknowledged
 
@@ -3063,17 +3072,17 @@ The next tick still refuses the ambiguity and retains its held work. Other error
 from reading the current definition propagate normally.
 Both report methods expose the first known prerequisite as `releaseBarrier`:
 
-| Value                 | Derivation and remedy                                                                                                                                                                              |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                  |
-| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                  |
-| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                        |
-| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit. |
-| `declaration-retired` | Legacy or inconsistent state has held envelopes with an absent/reaped declaration. Current retirement replaces holds with a disposition (§6.4), so it cannot create this barrier.                  |
-| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                            |
-| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                         |
-| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                            |
-| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.               |
+| Value                 | Derivation and remedy                                                                                                                                                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                                                             |
+| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                                                             |
+| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                                                                   |
+| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit.                                            |
+| `declaration-retired` | Legacy or inconsistent state has held envelopes with an absent/reaped declaration. Retirement consumes holds and admission checks declaration/owner liveness under the same SQLite writer lock (§6.4), preventing new holds after retirement. |
+| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                                                                       |
+| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                                                                    |
+| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                                                                       |
+| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.                                                          |
 
 `blockedByDefinition` retains its persistent-definition meaning, including an
 unresolved source in a persistent definition. It is false for ephemeral source,
@@ -3081,7 +3090,9 @@ owner and retirement barriers and for retained-work/capture barriers; it does no
 assert eligibility. `none` is a snapshot, not a promise that the next tick emits:
 concurrent edits, cadence, watcher ownership, in-flight admission, transactional
 failures and deliberate artifact filtering still apply. Diagnosis changes neither
-release timing nor retention policy. `held-notify-report.test.ts` exercises both
+release timing nor retention policy. An existing disposition is not proof that no hold remains:
+if both are persisted, `doctor` lists the actual hold and `monitor explain` uses it for the notify
+stage instead of reporting only the receipt. `held-notify-report.test.ts` exercises both
 surfaces, read-only persistence, stale-owner and recent-declaration clocks,
 interrupted-close database reopen, source restoration, and real release/retention
 outcomes (Refs #574).

@@ -176,6 +176,207 @@ function deferred<T>() {
   });
   return { promise, resolve };
 }
+
+/** A captured declaration and an outstanding source result both lose authority at retirement. */
+for (const interleaving of [
+  'queued declaration',
+  'separate connection',
+] as const) {
+  for (const strategy of ['debounce', 'rollup'] as const) {
+    for (const retirement of ['cancel', 'close', 'dormant'] as const) {
+      it(`${interleaving} cannot admit ${strategy} work after ${retirement}`, async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        vi.setSystemTime(new Date('2026-03-20T08:00:00Z'));
+        const root = mkdtempSync(path.join(tmpdir(), 'retirement-race-'));
+        roots.push(root);
+        const dir = path.join(root, 'monitors');
+        mkdirSync(dir);
+        const databasePath = path.join(root, 'race.sqlite');
+        const db = createDb(databasePath);
+        clients.push(db.$client);
+        const store = new RuntimeStore(db);
+        const registry = new SourceRegistry();
+        const started = deferred<undefined>();
+        const finish = deferred<ObservationResult>();
+        const calls = new Map<unknown, number>();
+        registry.register({
+          name: 'retirement-race',
+          scopeSchema: { type: 'object' },
+          async observe(scope) {
+            const call = (calls.get(scope.label) ?? 0) + 1;
+            calls.set(scope.label, call);
+            if (call === 2 && scope.label === 'paused') {
+              started.resolve(undefined);
+              return finish.promise;
+            }
+            return {
+              observations: [{ title: `Accepted ${String(call)}` }],
+              nextState: { cursor: call },
+            };
+          },
+        });
+        const runtime = new AgentMonitorRuntime(
+          store,
+          registry,
+          undefined,
+          undefined,
+          {
+            sessionDormancyMs: 1_000,
+          },
+        );
+        // The public declaration contract has no rollup option. Only definition
+        // reconstruction is substituted; ticks and all persistence remain real.
+        const reconstruction = runtime as unknown as {
+          ephemeralRecordToMonitor(
+            record: EphemeralMonitorRecord,
+          ): MonitorDefinition;
+        };
+        const rebuild = reconstruction.ephemeralRecordToMonitor.bind(runtime);
+        vi.spyOn(reconstruction, 'ephemeralRecordToMonitor').mockImplementation(
+          (record) => {
+            const monitor = rebuild(record);
+            monitor.frontmatter.notify =
+              strategy === 'debounce'
+                ? { strategy: 'debounce', 'settle-for': '1h' }
+                : { strategy: 'rollup', window: '0 9 * * *', timezone: 'UTC' };
+            return monitor;
+          },
+        );
+        const session = runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'retirement-race',
+            workspacePath: root,
+          }),
+        );
+        const paused = runtime.declareEphemeralMonitor({
+          sessionId: session.id,
+          source: 'retirement-race',
+          scope: { label: 'paused' },
+          urgency: 'high',
+          instruction: 'Inspect',
+        });
+        if (interleaving === 'queued declaration') {
+          vi.setSystemTime(new Date(Date.now() + 1_000));
+        }
+        const target =
+          interleaving === 'queued declaration'
+            ? runtime.declareEphemeralMonitor({
+                sessionId: session.id,
+                source: 'retirement-race',
+                scope: { label: 'queued' },
+                urgency: 'high',
+                instruction: 'Inspect',
+              })
+            : paused;
+        await runtime.tick(dir, root);
+        expect(
+          (strategy === 'debounce'
+            ? store.getMonitorState(target.id, root).notifyState.pendingDebounce
+            : store.getMonitorState(target.id, root).notifyState.pendingRollup
+          )?.observations,
+        ).toHaveLength(1);
+        for (const record of store.listActiveEphemeralMonitors(root)) {
+          store.setMonitorState(record.id, root, {
+            ...store.getMonitorState(record.id, root),
+            lastObservationAt: new Date('2000-01-01T00:00:00Z'),
+          });
+        }
+        const pending = runtime.tick(dir, root);
+        await started.promise;
+        let retiring = runtime;
+        if (interleaving === 'separate connection') {
+          const otherDb = createDb(databasePath);
+          clients.push(otherDb.$client);
+          retiring = new AgentMonitorRuntime(
+            new RuntimeStore(otherDb),
+            registry,
+            undefined,
+            undefined,
+            {
+              sessionDormancyMs: 1_000,
+            },
+          );
+        }
+        if (retirement === 'cancel') {
+          retiring.cancelEphemeralMonitor(session.id, target.id);
+        } else if (retirement === 'close') {
+          retiring.closeSession(session.id);
+        } else {
+          vi.setSystemTime(new Date(Date.now() + 2_000));
+          await retiring.tick(dir, root);
+        }
+        const terminal = store.getMonitorState(target.id, root);
+        expect(store.getEphemeralMonitorById(target.id).status).toBe('reaped');
+        expect(terminal.notifyState.disposition).toMatchObject({
+          observations: 1,
+          disposition:
+            retirement === 'cancel'
+              ? 'discarded-on-cancel'
+              : 'discarded-on-retirement',
+        });
+        const readDeclaration = store.findEphemeralMonitorById.bind(store);
+        const livenessLocks: boolean[] = [];
+        const livenessRead = vi
+          .spyOn(store, 'findEphemeralMonitorById')
+          .mockImplementation((id) => {
+            if (id === target.id) livenessLocks.push(db.$client.inTransaction);
+            return readDeclaration(id);
+          });
+        finish.resolve(
+          interleaving === 'queued declaration'
+            ? { observations: [] }
+            : {
+                observations: [{ title: 'Too late' }],
+                nextState: { cursor: 999 },
+              },
+        );
+        await pending;
+        livenessRead.mockRestore();
+        // Eligibility must be re-read while SQLite excludes competing writers;
+        // a check between observe and BEGIN would still allow another retire.
+        expect(livenessLocks.length).toBeGreaterThan(0);
+        expect(livenessLocks).not.toContain(false);
+        // Retirement freezes the accepted count, cursor and observation clock.
+        expect(store.getMonitorState(target.id, root)).toEqual(terminal);
+        vi.setSystemTime(new Date('2026-03-20T10:00:00Z'));
+        const reopenedDb = createDb(databasePath);
+        clients.push(reopenedDb.$client);
+        const reopenedStore = new RuntimeStore(reopenedDb);
+        const reopened = new AgentMonitorRuntime(reopenedStore, registry);
+        const input = {
+          monitorsDir: dir,
+          workspacePath: root,
+          monitorId: target.id,
+        };
+        const doctor = await reopened.doctorReport(input);
+        expect(
+          doctor.heldNotifyWork?.filter((hold) => hold.monitorId === target.id),
+        ).toEqual([]);
+        expect(doctor.heldNotifyDispositions).toContainEqual(
+          terminal.notifyState.disposition,
+        );
+        expect(
+          (await reopened.explainMonitor(input)).stages.find(
+            (stage) => stage.id === 'notify',
+          ),
+        ).toMatchObject({
+          status: 'ok',
+          details: terminal.notifyState.disposition,
+        });
+        await reopened.tick(dir, root);
+        expect(
+          reopenedStore.listEvents({
+            monitorId: target.id,
+            workspacePath: root,
+          }),
+        ).toEqual([]);
+        expect(reopenedStore.getMonitorState(target.id, root)).toEqual(
+          terminal,
+        );
+      });
+    }
+  }
+}
 const roots: string[] = [];
 const clients: Database[] = [];
 const handles: { stop(): Promise<void> }[] = [];
@@ -190,6 +391,56 @@ async function turns() {
   for (let i = 0; i < 32; i++) await Promise.resolve(undefined);
 }
 const DEBOUNCE = 'notify:\n  strategy: debounce\n  settle-for: 1h\n';
+
+it('refuses a late batch when only the durable owner is dormant', async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'owner-admission-'));
+  roots.push(root);
+  const dir = path.join(root, 'monitors');
+  mkdirSync(dir);
+  const db = createDb(path.join(root, 'owner.sqlite'));
+  clients.push(db.$client);
+  const store = new RuntimeStore(db);
+  const registry = new SourceRegistry();
+  const started = deferred<undefined>();
+  const finish = deferred<ObservationResult>();
+  registry.register({
+    name: 'paused-owner',
+    scopeSchema: { type: 'object' },
+    async observe() {
+      started.resolve(undefined);
+      return finish.promise;
+    },
+  });
+  const runtime = new AgentMonitorRuntime(store, registry);
+  const session = runtime.openSession(
+    claudeCodeAdapter.createSessionInput({
+      hostSessionId: 'owner-admission',
+      workspacePath: root,
+    }),
+  );
+  const monitor = runtime.declareEphemeralMonitor({
+    sessionId: session.id,
+    source: 'paused-owner',
+    scope: {},
+    urgency: 'high',
+  });
+  const before = store.getMonitorState(monitor.id, root);
+  const pending = runtime.tick(dir, root);
+  await started.promise;
+  // This lower-level owner transition deliberately leaves the declaration
+  // active: admission must independently check both durable liveness records.
+  store.closeSession(session.id);
+  expect(store.getEphemeralMonitorById(monitor.id).status).toBe('active');
+  finish.resolve({
+    observations: [{ title: 'Too late' }],
+    nextState: { cursor: 999 },
+  });
+  expect((await pending).emittedEventIds).toEqual([]);
+  expect(store.getMonitorState(monitor.id, root)).toEqual(before);
+  expect(
+    store.listEvents({ monitorId: monitor.id, workspacePath: root }),
+  ).toEqual([]);
+});
 
 /** Actual files, source effects and owned SQLite expose both public and precise admission boundaries. */
 function fixture(watched = false) {

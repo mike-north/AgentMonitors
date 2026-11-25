@@ -754,6 +754,39 @@ it('lists a cancelled hold disposition after database reopen without stranded wo
   }
 });
 
+for (const strategy of ['debounce', 'rollup'] as const) {
+  it(`reports a real ${strategy} hold even when a retirement receipt also exists`, async () => {
+    const fixture = await ephemeralHold(false);
+    const { db, runtime, store, session, monitor, workspace } = fixture;
+    try {
+      const accepted = store.getMonitorState(monitor.id, workspace);
+      const envelopes = accepted.notifyState.pendingDebounce?.observations;
+      expect(envelopes).toHaveLength(1);
+      runtime.cancelEphemeralMonitor(session.id, monitor.id);
+      const terminal = store.getMonitorState(monitor.id, workspace);
+      // Model persisted inconsistent state from an older writer. A terminal
+      // receipt describes past discards and cannot certify today's hold is gone.
+      store.setMonitorState(monitor.id, workspace, {
+        ...terminal,
+        notifyState: {
+          ...terminal.notifyState,
+          ...(strategy === 'debounce'
+            ? { pendingDebounce: accepted.notifyState.pendingDebounce }
+            : { pendingRollup: { observations: envelopes ?? [] } }),
+        },
+      });
+      await expectEphemeralBarrier(
+        fixture,
+        runtime,
+        'declaration-retired',
+        'declaration is retired',
+      );
+    } finally {
+      db.$client.close();
+    }
+  });
+}
+
 /** Both read-only surfaces must name the same barrier without rewriting accepted work. */
 async function expectEphemeralBarrier(
   fixture: Awaited<ReturnType<typeof ephemeralHold>>,
