@@ -1,5 +1,5 @@
 /**
- * The split preserves an immutable source fixture from 88162f9d1c6a466596498bd0f3ed59471e373a68.
+ * The split preserves an immutable source fixture from 1210066fd28f1826aa640b15da6becee2325ba31.
  * The compressed fixture keeps the complete historical bytes available in shallow checkouts.
  * Integration cases exercise the same file-only workflow used for future spec changes.
  */
@@ -123,9 +123,9 @@ describe('spec changelog', () => {
       ),
     ).toString('utf8');
     const entries = datedEntries(original);
-    expect(entries).toHaveLength(391);
+    expect(entries).toHaveLength(392);
     const originalHeadings = new Set(
-      entries.slice(4).map((part) => part.split('\n')[0]),
+      entries.slice(5).map((part) => part.split('\n')[0]),
     );
     const migratedFiles = readdirSync(path.join(root, 'docs/specs/changelog'));
     expect(
@@ -138,12 +138,12 @@ describe('spec changelog', () => {
         ),
       ),
     ).toHaveLength(387);
-    // Four later entries arrived on main before the split; preserve them as well.
+    // Five later records on main supplement the original 387; preserve all of them.
     expect(
       readdirSync(path.join(root, 'docs/specs/changelog')).filter((name) =>
         /^\d{4}-\d{2}-\d{2}-\d{4}-/u.test(name),
       ),
-    ).toHaveLength(391);
+    ).toHaveLength(392);
     const assembled = run(root, '--assemble');
     expect(assembled.status, assembled.stderr).toBe(0);
     const actual = datedEntries(assembled.stdout);
@@ -155,7 +155,7 @@ describe('spec changelog', () => {
       entries.toSorted((a, b) => b.slice(3, 13).localeCompare(a.slice(3, 13))),
     );
     expect(new Set(historical.map((part) => part.split('\n')[0])).size).toBe(
-      391,
+      392,
     );
   });
 
