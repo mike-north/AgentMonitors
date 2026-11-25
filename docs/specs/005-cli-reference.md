@@ -607,6 +607,8 @@ dry-run, including genuine quiet/no-change runs where the source matched its sco
 
 ### Bounded numeric options
 
+**Status:** Current.
+
 `daemon run --poll-ms` / `--reap-after-ms`, `verify --timeout-ms`,
 `monitor explain --history-limit` / `--event-limit`, and `monitor history --limit`
 accept only plain decimal digits within their inclusive option-table ranges. Fractions,
@@ -620,6 +622,11 @@ connection/startup, or file writes. The only output in text/toon format is one s
 JSON format instead writes one stdout line, `{"error":"<same message without Error: prefix>"}`,
 with empty stderr. The raw value is JSON-escaped so the diagnostic always occupies one line.
 `verify` retains its existing `text` and `json` formats.
+
+For example, `monitor history --limit 1junk` MUST reject the value rather than return one row,
+while `daemon run --reap-after-ms 0` MUST retain zero and disable idle reaping.
+`apps/cli/src/commands/numeric-options.integration.test.ts` enforces the ranges, exact output,
+unchanged defaults, accepted boundaries and absence of side effects before rejection.
 
 ### `monitor history` — Observation audit trail
 
