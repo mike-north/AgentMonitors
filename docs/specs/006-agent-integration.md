@@ -2000,9 +2000,14 @@ Unreadable files expire only when their filesystem mtime age is strictly greater
 `UNREADABLE_HEARTBEAT_REAP_AGE_MS` (48 hours, twice `HOOK_HEARTBEAT_TTL_MS`). Their payload's
 timestamps and lease fields cannot establish retention. Files exactly at the boundary are retained.
 Cleanup reads each candidate through an open descriptor and obtains its device, inode, size and
-mtime from `fstat`. An expired file is unlinked only if a final `lstat` of its path matches that
-identity; if either inode number is zero, size and mtime provide the fallback comparison. A changed
-identity defers cleanup to a later pass. Cleanup creates no files and does not rename records.
+mtime from `fstat`. Both descriptor and final path observations use bigint stats, retaining the
+filesystem's nanosecond timestamp precision. Device, size and mtime must always agree. If both
+inode numbers are non-zero, they must agree too. If either inode is zero, ctime and birthtime must
+agree instead, in addition to device, size and mtime. Zero birthtime represents unavailable creation
+time; two zero values agree, while zero versus a reported creation time does not. Ctime provides
+status-change evidence that cannot be backdated by setting mtime. An expired file is unlinked only
+after a matching final `lstat`; a mismatch defers cleanup to a later pass. Cleanup creates no files
+and does not rename records.
 
 The final path check and unlink are separate filesystem operations. A writer publishing in that
 gap can have its new heartbeat removed; the transport's next heartbeat write recreates the record.

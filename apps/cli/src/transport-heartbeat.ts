@@ -613,8 +613,11 @@ export function reapExpiredHeartbeats(now: Date): void {
 /**
  * Read and age one opened file, then check that its path still names the same
  * generation before unlinking. The descriptor pins the judged inode while
- * atomic writers publish different inodes. Filesystems reporting inode zero
- * use size and mtime as the available generation evidence.
+ * atomic writers publish different inodes. Device, size and mtime always
+ * participate. If either inode is zero, kernel-maintained ctime and available
+ * birthtime distinguish generations even when a writer repeats size and mtime.
+ * Bigint stats retain the filesystem's timestamp precision in nanoseconds;
+ * birthtime zero means unavailable and must agree between both observations.
  *
  * This is a best-effort check, not a writer lock: publication after lstat but
  * before rmSync can still lose that heartbeat until its next write. Cleanup
@@ -624,7 +627,7 @@ export function reapExpiredHeartbeats(now: Date): void {
 function reapHeartbeatFileIfExpired(filePath: string, now: Date): void {
   const fd = openSync(filePath, 'r');
   try {
-    const identity = fstatSync(fd);
+    const identity = fstatSync(fd, { bigint: true });
     const content = readFileSync(fd, 'utf-8');
     let parsed: unknown;
     try {
@@ -635,18 +638,21 @@ function reapHeartbeatFileIfExpired(filePath: string, now: Date): void {
     }
     const expired = canReadHeartbeatRecord(parsed)
       ? isHeartbeatStale(parsed, now)
-      : now.getTime() - identity.mtimeMs > UNREADABLE_HEARTBEAT_REAP_AGE_MS;
+      : BigInt(now.getTime()) * 1_000_000n - identity.mtimeNs >
+        BigInt(UNREADABLE_HEARTBEAT_REAP_AGE_MS) * 1_000_000n;
     if (!expired) {
       return;
     }
 
-    const current = lstatSync(filePath);
+    const current = lstatSync(filePath, { bigint: true });
     if (
+      identity.dev !== current.dev ||
       identity.size !== current.size ||
-      identity.mtimeMs !== current.mtimeMs ||
-      (identity.ino !== 0 &&
-        current.ino !== 0 &&
-        (identity.dev !== current.dev || identity.ino !== current.ino))
+      identity.mtimeNs !== current.mtimeNs ||
+      (identity.ino !== 0n && current.ino !== 0n
+        ? identity.ino !== current.ino
+        : identity.ctimeNs !== current.ctimeNs ||
+          identity.birthtimeNs !== current.birthtimeNs)
     ) {
       return;
     }
