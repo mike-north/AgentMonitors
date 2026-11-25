@@ -23,6 +23,7 @@ import {
   retryRecordLines,
 } from '../retry-diagnostics.js';
 import { reportError } from '../output.js';
+import { parseIntegerOption } from '../integer-option.js';
 import { requireFile } from '../validation.js';
 import { appendErrorHints } from '../command-hints.js';
 import { monitorRetryCommand } from './monitor-retry.js';
@@ -564,10 +565,32 @@ monitorTestCommand
       const format = resolveFormat(options.format);
       const json = format === 'json';
       const toon = format === 'toon';
+      // Query limits are CLI policy, checked before local-state reads or IPC.
+      // Both online and persisted-state paths must receive the same exact cap.
+      const history = parseIntegerOption(
+        '--history-limit',
+        options.historyLimit,
+        {
+          min: 1,
+          max: 1000,
+        },
+      );
+      if (!history.ok) {
+        reportError(history.message, json);
+        return;
+      }
+      const events = parseIntegerOption('--event-limit', options.eventLimit, {
+        min: 1,
+        max: 1000,
+      });
+      if (!events.ok) {
+        reportError(events.message, json);
+        return;
+      }
+      const historyLimit = history.value;
+      const eventLimit = events.value;
       const monitorsDir = path.resolve(options.dir);
       const workspacePath = path.resolve(options.workspace ?? process.cwd());
-      const historyLimit = Number.parseInt(options.historyLimit, 10);
-      const eventLimit = Number.parseInt(options.eventLimit, 10);
       // Auto-discover the SAME per-workspace socket `doctor`/`daemon
       // status`/`session open` use (issue #374) — previously this fell back to
       // the bare global default, so a live daemon booted for this workspace
@@ -583,12 +606,8 @@ monitorTestCommand
             monitorId,
             monitorsDir,
             workspacePath,
-            ...(Number.isFinite(historyLimit) && historyLimit > 0
-              ? { historyLimit }
-              : {}),
-            ...(Number.isFinite(eventLimit) && eventLimit > 0
-              ? { eventLimit }
-              : {}),
+            historyLimit,
+            eventLimit,
           },
           socketPath,
         );
@@ -634,12 +653,8 @@ monitorTestCommand
             monitorId,
             monitorsDir,
             workspacePath,
-            ...(Number.isFinite(historyLimit) && historyLimit > 0
-              ? { historyLimit }
-              : {}),
-            ...(Number.isFinite(eventLimit) && eventLimit > 0
-              ? { eventLimit }
-              : {}),
+            historyLimit,
+            eventLimit,
           },
           resolveWorkspaceDbPath(workspacePath, state),
         );
@@ -770,7 +785,16 @@ const monitorHistoryCommand = monitorTestCommand
       const format = resolveFormat(options.format);
       const json = format === 'json';
       const toon = format === 'toon';
-      const limit = Number.parseInt(options.limit, 10);
+      // Reject malformed limits before socket discovery or offline DB access.
+      const parsedLimit = parseIntegerOption('--limit', options.limit, {
+        min: 1,
+        max: 1000,
+      });
+      if (!parsedLimit.ok) {
+        reportError(parsedLimit.message, json);
+        return;
+      }
+      const limit = parsedLimit.value;
       const query = {
         ...(monitorId ? { monitorId } : {}),
         // Opt-in workspace scoping (issue #345 / #307). Omitted → list across
@@ -779,7 +803,7 @@ const monitorHistoryCommand = monitorTestCommand
         ...(options.workspace
           ? { workspacePath: path.resolve(options.workspace) }
           : {}),
-        ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+        limit,
       };
       // Auto-discover the SAME per-workspace socket `doctor`/`daemon
       // status`/`session open` use (issue #374) — previously this fell back to
