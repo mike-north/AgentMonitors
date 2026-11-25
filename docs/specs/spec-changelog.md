@@ -9,6 +9,42 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Skipped truncated posts keep scheduled offers (002 §7.2, 006 §4.5)
+
+A truncated post keeps its remaining resurfacing schedule if the hook write or channel push fails.
+Committing successful output clears the next deadline.
+
+## 2026-11-25 — Direct post offers survive delivery retries (002 §7.2, 005 §18, 006 §4.5 and §5.5)
+
+Workspace keys recover only the original post request. Hooks and channels consume each presented
+post offer before output so a lost commit cannot repeat the offer. A truncated post stays in
+unread history with no further offers. A bounded recap claims only the monitor groups it shows.
+
+## 2026-11-25 — Post retries retain their workspace and endpoint (002 §7.2, 005 §18)
+
+A post retry uses the original recipient workspace and daemon endpoint. The workspace's recovery
+record remains usable after the recipient changes workspace. A new write requires a matching
+registration, and an unconfirmed command prints its recovery parameters.
+
+## 2026-11-25 — Post recap priority and request recovery (002 §7.2, §9 and §15, 005 §18, 006 §5.5)
+
+Eligible posts take priority in bounded recaps. The projection deadline clears when the final
+needs-attention offer is committed. A workspace-scoped request key and its event ID are committed
+with the post, so a retry after a lost reply can return the original ID.
+
+## 2026-11-25 — Bounded post recaps and durable post results (002 §7.2, 005 §10.4 and §18, 006 §5.5–5.6)
+
+Recap commits preserve omitted post offers, including the final needs-attention offer.
+A committed post returns its event ID even if hook-state refresh fails. Explicit acknowledgement
+prevents new offers and permits a transport to finish an offer already held by a live reservation.
+
+## 2026-11-25 — Direct posts with required acknowledgement (002 §7.2, 005 §18)
+
+`post` targets one active lead session and uses existing delivery and acknowledgement.
+A required-acknowledgement post resurfaces at a configurable interval, then becomes
+`needs-attention` after its budget is spent and the final acknowledgement deadline passes.
+Post deadlines and budgets are independent of the monitor claim TTL.
+
 ## 2026-11-25 — Serialize ephemeral admission with retirement (002 §6.4 and §10.7) — Refs #667
 
 Notify admission and held-work flushes check the declaration and owner liveness under their

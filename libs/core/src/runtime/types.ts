@@ -129,7 +129,30 @@ export interface DeclareEphemeralMonitorInput {
   displayName?: string;
 }
 
+/** State of a post in its recipient's event list. */
+export type MessageState =
+  | 'pending'
+  | 'delivered'
+  | 'resurfaced'
+  | 'needs-attention'
+  | 'acked';
+
+/** A post and its optional per-message acknowledgement policy. */
+export interface PostMessageInput {
+  sessionId: string;
+  body: string;
+  /** A workspace-scoped key for recovering the original event ID on retry. */
+  key?: string | undefined;
+  /** Pin a keyed post to this registered workspace. An empty string selects the global scope. */
+  workspacePath?: string | undefined;
+  requireAck?: boolean | undefined;
+  resurfaceAfterMs?: number | undefined;
+  maxResurfaces?: number | undefined;
+}
+
 export interface MonitorEventRecord {
+  /** Present on posted messages in a session-scoped event list. */
+  messageState?: MessageState;
   id: string;
   workspacePath: string | null;
   monitorId: string;
@@ -175,7 +198,8 @@ export interface MonitorEventRecord {
   /**
    * The requesting session's delivery state for this event (002 §7):
    * `unread` (pending: never claimed or its claim cycle expired), `claimed`
-   * (a live, unacknowledged claim cycle), or `acknowledged`. Only present
+   * (a live monitor claim cycle or a delivered post awaiting acknowledgement),
+   * or `acknowledged`. Only present
    * when the query was session-scoped (`EventQuery.sessionId` set) — a
    * global/unscoped `listEvents()` call has no single session's state to
    * report, so this is `undefined` in that case. The CLI's unread filter

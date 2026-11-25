@@ -856,20 +856,7 @@ describe('renderHookDelivery', () => {
   });
 });
 
-// (issue #442, PR #442 round-9/round-10 review) Marker selection is
-// lifecycle-aware: a `post-compact` recap re-shows the FULL unread set on
-// EVERY recap, regardless of whether a row is already claimed (§5.5 —
-// `decideDelivery`'s recap branch reads `unreadEventsForSession`, not
-// `pendingEventsForSession`, and `applyDelivery` claims the FULL candidate
-// set at commit time regardless of what actually renders). Neither of the
-// two ordinary markers is truthful for a recap:
-//   - the "genuinely pending" deferred marker ("more monitor updates are
-//     pending ... run events list --unread to see the rest") wrongly implies
-//     the omitted content is NOT yet claimed;
-//   - the ordinary claimed-unread marker's outcome-agnostic "the full copy
-//     stays unread" wording is accurate but incomplete for a recap — it
-//     misses the POSITIVE guarantee a recap actually offers ("will reappear
-//     on future recaps"), which the recap-aware marker states explicitly.
+// Recap truncation points to unread details and respects the post delivery schedule.
 describe('renderHookDelivery post-compact recap marker (issue #442, round-9 review)', () => {
   function recapEvent(
     overrides: Partial<DeliveryEventSummary> = {},
@@ -912,8 +899,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     expect(ctx).toContain('[truncated');
     // The turn-interruptible claimed-unread framing must NOT leak into a recap.
     expect(ctx).not.toContain('the full copy stays unread');
-    // Truthful recap framing: it WILL reappear on future recaps.
-    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain('posts follow their delivery schedule');
     expect(ctx).toContain(
       'run `agentmonitors events list --session session-recap --unread` to see it now',
     );
@@ -944,7 +930,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     // here; it never redelivers via the context-event flow, only via the
     // next recap.
     expect(ctx).not.toContain('more monitor updates are pending');
-    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain('posts follow their delivery schedule');
     expect(ctx).toContain(
       'run `agentmonitors events list --session session-recap-multi --unread` to see it now',
     );
@@ -978,7 +964,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx.length).toBeLessThanOrEqual(4000);
     expect(ctx).toContain('[truncated');
-    expect(ctx).toContain('will reappear on future recaps');
+    expect(ctx).toContain('posts follow their delivery schedule');
   });
 
   it('a recap that fits entirely under the cap carries no marker at all', () => {
@@ -999,7 +985,7 @@ describe('renderHookDelivery post-compact recap marker (issue #442, round-9 revi
     );
     const ctx = out?.hookSpecificOutput.additionalContext ?? '';
     expect(ctx).toContain('the full copy stays unread');
-    expect(ctx).not.toContain('will reappear on future recaps');
+    expect(ctx).not.toContain('posts follow their delivery schedule');
   });
 });
 

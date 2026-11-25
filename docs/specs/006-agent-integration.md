@@ -273,15 +273,14 @@ whole blocks fit
 **claimed-set-equals-rendered-set** invariant: capping the assembled `content` **after the claim was
 already reserved** would have dropped later blocks from the rendered tag while the whole claim was
 still eligible to be committed, silently omitting claimed-but-unrendered events — rendering (the
-push) always runs before the commit that marks rows claimed, never the reverse (§5.5). Any
+push) runs before the commit that marks monitor rows claimed (§5.5). Any
 settled-high events that do not fit stay pending and
 re-deliver on a later poll, with an explicit, bracket-free deferral marker appended to `content` (never
 `<`/`>`/`[`/`]`, so it needs no `contentValue` sanitization pass of its own). Only the **per-event**
 change summary is bounded independently of packing (above, and §4.6), so no single untrusted diff is
 dumped wholesale regardless of how many events fit.
 
-**Exception: a single reserved (not yet committed) event whose own block alone still exceeds the
-ceiling.** Sizing upstream cannot rule out this pathological case — `packChannelEventsUnderCap`
+**Exception: a single reserved monitor event whose own block alone still exceeds the ceiling.** Sizing upstream cannot rule out this pathological case — `packChannelEventsUnderCap`
 deliberately returns at least 1 for a non-empty preview (forward progress, §5.5), and a reserve can
 race the earlier preview so the actually-reserved event was never measured. Only in this one case
 does `renderChannelEvent` cut an already-reserved (not yet durably claimed) block: it mid-truncates
@@ -291,7 +290,7 @@ the whole block stayed unclaimed and genuinely re-delivers later — this render
 reservation is committed, so at render time it is genuinely unknown which of THREE outcomes the commit
 that follows will land on (issue #442, PR #442 round-12 review — collapsing these to two conflates a
 definite outcome with a genuinely uncertain one): a commit that **resolves non-null** means the row is
-claimed and will **never** re-deliver on a later ordinary poll; a commit that **resolves null** (the
+claimed until its claim TTL expires or it is acknowledged; a monitor commit that **resolves null** (the
 reservation's lease already lapsed, `'surfaced-uncommitted'`) means the row was definitely never
 claimed and stays eligible for at-least-once redelivery; a commit that **rejects** (an IPC/transport
 error) is neither of those — the daemon may have applied it before the response was lost, so whether
@@ -409,13 +408,15 @@ Both transports key off the same `session_event_state`. When the channel transpo
 delivery it marks the underlying rows **claimed** (BP2), so the hook-state transport sees them
 already claimed and suppresses the duplicate reminder. No new dedup mechanism is required — the
 existing claimed state ([002 §7](./002-runtime-delivery.md)) is the dedup boundary across transports.
+Direct posts use a durable offer claim before output, as described in §4.5.1.
 Target: a channel commit requires host confirmation that the push surfaced
 ([§4.5.2](#452-commit-only-on-host-confirmed-surfacing-target), Refs #535).
 
 While a channel push is **in flight** — reserved but not yet committed (§4.5.1) — its rows are
 **leased**: hidden from the hook transport's claim decision exactly as a claimed row would be, so the
 two transports still cannot double-surface the same event during the push window. A lease is neither
-a claim nor an acknowledgement; committing the reservation is what durably marks the rows claimed.
+a claim nor an acknowledgement. A transport consumes direct-post offers before output and commits
+monitor claims after output.
 
 ### 4.5.1 Transport-state semantics: reserve → commit / release
 
@@ -426,14 +427,14 @@ a claim nor an acknowledgement; committing the reservation is what durably marks
 > in `libs/core/src/runtime/delivery-reservations.test.ts` and `apps/cli/src/commands/cli.integration.test.ts`
 > ("channel reserve → commit/release delivery cycle").
 
-A transport that surfaces claims over a **fallible** channel (the channel MCP push can reject or the
+For **monitor events**, a transport that surfaces claims over a **fallible** channel (the channel MCP push can reject or the
 transport can disconnect) **MUST NOT** mark a delivery claimed **before** it has actually surfaced it
 — a claim timestamp (`first_notified_at`) means "**was surfaced**". Marking claimed first means a
-transient push failure permanently consumes the delivery: the rows stay claimed, and the hook
-transport suppresses them as cross-transport duplicates (§4.5) even though nothing ever surfaced them
+transient push failure starts the claim TTL: the hook transport suppresses those rows until the
+claim expires (§4.5) even though nothing surfaced them
 (a P1 delivery-loss violation of the additive/fallback guarantee, §6/NP-CH).
 
-The channel therefore surfaces each claim in three steps, per poll:
+The channel therefore surfaces monitor claims in three steps, per poll:
 
 1. **Reserve** (`reserveDelivery` → `hook.reserve`): compute and render the same `DeliveryClaim` a
    direct claim would, and **lease** its rows (§4.5) — but perform **no** durable state change. The
@@ -478,13 +479,30 @@ the `hook deliver --debug` diagnosis (§5.2.1) and the per-session hook-state fi
 advertise a row the reservation makes momentarily unclaimable — staying consistent with what a claim
 would decide. Reserving and releasing refresh the hook-state projection so it tracks the lease as it
 is taken and dropped. (Leased rows remain **unread** — a lease is not an acknowledgement — so recap
-and `events list --unread` still show them.)
+and `events list --unread` still show monitor events. A direct post held by a live lease
+stays visible in unread details and is ineligible for a second recap offer while leased.)
 
 The reservation registry is **in-memory and daemon-local**: both transports drive the one daemon
-runtime (§6.1), and losing a lease (daemon restart, or a crashed/hung reserve that never commits or
-releases) is the **safe** direction — the rows simply return to `pending` for the hook path (PP1).
+runtime (§6.1). Losing a lease (daemon restart or an abandoned reservation) makes unconsumed
+offers and uncommitted monitor claims eligible again.
 A reservation self-expires after a short ceiling so a holder that neither commits nor releases cannot
 hide rows from the hook transport indefinitely.
+
+**Direct-post offers (_current_).** After rendering and before sending output, both transports
+MUST call `hook.preparePosts` with the reservation and the IDs of the rendered posts. A partially
+rendered post also carries its truncated event ID. The daemon consumes those offers in SQLite and
+grants permission to send the payload once. After successful output, `hook.commit` applies monitor
+claims and clears any remaining deadline for the truncated post. For example, if a hook writes a
+post and loses its commit, replaying the keyed request after restart recovers the same ID and the
+consumed offer stays settled. A required-acknowledgement post with remaining scheduled offers
+becomes eligible only at its next deadline. A consumed final offer has no next deadline.
+Session-scoped unread history retains the full post.
+
+A crash or lost permission reply between consuming the offer and writing output can skip that
+presentation, since the host provides no durable acceptance or deduplication receipt. Later
+scheduled offers and unread history remain available. The direct-post integration tests exercise
+a lost hook commit, a failed hook write with a reopened database, and a successfully presented
+truncated post.
 
 ### 4.5.2 Commit only on host-confirmed surfacing (_target_)
 
@@ -643,21 +661,9 @@ shape:
   [truncated — this update was too large to show in full; the full copy stays unread — run `agentmonitors events list --session <id> --socket <path> --unread` to see it now]
   ```
 
-  is used when THIS claim's own content was cut (a single event's own block exceeds the cap, or a
-  truncated reminder message). This marker is rendered from the **reservation's own claim, before
-  that reservation is committed** (§5.2, issue #442, PR #442 round-9/10 review) — so it deliberately
-  does **not** assert whether the row ends up durably claimed, or whether it will or will not
-  redeliver: at render time it is genuinely unknown which of THREE outcomes the commit that follows
-  will land on (issue #442, PR #442 round-12 review — collapsing these to two conflates a definite
-  outcome with a genuinely uncertain one). A prior version of this marker asserted "it is claimed but
-  NOT acknowledged ... it will not redeliver automatically" — true only if the commit **resolves
-  non-null**; **false** if it **resolves null** (the rows are then definitely never claimed and
-  deliberately stay pending, so they **will** redeliver via the ordinary context-event flow); and
-  neither holds if the commit **rejects** (an IPC/transport error), since the daemon may have applied
-  it before the response was lost, making the row's eventual claimed/pending state genuinely
-  UNCERTAIN rather than a guaranteed redelivery — fixed to state only what holds regardless of which
-  of the three outcomes occurs: the full copy is not yet acknowledged, so it stays unread and
-  reachable right now via the recovery command (issue #442, PR #442 round-10/12 review). Both markers
+  is used when a single event block or reminder exceeds the cap. The marker points to the full
+  unread copy. A monitor claim can become eligible again after its TTL, and a truncated direct
+  post ends its schedule when successful output is committed (§4.5.1). Both markers
   may appear together in the same `additionalContext` (issue
   #442, PR #442 round-8 review): when the sole claimed event is itself oversized (the second
   marker's case) AND further, different high-urgency work also stays genuinely pending beyond it
@@ -724,8 +730,7 @@ unread event for the session, across every urgency band. A capped high-urgency d
 defers some events beyond what fits under the 4000-char cap (§5.1) — they stay pending and re-deliver
 at the next context event ([§5.5](#55-unread-recoverability-truncation-and-partial-delivery)) — and a
 `post-compact` recap's own `events` array is only its rendered slice (up to 10, [002
-§9.4](./002-runtime-delivery.md#94-recap)) of a FULL unread set the recap decision actually claims at
-commit time. A compliant agent that ran the blanket instruction after handling only what it was shown
+§9.4](./002-runtime-delivery.md#94-recap)) of the recap candidates. A compliant agent that ran the blanket instruction after handling only what it was shown
 would silently acknowledge — and thereby permanently drop from ordinary redelivery — events it never
 saw: exactly the event-loss-during-batching class this project's review priorities rank first,
 reintroduced by instruction text. The instruction therefore **MUST** interpolate `--event-ids`
@@ -822,14 +827,14 @@ the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
    (`reserveSizedHookDelivery` + `reserveRenderAndCommitHookDelivery` +
    `writeAndCommitHookDelivery`, issue #442, PR #442 rounds 8–9) — not a single direct
    `claimDeliveryClient(sessionId, lifecycle, socket, maxEvents)` call, and — critically — the durable
-   commit is now the LAST step, never the first. For a `turn-interruptible` claim, sizing
+   monitor commit follows the write. For a `turn-interruptible` claim, sizing
    (`previewSettledHighDeliveryClient` + `packEventsUnderCap`) and the reservation itself are two
    SEPARATE IPC round-trips, so the events the reservation actually returns can differ from the ones
    the preview measured (a concurrent caller substitutes different, larger pending events into the
    same requested count). Claiming directly on an unvalidated count would let a substituted, oversized
    set pass the count check but still fail `renderHookDelivery`'s own repack — and because a claim
-   marks the underlying rows claimed **synchronously**, the truncated-away tail of an already-claimed
-   row can never redeliver (§5.5). `reserveSizedHookDelivery` therefore **reserves** (leases, does not
+   marks the underlying rows claimed **synchronously**, it can suppress an omitted event without
+   presenting it (§5.5). `reserveSizedHookDelivery` therefore **reserves** (leases, does not
    yet claim), then re-validates the fit of the **actual** reserved claim via `resolveHookClaimFit` —
    the same predicate `renderHookDelivery` uses — releasing and retrying with a tighter cap on a
    mismatch (bounded; the final attempt forces a single-event reservation, which always terminates).
@@ -847,8 +852,9 @@ the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
    window this ordering fix closes (issue #442, PR #442 round-10 review). A write failure — synchronous
    OR the awaited async rejection — releases the reservation instead of committing (nothing durably
    claimed; the rows return to pending). Non-`turn-interruptible` lifecycles, and a reminder claim
-   (`events: []`), carry no per-event sizing risk and are reserved+committed unsized (recap
-   re-validation of `moreDeferred` never applies — see step 8); a reminder claim's `moreDeferred` is
+   (`events: []`), reserve without a size limit. A bounded recap commit receives the IDs represented
+   in the rendered context so that omitted posts keep their offers (§5.5).
+   A reminder claim's `moreDeferred` is
    also always reported `false` regardless of what the settled-high sizing preview computed before the
    preview↔reserve race fell back to it (mirroring the channel transport's identical fix, issue #442,
    PR #442 round-10 review) — `renderHookDelivery` never reads `moreDeferred` for an eventless claim,
@@ -858,8 +864,8 @@ the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
    commit, or the daemon restarted) → exit 0. In the lease-expired case the output — if any — was
    ALREADY written by this point, so this
    is a safe, intentional duplicate rather than a loss.
-8. Render (as part of step 7, using the reservation's own claim, BEFORE commit) via
-   `renderHookDelivery(claim, hookEventName)`. If null (no event bodies and no reminder message),
+8. Render the reservation's claim and record which event blocks it presents. Before writing an
+   output with direct posts, secure permission with `hook.preparePosts` (§4.5.1). If null (no event bodies and no reminder message),
    nothing is written and the reservation still commits unsized (there is nothing to lose by
    committing an empty render). Marker selection inside `renderHookDelivery` is **lifecycle-aware**
    (issue #442, PR #442 round-9 review): a `post-compact` recap renders a distinct, lifecycle-specific
@@ -870,19 +876,10 @@ the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
    `output.hookSpecificOutput.additionalContext`. The commit (step 7) happens strictly AFTER this
    write succeeds.
 
-**Why commit must be the LAST step, not the first (issue #442, PR #442 round-9 review — an
-at-most-once loss window).** The pre-round-9 flow committed the reservation — the durable
-`first_notified_at` mutation that permanently excludes these rows from ordinary redelivery — BEFORE
-any hook output was rendered or written to stdout. If the daemon applied the commit but its RPC
-response was lost, or if rendering/writing failed AFTER commit, the command's always-exit-0 try/catch
-(below) swallowed the error and emitted nothing — while the rows were durably excluded from
-redelivery forever, recoverable only via the durable-but-unread `agentmonitors events list` copy. By
-rendering off the reservation's own (not-yet-committed) claim and deferring commit until after a
-successful write, a write failure can instead be recovered by RELEASING the reservation (nothing
-durably claimed, rows stay pending), and a commit failure/uncertainty AFTER a successful write only
-risks a later DUPLICATE delivery — the safe direction, never a silent loss. This mirrors the channel
-transport's reserve → push → commit ordering (§4, issue #300), applied to the hook transport's
-synchronous stdout write instead of a fallible MCP push.
+**Monitor claims commit after the write (issue #442).** Rendering from the reservation and
+committing monitor claims after a successful write lets a failed write release those rows back to
+pending. A commit failure after a successful write can repeat a monitor event. Direct-post offers
+use the separate durable permission step in §4.5.1.
 
 **Any internal error MUST be swallowed.** The command is invoked by a Claude Code hook; an
 unhandled error would interrupt the user's session. The wrapping try/catch ensures the command
@@ -1012,7 +1009,7 @@ lifecycle and emits nothing otherwise.
 | ------------------ | --------------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
 | `UserPromptSubmit` | yes                         | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal as reminder (low surfaces at `turn-idle`) |
 | `PostToolUse`      | yes                         | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal as reminder (low surfaces at `turn-idle`) |
-| `SessionStart`     | yes                         | `post-compact`       | All unread events as a recap with bodies                                                  |
+| `SessionStart`     | yes                         | `post-compact`       | Unread monitor events and eligible posts as a recap with bodies                           |
 | `PreToolUse`       | **no** (permissionDecision) | — (emit nothing)     | nothing — additionalContext would be ignored                                              |
 | `Stop`             | **no** (top-level decision) | — (emit nothing)     | nothing — additionalContext would be ignored                                              |
 
@@ -1058,18 +1055,18 @@ surface. Concretely, the hook-deliver transport:
    against the final, marker-reserving budget, releasing and retrying (with the just-measured cap) if
    it no longer fits. A failure of this revalidation preview itself releases the reservation before
    propagating; then
-5. **renders** the reservation's own (not-yet-committed) claim via `renderHookDelivery`, **writes** the
-   result to stdout, and only THEN **commits** the reservation (`commitDeliveryClient`) — never the
-   reverse (issue #442, PR #442 round-9 review; see the at-most-once-loss rationale in §5.2). A write
-   failure releases the reservation instead of committing. Once committed, the deferred remainder is
-   left **pending** (`first_notified_at` NULL) and re-delivers at the next context event.
+5. **Renders** the reservation's claim via `renderHookDelivery`, consumes represented direct-post
+   offers (§4.5.1), **writes** the result to stdout, and **commits** the monitor claims
+   (`commitDeliveryClient`). A write failure releases the uncommitted monitor claims. Deferred
+   events stay eligible for the next context event.
 
 This reserve → validate-fit → commit sequence exists specifically to close a substitution race a
 direct sized claim (`claimDelivery(sessionId, lifecycle, maxEvents)`, the pre-#442-round-8
 implementation) could not: preview and claim are two separate IPC round-trips, so a concurrent caller
 could substitute different, larger pending events into the same requested COUNT — passing the count
 check but still overflowing the cap. Because a claim marks the underlying rows claimed
-**synchronously**, an event dropped from a mismatched claim's render could never redeliver. Reserving
+**synchronously**, an event dropped from a mismatched claim's render could become temporarily
+ineligible despite being unseen. Reserving
 first (leasing, not claiming) makes the mismatch check-and-retry safe: nothing is durably consumed
 until the fit is confirmed.
 
@@ -1088,8 +1085,8 @@ outcome, or the claim's durable state, one way or the other: rendering happens B
 is committed (§5.2, issue #442, PR #442 round-9/10 review), so at render time it is genuinely unknown
 which of THREE outcomes the commit that follows will land on (issue #442, PR #442 round-12 review —
 collapsing these to two conflates a definite outcome with a genuinely uncertain one). If the commit
-**resolves non-null**, the row is claimed and this event's own omitted tail will not surface again
-via the ordinary context-event flow; if it **resolves null** (the reservation's lease already
+**resolves non-null**, a monitor event remains claimed through its TTL and its omitted tail has
+no separate offer; if it **resolves null** (the reservation's lease already
 lapsed), the row was definitely never claimed, so the rows deliberately stay **pending** and WILL
 redeliver normally — the opposite outcome; if it **rejects** (an IPC/transport error), neither
 holds — the daemon may have applied the commit before the response was lost, so whether the row
@@ -1106,8 +1103,8 @@ different high-urgency work also stays genuinely pending beyond it (`moreDeferre
 event's own tail vs. a separate, still-pending remainder) and neither implies the other, so omitting
 either one would silently drop a real signal.
 
-The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
-`post-compact` recap re-shows all unread each time, so both self-heal.
+Normal and low reminders inject no per-event bodies. A bounded `post-compact` recap reports
+which event blocks it presented when committing so that omitted post offers stay eligible.
 
 **The channel transport (§4.2.1) applies the SAME reserve → validate-fit → commit pattern, against its
 own, much larger content ceiling.** It is not exempt from boundedness — a coalesced high-urgency push previewed,
@@ -1142,9 +1139,9 @@ AFTER that push resolves. So at render time it is genuinely unknown which of THR
 that follows will land on (issue #442, PR #442 round-12 review — collapsing these to two conflates a
 definite outcome with a genuinely uncertain one):
 
-- **Resolves non-null** — committed: `pendingEventsForSession()` (whose query requires
-  `first_notified_at` still `NULL`, 002 §7) will never return the row again, so the omitted tail does
-  **not** "re-deliver at the next poll" the way the deferred-remainder case does.
+- **Resolves non-null** — the monitor row is claimed for its TTL. The omitted tail has no separate
+  offer. If the claim expires while the event is unread, the entire event can be offered again
+  ([002 §7.1](./002-runtime-delivery.md#71-claim-expiry-current)).
 - **Resolves null** — the reservation's lease already lapsed (`'surfaced-uncommitted'`): the row was
   definitely never claimed and stays eligible for at-least-once redelivery on a later poll — the
   opposite outcome from the bullet above.
@@ -1213,17 +1210,9 @@ the genuinely-deferred-remainder branch — and `buildHookClaimedUnreadMarker(se
 used for the single-event mid-truncation branch and for a truncated reminder message, reading "this
 update was too large to show in full; the full copy stays unread — run `agentmonitors events list
 --session <id> --socket <path> --unread` to see it now". This wording states only what holds
-regardless of whether the pending commit lands: the full copy is not yet acknowledged, so it stays
-unread and reachable right now via the recovery command. A prior version of this marker asserted "it
-is claimed but NOT acknowledged ... it will not redeliver automatically" — true only if the commit
-**resolves non-null**; false if it **resolves null** (the reservation's lease already lapsed), since
-the rows then are definitely never claimed and deliberately stay pending, so they DO redeliver via
-the ordinary context-event flow; and neither holds if the commit **rejects** (an IPC/transport
-error), since the daemon may have applied it before the response was lost, leaving the row's eventual
-claimed/pending state genuinely UNCERTAIN rather than a guaranteed redelivery (issue #442, PR #442
-round-10/12 review). Before the
-round-7 split, both branches shared one marker whose "more monitor updates are pending" framing
-falsely implied the mid-truncated event's own omitted tail would also redeliver.
+whether or not the pending monitor commit lands or a direct-post offer was consumed. The full
+unacknowledged copy stays unread and reachable via the recovery command. Monitor events can return
+when their claim TTL expires. Truncated direct posts have no further offers.
 
 **The two markers are NOT mutually exclusive (issue #442, PR #442 round-8 review).** When the sole
 reserved event is itself the pathological mid-truncation case AND further, different high-urgency work
@@ -1232,30 +1221,22 @@ the same `additionalContext` — the claimed-unread marker's outcome-agnostic "t
 unread" framing describes only THIS event's own omitted tail, and does not (and must not) speak for
 the separate, genuinely-pending remainder, which the deferred marker signposts correctly.
 
-**Marker selection is lifecycle-aware: a `post-compact` recap needs its own, THIRD framing, distinct
-from both markers above (issue #442, PR #442 round-9 review).** `decideDelivery`'s `post-compact`
-branch (`service.ts`) reads `unreadEventsForSession` — NOT `pendingEventsForSession` — and
-`applyDelivery` claims the FULL candidate set (every unread event, not just the rendered
-`recapSlice`) at commit time regardless of what actually renders. Because recap re-sources from
-UNREAD state, a row being claimed (`first_notified_at` set) never hides it from a FUTURE recap; only
-acknowledging does — and that self-heal guarantee holds regardless of whether THIS particular recap's
-own commit lands, since a future recap always re-sources from `unreadEventsForSession` again. That
-makes BOTH ordinary markers insufficient for a recap: `buildHookDeferredMarker`'s "more monitor
-updates are pending ... run `events list --unread` to see the rest" wrongly implies the omitted whole
-blocks are not (about to be) claimed along with the rest of the recap's candidate set;
-`buildHookClaimedUnreadMarker`'s outcome-agnostic "the full copy stays unread" is accurate but
-incomplete for a recap — it misses the stronger, POSITIVE guarantee a recap actually offers: the
-omitted/cut content WILL reappear, automatically, on the NEXT `post-compact` recap (and any after
-that) until acknowledged, which is the intentional self-heal behavior this section already documents.
-`renderHookDelivery` therefore checks `claim.lifecycle === 'post-compact'` and, when true, uses a
-single unified `buildHookRecapMarker` in place of BOTH ordinary markers (for the whole-blocks-omitted
-branch AND the single-event mid-truncation branch alike — for a recap both are the SAME fact: content
-that stays unread and will keep re-surfacing on future recaps), reading "not everything fit in this
-recap; the omitted content stays unread and will reappear on future recaps until acknowledged — run
-`agentmonitors events list --session <id> --socket <path> --unread` to see it now". Like the ordinary
-claimed-unread marker, this recap marker is also built from the reservation's own claim before commit
-— so it deliberately asserts only the self-healing future-recap behavior (true regardless of this
-particular commit's outcome), never that this content specifically "is claimed" right now.
+**Bounded recap delivery (_current_).** A `post-compact` recap draws from unread monitor
+events and direct posts eligible under [002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current).
+Eligible posts take priority under both the event-count and character limits. The hook renders
+those posts before monitor events, so an oversized unread monitor event cannot crowd out a due
+post. The hook MUST consume only the post offers represented in the rendered context. A partially
+shown post counts as presented and ends resurfacing. The recap commit MUST claim only represented
+monitor groups, including the folded rows for each shown group. An omitted monitor group keeps its
+claim timing and object cursor, and an omitted post retains its current offer, including a final
+needs-attention offer. For example, when an 8,000-character informational
+post fills a recap and a short post is omitted, the next recap can show the short post.
+The compiled hook regressions in `post.integration.test.ts` exercise this sequence and verify
+that repeated recaps reach needs-attention despite unread monitor events at both limits.
+
+Both truncation branches use the recap marker: "not everything fit in this recap; omitted
+content stays unread and posts follow their delivery schedule". The marker includes the
+session-scoped `events list --unread` command for retrieving full content.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).
@@ -1331,7 +1312,8 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
   rendering, writing (awaited to completion), and only then committing the `post-compact`
   reservation via the SAME shared `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery`
   flow `hook deliver` uses (§5.2, issue #442, PR #442 round-16 review), printing the rendered
-  `additionalContext` when there are unread events. This closes the same at-most-once loss window
+  `additionalContext` when there are recap candidates. Only posts represented in that context
+  consume their current offer. Omitted posts remain eligible for later recaps or ordinary delivery. This closes the same at-most-once loss window
   §5.2 describes for `hook deliver`'s own commit ordering: committing the reservation BEFORE the
   recap was successfully written would durably claim the unread rows even if an asynchronous write
   failure (e.g. `EPIPE`) meant nothing ever reached the agent. The SessionStart hook runs the single
@@ -1389,9 +1371,8 @@ identical daemon-IPC client function the `events ack` CLI command calls (§4.3).
 push and `hook deliver` both drive the SAME underlying reserve → validate-fit → render → commit
 sequence (§5.5) — `reserveDeliveryClient`/`commitDeliveryClient`/`releaseDeliveryClient`
 (`channel.ts`'s `runChannelDeliveryCycle`, `hook.ts`'s `reserveRenderAndCommitHookDelivery` — issue
-#442, PR #442 rounds 8–9) — rather than a single direct `claimDeliveryClient` call: neither transport
-may durably consume a delivery before it has actually been surfaced (a fallible MCP push for the
-channel; a render that must complete and be written before the commit, for the hook). Only the
+#442). Both transports call `preparePostDeliveryClient` before presenting rendered posts and commit
+monitor claims after a successful write or push. Only the
 manual, single-shot `hook claim` subcommand still calls `claimDeliveryClient` directly — it has no
 fallible surface to defer a commit behind. Every path still bottoms out on the SAME core delivery
 decision (`decideDelivery`/`applyDelivery`, `service.ts`) and the same `hook.claim` IPC method on the

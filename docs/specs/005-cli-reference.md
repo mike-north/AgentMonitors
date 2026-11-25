@@ -1562,7 +1562,15 @@ Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSI
 3. If no daemon is listening at the socket, spawns `daemon run` as a **detached background process** (`stdio: 'ignore'`, `.unref()`), passing the derived socket/db paths, the monitors dir, and `reap-after-ms` from the local state. Waits up to 8 seconds for the socket to appear.
 4. Persists the resolved socket/db paths back to `.claude/agentmonitors.local.md` (so sibling hooks can use them without re-deriving).
 5. Opens a session via the `session.open` IPC method (`claudeCodeAdapter.createSessionInput()` with `hostSessionId` and `workspacePath`).
-6. **Surfaces the post-compact recap in the same process.** `SessionStart` is a context event, and a Claude Code hook invocation provides only **one** stdin stream — so the recap cannot be a separately chained `hook deliver` (it would see an already-consumed stdin and no-op; see 006 §5.6). Reusing the payload it already read, `session start` reserves the `post-compact` delivery for the session, renders it, and — only if there are unread events — writes the rendered `SessionStart` hook JSON (`{ "continue": true, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }`) to stdout, **awaiting the write's actual completion** before committing the reservation (the same RESERVE → RENDER → WRITE → COMMIT ordering `hook deliver` uses, via the shared `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery` helpers — see 006 §5.6). The `post-compact` reservation's candidate rows come from a session's **unread** events (not only never-yet-claimed ones), so they can include rows an earlier delivery already claimed. A write failure (including an asynchronous `EPIPE` arriving after a synchronous "wrote" signal) releases the reservation instead of committing: this applies no new claim and does not advance the recap cursor, but it does NOT reset any row's existing claimed state either — a row already claimed by an earlier delivery stays claimed (it will not redeliver via the ordinary pending-event hook/channel path), while a row that was never claimed remains pending. Either way, every row in the reservation remains **unread** and is eligible to appear again on a future recap.
+6. **Surfaces the post-compact recap in the same process.** `session start` reads the hook payload
+   once and uses it to reserve, render, and write the `SessionStart` hook JSON for that session when
+   there are recap candidates. It awaits the stdout write before committing, using the same flow
+   as `hook deliver` (006 §5.6). If the write fails, including an asynchronous `EPIPE`, it releases
+   the reservation and preserves each row's prior delivery state and the recap cursor.
+   A successful write consumes offers only for posts represented in the rendered context,
+   including a post shown with a truncated body. Posts omitted by the 4,000-character cap keep
+   their current offer, including a final needs-attention offer. Later recaps can show unread
+   monitor events and posts eligible under the retry policy in 002 §7.2.
 
 **Output:**
 
@@ -1686,6 +1694,8 @@ in the same way.
 delivery state for that event (002 §7). Present only because this query is always session-scoped
 (`--session` is required); a hypothetical unscoped `listEvents()` call in core has no single
 session's state to report and leaves the field `undefined`.
+Direct posts also carry `messageState` ([002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current)).
+The text format uses that value in the delivery-state column for a post.
 
 **Scope parsing:** the `--scope` value is split on `,`, then each segment is split on `=` to build a `Record<string, string>`. Segments that cannot be parsed as `key=value` are silently dropped.
 
@@ -1761,9 +1771,9 @@ unscoped runtime composition uses `CLAUDE_PROJECT_DIR`, then the current directo
 `monitor history` without `--workspace` selects storage and policy from cwd while leaving its
 history query unscoped; `CLAUDE_PROJECT_DIR` does not select a different policy for that database.
 
-The policy applies store-wide, across all urgency bands. Daemon run (including lazy/detached
-startup), daemon once, and in-process CLI readers including doctor/explain resolve the same
-workspace file through runtime composition. `enabled` controls automatic startup, not this
+The policy applies to monitor events store-wide, across all urgency bands. Direct posts use
+their own schedule (§18). Daemon run (including lazy/detached startup), daemon once, and
+in-process CLI readers including doctor/explain resolve the same workspace file through runtime composition. `enabled` controls automatic startup, not this
 setting's use by explicitly invoked commands. Session coordination rewrites preserve the value.
 Restart a running daemon after editing it: runtimes load policy when opening their store. Omitting
 or deleting the setting restores the default. SDK callers retain the `RuntimeStore` constructor's
@@ -1974,7 +1984,7 @@ mode it is additionally named on stderr rather than silently disappearing.
 | -------------------- | --------------------------------- | ------------------------------------------------------------------------------- |
 | `turn-interruptible` | `UserPromptSubmit`, `PostToolUse` | settled high-urgency event bodies; normal-urgency changes as reminder text only |
 | `turn-idle`          | override only                     | low-urgency changes as reminder text only                                       |
-| `post-compact`       | `SessionStart`                    | all unread event bodies as a recap                                              |
+| `post-compact`       | `SessionStart`                    | unread monitor events and eligible posts as a recap                             |
 
 Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
 only — no body injection); `low` does likewise at `turn-idle`. "Reminder only" is **not** silence:
@@ -3022,6 +3032,46 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 
 ---
 
+## §18 `post` — Send a message
+
+**Status:** Current. Routes through the local daemon socket.
+
+```text
+agentmonitors post --session <id> [--socket <path>] [--key <string>] [--workspace <path>] [--require-ack]
+                   [--resurface-after-ms <ms>] [--max-resurfaces <count>] <body>
+```
+
+Use `session list` to find the recipient's active lead session ID. The body must contain text
+and is limited to 16,384 UTF-16 code units. On a successful reply, the command exits 0 and prints
+the committed event ID to stdout. If the subsequent hook-state refresh fails, the same success
+output and exit code apply, and stderr carries a warning. The core API and post IPC success result
+include the event ID and an optional `hookStateRefreshError` string for that failure. A refresh warning requires
+no repost. Command errors are reported on stderr with a nonzero exit code.
+
+- `--key <string>` accepts a nonempty request key and defaults to a fresh key for each invocation.
+  Reuse a key within the same workspace to recover the original ID. For example, repeating
+  `agentmonitors post --session <id> --key release-check 'Check the release'` returns the same ID.
+  The recipient, text and effective acknowledgement policy must match the original request.
+  A conflicting reuse fails with a nonzero exit.
+- `--workspace <path>` pins the request key to an exact registered workspace path. Use
+  `--workspace ''` for the global scope. The default is the recipient's workspace at lookup time.
+- `--require-ack` enables scheduled resurfacing.
+- `--resurface-after-ms` accepts integers from 1 through 2,147,483,647 and defaults to 300,000.
+- `--max-resurfaces` accepts integers from 0 through 100 and defaults to 2.
+
+If the connection fails after sending the request, including a reply timeout, the command
+retries once with the same key, workspace, and daemon endpoint. If it still cannot confirm the
+result, it exits nonzero and prints the key, workspace, and socket on stderr. Retry the command
+with those values to recover the ID. The CLI uses `messages.postScoped`, which requires a daemon
+that supports workspace-pinned posts. The compiled CLI integration tests withhold a reply past
+the IPC timeout and verify that moving the recipient to another workspace cannot duplicate the post.
+
+Both timing options require `--require-ack`. Use `events list --session <id>` to inspect a post's
+state and `events ack --session <id> --event-ids <event-id>` to acknowledge it. Use the same
+`--socket` option for each command when targeting an explicit daemon. See
+[002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current) for the
+delivery and acknowledgement lifecycle.
+
 ## Appendix A — Command inventory
 
 | Command    | Subcommand | Transport                                                     | Status                                                            |
@@ -3055,6 +3105,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `session`  | `list`     | socket                                                        | Fully implemented                                                 |
 | `session`  | `start`    | in-process + socket (lazy boot)                               | Fully implemented                                                 |
 | `session`  | `end`      | socket                                                        | Fully implemented                                                 |
+| `post`     | —          | socket                                                        | Fully implemented                                                 |
 | `events`   | `list`     | socket                                                        | Fully implemented                                                 |
 | `events`   | `ack`      | socket                                                        | Fully implemented                                                 |
 | `hook`     | `claim`    | socket                                                        | Fully implemented                                                 |

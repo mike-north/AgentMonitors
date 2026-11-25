@@ -125,6 +125,7 @@ import type {
   OrphanedMonitorWork,
   ObservationHistoryRecord,
   OpenSessionInput,
+  PostMessageInput,
   PollingDecision,
   ProcessObservationInput,
   UnretainedObservationLoss,
@@ -148,6 +149,7 @@ import {
   type DeliveryLifecycle,
   type SessionHookState,
 } from './types.js';
+import { POST_MONITOR_ID, postMessageInputSchema } from './message-policy.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
 
 /**
@@ -696,6 +698,14 @@ function matchCronField(field: string, value: number): boolean {
   }
   const parsed = Number(field);
   return Number.isFinite(parsed) && parsed === value;
+}
+
+/** A direct post is eligible as soon as it is pending. */
+function isSettledHigh(event: MonitorEventRecord, nowMs: number): boolean {
+  return (
+    event.monitorId === POST_MONITOR_ID ||
+    nowMs - event.createdAt.getTime() >= DEFAULT_HIGH_URGENCY_SETTLE_MS
+  );
 }
 
 function summarizeEvents(events: { title: string; summary: string }[]): string {
@@ -3239,6 +3249,44 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /** Post to one active lead session and return the stable event id for acknowledgement. */
+  postMessage(input: PostMessageInput): {
+    eventId: string;
+    hookStateRefreshError?: string;
+  } {
+    const message = postMessageInputSchema.parse(input);
+    const retryMs = message.requireAck
+      ? (message.resurfaceAfterMs ?? 300_000)
+      : 0;
+    const maxResurfaces = message.requireAck ? (message.maxResurfaces ?? 2) : 0;
+    const { eventId, created } =
+      message.key === undefined
+        ? {
+            eventId: this.store.insertMessage(
+              message.sessionId,
+              message.body,
+              retryMs,
+              maxResurfaces,
+            ).id,
+            created: true,
+          }
+        : this.store.insertMessageOnce(
+            message.sessionId,
+            message.body,
+            retryMs,
+            maxResurfaces,
+            message.key,
+            message.workspacePath,
+          );
+    if (!created) return { eventId };
+    try {
+      this.refreshHookState(message.sessionId);
+      return { eventId };
+    } catch (error) {
+      return { eventId, hookStateRefreshError: errorMessage(error) };
+    }
+  }
+
   /**
    * Acknowledge events for a session. Omitting `eventIds` acknowledges every
    * unread event for the session **except all rows** currently leased by an
@@ -3437,8 +3485,8 @@ export class AgentMonitorRuntime {
    * push the caller {@link releaseDelivery}, returning the rows to the hook path.
    * If the caller does neither, the lease self-expires and the rows re-deliver.
    *
-   * This is what lets the channel transport avoid consuming a delivery on a
-   * transient MCP disconnect: it reserves, pushes, and only then commits.
+   * Monitor events commit after output. Direct posts use
+   * {@link preparePostDelivery} before output to consume each offer once.
    */
   reserveDelivery(
     sessionId: string,
@@ -3446,13 +3494,15 @@ export class AgentMonitorRuntime {
     maxEvents?: number,
   ): DeliveryReservation | null {
     this.store.touchSession(sessionId);
-    const decision = this.decideDelivery(sessionId, lifecycle, maxEvents);
+    const now = new Date();
+    const decision = this.decideDelivery(sessionId, lifecycle, maxEvents, now);
     if (!decision) return null;
     const reservationId = this.reservations.add({
       sessionId: decision.sessionId,
       candidates: decision.candidates,
       isRecap: decision.isRecap,
       claim: decision.claim,
+      reservedAtMs: now.getTime(),
     });
     // Refresh the hook-state projection so it reflects the lease immediately: the
     // reserved rows are now hidden from `pendingForClaim`, so the file stops
@@ -3463,25 +3513,83 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Durably consume the rendered post offers before a transport presents them.
+   * A reservation grants permission once, including across a lost IPC reply.
+   * The later commit ends resurfacing for a truncated post and applies monitor claims.
+   */
+  preparePostDelivery(
+    reservationId: string,
+    presentedEventIds: readonly string[],
+    truncatedEventId?: string,
+  ): boolean {
+    const plan = this.reservations.get(reservationId);
+    if (!plan || plan.postsPrepared) return false;
+    const presented = new Set(presentedEventIds);
+    const posts = plan.candidates
+      .filter(
+        (event) =>
+          event.monitorId === POST_MONITOR_ID && presented.has(event.id),
+      )
+      .map((event) => event.id);
+    if (
+      !this.store.claimPostOffers(
+        plan.sessionId,
+        posts,
+        plan.claim.lifecycle,
+        plan.reservedAtMs,
+      )
+    ) {
+      return false;
+    }
+    plan.postsPrepared = true;
+    if (truncatedEventId && posts.includes(truncatedEventId)) {
+      plan.truncatedPostId = truncatedEventId;
+    }
+    return true;
+  }
+
+  /**
    * Commit a reservation from {@link reserveDelivery} after its claim was
    * surfaced (006 §4, issue #300): apply the deferred claim (mark the reserved
    * rows claimed, "was surfaced" — BP2, not acknowledged), returning the claim.
-   * Returns `null` if the reservation is unknown or already expired — the rows
-   * were never permanently consumed, so a stale commit is a safe no-op (they may
-   * have already re-delivered via the hook path).
+   * Returns `null` if the reservation is unknown or has expired. A stale
+   * commit leaves uncommitted monitor claims eligible and cannot repeat a
+   * prepared post offer. A bounded recap can pass the event IDs it presented
+   * to leave omitted groups eligible.
    */
-  commitDelivery(reservationId: string): DeliveryClaim | null {
+  commitDelivery(
+    reservationId: string,
+    presentedEventIds?: readonly string[],
+  ): DeliveryClaim | null {
     const plan = this.reservations.take(reservationId);
     if (!plan) return null;
-    this.applyDelivery(plan);
+    if (plan.truncatedPostId) {
+      this.store.endPostResurfacing(plan.sessionId, plan.truncatedPostId);
+    }
+    let candidates = plan.candidates;
+    if (plan.postsPrepared) {
+      candidates = candidates.filter(
+        (event) => event.monitorId !== POST_MONITOR_ID,
+      );
+    }
+    if (plan.isRecap && presentedEventIds !== undefined) {
+      const presented = new Set(presentedEventIds);
+      const representedGroups = new Set(
+        plan.candidates
+          .filter((event) => presented.has(event.id))
+          .map(netCollapseGroupKey),
+      );
+      candidates = candidates.filter((event) =>
+        representedGroups.has(netCollapseGroupKey(event)),
+      );
+    }
+    this.applyDelivery({ ...plan, candidates });
     return plan.claim;
   }
 
   /**
-   * Release a reservation from {@link reserveDelivery} WITHOUT claiming (006 §4,
-   * issue #300): the push failed or disconnected, so drop the lease and return
-   * the rows to `pending`, where the hook transport (or the next channel poll)
-   * re-delivers them. A no-op for an unknown/expired reservation.
+   * Drop a reservation, returning uncommitted monitor claims and unconsumed
+   * post offers to pending. Unknown and expired reservations are a no-op.
    */
   releaseDelivery(reservationId: string): void {
     const plan = this.reservations.remove(reservationId);
@@ -3580,8 +3688,8 @@ export class AgentMonitorRuntime {
     sessionId: string,
     lifecycle: DeliveryLifecycle,
     maxEvents?: number,
+    now = new Date(),
   ): DeliveryDecision | null {
-    const now = new Date();
     const unreadCounts = {
       low: this.store.unreadEventsForSession(sessionId, 'low').length,
       normal: this.store.unreadEventsForSession(sessionId, 'normal').length,
@@ -3594,10 +3702,8 @@ export class AgentMonitorRuntime {
 
     if (lifecycle === 'turn-interruptible') {
       const highUnread = this.pendingForClaim(sessionId, 'high');
-      const settledHigh = highUnread.filter(
-        (event) =>
-          now.getTime() - event.createdAt.getTime() >=
-          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+      const settledHigh = highUnread.filter((event) =>
+        isSettledHigh(event, now.getTime()),
       );
 
       // Cross-monitor coalescing window (issue #441): computed up front so a
@@ -3755,17 +3861,25 @@ export class AgentMonitorRuntime {
       };
     }
 
-    const unread = this.store.unreadEventsForSession(sessionId);
-    if (lifecycle === 'post-compact' && unread.length > 0) {
-      // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
-      // set, then recap only the delivered (post-collapse) tail. Only groups
-      // represented in that tail may be claimed or suppressed; the cap must
-      // leave unseen groups intact for a later delivery. Recap reads all UNREAD
-      // (not pending), so a leased row is still recapped — a lease is not
-      // acknowledgement, and recap re-shows unread
-      // until acked (006 §5.5).
-      const deliveredUnread = computeNetCollapseView(unread).delivered;
-      const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
+    if (lifecycle === 'post-compact') {
+      // Put eligible posts first so both the event cap and the renderer's
+      // character cap leave room for an offer. Keep their oldest-first order.
+      const pendingPosts = this.pendingForClaim(sessionId, 'high').filter(
+        (event) => event.monitorId === POST_MONITOR_ID,
+      );
+      const unreadMonitors = this.store
+        .unreadEventsForSession(sessionId)
+        .filter((event) => event.monitorId !== POST_MONITOR_ID);
+      if (pendingPosts.length === 0 && unreadMonitors.length === 0) return null;
+      const unread = [...pendingPosts, ...unreadMonitors];
+      const recapSlice = pendingPosts.slice(0, MAX_RECAP_EVENTS);
+      const monitorSlots = MAX_RECAP_EVENTS - recapSlice.length;
+      if (monitorSlots > 0) {
+        // Collapse the full set before choosing the newest monitor groups.
+        const deliveredMonitors =
+          computeNetCollapseView(unreadMonitors).delivered;
+        recapSlice.push(...deliveredMonitors.slice(-monitorSlots));
+      }
       const recapKeys = new Set(recapSlice.map(netCollapseGroupKey));
       const recapCandidates = unread.filter((event) =>
         recapKeys.has(netCollapseGroupKey(event)),
@@ -3855,10 +3969,8 @@ export class AgentMonitorRuntime {
     // hook transport sizes and claims exactly what a real claim would decide —
     // never an event the channel is mid-surfacing.
     const highUnread = this.pendingForClaim(sessionId, 'high');
-    const settledHigh = highUnread.filter(
-      (event) =>
-        now.getTime() - event.createdAt.getTime() >=
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
+    const settledHigh = highUnread.filter((event) =>
+      isSettledHigh(event, now.getTime()),
     );
     if (settledHigh.length === 0) return [];
     // Same pure collapse DECISION the claim uses, so the previewed set is exactly
@@ -3901,10 +4013,8 @@ export class AgentMonitorRuntime {
   previewCoalescedReminder(sessionId: string): string | undefined {
     const now = new Date();
     const highUnread = this.pendingForClaim(sessionId, 'high');
-    const settledHigh = highUnread.filter(
-      (event) =>
-        now.getTime() - event.createdAt.getTime() >=
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
+    const settledHigh = highUnread.filter((event) =>
+      isSettledHigh(event, now.getTime()),
     );
     if (settledHigh.length === 0) return undefined;
 
@@ -3965,19 +4075,18 @@ export class AgentMonitorRuntime {
       // Lease-aware (issue #300): exclude rows reserved by an in-flight channel
       // push so this diagnosis matches what a real claim would surface.
       const pendingHigh = this.pendingForClaim(sessionId, 'high');
-      const settleHold = classifySettleWindowHold(
-        pendingHigh.map((event) => event.createdAt),
-        unreadCounts.high,
-        now,
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
-      );
-      if (settleHold) holds.push(settleHold);
-
-      const settledHighCount = pendingHigh.filter(
-        (event) =>
-          now.getTime() - event.createdAt.getTime() >=
-          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+      const settledHighCount = pendingHigh.filter((event) =>
+        isSettledHigh(event, now.getTime()),
       ).length;
+      if (settledHighCount === 0) {
+        const settleHold = classifySettleWindowHold(
+          pendingHigh.map((event) => event.createdAt),
+          unreadCounts.high,
+          now,
+          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+        );
+        if (settleHold) holds.push(settleHold);
+      }
       const pendingNormal = this.pendingForClaim(sessionId, 'normal');
       const leasedNormal = this.leasedPendingCount(sessionId, 'normal');
       // Claimed-ids must be derived from the store's actually-claimed set
@@ -6643,11 +6752,8 @@ export class AgentMonitorRuntime {
     // `reserveDelivery`/`releaseDelivery` re-run this so the file tracks the
     // lease as it is taken and dropped.
     const highUnread = this.pendingForClaim(sessionId, 'high');
-    const pendingHigh = highUnread.some(
-      (event) =>
-        Date.now() - event.createdAt.getTime() >=
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
-    );
+    const nowMs = Date.now();
+    const pendingHigh = highUnread.some((event) => isSettledHigh(event, nowMs));
     const pendingNormal = this.pendingForClaim(sessionId, 'normal').length > 0;
     const pendingLow = this.pendingForClaim(sessionId, 'low').length > 0;
     const state = this.store.sessionHookState(sessionId, {

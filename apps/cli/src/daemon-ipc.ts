@@ -17,6 +17,7 @@ import net from 'node:net';
 import {
   isErrnoException,
   isVerifyScratchObjectKey,
+  postMessageInputSchema,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
@@ -57,6 +58,8 @@ const daemonMethodSchema = z.enum([
   'session.list',
   'events.list',
   'events.ack',
+  'messages.post',
+  'messages.postScoped',
   'events.retractObject',
   'events.suppressObject',
   'verifyArtifacts.register',
@@ -64,6 +67,7 @@ const daemonMethodSchema = z.enum([
   'hook.claim',
   'hook.reserve',
   'hook.commit',
+  'hook.preparePosts',
   'hook.release',
   'hook.preview',
   'hook.previewReminder',
@@ -184,6 +188,13 @@ const hookPreviewParamsSchema = z.object({
 const hookReserveParamsSchema = hookClaimParamsSchema;
 const hookReservationParamsSchema = z.object({
   reservationId: z.string(),
+});
+const hookCommitParamsSchema = hookReservationParamsSchema.extend({
+  presentedEventIds: z.array(z.string()).optional(),
+});
+const hookPreparePostsParamsSchema = hookReservationParamsSchema.extend({
+  presentedEventIds: z.array(z.string()),
+  truncatedEventId: z.string().optional(),
 });
 const hookDiagnoseParamsSchema = z.object({
   sessionId: z.string(),
@@ -790,6 +801,17 @@ function handleRequest(
         }),
       );
     }
+    case 'messages.post':
+    case 'messages.postScoped': {
+      const input = postMessageInputSchema.parse(request.params);
+      if (
+        request.method === 'messages.postScoped' &&
+        (input.key === undefined || input.workspacePath === undefined)
+      ) {
+        throw new Error('A post request key and workspace are required.');
+      }
+      return Promise.resolve(runtime.postMessage(input));
+    }
     case 'events.ack':
       {
         const params = eventsAckParamsSchema.parse(request.params);
@@ -854,9 +876,21 @@ function handleRequest(
         ),
       );
     }
+    case 'hook.preparePosts': {
+      const params = hookPreparePostsParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.preparePostDelivery(
+          params.reservationId,
+          params.presentedEventIds,
+          params.truncatedEventId,
+        ),
+      );
+    }
     case 'hook.commit': {
-      const params = hookReservationParamsSchema.parse(request.params);
-      return Promise.resolve(runtime.commitDelivery(params.reservationId));
+      const params = hookCommitParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.commitDelivery(params.reservationId, params.presentedEventIds),
+      );
     }
     case 'hook.release': {
       const params = hookReservationParamsSchema.parse(request.params);
@@ -1266,8 +1300,21 @@ export async function callDaemon<T = unknown>(
   params: JsonRecord = {},
   options: { socketPath?: string; timeoutMs?: number } = {},
 ): Promise<T> {
-  const socketPath = resolveSocketPath(options.socketPath);
-  const timeoutMs = options.timeoutMs ?? 2_000;
+  return await callDaemonAtSocket<T>(
+    resolveSocketPath(options.socketPath),
+    method,
+    params,
+    options.timeoutMs,
+  );
+}
+
+/** Send a request to an already resolved endpoint. */
+export async function callDaemonAtSocket<T = unknown>(
+  socketPath: string,
+  method: DaemonMethod,
+  params: JsonRecord,
+  timeoutMs = 2_000,
+): Promise<T> {
   const request: DaemonRequest = {
     id: `${String(Date.now())}-${Math.random().toString(16).slice(2)}`,
     method,

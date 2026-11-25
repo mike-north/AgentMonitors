@@ -59,12 +59,16 @@ import {
   monitorState,
   objectEventSuppressions,
   observationHistory,
+  postRequests,
   sessionEventState,
   sessionObjectCursor,
   verifyArtifacts,
 } from '../inbox/schema.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
-import { registerRuntimeTransaction } from './runtime-transaction.js';
+import {
+  registerRuntimeTransaction,
+  runRuntimeTransaction,
+} from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   EnqueueMaterializationRetryInput,
@@ -101,6 +105,10 @@ import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
 } from './retry-envelope.js';
+import {
+  POST_MONITOR_ID,
+  messageStateForProjection,
+} from './message-policy.js';
 import { registerStoreWriter } from './store-writer.js';
 import { isVerifyScratchObjectKey } from './verify-scratch-key.js';
 
@@ -315,21 +323,32 @@ export class MaterializationRetryCapacityError extends Error {
   }
 }
 
+/** Initial claims and deadline-based reoffers share this eligibility check. */
+function isPendingPost(nowMs: number) {
+  return or(
+    isNull(sessionEventState.firstNotifiedAt),
+    lte(sessionEventState.messageDueAtMs, nowMs),
+  );
+}
+
 /** Report effective delivery state without consuming or renewing a claim cycle. */
 function deliveryStateForRow(
   row: {
+    messageRetryMs: number | null;
+    firstNotifiedAt: Date | null;
     claimStartedAt: Date | null;
     acknowledgedAt: Date | null;
   },
   claimTtlMs: number,
+  nowMs: number,
 ): MonitorDeliveryState {
   if (row.acknowledgedAt) {
     return 'acknowledged';
   }
-  if (
-    row.claimStartedAt &&
-    Date.now() - row.claimStartedAt.getTime() < claimTtlMs
-  ) {
+  if (row.messageRetryMs !== null) {
+    return row.firstNotifiedAt ? 'claimed' : 'unread';
+  }
+  if (row.claimStartedAt && nowMs - row.claimStartedAt.getTime() < claimTtlMs) {
     return 'claimed';
   }
   return 'unread';
@@ -1667,6 +1686,112 @@ export class RuntimeStore {
     return this.writeEvent(input, baseline, options);
   }
 
+  /** Persist a post and its only projection in one transaction. */
+  insertMessage(
+    sessionId: string,
+    body: string,
+    retryMs: number,
+    maxResurfaces: number,
+  ): MonitorEventRecord {
+    const session = this.getSessionById(sessionId);
+    return this.writeEvent(
+      {
+        workspacePath: session.workspacePath ?? null,
+        monitorId: POST_MONITOR_ID,
+        sourceName: 'post',
+        urgency: 'high',
+        title: retryMs > 0 ? 'Message (acknowledgement required)' : 'Message',
+        body,
+        summary: body,
+        payload: {},
+        snapshotMetadata: {},
+        snapshotText: null,
+        diffText: null,
+        objectKey: null,
+        baselineStrategy: null,
+        queryScope: {},
+        tags: [],
+        createdAt: new Date(),
+      },
+      undefined,
+      { message: { sessionId, retryMs, maxResurfaces } },
+    );
+  }
+
+  /** Commit a keyed post and its recovery record in one writer transaction. */
+  insertMessageOnce(
+    sessionId: string,
+    body: string,
+    retryMs: number,
+    maxResurfaces: number,
+    key: string,
+    expectedWorkspacePath?: string,
+  ): { eventId: string; created: boolean } {
+    const db = asInternalDb(this.db);
+    return runRuntimeTransaction(this, () => {
+      const workspacePath =
+        expectedWorkspacePath ??
+        this.getSessionById(sessionId).workspacePath ??
+        '';
+      const existing = db
+        .select({
+          eventId: postRequests.eventId,
+          sessionId: sessionEventState.sessionId,
+          body: monitorEvents.body,
+          retryMs: sessionEventState.messageRetryMs,
+          maxResurfaces: sessionEventState.messageMaxResurfaces,
+        })
+        .from(postRequests)
+        .leftJoin(monitorEvents, eq(monitorEvents.id, postRequests.eventId))
+        .leftJoin(
+          sessionEventState,
+          eq(sessionEventState.eventId, postRequests.eventId),
+        )
+        .where(
+          and(
+            eq(postRequests.workspacePath, workspacePath),
+            eq(postRequests.requestKey, key),
+          ),
+        )
+        .get();
+      if (existing) {
+        if (
+          existing.sessionId !== sessionId ||
+          existing.body !== body ||
+          existing.retryMs !== retryMs ||
+          existing.maxResurfaces !== maxResurfaces
+        ) {
+          throw new Error(
+            'This request key is already used for a different post in this workspace.',
+          );
+        }
+        return { eventId: existing.eventId, created: false };
+      }
+
+      // A replay can recover the original result after the recipient moves.
+      // A new write requires the recipient to still belong to the pinned scope.
+      if (
+        expectedWorkspacePath !== undefined &&
+        (this.getSessionById(sessionId).workspacePath ?? '') !==
+          expectedWorkspacePath
+      ) {
+        throw new Error(
+          'The recipient is no longer registered in the selected workspace.',
+        );
+      }
+      const { id: eventId } = this.insertMessage(
+        sessionId,
+        body,
+        retryMs,
+        maxResurfaces,
+      );
+      db.insert(postRequests)
+        .values({ workspacePath, requestKey: key, eventId })
+        .run();
+      return { eventId, created: true };
+    });
+  }
+
   /**
    * {@link RuntimeStore.insertEvent}, optionally limited to recipients that
    * were registered before the event's observation was admitted. Retry
@@ -1677,7 +1802,10 @@ export class RuntimeStore {
   private writeEvent(
     input: Omit<MonitorEventRecord, 'id'>,
     baseline?: { previousContent: string | null },
-    options?: { restrictToSessionId?: string },
+    options?: {
+      restrictToSessionId?: string;
+      message?: { sessionId: string; retryMs: number; maxResurfaces: number };
+    },
     admittedAt?: RetryAdmission,
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
@@ -1732,15 +1860,22 @@ export class RuntimeStore {
         // leaking. The declaring session must also still be `active`: a session reaped
         // mid-tick (its close raced this observation) must not receive a projection
         // (007 §4.4). The event row itself is still retained for durability.
+        const message = options?.message;
+        const recipientId = message?.sessionId ?? options?.restrictToSessionId;
         const candidates = ephemeralStillActive
           ? this.sessionsForWorkspace(event.workspacePath).filter(
               (candidate) =>
                 candidate.role === 'lead' &&
-                (options?.restrictToSessionId === undefined ||
-                  (candidate.id === options.restrictToSessionId &&
+                (recipientId === undefined ||
+                  (candidate.id === recipientId &&
                     candidate.status === 'active')),
             )
           : [];
+        if (message && candidates.length !== 1) {
+          throw new Error(
+            'A message recipient must be an active lead session.',
+          );
+        }
         const projectionTargets =
           admittedAt === undefined
             ? candidates
@@ -1810,6 +1945,10 @@ export class RuntimeStore {
               sessionId: session.id,
               eventId: event.id,
               diffText: perRecipientDiff,
+              ...(message && {
+                messageRetryMs: message.retryMs,
+                messageMaxResurfaces: message.maxResurfaces,
+              }),
               createdAt: event.createdAt,
               updatedAt: event.createdAt,
             })
@@ -2019,6 +2158,7 @@ export class RuntimeStore {
       if (workspaceCondition) conditions.push(workspaceCondition);
     }
 
+    const nowMs = Date.now();
     let rows = query.sessionId
       ? asInternalDb(this.db)
           .select({
@@ -2043,15 +2183,23 @@ export class RuntimeStore {
           // equal-time history consistently across independent writers.
           .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
           .all()
-          .map((row) => ({
-            ...rowToEvent(row.event),
-            // Only the session-scoped path joins session_event_state, so only
-            // it can report per-session delivery state (issue #338). `--unread`
-            // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
-            // claimed-but-unacknowledged events; this field lets a caller tell
-            // those apart from pending work, including expired claim cycles.
-            deliveryState: deliveryStateForRow(row.state, this.claimTtlMs),
-          }))
+          .map((row) => {
+            const messageState = messageStateForProjection(row.state, nowMs);
+            return {
+              ...rowToEvent(row.event),
+              ...(messageState === undefined ? {} : { messageState }),
+              // Only the session-scoped path joins session_event_state, so only
+              // it can report per-session delivery state (issue #338). `--unread`
+              // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
+              // claimed-but-unacknowledged events; this field lets a caller tell
+              // those apart from pending monitor work, including expired cycles.
+              deliveryState: deliveryStateForRow(
+                row.state,
+                this.claimTtlMs,
+                nowMs,
+              ),
+            };
+          })
       : asInternalDb(this.db)
           .select()
           .from(monitorEvents)
@@ -2070,6 +2218,7 @@ export class RuntimeStore {
                 monitorEvents.monitorId,
                 `${EPHEMERAL_MONITOR_ID_PREFIX}%`,
               ),
+              ne(monitorEvents.monitorId, POST_MONITOR_ID),
               ...conditions,
             ),
           )
@@ -2786,12 +2935,13 @@ export class RuntimeStore {
       .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
       .all();
 
+    const nowMs = Date.now();
     return rows.map(({ event, state, session }) => ({
       eventId: event.id,
       sessionId: session.id,
       sessionRole: session.role,
       sessionStatus: session.status,
-      deliveryState: deliveryStateForRow(state, this.claimTtlMs),
+      deliveryState: deliveryStateForRow(state, this.claimTtlMs, nowMs),
       workspacePath: session.workspacePath ?? null,
       createdAt: state.createdAt,
       ...(state.firstNotifiedAt
@@ -2875,9 +3025,11 @@ export class RuntimeStore {
   ): MonitorEventRecord[] {
     const conditions = [eq(sessionEventState.sessionId, sessionId)];
     if (urgency) conditions.push(eq(monitorEvents.urgency, urgency));
+    const nowMs = Date.now();
     const rows = asInternalDb(this.db)
       .select({
         event: monitorEvents,
+        state: sessionEventState,
       })
       .from(sessionEventState)
       .innerJoin(monitorEvents, eq(sessionEventState.eventId, monitorEvents.id))
@@ -2886,10 +3038,16 @@ export class RuntimeStore {
           ...conditions,
           isNull(sessionEventState.acknowledgedAt),
           or(
-            isNull(sessionEventState.claimStartedAt),
-            lte(
-              sessionEventState.claimStartedAt,
-              new Date(Date.now() - this.claimTtlMs),
+            and(
+              isNotNull(sessionEventState.messageRetryMs),
+              isPendingPost(nowMs),
+            ),
+            and(
+              isNull(sessionEventState.messageRetryMs),
+              or(
+                isNull(sessionEventState.claimStartedAt),
+                sql`${sessionEventState.claimStartedAt} <= ${nowMs - this.claimTtlMs}`,
+              ),
             ),
           ),
           notInterpretSuppressed(),
@@ -2898,7 +3056,16 @@ export class RuntimeStore {
       )
       .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
-    return rows.map((row) => rowToEvent(row.event));
+    return rows.map(({ event, state }) => {
+      const record = rowToEvent(event);
+      const messageState = messageStateForProjection(state, nowMs);
+      if (messageState === 'needs-attention') {
+        record.title = 'Message needs-attention (acknowledgement required)';
+      } else if (state.messageDueAtMs !== null) {
+        record.title = 'Message resurfaced (acknowledgement required)';
+      }
+      return record;
+    });
   }
 
   acknowledgeEvents(sessionId: string, eventIds: string[]): void {
@@ -3424,6 +3591,7 @@ export class RuntimeStore {
         `Event not found: ${ids.find((id) => !found.has(id)) ?? ''}`,
       );
     }
+    const nowMs = Date.now();
     return rows.map((row) => {
       const supplied = suppliedById.get(row.event.id);
       const projectionDiff = row.state?.diffText;
@@ -3441,7 +3609,13 @@ export class RuntimeStore {
           ? { diffText: projectionDiff }
           : {}),
         ...(row.state && supplied?.deliveryState !== undefined
-          ? { deliveryState: deliveryStateForRow(row.state, this.claimTtlMs) }
+          ? {
+              deliveryState: deliveryStateForRow(
+                row.state,
+                this.claimTtlMs,
+                nowMs,
+              ),
+            }
           : {}),
       };
     });
@@ -3623,17 +3797,86 @@ export class RuntimeStore {
 
   markClaimed(sessionId: string, eventIds: string[], lifecycle: string): void {
     if (eventIds.length === 0) return;
-    const now = new Date();
+    this.writeClaims(sessionId, eventIds, lifecycle, new Date());
+    // Advance only to newer artifacts among the claimed rows.
+    this.advanceCursorsForClaimedEvents(sessionId, eventIds);
+  }
+
+  /**
+   * Atomically consume the presented post offers before writing to the host.
+   * @internal
+   */
+  claimPostOffers(
+    sessionId: string,
+    eventIds: string[],
+    lifecycle: string,
+    reservedAtMs: number,
+  ): boolean {
+    if (eventIds.length === 0) return true;
+    return runRuntimeTransaction(this, () => {
+      const now = new Date();
+      const eligible = asInternalDb(this.db)
+        .select({ id: sessionEventState.eventId })
+        .from(sessionEventState)
+        .where(
+          and(
+            eq(sessionEventState.sessionId, sessionId),
+            inArray(sessionEventState.eventId, eventIds),
+            isNotNull(sessionEventState.messageRetryMs),
+            isNull(sessionEventState.acknowledgedAt),
+            // A stale reservation cannot consume a later offer.
+            isPendingPost(Math.min(reservedAtMs, now.getTime())),
+          ),
+        )
+        .all();
+      if (eligible.length !== eventIds.length) return false;
+      this.writeClaims(sessionId, eventIds, lifecycle, now);
+      return true;
+    });
+  }
+
+  /** Clear the next offer after a truncated post was presented. @internal */
+  endPostResurfacing(sessionId: string, eventId: string): void {
+    asInternalDb(this.db)
+      .update(sessionEventState)
+      .set({ messageDueAtMs: null, updatedAt: new Date() })
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          eq(sessionEventState.eventId, eventId),
+          isNotNull(sessionEventState.messageDueAtMs),
+        ),
+      )
+      .run();
+  }
+
+  private writeClaims(
+    sessionId: string,
+    eventIds: string[],
+    lifecycle: string,
+    now: Date,
+  ): void {
     asInternalDb(this.db)
       .update(sessionEventState)
       .set({
         // First-surfaced history never changes, including across expired
         // cycles. Latest-claim metadata remains separate from cycle lifetime.
         firstNotifiedAt: sql`COALESCE(${sessionEventState.firstNotifiedAt}, ${Math.floor(now.getTime() / 1000)})`,
+        // The last ordinary offer arms one final needs-attention offer.
+        messageDueAtMs: sql`CASE
+          WHEN ${sessionEventState.messageRetryMs} > 0
+            AND ${sessionEventState.messageClaims} <= ${sessionEventState.messageMaxResurfaces}
+            AND ${sessionEventState.acknowledgedAt} IS NULL
+          THEN ${now.getTime()} + ${sessionEventState.messageRetryMs}
+          ELSE NULL
+        END`,
+        messageClaims: sql`${sessionEventState.messageClaims} +
+          CASE WHEN ${sessionEventState.messageRetryMs} IS NULL THEN 0 ELSE 1 END`,
         // Recaps within a live cycle do not extend its lifetime. An expired
         // cycle starts anew only when a delivery actually commits a claim.
-        claimStartedAt: sql`CASE WHEN ${sessionEventState.claimStartedAt} IS NULL
-          OR ${sessionEventState.claimStartedAt} <= ${now.getTime() - this.claimTtlMs}
+        claimStartedAt: sql`CASE WHEN ${sessionEventState.messageRetryMs} IS NULL
+          AND (${sessionEventState.claimStartedAt} IS NULL
+            OR ${sessionEventState.claimStartedAt} <= ${now.getTime() - this.claimTtlMs})
           THEN ${now.getTime()} ELSE ${sessionEventState.claimStartedAt} END`,
         lastClaimAt: now,
         lastClaimLifecycle: lifecycle,
@@ -3643,16 +3886,16 @@ export class RuntimeStore {
         and(
           eq(sessionEventState.sessionId, sessionId),
           inArray(sessionEventState.eventId, eventIds),
+          or(
+            isNull(sessionEventState.messageRetryMs),
+            and(
+              isNull(sessionEventState.acknowledgedAt),
+              isPendingPost(now.getTime()),
+            ),
+          ),
         ),
       )
       .run();
-
-    // Advance this recipient's per-object baseline cursor (G10, 002 §1.1.2): the
-    // cursor means "the latest artifact this recipient was shown", so a claim
-    // moves it to the artifact of the NEWEST claimed event for each object —
-    // never backward past an event an earlier claim already surfaced.
-    // Only snapshot-bearing events carry an artifact to advance to.
-    this.advanceCursorsForClaimedEvents(sessionId, eventIds);
   }
 
   /**

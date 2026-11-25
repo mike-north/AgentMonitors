@@ -24,7 +24,7 @@ export class AgentMonitorRuntime {
     claimDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryClaim | null;
     // (undocumented)
     closeSession(sessionId: string, now?: Date): AgentSessionRecord;
-    commitDelivery(reservationId: string): DeliveryClaim | null;
+    commitDelivery(reservationId: string, presentedEventIds?: readonly string[]): DeliveryClaim | null;
     declareEphemeralMonitor(input: DeclareEphemeralMonitorInput): EphemeralMonitorRecord;
     diagnoseHookDelivery(sessionId: string, lifecycle: DeliveryLifecycle): HookDeliveryDiagnosis;
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
@@ -40,6 +40,11 @@ export class AgentMonitorRuntime {
     listVerifyArtifacts(workspacePath?: string): VerifyArtifactRecord[];
     // (undocumented)
     openSession(input: OpenSessionInput): AgentSessionRecord;
+    postMessage(input: PostMessageInput): {
+        eventId: string;
+        hookStateRefreshError?: string;
+    };
+    preparePostDelivery(reservationId: string, presentedEventIds: readonly string[], truncatedEventId?: string): boolean;
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];
     rearmMaterializationRetry(input: MaterializationRetryRepairInput): MaterializationRetryRepairResult;
@@ -896,6 +901,9 @@ export class MaterializationRetryTransitionError extends Error {
 // @public
 export const MAX_OPERATION_TIMEOUT_MS = 2147483647;
 
+// @public
+export type MessageState = 'pending' | 'delivered' | 'resurfaced' | 'needs-attention' | 'acked';
+
 // @internal
 export function _monitorCommandLine(command: readonly string[], flags: readonly string[], ids: readonly string[]): string;
 
@@ -975,6 +983,7 @@ export interface MonitorEventRecord {
     diffText: string | null;
     // (undocumented)
     id: string;
+    messageState?: MessageState;
     // (undocumented)
     monitorId: string;
     // (undocumented)
@@ -1441,6 +1450,36 @@ export interface PendingRollupState {
 }
 
 // @public
+export const POST_MONITOR_ID = "message/post";
+
+// @public
+export interface PostMessageInput {
+    // (undocumented)
+    body: string;
+    key?: string | undefined;
+    // (undocumented)
+    maxResurfaces?: number | undefined;
+    // (undocumented)
+    requireAck?: boolean | undefined;
+    // (undocumented)
+    resurfaceAfterMs?: number | undefined;
+    // (undocumented)
+    sessionId: string;
+    workspacePath?: string | undefined;
+}
+
+// @public (undocumented)
+export const postMessageInputSchema: z.ZodObject<{
+    sessionId: z.ZodString;
+    body: z.ZodString;
+    key: z.ZodOptional<z.ZodString>;
+    workspacePath: z.ZodOptional<z.ZodString>;
+    requireAck: z.ZodOptional<z.ZodBoolean>;
+    resurfaceAfterMs: z.ZodOptional<z.ZodNumber>;
+    maxResurfaces: z.ZodOptional<z.ZodNumber>;
+}, z.core.$strip>;
+
+// @public
 export const PRIVATE_DIR_MODE = 448;
 
 // @public
@@ -1565,6 +1604,8 @@ export class RuntimeStore {
         baselineSnapshotId: string | null;
         baselineContent: string;
     }): void;
+    // @internal
+    claimPostOffers(sessionId: string, eventIds: string[], lifecycle: string, reservedAtMs: number): boolean;
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
@@ -1576,6 +1617,8 @@ export class RuntimeStore {
     }): MonitorEventRecord;
     // @internal
     discardRetiredVerifyArtifactRetry(id: string): boolean;
+    // @internal
+    endPostResurfacing(sessionId: string, eventId: string): void;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;
@@ -1605,6 +1648,11 @@ export class RuntimeStore {
     }, options?: {
         restrictToSessionId?: string;
     }): MonitorEventRecord;
+    insertMessage(sessionId: string, body: string, retryMs: number, maxResurfaces: number): MonitorEventRecord;
+    insertMessageOnce(sessionId: string, body: string, retryMs: number, maxResurfaces: number, key: string, expectedWorkspacePath?: string): {
+        eventId: string;
+        created: boolean;
+    };
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     isVerifyArtifactCleanupEffective(input: {
         workspacePath: string;
