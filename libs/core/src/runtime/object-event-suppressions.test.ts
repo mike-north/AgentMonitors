@@ -20,7 +20,8 @@
  * file verify created is cleaned up by the id-scoped `retractObjectEvents` instead.
  *
  * @see docs/specs/005-cli-reference.md §16 (step 9, "Clean up")
- * @see docs/specs/spec-changelog.md 2026-07-16 (Refs #414, #418)
+ * @see docs/specs/changelog/2026-07-16-0266-verify-use-workspace-daemon-suppresses-not-waits-to-retract-its-scratch-events-005-16.md (Refs #414)
+ * @see docs/specs/changelog/2026-07-16-0265-verify-cleanup-uses-two-mechanisms-with-non-overlapping-safe-domains-005-16-refs-418.md (Refs #418)
  */
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';

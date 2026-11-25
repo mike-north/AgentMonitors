@@ -1346,7 +1346,7 @@ When sources disagree, the spec process MUST NOT silently average them together.
 
 1. Identify the contradiction explicitly.
 2. Distinguish current implementation behavior from desired future behavior.
-3. Record the resolution in `spec-changelog.md`.
+3. Record the resolution in one new file under `docs/specs/changelog/` (format: [spec-changelog.md](./spec-changelog.md)).
 4. Update the relevant numbered spec doc.
 5. Update or add tests so the decision is enforced.
 
@@ -1376,9 +1376,35 @@ Any substantive spec addition or change MUST answer all of the following:
 - Does it say whether the behavior is current or target?
 - Is there at least one concrete example for the tricky part?
 - Is there at least one test or validation implication attached to it?
-- If it resolves a contradiction, is that recorded in `spec-changelog.md`?
+- If it resolves a contradiction, is that recorded in one new file under `docs/specs/changelog/`?
 
 If any answer is "no", the change is underspecified.
+
+### 6.0 Spec history files (_current_)
+
+Each change adds exactly one Markdown entry file under `docs/specs/changelog/`;
+recording the entry requires no edits to a shared index or generated document.
+The file begins with `## YYYY-MM-DD — <full title>`, with issue and section
+references included in the title when applicable. Its body extends to the end
+of the file and may contain third-level subsections. The date must be a valid
+calendar date, the title nonempty, and the date/title pair unique.
+
+`pnpm specs:changelog` validates and assembles history to stdout, descending by
+date, then ascending by filename for equal dates. Generated history is never
+committed. Inline file links are relative to each entry; assembly rebases them to
+`docs/specs/`, restoring migrated destinations to their original text. The ignored
+`docs/specs/spec-history.generated.md` view keeps that base for navigation.
+CommonMark source spans identify inline link and image destinations, including titled
+and angle-delimited forms. Assembly edits only destination base prefixes; code spans,
+code blocks, titles, delimiters and line endings retain their original bytes. Navigation
+tests use the same recognizer and decoded destinations. Reference-style definitions
+outside code are rejected with inline-link guidance because their document-wide label
+scope would couple independent records.
+`pnpm check:spec-changelog`, included in `pnpm check` through
+`check:workspace`, rejects invalid entries, duplicate identities, and dated entry
+headings reintroduced into the stable `spec-changelog.md` index.
+`scripts/spec-changelog.test.ts` checks byte preservation of migrated entries,
+ordering, rejection cases, and conflict-free merging of independent entry files.
 
 ### 6.1 External-envelope admission coverage (_current_)
 

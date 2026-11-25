@@ -30,7 +30,7 @@ Read top to bottom the first time; after that, jump to the doc that owns your co
 - **Supporting** (non-normative), this directory:
   - [glossary.md](./glossary.md) — one canonical definition per core term.
   - [roadmap.md](./roadmap.md) — the current→target gaps, as prioritizable work items.
-  - [spec-changelog.md](./spec-changelog.md) — clarifications and contradiction resolutions.
+  - [spec-changelog.md](./spec-changelog.md) — index and commands for the per-file change history.
   - [maintainer-migration-notes.md](./maintainer-migration-notes.md) — how the old single-page
     draft maps to this set.
 
@@ -41,7 +41,7 @@ checklist in [004 §6](./004-validation-testing.md). In short:
 
 1. Update the relevant numbered doc first. Keep _current_ vs _target_ explicit.
 2. If the change resolves a contradiction or alters an earlier statement, add a
-   [spec-changelog.md](./spec-changelog.md) entry.
+   new entry file under [changelog/](./changelog/) (see [instructions](./spec-changelog.md)).
 3. Add or update tests so the decision is enforced ([004 §3](./004-validation-testing.md)).
 4. Only then adjust public website summaries if needed.
 

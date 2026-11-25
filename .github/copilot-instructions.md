@@ -34,7 +34,7 @@ unrelated work. Relevance map:
   current→target gaps
 
 When a change alters behavior, expect the matching numbered doc to be updated and a
-`docs/specs/spec-changelog.md` entry added.
+new entry file added under `docs/specs/changelog/`.
 
 ## Architectural Rules
 

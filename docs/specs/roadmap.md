@@ -374,5 +374,5 @@ Gap ids and the marker convention are defined in [004 §3.0](./004-validation-te
 ## How to retire an item
 
 When an item ships: move the normative statement in its governing doc from _current_ to
-_target-achieved_ (drop the "not yet" framing), add the proving test, record the change in
-[spec-changelog.md](./spec-changelog.md), then delete the item here.
+_target-achieved_ (drop the "not yet" framing), add the proving test, add one new entry file under
+[changelog/](./changelog/), then delete the item here.

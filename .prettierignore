@@ -25,3 +25,7 @@ agent-plugins/
 
 # Integrity-checked upstream native payloads must retain their recorded bytes.
 **/vendor/koffi/
+
+# Historical entry separators must survive assembly byte for byte.
+# Formatting individual files would remove separators preserved by assembly tests.
+docs/specs/changelog/

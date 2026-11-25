@@ -24,5 +24,5 @@ rule as *current* vs *target*.
 - `docs/specs/roadmap.md` — known current→target gaps; `docs/specs/glossary.md` — terminology
 
 When code and a spec disagree, the spec states which behavior is current vs target. When you change
-behavior, update the matching numbered doc and add a `docs/specs/spec-changelog.md` entry (process in
+behavior, update the matching numbered doc and add one new entry file under `docs/specs/changelog/` (process in
 `docs/specs/004-validation-testing.md` §5–6).
