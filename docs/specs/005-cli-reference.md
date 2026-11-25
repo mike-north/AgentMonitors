@@ -3012,7 +3012,7 @@ The inspection commands are `agentmonitors session list` for session mutations,
 `agentmonitors events list --session <id>` for claiming, and `agentmonitors watch list` for
 watch mutations. These diagnostics never report that no daemon is running and never retry the
 request. `monitor retry` also exits 3 for an unknown outcome, retaining its scoped inspection
-commands and existing text/JSON routing (§4).
+commands and existing text/JSON routing (§6).
 
 ### Commands that use `process.exitCode` (not `process.exit`)
 
