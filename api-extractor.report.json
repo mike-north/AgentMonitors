@@ -9,5 +9,10 @@
   "apiReport": {
     "enabled": true,
     "reportFolder": "<projectFolder>/api-report/"
+  },
+  // Report validation and regeneration consume build's declarations. Only
+  // the build configuration may emit the rollups published from dist/.
+  "dtsRollup": {
+    "enabled": false
   }
 }

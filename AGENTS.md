@@ -84,6 +84,10 @@ Note: every published TypeScript package (`@agentmonitors/core`, `plugins/source
 API report (`<package>/api-report/*.api.md`). Changing a package's **public** API requires
 regenerating its report (`pnpm --filter <package> run fix:api-report`) and committing the diff, or CI's
 `pnpm check:api-report` (no `--local`) fails.
+Report checks run only API Extractor after Nx builds the package and its dependencies. The report
+config disables declaration rollups, so concurrent checks consume `dist/` without writing it;
+the build config still emits the published `dist/public.d.ts`. Regeneration uses the same report
+config with `--local` and retains its serialized rebuild step.
 
 ## Invariants to respect
 

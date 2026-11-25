@@ -55,7 +55,7 @@
       "cache": false
     },
     "check:api-report": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["build", "^build"],
       "cache": true,
       "inputs": [
         "production",

@@ -67,15 +67,8 @@ function stepsMatching(job, pattern) {
   );
 }
 
-/**
- * Root npm scripts that fan an api-report target out across every published
- * package via `nx run-many`. Both MUST run serially — see
- * `assertApiReportRunManyIsSerial` for why.
- */
-export const API_REPORT_RUN_MANY_SCRIPTS = [
-  'check:api-report',
-  'fix:api-report',
-];
+/** Root report regeneration still emits declarations and must run serially. */
+export const API_REPORT_RUN_MANY_SCRIPTS = ['fix:api-report'];
 
 /**
  * @typedef {{ scripts?: Record<string, string> }} RootPackageJson
@@ -88,8 +81,7 @@ export const API_REPORT_RUN_MANY_SCRIPTS = [
  * guard, rather than matching anywhere in the whole script string — a bare
  * `/--parallel(?:=|\s+)1\b/.test(script)` over the entire script would be
  * satisfied by an unrelated `--parallel=1` on a totally different command
- * chained into the same line, without the actual `--target=check:api-report`
- * (or `fix:api-report`) invocation being serialized at all.
+ * chained into the same line, without the actual `--target=fix:api-report` invocation being serialized at all.
  *
  * @param {string} script
  * @returns {string[]}
@@ -107,21 +99,10 @@ function escapeRegExp(value) {
 }
 
 /**
- * Validate that the root `check:api-report`/`fix:api-report` npm scripts
- * invoke `nx run-many --target=<name>` with `--parallel=1` on that SAME
- * invocation (not merely present somewhere else in the script string).
- *
- * These scripts fan an api-report target out across every published package.
- * Each package's `check:api-report`/`fix:api-report` script independently
- * re-emits its own declarations (`tsup && tsc -p tsconfig.build.json`) before
- * invoking API Extractor — and `@agentmonitors/core`'s `build` target (which
- * every plugin's `^build` dependency pulls in, since a plugin's
- * declarations import core's `dist/rollup.d.ts`) writes into that same
- * project's `dist/` folder. Without `--parallel=1`, nx schedules
- * `core:build` (needed transitively for the plugins) concurrently with
- * `core:check:api-report` (requested directly) — two independent processes
- * racing to write `libs/core/dist/*`, observed as a transient `ENOENT:
- * no such file or directory, unlink '.../dist/index.d.ts.map'` (issue #285).
+ * Regeneration recompiles each package before updating its report. Its fan-out
+ * stays serialized to avoid racing upstream builds for the same declarations.
+ * Validation consumes existing builds and does not need this restriction.
+ * The parallel flag must belong to the same Nx invocation it protects.
  *
  * @param {RootPackageJson} pkg
  */
@@ -154,8 +135,8 @@ export function assertApiReportRunManyIsSerial(pkg) {
     throw new Error(
       `package.json script(s) ${problems.map((n) => `"${n}"`).join(', ')} ` +
         'must invoke `nx run-many --target=<name>` with `--parallel=1` on ' +
-        "that same invocation — without it, a package's own api-report " +
-        "check races that same package's `build` target when a sibling " +
+        "that same invocation — without it, a package's report regeneration " +
+        "races that same package's `build` target when a sibling " +
         'package pulls it in via `^build` (issue #285)',
     );
   }

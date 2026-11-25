@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Validate reports from built declarations (004 §2.14) — Refs #665
+
+API report checks depend on their own build as well as upstream builds and run only API
+Extractor. The report configuration disables declaration rollups; build remains the sole
+owner of published declarations and never updates checked-in reports. Workspace checks can
+run concurrently. Explicit regeneration keeps its serialized recompilation and uses the same
+report configuration with `--local`.
+
 ## 2026-11-25 — Serialize ephemeral admission with retirement (002 §6.4 and §10.7) — Refs #667
 
 Notify admission and held-work flushes check the declaration and owner liveness under their

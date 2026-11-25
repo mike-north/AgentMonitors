@@ -767,17 +767,20 @@ fingerprint runs on every invocation. Re-enabling the daemon would let a host ga
 Docker replay a result recorded without them.
 
 `build` declares `{projectRoot}/dist`, its sole intended writer. `check:api-report` declares
-`{projectRoot}/temp`. It also re-emits `dist/` before API Extractor runs (see the CI note on
-`--parallel=1`), so it is a known second writer of identical declarations. Consolidating it
-behind `build` is a tracked follow-up. Cache scope is local (`.nx/cache` per worktree). CI does
-not restore an Nx cache.
+`{projectRoot}/temp` and depends on both `build` and `^build`. Each package's check runs only
+API Extractor against those declarations, with declaration rollups disabled in the report config;
+it MUST NOT write `dist/`. Build retains declaration rollups and MUST NOT write `api-report/`.
+Report regeneration uses the same report config with `--local`, but still recompiles first and
+keeps its serialized workspace invocation. Cache scope is local (`.nx/cache` per worktree).
+CI does not restore an Nx cache.
 
 A test that reads a file outside its project MUST add that file to its target inputs; the
 guard below checks known reads and cannot discover new ones. The `pnpm affected` development
 path selects projects that own, or depend on owners of, files changed since `origin/main` (or
 `NX_BASE`), plus projects whose declared inputs name a changed file. It includes uncommitted and
 untracked files. It runs `build` and `check` (website excluded, as in the root scripts), then
-`test` (website included, as in `pnpm test`), then `check:api-report` serially. It omits
+`test` (website included, as in `pnpm test`), then `check:api-report`, whose package checks may run
+concurrently once their builds complete. It omits
 `test:serial`, `test:scripts`, the workspace lint/format/aipm checks and the packaging checks, so
 it is not a substitute for §2.10. A cache-hit `test:serial` with Docker reachable replays the
 pinned Docker smoke rather than re-running its registry installs; use `NX_SKIP_NX_CACHE=true`
@@ -786,6 +789,9 @@ for fresh execution evidence.
 **Verified in:** `scripts/nx-cache-contract.test.ts` reads Nx's own hash plan for these targets,
 checks that the daemon is disabled, and checks that the fingerprint reports missing `jq`, `git`
 and `perl`, `CI`, and unreachable Docker.
+`scripts/api-report-contract.test.ts` checks package commands, resolved Extractor configurations,
+build prerequisites and concurrent workspace entry points. Clean-build, timestamp-preservation
+and deliberate public-export mutation checks validate the corresponding output boundaries.
 
 ### 2.15 External-ingress envelope validation
 
