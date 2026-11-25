@@ -491,16 +491,18 @@ hide rows from the hook transport indefinitely.
 **Direct-post offers (_current_).** After rendering and before sending output, both transports
 MUST call `hook.preparePosts` with the reservation and the IDs of the rendered posts. A partially
 rendered post also carries its truncated event ID. The daemon consumes those offers in SQLite and
-grants permission to send the payload once. The later `hook.commit` applies monitor claims. For
-example, if a hook writes a post and loses its commit, replaying the keyed request after restart
-recovers the same ID and the consumed offer stays settled. A required-acknowledgement post with
-remaining scheduled offers becomes eligible only at its next deadline. A truncated post or a
-consumed final offer has no next deadline. Session-scoped unread history retains the full post.
+grants permission to send the payload once. After successful output, `hook.commit` applies monitor
+claims and clears any remaining deadline for the truncated post. For example, if a hook writes a
+post and loses its commit, replaying the keyed request after restart recovers the same ID and the
+consumed offer stays settled. A required-acknowledgement post with remaining scheduled offers
+becomes eligible only at its next deadline. A consumed final offer has no next deadline.
+Session-scoped unread history retains the full post.
 
 A crash or lost permission reply between consuming the offer and writing output can skip that
 presentation, since the host provides no durable acceptance or deduplication receipt. Later
 scheduled offers and unread history remain available. The direct-post integration tests exercise
-a lost hook commit with a reopened database and a successfully presented truncated post.
+a lost hook commit, a failed hook write with a reopened database, and a successfully presented
+truncated post.
 
 ### 4.5.2 Commit only on host-confirmed surfacing (_target_)
 

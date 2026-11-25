@@ -3811,7 +3811,6 @@ export class RuntimeStore {
     eventIds: string[],
     lifecycle: string,
     reservedAtMs: number,
-    truncatedEventId?: string,
   ): boolean {
     if (eventIds.length === 0) return true;
     return runRuntimeTransaction(this, () => {
@@ -3831,9 +3830,24 @@ export class RuntimeStore {
         )
         .all();
       if (eligible.length !== eventIds.length) return false;
-      this.writeClaims(sessionId, eventIds, lifecycle, now, truncatedEventId);
+      this.writeClaims(sessionId, eventIds, lifecycle, now);
       return true;
     });
+  }
+
+  /** Clear the next offer after a truncated post was presented. @internal */
+  endPostResurfacing(sessionId: string, eventId: string): void {
+    asInternalDb(this.db)
+      .update(sessionEventState)
+      .set({ messageDueAtMs: null, updatedAt: new Date() })
+      .where(
+        and(
+          eq(sessionEventState.sessionId, sessionId),
+          eq(sessionEventState.eventId, eventId),
+          isNotNull(sessionEventState.messageDueAtMs),
+        ),
+      )
+      .run();
   }
 
   private writeClaims(
@@ -3841,7 +3855,6 @@ export class RuntimeStore {
     eventIds: string[],
     lifecycle: string,
     now: Date,
-    truncatedEventId?: string,
   ): void {
     asInternalDb(this.db)
       .update(sessionEventState)
@@ -3854,7 +3867,6 @@ export class RuntimeStore {
           WHEN ${sessionEventState.messageRetryMs} > 0
             AND ${sessionEventState.messageClaims} <= ${sessionEventState.messageMaxResurfaces}
             AND ${sessionEventState.acknowledgedAt} IS NULL
-            AND ${sessionEventState.eventId} IS NOT ${truncatedEventId ?? null}
           THEN ${now.getTime()} + ${sessionEventState.messageRetryMs}
           ELSE NULL
         END`,

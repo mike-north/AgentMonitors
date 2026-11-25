@@ -3439,7 +3439,7 @@ export class AgentMonitorRuntime {
   /**
    * Durably consume the rendered post offers before a transport presents them.
    * A reservation grants permission once, including across a lost IPC reply.
-   * The later commit still applies the monitor claims after a successful write.
+   * The later commit ends resurfacing for a truncated post and applies monitor claims.
    */
   preparePostDelivery(
     reservationId: string,
@@ -3461,12 +3461,14 @@ export class AgentMonitorRuntime {
         posts,
         plan.claim.lifecycle,
         plan.reservedAtMs,
-        truncatedEventId,
       )
     ) {
       return false;
     }
     plan.postsPrepared = true;
+    if (truncatedEventId && posts.includes(truncatedEventId)) {
+      plan.truncatedPostId = truncatedEventId;
+    }
     return true;
   }
 
@@ -3485,6 +3487,9 @@ export class AgentMonitorRuntime {
   ): DeliveryClaim | null {
     const plan = this.reservations.take(reservationId);
     if (!plan) return null;
+    if (plan.truncatedPostId) {
+      this.store.endPostResurfacing(plan.sessionId, plan.truncatedPostId);
+    }
     let candidates = plan.candidates;
     if (plan.postsPrepared) {
       candidates = candidates.filter(

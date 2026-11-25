@@ -9,6 +9,11 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Skipped truncated posts keep scheduled offers (002 §7.2, 006 §4.5)
+
+A truncated post keeps its remaining resurfacing schedule if the hook write or channel push fails.
+Committing successful output clears the next deadline.
+
 ## 2026-11-25 — Direct post offers survive delivery retries (002 §7.2, 005 §18, 006 §4.5 and §5.5)
 
 Workspace keys recover only the original post request. Hooks and channels consume each presented

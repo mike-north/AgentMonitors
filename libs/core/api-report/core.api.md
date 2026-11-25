@@ -1595,7 +1595,7 @@ export class RuntimeStore {
         baselineContent: string;
     }): void;
     // @internal
-    claimPostOffers(sessionId: string, eventIds: string[], lifecycle: string, reservedAtMs: number, truncatedEventId?: string): boolean;
+    claimPostOffers(sessionId: string, eventIds: string[], lifecycle: string, reservedAtMs: number): boolean;
     // (undocumented)
     closeSession(sessionId: string): AgentSessionRecord;
     collapseNetForClaim(sessionId: string, candidates: MonitorEventRecord[]): MonitorEventRecord[];
@@ -1607,6 +1607,8 @@ export class RuntimeStore {
     }): MonitorEventRecord;
     // @internal
     discardRetiredVerifyArtifactRetry(id: string): boolean;
+    // @internal
+    endPostResurfacing(sessionId: string, eventId: string): void;
     enqueueMaterializationRetries(inputs: EnqueueMaterializationRetryInput[], now?: Date): MaterializationRetryRecord[];
     findEphemeralMonitorById(id: string): EphemeralMonitorRecord | null;
     findSessionById(id: string): AgentSessionRecord | null;

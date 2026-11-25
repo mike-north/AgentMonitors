@@ -634,6 +634,74 @@ it('leaves a monitor omitted by the recap character limit pending', async () => 
   );
 });
 
+it.each([50, 8000])(
+  'reoffers an unread %i-character required-ack post after a failed hook write',
+  async (length) => {
+    await withPostSession(async ({ root, sessionId, runtime, socketPath }) => {
+      const start = Date.UTC(2026, 0, 1);
+      vi.setSystemTime(start);
+      const body = 'P'.repeat(length);
+      const { eventId } = runtime.postMessage({
+        sessionId,
+        body,
+        requireAck: true,
+        resurfaceAfterMs: 100,
+        maxResurfaces: 1,
+      });
+      const flow = await reserveRenderAndCommitHookDelivery(
+        sessionId,
+        'turn-interruptible',
+        socketPath,
+        'UserPromptSubmit',
+      );
+      if (!flow) throw new Error('Expected a hook delivery.');
+      const writeError = new Error('Hook output failed.');
+      const write = vi.fn(() => {
+        throw writeError;
+      });
+      await expect(writeAndCommitHookDelivery(flow, write)).rejects.toBe(
+        writeError,
+      );
+      expect(write).toHaveBeenCalledTimes(1);
+
+      const restarted = new AgentMonitorRuntime(
+        new RuntimeStore(createDb(path.join(root, 'runtime.db'))),
+        new SourceRegistry(),
+      );
+      const restartedSocket = path.join(root, 'restarted.sock');
+      const server = createDaemonServer({
+        runtime: restarted,
+        socketPath: restartedSocket,
+      });
+      const claim = () =>
+        callDaemon<DeliveryClaim | null>(
+          'hook.claim',
+          { sessionId, lifecycle: 'turn-interruptible' },
+          { socketPath: restartedSocket },
+        );
+      try {
+        await server.listen();
+        expect(
+          restarted.listEvents({ sessionId, unreadOnly: true }),
+        ).toContainEqual(
+          expect.objectContaining({
+            id: eventId,
+            body,
+            deliveryState: 'claimed',
+          }),
+        );
+        await expect(claim()).resolves.toBeNull();
+        vi.setSystemTime(start + 100);
+        expect((await claim())?.events).toMatchObject([
+          { eventId, title: expect.stringContaining('resurfaced') },
+        ]);
+      } finally {
+        await server.close();
+      }
+    });
+  },
+);
+
 it('ends resurfacing after presenting a truncated required-ack post', async () => {
   await withPostSession(async ({ sessionId, runtime, socketPath }) => {
     const start = Date.UTC(2026, 0, 1);

@@ -2602,8 +2602,8 @@ the write transaction runs.
 | `acked`           | The recipient explicitly acknowledged the post.                                                            |
 
 For a post requiring acknowledgement, committing the initial offer or a scheduled resurface
-starts a new deadline using the persisted interval. Consuming a final needs-attention offer or a
-truncated post clears the deadline. The full post remains unread until acknowledged. Each scheduled
+starts a new deadline using the persisted interval. Consuming a final needs-attention offer or committing the successful presentation of a truncated
+post clears the deadline. The full post remains unread until acknowledged. Each scheduled
 offer uses the same ID and body. Releasing or expiring a reservation before consuming the offer
 leaves it eligible without spending the resurfacing budget. Hooks and channels consume rendered
 offers before sending them to the host

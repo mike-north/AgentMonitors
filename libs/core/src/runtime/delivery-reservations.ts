@@ -41,6 +41,8 @@ export interface DeliveryReservationPlan {
   reservedAtMs: number;
   /** True once the transport has permission to present its direct posts. */
   postsPrepared?: boolean;
+  /** End this post’s resurfacing when the transport commits successful output. */
+  truncatedPostId?: string;
 }
 
 /**
