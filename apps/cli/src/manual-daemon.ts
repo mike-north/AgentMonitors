@@ -1,4 +1,6 @@
+/** Workspace socket discovery and honest diagnostics for manual daemon requests. */
 import { DaemonConnectionError, resolveSocketPath } from './daemon-ipc.js';
+import { reportError } from './output.js';
 import { readLocalState } from './local-state.js';
 import { workspacePaths } from './workspace-paths.js';
 
@@ -43,16 +45,39 @@ export function resolveManualDaemonSocketPath(
 }
 
 /**
- * Convert only transport-level daemon failures into the manual-command
- * remediation. Daemon-side application errors remain visible to the user.
+ * The mutation and read-only inspection that can establish its eventual result.
+ * @internal
  */
-export function manualDaemonErrorMessage(error: unknown): string {
-  if (isManualDaemonConnectionError(error)) {
-    return NO_WORKSPACE_DAEMON_MESSAGE;
-  }
-  return error instanceof Error ? error.message : String(error);
+export interface ManualDaemonMutation {
+  readonly action: string;
+  readonly checkCommand: string;
 }
 
-export function isManualDaemonConnectionError(error: unknown): boolean {
-  return error instanceof DaemonConnectionError;
+/**
+ * Report only what the transport established. A written request may still take
+ * effect, so missing replies use exit 3 and never suggest starting a daemon.
+ * Connection diagnostics always use stderr; application errors retain the
+ * command's existing format and exit 1. Mutation context is absent for reads.
+ * The transport retains the attempted socket so workspace edits cannot
+ * retarget a diagnostic while a request is waiting for its reply.
+ * @internal
+ */
+export function reportManualDaemonError(
+  error: unknown,
+  json: boolean,
+  mutation?: ManualDaemonMutation,
+): void {
+  if (!(error instanceof DaemonConnectionError)) {
+    reportError(error instanceof Error ? error.message : String(error), json);
+    return;
+  }
+  if (!error.requestSent) {
+    reportError(NO_WORKSPACE_DAEMON_MESSAGE, false);
+    return;
+  }
+  const message = mutation
+    ? `${mutation.action} outcome unknown: the daemon received the request but no reply arrived (${error.message}). It may already have been applied, or may still be applied. Check with \`${mutation.checkCommand}\` before running it again.`
+    : `Request to the AgentMon daemon at ${error.socketPath ?? resolveSocketPath()} got no reply (${error.message}); the daemon is running but did not answer.`;
+  reportError(message, false);
+  process.exitCode = 3;
 }

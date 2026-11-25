@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Distinguish missing replies from unreachable sockets (005 §17) — Refs #592
+
+Manual session, event, claim and watch commands now preserve the distinction between failure to
+connect and a written request without a reply. The former retains exit 1 and workspace-daemon
+remediation; the latter uses exit 3 and stderr text, with inspection commands for mutations.
+Read-only commands identify the unanswered socket as resolved for that request, independent of
+later workspace coordination edits. Retry repairs also use exit 3 for unknown
+outcomes while retaining their output routing and prohibition on in-process writes.
+
 ## 2026-11-25 — Prepare the rollup competitor once per file (004 §2.9) — Refs #664
 
 The rollup admission suite compiles its private competitor fixture and current core source once

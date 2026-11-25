@@ -159,6 +159,8 @@ async function runRepair(
           ),
           json,
         );
+        // A written repair can still take effect; distinguish it from a refusal.
+        process.exitCode = 3;
         return;
       }
       via = 'in-process';

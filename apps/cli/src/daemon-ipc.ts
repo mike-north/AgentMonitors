@@ -338,6 +338,8 @@ export class DaemonConnectionError extends Error {
     message: string,
     readonly cause?: unknown,
     requestSent = false,
+    /** The resolved target of this attempt, independent of later workspace edits. */
+    readonly socketPath?: string,
   ) {
     super(message);
     this.requestSent = requestSent;
@@ -1313,6 +1315,7 @@ export async function callDaemon<T = unknown>(
           `Timed out waiting for AgentMon daemon at ${socketPath}`,
           undefined,
           requestSent,
+          socketPath,
         ),
       );
     });
@@ -1328,6 +1331,7 @@ export async function callDaemon<T = unknown>(
           error instanceof Error ? error.message : String(error),
           error,
           requestSent,
+          socketPath,
         ),
       );
     });
@@ -1340,6 +1344,7 @@ export async function callDaemon<T = unknown>(
           `AgentMon daemon at ${socketPath} closed the connection without a reply`,
           undefined,
           requestSent,
+          socketPath,
         ),
       );
     });

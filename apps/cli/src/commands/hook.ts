@@ -5,7 +5,6 @@ import type {
   DeliveryLifecycle,
   DeliveryReservation,
 } from '@agentmonitors/core';
-import { reportError } from '../output.js';
 import {
   claimDeliveryClient,
   commitDeliveryClient,
@@ -28,8 +27,7 @@ import {
 import { readHookPayload } from '../hook-payload.js';
 import { writeTransportHeartbeat } from '../transport-heartbeat.js';
 import {
-  isManualDaemonConnectionError,
-  manualDaemonErrorMessage,
+  reportManualDaemonError,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
 import {
@@ -103,10 +101,10 @@ hookCommand
         }
         console.log(claim.message);
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && options.format === 'json',
-        );
+        reportManualDaemonError(error, options.format === 'json', {
+          action: 'Hook claim',
+          checkCommand: `agentmonitors events list --session ${options.session}`,
+        });
       }
     },
   );

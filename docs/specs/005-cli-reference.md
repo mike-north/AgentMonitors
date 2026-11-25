@@ -1040,7 +1040,7 @@ leaving it to its one-minute recheck. Which path applies depends on how far the 
 it takes effect on the next tick.` first.
 - **A daemon accepted the request but no reply arrived** (the wait above ran out, or the
   connection closed first): the daemon may already have applied the repair, or may still apply it
-  once it reads the request, so the outcome is unknown. The command writes nothing, exits 1 and prints
+  once it reads the request, so the outcome is unknown. The command writes nothing, exits 3 and prints
   ``<Re-arm|Skip> outcome unknown for retry <id> of monitor <monitorId> in workspace <path>: the
 daemon received the request but no reply arrived (<cause>). The <re-arm|skip> may already have
 been applied, or may still be applied; nothing was written to the store from here. Check with `<explain command>` or
@@ -2970,13 +2970,14 @@ static health checks — it proves the _dynamic_ delivery path the checks can't 
 
 ### General conventions
 
-| Condition                           | Exit code                        | Output target                                       |
-| ----------------------------------- | -------------------------------- | --------------------------------------------------- |
-| Success                             | `0`                              | —                                                   |
-| Validation/argument error           | `1` (via `process.exitCode = 1`) | stderr (text) or stdout (JSON `{ "error": "..." }`) |
-| Daemon socket unavailable / timeout | `1`                              | stderr                                              |
-| Unknown source / parse failure      | `1`                              | stderr or JSON error                                |
-| Placeholder command invoked         | `1`                              | stderr                                              |
+| Condition                                               | Exit code                        | Output target                                       |
+| ------------------------------------------------------- | -------------------------------- | --------------------------------------------------- |
+| Success                                                 | `0`                              | —                                                   |
+| Validation/argument error                               | `1` (via `process.exitCode = 1`) | stderr (text) or stdout (JSON `{ "error": "..." }`) |
+| Daemon connection failed before request write           | `1`                              | stderr                                              |
+| Daemon received the request, no reply (outcome unknown) | `3`                              | stderr                                              |
+| Unknown source / parse failure                          | `1`                              | stderr or JSON error                                |
+| Placeholder command invoked                             | `1`                              | stderr                                              |
 
 ### Error output routing
 
@@ -2985,9 +2986,37 @@ All commands that support `--format json` use `reportError()` (`apps/cli/src/out
 - **JSON mode:** writes `{ "error": "<message>" }` to **stdout** (so JSON consumers get a consistent channel) and sets `process.exitCode = 1`.
 - **Text mode:** writes `Error: <message>` to **stderr** and sets `process.exitCode = 1`.
 
+For manual socket commands (`session open|close|list`, `events ack|list`, `hook claim`, and
+`watch declare|cancel|list`), transport failures always use stderr text, even with `--format json`.
+Before a request is written, the existing workspace-daemon remediation is unchanged (exit 1).
+After a request is written, a timeout, socket error or close without a reply exits 3:
+
+Mutations print the following message. Action labels are `Session open`, `Session close`,
+`Events ack`, `Hook claim`, `Watch declare`, and `Watch cancel`.
+
+```text
+<Action> outcome unknown: the daemon received the request but no reply arrived (<cause>). It may already have been applied, or may still be applied. Check with `<check command>` before running it again.
+```
+
+Reads print:
+
+```text
+Request to the AgentMon daemon at <socket> got no reply (<cause>); the daemon is running but did not answer.
+```
+
+The socket is the resolved target of the request, even if workspace coordination changes before
+the failure is reported.
+
+The inspection commands are `agentmonitors session list` for session mutations,
+`agentmonitors events list --session <id> --unread` for acknowledgment,
+`agentmonitors events list --session <id>` for claiming, and `agentmonitors watch list` for
+watch mutations. These diagnostics never report that no daemon is running and never retry the
+request. `monitor retry` also exits 3 for an unknown outcome, retaining its scoped inspection
+commands and existing text/JSON routing (§6).
+
 ### Commands that use `process.exitCode` (not `process.exit`)
 
-All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. This allows in-flight async operations and Node.js cleanup handlers to complete before the process terminates.
+Errors set `process.exitCode` (1 for failures, 3 for the unknown outcomes above) rather than calling `process.exit()`. This allows in-flight async operations and Node.js cleanup handlers to complete before the process terminates.
 
 ### Daemon socket timeout
 

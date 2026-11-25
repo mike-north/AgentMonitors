@@ -634,7 +634,7 @@ describe('monitor retry behind a daemon that received the request but did not an
     label: 'Re-arm' | 'Skip',
     id: string,
   ): void {
-    expect(result.code).toBe(1);
+    expect(result.code).toBe(3);
     expect(result.stdout).not.toContain('applied to the persisted store');
     expect(result.stderr).toContain(
       `Error: ${label} outcome unknown for retry ${id} of monitor ${MONITOR} in workspace ${root}: the daemon received the request but no reply arrived (`,
@@ -696,7 +696,7 @@ describe('monitor retry behind a daemon that received the request but did not an
         expectOutcomeUnknown(result, label, id);
       }
       const json = await run(repairArgs('skip', id, '--format', 'json'));
-      expect(json.code).toBe(1);
+      expect(json.code).toBe(3);
       expect((JSON.parse(json.stdout) as { error: string }).error).toMatch(
         /^Skip outcome unknown for retry /u,
       );
@@ -1421,7 +1421,7 @@ it.each([
       try {
         const verb = scenario === 'unknown-rearm' ? 'rearm' : 'skip';
         const result = await repair(verb);
-        expect(result.code).toBe(1);
+        expect(result.code).toBe(3);
         expect(methods).toEqual([`retry.${verb}`]);
         expect(result.stderr).toContain('outcome unknown');
         prose = result.stderr;
