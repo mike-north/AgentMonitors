@@ -2306,7 +2306,7 @@ as if they were independent failures.
 a failed call was silently dropped, leaving the returned diagnosis set indistinguishable from "the
 check ran and found nothing suppressed". `deliverable` then read `true` even though whether a
 suppression was active had never actually been answered — a false green. `delivery-diagnosis-unavailable`
-makes that distinction explicit and, unlike the two advisory codes above, IS blocking: `deliverable`
+makes that distinction explicit and, unlike the advisory codes below, IS blocking: `deliverable`
 can never be `true` while it is present, precisely because "unknown" must not be reported as "healthy".
 
 **A hold with untrustworthy `claimedEventIds` is also `delivery-diagnosis-unavailable` (issue #425
@@ -2320,29 +2320,33 @@ avoid. An empty array is untrustworthy here too (round 8): an `already-claimed`/
 hold necessarily claims at least one event, so `[]` can only come from a malformed or hand-built
 value, not from a real suppression. See 006 §12.7.
 
-`version-skew` and `channel-registration-unverified` are the two **advisory, non-blocking** codes: both
-are reported when present, but neither counts toward a transport's `healthy` field, its `fail` status,
-or the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
+`version-skew`, `channel-registration-unverified`, and `channel-session-unmatched` are the three
+**advisory, non-blocking** codes: all are reported when present, but none counts toward a transport's `healthy` field, its `fail` status,
+or the overall `deliverable` verdict. `channel-lead-uncovered` is advisory only when fresh,
+correctly bound hook heartbeats cover every session missing a channel heartbeat; without that
+evidence, it remains blocking. `version-skew` was blocking through issue #373; it was made
 informational because the hook transport's heartbeat legitimately carries the pre-upgrade CLI version
 for up to its full 24h TTL after every release (it only refreshes on the next prompt) — treating it as
 blocking made `doctor` exit non-zero for up to a day after every single upgrade, the exact cry-wolf
 outcome issue #373 exists to prevent, and it directly contradicted the hook remediation's own "No
 action needed" wording.
 
-**Target (Refs #462): `channel-session-unmatched` becomes the third advisory code, and the exit code
-agrees with the verdict.** A channel record whose session is no longer an active lead is normally a
-leftover from an ended session, which expires within the channel heartbeat TTL. Reported as a
-blocking problem, it made `doctor` print a healthy delivery verdict and still exit 1 after ordinary
-session churn. Target contract:
+**Current: channel advisories preserve the delivery verdict.** A channel record whose session is no
+longer active remains visible until its heartbeat expires. `channel-session-unmatched` changes neither
+`healthy` nor the transport check status. It does not establish a listening route for another session.
+Both channel codes remain in
+`transports[].problems[]` and the text Delivery transports block, without additional JSON fields.
 
-- `channel-session-unmatched` is reported but never blocking, like the two codes above. It never
-  sets a transport's `fail` status on its own.
-- `doctor`'s exit status **MUST** agree with the delivery verdict line: whenever the verdict reports
-  delivery as deliverable, no delivery-transport check may fail. A genuinely wrong binding, where the
-  channel is the only route and it serves another session, already makes the verdict
-  undeliverable, so that case still fails.
-- The same rule covers `channel-lead-uncovered`, which fails in the same churn scenario. While the
-  hook path delivers to that lead, it is reported but not blocking.
+When `deliverable` is true, every delivery-transport check and `delivery-verdict` is non-failing.
+Defects in an unused route remain visible in its health and problem fields. A channel serving another
+session with no matching hook route still leaves delivery unavailable and exits 1. Checks unrelated
+to delivery can independently cause exit 1; no active session remains idle and exits 0 when no other
+check fails.
+
+Verified: `apps/cli/src/transport-health.ts` (`computeTransportHealth`, `buildTransport`),
+`apps/cli/src/commands/doctor.ts` (`transportChecks`), `apps/cli/src/transport-health.test.ts`, and
+`apps/cli/src/commands/transport-health.integration.test.ts` (channel session churn, hook coverage,
+and the delivery-check invariant applied to every doctor scenario).
 
 The section closes with a single verdict line: `delivery to active sessions in this workspace → via
 {hook | channel | both | none}`, plus whether it is deliverable **right now**. The verdict is
@@ -2354,8 +2358,9 @@ arrive — reporting only the method is what let a real CI failure go undelivere
 looked green.
 
 **Exit code.** A `transport:<name>` check is `fail` only for a transport that DID report in, is
-genuinely broken (misbound, stale — advisory codes never count), **and a lead session is currently
-registered for this workspace**. "A lead session exists but no transport has reported in yet" is
+genuinely broken (misbound, stale — advisory codes never count), delivery is unavailable through
+other routes, **and a lead session is currently registered for this workspace**.
+"A lead session exists but no transport has reported in yet" is
 `idle`, not `fail` — it is the ordinary state of a script-registered session or a freshly-opened one
 that has not yet had its first prompt, and failing there would cry wolf on a setup that is about to
 be fine. With no lead session at all, both transport checks are `idle`/`skip` and the verdict is

@@ -26,6 +26,15 @@ receipts independently of active declarations; monitor explain reports them in n
 The legacy `declaration-retired` barrier remains for preexisting inconsistent state.
 Suspension/resume and retention of suspended sessions remain target under #636.
 
+## 2026-11-25 — Doctor delivery checks agree with available routes (005 §15) — Refs #462
+
+Unmatched channel sessions are advisory and cannot establish delivery to an active session.
+Channel coverage gaps are advisory when matching fresh hook evidence covers those sessions.
+Doctor preserves all problem details while keeping transport checks non-failing whenever delivery
+is available. Unrelated failing checks still cause exit 1. Transport unit tests and built-CLI
+scenarios verify health, text/JSON diagnostics, exit status, and the delivery-check invariant.
+The corresponding doctor gap is removed from roadmap G22.
+
 ## 2026-11-25 — Prepare the rollup competitor once per file (004 §2.9) — Refs #664
 
 The rollup admission suite compiles its private competitor fixture and current core source once
