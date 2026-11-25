@@ -9,13 +9,24 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Database as BetterSQLiteClient } from 'better-sqlite3';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { build } from 'tsup';
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest';
 import { claudeCodeAdapter } from '../adapter/claude.js';
 import type {
   InterpretAdapter,
@@ -32,6 +43,46 @@ import { registerRuntimeTransaction } from './runtime-transaction.js';
 /** Source polling is due at 08:00/10:00; the independent rollup window is 09:00 UTC. */
 const BEFORE = Date.parse('2026-11-01T08:00:00Z');
 const WINDOW = Date.parse('2026-11-01T09:00:00Z');
+/** Child execution is bounded inside the competing case's fixture/assertion budget. */
+const COMPETITOR_TIMEOUT_MS = 15_000;
+const COMPETITOR_CASE_MARGIN_MS = 5_000;
+/** Compilation has its own hook budget and never consumes a competing case's budget. */
+const COMPETITOR_BUILD_TIMEOUT_MS = 15_000;
+/** File-owned output is reused by all competitors; per-case cleanup must not remove it. */
+let competitorRoot: string | undefined;
+let competitorBundle: string;
+beforeAll(async () => {
+  competitorRoot = mkdtempSync(path.join(tmpdir(), 'rollup-competitor-'));
+  competitorBundle = path.join(competitorRoot, 'rollup-writer.mjs');
+  // Keep native SQLite and other external packages on their installed resolution
+  // path while compiling the local source graph into a private, immutable file.
+  symlinkSync(
+    fileURLToPath(new URL('../../node_modules', import.meta.url)),
+    path.join(competitorRoot, 'node_modules'),
+    'junction',
+  );
+  await build({
+    entry: [
+      fileURLToPath(
+        new URL('./test-fixtures/rollup-writer.mjs', import.meta.url),
+      ),
+    ],
+    outDir: competitorRoot,
+    outExtension: () => ({ js: '.mjs' }),
+    format: ['esm'],
+    platform: 'node',
+    target: 'node24',
+    splitting: false,
+    config: false,
+    silent: true,
+  });
+}, COMPETITOR_BUILD_TIMEOUT_MS);
+afterAll(() => {
+  if (competitorRoot) {
+    rmSync(competitorRoot, { recursive: true, force: true });
+  }
+});
+
 let clockTime = BEFORE;
 /** Native Date instances preserve the retry serializer's plain-timestamp invariant. */
 const owned: { root: string; clients: BetterSQLiteClient[] }[] = [];
@@ -257,19 +308,15 @@ function beforeAdmission(
   };
 }
 
-/** The child imports current source using Node 24 type transformation and a confined resolver hook. */
+/** A real competing process commits through the same runtime using the file-owned source bundle. */
 function competingRuntime(
   f: Awaited<ReturnType<typeof fixture>>,
   mode: 'notdue' | 'due' | 'watch',
 ) {
-  const child = fileURLToPath(
-    new URL('./test-fixtures/rollup-writer.mjs', import.meta.url),
-  );
   const output = execFileSync(
     process.execPath,
     [
-      '--experimental-transform-types',
-      child,
+      competitorBundle,
       mode,
       f.dbPath,
       f.monitorsDir,
@@ -278,7 +325,7 @@ function competingRuntime(
     ],
     {
       encoding: 'utf8',
-      timeout: 15_000,
+      timeout: COMPETITOR_TIMEOUT_MS,
       maxBuffer: 1024 * 1024,
     },
   );
@@ -319,6 +366,7 @@ function expectNoAdmission(f: Awaited<ReturnType<typeof fixture>>) {
 
 describe('not-due rollup admission', () => {
   for (const mode of ['notdue', 'due', 'watch'] as const) {
+    // prettier-ignore
     it(`does not duplicate a competing ${mode} runtime's committed window`, async () => {
       const f = await fixture();
       clockTime = WINDOW;
@@ -353,7 +401,7 @@ describe('not-due rollup admission', () => {
       );
       expect(state.notifyState).toEqual(firedWindowNotify(f));
       expect(f.observations()).toBe(1);
-    });
+    }, COMPETITOR_TIMEOUT_MS + COMPETITOR_CASE_MARGIN_MS);
   }
 
   for (const fired of [false, true]) {
