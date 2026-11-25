@@ -9,6 +9,21 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Preserve declarations during report regeneration (004 §2.14) — Refs #665
+
+Report regeneration now depends on each package's own and upstream builds and invokes only
+API Extractor with `--local`. Recompilation inside regeneration could delete rollups before
+downstream extraction, changing reports despite unchanged source. Build alone emits declarations;
+a workspace regression checks stable reports and retained public declaration entry points.
+
+## 2026-11-25 — Validate reports from built declarations (004 §2.14) — Refs #665
+
+API report checks depend on their own build as well as upstream builds and run only API
+Extractor. The report configuration disables declaration rollups; build remains the sole
+owner of published declarations and never updates checked-in reports. Workspace checks can
+run concurrently. Explicit regeneration keeps its serialized recompilation and uses the same
+report configuration with `--local`.
+
 ## 2026-11-25 — Skipped truncated posts keep scheduled offers (002 §7.2, 006 §4.5)
 
 A truncated post keeps its remaining resurfacing schedule if the hook write or channel push fails.

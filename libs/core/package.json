@@ -28,8 +28,8 @@
     "check": "tsc --noEmit",
     "test": "vitest run",
     "clean": "rm -rf dist temp",
-    "check:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --verbose -c api-extractor.report.json",
-    "fix:api-report": "tsup && tsc -p tsconfig.build.json && api-extractor run --local --verbose -c api-extractor.report.json"
+    "check:api-report": "api-extractor run --verbose -c api-extractor.report.json",
+    "fix:api-report": "api-extractor run --local -c api-extractor.report.json"
   },
   "license": "MIT",
   "dependencies": {

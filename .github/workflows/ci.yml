@@ -39,15 +39,9 @@ jobs:
       # deliberately different configs so `build`'s `--local` rollup step can
       # never touch `api-report/`). Runs without `--local`, so an unintentional
       # public-type change fails this step until the report is regenerated
-      # (`pnpm fix:api-report`) and reviewed. The `check:api-report`/
-      # `fix:api-report` npm scripts also pass `--parallel=1` to `nx run-many`:
-      # each package's script independently re-emits its own declarations
-      # (`tsup && tsc`) before invoking API Extractor, and `@agentmonitors/core`'s
-      # `build` target (which every plugin's `^build` dependency pulls in) writes
-      # into that same `dist/` folder — running both concurrently raced and
-      # produced a transient `ENOENT` on `dist/index.d.ts.map`. This is a `dist/`
-      # write race, independent of the apiReport config split above, so
-      # `--parallel=1` stays regardless.
+      # (`pnpm fix:api-report`) and reviewed. Nx builds each package and its
+      # dependencies before checking. Checks only run API Extractor, with
+      # declaration rollups disabled, so concurrent checks never write dist/.
       - name: Check (API report drift)
         run: pnpm check:api-report
 

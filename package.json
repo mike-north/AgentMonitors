@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "verify": "pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run",
-    "affected": "NX_TUI=false nx affected -t build check --exclude=agentmonitors-workspace,@agentmonitors/website --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t test --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t check:api-report --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main} --parallel=1",
+    "affected": "NX_TUI=false nx affected -t build check --exclude=agentmonitors-workspace,@agentmonitors/website --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t test --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t check:api-report --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main}",
     "build": "NX_TUI=false nx run-many --target=build --exclude=agentmonitors-workspace,@agentmonitors/website",
     "check": "pnpm check:packages && pnpm check:workspace && pnpm check:aipm",
     "check:aipm": "aipm validate",
@@ -31,7 +31,7 @@
     "test:e2e-fresh-install-hooks": "node scripts/test-e2e-fresh-install-hooks.mjs",
     "test:windows-install": "node scripts/test-windows-install.mjs",
     "clean": "NX_TUI=false nx run-many --target=clean --exclude=agentmonitors-workspace && NX_TUI=false nx reset",
-    "check:api-report": "NX_TUI=false nx run-many --target=check:api-report --exclude=agentmonitors-workspace --parallel=1",
+    "check:api-report": "NX_TUI=false nx run-many --target=check:api-report --exclude=agentmonitors-workspace",
     "fix:api-report": "NX_TUI=false nx run-many --target=fix:api-report --exclude=agentmonitors-workspace --parallel=1",
     "version:packages": "changeset version",
     "fix:vendor-koffi": "node scripts/vendor-koffi.mjs"
