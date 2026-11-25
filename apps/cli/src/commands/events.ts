@@ -183,12 +183,7 @@ const eventsListCommand = eventsCommand
           );
         }
       } catch (error) {
-        reportManualDaemonError(
-          error,
-          format === 'json',
-          undefined,
-          resolveManualDaemonSocketPath(options.socket),
-        );
+        reportManualDaemonError(error, format === 'json');
       }
     },
   )

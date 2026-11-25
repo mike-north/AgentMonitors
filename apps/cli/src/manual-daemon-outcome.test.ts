@@ -9,8 +9,58 @@ import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { describe, expect, it } from 'vitest';
 import { NO_WORKSPACE_DAEMON_MESSAGE } from './manual-daemon.js';
+import { writeLocalState } from './local-state.js';
 
 const cli = path.resolve(import.meta.dirname, '../dist/index.cjs');
+
+/** Diagnostics identify the contacted socket even when coordination now selects another. */
+it('names the contacted workspace socket after coordination changes before a missing reply', async () => {
+  const workspace = tmpdir();
+  const socketPath = path.join(workspace, 'contacted.sock');
+  writeLocalState(workspace, { enabled: true, socket: socketPath });
+  let received = false;
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
+    socket.on('error', () => undefined);
+    socket.setEncoding('utf8');
+    let buffer = '';
+    socket.on('data', (chunk: string) => {
+      buffer += chunk;
+      if (!buffer.includes('\n') || received) return;
+      received = true;
+      writeLocalState(workspace, {
+        enabled: true,
+        socket: path.join(workspace, 'replacement.sock'),
+      });
+      socket.end();
+    });
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(socketPath, resolve);
+    });
+    const result = await run(
+      ['events', 'list', '--session', 'session-1', '--format', 'json'],
+      {
+        ...process.env,
+        AGENTMONITORS_SOCKET: undefined,
+        CLAUDE_PROJECT_DIR: workspace,
+      },
+    );
+    expect(received).toBe(true);
+    expect(result.stderr).toBe(
+      `Error: Request to the AgentMon daemon at ${socketPath} got no reply (AgentMon daemon at ${socketPath} closed the connection without a reply); the daemon is running but did not answer.\n`,
+    );
+    expect(result.stdout).toBe('');
+    expect(result.code).toBe(3);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 /** Expected actions and inspection commands come from the CLI contract. */
 const commands = [
@@ -73,9 +123,10 @@ const commands = [
 /** Capture both channels without blocking the peer's request reader. */
 async function run(
   args: string[],
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, [cli, ...args], {
-    env: process.env,
+    env,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stdout = '';

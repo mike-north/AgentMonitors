@@ -58,13 +58,14 @@ export interface ManualDaemonMutation {
  * effect, so missing replies use exit 3 and never suggest starting a daemon.
  * Connection diagnostics always use stderr; application errors retain the
  * command's existing format and exit 1. Mutation context is absent for reads.
+ * The transport retains the attempted socket so workspace edits cannot
+ * retarget a diagnostic while a request is waiting for its reply.
  * @internal
  */
 export function reportManualDaemonError(
   error: unknown,
   json: boolean,
   mutation?: ManualDaemonMutation,
-  socketPath?: string,
 ): void {
   if (!(error instanceof DaemonConnectionError)) {
     reportError(error instanceof Error ? error.message : String(error), json);
@@ -76,7 +77,7 @@ export function reportManualDaemonError(
   }
   const message = mutation
     ? `${mutation.action} outcome unknown: the daemon received the request but no reply arrived (${error.message}). It may already have been applied, or may still be applied. Check with \`${mutation.checkCommand}\` before running it again.`
-    : `Request to the AgentMon daemon at ${resolveSocketPath(socketPath)} got no reply (${error.message}); the daemon is running but did not answer.`;
+    : `Request to the AgentMon daemon at ${error.socketPath ?? resolveSocketPath()} got no reply (${error.message}); the daemon is running but did not answer.`;
   reportError(message, false);
   process.exitCode = 3;
 }

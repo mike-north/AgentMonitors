@@ -215,12 +215,7 @@ sessionCommand
         );
       }
     } catch (error) {
-      reportManualDaemonError(
-        error,
-        options.format === 'json',
-        undefined,
-        resolveManualDaemonSocketPath(options.socket),
-      );
+      reportManualDaemonError(error, options.format === 'json');
     }
   });
 

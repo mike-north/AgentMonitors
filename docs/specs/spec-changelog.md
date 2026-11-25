@@ -14,7 +14,8 @@ Agent Monitors spec set in `docs/specs/`.
 Manual session, event, claim and watch commands now preserve the distinction between failure to
 connect and a written request without a reply. The former retains exit 1 and workspace-daemon
 remediation; the latter uses exit 3 and stderr text, with inspection commands for mutations.
-Read-only commands identify the unanswered socket. Retry repairs also use exit 3 for unknown
+Read-only commands identify the unanswered socket as resolved for that request, independent of
+later workspace coordination edits. Retry repairs also use exit 3 for unknown
 outcomes while retaining their output routing and prohibition on in-process writes.
 
 ## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468

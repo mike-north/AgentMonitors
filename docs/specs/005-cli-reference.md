@@ -3004,6 +3004,9 @@ Reads print:
 Request to the AgentMon daemon at <socket> got no reply (<cause>); the daemon is running but did not answer.
 ```
 
+The socket is the resolved target of the request, even if workspace coordination changes before
+the failure is reported.
+
 The inspection commands are `agentmonitors session list` for session mutations,
 `agentmonitors events list --session <id> --unread` for acknowledgment,
 `agentmonitors events list --session <id>` for claiming, and `agentmonitors watch list` for
