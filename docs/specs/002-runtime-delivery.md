@@ -2554,7 +2554,7 @@ and interrupted-close atomicity, plus real-hold diagnosis beside an existing rec
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):
 
 - **Unread:** `acknowledgedAt IS NULL` in `session_event_state`. The session has not acknowledged the event.
-- **Claimed (pending → notified):** `claim_started_at_ms IS NOT NULL` and the claim TTL has not elapsed. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (unacknowledged events with no claim-cycle start or a start at or before `now − claimTtlMs`). `firstNotifiedAt` records the **first** claim and is never overwritten: a repeat claim within a live cycle updates only `lastClaimAt` and `lastClaimLifecycle`; a claim after expiry also starts a new cycle. Every claim, first or repeat, advances the recipient's object cursor only forward (§1.1.2).
+- **Claimed (pending → notified) for monitor events:** `claim_started_at_ms IS NOT NULL` and the claim TTL has not elapsed. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (unacknowledged events with no claim-cycle start or a start at or before `now − claimTtlMs`). `firstNotifiedAt` records the **first** claim and is never overwritten: a repeat claim within a live cycle updates only `lastClaimAt` and `lastClaimLifecycle`; a claim after expiry also starts a new cycle. Every claim, first or repeat, advances the recipient's object cursor only forward (§1.1.2).
 - **Acknowledged:** `acknowledgedAt IS NOT NULL`. The session explicitly marked the event read.
 
 This distinction matters because a claimed event may still need user or agent attention later.
@@ -2565,7 +2565,7 @@ Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines
 
 > **Status: current** (Refs #468; origin #434).
 
-A claim not followed by acknowledgment within the claim TTL returns to **pending**, while
+A monitor event claim not followed by acknowledgment within the claim TTL returns to **pending**, while
 remaining unread. Expiry never acknowledges. Delivery is at-least-once: each expired event follows
 its urgency's next delivery point (§9), and cycles repeat until acknowledged.
 
@@ -2600,6 +2600,63 @@ cycles, acknowledgment, recap, lease independence and cursor ordering);
 `apps/cli/src/claim-ttl.integration.test.ts`, `apps/cli/src/claim-ttl-coordination.integration.test.ts`
 and `apps/cli/src/local-state.test.ts`.
 
+### 7.2 Direct posts and required acknowledgement (_current_)
+
+`AgentMonitorRuntime.postMessage` creates a durable event and its projection atomically for one
+existing, active lead session. It returns the event ID. The event is eligible immediately for
+concrete delivery at `turn-interruptible` or in a `post-compact` recap. Both paths use the normal
+delivery claim and reservation protocol. A post has no snapshot or object cursor. Posts appear
+only in the recipient's session-scoped event list and use the reserved event identity
+`message/post`.
+
+When the optional request `key` is supplied, the runtime commits the key and event ID in the
+same transaction as the event and projection. Keys are unique within the recipient's workspace.
+A repeat with the same recipient, body and effective acknowledgement policy returns the original ID
+without creating or changing a post, even after a restart or when the original session is dormant.
+Reusing the key for a different request in that workspace fails. Different
+workspaces can use the same key independently. A keyed request may pin its workspace explicitly.
+The runtime looks for the original ID in that workspace before checking the recipient's current
+registration. A new post requires the recipient to be registered in the selected workspace when
+the write transaction runs.
+
+| State             | Meaning                                                                                                    |
+| ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| `pending`         | The initial delivery has yet to be claimed.                                                                |
+| `delivered`       | The initial delivery was claimed.                                                                          |
+| `resurfaced`      | At least one scheduled reoffer was claimed.                                                                |
+| `needs-attention` | The acknowledgement deadline passed after the initial delivery and all configured resurfaces were claimed. |
+| `acked`           | The recipient explicitly acknowledged the post.                                                            |
+
+For a post requiring acknowledgement, committing the initial offer or a scheduled resurface
+starts a new deadline using the persisted interval. Consuming a final needs-attention offer or committing the successful presentation of a truncated
+post clears the deadline. The full post remains unread until acknowledged. Each scheduled
+offer uses the same ID and body. Releasing or expiring a reservation before consuming the offer
+leaves it eligible without spending the resurfacing budget. Hooks and channels consume rendered
+offers before sending them to the host
+([006 §4.5.1](./006-agent-integration.md#451-transport-state-semantics-reserve--commit--release)).
+At the deadline
+after the last allowed resurface, the event becomes `needs-attention` and is eligible for one
+final delivery labeled accordingly. It remains visible as `needs-attention` until acknowledged.
+With a zero budget the first deadline after initial delivery makes it `needs-attention`.
+Posts without required acknowledgement are offered once. Recaps respect these eligibility rules.
+Post eligibility and resurfacing are independent of the monitor claim TTL (§7.1). In a
+session-scoped listing, a post's `deliveryState` remains `claimed` from its first delivery
+until acknowledgement, and `messageState` reports its post-specific state.
+
+Acknowledgement through `acknowledgeSession` or either delivery transport uses the existing
+session event acknowledgement. After acknowledgement, no new offer can be reserved. If a previously
+delivered post has an in-flight retry or final offer, explicit acknowledgement by ID may race with
+that delivery. The transport may finish presenting the reserved offer, and the post stays
+acknowledged. Bulk acknowledgement skips posts held by a live reservation, like other leased
+events ([006 §4.5.1](./006-agent-integration.md#451-transport-state-semantics-reserve--commit--release)).
+The timing policy and claim progress are stored with the projection and survive restart.
+Interval and budget defaults and bounds are in [005 §18](./005-cli-reference.md#18-post--send-a-message).
+
+Verified: `apps/cli/src/commands/post.integration.test.ts` exercises posting, claiming, listing
+and acknowledgement over the local socket with a controlled clock and a reopened database. It also
+checks ID recovery after a committed reply times out. `libs/core/src/inbox/db.migration.test.ts`
+covers legacy projections and keyed replay across database connections.
+
 ## 8. Hook State
 
 Each session has a hook-state JSON file on disk. The file is written atomically (write to `.tmp`, then `rename`) to prevent partial reads.
@@ -2608,9 +2665,9 @@ Verified: `libs/core/src/runtime/service.ts` — `writeJsonAtomic()` (lines 45�
 
 The hook state **MUST** include: `sessionId`, `updatedAt` (ISO 8601 string), unread counts for `low`, `normal`, `high`, and `total`, `hasPendingHigh`, `hasPendingNormal`, `hasPendingLow`, `latestHighTitles`.
 
-`hasPendingHigh` becomes `true` only when at least one unread high-urgency event is pending (never claimed or its claim cycle has expired, §7.1) **and** its age is at or above the 15-second high-urgency settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000`). This threshold deliberately mirrors the delivery condition used by `claimDelivery` at `turn-interruptible`.
+`hasPendingHigh` becomes `true` only when at least one unread high-urgency event is pending (never claimed or its claim cycle has expired, §7.1) **and** its age is at or above the 15-second high-urgency settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000`). This threshold deliberately mirrors the delivery condition used by `claimDelivery` at `turn-interruptible`. Pending direct posts follow §7.2 and set this flag without the monitor settle window.
 
-`latestHighTitles` contains the titles of up to the 5 most recent unclaimed high-urgency events.
+`latestHighTitles` contains the titles of up to the 5 most recent eligible high-urgency events.
 
 Verified: `libs/core/src/runtime/service.ts` — `refreshHookState()` (lines 426–447): settle window check at line 430–432; `highUnread.slice(-5)` at line 441. `libs/core/src/runtime/types.ts` — `SessionHookState` (lines 121–129).
 
@@ -2816,15 +2873,26 @@ and reservation scenarios for `low` at `turn-idle` and `normal` at `turn-interru
 
 ### 9.4 Recap
 
-At `post-compact`, if unread events remain, the runtime **MUST** emit a recap payload that:
+At `post-compact`, if unread monitor events or eligible posts remain, the runtime **MUST** emit a recap payload that:
 
-- includes a summary of up to the 10 most recent unread events (`MAX_RECAP_EVENTS = 10`, using `.slice(-10)` so the 10 newest are included)
+- includes a summary of up to 10 recap candidates (`MAX_RECAP_EVENTS = 10`)
 - appends two commands: one for full session history and one for unread details
 - updates `lastRecapAt` on the session record
 
-The `DeliveryClaim` in this case has `mode: 'recap'`. The `events` array contains up to 10 `DeliveryEventSummary` entries, each including `body` (the raw monitor instructions — see §9.1 for the `DeliveryEventSummary` shape). Claiming any delivery **MUST** mark the underlying session-event rows as claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains null) (BP2).
+The `DeliveryClaim` in this case has `mode: 'recap'`. Eligible posts fill the first slots in
+oldest-first order. The newest unread monitor events fill remaining slots after per-recipient
+collapse. Each `DeliveryEventSummary` includes `body`, which contains the monitor instructions or
+post text (see §9.1). Claiming a delivery **MUST** mark its underlying session-event rows as
+claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains
+null) (BP2). Bounded hook recaps consume only the post offers represented in the rendered context
+(006 §5.5).
 
-Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` post-compact branch; `MAX_RECAP_EVENTS = 10`; `store.markClaimed()` does not set `acknowledgedAt` (see `libs/core/src/runtime/store.ts`: sets `firstNotifiedAt`, `claimStartedAt`, `lastClaimAt`, `lastClaimLifecycle` and `updatedAt`). Each mapped event includes `body: event.body`.
+Verified: `libs/core/src/runtime/service.ts` selects the `post-compact` claim.
+`store.markClaimed()` records claim metadata, starts a monitor cycle when needed (§7.1), and
+advances the post schedule (§7.2) while leaving acknowledgement state intact. The mixed recap regression in
+`libs/core/src/runtime/claim-ttl.test.ts` covers independent post deadlines and monitor claim expiry
+with a monotonic cursor. The compiled recap regressions in
+`apps/cli/src/commands/post.integration.test.ts` exercise both limits.
 
 ## 10. Daemon and IPC
 
@@ -3473,26 +3541,41 @@ Real owned-socket tests verify dates rather than inferring correctness from core
 
 Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Retained rows drain before newer input (§2.7). Final crash acceptance remains separate work.
 
+### `post_requests`
+
+Durable recovery records for keyed posts (§7.2). The primary key is
+`(workspace_path, request_key)`.
+
+| Column           | Type          | Notes                                                          |
+| ---------------- | ------------- | -------------------------------------------------------------- |
+| `workspace_path` | TEXT NOT NULL | Recipient workspace, or the empty string for unscoped sessions |
+| `request_key`    | TEXT NOT NULL | Request key supplied by the caller                             |
+| `event_id`       | TEXT NOT NULL | ID returned for the original post                              |
+
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
 
-| Column                 | Type             | Notes                                                                                 |
-| ---------------------- | ---------------- | ------------------------------------------------------------------------------------- |
-| `id`                   | TEXT PK          | ULID                                                                                  |
-| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                                                             |
-| `event_id`             | TEXT NOT NULL    | FK to `monitor_events.id`                                                             |
-| `first_notified_at`    | INTEGER nullable | Permanent first-surfaced history; `NULL` = never claimed                              |
-| `acknowledged_at`      | INTEGER nullable | Set by explicit ack; `NULL` = unread                                                  |
-| `claim_started_at_ms`  | INTEGER nullable | Durable current claim-cycle start in milliseconds; TTL determines pending eligibility |
-| `last_claim_at`        | INTEGER nullable | Time of most recent claim                                                             |
-| `last_claim_lifecycle` | TEXT nullable    | Lifecycle at most recent claim                                                        |
-| `diff_text`            | TEXT nullable    | Per-recipient delta (G10); `NULL` ⇒ fall back to `monitor_events.diff_text`           |
-| `interpret_decision`   | TEXT nullable    | Per-recipient Interpret verdict (G14); `NULL` for non-`prose`                         |
-| `interpret_reason`     | TEXT nullable    | Interpret suppression/failure detail (G14)                                            |
-| `interpret_digest`     | TEXT nullable    | Delivered cheap digest when verdict is `deliver` (G14)                                |
-| `created_at`           | INTEGER NOT NULL |                                                                                       |
-| `updated_at`           | INTEGER NOT NULL |                                                                                       |
+| Column                   | Type             | Notes                                                                               |
+| ------------------------ | ---------------- | ----------------------------------------------------------------------------------- |
+| `id`                     | TEXT PK          | ULID                                                                                |
+| `session_id`             | TEXT NOT NULL    | FK to `agent_sessions.id`                                                           |
+| `event_id`               | TEXT NOT NULL    | FK to `monitor_events.id`                                                           |
+| `first_notified_at`      | INTEGER nullable | Permanent first-surfaced history; `NULL` = never claimed                            |
+| `acknowledged_at`        | INTEGER nullable | Set by explicit ack; `NULL` = unread                                                |
+| `claim_started_at_ms`    | INTEGER nullable | Durable monitor claim-cycle start in Unix milliseconds                              |
+| `last_claim_at`          | INTEGER nullable | Time of most recent claim                                                           |
+| `last_claim_lifecycle`   | TEXT nullable    | Lifecycle at most recent claim                                                      |
+| `diff_text`              | TEXT nullable    | Per-recipient delta (G10); `NULL` ⇒ fall back to `monitor_events.diff_text`         |
+| `interpret_decision`     | TEXT nullable    | Per-recipient Interpret verdict (G14); `NULL` for non-`prose`                       |
+| `interpret_reason`       | TEXT nullable    | Interpret suppression/failure detail (G14)                                          |
+| `interpret_digest`       | TEXT nullable    | Delivered cheap digest when verdict is `deliver` (G14)                              |
+| `message_retry_ms`       | INTEGER nullable | Resurface interval in milliseconds, 0 for a one-off post, NULL for monitor events   |
+| `message_max_resurfaces` | INTEGER NOT NULL | Maximum scheduled resurfaces, defaults to 0                                         |
+| `message_claims`         | INTEGER NOT NULL | Committed post offers, including the initial and final offers, defaults to 0        |
+| `message_due_at_ms`      | INTEGER nullable | Next offer deadline in Unix milliseconds, cleared when the final offer is committed |
+| `created_at`             | INTEGER NOT NULL |                                                                                     |
+| `updated_at`             | INTEGER NOT NULL |                                                                                     |
 
 ### `session_object_cursor`
 

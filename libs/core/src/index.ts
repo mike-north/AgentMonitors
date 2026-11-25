@@ -180,6 +180,10 @@ export {
   isVerifyScratchObjectKey,
 } from './runtime/service.js';
 export {
+  POST_MONITOR_ID,
+  postMessageInputSchema,
+} from './runtime/message-policy.js';
+export {
   MaterializationRetryCapacityError,
   MaterializationRetryNotFoundError,
   MaterializationRetryTransitionError,
@@ -275,6 +279,8 @@ export type {
   EnqueueMaterializationRetryInput,
   MonitorDoctorReport,
   MonitorEventRecord,
+  MessageState,
+  PostMessageInput,
   MonitorExplainInput,
   MonitorExplainReport,
   MonitorExplainStage,

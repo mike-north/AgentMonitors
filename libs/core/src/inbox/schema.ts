@@ -181,6 +181,16 @@ export const interpretDecisionValues = [
 ] as const;
 export type InterpretDecision = (typeof interpretDecisionValues)[number];
 
+/**
+ * Durable mapping from a workspace request key to the original post ID.
+ * @internal
+ */
+export const postRequests = sqliteTable('post_requests', {
+  workspacePath: text('workspace_path').notNull(),
+  requestKey: text('request_key').notNull(),
+  eventId: text('event_id').notNull(),
+});
+
 export const sessionEventState = sqliteTable('session_event_state', {
   id: text('id').primaryKey(),
   sessionId: text('session_id').notNull(),
@@ -191,6 +201,11 @@ export const sessionEventState = sqliteTable('session_event_state', {
   claimStartedAt: integer('claim_started_at_ms', { mode: 'timestamp_ms' }),
   acknowledgedAt: integer('acknowledged_at', { mode: 'timestamp' }),
   lastClaimAt: integer('last_claim_at', { mode: 'timestamp' }),
+  // NULL identifies monitor work. Zero identifies a post with no ack policy.
+  messageRetryMs: integer('message_retry_ms'),
+  messageMaxResurfaces: integer('message_max_resurfaces').notNull().default(0),
+  messageClaims: integer('message_claims').notNull().default(0),
+  messageDueAtMs: integer('message_due_at_ms'),
   lastClaimLifecycle: text('last_claim_lifecycle'),
   // The PER-RECIPIENT delta (G10, 002 §1.1.2): the diff of this event's shaped
   // artifact against THIS session's own baseline cursor at projection time.

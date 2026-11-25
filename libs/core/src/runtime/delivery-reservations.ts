@@ -38,6 +38,11 @@ export interface DeliveryReservationPlan {
   claim: DeliveryClaim;
   /** Epoch ms after which the lease is void and the rows return to the hook path. */
   expiresAt: number;
+  reservedAtMs: number;
+  /** True once the transport has permission to present its direct posts. */
+  postsPrepared?: boolean;
+  /** End this post’s resurfacing when the transport commits successful output. */
+  truncatedPostId?: string;
 }
 
 /**
@@ -82,16 +87,22 @@ export class DeliveryReservationRegistry {
     return reservationId;
   }
 
+  /** Read a live reservation without releasing its lease. */
+  get(reservationId: string): DeliveryReservationPlan | undefined {
+    const plan = this.reservations.get(reservationId);
+    if (plan && plan.expiresAt > this.now()) return plan;
+    this.reservations.delete(reservationId);
+    return undefined;
+  }
+
   /**
    * Remove and return a reservation for commit. Returns `undefined` if it is
    * unknown or already expired (a caller must then treat the delivery as not
    * committed — the rows may have re-delivered via the hook path).
    */
   take(reservationId: string): DeliveryReservationPlan | undefined {
-    const plan = this.reservations.get(reservationId);
+    const plan = this.get(reservationId);
     this.reservations.delete(reservationId);
-    if (!plan) return undefined;
-    if (plan.expiresAt <= this.now()) return undefined;
     return plan;
   }
 

@@ -166,66 +166,10 @@ function buildHookClaimedUnreadMarker(
   return `\n\n[truncated — this update was too large to show in full; the full copy stays unread — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
 }
 
-/**
- * Build the marker used for a truncated `post-compact` **recap** — lifecycle-
- * aware, distinct from both {@link buildHookDeferredMarker} and
- * {@link buildHookClaimedUnreadMarker} (issue #442, PR #442 round-9 review).
- *
- * Neither of those two markers is TRUE for a recap. A recap's decision
- * (`decideDelivery`'s `post-compact` branch, `service.ts`) reads ALL unread
- * events for the session and claims the FULL unread set at apply time
- * (`applyDelivery` claims `decision.candidates`, not just the rendered
- * `recapSlice`) — but recap re-SOURCES from `unreadEventsForSession`, not
- * `pendingEventsForSession`, so a row being claimed (`first_notified_at` set)
- * never hides it from a FUTURE recap; only acknowledging does (§5.5). That
- * means:
- *
- * - {@link buildHookDeferredMarker}'s own contract — "more monitor updates
- *   are pending; run `events list --unread` to see the rest" — is a genuine
- *   promise that the omitted rows stay pending and WILL redeliver: it is
- *   built only for rows that were never reserved at all (see its own doc
- *   comment). That promise does not hold here: the recap's omitted whole
- *   blocks ARE part of THIS reservation's candidate set (`applyDelivery`
- *   claims `decision.candidates`, not just the rendered `recapSlice`) and
- *   are about to be claimed once this render's commit lands — not yet
- *   claimed at render time, per the render-before-commit ordering described
- *   below. So whether they end up claimed (and therefore excluded from
- *   ordinary, `pendingEventsForSession`-sourced redelivery) or return to
- *   pending depends on which of the three commit outcomes follows (a null
- *   commit returns them to pending; a resolved non-null commit claims them;
- *   a rejected commit leaves that outcome unknown) — reusing the deferred
- *   marker here would misleadingly borrow a guarantee this reservation
- *   can't back up. The recap marker below is preferred precisely because it
- *   CAN make a guarantee that holds across all three commit outcomes:
- *   future recap resurfacing, which is unaffected by whether THIS commit
- *   claims these rows (§5.5's self-heal re-sources from
- *   `unreadEventsForSession`, not `pendingEventsForSession`).
- * - {@link buildHookClaimedUnreadMarker} (in its current, post-round-10
- *   wording) no longer asserts a redelivery outcome either way — but a
- *   recap's own framing is still distinct: it can (and should) promise the
- *   POSITIVE "will reappear on future recaps" outcome, which is true
- *   regardless of whether THIS recap's own commit lands, because a FUTURE
- *   recap always re-sources from `unreadEventsForSession` (§5.5's self-heal).
- *   The ordinary marker cannot make that promise (a `turn-interruptible`
- *   claim's tail genuinely does NOT redeliver once acknowledged-adjacent
- *   state is uncertain), so it settles for the outcome-agnostic "stays
- *   unread" framing instead — see {@link buildHookClaimedUnreadMarker}'s own
- *   doc comment.
- *
- * So a recap needs its own truthful framing regardless of which of
- * {@link renderHookDelivery}'s two truncation branches (whole-blocks-omitted,
- * or a single event's own block mid-truncated) produced it — both are, for a
- * recap, the SAME fact: this content stays unread and will keep re-surfacing
- * on future recaps until acknowledged. Like {@link buildHookClaimedUnreadMarker},
- * this marker is built from the reservation's own (not-yet-committed) claim
- * (issue #442, PR #442 round-9/10 review) — so it deliberately does NOT
- * assert this content "is claimed" at render time either, only the
- * self-healing future-recap behavior, which holds regardless of this
- * particular commit's outcome.
- */
+/** Point to unread details when a recap reaches its context limit. */
 function buildHookRecapMarker(sessionId: string, socketPath?: string): string {
   const safeSessionId = sanitize(sessionId);
-  return `\n\n[truncated — not everything fit in this recap; the omitted content stays unread and will reappear on future recaps until acknowledged — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
+  return `\n\n[truncated — not everything fit in this recap; omitted content stays unread and posts follow their delivery schedule — run \`agentmonitors events list --session ${safeSessionId}${socketClause(socketPath)} --unread\` to see it now]`;
 }
 
 /**
@@ -698,31 +642,25 @@ export function renderHookDelivery(
   hookEventName: string,
   options: RenderHookDeliveryOptions = {},
 ): HookDeliveryOutput | null {
+  return (
+    renderHookDeliveryWithCoverage(claim, hookEventName, options)?.output ??
+    null
+  );
+}
+
+/** Render context with the number of event blocks represented in its prefix. */
+export function renderHookDeliveryWithCoverage(
+  claim: DeliveryClaim | null,
+  hookEventName: string,
+  options: RenderHookDeliveryOptions = {},
+): {
+  output: HookDeliveryOutput;
+  presentedCount: number;
+  truncatedEventId?: string;
+} | null {
   if (!claim) return null;
 
-  // A `post-compact` recap is a DIFFERENT lifecycle from a `turn-interruptible`
-  // (or `turn-idle`) claim: it intentionally re-shows the full unread set on
-  // EVERY recap, regardless of whether a given row already got claimed
-  // (§5.5) — so neither of the two markers below is truthful for it. Marker
-  // selection is therefore lifecycle-aware (issue #442, PR #442 round-9
-  // review): see {@link buildHookRecapMarker}.
   const isRecap = claim.lifecycle === 'post-compact';
-
-  // Built once per claim from its own `sessionId` (issue #442) and the
-  // resolved `socketPath` (issue #358, PR #442 round-7 review) so every marker
-  // rendered below points at the exact, directly runnable recovery command for
-  // THIS claim's session — see {@link buildHookDeferredMarker} and
-  // {@link buildHookClaimedUnreadMarker}. The two are DELIBERATELY distinct
-  // for a non-recap claim (see their doc comments): the deferred marker
-  // promises a redelivery that will actually happen (these events were never
-  // reserved at all — they stay pending, full stop); the claimed-unread marker
-  // makes no redelivery promise either way, since it is rendered from the
-  // reservation's own claim before that reservation is committed (issue #442,
-  // PR #442 round-9/10 review). For a recap, both slots use the SAME
-  // recap-aware marker (`buildHookRecapMarker`) — the distinction between
-  // "genuinely pending" and "this claim's own content" doesn't apply: recap
-  // re-shows everything unread regardless of this delivery's own commit
-  // outcome.
   const deferredMarker = isRecap
     ? buildHookRecapMarker(claim.sessionId, options.socketPath)
     : buildHookDeferredMarker(claim.sessionId, options.socketPath);
@@ -759,7 +697,7 @@ export function renderHookDelivery(
       claim.sessionId,
       options.socketPath,
     );
-    return {
+    const output: HookDeliveryOutput = {
       continue: true,
       hookSpecificOutput: {
         hookEventName,
@@ -770,6 +708,7 @@ export function renderHookDelivery(
         ),
       },
     };
+    return { output, presentedCount: 0 };
   }
 
   // Body injection: consume {@link resolveHookClaimFit}'s OWN sizing rather
@@ -825,8 +764,11 @@ export function renderHookDelivery(
   );
 
   let additionalContext: string;
+  let presentedCount: number;
+  let truncatedEventId: string | undefined;
   if (fit.whole.includedCount === claim.events.length && !moreDeferred) {
     // Every claimed event fits and nothing was deferred → no marker.
+    presentedCount = fit.whole.includedCount;
     additionalContext = fit.whole.text + reminderFooter;
   } else if (fit.reserved.includedCount >= 1) {
     // A marker is needed (some claimed blocks did not fit here, and/or the caller
@@ -834,6 +776,7 @@ export function renderHookDelivery(
     // marker AND named exactly the events it includes in its own header — this
     // branch only fires when at least one WHOLE block was genuinely left
     // pending (unclaimed), which is exactly what that marker promises.
+    presentedCount = fit.reserved.includedCount;
     additionalContext = fit.reserved.text + deferredMarker + reminderFooter;
   } else {
     // Even the first block alone exceeds (cap − marker): mid-truncate block 0
@@ -861,7 +804,9 @@ export function renderHookDelivery(
     // `reserveSizedHookDelivery` for a non-`turn-interruptible` lifecycle
     // anyway (issue #442, PR #442 round-9 review) — but guard against ever
     // doubling an identical marker regardless.
+    presentedCount = 1;
     const firstEvent = claim.events[0];
+    truncatedEventId = firstEvent?.eventId;
     const firstBlock = firstEvent ? buildEventBlock(firstEvent) : '';
     const soleEventHeader = buildHeader(
       claim.sessionId,
@@ -882,12 +827,17 @@ export function renderHookDelivery(
       ) + reminderFooter;
   }
 
-  return {
+  const output: HookDeliveryOutput = {
     continue: true,
     hookSpecificOutput: {
       hookEventName,
       additionalContext,
     },
+  };
+  return {
+    output,
+    presentedCount,
+    ...(truncatedEventId ? { truncatedEventId } : {}),
   };
 }
 

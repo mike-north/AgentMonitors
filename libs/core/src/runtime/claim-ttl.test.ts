@@ -237,3 +237,73 @@ it('defaults to a 30 minute claim TTL', () => {
     h.runtime.claimDelivery(h.sessionId, 'turn-interruptible'),
   ).not.toBeNull();
 });
+
+it('keeps post deadlines independent of claim expiry and preserves the cursor in a mixed recap', () => {
+  const h = harness();
+  const { eventId: postId } = h.runtime.postMessage({
+    sessionId: h.sessionId,
+    body: 'Follow up on the handoff',
+    requireAck: true,
+    resurfaceAfterMs: TTL * 2,
+    maxResurfaces: 1,
+  });
+  const { eventId: oneOffId } = h.runtime.postMessage({
+    sessionId: h.sessionId,
+    body: 'Handoff started',
+  });
+  expect(
+    h.runtime
+      .claimDelivery(h.sessionId, 'turn-interruptible')
+      ?.events.map((event) => event.eventId),
+  ).toEqual(expect.arrayContaining([h.eventId, postId, oneOffId]));
+
+  vi.setSystemTime(START + 1000);
+  const newer = h.insert('newer');
+  expect(
+    h.runtime
+      .claimDelivery(h.sessionId, 'turn-interruptible')
+      ?.events.map((event) => event.eventId),
+  ).toEqual([newer]);
+  h.runtime.acknowledgeSession(h.sessionId, [newer]);
+
+  vi.setSystemTime(START + TTL);
+  expect(h.store.pendingEventsForSession(h.sessionId).map((e) => e.id)).toEqual(
+    [h.eventId],
+  );
+  expect(
+    h.runtime
+      .listEvents({ sessionId: h.sessionId })
+      .find((e) => e.id === postId),
+  ).toMatchObject({ deliveryState: 'claimed', messageState: 'delivered' });
+
+  vi.setSystemTime(START + TTL * 2);
+  expect(
+    h.runtime
+      .claimDelivery(h.sessionId, 'post-compact')
+      ?.events.map((event) => event.eventId),
+  ).toEqual([postId, h.eventId]);
+  expect(
+    h.store.getSessionObjectCursor(h.sessionId, 'monitor', 'object', h.root)
+      ?.baselineSnapshotId,
+  ).toBe(newer);
+
+  vi.setSystemTime(START + TTL * 4);
+  expect(
+    h.runtime
+      .claimDelivery(h.sessionId, 'post-compact')
+      ?.events.map((event) => event.eventId),
+  ).toEqual([postId, h.eventId]);
+  expect(
+    h.runtime
+      .listEvents({ sessionId: h.sessionId })
+      .find((e) => e.id === postId),
+  ).toMatchObject({
+    deliveryState: 'claimed',
+    messageState: 'needs-attention',
+  });
+
+  vi.setSystemTime(START + TTL * 6);
+  expect(h.store.pendingEventsForSession(h.sessionId).map((e) => e.id)).toEqual(
+    [h.eventId],
+  );
+});
