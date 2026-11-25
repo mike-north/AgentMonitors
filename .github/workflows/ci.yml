@@ -57,6 +57,9 @@ jobs:
       - name: Test (serial daemon-spawn)
         run: pnpm test:serial
 
+      - name: Test (Docker install smoke)
+        run: pnpm test:docker-smoke
+
       - name: Test (build script source coverage)
         run: pnpm test:scripts
 
@@ -68,9 +71,7 @@ jobs:
       # firing, delivered through the real Claude Code hook stdin/stdout
       # contract (docs/specs/006-agent-integration.md §5). Runs per-PR: the
       # measured runtime (~50-70s) is comparable to the standalone-consumer
-      # step above, and to the Docker-backed daemon tests (`*.docker.test.ts`)
-      # that already run inside the generic "Test" step — there is no
-      # separate Docker smoke job in this workflow.
+      # and Docker install smoke steps above.
       - name: Test (E2E fresh-environment install-to-first-signal, hooks path)
         run: pnpm test:e2e-fresh-install-hooks
 

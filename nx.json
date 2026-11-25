@@ -49,7 +49,7 @@
     "test:serial": {
       "dependsOn": ["^build"],
       "cache": true,
-      "inputs": ["default", "^production", "testIsolation", "dockerEnvironment"]
+      "inputs": ["default", "^production", "testIsolation", "testEnvironment"]
     },
     "clean": {
       "cache": false

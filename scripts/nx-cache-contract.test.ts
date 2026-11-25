@@ -152,18 +152,22 @@ describe('test inputs outside the owning project', () => {
       );
     }
   });
-
-  it('the Docker smoke suite hashes the workspace install inputs it copies', () => {
-    expect(plan('@agentmonitors/cli', 'test:serial')).toEqual(
-      expect.arrayContaining([
-        'file:package.json',
-        'file:pnpm-lock.yaml',
-        'file:pnpm-workspace.yaml',
-        'file:apps/website/package.json',
-      ]),
-    );
-  });
 });
+
+it('resolves the live Docker install smoke to cache: false', () => {
+  const project = JSON.parse(
+    execFileSync(
+      'pnpm',
+      ['nx', 'show', 'project', '@agentmonitors/cli', '--json'],
+      {
+        cwd: REPO_ROOT,
+        encoding: 'utf8',
+      },
+    ),
+  ) as { targets: Record<string, { cache?: boolean }> };
+  expect(project.targets['test:docker-smoke']?.cache).toBe(false);
+  expect(project.targets['test:serial']?.cache).toBe(true);
+}, 30_000);
 
 describe('host facilities that change what a suite exercises', () => {
   it.each([
@@ -184,20 +188,21 @@ describe('host facilities that change what a suite exercises', () => {
     );
   });
 
-  it.each([
-    ['@agentmonitors/cli', 'test:serial'],
-    ['@agentmonitors/source-command-poll', 'test'],
-  ])(
-    '%s:%s also hashes Docker reachability (it has a Docker suite)',
-    (p, t) => {
-      expect(plan(p, t)).toEqual(
-        expect.arrayContaining([
-          'file:scripts/test-isolation/config.mjs',
-          DOCKER_ENVIRONMENT,
-        ]),
-      );
-    },
-  );
+  it('serial CLI tests hash the host fingerprint without Docker or install inputs', () => {
+    const serialPlan = plan('@agentmonitors/cli', 'test:serial');
+    expect(serialPlan).toContain(TEST_ENVIRONMENT);
+    expect(serialPlan).not.toContain(DOCKER_ENVIRONMENT);
+    expect(serialPlan).not.toContain('file:pnpm-lock.yaml');
+  });
+
+  it('command-poll tests hash Docker reachability for the watchdog suite', () => {
+    expect(plan('@agentmonitors/source-command-poll', 'test')).toEqual(
+      expect.arrayContaining([
+        'file:scripts/test-isolation/config.mjs',
+        DOCKER_ENVIRONMENT,
+      ]),
+    );
+  });
 });
 
 describe('host fingerprint script', () => {
