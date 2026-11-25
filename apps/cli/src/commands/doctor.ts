@@ -762,19 +762,15 @@ function transportChecks(
       continue;
     }
 
-    // A transport row reports only the problems that transport OWNS. Three
-    // categories are excluded: the unprovable channel-registration caveat and
-    // version-skew (both advisories, never defects — see `transport-health.ts`
-    // for why crying wolf on either would make a working transport read as
-    // broken on every run/upgrade), and pipeline-wide problems like a down
-    // daemon or muted reminders, which the `delivery-verdict` check below
-    // reports once instead of repeating them on every row as if they were
-    // independent failures.
+    // Route defects stay visible in the transport block and JSON health fields.
+    // A usable alternative route makes delivery successful, so an optional
+    // transport must not independently turn that delivery result into a failure.
+    // Pipeline failures belong to the delivery verdict rather than each row.
     const blocking = transport.problems.filter((problem) =>
       disqualifiesFromListening(problem.code),
     );
 
-    if (blocking.length === 0) {
+    if (health.deliverable || blocking.length === 0) {
       checks.push({ name, status: 'pass', detail: summary });
       continue;
     }

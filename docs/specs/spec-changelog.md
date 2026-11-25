@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Doctor delivery checks agree with available routes (005 §15) — Refs #462
+
+Unmatched channel sessions are advisory and cannot establish delivery to an active session.
+Channel coverage gaps are advisory when matching fresh hook evidence covers those sessions.
+Doctor preserves all problem details while keeping transport checks non-failing whenever delivery
+is available. Unrelated failing checks still cause exit 1. Transport unit tests and built-CLI
+scenarios verify health, text/JSON diagnostics, exit status, and the delivery-check invariant.
+The corresponding doctor gap is removed from roadmap G22.
+
 ## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468
 
 Coordination rewrites now retain the complete `claim-ttl-ms` field line, including indentation,
