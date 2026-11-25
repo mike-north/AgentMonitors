@@ -11,6 +11,13 @@ import { once } from 'node:events';
 import { expect, it } from 'vitest';
 import { writeLocalState } from '../local-state.js';
 import type { HeldNotifyWork, MonitorExplainReport } from '@agentmonitors/core';
+import {
+  AgentMonitorRuntime,
+  RuntimeStore,
+  SourceRegistry,
+  createDb,
+  claudeCodeAdapter,
+} from '@agentmonitors/core';
 
 /** The published command bundle, built by Nx before this serial suite runs. */
 const cli = path.resolve(import.meta.dirname, '../../dist/index.cjs');
@@ -132,6 +139,9 @@ Inspect the changed file.
     throw error;
   }
   return {
+    workspace,
+    dir,
+    databasePath: db,
     run,
     until,
     explain: () =>
@@ -155,6 +165,75 @@ Inspect the changed file.
     stop,
   };
 }
+
+it('prints a cancelled hold receipt in both built commands and output formats', async () => {
+  const f = await fixture('debounce');
+  const db = createDb(f.databasePath);
+  try {
+    const store = new RuntimeStore(db);
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'receipt-source',
+      scopeSchema: { type: 'object' },
+      async observe() {
+        return {
+          observations: [{ title: 'Accepted' }, { title: 'Also accepted' }],
+        };
+      },
+    });
+    const runtime = new AgentMonitorRuntime(store, registry);
+    const session = runtime.openSession(
+      claudeCodeAdapter.createSessionInput({
+        hostSessionId: 'receipt-owner',
+        workspacePath: f.workspace,
+      }),
+    );
+    const monitor = runtime.declareEphemeralMonitor({
+      sessionId: session.id,
+      source: 'receipt-source',
+      scope: {},
+      urgency: 'high',
+    });
+    // This runtime admits only the declaration; the daemon owns file observation.
+    const declarationDir = path.join(f.workspace, 'declarations');
+    mkdirSync(declarationDir);
+    await runtime.tick(declarationDir, f.workspace);
+    expect(
+      store.getMonitorState(monitor.id, f.workspace).notifyState.pendingDebounce
+        ?.observations,
+    ).toHaveLength(2);
+    runtime.cancelEphemeralMonitor(session.id, monitor.id);
+    for (const command of [['doctor'], ['monitor', 'explain', monitor.id]]) {
+      const json = f.run(command);
+      const text = f.run(command, 'text');
+      expect(json).toContain('discarded-on-cancel');
+      expect(text).toContain('discarded-on-cancel');
+      expect(text).toContain('2 accepted observation(s)');
+      expect(json + text).not.toContain('no future tick releases this work');
+      expect(json + text).not.toContain(
+        'no future tick will release this work',
+      );
+      const report = JSON.parse(json);
+      if (command[0] === 'doctor') {
+        expect(report.heldNotifyDispositions).toEqual([
+          expect.objectContaining({ monitorId: monitor.id, observations: 2 }),
+        ]);
+        expect(report.heldNotifyWork).toEqual([]);
+      } else {
+        expect(
+          report.stages.find((stage: { id: string }) => stage.id === 'notify')
+            .details,
+        ).toMatchObject({
+          disposition: 'discarded-on-cancel',
+          observations: 2,
+        });
+      }
+    }
+  } finally {
+    db.$client.close();
+    await f.stop();
+  }
+});
 
 for (const strategy of ['debounce', 'rollup'] as const) {
   it(`reports rejected-definition ${strategy} work in explain and doctor, then releases after repair`, async () => {

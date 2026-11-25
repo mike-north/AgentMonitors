@@ -24,6 +24,23 @@ uninterpretable records only after 48 hours measured from file mtime; compatible
 their own lease policy. Newer integer schema markers produce an informational health advisory
 instead of an empty-registry diagnosis. Doctor remains read-only and its exit status is unchanged.
 
+## 2026-11-25 — Serialize ephemeral admission with retirement (002 §6.4 and §10.7) — Refs #667
+
+Notify admission and held-work flushes check the declaration and owner liveness under their
+immediate SQLite writer transaction. Queued evaluations and outstanding observations cannot
+recreate held work after cancellation, session end or inactivity retirement, including across
+separate connections. Explain gives any persisted hold precedence over a historical disposition,
+matching doctor's view of inconsistent state.
+
+## 2026-11-25 — Account for held work at ephemeral retirement (002 §6.4, 005 §6 and doctor) — Refs #667
+
+Cancellation records `discarded-on-cancel`; explicit end and inactivity reap record
+`discarded-on-retirement`. Each scoped receipt replaces accepted holds atomically with
+retirement and retains the count and recording time across database reopen. Doctor lists
+receipts independently of active declarations; monitor explain reports them in notify.
+The legacy `declaration-retired` barrier remains for preexisting inconsistent state.
+Suspension/resume and retention of suspended sessions remain target under #636.
+
 ## 2026-11-25 — Doctor delivery checks agree with available routes (005 §15) — Refs #462
 
 Unmatched channel sessions are advisory and cannot establish delivery to an active session.

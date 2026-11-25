@@ -2480,7 +2480,7 @@ liveness signal.
 - **Host loss without an end.** When the recorded host process is gone and no end was reported, as
   after a crash or a killed host, the session becomes **suspended**. Its ephemeral monitors stop
   observing; they are not reaped. Suspension keeps their durable state: source state, snapshots,
-  per-recipient cursors, delivery rows and held notify work ([§6.4](#64-held-notify-work-when-an-ephemeral-declaration-retires-or-suspends-target)).
+  per-recipient cursors, delivery rows and held notify work ([§6.4](#64-held-notify-work-when-an-ephemeral-declaration-retires-or-suspends-currenttarget)).
 - **Resume.** Opening the session again with the same `(adapter, hostSessionId)`, such as a host
   resume, records the new host process and re-arms its suspended ephemeral monitors. Each source
   resumes from its own durable state, so changes made while suspended are observed on the next
@@ -2501,27 +2501,53 @@ self-termination of [§10.2](#102-daemon-run--continuous-loop--unix-socket-serve
 suspended session is not active: it has no host to deliver to, so it does not keep the daemon
 alive. Its durable state survives the daemon stopping, and a resume re-arms it.
 
-### 6.4 Held notify work when an ephemeral declaration retires or suspends (_target_)
+### 6.4 Held notify work when an ephemeral declaration retires or suspends (_current/target_)
 
-> **Status: target** (Refs #636).
+> **Status: current** for cancellation, explicit end and inactivity retirement (#667).
+> Suspension and retention of suspended sessions remain **target** (#636).
 
 Notify work that the runtime has accepted for an ephemeral monitor, such as a debounce batch or a
 rollup window, **MUST NOT** be held indefinitely or discarded silently when the declaration stops
 being evaluated.
 
-- **Cancellation** (`watch cancel`): the held work is recorded with an explicit terminal
-  disposition, _discarded on cancel_, at the moment of cancellation. The agent asked to stop
+- **Cancellation (current)** (`watch cancel`): the held work is recorded with the terminal
+  disposition `discarded-on-cancel` at the moment of cancellation. The session asked to stop
   watching, so the work is not delivered after the cancel. The disposition is durable and appears in
   `monitor explain` and `doctor`.
-- **Suspension** ([§6.3](#63-session-liveness-by-host-process-and-suspension-target)): the held work
+- **Suspension (target, #636)** ([§6.3](#63-session-liveness-by-host-process-and-suspension-target)): the held work
   is kept with its original acceptance and timing. On resume it is released through the normal
   notify timing. A deadline that passed while suspended releases on the first tick after resume.
-- **Explicit session end, or retention retiring a suspended session**: the held work is recorded
-  with an explicit terminal disposition, _discarded on retirement_, durable and visible in the same
-  way as a cancellation.
+- **Explicit session end and inactivity reap (current)**: `closeSession` and the existing
+  inactivity reap (§6.2) record `discarded-on-retirement`, visible in the same way as cancellation.
+- **Retention retiring a suspended session (target, #636)** records `discarded-on-retirement`.
 - After a cancellation, an explicit end or a retirement, no "held" entry may remain for the retired
   declaration in `doctor` or `monitor explain`. Suspension is not retirement, so its held work stays
   visible as held.
+
+Each scoped disposition contains `monitorId`, `disposition`, `recordedAt` (an ISO timestamp)
+and `observations` (the number of accepted observations discarded, summed across both hold kinds).
+It replaces the held envelopes in `monitor_state.notify_state` in the same SQLite transaction
+as declaration retirement; session end also commits owner dormancy in that transaction. A failed
+write preserves the active declaration and its accepted work. Every stored workspace route is
+accounted for, including routes observed for a global owner. Already materialized events remain.
+Repeated retirement preserves the first receipt. Receipts survive database reopen and are listed
+independently of active declarations; they do not depend on observation-history retention.
+
+Admission re-reads the ephemeral declaration and its declaring session under the immediate SQLite
+writer transaction, before changing notify state, the source checkpoint or observation clock, or
+materializing events. Both records must still be active and belong together. A result returned by
+an outstanding observation, or an evaluation queued from an earlier declaration list, has no
+admission authority after retirement. Held-work flushes use the same check. SQLite serializes these
+checks and writes with retirement even when the poll and retirement use separate connections.
+
+Verified: `libs/core/src/runtime/service.ts` — `discardRetiringNotifyWork`,
+`cancelEphemeralMonitor`, `closeSession`, `reapDormantSessions`, `canAdmitEphemeralWork`,
+`ingest`, `flushHeldNotifyWork`;
+`libs/core/src/runtime/notify-admission-lifetime.test.ts` — both hold kinds across all three
+retirement paths, write-failure rollback, queued evaluations and separate-connection observations,
+writer-lock liveness checks, dormant-owner refusal, no later emission, and database reopen;
+`libs/core/src/runtime/held-notify-report.test.ts` — cancelled receipt diagnosis after reopen
+and interrupted-close atomicity, plus real-hold diagnosis beside an existing receipt.
 
 ## 7. Unread, Claimed, and Acknowledged
 
@@ -3046,17 +3072,17 @@ The next tick still refuses the ambiguity and retains its held work. Other error
 from reading the current definition propagate normally.
 Both report methods expose the first known prerequisite as `releaseBarrier`:
 
-| Value                 | Derivation and remedy                                                                                                                                                                              |
-| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                  |
-| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                  |
-| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                        |
-| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit. |
-| `declaration-retired` | The ephemeral record is absent or reaped; no future tick releases this work and there is no file to edit.                                                                                          |
-| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                            |
-| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                         |
-| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                            |
-| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.               |
+| Value                 | Derivation and remedy                                                                                                                                                                                                                         |
+| --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`                | No known prerequisite blocks this batch; stored pacing, source cadence and execution still apply.                                                                                                                                             |
+| `definition-rejected` | Missing/unreadable/ambiguous persistent definition, invalid persistent scope or schedule, or duplicate ids aborting the tick; fix the definition.                                                                                             |
+| `source-unavailable`  | Registry resolution fails; restore the source registration.                                                                                                                                                                                   |
+| `owner-inactive`      | Owner will be reaped by tick's dormancy predicate, or the active-declaration query excludes its inactive/missing owner; no tick releases this batch under that owner and there is no file to edit.                                            |
+| `declaration-retired` | Legacy or inconsistent state has held envelopes with an absent/reaped declaration. Retirement consumes holds and admission checks declaration/owner liveness under the same SQLite writer lock (§6.4), preventing new holds after retirement. |
+| `workspace-mismatch`  | An active declaration and owner do not belong to the requested workspace/global query; inspect the declaring workspace.                                                                                                                       |
+| `declaration-invalid` | An ephemeral definition cannot rebuild or pass scope/schedule validation; restore a compatible source or declare a replacement, which does not release the original batch.                                                                    |
+| `retained-work`       | The same oldest-retry query tick drains first is nonempty; inspect retry diagnostics and repair terminal retries. A read cannot predict whether a due attempt succeeds.                                                                       |
+| `capture-invalid`     | Tick's captured-envelope validator or effective policy key rejects retained data; restore captured data from a trusted backup, without borrowing the current definition's semantics.                                                          |
 
 `blockedByDefinition` retains its persistent-definition meaning, including an
 unresolved source in a persistent definition. It is false for ephemeral source,
@@ -3064,7 +3090,9 @@ owner and retirement barriers and for retained-work/capture barriers; it does no
 assert eligibility. `none` is a snapshot, not a promise that the next tick emits:
 concurrent edits, cadence, watcher ownership, in-flight admission, transactional
 failures and deliberate artifact filtering still apply. Diagnosis changes neither
-release timing nor retention policy. `held-notify-report.test.ts` exercises both
+release timing nor retention policy. An existing disposition is not proof that no hold remains:
+if both are persisted, `doctor` lists the actual hold and `monitor explain` uses it for the notify
+stage instead of reporting only the receipt. `held-notify-report.test.ts` exercises both
 surfaces, read-only persistence, stale-owner and recent-declaration clocks,
 interrupted-close database reopen, source restoration, and real release/retention
 outcomes (Refs #574).

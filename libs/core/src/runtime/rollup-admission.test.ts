@@ -291,8 +291,11 @@ function beforeAdmission(
     f.store,
     (operation) => {
       const stack = new Error().stack ?? '';
-      const isEditDrain = stack.includes('withStoreWriter');
-      if (firedAt === undefined && isEditDrain === (target === 'edit-drain')) {
+      // Retirement has its own transaction too. Interpose only at the named
+      // admission boundary so the competing commit still tests the flush lock.
+      const targetFrame =
+        target === 'flush' ? 'flushHeldNotifyWork' : 'withStoreWriter';
+      if (firedAt === undefined && stack.includes(targetFrame)) {
         firedAt = stack;
         competingCommit();
       }
