@@ -17,13 +17,10 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { parse } from 'yaml';
 import {
-  API_REPORT_RUN_MANY_SCRIPTS,
   CI_WORKFLOW_PATH,
   REPO_ROOT,
-  ROOT_PACKAGE_JSON_PATH,
   REQUIRED_JOB_ID,
   assertApiReportCheckRuns,
-  assertApiReportRunManyIsSerial,
   assertApiReportScriptConfigSplit,
   hasApiExtractorConfigs,
 } from './api-report-ci-wiring.mjs';
@@ -243,96 +240,6 @@ jobs:
         workflow as Parameters<typeof assertApiReportCheckRuns>[0],
       ),
     ).not.toThrow();
-  });
-});
-
-/** Report regeneration still recompiles, so its fan-out must remain serialized. */
-describe('assertApiReportRunManyIsSerial', () => {
-  it('rejects the pre-fix shape: nx run-many with no --parallel override', () => {
-    expect(() =>
-      assertApiReportRunManyIsSerial({
-        scripts: {
-          'fix:api-report':
-            'NX_TUI=false nx run-many --target=fix:api-report --exclude=agentmonitors-workspace',
-        },
-      }),
-    ).toThrow(/"fix:api-report"/);
-  });
-
-  it('rejects a --parallel value greater than 1 (still races)', () => {
-    expect(() =>
-      assertApiReportRunManyIsSerial({
-        scripts: {
-          'fix:api-report': 'nx run-many --target=fix:api-report --parallel=3',
-        },
-      }),
-    ).toThrow(/"fix:api-report"/);
-  });
-
-  // Regression guard: the pre-fix regex matched a bare `--parallel=1`
-  // ANYWHERE in the script string, so an unrelated command chained into the
-  // same line — one that never even touches `--target=fix:api-report` —
-  // could satisfy the guard while the actual `fix:api-report` invocation
-  // stayed unserialized.
-  it('rejects --parallel=1 on an unrelated chained command, not the guarded invocation', () => {
-    expect(() =>
-      assertApiReportRunManyIsSerial({
-        scripts: {
-          'fix:api-report':
-            'nx run-many --target=fix:api-report --exclude=x && nx run-many --target=irrelevant --parallel=1',
-        },
-      }),
-    ).toThrow(/"fix:api-report"/);
-  });
-
-  it('accepts --parallel=1 on the guarded invocation even alongside an unrelated chained command', () => {
-    expect(() =>
-      assertApiReportRunManyIsSerial({
-        scripts: {
-          'fix:api-report':
-            'nx run-many --target=fix:api-report --parallel=1 && nx run-many --target=irrelevant',
-        },
-      }),
-    ).not.toThrow();
-  });
-
-  it('rejects a script that never invokes --target=<name> at all', () => {
-    expect(() =>
-      assertApiReportRunManyIsSerial({
-        scripts: {
-          'fix:api-report': 'echo "not an nx invocation"',
-        },
-      }),
-    ).toThrow(/"fix:api-report"/);
-  });
-
-  it.each(['--parallel=1', '--parallel 1'])(
-    'accepts %s spelling (positive control)',
-    (flag) => {
-      expect(() =>
-        assertApiReportRunManyIsSerial({
-          scripts: {
-            'fix:api-report': `nx run-many --target=fix:api-report ${flag}`,
-          },
-        }),
-      ).not.toThrow();
-    },
-  );
-
-  // The real proof: the actual, on-disk root package.json.
-  it('accepts the real, on-disk package.json', () => {
-    const pkg: unknown = JSON.parse(
-      readFileSync(ROOT_PACKAGE_JSON_PATH, 'utf8'),
-    );
-    expect(() =>
-      assertApiReportRunManyIsSerial(
-        pkg as Parameters<typeof assertApiReportRunManyIsSerial>[0],
-      ),
-    ).not.toThrow();
-  });
-
-  it('exercises the remaining declaration writer (sanity on the fixture list itself)', () => {
-    expect(API_REPORT_RUN_MANY_SCRIPTS).toEqual(['fix:api-report']);
   });
 });
 

@@ -111,8 +111,8 @@ into `api-report/`, even with `--local`. `check:api-report`/`fix:api-report` use
 `apiReport`-**enabled**, `dtsRollup`-**disabled** config (`api-extractor.report.json`) instead.
 `check:api-report` runs only API Extractor against the existing declarations; Nx orders each check
 after its own `build` and `^build`. Checks may run concurrently because they never write `dist/`.
-`fix:api-report` uses the same report config with `--local`, but still recompiles first and keeps
-its serialized workspace invocation. This split exists because a single
+`fix:api-report` has the same build prerequisites and runs only API Extractor with `--local`
+to update reports. Both Extractor tasks consume build-owned declarations. This split exists because a single
 shared config previously let `build`'s `--local` rollup step (scheduled as a dependency of a sibling
 package's `check:api-report` via `^build`) silently rewrite the checked-in report before the non-local
 validation ever read it (issue #285) — see `api-extractor.build.json`/`api-extractor.report.json` for the
@@ -121,6 +121,8 @@ its own checked-in API report. If you change a package's **public** API surface,
 (`pnpm --filter <package> run fix:api-report`) and commit the diff, or CI's `check:api-report` step
 (non-`--local` — it fails on drift instead of silently fixing it) rejects the PR. Downstream packages
 (`apps/cli`, `plugins/*`) depend on `^build`, so build core first.
+Direct package scripts bypass Nx and require a prior build; root `pnpm fix:api-report` schedules
+the build prerequisites automatically.
 
 ## Architecture
 

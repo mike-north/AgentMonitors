@@ -770,8 +770,9 @@ Docker replay a result recorded without them.
 `{projectRoot}/temp` and depends on both `build` and `^build`. Each package's check runs only
 API Extractor against those declarations, with declaration rollups disabled in the report config;
 it MUST NOT write `dist/`. Build retains declaration rollups and MUST NOT write `api-report/`.
-Report regeneration uses the same report config with `--local`, but still recompiles first and
-keeps its serialized workspace invocation. Cache scope is local (`.nx/cache` per worktree).
+Report regeneration also depends on `build` and `^build` and runs only API Extractor, using
+the same report config with `--local`. It updates checked-in reports without writing `dist/`;
+all declaration emission belongs to the build prerequisites. Cache scope is local (`.nx/cache` per worktree).
 CI does not restore an Nx cache.
 
 A test that reads a file outside its project MUST add that file to its target inputs; the
@@ -792,6 +793,8 @@ and `perl`, `CI`, and unreachable Docker.
 `scripts/api-report-contract.test.ts` checks package commands, resolved Extractor configurations,
 build prerequisites and concurrent workspace entry points. Clean-build, timestamp-preservation
 and deliberate public-export mutation checks validate the corresponding output boundaries.
+`scripts/api-report-regeneration.test.ts` runs workspace regeneration in a private copy of
+the real built packages, checking unchanged report bytes and preserved declaration entry points.
 
 ### 2.15 External-ingress envelope validation
 

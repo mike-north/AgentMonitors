@@ -32,6 +32,9 @@ describe('API report build ownership', () => {
       expect(pkg.scripts['check:api-report']).toBe(
         'api-extractor run --verbose -c api-extractor.report.json',
       );
+      expect(pkg.scripts['fix:api-report']).toBe(
+        'api-extractor run --local -c api-extractor.report.json',
+      );
       const report = reportConfig(dir, 'report');
       expect(report.apiReportEnabled).toBe(true);
       expect(report.rollupEnabled).toBe(false);
@@ -44,11 +47,15 @@ describe('API report build ownership', () => {
     },
   );
 
-  it('orders each check after its own build and upstream builds', () => {
-    expect(
-      readJson('nx.json').targetDefaults['check:api-report'].dependsOn,
-    ).toEqual(['build', '^build']);
-  });
+  it.each(['check:api-report', 'fix:api-report'])(
+    'orders %s after its own build and upstream builds',
+    (target) => {
+      expect(readJson('nx.json').targetDefaults[target].dependsOn).toEqual([
+        'build',
+        '^build',
+      ]);
+    },
+  );
 
   it('allows concurrent report checks in both workspace entry points', () => {
     const scripts = readJson('package.json').scripts;

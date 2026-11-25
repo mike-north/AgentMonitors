@@ -65,7 +65,7 @@
       "outputs": ["{projectRoot}/temp"]
     },
     "fix:api-report": {
-      "dependsOn": ["^build"],
+      "dependsOn": ["build", "^build"],
       "cache": false
     }
   }

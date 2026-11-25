@@ -87,7 +87,9 @@ regenerating its report (`pnpm --filter <package> run fix:api-report`) and commi
 Report checks run only API Extractor after Nx builds the package and its dependencies. The report
 config disables declaration rollups, so concurrent checks consume `dist/` without writing it;
 the build config still emits the published `dist/public.d.ts`. Regeneration uses the same report
-config with `--local` and retains its serialized rebuild step.
+config with `--local`, after the same Nx build prerequisites, and only updates reports.
+Direct package-script invocations bypass Nx and require a prior build; the root
+`pnpm fix:api-report` command schedules those builds automatically.
 
 ## Invariants to respect
 
