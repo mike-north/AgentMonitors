@@ -55,6 +55,49 @@ upgrade from its baseline event and re-read from that event before each comparis
 retained. 002 §7 now states that `firstNotifiedAt` keeps the first claim time;
 a repeat claim updates only the last-claim fields.
 
+## 2026-11-23 — `monitor explain` attributes each history row to its own stage (002 §10.7; 005 §6) — Refs #591
+
+The Observation stage used to read the newest `observation_history` row whatever it recorded. A
+skipped terminal retry, an observation a hold refused, a failed retry attempt and a terminal pause
+all write `errored` rows, so right after one of them explain reported `Source observation failed`
+and put the verdict at Observation, though the source was fine. 005 §6 now lists which rows each
+stage reads. Explain classifies every row once, by kind (source outcome, released work, admission
+loss, skipped-retry loss, retry drain, unrecognized); Observation reads only source outcomes and
+released work, and reports the retained-work pause while the outbox holds work. Losses and drain
+reports stay with Materialization, whose retained-work reasons now end in the oldest retry's last
+error. A genuine source failure fails Observation as before. What history records is unchanged.
+While retained work remains, a source failure recorded by the tick that retained it still fails
+Observation: a held flush retained on a failing source call records the source's row last (002
+§2.6). A retry-drain report is recognized only with a ULID retry id. 005 §6 names the limits of
+reading unmarked rows. A drained tick's `triggered` row that keeps the source's own
+`no-files-matched` or `rebaselined` as `sourceOutcome` is a source outcome, not released work.
+
+## 2026-11-23 — Session lifetime, held work, claim expiry, doctor exit status and confirmed channel commits (target) — Refs #396, #636, #468, #462, #535
+
+Five target decisions for delivery honesty. Current behaviour is unchanged until each one ships;
+roadmap G22 tracks them.
+
+- **002 §6.3, 007 §4.4 (#396).** A session is alive while its host process is alive. Inactivity is
+  no longer a liveness signal, because an agent may wait for a delivery with no hook activity.
+  Liveness checks are process checks that never reach the model. An explicit end reaps ephemeral
+  monitors. Losing the host without an end suspends them, and a resume re-arms them. Retention, not
+  a timer, retires a session that is never resumed. `suspended` is a session status, and a watch
+  of a suspended session reports `suspended`; a suspended session does not keep the daemon alive.
+  §6.2's inactivity trigger is marked for replacement.
+- **002 §6.4 (#636).** Held notify work is never held forever or discarded silently. A cancel or a
+  retirement records a durable, visible terminal disposition. Suspension keeps the work and
+  releases it on resume.
+- **002 §7.1 (#468).** Claim expiry: a claim that is not acknowledged within a configurable claim
+  TTL goes from claimed back to pending, so it is delivered again; it stays unread. Expiry is
+  measured from the durable claim time. In-flight leases are unaffected. Delivery is at-least-once.
+- **005 doctor (#462).** `channel-session-unmatched` becomes advisory, and `channel-lead-uncovered`
+  does not block while the hook path covers that lead. `doctor`'s exit status agrees with the
+  delivery verdict.
+- **006 §4.5.2, §12.6 (#535).** A channel commits a delivery only when the host confirms the push
+  reached the session. For Claude Code the evidence is the `enqueue` entry the host writes to the
+  session transcript. A model-facing check is ruled out, because it costs a model turn. Without
+  evidence the push is released, the route is marked unproven, and the hook path delivers.
+
 ## 2026-11-23 — Drained retries count in the tick's history row (002 §2.7, §15) — Refs #617
 
 A tick whose retry drain completed retained work recorded its events on the tick result but not in
@@ -122,49 +165,6 @@ recomputing it against a cursor already at the endpoint and rendering it with no
 events are rendered and claimed, and the cursor advance, are unchanged. 005 notes that rows
 marked suppressed by older versions after being shown keep counting as `netSuppressed`. Output
 shape is otherwise unchanged. Implementation now matches the described behavior.
-
-## 2026-11-23 — `monitor explain` attributes each history row to its own stage (002 §10.7; 005 §6) — Refs #591
-
-The Observation stage used to read the newest `observation_history` row whatever it recorded. A
-skipped terminal retry, an observation a hold refused, a failed retry attempt and a terminal pause
-all write `errored` rows, so right after one of them explain reported `Source observation failed`
-and put the verdict at Observation, though the source was fine. 005 §6 now lists which rows each
-stage reads. Explain classifies every row once, by kind (source outcome, released work, admission
-loss, skipped-retry loss, retry drain, unrecognized); Observation reads only source outcomes and
-released work, and reports the retained-work pause while the outbox holds work. Losses and drain
-reports stay with Materialization, whose retained-work reasons now end in the oldest retry's last
-error. A genuine source failure fails Observation as before. What history records is unchanged.
-While retained work remains, a source failure recorded by the tick that retained it still fails
-Observation: a held flush retained on a failing source call records the source's row last (002
-§2.6). A retry-drain report is recognized only with a ULID retry id. 005 §6 names the limits of
-reading unmarked rows. A drained tick's `triggered` row that keeps the source's own
-`no-files-matched` or `rebaselined` as `sourceOutcome` is a source outcome, not released work.
-
-## 2026-11-23 — Session lifetime, held work, claim expiry, doctor exit status and confirmed channel commits (target) — Refs #396, #636, #468, #462, #535
-
-Five target decisions for delivery honesty. Current behaviour is unchanged until each one ships;
-roadmap G22 tracks them.
-
-- **002 §6.3, 007 §4.4 (#396).** A session is alive while its host process is alive. Inactivity is
-  no longer a liveness signal, because an agent may wait for a delivery with no hook activity.
-  Liveness checks are process checks that never reach the model. An explicit end reaps ephemeral
-  monitors. Losing the host without an end suspends them, and a resume re-arms them. Retention, not
-  a timer, retires a session that is never resumed. `suspended` is a session status, and a watch
-  of a suspended session reports `suspended`; a suspended session does not keep the daemon alive.
-  §6.2's inactivity trigger is marked for replacement.
-- **002 §6.4 (#636).** Held notify work is never held forever or discarded silently. A cancel or a
-  retirement records a durable, visible terminal disposition. Suspension keeps the work and
-  releases it on resume.
-- **002 §7.1 (#468).** Claim expiry: a claim that is not acknowledged within a configurable claim
-  TTL goes from claimed back to pending, so it is delivered again; it stays unread. Expiry is
-  measured from the durable claim time. In-flight leases are unaffected. Delivery is at-least-once.
-- **005 doctor (#462).** `channel-session-unmatched` becomes advisory, and `channel-lead-uncovered`
-  does not block while the hook path covers that lead. `doctor`'s exit status agrees with the
-  delivery verdict.
-- **006 §4.5.2, §12.6 (#535).** A channel commits a delivery only when the host confirms the push
-  reached the session. For Claude Code the evidence is the `enqueue` entry the host writes to the
-  session transcript. A model-facing check is ruled out, because it costs a model turn. Without
-  evidence the push is released, the route is marked unproven, and the hook path delivers.
 
 ## 2026-11-16 — External envelope admission preserves safe state and RFC 3339 syntax (002 §2.6, §16.1)
 
@@ -1092,6 +1092,21 @@ SQL comments, and the refusal message says that SQLite cannot drop a column or t
 must be rebuilt by hand or the database restored. A carried default that ends in a line comment is
 written back with a newline before its closing parenthesis. 002 §5.2 lists what is preserved, lost and refused.
 
+## 2026-11-11 — An unserializable observation is refused at hold acceptance (002 §4.3/§4.4/§4.7, §`observation_history`, 004 §3.3) — Refs #570
+
+Before this change, a debounce or rollup hold whose observation could not be encoded as JSON (a
+BigInt or a cyclic payload) failed every notify-state write for its monitor. The source baseline
+never advanced, the same batch was re-observed on every tick, and the observation's batch siblings
+were never held. The only trace was a raw serializer error repeated each tick.
+
+Add 002 §4.7. Serializability is checked once per observation, where it would join
+`pendingDebounce` or `pendingRollup`, using the hold's own serializer. A refused observation is not
+held. It gets one `errored` `observation_history` row naming the observation, the strategy and the
+reason, reported on the tick result's `erroredObservations` or the watcher's `onError`. Its siblings
+are held in order, and the baseline advances. The span's batch row counts refusals as `notHeld` and
+is omitted when every observation was refused. Observations that bypass a hold are outside this
+rule and keep the materialization contract (§5). Round-tripping such payloads remains out of scope.
+
 ## 2026-11-12 — Notify-policy admission gates whole watch batches; edit drains record no drops (002 §2.3/§2.4/§4.6, 004 §2.5) — Refs #497, #537
 
 Reconcile effective notify-policy edits with explicit watch batches and span admission outcomes.
@@ -1108,21 +1123,6 @@ not held work and stays outstanding across an edit unless a drained event supers
 A retained poll result is later admitted against the source baseline it was observed from.
 004 restates the #537 watcher scenarios for batches and requires the edit/admission-outcome
 interaction tests.
-
-## 2026-11-11 — An unserializable observation is refused at hold acceptance (002 §4.3/§4.4/§4.7, §`observation_history`, 004 §3.3) — Refs #570
-
-Before this change, a debounce or rollup hold whose observation could not be encoded as JSON (a
-BigInt or a cyclic payload) failed every notify-state write for its monitor. The source baseline
-never advanced, the same batch was re-observed on every tick, and the observation's batch siblings
-were never held. The only trace was a raw serializer error repeated each tick.
-
-Add 002 §4.7. Serializability is checked once per observation, where it would join
-`pendingDebounce` or `pendingRollup`, using the hold's own serializer. A refused observation is not
-held. It gets one `errored` `observation_history` row naming the observation, the strategy and the
-reason, reported on the tick result's `erroredObservations` or the watcher's `onError`. Its siblings
-are held in order, and the baseline advances. The span's batch row counts refusals as `notHeld` and
-is omitted when every observation was refused. Observations that bypass a hold are outside this
-rule and keep the materialization contract (§5). Round-tripping such payloads remains out of scope.
 
 ## 2026-11-11 — Identity-verified live cleanup signals (008 §3.1, §5, §6.1; 003 §11.2; 004 §3.2, §3.5) — Refs #479
 
@@ -1239,16 +1239,6 @@ row or column (a generated column; `NULL` in a required column) reports a `Schem
 naming the table and column, and the database is left unchanged. 004 adds a released-layout
 suite that opens each layout released versions produced.
 
-## 2026-11-11 — Source-config rejection closes admission only for held work (002 §2.0/§4.6, 004 §2.5) — Refs #537
-
-Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
-rejection closes the scope's admission gate only when it has durable holds or a retained poll
-result, so a running watcher cannot commit beside that work under the rejected definition. Without
-held work, the rejection never closes admission by itself, so a watcher with open admission keeps
-its startup config, while one already blocked stays blocked until valid reconciliation (002 §4.6).
-Require tick and rescan
-proofs of both cases.
-
 ## 2026-11-10 — Record native rollback in the locked rollup flush (002 §2, §10.7; 004 §3.4) — Refs #498
 
 With the locked not-due rollup flush composed onto the native-rollback guard, a transaction-wide
@@ -1326,6 +1316,16 @@ A transaction-wide `RAISE(ROLLBACK)` differs: the whole span rolls back, prefix 
 is queued, the source baseline does not advance, and the single `errored` row comes from `tick()`'s
 ingest-error catch (or `consumeWatch()`'s outer catch, which also ends the watcher).
 
+## 2026-11-11 — Source-config rejection closes admission only for held work (002 §2.0/§4.6, 004 §2.5) — Refs #537
+
+Reconcile the source-config preflight with held-work admission. A tick or watcher-startup
+rejection closes the scope's admission gate only when it has durable holds or a retained poll
+result, so a running watcher cannot commit beside that work under the rejected definition. Without
+held work, the rejection never closes admission by itself, so a watcher with open admission keeps
+its startup config, while one already blocked stays blocked until valid reconciliation (002 §4.6).
+Require tick and rescan
+proofs of both cases.
+
 ## 2026-11-10 — Doctor does not invent an outbox for unattributed monitor rows; scoped remediation (004, 005) — Refs #496
 
 Doctor attributes each retry outbox once. A monitor row whose id has an orphan group claims no
@@ -1334,6 +1334,107 @@ other row without a summary, including a duplicated id with no retained work and
 older daemon report that carries no orphan groups, gets the empty summary (`0/0`). Retained-work remediation names
 `monitor explain` with `--workspace`/`--dir` when doctor was given non-default values. 004 now
 describes the retry CLI suite as running the shared Nx-built bundle, not an owned package layout.
+
+## 2026-11-06 — Preserve opaque source baselines during notify edits (002 §3/§4.6, 004 §2.5) — Refs #537
+
+Clarify the existing source-state ownership rule for guard-only resets and held drains: effective
+policy adoption updates notify metadata and materialization artifacts without reserializing raw
+source state, clearing fingerprints or changing observation clocks. Require tick/startup and
+full-reopen proofs of the next actual source's previousState, clock-only scheduling in fixtures,
+real notify-write rollback and a narrow broad-setter reversion. Ordinary ingestion/checkpoint
+semantics and ordinary flush recovery remain separate.
+
+## 2026-11-06 — Learn legacy identity and reconcile factory-less owned scopes (002 §4.6, 004 §2.5) — Refs #537
+
+A successful unchanged scan learns missing private identity on an existing row without retiring
+its guards or changing source baselines. Later known edits can reset retired guards across restart;
+no pre-first-scan history is inferred. Failed validation/write does not learn identity.
+Factory capability does not exempt existing watcher/poll ownership from startup reconciliation.
+Current invalid scope or failed drain blocks live writes; unowned observe-only state remains ordinary
+polling work. Require actual public SQLite/reopen proofs and independent narrow reversions.
+
+## 2026-11-06 — Retain current location through blocked admission (002 §4.6, 004 §2.5) — Refs #537
+
+Separate current location provenance from gate permission within the existing counted owner.
+A closed gate cannot forget the admitted/blocked location and authorize unchanged fallback on a
+later scan. Revalidate current files until valid recovery or proven absence, including locations
+that never reconciled successfully. Keep only one pathname, no instructions/history, and retire
+it with the last live lease. Require repeated public tick/startup/captured-route permission proofs,
+fresh edits, genuine moveback, owner retirement/recreation and a narrow loss-of-provenance reversion.
+
+## 2026-11-06 — Proven absence before location fallback (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify that boolean nonexistence is not proof of deletion: access or I/O failures can produce the
+same result. Only metadata ENOENT/ENOTDIR permits replacing an admitted location with a valid
+earlier location. Other failures preserve the original read diagnostic, held work and blocked
+admission without starving siblings. Require actual POSIX permission/checkpoint/yield/reopen proof,
+faithful filesystem fault controls, genuine moveback controls and narrow classification reversion.
+
+## 2026-11-06 — Live held membership and same-ID location authority (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify that holds may first appear while earlier discovery work awaits: unknown-source admission
+closes immediately and classifies current workspace-scoped holds, preserving scoped failures with
+holds and existing fatal behavior without them. A filename is not monitor identity. Revalidate a
+live owner's current same-ID/workspace replacement before an obsolete discovered/captured path can
+close its gate. Validate current file/source/scope, retain fatal duplicates, and add no path history
+or execution reload. Require actual checkpoint/yield/recovery/reopen and relocation controls across
+public tick/startup, plus independent narrow reversions.
+
+## 2026-11-06 — Fresh authored admission and balanced deferred handoffs (002 §4.6, 004 §2.5) — Refs #537
+
+Directory discovery can outlive the definition it read while another monitor awaits. Clarify the
+synchronous per-file revalidation boundary immediately before reconciliation, including stale
+missing/invalid diagnostics; no generation history or live source restart is introduced. Deferred
+handoff releases its retained cache lease even when argument access fails before ingestion. Its
+error describes the already committed drain rather than claiming old holds remain. Require actual
+public tick/startup overlap, SQLite faults/reopen, live-owner controls and independent repair reversions.
+
+## 2026-11-06 — Late poll errors preserve successor admissions (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify source exclusion after a poll relinquishes its synchronous admission: its later asynchronous
+ingestion error reporting cannot remove a successor's slot or wake work through it. Require public
+overlapping ticks, a real SQLite fault, ordered durable reopen and watcher/checkpoint/scope controls.
+This does not add ordinary ingestion rollback or a durable recovery queue.
+
+## 2026-11-05 — Close checkpoint admission before scope retirement (002 §2.4, 004 §2.5) — Refs #537
+
+Clarify the existing G14/notify-boundary guarantee across natural completion and iterator error.
+Close admission immediately, retaining the monitor/workspace exclusion and cache lease until
+accepted pre-close writes settle. A recovery rescan opens their gate without letting polling or
+replacement sources overtake them; actual writes also recheck token/cancellation. Replace the
+obsolete delete-before-drain/stable-reference description. Require source/SQLite/reopen evidence
+that cursor 111 precedes a later source baseline 999, plus cancellation and scoped successor controls.
+
+## 2026-11-05 — Poll admission and live policy ownership (002 §4.6, 004 §2.5) — Refs #537
+
+Extend the existing #556 admission rule explicitly across asynchronous polling and source creation.
+A blocked returned poll result retains its original source cursor and handling, finishes the tick
+without deadlocking recovery scans, and is admitted under current pacing before later source work.
+Factory creation rechecks cancellation/current admission and pins the latest initial snapshot.
+Process-local policy caches belong to live work and retire with completion/teardown or ephemeral
+lifetime; they do not retain retired instruction history or delete durable holds. Require actual
+public-tick/source/SQLite interleavings and bounded lifecycle controls. No durable ordinary recovery
+queue or new source outcome is introduced.
+
+## 2026-11-05 — Notify admission and startup publication boundaries (002 §4.6, 004 §2.5) — Refs #537
+
+Clarify the existing #556 rule at asynchronous watcher admission: immediate/throttle escalation
+participates in effective policy identity without resetting unchanged prior private-key clocks;
+a previously captured gate cannot authorize a mutation
+after reconciliation blocks it. Deterministic span writes precede async Interpret, and committed
+startup projections refresh hook files even without a later yield/tick. Require actual watcher-chain
+microtask, SQLite failure and hook-file regressions with positive controls. Ordinary flush recovery
+and source execution/handling reload remain outside this rule.
+
+## 2026-11-05 — Effective notify edits drain captured holds (002 §4.6, 004 §2.5) — Refs #537
+
+Record decision #556: a changed effective notify policy flushes accepted old work before new
+source observation, even before a debounce deadline or rollup window. Preserve captured semantics;
+unchanged pacing and body-only edits keep normal clocks. The whole edit drain rereads under an
+owned writer transaction and commits materialization with hold removal; failure retains all state
+and backpressures only that monitor. Specify restart, missing-definition diagnostics, independent
+writer exclusion, real SQLite faults and actual bounded-child kill acceptance. Ordinary flush
+recovery remains separate.
 
 ## 2026-11-10 — Pending events keep the semantics they were observed under (002 §5.3, 004 §2.5) — Refs #451
 
@@ -1406,6 +1507,96 @@ reproduces the package-entry module-load failure, and an exact-restored cold pas
 still requires a prior build; no build moves into tests. Production/test source, module resolution,
 public API, preflight behavior and the accepted #561/#562 boundaries remain unchanged.
 
+## 2026-11-05 — Isolate source validator exceptions (002 §2.0, 004 §2.2/§2.5) — Refs #554
+
+Validate plugin-owned schemas on a private copy so frozen valid schemas remain
+usable and validation cannot annotate the registered schema. Convert schema
+setup/evaluation exceptions into explicit per-monitor rejection diagnostics through
+the existing validation channels; never treat an exception as valid config or
+abort healthy siblings, tick cleanup, or hook refresh. Tests-first real-source and
+SQLite regressions cover malformed patterns, frozen schemas, ordinary controls,
+retained baseline/cursor/held notify state, and recovery after correction. Existing
+source-schema format, result types, cadence sizing and accepted #561/#562 deferral
+remain unchanged; no ownership/lifetime repair is implemented here.
+
+## 2026-11-05 — Preserve safely derivable cleanup cadence (002 §2.0, 004 §2.5) — Refs #554, #561
+
+Correct the whole-source-scope guard introduced by the early reaper fix: rejecting
+unrelated source config must not shorten valid runtime cadence protection. Derive
+only poll timing, catching duration parse failure narrowly, and preserve authored
+intervals and known defaults with existing settle/margin sizing. Missing definition
+or unparseable cadence retains the five-minute fallback. Real-source/SQLite tests
+reproduce the parent-head 665000ms-to-5m shortening and actual later-claim leak,
+then verify repair within the restored window, legitimate work and workspace
+isolation. The known finite-lifetime/held-only ownership gap is assigned to #562 by
+Mike's accepted #561 decision, which permits #557 after the introduced regression and
+truthful documentation are corrected. Separate M1 repair #562 follows #305/#537/#554:
+durable exact ownership without TTL and explicit retirement, with source contracts
+unchanged. Annotate current cleanup claims in 002/004/005 with the precise delayed
+recovery and held-only discovery gap; preserve the intended goal and historical records.
+#557 does not wait for that general repair.
+
+## 2026-11-05 — Validate early reaper cadence lookup (002 §2.0, 004 §2.5) — Refs #554
+
+Dormant verify-session cleanup precedes observation preflight. Validate the source
+scope before deriving a suppression lifetime from cadence; invalid or unavailable
+config uses the existing five-minute fallback. Preserve valid interval + settle +
+margin sizing and missing-definition behavior. Real-source regression reproduces
+the malformed-duration throw before cleanup, then proves scratch retraction and
+suppression, honest config skip, healthy sibling progress, and unchanged baseline
+and held legitimate work. No new TTL policy or broad scheduler exception handling. The initial whole-scope
+condition is superseded by the safely derivable cadence correction above.
+
+## 2026-11-05 — Doctor preserves rejected-config diagnostics (002 §2.0, 004 §2.5) — Refs #554
+
+Doctor must not schedule a scope already rejected by `validateWatchScope`. A malformed
+file-fingerprint interval previously threw from scheduling and aborted the report.
+Return the shared validation error, no due time, and healthy sibling results without
+mutating durable state. Add real bundled-source and built-CLI red-to-green regressions.
+Correct the core Changeset to minor under the established pre-1.0 incompatible-change
+policy; the skipped-result union and documented consumer migration remain unchanged.
+
+## 2026-11-05 — Source-config execution preflight (002 §2.0/§2.5, 004 §2.2/§2.5) — Refs #554
+
+Apply Mike's 2026-11-05 decision: schema-invalid configs stop observing, including
+existing configs previously allowed to run. Use the accepted `validateWatchScope`
+helper before tick scheduling/notify processing and continuous watcher startup.
+Report skips visibly with the same diagnostics as validate/explain/doctor; retain
+baseline and pending notify state across restart so a corrected config resumes.
+Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
+and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
+
+## 2026-11-01 — Lock the complete rollup decision and admission (002 §4.4; 004 §3.4) — Refs #498
+
+Require not-due rollup checks to read their authoritative batch, marker, source checkpoint and
+observation time after obtaining the writer lock. Preserve fresh source/time state while committing
+successful event prefix, retained suffix, batch clear and marker together. Empty windows persist a
+marker without delivery/audit spam; non-emitting write failures roll back and remain monitor-local.
+Controlled competing runtimes cover not-due/due/watch entrypoints; independent readers verify suffix
+visibility before Interpret, rollback and restart. No public API changes or retry drain are introduced.
+
+## 2026-11-01 — Watch batches bind observations to source checkpoints (002 §2.4; 003 §2; 004 §3.4) — Refs #497, #294, #295
+
+Record the user's accepted explicit-batch decision and its rationale: an independent opaque
+checkpoint can skip not-yet-yielded work, and staging it until one later yield cannot recover the
+covered span. Change watch to yield ObservationResult, remove context.checkpoint, reject legacy bare
+observations, and atomically admit each complete batch before Interpret or the next pull. Empty
+batches are valid; omitted/undefined state preserves and null retains the existing reset-to-{} behavior.
+Whole admission failure stops the iterator with the old baseline and prior committed cache intact.
+Read source/notify state and decide dispatch under the admission write lock; refuse batches whose
+pre-acquisition source token no longer matches, preserving competing writers' checkpoints and held
+work. Document breaking third-party migration, runtime-local ownership, source replay responsibility
+and remaining retry-drain/crash-proof work. File-fingerprint's target watch design adopts the same contract.
+
+## 2026-11-01 — Complete poll admission before interpretation (002 §2; 004 §3.4) — Refs #497, #294, #295
+
+Require the entire finite poll span, successful event prefix, ordered retry suffix and source/notify
+state to commit before the first optional Interpret invocation. Independent-connection barrier tests
+cover multiple recipients, repeated object transitions and empty snapshots. Outer rollback restores
+the last committed recipient cache as well as database rows; held notify work survives failed
+admission and reopens for replay. Transaction composition stays package-private, preserving the
+concrete retry-completion API. The separate watch checkpoint contract is unchanged.
+
 ## 2026-11-07 — Build incoming-changes before its compiled tests (004 §2.9) — Refs #560
 
 The incoming-changes Nx test target requires both dependency builds and its own build because
@@ -1415,66 +1606,27 @@ failures while the 52 controls pass. Direct vitest still consumes prebuilt outpu
 moves into test code. Source behavior, public API, feature tests and global Nx defaults remain
 unchanged.
 
-## 2026-11-06 — Preserve opaque source baselines during notify edits (002 §3/§4.6, 004 §2.5) — Refs #537
+## 2026-11-05 — Verify resolved Git objects without rewriting authored revisions (003–004) — Refs #305
 
-Clarify the existing source-state ownership rule for guard-only resets and held drains: effective
-policy adoption updates notify metadata and materialization artifacts without reserializing raw
-source state, clearing fingerprints or changing observation clocks. Require tick/startup and
-full-reopen proofs of the next actual source's previousState, clock-only scheduling in fixtures,
-real notify-write rollback and a narrow broad-setter reversion. Ordinary ingestion/checkpoint
-semantics and ordinary flush recovery remain separate.
+Resolve an authored incoming-changes revision unchanged to one complete SHA-1/SHA-256 object ID,
+then separately peel that ID to a commit. Suffixing arbitrary input can turn a commit-type check
+into a blob filename or alter a commit-message search regex. Both hash formats now require real
+source/built-source/CLI regressions for suffix-named blob paths and valid commit-search expressions,
+with ordinary commit/tag/extended-expression controls. The accepted #555 ordinary error diagnostic,
+baseline/state/history contracts, quiet recovery and public API remain unchanged.
 
-## 2026-11-06 — Learn legacy identity and reconcile factory-less owned scopes (002 §4.6, 004 §2.5) — Refs #537
+## 2026-11-05 — Truthful incoming-changes failures (002–005) — Refs #305
 
-A successful unchanged scan learns missing private identity on an existing row without retiring
-its guards or changing source baselines. Later known edits can reset retired guards across restart;
-no pre-first-scan history is inferred. Failed validation/write does not learn identity.
-Factory capability does not exempt existing watcher/poll ownership from startup reconciliation.
-Current invalid scope or failed drain blocks live writes; unowned observe-only state remains ordinary
-polling work. Require actual public SQLite/reopen proofs and independent narrow reversions.
-
-## 2026-11-06 — Retain current location through blocked admission (002 §4.6, 004 §2.5) — Refs #537
-
-Separate current location provenance from gate permission within the existing counted owner.
-A closed gate cannot forget the admitted/blocked location and authorize unchanged fallback on a
-later scan. Revalidate current files until valid recovery or proven absence, including locations
-that never reconciled successfully. Keep only one pathname, no instructions/history, and retire
-it with the last live lease. Require repeated public tick/startup/captured-route permission proofs,
-fresh edits, genuine moveback, owner retirement/recreation and a narrow loss-of-provenance reversion.
-
-## 2026-11-06 — Proven absence before location fallback (002 §4.6, 004 §2.5) — Refs #537
-
-Clarify that boolean nonexistence is not proof of deletion: access or I/O failures can produce the
-same result. Only metadata ENOENT/ENOTDIR permits replacing an admitted location with a valid
-earlier location. Other failures preserve the original read diagnostic, held work and blocked
-admission without starving siblings. Require actual POSIX permission/checkpoint/yield/reopen proof,
-faithful filesystem fault controls, genuine moveback controls and narrow classification reversion.
-
-## 2026-11-06 — Live held membership and same-ID location authority (002 §4.6, 004 §2.5) — Refs #537
-
-Clarify that holds may first appear while earlier discovery work awaits: unknown-source admission
-closes immediately and classifies current workspace-scoped holds, preserving scoped failures with
-holds and existing fatal behavior without them. A filename is not monitor identity. Revalidate a
-live owner's current same-ID/workspace replacement before an obsolete discovered/captured path can
-close its gate. Validate current file/source/scope, retain fatal duplicates, and add no path history
-or execution reload. Require actual checkpoint/yield/recovery/reopen and relocation controls across
-public tick/startup, plus independent narrow reversions.
-
-## 2026-11-06 — Fresh authored admission and balanced deferred handoffs (002 §4.6, 004 §2.5) — Refs #537
-
-Directory discovery can outlive the definition it read while another monitor awaits. Clarify the
-synchronous per-file revalidation boundary immediately before reconciliation, including stale
-missing/invalid diagnostics; no generation history or live source restart is introduced. Deferred
-handoff releases its retained cache lease even when argument access fails before ingestion. Its
-error describes the already committed drain rather than claiming old holds remain. Require actual
-public tick/startup overlap, SQLite faults/reopen, live-owner controls and independent repair reversions.
-
-## 2026-11-06 — Late poll errors preserve successor admissions (002 §4.6, 004 §2.5) — Refs #537
-
-Clarify source exclusion after a poll relinquishes its synchronous admission: its later asynchronous
-ingestion error reporting cannot remove a successor's slot or wake work through it. Require public
-overlapping ticks, a real SQLite fault, ordered durable reopen and watcher/checkpoint/scope controls.
-This does not add ordinary ingestion rollback or a durable recovery queue.
+Adopt [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474):
+replace 003 §6.5's silent unavailable result with the existing recoverable source-error contract.
+Verify commit-ish refs, capture Git stderr, retain the last-good SHA and notify state, and preserve
+quiet missing-old-SHA rebaseline/per-file snapshot omission. Require non-nullish state before a
+CLI initial baseline; retain no-files-matched precedence and source-owned primitive states.
+History text and explain now include the existing error payload using bounded, terminal-safe
+single-line display; stored/structured audit data stays intact. No public outcome, schema or
+migration is added. Required tests cover real Git/CLI, SQLite reopen and socket/offline diagnosis.
+Existing error retry cadence and held-notify deferral remain unchanged; #558 and #559 track those
+separately rather than silently broadening this repair.
 
 ## 2026-11-06 — Bound script scheduling and fixture startup (004 §2.10) — Refs #458
 
@@ -1552,127 +1704,6 @@ CLI package suite. Do not start detached production observations in the facility
 Outermost error-free helper completion confirms terminal state of its known owned group,
 including Linux zombies, within its existing bound. A signal request alone is insufficient.
 No production source owner-death behavior, API, dependency, deadline, or aggregate changed.
-
-## 2026-11-05 — Close checkpoint admission before scope retirement (002 §2.4, 004 §2.5) — Refs #537
-
-Clarify the existing G14/notify-boundary guarantee across natural completion and iterator error.
-Close admission immediately, retaining the monitor/workspace exclusion and cache lease until
-accepted pre-close writes settle. A recovery rescan opens their gate without letting polling or
-replacement sources overtake them; actual writes also recheck token/cancellation. Replace the
-obsolete delete-before-drain/stable-reference description. Require source/SQLite/reopen evidence
-that cursor 111 precedes a later source baseline 999, plus cancellation and scoped successor controls.
-
-## 2026-11-05 — Poll admission and live policy ownership (002 §4.6, 004 §2.5) — Refs #537
-
-Extend the existing #556 admission rule explicitly across asynchronous polling and source creation.
-A blocked returned poll result retains its original source cursor and handling, finishes the tick
-without deadlocking recovery scans, and is admitted under current pacing before later source work.
-Factory creation rechecks cancellation/current admission and pins the latest initial snapshot.
-Process-local policy caches belong to live work and retire with completion/teardown or ephemeral
-lifetime; they do not retain retired instruction history or delete durable holds. Require actual
-public-tick/source/SQLite interleavings and bounded lifecycle controls. No durable ordinary recovery
-queue or new source outcome is introduced.
-
-## 2026-11-05 — Notify admission and startup publication boundaries (002 §4.6, 004 §2.5) — Refs #537
-
-Clarify the existing #556 rule at asynchronous watcher admission: immediate/throttle escalation
-participates in effective policy identity without resetting unchanged prior private-key clocks;
-a previously captured gate cannot authorize a mutation
-after reconciliation blocks it. Deterministic span writes precede async Interpret, and committed
-startup projections refresh hook files even without a later yield/tick. Require actual watcher-chain
-microtask, SQLite failure and hook-file regressions with positive controls. Ordinary flush recovery
-and source execution/handling reload remain outside this rule.
-
-## 2026-11-05 — Effective notify edits drain captured holds (002 §4.6, 004 §2.5) — Refs #537
-
-Record decision #556: a changed effective notify policy flushes accepted old work before new
-source observation, even before a debounce deadline or rollup window. Preserve captured semantics;
-unchanged pacing and body-only edits keep normal clocks. The whole edit drain rereads under an
-owned writer transaction and commits materialization with hold removal; failure retains all state
-and backpressures only that monitor. Specify restart, missing-definition diagnostics, independent
-writer exclusion, real SQLite faults and actual bounded-child kill acceptance. Ordinary flush
-recovery remains separate.
-
-## 2026-11-05 — Isolate source validator exceptions (002 §2.0, 004 §2.2/§2.5) — Refs #554
-
-Validate plugin-owned schemas on a private copy so frozen valid schemas remain
-usable and validation cannot annotate the registered schema. Convert schema
-setup/evaluation exceptions into explicit per-monitor rejection diagnostics through
-the existing validation channels; never treat an exception as valid config or
-abort healthy siblings, tick cleanup, or hook refresh. Tests-first real-source and
-SQLite regressions cover malformed patterns, frozen schemas, ordinary controls,
-retained baseline/cursor/held notify state, and recovery after correction. Existing
-source-schema format, result types, cadence sizing and accepted #561/#562 deferral
-remain unchanged; no ownership/lifetime repair is implemented here.
-
-## 2026-11-05 — Preserve safely derivable cleanup cadence (002 §2.0, 004 §2.5) — Refs #554, #561
-
-Correct the whole-source-scope guard introduced by the early reaper fix: rejecting
-unrelated source config must not shorten valid runtime cadence protection. Derive
-only poll timing, catching duration parse failure narrowly, and preserve authored
-intervals and known defaults with existing settle/margin sizing. Missing definition
-or unparseable cadence retains the five-minute fallback. Real-source/SQLite tests
-reproduce the parent-head 665000ms-to-5m shortening and actual later-claim leak,
-then verify repair within the restored window, legitimate work and workspace
-isolation. The known finite-lifetime/held-only ownership gap is assigned to #562 by
-Mike's accepted #561 decision, which permits #557 after the introduced regression and
-truthful documentation are corrected. Separate M1 repair #562 follows #305/#537/#554:
-durable exact ownership without TTL and explicit retirement, with source contracts
-unchanged. Annotate current cleanup claims in 002/004/005 with the precise delayed
-recovery and held-only discovery gap; preserve the intended goal and historical records.
-#557 does not wait for that general repair.
-
-## 2026-11-05 — Validate early reaper cadence lookup (002 §2.0, 004 §2.5) — Refs #554
-
-Dormant verify-session cleanup precedes observation preflight. Validate the source
-scope before deriving a suppression lifetime from cadence; invalid or unavailable
-config uses the existing five-minute fallback. Preserve valid interval + settle +
-margin sizing and missing-definition behavior. Real-source regression reproduces
-the malformed-duration throw before cleanup, then proves scratch retraction and
-suppression, honest config skip, healthy sibling progress, and unchanged baseline
-and held legitimate work. No new TTL policy or broad scheduler exception handling. The initial whole-scope
-condition is superseded by the safely derivable cadence correction above.
-
-## 2026-11-05 — Doctor preserves rejected-config diagnostics (002 §2.0, 004 §2.5) — Refs #554
-
-Doctor must not schedule a scope already rejected by `validateWatchScope`. A malformed
-file-fingerprint interval previously threw from scheduling and aborted the report.
-Return the shared validation error, no due time, and healthy sibling results without
-mutating durable state. Add real bundled-source and built-CLI red-to-green regressions.
-Correct the core Changeset to minor under the established pre-1.0 incompatible-change
-policy; the skipped-result union and documented consumer migration remain unchanged.
-
-## 2026-11-05 — Source-config execution preflight (002 §2.0/§2.5, 004 §2.2/§2.5) — Refs #554
-
-Apply Mike's 2026-11-05 decision: schema-invalid configs stop observing, including
-existing configs previously allowed to run. Use the accepted `validateWatchScope`
-helper before tick scheduling/notify processing and continuous watcher startup.
-Report skips visibly with the same diagnostics as validate/explain/doctor; retain
-baseline and pending notify state across restart so a corrected config resumes.
-Cover source effects, sibling progress, directory/ephemeral ticks, watcher startup,
-and built CLI diagnostic parity. Correct 004 §5.1's stale partial-validation claim.
-
-## 2026-11-05 — Verify resolved Git objects without rewriting authored revisions (003–004) — Refs #305
-
-Resolve an authored incoming-changes revision unchanged to one complete SHA-1/SHA-256 object ID,
-then separately peel that ID to a commit. Suffixing arbitrary input can turn a commit-type check
-into a blob filename or alter a commit-message search regex. Both hash formats now require real
-source/built-source/CLI regressions for suffix-named blob paths and valid commit-search expressions,
-with ordinary commit/tag/extended-expression controls. The accepted #555 ordinary error diagnostic,
-baseline/state/history contracts, quiet recovery and public API remain unchanged.
-
-## 2026-11-05 — Truthful incoming-changes failures (002–005) — Refs #305
-
-Adopt [decision #555](https://github.com/mike-north/AgentMonitors/issues/555#issuecomment-6665229474):
-replace 003 §6.5's silent unavailable result with the existing recoverable source-error contract.
-Verify commit-ish refs, capture Git stderr, retain the last-good SHA and notify state, and preserve
-quiet missing-old-SHA rebaseline/per-file snapshot omission. Require non-nullish state before a
-CLI initial baseline; retain no-files-matched precedence and source-owned primitive states.
-History text and explain now include the existing error payload using bounded, terminal-safe
-single-line display; stored/structured audit data stays intact. No public outcome, schema or
-migration is added. Required tests cover real Git/CLI, SQLite reopen and socket/offline diagnosis.
-Existing error retry cadence and held-notify deferral remain unchanged; #558 and #559 track those
-separately rather than silently broadening this repair.
 
 ## 2026-11-05 — Explicit local gate scheduling, facilities, and audit boundaries (004 §2.10) — Refs #458
 
@@ -1866,37 +1897,6 @@ disabled; a script test guards the configuration. Product observation-boundary b
 Point the milestone citations in 008 §9–§10 and the G21 proof at the milestones in
 [docs/product/roadmap.md](../product/roadmap.md). Contract text is unchanged; only the planned
 sequencing of these targets moved.
-
-## 2026-11-01 — Lock the complete rollup decision and admission (002 §4.4; 004 §3.4) — Refs #498
-
-Require not-due rollup checks to read their authoritative batch, marker, source checkpoint and
-observation time after obtaining the writer lock. Preserve fresh source/time state while committing
-successful event prefix, retained suffix, batch clear and marker together. Empty windows persist a
-marker without delivery/audit spam; non-emitting write failures roll back and remain monitor-local.
-Controlled competing runtimes cover not-due/due/watch entrypoints; independent readers verify suffix
-visibility before Interpret, rollback and restart. No public API changes or retry drain are introduced.
-
-## 2026-11-01 — Watch batches bind observations to source checkpoints (002 §2.4; 003 §2; 004 §3.4) — Refs #497, #294, #295
-
-Record the user's accepted explicit-batch decision and its rationale: an independent opaque
-checkpoint can skip not-yet-yielded work, and staging it until one later yield cannot recover the
-covered span. Change watch to yield ObservationResult, remove context.checkpoint, reject legacy bare
-observations, and atomically admit each complete batch before Interpret or the next pull. Empty
-batches are valid; omitted/undefined state preserves and null retains the existing reset-to-{} behavior.
-Whole admission failure stops the iterator with the old baseline and prior committed cache intact.
-Read source/notify state and decide dispatch under the admission write lock; refuse batches whose
-pre-acquisition source token no longer matches, preserving competing writers' checkpoints and held
-work. Document breaking third-party migration, runtime-local ownership, source replay responsibility
-and remaining retry-drain/crash-proof work. File-fingerprint's target watch design adopts the same contract.
-
-## 2026-11-01 — Complete poll admission before interpretation (002 §2; 004 §3.4) — Refs #497, #294, #295
-
-Require the entire finite poll span, successful event prefix, ordered retry suffix and source/notify
-state to commit before the first optional Interpret invocation. Independent-connection barrier tests
-cover multiple recipients, repeated object transitions and empty snapshots. Outer rollback restores
-the last committed recipient cache as well as database rows; held notify work survives failed
-admission and reopens for replay. Transaction composition stays package-private, preserving the
-concrete retry-completion API. The separate watch checkpoint contract is unchanged.
 
 ## 2026-11-01 — Preserve recipient views while canonicalizing event order (002 §1.1.7, 004) — Refs #293
 
@@ -2291,151 +2291,6 @@ green. The fixture now keys hook records by host session id, matching the real r
 positive case seeds two active leads' hook heartbeats and asserts both survive with a fully
 deliverable, exit-0 verdict.
 
-## 2026-07-21 — Cross-monitor coalescing hardening: withhold a due normal reminder until concurrent high-urgency work settles, and surface the coalesced reminder to bounded transports (002 §9.1.1) — Refs #441
-
-PR #456 review found the first #441 fix (below) still preserved the two-interrupt failure and
-introduced a claimed-but-unrendered gap:
-
-1. **Preempt-then-preempt-again, not fixed.** With a settled-high batch and a due normal reminder
-   created TOGETHER, an immediate `turn-interruptible` call reached the normal-alone branch (because
-   `settledHigh` was still empty — the high event had not aged past its 15s settle window yet),
-   firing the reminder standalone; a LATER call then delivered the high batch separately — the exact
-   two-interrupt failure #441 set out to fix, just reordered. Fixed: `decideDelivery` now withholds
-   a fully-due normal reminder whenever ANY high-urgency work is pending (settled or not), so it
-   fires standalone only once no high-urgency work is pending at all — otherwise it waits and
-   coalesces into the settled-high delivery once that work settles, in the SAME call.
-2. **Claimed but never rendered (006 §5.5 violation).** `applyDelivery` claimed the coalesced normal
-   rows alongside the surfaced high events, but both bounded transports (hook-deliver, channel) only
-   ever rendered `events`/`message` — and neither consults `message` once `events` is non-empty — so
-   the coalesced reminder text was claimed but never surfaced anywhere. Fixed: `DeliveryClaim` gained
-   an optional `coalescedReminder: string` field, populated only when a reminder was folded in; both
-   `renderHookDelivery` and `renderChannelEvent` render it as a cap-reserved footer after the packed
-   event block(s).
-3. **Sizing couldn't see the coalesced reminder.** A length-bounded transport previously sized how
-   many event blocks fit purely from `previewSettledHighDelivery`, with no way to reserve room for a
-   reminder appended afterward — risking either an over-cap render or a truncated-away reminder
-   (another claimed-but-unrendered case). Fixed: added `previewCoalescedReminder` (core) /
-   `previewCoalescedReminderClient` (CLI), which both `hook.ts` and `channel.ts` now call alongside
-   the settled-high preview to reserve footer room before sizing, and the post-reservation fit checks
-   size against the ACTUAL claim's `coalescedReminder` (not the earlier preview) for exactness.
-4. **Stale diagnosis precedence.** `diagnoseHookDelivery` unconditionally skipped its normal-reminder
-   hold check whenever settled high-urgency work existed, on the assumption settled-high always
-   preempts the reminder — true only when the reminder is otherwise fully due (it then coalesces).
-   It is false whenever the coalesced-until-ack guard (#333) is ALREADY blocking the reminder on its
-   own, independent of any concurrent high-urgency work — that genuine hold went unreported. Fixed:
-   the ordinary `already-claimed`/`coalesced-until-ack` check (`classifyReminderHold`) is now always
-   evaluated, and a new `classifyCoalescingWithheldHold` reports the settle-window-withheld case (item
-   1 above) as its own `settle-window`-reasoned hold on the `normal` band.
-
-Also fixed the two Copilot-flagged doc issues from the same review: 001 §6.2's cross-reference now
-points at 002 §9.1.1 (not §9.1), and §9.1.1 no longer claims "one channel tag / hook injection,
-listing both" as if `events`/`message` alone conveyed the coalesced reminder — it now documents the
-dedicated `coalescedReminder` field bounded transports must render explicitly.
-
-## 2026-07-21 — Preserve BOTH object identity and the Interpret digest in a delivered event block; TAB is an escaped control character in `events list --format text` (002 §1.1.6/§1.1.8, 005 §11.1, 006 §4.2.1) — Refs #449
-
-Round-10 review follow-up to the 2026-07-20 `#449` entry below. The `objectDetail` fix in that
-entry closed the object-identity loss, but selecting `objectDetail` alone for the rendered detail
-line silently dropped a successful Interpret digest entirely — `buildEventBlock` (006 §4.2.1) now
-renders an ADDITIONAL digest line (`DeliveryEventSummary.summary`) whenever it says something the
-title, body, and `objectDetail` line do not, so a named multi-object `prose` monitor's delivered
-block carries both which object changed and what the digest said about it. The common
-no-digest-produced case is unaffected: `summary` then degrades to the same deterministic chain as
-`objectDetail`, so the two are equal and the digest line is suppressed to avoid duplication. 006
-§4.2.1 and the `buildEventBlock` TSDoc are updated to state the three-way suppression explicitly.
-
-**`events list --format text`'s control-safe transform now also escapes TAB (U+0009).** It is a C0
-control character like the others this transform escapes, and left raw it can still shift the
-visual column layout of a row; the prior fix (2026-07-20 entry below) omitted it from the escaped
-set. 005 §11.1 is updated to state the control-safe transformation and the `summary === body`
-non-suppression explicitly (it previously claimed exact parity with `buildEventBlock`'s detail-line
-suppression, which stopped being accurate once the digest line above was added and was already
-inaccurate before that: `events list --format text` never renders `event.body`, so it has no reason
-to suppress on a `summary === body` match the way the rendered block does).
-
-**Two additional generated-artifact/report fixes, no behavior change to a runtime contract:**
-`diffKeyedCollection`'s additive sixth parameter (`displayScope`, 2026-07-20 entry below) is now
-reflected in the checked-in `libs/core/api-report/core.api.md`; and `generateMonitorSchema`'s
-editor/authoring JSON Schema now adds a `pattern: "\\S"` constraint on `name` so it stays in parity
-with `monitorFrontmatterSchema`'s whitespace-only rejection (2026-07-20 entry below) — previously
-`agentmonitors schema generate`/editor validation accepted a `name: "   "` the authoritative parser
-rejected at runtime.
-
-## 2026-07-21 — `pr-review`'s pending-team-request override is scope-conditional, and the `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` scrub is documented accurately (003 §11.9, 004 §3.6) — Refs #444, #446
-
-Two findings from PR #446's `pullrequestreview-4747480111`/`pullrequestreview-4747299707` review round:
-
-- **Treating every login-less `reviewRequests` entry as a still-pending request from the viewer's own
-  team was only sound under the default `review-requested:@me` scope** (`discussion_r3624450049`).
-  `pr-review` also scaffolds `label:needs-review` and an unscoped search as supported alternatives, and
-  under either of those the fetched `reviewRequests` can list a team the viewer does not belong to at
-  all — the fetch itself is no longer what established viewer relevance. Reproduced with an
-  `APPROVED`, non-viewer-team-requested PR under the label-driven scope: the prior unconditional clause
-  wrongly kept it in the queue. The reviewer-scoping shell variable is now a single `search='...'`
-  assignment (rather than a value inlined directly into `--search`), read by both the `gh pr list
---search "$search"` argument and a new `--arg scope "$search"` passed to the `--jq` reduction, so the
-  team-request clause now only applies `and ($scope == "review-requested:@me")`. Editing that one
-  variable to switch scopes keeps the `--search` argument and the jq's scope check in lockstep, with no
-  second edit required. 003 §11.9's field-selection paragraph and reviewer-scoping table, and 004 §3.6's
-  scenario table, are updated to describe the scope-conditional rule; a new
-  `apps/cli/src/commands/pr-alerting-presets.test.ts` regression drops an `APPROVED` PR with only a
-  team review request once `search=` is switched to `label:needs-review`.
-- **The `unset` doc comment claimed the wrapper scrubs three inherited overrides
-  (`GH_TOKEN GITHUB_TOKEN GH_REPO`)**, but the shipped script actually scrubs five, also unsetting
-  `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` (added to close the Enterprise-token identity-mismatch
-  finding from a prior round). The doc comment is corrected to name and explain all five.
-
-## 2026-07-21 — Every public surface consistently describes the no-`--event-ids`/no-`event_ids` ack as excluding ALL currently leased rows, plural (005 §11.2, 006 §4.3) — Refs #438, #434, PR #445 review round 12
-
-Round 10 added the leased-row exception to `acknowledgeSession`'s default "ack everything unread"
-path, but the shipped wording across the CLI's `--event-ids` help, the `agentmon_ack` MCP tool
-description (`channel-ack.ts`'s `ACK_TOOL`), `channel serve`'s server `instructions`, and the public
-005/006 docs and website pages said "except **one** row" / "**a** row" — singular. That undersells
-the actual behavior: `AgentMonitorRuntime.acknowledgeSession`'s exclusion set comes from
-`reservedEventIds(sessionId)`, which returns every candidate held by every live reservation for the
-session, so more than one row can be excluded from a single no-argument ack at once (e.g. two
-concurrent channel pushes each mid-surfacing a different event). `channel serve`'s advertised MCP
-server `instructions` previously omitted the exception entirely, telling a channel-connected agent
-that the no-argument form acknowledges all unread with no carve-out.
-
-Corrected every surface that described this exception (or omitted it) to describe **all currently
-leased rows** rather than a single row: `service.ts`'s `acknowledgeSession` doc comment,
-`channel-ack.ts`'s `ACK_TOOL` description and `AckArgs` doc comment, `commands/events.ts`'s
-`--event-ids` help text, `commands/channel.ts`'s MCP server `instructions`, 005 §11.2's `events ack`
-exception paragraph and the `channel serve` behavior note, 006 §4.3's example tool schema, and the
-website's CLI reference and agent-integration capability table (with a footnote pointing at the
-exception).
-
-## 2026-07-21 — A leased-but-unclaimed reminder hold gets its own `reserved-in-flight` reason and can no longer be acknowledged away (002 §10.7, 006 §5.2) — Refs #438, #434, PR #445 review round 10
-
-Round 8 documented (but did not fix) that a row LEASED by an in-flight channel-push reservation
-(issue #300) reads identically to a truly claimed row to the reminder-suppression diagnosis — both
-report `already-claimed`/`coalesced-until-ack`, and both messages recommend `agentmonitors events
-ack`. Round 10 proved that overlap unsafe rather than merely misleading: `acknowledgeSession`'s
-implicit "ack everything unread" path (the literal remedy the shared message recommends) would sweep
-the still-leased row too. `acknowledgeEvents` sets `acknowledgedAt` without requiring
-`firstNotifiedAt`, so if the in-flight push then rejects/disconnects and the lease releases the row
-back to `pending`, the row is already (wrongly) acknowledged and can never redeliver — event loss.
-
-Fixed on both sides:
-
-1. **Diagnosis** (`hook-delivery-diagnosis.ts`, `reminder-diagnosis.ts`): `HookDeliveryHoldReason`
-   and `ReminderSuppressionReason` gain a `reserved-in-flight` variant, reported whenever a band has
-   no durably claimed row but at least one leased row (`claimedCount === 0 && leasedCount > 0`). Its
-   message never mentions `events ack`. A mix of a durable claim and a live lease still reports
-   `coalesced-until-ack` (ack remains the correct remedy for the claimed portion) but now names the
-   leased portion separately so it isn't implied to need the same action. `HookDeliveryHold` and
-   `ReminderSuppressionFinding` both gain a `leasedCount` field.
-2. **The actual bug**: `AgentMonitorRuntime.acknowledgeSession(sessionId)` (no explicit `eventIds`)
-   now excludes rows currently leased by an outstanding reservation from its default "every unread
-   event" set. A scoped ack (explicit `eventIds`, e.g. a hook body-injection's per-batch instruction)
-   is unaffected — it names rows the caller actually saw. Regression: reserving a delivery, calling
-   `acknowledgeSession` with no ids, then releasing the reservation proves the row is still `unread`
-   and re-claimable, never silently lost.
-
-Updated 006 §5.2's `--debug` hold-reason list and 002 §10.7's `monitor explain` description to name
-`reserved-in-flight` and its no-ack constraint.
-
 ## 2026-07-20 — Transport-health review round 9: remaining stale workspace-keyed hook comments in tests (006 §12.3, 005 §15) — Refs #425
 
 Round 8's "Corrected throughout" claim for the stale workspace-keyed hook description missed two
@@ -2627,6 +2482,97 @@ failure):
   matching record's problems are still unioned regardless of which one is chosen as representative), so
   a broken sibling's problems are never hidden either way.
 
+## 2026-07-21 — Cross-monitor coalescing hardening: withhold a due normal reminder until concurrent high-urgency work settles, and surface the coalesced reminder to bounded transports (002 §9.1.1) — Refs #441
+
+PR #456 review found the first #441 fix (below) still preserved the two-interrupt failure and
+introduced a claimed-but-unrendered gap:
+
+1. **Preempt-then-preempt-again, not fixed.** With a settled-high batch and a due normal reminder
+   created TOGETHER, an immediate `turn-interruptible` call reached the normal-alone branch (because
+   `settledHigh` was still empty — the high event had not aged past its 15s settle window yet),
+   firing the reminder standalone; a LATER call then delivered the high batch separately — the exact
+   two-interrupt failure #441 set out to fix, just reordered. Fixed: `decideDelivery` now withholds
+   a fully-due normal reminder whenever ANY high-urgency work is pending (settled or not), so it
+   fires standalone only once no high-urgency work is pending at all — otherwise it waits and
+   coalesces into the settled-high delivery once that work settles, in the SAME call.
+2. **Claimed but never rendered (006 §5.5 violation).** `applyDelivery` claimed the coalesced normal
+   rows alongside the surfaced high events, but both bounded transports (hook-deliver, channel) only
+   ever rendered `events`/`message` — and neither consults `message` once `events` is non-empty — so
+   the coalesced reminder text was claimed but never surfaced anywhere. Fixed: `DeliveryClaim` gained
+   an optional `coalescedReminder: string` field, populated only when a reminder was folded in; both
+   `renderHookDelivery` and `renderChannelEvent` render it as a cap-reserved footer after the packed
+   event block(s).
+3. **Sizing couldn't see the coalesced reminder.** A length-bounded transport previously sized how
+   many event blocks fit purely from `previewSettledHighDelivery`, with no way to reserve room for a
+   reminder appended afterward — risking either an over-cap render or a truncated-away reminder
+   (another claimed-but-unrendered case). Fixed: added `previewCoalescedReminder` (core) /
+   `previewCoalescedReminderClient` (CLI), which both `hook.ts` and `channel.ts` now call alongside
+   the settled-high preview to reserve footer room before sizing, and the post-reservation fit checks
+   size against the ACTUAL claim's `coalescedReminder` (not the earlier preview) for exactness.
+4. **Stale diagnosis precedence.** `diagnoseHookDelivery` unconditionally skipped its normal-reminder
+   hold check whenever settled high-urgency work existed, on the assumption settled-high always
+   preempts the reminder — true only when the reminder is otherwise fully due (it then coalesces).
+   It is false whenever the coalesced-until-ack guard (#333) is ALREADY blocking the reminder on its
+   own, independent of any concurrent high-urgency work — that genuine hold went unreported. Fixed:
+   the ordinary `already-claimed`/`coalesced-until-ack` check (`classifyReminderHold`) is now always
+   evaluated, and a new `classifyCoalescingWithheldHold` reports the settle-window-withheld case (item
+   1 above) as its own `settle-window`-reasoned hold on the `normal` band.
+
+Also fixed the two Copilot-flagged doc issues from the same review: 001 §6.2's cross-reference now
+points at 002 §9.1.1 (not §9.1), and §9.1.1 no longer claims "one channel tag / hook injection,
+listing both" as if `events`/`message` alone conveyed the coalesced reminder — it now documents the
+dedicated `coalescedReminder` field bounded transports must render explicitly.
+
+## 2026-07-19 — Cross-monitor delivery coalescing: a due normal reminder folds into a concurrent settled-high delivery instead of a separate later interrupt (002 §9.1.1) — Refs #441
+
+Two monitors watching overlapping state (a high-urgency label monitor and a normal-urgency
+review-queue monitor both firing off the same underlying change) previously interrupted a session
+TWICE for one action: `decideDelivery`'s `turn-interruptible` branch always returned early once a
+settled high-urgency batch was found, leaving a simultaneously-due normal reminder for a SEPARATE,
+later `claimDelivery` call — one interrupt, one ack, then a second interrupt, then a second ack, for
+work the session had already handled. Added 002 §9.1.1: when both a settled high batch and a due
+normal reminder are decided in the SAME call, they are folded into ONE `DeliveryClaim` — the
+`events` array and top-level `urgency: 'high'` are unchanged from a pure high delivery (never
+downgraded), the normal reminder's text is appended to the message (never escalated into per-event
+detail), and both event sets are claimed together so there is no leftover second interrupt. Also
+added 001 §6.2 and the `setup-monitors` skill's authoring guidance: the runtime cannot coalesce two
+_independently-authored_ monitor definitions into one, so overlapping monitors should be merged into
+one branching monitor or scoped disjointly by the author.
+
+Deliberately out of scope for this change (see the #441 decision-brief comment on the issue for the
+full writeup): the ack-race closure (an ack-all sweep racing a sibling monitor's event materializing
+one tick later) and self-caused-event suppression — both are three-state-model / attribution
+decisions reserved for Mike, not mechanical fixes.
+
+## 2026-07-21 — Preserve BOTH object identity and the Interpret digest in a delivered event block; TAB is an escaped control character in `events list --format text` (002 §1.1.6/§1.1.8, 005 §11.1, 006 §4.2.1) — Refs #449
+
+Round-10 review follow-up to the 2026-07-20 `#449` entry below. The `objectDetail` fix in that
+entry closed the object-identity loss, but selecting `objectDetail` alone for the rendered detail
+line silently dropped a successful Interpret digest entirely — `buildEventBlock` (006 §4.2.1) now
+renders an ADDITIONAL digest line (`DeliveryEventSummary.summary`) whenever it says something the
+title, body, and `objectDetail` line do not, so a named multi-object `prose` monitor's delivered
+block carries both which object changed and what the digest said about it. The common
+no-digest-produced case is unaffected: `summary` then degrades to the same deterministic chain as
+`objectDetail`, so the two are equal and the digest line is suppressed to avoid duplication. 006
+§4.2.1 and the `buildEventBlock` TSDoc are updated to state the three-way suppression explicitly.
+
+**`events list --format text`'s control-safe transform now also escapes TAB (U+0009).** It is a C0
+control character like the others this transform escapes, and left raw it can still shift the
+visual column layout of a row; the prior fix (2026-07-20 entry below) omitted it from the escaped
+set. 005 §11.1 is updated to state the control-safe transformation and the `summary === body`
+non-suppression explicitly (it previously claimed exact parity with `buildEventBlock`'s detail-line
+suppression, which stopped being accurate once the digest line above was added and was already
+inaccurate before that: `events list --format text` never renders `event.body`, so it has no reason
+to suppress on a `summary === body` match the way the rendered block does).
+
+**Two additional generated-artifact/report fixes, no behavior change to a runtime contract:**
+`diffKeyedCollection`'s additive sixth parameter (`displayScope`, 2026-07-20 entry below) is now
+reflected in the checked-in `libs/core/api-report/core.api.md`; and `generateMonitorSchema`'s
+editor/authoring JSON Schema now adds a `pattern: "\\S"` constraint on `name` so it stays in parity
+with `monitorFrontmatterSchema`'s whitespace-only rejection (2026-07-20 entry below) — previously
+`agentmonitors schema generate`/editor validation accepted a `name: "   "` the authoritative parser
+rejected at runtime.
+
 ## 2026-07-20 — Object identity in a delivered event block must not be lost to an Interpret digest, and an authored monitor name must not be blank (002 §1.1.8, §5.4, 006 §4.2.1) — Refs #449
 
 Round-9 review follow-up to the 2026-07-19 `#449` entry above. Three fixes:
@@ -2662,6 +2608,30 @@ it repeats the title," which stopped being true once the body-equality suppressi
 added — it is now omitted for either match. A Markdown inline-code span illustrating the detail line
 had also been split across a line break by prior wrapping, which renders incorrectly; it is now a
 single line.
+
+## 2026-07-21 — `pr-review`'s pending-team-request override is scope-conditional, and the `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` scrub is documented accurately (003 §11.9, 004 §3.6) — Refs #444, #446
+
+Two findings from PR #446's `pullrequestreview-4747480111`/`pullrequestreview-4747299707` review round:
+
+- **Treating every login-less `reviewRequests` entry as a still-pending request from the viewer's own
+  team was only sound under the default `review-requested:@me` scope** (`discussion_r3624450049`).
+  `pr-review` also scaffolds `label:needs-review` and an unscoped search as supported alternatives, and
+  under either of those the fetched `reviewRequests` can list a team the viewer does not belong to at
+  all — the fetch itself is no longer what established viewer relevance. Reproduced with an
+  `APPROVED`, non-viewer-team-requested PR under the label-driven scope: the prior unconditional clause
+  wrongly kept it in the queue. The reviewer-scoping shell variable is now a single `search='...'`
+  assignment (rather than a value inlined directly into `--search`), read by both the `gh pr list
+--search "$search"` argument and a new `--arg scope "$search"` passed to the `--jq` reduction, so the
+  team-request clause now only applies `and ($scope == "review-requested:@me")`. Editing that one
+  variable to switch scopes keeps the `--search` argument and the jq's scope check in lockstep, with no
+  second edit required. 003 §11.9's field-selection paragraph and reviewer-scoping table, and 004 §3.6's
+  scenario table, are updated to describe the scope-conditional rule; a new
+  `apps/cli/src/commands/pr-alerting-presets.test.ts` regression drops an `APPROVED` PR with only a
+  team review request once `search=` is switched to `label:needs-review`.
+- **The `unset` doc comment claimed the wrapper scrubs three inherited overrides
+  (`GH_TOKEN GITHUB_TOKEN GH_REPO`)**, but the shipped script actually scrubs five, also unsetting
+  `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` (added to close the Enterprise-token identity-mismatch
+  finding from a prior round). The doc comment is corrected to name and explain all five.
 
 ## 2026-07-20 — `pr-review`/`my-prs` close four PR #446 21:43-round blockers: Enterprise host resolution, per-viewer review requests, mutable-title churn, and date-scoped terminal coverage (003 §11.9, 004 §3.6) — Refs #444, #446
 
@@ -2789,242 +2759,6 @@ The four `@agentmonitors/source-api-poll` Changesets accumulated across this iss
 follow-ups) are also consolidated into one, reclassified `minor` — the new `timeout` scope field is
 additive authoring surface, matching this repository's precedent for the earlier `api-poll`
 composite option.
-
-## 2026-07-20 — PR-alerting presets: 003's field-selection paragraph re-aligned with the shipped `gh` query, and two further review findings closed (003 §11.9, 004 §3.6) — Refs #444, #446
-
-003 §11.9's "Field selection is what makes the transitions observable" section still described a
-superseded `pr-review` shape: `{number, title, headRefName, reviewDecision, author}` projected via
-`--search '-author:@me'`. The shipped query (since the prior entry's reviewer-scoping fix) projects
-`{number, title, headRefName, author}` — `reviewDecision` decides membership rather than being carried
-as a field — and scopes via the configurable `--search`, defaulting to `review-requested:@me`. The
-paragraph is corrected to match, and the adjacent "per-reviewer list" description is updated from
-`{by, state}` to `{by, state, at}` to reflect the repeat-feedback fix from the prior entry.
-
-Two further PR #446 review findings, addressed in the same delta:
-
-**`GH_TOKEN`/`GH_REPO` were not scrubbed.** The shell wrapper unset only `GITHUB_TOKEN`, but `gh` gives
-`GH_TOKEN` higher precedence still, and `GH_REPO` overrides repository selection outright — either
-inherited variable could silently redirect a preset to the wrong identity or repository despite `@me`
-and the explicit `cwd:`. The wrapper now scrubs all three (`env -u GH_TOKEN -u GITHUB_TOKEN -u
-GH_REPO`). The wrapper's stderr temp file also moved from a predictable `$$`-PID-based path (removed by
-explicit `rm -f` on each branch, so a `SIGKILL` between creation and either branch could leak it) to an
-`mktemp`-created private file removed by an `EXIT` trap, which additionally survives the wrapper's own
-`kill -TERM $$` self-signal and `command-poll`'s `SIGTERM` timeout escalation.
-
-**`my-prs`'s `commentCount` churned on the author's own replies and bot comments.** Since `commentCount`
-growing is one of the signals that re-fires an already-actionable entry, every self-reply or bot status
-comment produced a spurious high-urgency interrupt. The count now excludes comments whose author is the
-PR's own author (`author.login`, now fetched alongside the other fields) or whose login ends `[bot]`.
-
-Not addressed in this delta, evaluated and left open with rationale (PR #446 review):
-
-- **A newly-opened draft PR enters `my-prs`'s `draft` membership**, which is a benign, self-caused
-  transition rather than a true "someone acted on your PR" signal. This is a structural limit of
-  stateless `json-diff` polling: distinguishing "just created as a draft" from "pulled back to draft
-  after being ready" requires state `command-poll` does not carry between ticks. The scaffolded body
-  already tells the author how to tell the two apart ("If you did not just put it there, someone pulled
-  it back"), and `apps/cli/src/commands/pr-alerting-presets.test.ts` gained a characterization test
-  pinning this documented, accepted shape so it can't silently drift.
-
-004 §3 gained a new §3.6 mapping the presets' required scenarios (reviewer scoping, disjointness,
-environment/temp-file hardening, terminal time-bounding, `commentCount` filtering, graceful
-degradation, portability) to `apps/cli/src/commands/pr-alerting-presets.test.ts`'s describe blocks, per
-§6's spec-change checklist.
-
-## 2026-07-20 — `command-poll`'s `cwd` resolves against the runtime workspace root; `my-prs` fetches open/merged/closed separately; the CI-crossing double-fire is characterized, not silently left undocumented (003 §3.1, §11.1, §11.9) — Refs #444, #446
-
-Three further PR #446 review findings closed on top of the entries above, all against exact head
-`66741b0`:
-
-**A scaffolded preset's `cwd:` was bound to the checkout path `init` ran from** (finding 826) — the
-prior entry's own "not addressed" list called this out as inherent to the design, but the real fix
-turned out to be a small, well-precedented core change rather than a `cwd:` tradeoff: 003 §11.1 now
-resolves an **omitted** `cwd` (and, for a relative `cwd`, its base) against the runtime workspace/config
-root for a project monitor — the same base `file-fingerprint` already resolves a relative `cwd`/`globs`
-against (§3.1) — instead of the daemon's own process working directory. `command-poll`'s `resolveCwd`
-(`plugins/source-command-poll/src/index.ts`) implements this; `agentmonitors init` no longer seeds an
-absolute `cwd:` into either preset at all (the `seedPresetCwd` scaffold-time mechanism is removed
-outright), so a scaffolded `MONITOR.md` has no project-root-shaped state to go stale when the project is
-relocated, cloned elsewhere, or shared to a teammate's checkout.
-
-**`my-prs`'s `--state all --limit 60` could still evict an old, still-open PR** (finding 989) once
-enough newer PRs (open or terminal) existed, silencing its later CI/review activity — the prior entry
-left this open as "real design work." §11.9's "Field selection" section is now split into three
-separate `gh pr list` calls (`--state open --limit 30`, `--state merged --limit 20`, `--state closed
---limit 20`), each with its own `--limit` so terminal history can never displace open coverage, unioned
-by a `jq -sc 'add | unique_by(.number) | ...'` stage that now runs the `--jq` reduction as a pipeline
-step over the fetch's raw stdout rather than as `gh`'s own `--jq` flag (the mechanism that makes a
-multi-call fetch possible at all — `-s`/`--slurp` folds however many arrays the fetch printed back into
-one). `pr-review`'s single-call fetch is unaffected in shape; both presets now share the same
-fetch/reduce split in `ghPresetScript`.
-
-**A CI failure crossing the `pr-review`/`my-prs` readiness partition still fires both monitors**
-(discussion `r3615190027`): static membership disjointness (the prior "disjoint by construction" entry
-below) does not imply glitch-free crossing — `pr-review` sees `[PR] -> []`, `my-prs` sees `[] -> [PR,
-needs: ci-failing]`, and both independently-scheduled `command-poll` monitors fire once each in the same
-tick, for the same real event. This is the same residual class §11.9 already documented for a PR
-merging under a same-identity reviewer scope (one dismissible removal plus one actionable entry, not
-issue #441's N-round-trip multiplier) — reachable only when a reviewer-scoping model does not exclude
-the current user's own PRs from `pr-review` (the label-driven model, or an unscoped queue); it cannot
-fire on your own PR under the default `review-requested:@me` scope at all, since GitHub forbids
-requesting your own review. No cross-monitor coordination is added to suppress it: the two presets are
-independently scheduled instances with no shared state by design, and issue #441's own preferred remedy
-— not shipping redundant payloads — is exactly what "the two presets do not overlap" already does. §11.9
-is updated to state this explicitly for the CI-failure case (previously only the merge case was
-documented), and `apps/cli/src/commands/pr-alerting-presets.test.ts` gained a dual-monitor transition
-regression that pins the exact `[PR]->[]` / `[]->[PR, needs: ci-failing]` shape so a future change that
-makes this fire for a DIFFERENT, undocumented reason is still caught.
-
-004 §3.6 is updated to reflect the three-call `my-prs` fetch and the `cwd` portability guarantee; 005 §2's
-"Repository auto-scoping" paragraph is updated to match (no more `cwd:` in either scaffolded preset).
-
-## 2026-07-20 — PR-alerting presets are disjoint by construction, so enabling both is not an interrupt multiplier (003 §11.9) — Refs #444, #441
-
-Shipping two presets a user may enable together risked reproducing #441's measured
-interrupt-multiplier by construction. Measured directly with both presets' `--jq` run over the same
-raw PR set: `pr-review` held `[1, 2]` while `my-prs` held `[2, 3, 4]` — PR 2 (red CI, undecided,
-non-draft) was claimed by **both**, so every transition on it would deliver two alerts.
-
-The server-side `--search` scope does not fix this in general. It does under the default
-(`review-requested:@me` cannot match a PR you authored, since GitHub forbids requesting review from
-yourself), but not under the label-driven model — which is exactly the model required when author and
-reviewer share an identity, the case this whole workflow runs in.
-
-`pr-review` now **excludes PRs with failing checks**, which makes the two memberships partition by
-readiness under every scoping model: a red PR is not review-ready, it belongs to its author, and
-`my-prs` already classifies it `ci-failing`. Re-measured after the change: `[1]` versus `[2, 3, 4]`,
-disjoint. A test asserts every plausible PR state lands in at most one payload and fails if the
-exclusion is removed.
-
-Residual, by nature rather than defect: a PR merging leaves `pr-review` and enters `my-prs` as
-`merged`. Under the default scope those are different PRs. Under a same-identity scope it is one
-benign removal plus one actionable entry for the same merge — one dismissible fire, not a multiplier.
-Delivery-layer cross-monitor coalescing (#441) is complementary; per #441's own guidance the
-authoring-level fix is preferred and is what this does.
-
-## 2026-07-20 — `normalPending` is lease-aware (not merely "not-yet-claimed"), and the false "fresh event" recovery clause is removed from every normative surface (002 §9.2/§9.3/§13.3, 006 §5.1.1) — Refs #438, #434, PR #445 review round 8
-
-Two follow-on defects found on round 8 of reviewing the same change.
-
-**1. §9.2/§9.3/§13.3 promised a fresh unclaimed event restores a suppressed reminder.** They do not:
-starting from one claimed-but-unacknowledged row (`normalPending = 0`, `unreadNormal = 1`), a fresh
-unclaimed row makes it `1` and `2` — the equality guard (`normalPending.length === unreadNormal.length`)
-stays unsatisfied until the claimed row is specifically acknowledged, regardless of how many new
-unclaimed rows arrive. Removed the "or a fresh unclaimed event arrives" alternative from §9.2, §9.3, and
-the §13.3 worked example, and from the matching prose/messages in `reminder-diagnosis.ts` and
-`hook-delivery-diagnosis.ts` (both diagnostics' `coalesced-until-ack` branch already stated the correct,
-ack-only condition — only the `already-claimed` branch carried the false alternative).
-
-**2. §5.1.1 described `normalPending` as merely "not-yet-claimed."** `pendingForClaim` (issue #300) also
-excludes rows held by an in-flight channel-push reservation, so an unread, unclaimed, but currently
-leased row is absent from `normalPending` too — proven by the committed reservation regression, which
-shows a concurrent reminder stays suppressed until the lease releases. Reworded §5.1.1 to describe
-`normalPending` as pending **and currently claimable (not leased)**. This also means both diagnostics'
-`claimedCount = unreadCount - pendingCount` reports a leased-but-unclaimed row as `already-claimed`
-alongside truly claimed rows; documented that lease-aware overlap in both modules' doc comments rather
-than distinguishing it with a new reason (a public-API change to `HookDeliveryHoldReason`), and pinned
-the leased case with a dedicated regression.
-
-## 2026-07-20 — The coalesced-until-ack guard's band comparison no longer mislabels the pending side as claimed (006 §5.1.1) — Refs #438, #434, PR #445 review round 7
-
-One follow-on defect found on round 7 of reviewing the same change.
-
-**1. §5.1.1 described `normalPending` as the claimed-but-unacknowledged set.** `pendingForClaim`
-delegates to `pendingEventsForSession`, which requires `first_notified_at IS NULL` — so `normalPending`
-holds only not-yet-claimed rows. `unreadNormal` is the superset that additionally contains any
-claimed-but-unacknowledged row. The mixed-recap conclusion in the prior correction (round 6, above) was
-correct — `normalPending` is 1 (the fresh unclaimed row) while `unreadNormal` is 2 (that row plus the
-still-claimed recap row) — but describing the LHS as "claimed" could mislead an implementer into
-reversing the guard. Reworded lines 624-633 to say the runtime compares the band's pending/unclaimed
-count against its total unread count, and that claimed-but-unacknowledged rows appear only in the
-latter.
-
-## 2026-07-20 — The header-packing fixed-point search no longer oscillates into an under-scoped ack, and the coalesced-until-ack guard's mixed-recap case is documented correctly (006 §5.1.1) — Refs #438, #434, PR #445 review round 6
-
-Two more follow-on defects found on round 6 of reviewing the same change.
-
-**1. `resolveHookHeaderPacking`'s fixed-point-guess search could oscillate, under-scoping `--event-ids`
-(BLOCKER).** The prior iterative-narrowing search re-guessed the next candidate id count from the
-PREVIOUS candidate's packed-block count; at a specific boundary (two ~26-character event ids with
-~1,774-character bodies, reserved against the deferred marker) this bounced between guesses (`guess=2`
-packs 1 block; the resulting shorter 1-id header then packs 2 blocks; `guess` returns to 2, repeating)
-without ever landing on a self-consistent `k`, so the loop exhausted and fell back to the narrowest
-(0-id) header while BOTH blocks still rendered — an ack instruction naming zero ids for two rendered
-events, which a compliant agent could only satisfy with the no-id "ack everything" form, silently
-dropping unrelated deferred/recap rows into that same blanket ack. Resolved by testing each candidate
-`k` directly (descending from `events.length` to `0`, packing only `blocks.slice(0, k)` against the
-header built for `events.slice(0, k)`) rather than iterating a guess derived from the previous
-candidate's result — `k = 0` is always self-consistent (no ids, no blocks), so the search is guaranteed
-to terminate at a header whose named ids exactly match what's rendered. Regression test:
-`hook-deliver-render.test.ts` reproduces the exact oscillation boundary and asserts the rendered
-`--event-ids` count always equals the rendered `### ` block count.
-
-**2. §5.1.1's coalesced-until-ack correction overgeneralized the high-only case to mixed-band recaps.**
-The prior correction (round 5, below) stated an unacknowledged `high`-urgency **or mixed-band recap**
-claim does not block a new `normal`-urgency reminder. That's true for a `high`-only claim (it touches
-no `normal`/`low` row), but wrong for a mixed-band recap: if a `post-compact` recap claims an old
-`normal` (or `low`) event alongside `high` events, that row stays claimed-but-unacknowledged, so
-`normalPending` no longer equals `unreadNormal` once a fresh, unrelated `normal` event later arrives —
-the band-scoped equality guard suppresses that band's next `turn-interruptible` reminder too, until the
-recap's `normal`/`low` events are acknowledged. A current-head `service.ts` probe reproduced
-`normalPending=1`, `unreadNormal=2`, and a `null` claim. Corrected `006-agent-integration.md` to
-distinguish the high-only case from the mixed-recap case, and updated the stale `hook-deliver-render.ts`
-doc comment making the same overgeneralization; the public website (`agent-integration.md`) already
-scoped this correctly to "a `high`-only claim." Added a regression test (`service.test.ts`, "mixed-band
-recap suppression") reproducing the exact scenario above.
-
-## 2026-07-20 — Recap sizing reserves against the marker actually appended, the channel reminder's action step is sequenced list-then-ack everywhere, and the coalesced-until-ack guard's band scope is documented correctly (002 §9.2, 006 §4.2.1, §5.1.1) — Refs #438, #434, PR #445 review round 3
-
-Three more follow-on defects found on round 3 of reviewing the same change.
-
-**1. `resolveHookClaimFit` sized against the wrong marker for a `post-compact` recap (BLOCKER).**
-`resolveHookClaimFit` defaulted to reserving room for `buildHookDeferredMarker`'s length regardless of
-lifecycle, but `renderHookDelivery`'s recap branch appends the LONGER `buildHookRecapMarker` on top of
-that packing instead. Reserving against the shorter marker while appending the longer one could let a
-multi-event recap's rendered `additionalContext` exceed `MAX_ADDITIONAL_CONTEXT` (4000 chars). Resolved
-by threading the lifecycle-specific marker `renderHookDelivery` will actually append into
-`resolveHookClaimFit` as an explicit parameter, so `includedCount` stays truthful for both lifecycles.
-Regression test: a two-event recap boundary case (`hook-deliver-render.test.ts`) with a body length of
-3546 chars — the smallest size that genuinely overflows the cap under the pre-fix packing.
-
-**2. A stale channel-transport example still showed the bare-ack "OR" wording (§4.2.1) swept.** Round 2
-(below) fixed the channel reminder's rendered text and its spec prose, but left an illustrative example
-in `experiments/channel-uat/README.md` quoting the old "Call the agentmon_ack tool, or run `events
-list` ... for details" shape. Updated to the current list-then-scoped-ack wording so no reader copies
-the superseded phrasing.
-
-**3. The coalesced-until-ack suppression's spec prose and changeset overclaimed cross-band scope
-(§5.1.1).** Both `docs/specs/006-agent-integration.md` and the `self-sufficient-delivery-text`
-changeset described an unacknowledged claim as suppressing "every subsequent"/"every later"
-normal-urgency reminder for the session — but the guard
-(`normalPending.length === unreadNormal.length`; the low-urgency guard, §9.3, is the identical pattern)
-is band-scoped: it compares a band's own claimed-but-unacknowledged events against that SAME band's
-unread total. An unacknowledged `high`-urgency (or mixed-band recap) claim does not, on its own, block a
-NEW `normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
-session — the two coexist. Corrected both the spec prose and the changeset; added a regression test
-(`service.test.ts`, "cross-band independence") proving an unacked high-urgency claim does not suppress a
-same-session normal-urgency reminder.
-
-## 2026-07-19 — Cross-monitor delivery coalescing: a due normal reminder folds into a concurrent settled-high delivery instead of a separate later interrupt (002 §9.1.1) — Refs #441
-
-Two monitors watching overlapping state (a high-urgency label monitor and a normal-urgency
-review-queue monitor both firing off the same underlying change) previously interrupted a session
-TWICE for one action: `decideDelivery`'s `turn-interruptible` branch always returned early once a
-settled high-urgency batch was found, leaving a simultaneously-due normal reminder for a SEPARATE,
-later `claimDelivery` call — one interrupt, one ack, then a second interrupt, then a second ack, for
-work the session had already handled. Added 002 §9.1.1: when both a settled high batch and a due
-normal reminder are decided in the SAME call, they are folded into ONE `DeliveryClaim` — the
-`events` array and top-level `urgency: 'high'` are unchanged from a pure high delivery (never
-downgraded), the normal reminder's text is appended to the message (never escalated into per-event
-detail), and both event sets are claimed together so there is no leftover second interrupt. Also
-added 001 §6.2 and the `setup-monitors` skill's authoring guidance: the runtime cannot coalesce two
-_independently-authored_ monitor definitions into one, so overlapping monitors should be merged into
-one branching monitor or scoped disjointly by the author.
-
-Deliberately out of scope for this change (see the #441 decision-brief comment on the issue for the
-full writeup): the ack-race closure (an ack-all sweep racing a sibling monitor's event materializing
-one tick later) and self-caused-event suppression — both are three-state-model / attribution
-decisions reserved for Mike, not mechanical fixes.
 
 ## 2026-07-19 — `daemon run --detach`'s log `fchmod` is a fail-closed exception to the §3.1 warn-and-continue rule, not an oversight (002 §3.1) — Refs #389
 
@@ -3181,6 +2915,118 @@ poll-until-`daemonAvailable` loop with slightly different timeout/poll constants
 (`daemon-ipc.ts`); each call site keeps its own pre-existing timeout/poll values — no behavior change.
 
 Finding 5 (test teardown pid fallback) is test-infrastructure-only, no spec change.
+
+## 2026-07-20 — PR-alerting presets: 003's field-selection paragraph re-aligned with the shipped `gh` query, and two further review findings closed (003 §11.9, 004 §3.6) — Refs #444, #446
+
+003 §11.9's "Field selection is what makes the transitions observable" section still described a
+superseded `pr-review` shape: `{number, title, headRefName, reviewDecision, author}` projected via
+`--search '-author:@me'`. The shipped query (since the prior entry's reviewer-scoping fix) projects
+`{number, title, headRefName, author}` — `reviewDecision` decides membership rather than being carried
+as a field — and scopes via the configurable `--search`, defaulting to `review-requested:@me`. The
+paragraph is corrected to match, and the adjacent "per-reviewer list" description is updated from
+`{by, state}` to `{by, state, at}` to reflect the repeat-feedback fix from the prior entry.
+
+Two further PR #446 review findings, addressed in the same delta:
+
+**`GH_TOKEN`/`GH_REPO` were not scrubbed.** The shell wrapper unset only `GITHUB_TOKEN`, but `gh` gives
+`GH_TOKEN` higher precedence still, and `GH_REPO` overrides repository selection outright — either
+inherited variable could silently redirect a preset to the wrong identity or repository despite `@me`
+and the explicit `cwd:`. The wrapper now scrubs all three (`env -u GH_TOKEN -u GITHUB_TOKEN -u
+GH_REPO`). The wrapper's stderr temp file also moved from a predictable `$$`-PID-based path (removed by
+explicit `rm -f` on each branch, so a `SIGKILL` between creation and either branch could leak it) to an
+`mktemp`-created private file removed by an `EXIT` trap, which additionally survives the wrapper's own
+`kill -TERM $$` self-signal and `command-poll`'s `SIGTERM` timeout escalation.
+
+**`my-prs`'s `commentCount` churned on the author's own replies and bot comments.** Since `commentCount`
+growing is one of the signals that re-fires an already-actionable entry, every self-reply or bot status
+comment produced a spurious high-urgency interrupt. The count now excludes comments whose author is the
+PR's own author (`author.login`, now fetched alongside the other fields) or whose login ends `[bot]`.
+
+Not addressed in this delta, evaluated and left open with rationale (PR #446 review):
+
+- **A newly-opened draft PR enters `my-prs`'s `draft` membership**, which is a benign, self-caused
+  transition rather than a true "someone acted on your PR" signal. This is a structural limit of
+  stateless `json-diff` polling: distinguishing "just created as a draft" from "pulled back to draft
+  after being ready" requires state `command-poll` does not carry between ticks. The scaffolded body
+  already tells the author how to tell the two apart ("If you did not just put it there, someone pulled
+  it back"), and `apps/cli/src/commands/pr-alerting-presets.test.ts` gained a characterization test
+  pinning this documented, accepted shape so it can't silently drift.
+
+004 §3 gained a new §3.6 mapping the presets' required scenarios (reviewer scoping, disjointness,
+environment/temp-file hardening, terminal time-bounding, `commentCount` filtering, graceful
+degradation, portability) to `apps/cli/src/commands/pr-alerting-presets.test.ts`'s describe blocks, per
+§6's spec-change checklist.
+
+## 2026-07-20 — `command-poll`'s `cwd` resolves against the runtime workspace root; `my-prs` fetches open/merged/closed separately; the CI-crossing double-fire is characterized, not silently left undocumented (003 §3.1, §11.1, §11.9) — Refs #444, #446
+
+Three further PR #446 review findings closed on top of the entries above, all against exact head
+`66741b0`:
+
+**A scaffolded preset's `cwd:` was bound to the checkout path `init` ran from** (finding 826) — the
+prior entry's own "not addressed" list called this out as inherent to the design, but the real fix
+turned out to be a small, well-precedented core change rather than a `cwd:` tradeoff: 003 §11.1 now
+resolves an **omitted** `cwd` (and, for a relative `cwd`, its base) against the runtime workspace/config
+root for a project monitor — the same base `file-fingerprint` already resolves a relative `cwd`/`globs`
+against (§3.1) — instead of the daemon's own process working directory. `command-poll`'s `resolveCwd`
+(`plugins/source-command-poll/src/index.ts`) implements this; `agentmonitors init` no longer seeds an
+absolute `cwd:` into either preset at all (the `seedPresetCwd` scaffold-time mechanism is removed
+outright), so a scaffolded `MONITOR.md` has no project-root-shaped state to go stale when the project is
+relocated, cloned elsewhere, or shared to a teammate's checkout.
+
+**`my-prs`'s `--state all --limit 60` could still evict an old, still-open PR** (finding 989) once
+enough newer PRs (open or terminal) existed, silencing its later CI/review activity — the prior entry
+left this open as "real design work." §11.9's "Field selection" section is now split into three
+separate `gh pr list` calls (`--state open --limit 30`, `--state merged --limit 20`, `--state closed
+--limit 20`), each with its own `--limit` so terminal history can never displace open coverage, unioned
+by a `jq -sc 'add | unique_by(.number) | ...'` stage that now runs the `--jq` reduction as a pipeline
+step over the fetch's raw stdout rather than as `gh`'s own `--jq` flag (the mechanism that makes a
+multi-call fetch possible at all — `-s`/`--slurp` folds however many arrays the fetch printed back into
+one). `pr-review`'s single-call fetch is unaffected in shape; both presets now share the same
+fetch/reduce split in `ghPresetScript`.
+
+**A CI failure crossing the `pr-review`/`my-prs` readiness partition still fires both monitors**
+(discussion `r3615190027`): static membership disjointness (the prior "disjoint by construction" entry
+below) does not imply glitch-free crossing — `pr-review` sees `[PR] -> []`, `my-prs` sees `[] -> [PR,
+needs: ci-failing]`, and both independently-scheduled `command-poll` monitors fire once each in the same
+tick, for the same real event. This is the same residual class §11.9 already documented for a PR
+merging under a same-identity reviewer scope (one dismissible removal plus one actionable entry, not
+issue #441's N-round-trip multiplier) — reachable only when a reviewer-scoping model does not exclude
+the current user's own PRs from `pr-review` (the label-driven model, or an unscoped queue); it cannot
+fire on your own PR under the default `review-requested:@me` scope at all, since GitHub forbids
+requesting your own review. No cross-monitor coordination is added to suppress it: the two presets are
+independently scheduled instances with no shared state by design, and issue #441's own preferred remedy
+— not shipping redundant payloads — is exactly what "the two presets do not overlap" already does. §11.9
+is updated to state this explicitly for the CI-failure case (previously only the merge case was
+documented), and `apps/cli/src/commands/pr-alerting-presets.test.ts` gained a dual-monitor transition
+regression that pins the exact `[PR]->[]` / `[]->[PR, needs: ci-failing]` shape so a future change that
+makes this fire for a DIFFERENT, undocumented reason is still caught.
+
+004 §3.6 is updated to reflect the three-call `my-prs` fetch and the `cwd` portability guarantee; 005 §2's
+"Repository auto-scoping" paragraph is updated to match (no more `cwd:` in either scaffolded preset).
+
+## 2026-07-20 — PR-alerting presets are disjoint by construction, so enabling both is not an interrupt multiplier (003 §11.9) — Refs #444, #441
+
+Shipping two presets a user may enable together risked reproducing #441's measured
+interrupt-multiplier by construction. Measured directly with both presets' `--jq` run over the same
+raw PR set: `pr-review` held `[1, 2]` while `my-prs` held `[2, 3, 4]` — PR 2 (red CI, undecided,
+non-draft) was claimed by **both**, so every transition on it would deliver two alerts.
+
+The server-side `--search` scope does not fix this in general. It does under the default
+(`review-requested:@me` cannot match a PR you authored, since GitHub forbids requesting review from
+yourself), but not under the label-driven model — which is exactly the model required when author and
+reviewer share an identity, the case this whole workflow runs in.
+
+`pr-review` now **excludes PRs with failing checks**, which makes the two memberships partition by
+readiness under every scoping model: a red PR is not review-ready, it belongs to its author, and
+`my-prs` already classifies it `ci-failing`. Re-measured after the change: `[1]` versus `[2, 3, 4]`,
+disjoint. A test asserts every plausible PR state lands in at most one payload and fails if the
+exclusion is removed.
+
+Residual, by nature rather than defect: a PR merging leaves `pr-review` and enters `my-prs` as
+`merged`. Under the default scope those are different PRs. Under a same-identity scope it is one
+benign removal plus one actionable entry for the same merge — one dismissible fire, not a multiplier.
+Delivery-layer cross-monitor coalescing (#441) is complementary; per #441's own guidance the
+authoring-level fix is preferred and is what this does.
 
 ## 2026-07-19 — PR-alerting presets: selectable reviewer scoping, a review-revision signal, and time-bounded terminal states (003 §11.9, 005 §2) — Refs #444
 
@@ -3762,6 +3608,160 @@ memory.
   still treats the capped output as a valid result — a stalled/incomplete HTTP body is not a
   meaningful baseline the way capped command output is.
 
+## 2026-07-21 — Every public surface consistently describes the no-`--event-ids`/no-`event_ids` ack as excluding ALL currently leased rows, plural (005 §11.2, 006 §4.3) — Refs #438, #434, PR #445 review round 12
+
+Round 10 added the leased-row exception to `acknowledgeSession`'s default "ack everything unread"
+path, but the shipped wording across the CLI's `--event-ids` help, the `agentmon_ack` MCP tool
+description (`channel-ack.ts`'s `ACK_TOOL`), `channel serve`'s server `instructions`, and the public
+005/006 docs and website pages said "except **one** row" / "**a** row" — singular. That undersells
+the actual behavior: `AgentMonitorRuntime.acknowledgeSession`'s exclusion set comes from
+`reservedEventIds(sessionId)`, which returns every candidate held by every live reservation for the
+session, so more than one row can be excluded from a single no-argument ack at once (e.g. two
+concurrent channel pushes each mid-surfacing a different event). `channel serve`'s advertised MCP
+server `instructions` previously omitted the exception entirely, telling a channel-connected agent
+that the no-argument form acknowledges all unread with no carve-out.
+
+Corrected every surface that described this exception (or omitted it) to describe **all currently
+leased rows** rather than a single row: `service.ts`'s `acknowledgeSession` doc comment,
+`channel-ack.ts`'s `ACK_TOOL` description and `AckArgs` doc comment, `commands/events.ts`'s
+`--event-ids` help text, `commands/channel.ts`'s MCP server `instructions`, 005 §11.2's `events ack`
+exception paragraph and the `channel serve` behavior note, 006 §4.3's example tool schema, and the
+website's CLI reference and agent-integration capability table (with a footnote pointing at the
+exception).
+
+## 2026-07-21 — A leased-but-unclaimed reminder hold gets its own `reserved-in-flight` reason and can no longer be acknowledged away (002 §10.7, 006 §5.2) — Refs #438, #434, PR #445 review round 10
+
+Round 8 documented (but did not fix) that a row LEASED by an in-flight channel-push reservation
+(issue #300) reads identically to a truly claimed row to the reminder-suppression diagnosis — both
+report `already-claimed`/`coalesced-until-ack`, and both messages recommend `agentmonitors events
+ack`. Round 10 proved that overlap unsafe rather than merely misleading: `acknowledgeSession`'s
+implicit "ack everything unread" path (the literal remedy the shared message recommends) would sweep
+the still-leased row too. `acknowledgeEvents` sets `acknowledgedAt` without requiring
+`firstNotifiedAt`, so if the in-flight push then rejects/disconnects and the lease releases the row
+back to `pending`, the row is already (wrongly) acknowledged and can never redeliver — event loss.
+
+Fixed on both sides:
+
+1. **Diagnosis** (`hook-delivery-diagnosis.ts`, `reminder-diagnosis.ts`): `HookDeliveryHoldReason`
+   and `ReminderSuppressionReason` gain a `reserved-in-flight` variant, reported whenever a band has
+   no durably claimed row but at least one leased row (`claimedCount === 0 && leasedCount > 0`). Its
+   message never mentions `events ack`. A mix of a durable claim and a live lease still reports
+   `coalesced-until-ack` (ack remains the correct remedy for the claimed portion) but now names the
+   leased portion separately so it isn't implied to need the same action. `HookDeliveryHold` and
+   `ReminderSuppressionFinding` both gain a `leasedCount` field.
+2. **The actual bug**: `AgentMonitorRuntime.acknowledgeSession(sessionId)` (no explicit `eventIds`)
+   now excludes rows currently leased by an outstanding reservation from its default "every unread
+   event" set. A scoped ack (explicit `eventIds`, e.g. a hook body-injection's per-batch instruction)
+   is unaffected — it names rows the caller actually saw. Regression: reserving a delivery, calling
+   `acknowledgeSession` with no ids, then releasing the reservation proves the row is still `unread`
+   and re-claimable, never silently lost.
+
+Updated 006 §5.2's `--debug` hold-reason list and 002 §10.7's `monitor explain` description to name
+`reserved-in-flight` and its no-ack constraint.
+
+## 2026-07-20 — `normalPending` is lease-aware (not merely "not-yet-claimed"), and the false "fresh event" recovery clause is removed from every normative surface (002 §9.2/§9.3/§13.3, 006 §5.1.1) — Refs #438, #434, PR #445 review round 8
+
+Two follow-on defects found on round 8 of reviewing the same change.
+
+**1. §9.2/§9.3/§13.3 promised a fresh unclaimed event restores a suppressed reminder.** They do not:
+starting from one claimed-but-unacknowledged row (`normalPending = 0`, `unreadNormal = 1`), a fresh
+unclaimed row makes it `1` and `2` — the equality guard (`normalPending.length === unreadNormal.length`)
+stays unsatisfied until the claimed row is specifically acknowledged, regardless of how many new
+unclaimed rows arrive. Removed the "or a fresh unclaimed event arrives" alternative from §9.2, §9.3, and
+the §13.3 worked example, and from the matching prose/messages in `reminder-diagnosis.ts` and
+`hook-delivery-diagnosis.ts` (both diagnostics' `coalesced-until-ack` branch already stated the correct,
+ack-only condition — only the `already-claimed` branch carried the false alternative).
+
+**2. §5.1.1 described `normalPending` as merely "not-yet-claimed."** `pendingForClaim` (issue #300) also
+excludes rows held by an in-flight channel-push reservation, so an unread, unclaimed, but currently
+leased row is absent from `normalPending` too — proven by the committed reservation regression, which
+shows a concurrent reminder stays suppressed until the lease releases. Reworded §5.1.1 to describe
+`normalPending` as pending **and currently claimable (not leased)**. This also means both diagnostics'
+`claimedCount = unreadCount - pendingCount` reports a leased-but-unclaimed row as `already-claimed`
+alongside truly claimed rows; documented that lease-aware overlap in both modules' doc comments rather
+than distinguishing it with a new reason (a public-API change to `HookDeliveryHoldReason`), and pinned
+the leased case with a dedicated regression.
+
+## 2026-07-20 — The coalesced-until-ack guard's band comparison no longer mislabels the pending side as claimed (006 §5.1.1) — Refs #438, #434, PR #445 review round 7
+
+One follow-on defect found on round 7 of reviewing the same change.
+
+**1. §5.1.1 described `normalPending` as the claimed-but-unacknowledged set.** `pendingForClaim`
+delegates to `pendingEventsForSession`, which requires `first_notified_at IS NULL` — so `normalPending`
+holds only not-yet-claimed rows. `unreadNormal` is the superset that additionally contains any
+claimed-but-unacknowledged row. The mixed-recap conclusion in the prior correction (round 6, above) was
+correct — `normalPending` is 1 (the fresh unclaimed row) while `unreadNormal` is 2 (that row plus the
+still-claimed recap row) — but describing the LHS as "claimed" could mislead an implementer into
+reversing the guard. Reworded lines 624-633 to say the runtime compares the band's pending/unclaimed
+count against its total unread count, and that claimed-but-unacknowledged rows appear only in the
+latter.
+
+## 2026-07-20 — The header-packing fixed-point search no longer oscillates into an under-scoped ack, and the coalesced-until-ack guard's mixed-recap case is documented correctly (006 §5.1.1) — Refs #438, #434, PR #445 review round 6
+
+Two more follow-on defects found on round 6 of reviewing the same change.
+
+**1. `resolveHookHeaderPacking`'s fixed-point-guess search could oscillate, under-scoping `--event-ids`
+(BLOCKER).** The prior iterative-narrowing search re-guessed the next candidate id count from the
+PREVIOUS candidate's packed-block count; at a specific boundary (two ~26-character event ids with
+~1,774-character bodies, reserved against the deferred marker) this bounced between guesses (`guess=2`
+packs 1 block; the resulting shorter 1-id header then packs 2 blocks; `guess` returns to 2, repeating)
+without ever landing on a self-consistent `k`, so the loop exhausted and fell back to the narrowest
+(0-id) header while BOTH blocks still rendered — an ack instruction naming zero ids for two rendered
+events, which a compliant agent could only satisfy with the no-id "ack everything" form, silently
+dropping unrelated deferred/recap rows into that same blanket ack. Resolved by testing each candidate
+`k` directly (descending from `events.length` to `0`, packing only `blocks.slice(0, k)` against the
+header built for `events.slice(0, k)`) rather than iterating a guess derived from the previous
+candidate's result — `k = 0` is always self-consistent (no ids, no blocks), so the search is guaranteed
+to terminate at a header whose named ids exactly match what's rendered. Regression test:
+`hook-deliver-render.test.ts` reproduces the exact oscillation boundary and asserts the rendered
+`--event-ids` count always equals the rendered `### ` block count.
+
+**2. §5.1.1's coalesced-until-ack correction overgeneralized the high-only case to mixed-band recaps.**
+The prior correction (round 5, below) stated an unacknowledged `high`-urgency **or mixed-band recap**
+claim does not block a new `normal`-urgency reminder. That's true for a `high`-only claim (it touches
+no `normal`/`low` row), but wrong for a mixed-band recap: if a `post-compact` recap claims an old
+`normal` (or `low`) event alongside `high` events, that row stays claimed-but-unacknowledged, so
+`normalPending` no longer equals `unreadNormal` once a fresh, unrelated `normal` event later arrives —
+the band-scoped equality guard suppresses that band's next `turn-interruptible` reminder too, until the
+recap's `normal`/`low` events are acknowledged. A current-head `service.ts` probe reproduced
+`normalPending=1`, `unreadNormal=2`, and a `null` claim. Corrected `006-agent-integration.md` to
+distinguish the high-only case from the mixed-recap case, and updated the stale `hook-deliver-render.ts`
+doc comment making the same overgeneralization; the public website (`agent-integration.md`) already
+scoped this correctly to "a `high`-only claim." Added a regression test (`service.test.ts`, "mixed-band
+recap suppression") reproducing the exact scenario above.
+
+## 2026-07-20 — Recap sizing reserves against the marker actually appended, the channel reminder's action step is sequenced list-then-ack everywhere, and the coalesced-until-ack guard's band scope is documented correctly (002 §9.2, 006 §4.2.1, §5.1.1) — Refs #438, #434, PR #445 review round 3
+
+Three more follow-on defects found on round 3 of reviewing the same change.
+
+**1. `resolveHookClaimFit` sized against the wrong marker for a `post-compact` recap (BLOCKER).**
+`resolveHookClaimFit` defaulted to reserving room for `buildHookDeferredMarker`'s length regardless of
+lifecycle, but `renderHookDelivery`'s recap branch appends the LONGER `buildHookRecapMarker` on top of
+that packing instead. Reserving against the shorter marker while appending the longer one could let a
+multi-event recap's rendered `additionalContext` exceed `MAX_ADDITIONAL_CONTEXT` (4000 chars). Resolved
+by threading the lifecycle-specific marker `renderHookDelivery` will actually append into
+`resolveHookClaimFit` as an explicit parameter, so `includedCount` stays truthful for both lifecycles.
+Regression test: a two-event recap boundary case (`hook-deliver-render.test.ts`) with a body length of
+3546 chars — the smallest size that genuinely overflows the cap under the pre-fix packing.
+
+**2. A stale channel-transport example still showed the bare-ack "OR" wording (§4.2.1) swept.** Round 2
+(below) fixed the channel reminder's rendered text and its spec prose, but left an illustrative example
+in `experiments/channel-uat/README.md` quoting the old "Call the agentmon_ack tool, or run `events
+list` ... for details" shape. Updated to the current list-then-scoped-ack wording so no reader copies
+the superseded phrasing.
+
+**3. The coalesced-until-ack suppression's spec prose and changeset overclaimed cross-band scope
+(§5.1.1).** Both `docs/specs/006-agent-integration.md` and the `self-sufficient-delivery-text`
+changeset described an unacknowledged claim as suppressing "every subsequent"/"every later"
+normal-urgency reminder for the session — but the guard
+(`normalPending.length === unreadNormal.length`; the low-urgency guard, §9.3, is the identical pattern)
+is band-scoped: it compares a band's own claimed-but-unacknowledged events against that SAME band's
+unread total. An unacknowledged `high`-urgency (or mixed-band recap) claim does not, on its own, block a
+NEW `normal`-urgency reminder from firing for unrelated, still-unclaimed `normal` events in the same
+session — the two coexist. Corrected both the spec prose and the changeset; added a regression test
+(`service.test.ts`, "cross-band independence") proving an unacked high-urgency claim does not suppress a
+same-session normal-urgency reminder.
+
 ## 2026-07-19 — The per-batch ack instruction is socket-scoped, and the channel reminder's action step no longer offers a blanket-ack shortcut (002 §9.2, 006 §5.1.1) — Refs #438, #434, PR #445 review round 2
 
 Two more follow-on defects found on round 2 of reviewing the same change, both in the same
@@ -4026,6 +4026,55 @@ call; both sections, plus the round-10 entry above, are now corrected to describ
 reserve → push/render → commit ordering and its three-way conditional outcome, and to document the
 mixed-case dual-marker rendering.
 
+## 2026-07-18 — Hook-deliver commits AFTER writing (not before), re-validates the candidate-growth race, `verify` reuses the same reserve/validate/commit flow, and marker selection is lifecycle-aware for post-compact recaps (006 §5.2, §5.5, §6.1) — Refs #442
+
+Four fixes found on this PR's round-9 review.
+
+- **An at-most-once loss window: `hook deliver` committed the reservation BEFORE rendering or
+  writing any output.** `commitDeliveryClient` — the durable `first_notified_at` mutation that
+  permanently excludes rows from ordinary redelivery — ran first; if the daemon applied the commit
+  but its RPC response was lost, or if rendering/stdout writing failed afterward, the command's
+  always-exit-0 try/catch swallowed the error and emitted nothing while the rows were durably
+  excluded from redelivery forever (recoverable only via the durable-but-unread `agentmonitors events
+list` copy). Fixed by inverting the order: `reserveRenderAndCommitHookDelivery` renders the
+  RESERVATION's own (not-yet-committed) claim immediately, and `writeAndCommitHookDelivery` writes
+  that output to stdout FIRST, committing only after a successful write. A write failure now releases
+  the reservation instead of committing (nothing durably claimed, rows return to pending); a commit
+  failure/uncertainty AFTER a successful write only risks a later DUPLICATE delivery — the safe
+  direction, never a loss. Mirrors the channel transport's reserve → push → commit ordering (§4,
+  issue #300).
+- **The hook transport's final fit check trusted `moreDeferred` from the PRE-reservation preview,**
+  which could go stale in the direction the round-8 fix didn't cover: a preview seeing only event A
+  sizes `maxEvents=1` and computes `moreDeferred=false`; event B settles before the reservation lands;
+  the reservation legitimately returns only A, which fits on its own, so the (stale) `false` was
+  returned unchanged — silently dropping the marker that would have told the agent B stays genuinely
+  pending (§5.5). Fixed by adding the same post-reservation candidate-growth re-check the channel
+  transport already had (`settledWorkRemainsBeyondClaim`, round-6 entry below): `reserveSizedHookDelivery`
+  re-runs the settled-high preview once more, after the reservation is accepted, and flips
+  `moreDeferred` to `true` when a settled event isn't in the reservation — recomputing fit against the
+  final, marker-reserving budget and releasing/retrying if it no longer fits.
+- **`verify`'s `claimAndRender` duplicated a bespoke, unvalidated preview → direct-claim → render
+  sequence of its own,** instead of reusing the hardened flow `hook deliver` uses — so `verify` could
+  pass even when the production claimed-set-equals-rendered-set contract (§5.5) was violated by the
+  same substitution race the round-8 fix closed on the real hook path. Fixed by extracting the shared
+  reserve → validate-fit → render → commit sequence into `reserveRenderAndCommitHookDelivery`
+  (`hook.ts`), which both `hook deliver` and `verify`'s `claimAndRender` now call.
+- **Marker selection wasn't lifecycle-aware: a `post-compact` recap could render either ordinary
+  marker, both of which are untruthful for it.** `decideDelivery`'s recap branch reads
+  `unreadEventsForSession` (not `pendingEventsForSession`) and claims the FULL unread candidate set at
+  commit time regardless of what actually renders — so a row being claimed never hides it from a
+  FUTURE recap, only acknowledging does. That makes the deferred-remainder marker's "not yet claimed"
+  framing wrong (the omitted blocks ARE claimed) and the claimed-unread marker's "will not redeliver
+  automatically" actively false (it WILL, on the next recap). Fixed by making `renderHookDelivery`
+  check `claim.lifecycle === 'post-compact'` and use a single, unified `buildHookRecapMarker` in place
+  of both ordinary markers for a recap.
+
+006 §5.2, §5.5, and §6.1 previously described commit-before-render, a preview-only candidate-growth
+guard, and a `claimDeliveryClient`-based capability-parity claim for `hook deliver`; all three are now
+corrected to match the shipped write-before-commit ordering, the hook-side growth re-check, and the
+reserve/commit sequence `hook deliver` (and `verify`) actually use. `channel-hooks-ipc-parity.test.ts`
+is updated to match.
+
 ## 2026-07-19 — Hook-deliver awaits the write's ACTUAL completion (not stdout's synchronous return), clears a stale `moreDeferred` for a raced-down eventless reminder, and reworks the pre-commit truncation marker to be truthful regardless of commit outcome (006 §5.1, §5.2, §5.5) — Refs #442
 
 Three fixes found on this PR's round-10 review, all consequences of round-9's render-before-commit
@@ -4082,111 +4131,6 @@ transport's pre-commit truncation markers, and described the synchronous `stdout
 write-completion signal; both are now corrected to the outcome-agnostic marker wording and the
 awaited-completion write seam actually shipped.
 
-## 2026-07-19 — Both transports' recovery markers now carry an explicit `--socket <path>`, a post-acceptance `moreDeferred` flip re-validates the actual claim's fit, and the hook side splits its marker framing to match the channel side's claimed-vs-deferred distinction (006 §4.2.1, §5.1, §5.5) — Refs #442
-
-Four fixes found on this PR's round-7 review, all following directly from the round-3/round-6/round-5
-entries below.
-
-- **A post-acceptance `moreDeferred` flip could commit a claim the render then silently shrinks.**
-  `reserveSizedChannelDelivery`'s candidate-set-growth re-check (round-6 entry below) computed
-  `revalidatedMoreDeferred` AFTER `resolveChannelClaimFit` had already accepted the claim against the
-  ORIGINAL `moreDeferred` value. At the cap boundary — two blocks that together fit under the FULL cap
-  but NOT under the marker-reserving budget — a third candidate settling in the revalidation window
-  flips `moreDeferred` to `true` post-acceptance; `renderChannelEvent` then has to reserve marker room
-  itself and silently drops the second block from the render while `meta.event_count` still reports
-  the full committed count. The fix recomputes `resolveChannelClaimFit` against the FINAL
-  `moreDeferred` value before trusting it, and releases/retries through the existing mismatch path on
-  a no-longer-fits result — exactly like the initial fit check does. Separately, if that revalidation
-  preview call itself rejects, the reservation is now released BEFORE the error propagates (it
-  previously threw first, leaving the reservation leased until the 30s TTL).
-- **The mid-truncation marker's recovery command was not reliably runnable.** `channel serve` may be
-  bound to an enabled workspace's own persisted/derived socket (issue #358), which takes precedence
-  over a stale `$AGENTMONITORS_SOCKET` — but `agentmonitors events list` itself resolves its socket
-  ENV-FIRST (issue #335), so a copy-pasted marker command with no `--socket` could silently query a
-  stale or different workspace's daemon. `buildChannelTruncatedMarker` and the hook transport's marker
-  builders now take the resolved `socketPath` and render an explicit, shell-quoted `--socket <path>`
-  clause; `channel.ts`/`hook.ts`/`verify.ts`/`session.ts` thread their own resolved socket through.
-- **The hook transport's single shared marker falsely implied the mid-truncated event would
-  redeliver.** `hook-deliver-render.ts` previously rendered both the genuinely-deferred-remainder
-  branch and the single-event mid-truncation branch (plus a truncated reminder message) with ONE
-  marker whose "more monitor updates are pending" framing is only true for the FIRST. Since
-  `claimDeliveryClient` claims (sets `first_notified_at`) synchronously, the mid-truncation/reminder
-  cases are already-claimed content being cut — they will NOT redeliver via the ordinary
-  context-event flow. The marker is split into `buildHookDeferredMarker` (kept for the genuinely
-  deferred case) and `buildHookClaimedUnreadMarker` (claimed-unread framing for the other two),
-  mirroring the channel transport's `CHANNEL_DEFERRED_MARKER` vs `buildChannelTruncatedMarker` split.
-- **006 §5.5 and a matching source comment falsely claimed a mid-truncated hook event re-delivers.**
-  Both are corrected to describe the claimed-unread recovery path (durable unread copy only, no
-  automatic redelivery), consistent with the marker split above.
-
-## 2026-07-19 — `command-poll` drains excess stdout/stderr instead of killing the command (003 §11.2) — Refs #302
-
-Clarifies the drain-not-kill contract for `command-poll`'s 1 MiB stdout cap, and documents an
-independent stderr retention cap. An earlier implementation used `execFile({ maxBuffer })`, which
-kills the child the instant either stream crosses the cap and reports the overflow as a truncated
-success with a fabricated zero exit code — losing the command's real exit status, mislabeling
-stderr-only overflow as stdout truncation, and potentially baselining a command that never actually
-finished its side effects. §11.2 now states explicitly that neither stream's retention cap is ever a
-kill trigger: both streams are consumed as they arrive (never buffered to completion), stdout retains
-its leading 1 MiB, stderr is bounded independently to a small cap sized for diagnostics, and the
-command always runs to its real completion with its real exit code reported.
-
-- No schema or persisted-shape change — `payload`/`snapshot`/`nextState` still carry
-  `{ command, exitCode, strategy, stdout, truncated }`; only the mechanics behind that `exitCode` and
-  `truncated` are now spelled out.
-- §11.7 gains four verification bullets: an overflow-then-side-effect-then-nonzero-exit case, a
-  large-stderr/small-stdout case, a simultaneous-large-stdout-and-stderr case, and a
-  keeps-writing-past-both-caps case that must still resolve promptly rather than hang the tick.
-
-## 2026-07-18 — Hook-deliver commits AFTER writing (not before), re-validates the candidate-growth race, `verify` reuses the same reserve/validate/commit flow, and marker selection is lifecycle-aware for post-compact recaps (006 §5.2, §5.5, §6.1) — Refs #442
-
-Four fixes found on this PR's round-9 review.
-
-- **An at-most-once loss window: `hook deliver` committed the reservation BEFORE rendering or
-  writing any output.** `commitDeliveryClient` — the durable `first_notified_at` mutation that
-  permanently excludes rows from ordinary redelivery — ran first; if the daemon applied the commit
-  but its RPC response was lost, or if rendering/stdout writing failed afterward, the command's
-  always-exit-0 try/catch swallowed the error and emitted nothing while the rows were durably
-  excluded from redelivery forever (recoverable only via the durable-but-unread `agentmonitors events
-list` copy). Fixed by inverting the order: `reserveRenderAndCommitHookDelivery` renders the
-  RESERVATION's own (not-yet-committed) claim immediately, and `writeAndCommitHookDelivery` writes
-  that output to stdout FIRST, committing only after a successful write. A write failure now releases
-  the reservation instead of committing (nothing durably claimed, rows return to pending); a commit
-  failure/uncertainty AFTER a successful write only risks a later DUPLICATE delivery — the safe
-  direction, never a loss. Mirrors the channel transport's reserve → push → commit ordering (§4,
-  issue #300).
-- **The hook transport's final fit check trusted `moreDeferred` from the PRE-reservation preview,**
-  which could go stale in the direction the round-8 fix didn't cover: a preview seeing only event A
-  sizes `maxEvents=1` and computes `moreDeferred=false`; event B settles before the reservation lands;
-  the reservation legitimately returns only A, which fits on its own, so the (stale) `false` was
-  returned unchanged — silently dropping the marker that would have told the agent B stays genuinely
-  pending (§5.5). Fixed by adding the same post-reservation candidate-growth re-check the channel
-  transport already had (`settledWorkRemainsBeyondClaim`, round-6 entry below): `reserveSizedHookDelivery`
-  re-runs the settled-high preview once more, after the reservation is accepted, and flips
-  `moreDeferred` to `true` when a settled event isn't in the reservation — recomputing fit against the
-  final, marker-reserving budget and releasing/retrying if it no longer fits.
-- **`verify`'s `claimAndRender` duplicated a bespoke, unvalidated preview → direct-claim → render
-  sequence of its own,** instead of reusing the hardened flow `hook deliver` uses — so `verify` could
-  pass even when the production claimed-set-equals-rendered-set contract (§5.5) was violated by the
-  same substitution race the round-8 fix closed on the real hook path. Fixed by extracting the shared
-  reserve → validate-fit → render → commit sequence into `reserveRenderAndCommitHookDelivery`
-  (`hook.ts`), which both `hook deliver` and `verify`'s `claimAndRender` now call.
-- **Marker selection wasn't lifecycle-aware: a `post-compact` recap could render either ordinary
-  marker, both of which are untruthful for it.** `decideDelivery`'s recap branch reads
-  `unreadEventsForSession` (not `pendingEventsForSession`) and claims the FULL unread candidate set at
-  commit time regardless of what actually renders — so a row being claimed never hides it from a
-  FUTURE recap, only acknowledging does. That makes the deferred-remainder marker's "not yet claimed"
-  framing wrong (the omitted blocks ARE claimed) and the claimed-unread marker's "will not redeliver
-  automatically" actively false (it WILL, on the next recap). Fixed by making `renderHookDelivery`
-  check `claim.lifecycle === 'post-compact'` and use a single, unified `buildHookRecapMarker` in place
-  of both ordinary markers for a recap.
-
-006 §5.2, §5.5, and §6.1 previously described commit-before-render, a preview-only candidate-growth
-guard, and a `claimDeliveryClient`-based capability-parity claim for `hook deliver`; all three are now
-corrected to match the shipped write-before-commit ordering, the hook-side growth re-check, and the
-reserve/commit sequence `hook deliver` (and `verify`) actually use. `channel-hooks-ipc-parity.test.ts`
-is updated to match.
-
 ## 2026-07-18 — The socket path in both markers is now transport-safe-escaped, the hook transport reserves/validates/commits instead of claiming directly, and its two markers can co-render (006 §4.2.1, §5.1, §5.5) — Refs #442
 
 Three fixes found on this PR's round-8 review.
@@ -4224,6 +4168,43 @@ Three fixes found on this PR's round-8 review.
 006 §5.1, §4.2.1, and the changeset for #436/#442 previously described only the socketless, unsplit
 recovery command; both are now corrected to match the shipped, split-marker, socket-and-session-scoped
 contract, including the mixed claimed-truncation + deferred-remainder case.
+
+## 2026-07-19 — Both transports' recovery markers now carry an explicit `--socket <path>`, a post-acceptance `moreDeferred` flip re-validates the actual claim's fit, and the hook side splits its marker framing to match the channel side's claimed-vs-deferred distinction (006 §4.2.1, §5.1, §5.5) — Refs #442
+
+Four fixes found on this PR's round-7 review, all following directly from the round-3/round-6/round-5
+entries below.
+
+- **A post-acceptance `moreDeferred` flip could commit a claim the render then silently shrinks.**
+  `reserveSizedChannelDelivery`'s candidate-set-growth re-check (round-6 entry below) computed
+  `revalidatedMoreDeferred` AFTER `resolveChannelClaimFit` had already accepted the claim against the
+  ORIGINAL `moreDeferred` value. At the cap boundary — two blocks that together fit under the FULL cap
+  but NOT under the marker-reserving budget — a third candidate settling in the revalidation window
+  flips `moreDeferred` to `true` post-acceptance; `renderChannelEvent` then has to reserve marker room
+  itself and silently drops the second block from the render while `meta.event_count` still reports
+  the full committed count. The fix recomputes `resolveChannelClaimFit` against the FINAL
+  `moreDeferred` value before trusting it, and releases/retries through the existing mismatch path on
+  a no-longer-fits result — exactly like the initial fit check does. Separately, if that revalidation
+  preview call itself rejects, the reservation is now released BEFORE the error propagates (it
+  previously threw first, leaving the reservation leased until the 30s TTL).
+- **The mid-truncation marker's recovery command was not reliably runnable.** `channel serve` may be
+  bound to an enabled workspace's own persisted/derived socket (issue #358), which takes precedence
+  over a stale `$AGENTMONITORS_SOCKET` — but `agentmonitors events list` itself resolves its socket
+  ENV-FIRST (issue #335), so a copy-pasted marker command with no `--socket` could silently query a
+  stale or different workspace's daemon. `buildChannelTruncatedMarker` and the hook transport's marker
+  builders now take the resolved `socketPath` and render an explicit, shell-quoted `--socket <path>`
+  clause; `channel.ts`/`hook.ts`/`verify.ts`/`session.ts` thread their own resolved socket through.
+- **The hook transport's single shared marker falsely implied the mid-truncated event would
+  redeliver.** `hook-deliver-render.ts` previously rendered both the genuinely-deferred-remainder
+  branch and the single-event mid-truncation branch (plus a truncated reminder message) with ONE
+  marker whose "more monitor updates are pending" framing is only true for the FIRST. Since
+  `claimDeliveryClient` claims (sets `first_notified_at`) synchronously, the mid-truncation/reminder
+  cases are already-claimed content being cut — they will NOT redeliver via the ordinary
+  context-event flow. The marker is split into `buildHookDeferredMarker` (kept for the genuinely
+  deferred case) and `buildHookClaimedUnreadMarker` (claimed-unread framing for the other two),
+  mirroring the channel transport's `CHANNEL_DEFERRED_MARKER` vs `buildChannelTruncatedMarker` split.
+- **006 §5.5 and a matching source comment falsely claimed a mid-truncated hook event re-delivers.**
+  Both are corrected to describe the claimed-unread recovery path (durable unread copy only, no
+  automatic redelivery), consistent with the marker split above.
 
 ## 2026-07-18 — The hook-deliver transport's truncation marker now advertises the same directly-runnable, session-scoped recovery command as the channel transport (006 §5.1, §5.5) — Refs #442
 
@@ -4397,6 +4378,25 @@ semantics as the hook-deliver transport, not a lesser summary.
 
 No change to runtime notify/debounce timing, urgency bands, projection, the unread/claimed/
 acknowledged model, or the reserve → commit/release transport-state semantics (§4.5.1).
+
+## 2026-07-19 — `command-poll` drains excess stdout/stderr instead of killing the command (003 §11.2) — Refs #302
+
+Clarifies the drain-not-kill contract for `command-poll`'s 1 MiB stdout cap, and documents an
+independent stderr retention cap. An earlier implementation used `execFile({ maxBuffer })`, which
+kills the child the instant either stream crosses the cap and reports the overflow as a truncated
+success with a fabricated zero exit code — losing the command's real exit status, mislabeling
+stderr-only overflow as stdout truncation, and potentially baselining a command that never actually
+finished its side effects. §11.2 now states explicitly that neither stream's retention cap is ever a
+kill trigger: both streams are consumed as they arrive (never buffered to completion), stdout retains
+its leading 1 MiB, stderr is bounded independently to a small cap sized for diagnostics, and the
+command always runs to its real completion with its real exit code reported.
+
+- No schema or persisted-shape change — `payload`/`snapshot`/`nextState` still carry
+  `{ command, exitCode, strategy, stdout, truncated }`; only the mechanics behind that `exitCode` and
+  `truncated` are now spelled out.
+- §11.7 gains four verification bullets: an overflow-then-side-effect-then-nonzero-exit case, a
+  large-stderr/small-stdout case, a simultaneous-large-stdout-and-stderr case, and a
+  keeps-writing-past-both-caps case that must still resolve promptly rather than hang the tick.
 
 ## 2026-07-18 — Channel transport commits claims only after a successful push: reserve → commit/release (006 §4.5.1) — Refs #300
 
@@ -4817,6 +4817,24 @@ Two follow-on fixes to the `lead-session` remediation shipped below (#387).
   "daemon-reachability ping", predating the #382 fix (above) that made `doctor` call the real
   `doctor.report` RPC over that socket, falling back in-process only when unreachable. Corrected.
 
+## 2026-07-15 — `doctor` lead-session remediation points at `session start`, a runnable command (005 §15) — Refs #387
+
+`doctor`'s `lead-session` remediation previously recommended `agentmonitors session open --role lead
+--workspace <path>`. That command is not runnable as printed: `session open`'s `--host-session-id`
+is a required option, so a copy-paste fails immediately with `error: required option
+'--host-session-id' not specified`, and a manual/no-plugin CLI user has no meaningful value to supply
+for it ("host session id from the integrating runtime"). In a blind usability evaluation this was the
+first dead end a manual CLI user hit — reached by following the tool's own printed advice.
+
+Fixed by pointing the remediation at `agentmonitors session start` — the flagless lazy-boot path that
+matches real usage (the `SessionStart` hook runs exactly this command; 005 §10.4): it boots the
+project daemon if needed and registers a lead session in one shot, and has no required options so it
+can never fail with a missing-required-option error. For the manual case the hint now prints the exact
+stdin payload `session start` reads (`session_id` + `cwd`, delivered as JSON on stdin like a real hook)
+with an explicit `manual-cli-session` placeholder, so the printed command runs verbatim. The existing
+issue #335 self-diagnosing invariant is preserved: the `detail` and remediation still name the exact
+workspace path doctor searched. `session open`'s own required-flag contract is unchanged (non-goal).
+
 ## 2026-07-16 — `doctor` survives version-skew daemons; a down daemon with a registered lead session fails instead of idling (005 §15) — Refs #382
 
 Two follow-on bugfixes to `agentmonitors doctor`'s exit-code contract (§15), both discovered by
@@ -4855,6 +4873,52 @@ review after the #373 fix above.
   old-daemon server answering the legacy sentinel for `doctor.report` proves `doctor` falls back and
   exits 0 without ever printing the raw sentinel text; a real daemon killed while a lead session is
   registered proves `daemon-reachable` fails (exit 1) while `lead-session` itself still passes.
+
+## 2026-07-15 — `init --command` seed for command-poll + untouched-default `validate` warning (005 §2, §3) — Refs #388
+
+`init <name> --type command-poll` always scaffolded the fixed default command `git ls-remote origin
+refs/heads/main`, regardless of the author's intent. Because that default still **validates** and
+still **runs**, a scaffold left untouched silently watched the wrong thing for any other intent
+(e.g. an author wanting "uncommitted changes" — `git status --porcelain`) — worse than a hard
+failure, which is at least visible (blind usability evaluation, issue #388).
+
+- **005 §2 — new `--command` seed flag.** Mirrors `--glob`: repeatable, scaffold-form only, seeds
+  `watch.command` **one argv token per flag, order-preserving** (`--command git --command status
+--command --porcelain` → `command: [git, status, --porcelain]`). Each token is emitted as a
+  single-quoted YAML scalar so leading-dash tokens / spaces / `#` / `:` round-trip verbatim; the CLI
+  never whitespace-splits, so it never invents shell semantics the source lacks (spec 003
+  command-poll is argv, no shell). Rejected for any `--type` other than `command-poll` with a clear
+  stderr message and no directory created, mirroring `--glob`'s guard.
+- **005 §2/§3 — untouched-default is no longer a silent trap.** The template keeps the illustrative
+  upstream-tip default when `--command` is omitted (so it still validates and runs), but `validate`
+  now emits a **soft, non-fatal warning** for a `command-poll` monitor whose `watch.command` still
+  equals the exact untouched default. The warning does not change the valid/invalid counts or the
+  exit code; it is safe to ignore when upstream-tip polling is the real intent.
+- **005 §3 — additive `warnings` output.** Text output gains an optional `Warnings: <n>` section
+  (omitted when empty); JSON output gains a `warnings: [{ id, warning }]` array (`[]` when none).
+  Additive only — the valid/invalid counts, exit code, and existing JSON keys are unchanged, so
+  existing consumers are unaffected.
+
+## 2026-07-15 — `init <name>` always seeds a derived `name:` (005 §2 current) — Refs #375
+
+`init <name>`'s scaffold path previously left `name:` as the chosen `--type`'s literal template
+placeholder (`My monitor`, `Upstream branch monitor`, …) whenever `--name` was omitted, so a
+rushed author could commit a monitor that was never renamed to describe what it watches.
+
+- **005 §2 — current.** `--name` is no longer the only way `name:` gets seeded: when omitted, the
+  scaffold now derives a readable value from the positional `[name]` (`-`/`_`-separated segments
+  joined with spaces, first segment capitalized — e.g. `watch-docs` → `Watch docs`) and seeds that
+  instead. `--name` still overrides with its own value, verbatim. This only affects the named
+  scaffold path (`init <name>`); the bare bootstrap path (`init`, no name) is unaffected, per the
+  issue #330 non-goal that bootstrap scaffolding stays untouched by seed-flag work.
+- **005 §2 — current.** The `command-poll` template's inline comment previously warned that local
+  commands "such as `git status`" can stay stale until a fetch — backwards advice that
+  contradicted the `skill.md` authoring guide's own recommended minimal `command-poll` example,
+  `git status --porcelain`. The comment now scopes that staleness caveat to a local read of a
+  remote-tracking ref (e.g. `git rev-parse origin/main`); the scaffold's own `git ls-remote`
+  queries the remote live and is always current, and `git status --porcelain` is local
+  working-tree state with no fetch lag — so the comment no longer discourages a correct,
+  guide-recommended setup.
 
 ## 2026-07-16 — First-class `verify` command replaces the manual Phase-5 proof recipe (005 §16, new) — Refs #399
 
@@ -4904,70 +4968,6 @@ single command.
   change → PASS with delivered `additionalContext` and scratch cleanup; a `debounce` monitor still
   reaching PASS despite `no-change` ticks while it settles; `no-change` and `budget-exceeded` FAILs
   naming the correct stage; monitor-not-found / ambiguous setup errors).
-
-## 2026-07-15 — `doctor` lead-session remediation points at `session start`, a runnable command (005 §15) — Refs #387
-
-`doctor`'s `lead-session` remediation previously recommended `agentmonitors session open --role lead
---workspace <path>`. That command is not runnable as printed: `session open`'s `--host-session-id`
-is a required option, so a copy-paste fails immediately with `error: required option
-'--host-session-id' not specified`, and a manual/no-plugin CLI user has no meaningful value to supply
-for it ("host session id from the integrating runtime"). In a blind usability evaluation this was the
-first dead end a manual CLI user hit — reached by following the tool's own printed advice.
-
-Fixed by pointing the remediation at `agentmonitors session start` — the flagless lazy-boot path that
-matches real usage (the `SessionStart` hook runs exactly this command; 005 §10.4): it boots the
-project daemon if needed and registers a lead session in one shot, and has no required options so it
-can never fail with a missing-required-option error. For the manual case the hint now prints the exact
-stdin payload `session start` reads (`session_id` + `cwd`, delivered as JSON on stdin like a real hook)
-with an explicit `manual-cli-session` placeholder, so the printed command runs verbatim. The existing
-issue #335 self-diagnosing invariant is preserved: the `detail` and remediation still name the exact
-workspace path doctor searched. `session open`'s own required-flag contract is unchanged (non-goal).
-
-## 2026-07-15 — `init --command` seed for command-poll + untouched-default `validate` warning (005 §2, §3) — Refs #388
-
-`init <name> --type command-poll` always scaffolded the fixed default command `git ls-remote origin
-refs/heads/main`, regardless of the author's intent. Because that default still **validates** and
-still **runs**, a scaffold left untouched silently watched the wrong thing for any other intent
-(e.g. an author wanting "uncommitted changes" — `git status --porcelain`) — worse than a hard
-failure, which is at least visible (blind usability evaluation, issue #388).
-
-- **005 §2 — new `--command` seed flag.** Mirrors `--glob`: repeatable, scaffold-form only, seeds
-  `watch.command` **one argv token per flag, order-preserving** (`--command git --command status
---command --porcelain` → `command: [git, status, --porcelain]`). Each token is emitted as a
-  single-quoted YAML scalar so leading-dash tokens / spaces / `#` / `:` round-trip verbatim; the CLI
-  never whitespace-splits, so it never invents shell semantics the source lacks (spec 003
-  command-poll is argv, no shell). Rejected for any `--type` other than `command-poll` with a clear
-  stderr message and no directory created, mirroring `--glob`'s guard.
-- **005 §2/§3 — untouched-default is no longer a silent trap.** The template keeps the illustrative
-  upstream-tip default when `--command` is omitted (so it still validates and runs), but `validate`
-  now emits a **soft, non-fatal warning** for a `command-poll` monitor whose `watch.command` still
-  equals the exact untouched default. The warning does not change the valid/invalid counts or the
-  exit code; it is safe to ignore when upstream-tip polling is the real intent.
-- **005 §3 — additive `warnings` output.** Text output gains an optional `Warnings: <n>` section
-  (omitted when empty); JSON output gains a `warnings: [{ id, warning }]` array (`[]` when none).
-  Additive only — the valid/invalid counts, exit code, and existing JSON keys are unchanged, so
-  existing consumers are unaffected.
-
-## 2026-07-15 — `init <name>` always seeds a derived `name:` (005 §2 current) — Refs #375
-
-`init <name>`'s scaffold path previously left `name:` as the chosen `--type`'s literal template
-placeholder (`My monitor`, `Upstream branch monitor`, …) whenever `--name` was omitted, so a
-rushed author could commit a monitor that was never renamed to describe what it watches.
-
-- **005 §2 — current.** `--name` is no longer the only way `name:` gets seeded: when omitted, the
-  scaffold now derives a readable value from the positional `[name]` (`-`/`_`-separated segments
-  joined with spaces, first segment capitalized — e.g. `watch-docs` → `Watch docs`) and seeds that
-  instead. `--name` still overrides with its own value, verbatim. This only affects the named
-  scaffold path (`init <name>`); the bare bootstrap path (`init`, no name) is unaffected, per the
-  issue #330 non-goal that bootstrap scaffolding stays untouched by seed-flag work.
-- **005 §2 — current.** The `command-poll` template's inline comment previously warned that local
-  commands "such as `git status`" can stay stale until a fetch — backwards advice that
-  contradicted the `skill.md` authoring guide's own recommended minimal `command-poll` example,
-  `git status --porcelain`. The comment now scopes that staleness caveat to a local read of a
-  remote-tracking ref (e.g. `git rev-parse origin/main`); the scaffold's own `git ls-remote`
-  queries the remote live and is always current, and `git status --porcelain` is local
-  working-tree state with no fetch lag — so the comment no longer discourages a correct,
-  guide-recommended setup.
 
 ## 2026-07-15 — Test-bearing packages must fail on a zero-test suite (004 §2.8, new) — Refs #288
 
@@ -5276,43 +5276,6 @@ as persistent `MONITOR.md` monitors (AP7). All entries below are _current_.
   hook-state + `hook claim` delivery → cancel; plus invalid-scope parity with `validate`).
 - **Roadmap:** G17 retired to a shipped blockquote.
 
-## 2026-07-15 — Document + harden the hook-deliver warning's untrusted-id rendering (005 §12.2.1, 006 §5.2.1) — Refs #329
-
-The always-on unknown-session stderr warning (issue #329) renders an id taken from untrusted
-stdin. Two follow-ups from a post-merge review:
-
-- **005 §12.2.1 / 006 §5.2.1 — clarified (current).** Both sections now state the rendering
-  contract the implementation applies: the id is JSON-string-escaped (control characters never
-  reach the terminal raw) and truncated at 128 characters with a trailing `…` — matching how the
-  same specs document the analogous `additionalContext` truncation contract with precision.
-- **Not a contract change — CLI hardening:** the truncation now cuts at a Unicode code-point
-  boundary (a raw `slice` could split a surrogate pair straddling the cap, leaving a lone
-  surrogate rendered as a garbled escape), following the same rationale as `hook deliver`'s
-  render-side `truncateForCap`. The escaping also covers what `JSON.stringify` alone leaves
-  raw — DEL, the C1 controls (U+0080–U+009F, e.g. CSI), and the U+2028/U+2029 line/paragraph
-  separators — so the "control-safe one line" wording holds for the full range, matching the
-  C0/C1 handling in the render-side `sanitize`.
-
-## 2026-07-15 — Add the channel-transport manual UAT recipe (006 §4) — Refs #277
-
-The channel transport's "Status: implemented" note has named an outstanding manual UAT
-(channels are research-preview, not CI-able) since it shipped, but no written recipe existed —
-"did the channel path regress" depended on whoever remembered how to test it by hand.
-
-- **006 §4 — clarified (current), one-line pointer added.** The UAT-gating note now links
-  [`docs/uat/channel-transport.md`](../uat/channel-transport.md), a numbered, copy-runnable recipe
-  covering setup, the `<channel>` push and its field schema (§4.2), cross-transport dedup (§4.5),
-  in-session acknowledgement via `agentmon_ack` (§4.3) verified through `events list`, and a
-  blocked-channel step proving hooks-only delivery with a silent no-op (§6/NP-CH). No behavior
-  changed; this is documentation-only.
-- **Not a spec change — discovered while grounding the recipe in the real code.** `channel serve`,
-  spawned with no `--socket` flag exactly as the plugin's `.mcp.json` spawns it, does not resolve
-  the same per-workspace socket a `session start`-lazy-booted daemon binds to for an enabled
-  project (it falls back to the stale global-default socket, where nothing is listening), so the
-  channel push silently never arrives in the real, unmodified plugin flow. Filed as #358 with a
-  confirmed repro and suggested fix; the UAT recipe documents a pre-seed workaround so the rest of
-  the recipe (ack, dedup, blocked-channel) remains fully runnable in the meantime.
-
 ## 2026-07-14 — Watch-mode source-state checkpointing implemented (002 §2.4 target → current) — Refs #278
 
 The watch-checkpoint core contract (002 §2.4, landed as _target_ via the #192 design pass) is now
@@ -5374,6 +5337,23 @@ are _current_.
   api-extractor rollup regeneration and a minor `@agentmonitors/core` changeset (the umbrella
   `agentmonitors` launcher re-exports nothing from `@agentmonitors/core`, so it is not part of this
   changeset; `updateInternalDependencies: "patch"` cascades it a patch bump automatically).
+
+## 2026-07-15 — Document + harden the hook-deliver warning's untrusted-id rendering (005 §12.2.1, 006 §5.2.1) — Refs #329
+
+The always-on unknown-session stderr warning (issue #329) renders an id taken from untrusted
+stdin. Two follow-ups from a post-merge review:
+
+- **005 §12.2.1 / 006 §5.2.1 — clarified (current).** Both sections now state the rendering
+  contract the implementation applies: the id is JSON-string-escaped (control characters never
+  reach the terminal raw) and truncated at 128 characters with a trailing `…` — matching how the
+  same specs document the analogous `additionalContext` truncation contract with precision.
+- **Not a contract change — CLI hardening:** the truncation now cuts at a Unicode code-point
+  boundary (a raw `slice` could split a surrogate pair straddling the cap, leaving a lone
+  surrogate rendered as a garbled escape), following the same rationale as `hook deliver`'s
+  render-side `truncateForCap`. The escaping also covers what `JSON.stringify` alone leaves
+  raw — DEL, the C1 controls (U+0080–U+009F, e.g. CSI), and the U+2028/U+2029 line/paragraph
+  separators — so the "control-safe one line" wording holds for the full range, matching the
+  C0/C1 handling in the render-side `sanitize`.
 
 ## 2026-07-14 — Namespace persisted monitor runtime state + observation history by workspace (002 §3, `monitor_state`/`observation_history` schema) — Refs #345, #307
 
@@ -5437,6 +5417,26 @@ can never deliver.
   `--debug`-gated) `describeNoSessionMatch` diagnosis.
 - **No behavior change to stdout, exit codes, or the settle-window/holding branches** — those stay
   exactly as silent as before; only the never-resolvable unknown-session branch gained a signal.
+
+## 2026-07-15 — Add the channel-transport manual UAT recipe (006 §4) — Refs #277
+
+The channel transport's "Status: implemented" note has named an outstanding manual UAT
+(channels are research-preview, not CI-able) since it shipped, but no written recipe existed —
+"did the channel path regress" depended on whoever remembered how to test it by hand.
+
+- **006 §4 — clarified (current), one-line pointer added.** The UAT-gating note now links
+  [`docs/uat/channel-transport.md`](../uat/channel-transport.md), a numbered, copy-runnable recipe
+  covering setup, the `<channel>` push and its field schema (§4.2), cross-transport dedup (§4.5),
+  in-session acknowledgement via `agentmon_ack` (§4.3) verified through `events list`, and a
+  blocked-channel step proving hooks-only delivery with a silent no-op (§6/NP-CH). No behavior
+  changed; this is documentation-only.
+- **Not a spec change — discovered while grounding the recipe in the real code.** `channel serve`,
+  spawned with no `--socket` flag exactly as the plugin's `.mcp.json` spawns it, does not resolve
+  the same per-workspace socket a `session start`-lazy-booted daemon binds to for an enabled
+  project (it falls back to the stale global-default socket, where nothing is listening), so the
+  channel push silently never arrives in the real, unmodified plugin flow. Filed as #358 with a
+  confirmed repro and suggested fix; the UAT recipe documents a pre-seed workaround so the rest of
+  the recipe (ack, dedup, blocked-channel) remains fully runnable in the meantime.
 
 ## 2026-07-14 — Local-data permission hardening: no split-brain, no daemon crash, degrade gracefully (002 §3.1, §10.3) — Refs #292
 
@@ -7389,6 +7389,30 @@ and renderer truncation-marker + surrogate-pair unit tests.
 
 ---
 
+## 2026-06-09 — Package scope rename: `@mike-north/*` → `@agentmonitors/*`; public npm publish
+
+All published packages now use the `@agentmonitors` npm scope published to public npm
+(`https://registry.npmjs.org`), replacing the previous `@mike-north` GitHub Packages scope.
+The CLI (`@agentmonitors/cli`) is now a publishable package (no longer `private: true`); the
+canonical install is `npm install -g @agentmonitors/cli`.
+
+Packages renamed:
+
+- `@mike-north/core` → `@agentmonitors/core`
+- `@mike-north/source-file-fingerprint` → `@agentmonitors/source-file-fingerprint`
+- `@mike-north/source-api-poll` → `@agentmonitors/source-api-poll`
+- `@mike-north/source-schedule` → `@agentmonitors/source-schedule`
+- `@mike-north/source-incoming-changes` → `@agentmonitors/source-incoming-changes`
+- `@mike-north/cli` → `@agentmonitors/cli`
+- `@mike-north/website` → `@agentmonitors/website`
+
+Release pipeline: `release.yml` now uses `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` (repo
+owner must add the `NPM_TOKEN` secret). Changeset `access` set to `"public"`.
+
+No spec behavior changes. All package references in docs, source files, and tooling updated.
+
+---
+
 ## 2026-06-10 — Plan D Tasks 2–3: hook-deliver renderer + `hook deliver` command
 
 - Added `apps/cli/src/hook-deliver-render.ts` — a **pure, side-effect-free renderer** that maps a
@@ -7411,30 +7435,6 @@ and renderer truncation-marker + surrogate-pair unit tests.
 - [006 §5](./006-agent-integration.md) added (hook-deliver transport spec: wire contract, behavior
   steps, lifecycle-to-delivery mapping, and hook registration examples).
 - `.changeset/hook-deliver-command.md`: `@agentmonitors/cli` minor (new `hook deliver` command).
-
----
-
-## 2026-06-09 — Package scope rename: `@mike-north/*` → `@agentmonitors/*`; public npm publish
-
-All published packages now use the `@agentmonitors` npm scope published to public npm
-(`https://registry.npmjs.org`), replacing the previous `@mike-north` GitHub Packages scope.
-The CLI (`@agentmonitors/cli`) is now a publishable package (no longer `private: true`); the
-canonical install is `npm install -g @agentmonitors/cli`.
-
-Packages renamed:
-
-- `@mike-north/core` → `@agentmonitors/core`
-- `@mike-north/source-file-fingerprint` → `@agentmonitors/source-file-fingerprint`
-- `@mike-north/source-api-poll` → `@agentmonitors/source-api-poll`
-- `@mike-north/source-schedule` → `@agentmonitors/source-schedule`
-- `@mike-north/source-incoming-changes` → `@agentmonitors/source-incoming-changes`
-- `@mike-north/cli` → `@agentmonitors/cli`
-- `@mike-north/website` → `@agentmonitors/website`
-
-Release pipeline: `release.yml` now uses `NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}` (repo
-owner must add the `NPM_TOKEN` secret). Changeset `access` set to `"public"`.
-
-No spec behavior changes. All package references in docs, source files, and tooling updated.
 
 ---
 
