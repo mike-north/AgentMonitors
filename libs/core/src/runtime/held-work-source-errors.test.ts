@@ -665,13 +665,28 @@ describe('held notify work despite source observation failures (#558)', () => {
       const inFlight = f.tick('a');
       await stalled;
       f.cancelEphemeral('a', record.id);
+      const retired = f.state('a', record.id);
+      expect(retired).toEqual({
+        ...held,
+        notifyState: {
+          ...held.notifyState,
+          pendingDebounce: undefined,
+          disposition: {
+            monitorId: record.id,
+            disposition: 'discarded-on-cancel',
+            observations: 1,
+            recordedAt: '2026-03-20T08:00:16.000Z',
+          },
+        },
+      });
       f.failStalled('eph');
       const failed = await inFlight;
 
       expect(failed.emittedEventIds).toEqual([]);
       expect(f.events('a', record.id)).toEqual([]);
       expect(f.sessionEvents('a')).toEqual([]);
-      expect(f.state('a', record.id)).toEqual(held); // the hold was not flushed
+      // Late source failure cannot resurrect work already accounted for by cancel.
+      expect(f.state('a', record.id)).toEqual(retired);
       expect(
         f.history('a', record.id).some((row) => row.result === 'triggered'),
       ).toBe(false);

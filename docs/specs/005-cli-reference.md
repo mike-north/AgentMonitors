@@ -738,6 +738,13 @@ runtime can release this work under its notify policy.` An unresolved source
 instead asks to restore its registration. Repair permits release under 002 §4; it does not bypass pacing,
 retry ordering or captured-envelope validation.
 
+**Retired notify work (current, #667).** For a retired ephemeral monitor with a
+discard receipt, the notify stage is `ok` and reports `discarded-on-cancel` or
+`discarded-on-retirement`, its accepted observation count and recording time.
+JSON `stages[].details` contains `monitorId`, `disposition`, `recordedAt` and
+`observations`. Text includes the identifier and count, including when the
+declaration is no longer active. This is terminal accounting, not a pending hold.
+
 For a single batch, JSON `stages[].details` keeps its existing `observations`,
 `dueAt`/`overdue` (debounce) or `window` (rollup), and adds `monitorId`, `strategy`,
 `blockedByDefinition`, `releaseBarrier` and `reason`; rollup also includes its captured `timezone`
@@ -2417,8 +2424,19 @@ query. An inactive owner, including one already due for reaping, gets
 `releaseBarrier: "owner-inactive"`: no future tick releases this work under that
 owner, and no definition file exists to edit. An unavailable source gets
 `"source-unavailable"` and asks to restore its registration. A cancelled/reaped
-record gets `"declaration-retired"` and no future-release promise. These barriers
+record with legacy or inconsistent held state gets `"declaration-retired"` and no future-release promise. These barriers
 are distinct from `"definition-rejected"`, whose remedy remains file repair.
+
+Cancellation, explicit session end and inactivity retirement replace accepted
+holds with the durable disposition defined in 002 §6.4. Doctor JSON lists these
+as top-level `heldNotifyDispositions` (empty when none exist), independently of
+active declarations and `heldNotifyWork`. Text prints
+`Notify disposition <id>: <disposition>; discarded <count> accepted observation(s) at <time>.`
+The same receipt appears in `monitor explain <id>`'s notify stage. Both commands
+retain this account after database reopen and never describe it as stranded work.
+
+Verified: `apps/cli/src/commands/held-notify.integration.test.ts` — built doctor
+and monitor explain commands in JSON and text with a cancelled, tick-admitted hold.
 
 The other values are `"workspace-mismatch"` (inspect the declaring workspace),
 `"declaration-invalid"` (restore source compatibility or declare a replacement,

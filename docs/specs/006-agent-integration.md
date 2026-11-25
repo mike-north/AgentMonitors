@@ -663,7 +663,7 @@ shape:
 
   is used when a single event block or reminder exceeds the cap. The marker points to the full
   unread copy. A monitor claim can become eligible again after its TTL, and a truncated direct
-  post ends its schedule when the offer is consumed (§4.5.1). Both markers
+  post ends its schedule when successful output is committed (§4.5.1). Both markers
   may appear together in the same `additionalContext` (issue
   #442, PR #442 round-8 review): when the sole claimed event is itself oversized (the second
   marker's case) AND further, different high-urgency work also stays genuinely pending beyond it

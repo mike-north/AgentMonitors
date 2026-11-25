@@ -55,6 +55,8 @@ import {
 } from './store.js';
 import {
   heldMonitorIds,
+  monitorStateRoutes,
+  dispositionMonitorIds,
   withStoreWriter,
   learnNotifyPolicyIdentity,
   commitNotifyPolicyEdit,
@@ -93,6 +95,7 @@ import {
 import type {
   AgentSessionRecord,
   HeldNotifyBarrier,
+  HeldNotifyDisposition,
   DeclareEphemeralMonitorInput,
   DeliveryClaim,
   DeliveryEventSummary,
@@ -1638,8 +1641,21 @@ export class AgentMonitorRuntime {
   }
 
   closeSession(sessionId: string, now = new Date()): AgentSessionRecord {
-    const ephemerals = this.store.listEphemeralMonitorsForSession(sessionId);
-    const session = this.store.closeSession(sessionId);
+    // Commit owner liveness, declaration retirement and accepted-work accounting
+    // together. Failure leaves the owner and every held envelope recoverable.
+    const { session, ephemerals } = runRuntimeTransaction(this.store, () => {
+      const ephemerals = this.store.listEphemeralMonitorsForSession(sessionId);
+      const session = this.store.closeSession(sessionId);
+      for (const record of ephemerals) {
+        this.discardRetiringNotifyWork(
+          record.id,
+          'discarded-on-retirement',
+          now,
+        );
+      }
+      this.store.reapEphemeralMonitorsForSession(sessionId);
+      return { session, ephemerals };
+    });
     // An ended owner no longer needs verify's proof delivery: its registered
     // artifacts gain cleanup authority now (002 §2.8, issue #562). A crash
     // between the close above and this record is repaired by the next tick's
@@ -1656,7 +1672,6 @@ export class AgentMonitorRuntime {
     // after a daemon restart. Reaping retains their already-materialized events
     // (the session record goes dormant, not deleted) so a late delivery is never
     // silently dropped (007 §4.4 default retention, PP1).
-    this.store.reapEphemeralMonitorsForSession(sessionId);
     for (const record of ephemerals) this.retirePollAdmission(record.id);
     this.refreshHookState(session.id);
     return session;
@@ -1807,9 +1822,50 @@ export class AgentMonitorRuntime {
         `Ephemeral monitor "${ephemeralId}" was not found for session "${sessionId}".`,
       );
     }
-    this.store.reapEphemeralMonitor(ephemeralId);
+    runRuntimeTransaction(this.store, () => {
+      this.discardRetiringNotifyWork(
+        ephemeralId,
+        'discarded-on-cancel',
+        new Date(),
+      );
+      this.store.reapEphemeralMonitor(ephemeralId);
+    });
     this.retirePollAdmission(ephemeralId);
     return this.store.getEphemeralMonitorById(ephemeralId);
+  }
+
+  /**
+   * Replace accepted holds with a terminal receipt inside the caller's retirement
+   * transaction. Global owners can accumulate work on several workspace routes;
+   * each route accounts for its own observations. Repeated retirement preserves
+   * the original receipt, and materialized events and source baselines are retained.
+   */
+  private discardRetiringNotifyWork(
+    monitorId: string,
+    disposition: HeldNotifyDisposition['disposition'],
+    now: Date,
+  ): void {
+    for (const workspacePath of monitorStateRoutes(this.store, monitorId)) {
+      const state = this.store.getMonitorState(monitorId, workspacePath);
+      const { pendingDebounce, pendingRollup, ...notifyState } =
+        state.notifyState;
+      const observations =
+        (pendingDebounce?.observations.length ?? 0) +
+        (pendingRollup?.observations.length ?? 0);
+      if (observations === 0) continue;
+      this.store.setMonitorState(monitorId, workspacePath, {
+        ...state,
+        notifyState: {
+          ...notifyState,
+          disposition: {
+            monitorId,
+            disposition,
+            recordedAt: now.toISOString(),
+            observations,
+          },
+        },
+      });
+    }
   }
 
   /**
@@ -2297,14 +2353,26 @@ export class AgentMonitorRuntime {
       input.monitorId,
       workspacePath,
     );
-    const rejectedHoldStage = heldNotifyStage(
-      describeHeldNotifyWork(
-        input.monitorId,
-        runtimeState.notifyState,
-        this.heldReleaseBarrier(input.monitorId, workspacePath, scan, now),
-        now,
-      ),
-    );
+    const receipt = runtimeState.notifyState.disposition;
+    // A receipt accounts for past discards. Persisted holds are present work
+    // even beside an older receipt, and must agree with doctor's diagnosis.
+    const rejectedHoldStage =
+      heldNotifyStage(
+        describeHeldNotifyWork(
+          input.monitorId,
+          runtimeState.notifyState,
+          this.heldReleaseBarrier(input.monitorId, workspacePath, scan, now),
+          now,
+        ),
+      ) ??
+      (receipt
+        ? explainStage(
+            'notify',
+            'ok',
+            `${receipt.disposition}: discarded ${String(receipt.observations)} accepted observation(s) at ${receipt.recordedAt}.`,
+            { ...receipt },
+          )
+        : undefined);
 
     if (parseError) {
       stages.push(
@@ -3159,6 +3227,14 @@ export class AgentMonitorRuntime {
     return {
       generatedAt: now,
       heldNotifyWork,
+      heldNotifyDispositions: dispositionMonitorIds(
+        this.store,
+        workspacePath,
+      ).flatMap((monitorId) => {
+        const receipt = this.store.getMonitorState(monitorId, workspacePath)
+          .notifyState.disposition;
+        return receipt ? [receipt] : [];
+      }),
       monitorsDir,
       workspacePath,
       monitorsDirExists,
@@ -5635,6 +5711,25 @@ export class AgentMonitorRuntime {
   }
 
   /**
+   * Admission authority for a session-owned declaration must be read under the
+   * same SQLite writer lock as notify/event writes. Captured tick lists and
+   * process-local poll flags cannot see retirement on another connection.
+   * Persistent monitors have no declaring session and retain their own policy.
+   */
+  private canAdmitEphemeralWork(
+    monitorId: string,
+    sessionId: string | undefined,
+  ): boolean {
+    if (sessionId === undefined) return true;
+    const declaration = this.store.findEphemeralMonitorById(monitorId);
+    return (
+      declaration?.status === 'active' &&
+      declaration.sessionId === sessionId &&
+      this.store.findSessionById(sessionId)?.status === 'active'
+    );
+  }
+
+  /**
    * Funnel a batch of observations through notify dispatch, persist the updated
    * monitor state, and materialize the emitted observations into durable events.
    * Shared by the tick loop (one-shot `observe()`) and the continuous watcher
@@ -5698,6 +5793,12 @@ export class AgentMonitorRuntime {
     });
 
     const admitted = runRuntimeTransaction(this.store, () => {
+      // Retirement and admission serialize here, including separate runtimes.
+      // An unaccepted late result changes neither the receipt nor the source
+      // checkpoint, observation clock, held work or materialized events.
+      if (!this.canAdmitEphemeralWork(monitor.id, options.ephemeralSessionId)) {
+        return undefined;
+      }
       // Read and decide under the same write lock as admission. Another writer's
       // held notify work must participate in dispatch rather than be overwritten
       // by a stale pre-transaction snapshot.
@@ -5772,6 +5873,7 @@ export class AgentMonitorRuntime {
         notHeld: dispatch.notHeld,
       };
     });
+    if (!admitted) return { emittedEventIds: [], failures: [] };
     // Refusals are reported only once the admission transaction has committed
     // and the span has materialized, so a throwing report callback can never
     // cut off committed work, and a rolled-back span reports none.
@@ -5815,6 +5917,11 @@ export class AgentMonitorRuntime {
     drained?: DrainedHistory,
   ): Promise<MaterializationSpanResult> {
     const admitted = runRuntimeTransaction(this.store, () => {
+      // An older tick's rollup check or source-failure flush has no authority
+      // after retirement, just like a batch returning from observe().
+      if (!this.canAdmitEphemeralWork(monitor.id, ephemeralSessionId)) {
+        return undefined;
+      }
       const current = this.store.getMonitorState(monitor.id, workspacePath);
       const dispatch = this.dispatchNotify(
         monitor,
@@ -5845,8 +5952,9 @@ export class AgentMonitorRuntime {
     // too. It has already cleared the hold, and it writes no row, so on the
     // failing-source path the source's `errored` row stays the newest (002 §2.6).
     if (
-      admitted.durable.materialized.length === 0 &&
-      admitted.durable.failures.length === 0
+      !admitted ||
+      (admitted.durable.materialized.length === 0 &&
+        admitted.durable.failures.length === 0)
     )
       return { emittedEventIds: [], failures: [] };
     return await this.finishMaterializationSpan(
