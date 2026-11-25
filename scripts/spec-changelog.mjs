@@ -9,9 +9,12 @@
  * during assembly. For migrated links this reverses the relocation (../doc becomes ./doc,
  * ../../product becomes ../product), preserving the original assembled bytes while keeping
  * individual entries navigable. Other Markdown bytes, URI links and anchors are unchanged.
+ * Shared CommonMark tokenization locates real link/image destinations outside code and
+ * rejects reference definitions, whose label scope cannot safely span independent entries.
  */
 import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
+import { inlineFileLinks } from './lib/spec-changelog-links.mjs';
 
 /** Reject old-branch insertions before reading entries, so they cannot disappear from history. */
 function readEntries(root) {
@@ -34,7 +37,9 @@ function readEntries(root) {
         throw new Error(`${name}: entry files must use .md`);
       }
       const text = readFileSync(path.join(directory, name), 'utf8');
-      const heading = text.split('\n')[0];
+      const rawHeading = text.split('\n')[0];
+      // Interpret the line terminator without normalizing the recorded Markdown bytes.
+      const heading = rawHeading.replace(/\r$/u, '');
       const date = /^## (\d{4}-\d{2}-\d{2})(?: |$)/u.exec(heading)?.[1];
       if (
         !date ||
@@ -49,7 +54,7 @@ function readEntries(root) {
           `${name}: expected a nonempty title after the date and em dash`,
         );
       }
-      if (/^## /m.test(text.slice(heading.length + 1))) {
+      if (/^## /m.test(text.slice(rawHeading.length + 1))) {
         throw new Error(
           `${name}: only one second-level entry heading is allowed`,
         );
@@ -63,24 +68,38 @@ function readEntries(root) {
       if (!text.endsWith('\n')) {
         throw new Error(`${name}: entry must end with a newline`);
       }
-      return { date, text };
+      let links;
+      try {
+        links = inlineFileLinks(text);
+      } catch (error) {
+        throw new Error(
+          `${name}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      return { date, text, links };
     })
     .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
 }
 
 /** Express entry-relative file destinations from the assembled document's specs directory. */
-function assembleEntry(text) {
-  return text.replace(
-    /(\]\()([^)\s]+)(\))/gu,
-    (match, opening, target, closing) => {
-      if (/^(?:[a-z][a-z\d+.-]*:|\/|#)/iu.test(target)) {
-        return match;
-      }
-      const rebased = path.posix.join('changelog', target);
-      const destination = rebased.startsWith('../') ? rebased : `./${rebased}`;
-      return `${opening}${destination}${closing}`;
-    },
-  );
+function assembleEntry({ text, links }) {
+  let assembled = text;
+  // Edit right to left using original spans; later replacements cannot shift earlier offsets.
+  for (const { start, end } of links.toSorted((a, b) => b.start - a.start)) {
+    const target = text.slice(start, end);
+    // Change only the base prefix: URL queries/fragments must never be path-normalized.
+    const parentRelative = target.startsWith('../');
+    const tail = parentRelative
+      ? target.slice(3)
+      : target.replace(/^\.\//u, '');
+    const destination = parentRelative
+      ? tail.startsWith('../')
+        ? tail
+        : `./${tail}`
+      : `./changelog/${tail}`;
+    assembled = assembled.slice(0, start) + destination + assembled.slice(end);
+  }
+  return assembled;
 }
 
 /** Both modes validate the complete input; assembly cannot silently omit an invalid entry. */
@@ -95,7 +114,7 @@ function main() {
   if (mode === '--assemble') {
     process.stdout.write(
       '# Spec Changelog\n\n' +
-        entries.map((entry) => assembleEntry(entry.text)).join(''),
+        entries.map((entry) => assembleEntry(entry)).join(''),
     );
   } else {
     console.log(`Spec changelog: ${entries.length} valid entries`);

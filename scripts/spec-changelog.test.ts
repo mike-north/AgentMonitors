@@ -16,6 +16,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { gunzipSync } from 'node:zlib';
 import { describe, expect, it } from 'vitest';
+import { inlineFileLinks } from './lib/spec-changelog-links.mjs';
 
 const root = path.resolve(import.meta.dirname, '..');
 const script = path.join(root, 'scripts/spec-changelog.mjs');
@@ -50,13 +51,9 @@ function run(dir: string, mode = '--check') {
   });
 }
 
-/** Check filesystem destinations independently of assembly, leaving URI schemes and anchors alone. */
+/** Navigation shares the source recognizer used by validation and assembly. */
 function relativeLinks(text: string): string[] {
-  return [...text.matchAll(/\[[^\n]*?\]\(([^)\s]+)\)/gu)]
-    .map((match) => match[1] ?? '')
-    .filter(
-      (target) => target && !/^(?:[a-z][a-z\d+.-]*:|\/|#)/iu.test(target),
-    );
+  return inlineFileLinks(text).map((link) => link.destination);
 }
 
 /** Fragments identify sections inside a file; navigation must first reach that file. */
@@ -70,6 +67,127 @@ function missingLinks(text: string, base: string): string[] {
 }
 
 describe('spec changelog', () => {
+  it.each([
+    ['code span', '`[Spec](../004-validation-testing.md)`\n'],
+    ['fenced code', '```md\n[Spec](../004-validation-testing.md)\n```\n'],
+    ['indented code', '    [Spec](../004-validation-testing.md)\n'],
+    [
+      'quoted fenced code',
+      '> ```md\n> [Spec](../004-validation-testing.md)\n> ```\n',
+    ],
+  ])('preserves literal Markdown in a %s byte for byte', (_name, body) => {
+    const dir = fixture();
+    const text = `## 2026-11-25 — Literals\n\n${body}`;
+    entry(dir, 'literal.md', text);
+    expect(run(dir, '--assemble').stdout).toBe('# Spec Changelog\n\n' + text);
+  });
+
+  it.each([
+    [
+      'double-quoted title',
+      '[Spec](../004-validation-testing.md "A title")',
+      '[Spec](./004-validation-testing.md "A title")',
+    ],
+    [
+      'single-quoted title',
+      "[Spec](../004-validation-testing.md 'A title')",
+      "[Spec](./004-validation-testing.md 'A title')",
+    ],
+    [
+      'angle delimiters',
+      '[Spec](<../004-validation-testing.md>)',
+      '[Spec](<./004-validation-testing.md>)',
+    ],
+    [
+      'angle delimiters and title',
+      '[Spec](<../004-validation-testing.md> "A title")',
+      '[Spec](<./004-validation-testing.md> "A title")',
+    ],
+    [
+      'image',
+      '![Spec](../diagram.png "Diagram")',
+      '![Spec](./diagram.png "Diagram")',
+    ],
+    ['balanced parentheses', '[Spec](../a(b).md)', '[Spec](./a(b).md)'],
+    ['escaped destination', '[Spec](../a\\(b\\).md)', '[Spec](./a\\(b\\).md)'],
+    [
+      'multiline whitespace',
+      '[Spec](  <../004-validation-testing.md>\n  "A title"  )',
+      '[Spec](  <./004-validation-testing.md>\n  "A title"  )',
+    ],
+    [
+      'spaces in an angle destination',
+      '[Spec](<../a b.md> "Title")',
+      '[Spec](<./a b.md> "Title")',
+    ],
+    [
+      'query and fragment dot segments',
+      '[Spec](../spec.md?next=/../x#part/../y)',
+      '[Spec](./spec.md?next=/../x#part/../y)',
+    ],
+  ])(
+    'rebases a %s without changing surrounding syntax',
+    (_name, input, output) => {
+      const dir = fixture();
+      entry(dir, 'syntax.md', `## 2026-11-25 — Syntax\n\n${input}\n`);
+      expect(run(dir, '--assemble').stdout).toBe(
+        `# Spec Changelog\n\n## 2026-11-25 — Syntax\n\n${output}\n`,
+      );
+    },
+  );
+
+  it('extracts titled and delimited link and image destinations while excluding code', () => {
+    const text =
+      '[Spec](../spec.md "Title") ![Image](<../image.png> "Title") `[Literal](../code.md)`\n\n```md\n[Fenced](../fenced.md)\n```\n\n    [Indented](../indented.md)\n';
+    expect(relativeLinks(text)).toEqual(['../spec.md', '../image.png']);
+  });
+
+  it('uses original source offsets across Unicode and CRLF line endings', () => {
+    const dir = fixture();
+    const text =
+      '## 2026-11-25 — Unicode\r\n\r\nPréface 😀 [Spec](<../spec.md> "Title")\r\n\r\n```md\r\n[Literal](../code.md)\r\n```\r\n';
+    entry(dir, 'unicode.md', text);
+    expect(run(dir, '--assemble').stdout).toBe(
+      '# Spec Changelog\n\n## 2026-11-25 — Unicode\r\n\r\nPréface 😀 [Spec](<./spec.md> "Title")\r\n\r\n```md\r\n[Literal](../code.md)\r\n```\r\n',
+    );
+  });
+
+  it('extracts decoded semantic destinations without losing source escaping during assembly', () => {
+    const dir = fixture();
+    const text =
+      '## 2026-11-25 — Escaping\n\n[Entity](../a&amp;b.md "Title") [Escape](../a\\(b\\).md)\n';
+    expect(relativeLinks(text)).toEqual(['../a&b.md', '../a(b).md']);
+    entry(dir, 'escaping.md', text);
+    expect(run(dir, '--assemble').stdout).toBe(
+      '# Spec Changelog\n\n## 2026-11-25 — Escaping\n\n[Entity](./a&amp;b.md "Title") [Escape](./a\\(b\\).md)\n',
+    );
+  });
+
+  it('rejects reference-style definitions with a filename and inline-link guidance', () => {
+    const dir = fixture();
+    entry(
+      dir,
+      'reference.md',
+      '## 2026-11-25 — Reference\n\n[Spec][spec]\n\n[spec]: ../004-validation-testing.md "Title"\n',
+    );
+    for (const mode of ['--check', '--assemble']) {
+      const result = run(dir, mode);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('reference.md');
+      expect(result.stderr).toContain('reference-style definitions');
+      expect(result.stderr).toContain('inline');
+    }
+  });
+
+  it('retains reference examples inside code without treating them as definitions', () => {
+    const dir = fixture();
+    const text =
+      '## 2026-11-25 — Reference examples\n\n`[spec]: ../004-validation-testing.md`\n\n~~~md\n[spec]: ../004-validation-testing.md\n~~~\n\n    [spec]: ../004-validation-testing.md\n';
+    entry(dir, 'reference-code.md', text);
+    expect(run(dir).status).toBe(0);
+    expect(run(dir, '--assemble').stdout).toBe('# Spec Changelog\n\n' + text);
+  });
+
   it('resolves every relative link from its entry file location', () => {
     const directory = path.join(root, 'docs/specs/changelog');
     const missing = readdirSync(directory).flatMap((name) => {

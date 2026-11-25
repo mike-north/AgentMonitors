@@ -1394,6 +1394,12 @@ date, then ascending by filename for equal dates. Generated history is never
 committed. Inline file links are relative to each entry; assembly rebases them to
 `docs/specs/`, restoring migrated destinations to their original text. The ignored
 `docs/specs/spec-history.generated.md` view keeps that base for navigation.
+CommonMark source spans identify inline link and image destinations, including titled
+and angle-delimited forms. Assembly edits only destination base prefixes; code spans,
+code blocks, titles, delimiters and line endings retain their original bytes. Navigation
+tests use the same recognizer and decoded destinations. Reference-style definitions
+outside code are rejected with inline-link guidance because their document-wide label
+scope would couple independent records.
 `pnpm check:spec-changelog`, included in `pnpm check` through
 `check:workspace`, rejects invalid entries, duplicate identities, and dated entry
 headings reintroduced into the stable `spec-changelog.md` index.

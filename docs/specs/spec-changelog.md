@@ -16,6 +16,11 @@ The date and full title together must be unique. The heading records any referen
 issues and spec sections without adding references that were never specified.
 Use inline Markdown links relative to the entry file, such as `../004-validation-testing.md`.
 Assembly rebases file links to `docs/specs/`, retaining the original historical link text.
+Inline links and images may use titles and angle-delimited destinations, such as
+`[Contract](<../004-validation-testing.md> "Validation")`. Code examples remain literal.
+Reference-style definitions outside code are rejected by both validation and assembly:
+their labels would share a document-wide scope when independent entries are combined.
+Use inline links and images instead.
 
 Run `pnpm check:spec-changelog` to validate entries. Run `pnpm specs:changelog` to view
 all entries, newest date first, with equal dates ordered by filename. The command writes
