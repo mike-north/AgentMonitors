@@ -30,8 +30,7 @@ import {
   writeStreamChunk,
 } from './hook.js';
 import {
-  isManualDaemonConnectionError,
-  manualDaemonErrorMessage,
+  reportManualDaemonError,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
 
@@ -149,10 +148,10 @@ sessionCommand
         console.log(`Agent identity: ${session.agentIdentity}`);
         console.log(`Hook state: ${session.hookStatePath}`);
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && options.format === 'json',
-        );
+        reportManualDaemonError(error, options.format === 'json', {
+          action: 'Session open',
+          checkCommand: 'agentmonitors session list',
+        });
       }
     },
   );
@@ -180,10 +179,10 @@ sessionCommand
         }
         console.log(`Closed session: ${session.id}`);
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && options.format === 'json',
-        );
+        reportManualDaemonError(error, options.format === 'json', {
+          action: 'Session close',
+          checkCommand: 'agentmonitors session list',
+        });
       }
     },
   );
@@ -216,9 +215,11 @@ sessionCommand
         );
       }
     } catch (error) {
-      reportError(
-        manualDaemonErrorMessage(error),
-        !isManualDaemonConnectionError(error) && options.format === 'json',
+      reportManualDaemonError(
+        error,
+        options.format === 'json',
+        undefined,
+        resolveManualDaemonSocketPath(options.socket),
       );
     }
   });

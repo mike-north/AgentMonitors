@@ -6,8 +6,7 @@ import {
   listWatchClient,
 } from '../runtime-client.js';
 import {
-  isManualDaemonConnectionError,
-  manualDaemonErrorMessage,
+  reportManualDaemonError,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
 
@@ -135,10 +134,10 @@ watchCommand
         console.log(`Source: ${record.sourceName}`);
         console.log(`Urgency: ${record.urgency}`);
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && options.format === 'json',
-        );
+        reportManualDaemonError(error, options.format === 'json', {
+          action: 'Watch declare',
+          checkCommand: 'agentmonitors watch list',
+        });
       }
     },
   );
@@ -174,9 +173,11 @@ watchCommand
           );
         }
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && options.format === 'json',
+        reportManualDaemonError(
+          error,
+          options.format === 'json',
+          undefined,
+          resolveManualDaemonSocketPath(options.socket),
         );
       }
     },
@@ -209,10 +210,10 @@ watchCommand
         }
         console.log(`Cancelled ephemeral monitor: ${record.id}`);
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && options.format === 'json',
-        );
+        reportManualDaemonError(error, options.format === 'json', {
+          action: 'Watch cancel',
+          checkCommand: 'agentmonitors watch list',
+        });
       }
     },
   );

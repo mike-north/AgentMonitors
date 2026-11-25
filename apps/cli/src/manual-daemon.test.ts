@@ -1,9 +1,13 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { resolveSocketPath } from './daemon-ipc.js';
-import { resolveManualDaemonSocketPath } from './manual-daemon.js';
+import { DaemonConnectionError, resolveSocketPath } from './daemon-ipc.js';
+import {
+  NO_WORKSPACE_DAEMON_MESSAGE,
+  reportManualDaemonError,
+  resolveManualDaemonSocketPath,
+} from './manual-daemon.js';
 import { workspacePaths } from './workspace-paths.js';
 import { writeLocalState } from './local-state.js';
 
@@ -113,5 +117,66 @@ describe('resolveManualDaemonSocketPath (issue #335)', () => {
     } finally {
       rmSync(ws, { recursive: true, force: true });
     }
+  });
+});
+
+/** Transport causes cannot change whether retrying a written mutation is safe. */
+describe('manual daemon failure classification', () => {
+  afterEach(() => {
+    process.exitCode = undefined;
+    vi.restoreAllMocks();
+  });
+
+  it.each(['reply timeout', 'socket error', 'socket close'])(
+    'reports %s after write with exit 3',
+    (cause) => {
+      const stderr = vi
+        .spyOn(console, 'error')
+        .mockImplementation(() => undefined);
+      const stdout = vi
+        .spyOn(console, 'log')
+        .mockImplementation(() => undefined);
+      reportManualDaemonError(
+        new DaemonConnectionError(cause, undefined, true),
+        true,
+        {
+          action: 'Events ack',
+          checkCommand:
+            'agentmonitors events list --session session-1 --unread',
+        },
+      );
+      expect(stderr).toHaveBeenCalledExactlyOnceWith(
+        `Error: Events ack outcome unknown: the daemon received the request but no reply arrived (${cause}). It may already have been applied, or may still be applied. Check with \`agentmonitors events list --session session-1 --unread\` before running it again.`,
+      );
+      expect(stdout).not.toHaveBeenCalled();
+      expect(process.exitCode).toBe(3);
+    },
+  );
+
+  it.each(['missing socket', 'refused connection', 'connect timeout'])(
+    'preserves %s before write with exit 1',
+    (cause) => {
+      const stderr = vi
+        .spyOn(console, 'error')
+        .mockImplementation(() => undefined);
+      reportManualDaemonError(new DaemonConnectionError(cause), true);
+      expect(stderr).toHaveBeenCalledExactlyOnceWith(
+        `Error: ${NO_WORKSPACE_DAEMON_MESSAGE}`,
+      );
+      expect(process.exitCode).toBe(1);
+    },
+  );
+
+  it('preserves application errors and JSON routing', () => {
+    const stdout = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+    const stderr = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined);
+    reportManualDaemonError(new Error('Unknown session'), true);
+    expect(stdout).toHaveBeenCalledExactlyOnceWith(
+      '{"error":"Unknown session"}',
+    );
+    expect(stderr).not.toHaveBeenCalled();
+    expect(process.exitCode).toBe(1);
   });
 });

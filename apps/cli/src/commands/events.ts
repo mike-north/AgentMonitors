@@ -1,13 +1,11 @@
 import { Command, Option } from 'commander';
-import { reportError } from '../output.js';
 import { renderToon, resolveFormat } from '../toon-format.js';
 import {
   acknowledgeEventsClient,
   listEventsClient,
 } from '../runtime-client.js';
 import {
-  isManualDaemonConnectionError,
-  manualDaemonErrorMessage,
+  reportManualDaemonError,
   resolveManualDaemonSocketPath,
 } from '../manual-daemon.js';
 import { appendErrorHints } from '../command-hints.js';
@@ -185,9 +183,11 @@ const eventsListCommand = eventsCommand
           );
         }
       } catch (error) {
-        reportError(
-          manualDaemonErrorMessage(error),
-          !isManualDaemonConnectionError(error) && format === 'json',
+        reportManualDaemonError(
+          error,
+          format === 'json',
+          undefined,
+          resolveManualDaemonSocketPath(options.socket),
         );
       }
     },
@@ -225,7 +225,10 @@ const eventsAckCommand = eventsCommand
         );
         console.log('Acknowledged events.');
       } catch (error) {
-        reportError(manualDaemonErrorMessage(error), false);
+        reportManualDaemonError(error, false, {
+          action: 'Events ack',
+          checkCommand: `agentmonitors events list --session ${options.session} --unread`,
+        });
       }
     },
   )

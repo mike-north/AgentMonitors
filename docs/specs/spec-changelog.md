@@ -9,6 +9,14 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Distinguish missing replies from unreachable sockets (005 §17) — Refs #592
+
+Manual session, event, claim and watch commands now preserve the distinction between failure to
+connect and a written request without a reply. The former retains exit 1 and workspace-daemon
+remediation; the latter uses exit 3 and stderr text, with inspection commands for mutations.
+Read-only commands identify the unanswered socket. Retry repairs also use exit 3 for unknown
+outcomes while retaining their output routing and prohibition on in-process writes.
+
 ## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468
 
 Coordination rewrites now retain the complete `claim-ttl-ms` field line, including indentation,
