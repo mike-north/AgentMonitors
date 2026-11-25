@@ -390,22 +390,19 @@ vitest config MUST reject an empty/misconfigured run — vitest's own default,
 accidentally excluding an entire package's test files MUST fail that package's Nx `test` target,
 never report a false green. This applies to the default `vitest.config.ts` of every publishable
 package in the authoritative `PACKAGE_DIRS` inventory (`scripts/publish-release-packages.mjs`),
-plus every named config wired into a CI test step — `apps/cli/vitest.serial.config.ts` (the serial
-daemon-spawn suite) and `scripts/vitest.config.ts` (this guard's own home config) — both of which
-already set this correctly and are the reference pattern the rest follow.
+plus every named config wired into a CI test step, including the serial daemon-spawn suite,
+the Docker install smoke and the script suite.
 
-Because `apps/cli` splits its tests across two suites (a default parallel run and a serial run for
-daemon-spawn tests that need CPU isolation — [§2.6](#26-cli-integration-tests)), those two suites
-MUST also partition the package's test files without overlap (a file run by both wastes CI time
-and can reintroduce the CPU-starvation flakiness the serial suite exists to avoid) or gaps (a file
-run by neither is silently never executed).
+The default parallel suite, serial daemon-spawn suite ([§2.6](#26-cli-integration-tests)) and
+Docker install smoke MUST partition the CLI's tracked test files. Each file MUST run in exactly
+one suite to keep test coverage complete and preserve CPU isolation.
 
 **Verified in:** `scripts/vitest-pass-with-no-tests.test.ts` (dynamically imports every guarded
 vitest config — the real module `vitest run` loads — and asserts none resolve to
 `passWithNoTests: true`; the guarded set is derived from the authoritative `PACKAGE_DIRS` list in
 `scripts/publish-release-packages.mjs` so a newly added publishable package is covered
 automatically) and `scripts/cli-suite-partition.test.ts` (runs the real `vitest list` resolution
-against both `apps/cli` configs and asserts the result partitions the package's git-tracked test
+against all three `apps/cli` configs and asserts the result partitions the package's git-tracked test
 files with no overlap or gaps). Both run under `pnpm test:scripts`, wired into CI per-PR.
 
 ### 2.9 Test-run build ownership and first-attempt launcher gate

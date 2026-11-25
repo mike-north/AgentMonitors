@@ -1,21 +1,15 @@
-// Proves apps/cli's default and serial vitest suites partition the
-// package's tracked test files without overlap or gaps (issue #288): every
-// `*.test.ts` file under apps/cli must be run by EXACTLY one of the two
-// suites, so a file added to, or excluded from, one suite's include/exclude
-// list can never silently stop running in either suite, nor run twice.
-//
-// File resolution shells out to the real `vitest list --filesOnly --json`
-// against each config — the actual include/exclude glob resolution vitest
-// itself performs — rather than a hand-built glob matcher, so drift in
-// either config's glob patterns is caught against real behavior, not an
-// approximation of it.
+// Every tracked CLI test file must belong to exactly one Vitest suite.
+// Query Vitest itself so include and exclude drift fails against real discovery.
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { REPO_ROOT } from './publish-release-packages.mjs';
 
 export const CLI_PACKAGE_DIR = 'apps/cli';
-export const CLI_DEFAULT_CONFIG = 'vitest.config.ts';
-export const CLI_SERIAL_CONFIG = 'vitest.serial.config.ts';
+export const CLI_VITEST_CONFIGS = [
+  'vitest.config.ts',
+  'vitest.serial.config.ts',
+  'vitest.docker-smoke.config.ts',
+];
 
 /**
  * A single `{ file: string }` entry as printed by
@@ -46,7 +40,7 @@ export function listVitestFiles(packageAbsDir, configFile) {
 /**
  * Every `*.test.ts` / `*.spec.ts` file git tracks under a package directory,
  * absolute-pathed to match `listVitestFiles`'s output — the independent
- * enumeration the two suites together must fully (and only) cover.
+ * enumeration all suites together must cover exactly once.
  *
  * @param {string} repoRoot
  * @param {string} packageDir - relative to `repoRoot`
@@ -65,63 +59,48 @@ export function listTrackedTestFiles(repoRoot, packageDir) {
 }
 
 /**
- * Pure partition check: every file in `allFiles` MUST appear in exactly one
- * of `groupA` / `groupB`. Returns a list of human-readable issues; an empty
- * list means the partition holds.
+ * Report gaps, overlaps, and files outside the tracked inventory.
  *
- * @param {object} input
- * @param {string[]} input.allFiles - the independent, full inventory
- * @param {string[]} input.groupA
- * @param {string} input.groupAName
- * @param {string[]} input.groupB
- * @param {string} input.groupBName
+ * @param {string[]} allFiles
+ * @param {Record<string, string[]>} groups - files discovered by configuration name
  * @returns {string[]}
  */
-export function partitionIssues({
-  allFiles,
-  groupA,
-  groupAName,
-  groupB,
-  groupBName,
-}) {
+export function partitionIssues(allFiles, groups) {
   const issues = [];
-  const setA = new Set(groupA);
-  const setB = new Set(groupB);
+  const membership = new Map(
+    allFiles.map((file) => [file, /** @type {string[]} */ ([])]),
+  );
 
-  const overlap = allFiles.filter((f) => setA.has(f) && setB.has(f));
-  if (overlap.length > 0) {
-    issues.push(
-      `File(s) run by BOTH ${groupAName} and ${groupBName}: ${overlap.join(', ')}`,
-    );
+  for (const [name, files] of Object.entries(groups)) {
+    const unknown = [];
+    for (const file of files) {
+      const suites = membership.get(file);
+      if (suites) {
+        suites.push(name);
+      } else {
+        unknown.push(file);
+      }
+    }
+    if (unknown.length > 0) {
+      issues.push(
+        `${name} runs file(s) outside the tracked test-file inventory: ${unknown.join(', ')}`,
+      );
+    }
   }
 
-  const missing = allFiles.filter((f) => !setA.has(f) && !setB.has(f));
-  if (missing.length > 0) {
-    issues.push(
-      `File(s) run by NEITHER ${groupAName} nor ${groupBName}: ${missing.join(', ')}`,
-    );
-  }
-
-  const allSet = new Set(allFiles);
-  const unknownA = groupA.filter((f) => !allSet.has(f));
-  const unknownB = groupB.filter((f) => !allSet.has(f));
-  if (unknownA.length > 0) {
-    issues.push(
-      `${groupAName} runs file(s) outside the tracked test-file inventory: ${unknownA.join(', ')}`,
-    );
-  }
-  if (unknownB.length > 0) {
-    issues.push(
-      `${groupBName} runs file(s) outside the tracked test-file inventory: ${unknownB.join(', ')}`,
-    );
+  for (const [file, suites] of membership) {
+    if (suites.length === 0) {
+      issues.push(`No CLI suite runs: ${file}`);
+    } else if (suites.length > 1) {
+      issues.push(`Multiple CLI suites run ${file}: ${suites.join(', ')}`);
+    }
   }
 
   return issues;
 }
 
 /**
- * Compute the partition issues for apps/cli's real, on-disk default and
- * serial vitest suites.
+ * Compute the partition issues for the CLI's real Vitest configurations.
  *
  * @param {string} [repoRoot]
  * @returns {string[]}
@@ -129,13 +108,11 @@ export function partitionIssues({
 export function realCliSuitePartitionIssues(repoRoot = REPO_ROOT) {
   const packageAbsDir = path.join(repoRoot, CLI_PACKAGE_DIR);
   const allFiles = listTrackedTestFiles(repoRoot, CLI_PACKAGE_DIR);
-  const defaultFiles = listVitestFiles(packageAbsDir, CLI_DEFAULT_CONFIG);
-  const serialFiles = listVitestFiles(packageAbsDir, CLI_SERIAL_CONFIG);
-  return partitionIssues({
-    allFiles,
-    groupA: defaultFiles,
-    groupAName: `default (${CLI_DEFAULT_CONFIG})`,
-    groupB: serialFiles,
-    groupBName: `serial (${CLI_SERIAL_CONFIG})`,
-  });
+  const groups = Object.fromEntries(
+    CLI_VITEST_CONFIGS.map((config) => [
+      config,
+      listVitestFiles(packageAbsDir, config),
+    ]),
+  );
+  return partitionIssues(allFiles, groups);
 }
