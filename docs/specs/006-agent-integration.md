@@ -2001,18 +2001,24 @@ Unreadable files expire only when their filesystem mtime age is strictly greater
 timestamps and lease fields cannot establish retention. Files exactly at the boundary are retained.
 Cleanup reads each candidate through an open descriptor and obtains its device, inode, size and
 mtime from `fstat`. Both descriptor and final path observations use bigint stats, retaining the
-filesystem's nanosecond timestamp precision. Device, size and mtime must always agree. If both
-inode numbers are non-zero, they must agree too. If either inode is zero, ctime and birthtime must
-agree instead, in addition to device, size and mtime. Zero birthtime represents unavailable creation
-time; two zero values agree, while zero versus a reported creation time does not. Ctime provides
-status-change evidence that cannot be backdated by setting mtime. An expired file is unlinked only
-after a matching final `lstat`; a mismatch defers cleanup to a later pass. Cleanup creates no files
-and does not rename records.
+precision the filesystem reports. Device, size and mtime must always agree. If both inode numbers
+are non-zero, they must agree too: device/inode identifies the opened file exactly while its
+descriptor remains open. If either inode is zero, ctime and birthtime must agree instead, in
+addition to device, size and mtime. Two zero birthtimes agree, while zero versus a reported creation
+time does not. An expired file is unlinked only after a matching final `lstat`; a mismatch defers
+cleanup to a later pass.
 
-The final path check and unlink are separate filesystem operations. A writer publishing in that
-gap can have its new heartbeat removed; the transport's next heartbeat write recreates the record.
-This bounded absence is part of the cleanup contract, rather than a guarantee of synchronization
-with writers. Unlink errors leave the original record in place for a subsequent cleanup attempt.
+On filesystems without inode identity, this comparison is **best-effort**. Ctime and birthtime can
+be unavailable, synthesized or too coarsely resolved to separate files. Equal stat observations
+therefore do not prove that the path still holds the file cleanup read. A heartbeat published
+between cleanup's first read and its final path check can be removed on these filesystems.
+Nanosecond representation does not create identity information the filesystem omitted.
+
+The final path check and unlink are also separate operations on every filesystem, so a replacement
+published after that check can be removed even when inode identity is exact. In every case cleanup
+creates no files and does not rename records, and the next heartbeat write recreates a removed
+record. These removal windows are part of the cleanup contract; writers and cleanup are not
+synchronized. Unlink errors leave the original record in place for a subsequent cleanup attempt.
 
 A parsed JSON object with an integer schema version greater than this CLI's version produces
 `[heartbeat-newer-schema]`: a transport using a newer record format is present, but this CLI cannot

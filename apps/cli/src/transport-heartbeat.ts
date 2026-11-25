@@ -611,18 +611,20 @@ export function reapExpiredHeartbeats(now: Date): void {
 }
 
 /**
- * Read and age one opened file, then check that its path still names the same
- * generation before unlinking. The descriptor pins the judged inode while
- * atomic writers publish different inodes. Device, size and mtime always
- * participate. If either inode is zero, kernel-maintained ctime and available
- * birthtime distinguish generations even when a writer repeats size and mtime.
- * Bigint stats retain the filesystem's timestamp precision in nanoseconds;
- * birthtime zero means unavailable and must agree between both observations.
+ * Read and age one opened file, then compare its path's stat observations before
+ * unlinking. The descriptor pins the judged inode. When both observations have
+ * non-zero inode numbers, device/inode comparison identifies that file exactly.
+ * Device, size and mtime always participate; if either inode is zero, ctime and
+ * birthtime are compared too, with zero birthtime agreeing only with zero.
  *
- * This is a best-effort check, not a writer lock: publication after lstat but
- * before rmSync can still lose that heartbeat until its next write. Cleanup
- * neither moves records nor creates artifacts that need later recovery; a
- * failed unlink leaves the original path available to subsequent passes.
+ * Without inode identity this is best-effort: absent, synthesized or coarse
+ * timestamps can match across different files. A heartbeat published between
+ * cleanup's first read and its final path check can therefore be removed.
+ * Bigint stats retain reported precision; they cannot supply missing identity.
+ * Even with exact inode identity, publication after lstat but before rmSync
+ * remains a race. In every case cleanup creates no files or alternate names,
+ * and the next heartbeat write recreates a removed record. A failed unlink
+ * leaves the original path available to subsequent passes.
  */
 function reapHeartbeatFileIfExpired(filePath: string, now: Date): void {
   const fd = openSync(filePath, 'r');

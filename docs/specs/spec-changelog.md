@@ -11,13 +11,14 @@ Agent Monitors spec set in `docs/specs/`.
 
 ## 2026-11-25 — Heartbeat cleanup checks file identity (006 §12.9) — Refs #463
 
-The comparison always includes device and retains nanosecond timestamps with bigint stats. When
-an inode is unavailable, ctime and birthtime join size and mtime as generation evidence. Tests
-cover an atomic replacement with equal size/mtime, independent generation-field changes and
-candidate I/O failures without leaked descriptors or additional files.
+The comparison always includes device and retains reported timestamp precision with bigint stats.
+The documented identity contract is exact with non-zero inode observations and best-effort without
+them. Missing, synthesized or coarse timestamps can match a replacement published between the
+first read and final check. Cleanup creates no files, and the next heartbeat write recreates a
+removed record. This clarifies existing behavior without changing code or tests.
 
 Cleanup reads lease or retention evidence through a descriptor and compares its file identity with
-the path immediately before unlinking. Changed identities are left for a later pass; no cleanup
+the path immediately before unlinking. Changed stat observations defer cleanup; no cleanup
 files are created. The final check and unlink are not atomic, so a publication in that window can
 remain absent until the next heartbeat write. Real-filesystem tests cover replacement detection,
 zero-inode fallback, unlink failure and next-write recovery. §12.9 names the verifying code and tests.
