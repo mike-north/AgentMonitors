@@ -200,6 +200,22 @@ describe('computeTransportHealth', () => {
       expect(health.deliverable).toBe(false);
     });
 
+    it('keeps unmatched channel records healthy without adopting them as recipients', () => {
+      const health = computeTransportHealth(
+        input({
+          heartbeats: [
+            heartbeat('hook'),
+            heartbeat('channel', { hostSessionId: 'ended-session' }),
+          ],
+        }),
+      );
+      const channel = find(health.transports, 'channel');
+      expect(codesOf(channel)).toContain('channel-session-unmatched');
+      expect(channel.healthy).toBe(true);
+      expect(health.deliveryWillReachThisSession).toBe('hook');
+      expect(health.deliverable).toBe(true);
+    });
+
     it('orders records NaN-safely so an unparseable timestamp sorts as oldest', () => {
       // `Date.parse` yields NaN for a corrupt record, and a NaN comparator is
       // inconsistent — it could leave the corrupt record ahead of a real one.
@@ -324,6 +340,38 @@ describe('computeTransportHealth', () => {
       expect(health.deliveryWillReachThisSession).not.toBe('channel');
       expect(health.deliverable).toBe(false);
     });
+
+    it.each(['fresh', 'stale', 'misbound', 'missing'] as const)(
+      'judges channel gaps using matching hook evidence (%s)',
+      (hookState) => {
+        const health = computeTransportHealth(
+          input({
+            leadHostSessionIds: ['session-covered', 'session-uncovered'],
+            heartbeats: [
+              heartbeat('channel', { hostSessionId: 'session-covered' }),
+              heartbeat('hook', { hostSessionId: 'session-covered' }),
+              ...(hookState === 'missing'
+                ? []
+                : [
+                    heartbeat('hook', {
+                      hostSessionId: 'session-uncovered',
+                      ...(hookState === 'stale'
+                        ? { updatedAt: '2026-07-19T10:00:00.000Z' }
+                        : {}),
+                      ...(hookState === 'misbound'
+                        ? { socketPath: '/wrong.sock' }
+                        : {}),
+                    }),
+                  ]),
+            ],
+          }),
+        );
+        const channel = find(health.transports, 'channel');
+        expect(codesOf(channel)).toContain('channel-lead-uncovered');
+        expect(channel.healthy).toBe(hookState === 'fresh');
+        expect(health.deliverable).toBe(hookState === 'fresh');
+      },
+    );
 
     it('reports no uncovered leads when every active lead has a matching channel heartbeat', () => {
       const health = computeTransportHealth(
