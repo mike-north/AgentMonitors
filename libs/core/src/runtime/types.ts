@@ -141,6 +141,8 @@ export type MessageState =
 export interface PostMessageInput {
   sessionId: string;
   body: string;
+  /** A workspace-scoped key for recovering the original event ID on retry. */
+  key?: string | undefined;
   requireAck?: boolean | undefined;
   resurfaceAfterMs?: number | undefined;
   maxResurfaces?: number | undefined;

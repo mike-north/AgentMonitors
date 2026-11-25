@@ -483,6 +483,15 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   `);
 
   db.run(sql`
+    CREATE TABLE IF NOT EXISTS post_requests (
+      workspace_path TEXT NOT NULL,
+      request_key TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      PRIMARY KEY (workspace_path, request_key)
+    )
+  `);
+
+  db.run(sql`
     CREATE TABLE IF NOT EXISTS session_event_state (
       id TEXT PRIMARY KEY,
       session_id TEXT NOT NULL,

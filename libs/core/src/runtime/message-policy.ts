@@ -13,6 +13,7 @@ export const postMessageInputSchema = z
       .refine((body) => body.trim().length > 0, {
         message: 'Message body must contain text.',
       }),
+    key: z.string().min(1).optional(),
     requireAck: z.boolean().optional(),
     resurfaceAfterMs: z.number().int().min(1).max(2_147_483_647).optional(),
     maxResurfaces: z.number().int().min(0).max(100).optional(),

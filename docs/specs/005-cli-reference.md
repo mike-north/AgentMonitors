@@ -2976,20 +2976,30 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 **Status:** Current. Routes through the local daemon socket.
 
 ```text
-agentmonitors post --session <id> [--socket <path>] [--require-ack]
+agentmonitors post --session <id> [--socket <path>] [--key <string>] [--require-ack]
                    [--resurface-after-ms <ms>] [--max-resurfaces <count>] <body>
 ```
 
 Use `session list` to find the recipient's active lead session ID. The body must contain text
-and is limited to 16,384 UTF-16 code units. A committed post exits 0 and prints its event ID to
-stdout. If the subsequent hook-state refresh fails, the same success output and exit code apply,
-and stderr carries a warning. The core API and `messages.post` IPC success result include the
-event ID and an optional `hookStateRefreshError` string for that failure. A refresh warning requires
+and is limited to 16,384 UTF-16 code units. On a successful reply, the command exits 0 and prints
+the committed event ID to stdout. If the subsequent hook-state refresh fails, the same success
+output and exit code apply, and stderr carries a warning. The core API and post IPC success result
+include the event ID and an optional `hookStateRefreshError` string for that failure. A refresh warning requires
 no repost. Command errors are reported on stderr with a nonzero exit code.
 
+- `--key <string>` accepts a nonempty request key and defaults to a fresh key for each invocation.
+  Reuse a key within the same workspace to recover the original ID. For example, repeating
+  `agentmonitors post --session <id> --key release-check 'Check the release'` returns the same ID.
 - `--require-ack` enables scheduled resurfacing.
 - `--resurface-after-ms` accepts integers from 1 through 2,147,483,647 and defaults to 300,000.
 - `--max-resurfaces` accepts integers from 0 through 100 and defaults to 2.
+
+If the connection fails after sending the request, including a reply timeout, the command
+retries once with the same key. If it still cannot confirm the result, it exits nonzero and
+prints the key on stderr. Retry the same command with the printed `--key` to recover the ID.
+The CLI uses `messages.postKeyed`, which requires a daemon that supports keyed posts.
+The compiled CLI integration tests delay a reply past the IPC timeout and verify that only one
+post is committed.
 
 Both timing options require `--require-ack`. Use `events list --session <id>` to inspect a post's
 state and `events ack --session <id> --event-ids <event-id>` to acknowledge it. Use the same

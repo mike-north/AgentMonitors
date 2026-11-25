@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { setTimeout } from 'node:timers/promises';
 import {
   AgentMonitorRuntime,
   createDb,
@@ -236,6 +237,7 @@ async function withPostSession(
     hookStatePath: string;
     sessionId: string;
     runtime: AgentMonitorRuntime;
+    store: RuntimeStore;
     post: (
       body: string,
       ...options: string[]
@@ -245,10 +247,8 @@ async function withPostSession(
   const root = mkdtempSync(path.join(tmpdir(), 'am-post-'));
   const socketPath = path.join(root, 'daemon.sock');
   const hookStatePath = path.join(root, 'hook.json');
-  const runtime = new AgentMonitorRuntime(
-    new RuntimeStore(createDb(path.join(root, 'runtime.db'))),
-    new SourceRegistry(),
-  );
+  const store = new RuntimeStore(createDb(path.join(root, 'runtime.db')));
+  const runtime = new AgentMonitorRuntime(store, new SourceRegistry());
   const server = createDaemonServer({ runtime, socketPath });
 
   try {
@@ -273,9 +273,17 @@ async function withPostSession(
           socketPath,
           ...options,
         ],
-        { timeout: 5000 },
+        { timeout: 8000 },
       );
-    await test({ root, socketPath, hookStatePath, sessionId, runtime, post });
+    await test({
+      root,
+      socketPath,
+      hookStatePath,
+      sessionId,
+      runtime,
+      store,
+      post,
+    });
   } finally {
     await server.close();
     vi.useRealTimers();
@@ -283,39 +291,35 @@ async function withPostSession(
   }
 }
 
+function createRecap(root: string, socketPath: string) {
+  mkdirSync(path.join(root, '.claude'));
+  writeFileSync(
+    path.join(root, '.claude/agentmonitors.local.md'),
+    '---\nenabled: true\n---\n',
+  );
+  return async () => {
+    const child = exec(
+      process.execPath,
+      [cli, 'hook', 'deliver', '--socket', socketPath, '--format', 'text'],
+      { timeout: 5000 },
+    );
+    child.child.stdin?.end(
+      JSON.stringify({
+        session_id: 'recipient',
+        hook_event_name: 'SessionStart',
+        cwd: root,
+      }),
+    );
+    return (await child).stdout.trim();
+  };
+}
+
 it.each(['initial', 'final'])(
   'preserves a %s post offer omitted from a bounded recap',
   async (offer) => {
     await withPostSession(
       async ({ root, socketPath, runtime, sessionId, post }) => {
-        mkdirSync(path.join(root, '.claude'));
-        writeFileSync(
-          path.join(root, '.claude/agentmonitors.local.md'),
-          '---\nenabled: true\n---\n',
-        );
-        const recap = async () => {
-          const child = exec(
-            process.execPath,
-            [
-              cli,
-              'hook',
-              'deliver',
-              '--socket',
-              socketPath,
-              '--format',
-              'text',
-            ],
-            { timeout: 5000 },
-          );
-          child.child.stdin?.end(
-            JSON.stringify({
-              session_id: 'recipient',
-              hook_event_name: 'SessionStart',
-              cwd: root,
-            }),
-          );
-          return (await child).stdout.trim();
-        };
+        const recap = createRecap(root, socketPath);
         const start = Date.UTC(2026, 0, 1);
         vi.setSystemTime(start);
         const options =
@@ -393,3 +397,141 @@ it('returns the committed post ID when hook-state refresh fails', async () => {
     },
   );
 }, 30_000);
+
+it.each(['character limit', 'event limit'])(
+  'resurfaces a post ahead of unread monitor events at the recap %s',
+  async (limit) => {
+    await withPostSession(
+      async ({ root, socketPath, runtime, store, sessionId, post }) => {
+        const recap = createRecap(root, socketPath);
+        const start = Date.UTC(2026, 0, 1);
+        vi.setSystemTime(start);
+        const insertMonitorEvent = (body: string) =>
+          store.insertEvent({
+            workspacePath: root,
+            monitorId: 'release',
+            sourceName: 'schedule',
+            urgency: 'normal',
+            title: 'Release monitor',
+            body,
+            summary: body,
+            payload: {},
+            snapshotMetadata: {},
+            snapshotText: null,
+            diffText: null,
+            objectKey: null,
+            baselineStrategy: null,
+            queryScope: {},
+            tags: [],
+            createdAt: new Date(),
+          });
+        if (limit === 'character limit') insertMonitorEvent('M'.repeat(8000));
+        const eventId = (
+          await post(
+            'Check the release.',
+            '--require-ack',
+            '--resurface-after-ms',
+            '100',
+            '--max-resurfaces',
+            '1',
+          )
+        ).stdout.trim();
+        expect(
+          runtime.claimDelivery(sessionId, 'turn-interruptible')?.events,
+        ).toMatchObject([{ eventId }]);
+        if (limit === 'event limit') {
+          for (let i = 0; i < 10; i++)
+            insertMonitorEvent('Monitor is still unread.');
+        }
+
+        vi.setSystemTime(start + 99);
+        expect(await recap()).not.toContain(eventId);
+        vi.setSystemTime(start + 100);
+        const retry = await recap();
+        expect(retry).toContain(eventId);
+        expect(retry).toContain('Message resurfaced');
+        expect(retry.length).toBeLessThanOrEqual(4000);
+        expect(await recap()).not.toContain(eventId);
+
+        vi.setSystemTime(start + 199);
+        expect(await recap()).not.toContain(eventId);
+        vi.setSystemTime(start + 200);
+        const final = await recap();
+        expect(final).toContain(eventId);
+        expect(final).toContain('Message needs-attention');
+        expect(runtime.listEvents({ sessionId })).toContainEqual(
+          expect.objectContaining({
+            id: eventId,
+            messageState: 'needs-attention',
+          }),
+        );
+        vi.setSystemTime(start + 400);
+        expect(await recap()).not.toContain(eventId);
+      },
+    );
+  },
+  30_000,
+);
+
+it('recovers the committed ID when the daemon reply misses the IPC timeout', async () => {
+  await withPostSession(async ({ runtime, sessionId, post }) => {
+    const commit = runtime.postMessage.bind(runtime);
+    const requests = vi
+      .spyOn(runtime, 'postMessage')
+      .mockImplementationOnce((input) => {
+        const result = commit(input);
+        // The IPC dispatcher assimilates the thenable before replying.
+        return {
+          ...result,
+          then: (resolve: (value: typeof result) => void) =>
+            setTimeout(2600).then(() => resolve(result)),
+        };
+      });
+
+    const first = await post('Only one durable post');
+    const eventId = first.stdout.trim();
+    const key = requests.mock.calls[0]?.[0].key;
+    expect(key).toBeTruthy();
+    if (!key) throw new Error('Missing request key.');
+    expect(requests.mock.calls.map(([input]) => input.key)).toEqual([key, key]);
+    expect(runtime.listEvents({ sessionId }).map(({ id }) => id)).toEqual([
+      eventId,
+    ]);
+
+    const replay = await post('Only one durable post', '--key', key);
+    expect(replay.stdout.trim()).toBe(eventId);
+    expect(runtime.listEvents({ sessionId }).map(({ id }) => id)).toEqual([
+      eventId,
+    ]);
+  });
+}, 15_000);
+
+it('prints the key when neither post attempt receives a reply', async () => {
+  await withPostSession(async ({ runtime, sessionId, post }) => {
+    const commit = runtime.postMessage.bind(runtime);
+    const requests = vi
+      .spyOn(runtime, 'postMessage')
+      .mockImplementation((input) => ({
+        ...commit(input),
+        then() {
+          // Leave the response pending until the client gives up.
+        },
+      }));
+    const result = post('Recoverable post');
+    await expect(result).rejects.toMatchObject({ code: 1, stdout: '' });
+    const key = requests.mock.calls[0]?.[0].key;
+    if (!key) throw new Error('Missing request key.');
+    await expect(result).rejects.toMatchObject({
+      stderr: expect.stringContaining(
+        `Retry the same command with --key '${key}'.`,
+      ),
+    });
+    expect(requests.mock.calls.map(([input]) => input.key)).toEqual([key, key]);
+    const events = runtime.listEvents({ sessionId });
+    expect(events).toHaveLength(1);
+
+    requests.mockRestore();
+    const replay = await post('Recoverable post', '--key', key);
+    expect(replay.stdout.trim()).toBe(events[0]?.id);
+  });
+}, 15_000);

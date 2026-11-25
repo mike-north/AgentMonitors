@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Post recap priority and request recovery (002 §7.2, §9 and §15, 005 §18, 006 §5.5)
+
+Eligible posts take priority in bounded recaps. The projection deadline clears when the final
+needs-attention offer is committed. A workspace-scoped request key and its event ID are committed
+with the post, so a retry after a lost reply can return the original ID.
+
 ## 2026-11-25 — Bounded post recaps and durable post results (002 §7.2, 005 §10.4 and §18, 006 §5.5–5.6)
 
 Recap commits preserve omitted post offers, including the final needs-attention offer.

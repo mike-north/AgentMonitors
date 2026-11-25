@@ -3179,17 +3179,34 @@ export class AgentMonitorRuntime {
     hookStateRefreshError?: string;
   } {
     const message = postMessageInputSchema.parse(input);
-    const event = this.store.insertMessage(
-      message.sessionId,
-      message.body,
-      message.requireAck ? (message.resurfaceAfterMs ?? 300_000) : 0,
-      message.requireAck ? (message.maxResurfaces ?? 2) : 0,
-    );
+    const retryMs = message.requireAck
+      ? (message.resurfaceAfterMs ?? 300_000)
+      : 0;
+    const maxResurfaces = message.requireAck ? (message.maxResurfaces ?? 2) : 0;
+    const { eventId, created } =
+      message.key === undefined
+        ? {
+            eventId: this.store.insertMessage(
+              message.sessionId,
+              message.body,
+              retryMs,
+              maxResurfaces,
+            ).id,
+            created: true,
+          }
+        : this.store.insertMessageOnce(
+            message.sessionId,
+            message.body,
+            retryMs,
+            maxResurfaces,
+            message.key,
+          );
+    if (!created) return { eventId };
     try {
       this.refreshHookState(message.sessionId);
-      return { eventId: event.id };
+      return { eventId };
     } catch (error) {
-      return { eventId: event.id, hookStateRefreshError: errorMessage(error) };
+      return { eventId, hookStateRefreshError: errorMessage(error) };
     }
   }
 
@@ -3721,26 +3738,24 @@ export class AgentMonitorRuntime {
     }
 
     if (lifecycle === 'post-compact') {
-      // Posts follow the same budget during recap and ordinary delivery.
+      // Put eligible posts first so both the event cap and the renderer's
+      // character cap leave room for an offer. Keep their oldest-first order.
       const pendingPosts = this.pendingForClaim(sessionId, 'high').filter(
         (event) => event.monitorId === POST_MONITOR_ID,
       );
-      const postsById = new Map(pendingPosts.map((event) => [event.id, event]));
-      const unread = this.store
+      const unreadMonitors = this.store
         .unreadEventsForSession(sessionId)
-        .flatMap((event) => {
-          if (event.monitorId !== POST_MONITOR_ID) return [event];
-          const pending = postsById.get(event.id);
-          return pending ? [pending] : [];
-        });
-      if (unread.length === 0) return null;
-      // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
-      // set, then recap only the delivered (post-collapse) tail. Only groups
-      // represented in that tail may be claimed or suppressed; the cap must
-      // leave unseen groups intact for a later delivery. Recap re-shows unread
-      // monitor events, while posts follow the normal offer policy (006 §5.5).
-      const deliveredUnread = computeNetCollapseView(unread).delivered;
-      const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
+        .filter((event) => event.monitorId !== POST_MONITOR_ID);
+      if (pendingPosts.length === 0 && unreadMonitors.length === 0) return null;
+      const unread = [...pendingPosts, ...unreadMonitors];
+      const recapSlice = pendingPosts.slice(0, MAX_RECAP_EVENTS);
+      const monitorSlots = MAX_RECAP_EVENTS - recapSlice.length;
+      if (monitorSlots > 0) {
+        // Collapse the full set before choosing the newest monitor groups.
+        const deliveredMonitors =
+          computeNetCollapseView(unreadMonitors).delivered;
+        recapSlice.push(...deliveredMonitors.slice(-monitorSlots));
+      }
       const recapKeys = new Set(recapSlice.map(netCollapseGroupKey));
       const recapCandidates = unread.filter((event) =>
         recapKeys.has(netCollapseGroupKey(event)),

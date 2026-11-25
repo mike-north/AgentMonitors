@@ -181,6 +181,16 @@ export const interpretDecisionValues = [
 ] as const;
 export type InterpretDecision = (typeof interpretDecisionValues)[number];
 
+/**
+ * Durable mapping from a workspace request key to the original post ID.
+ * @internal
+ */
+export const postRequests = sqliteTable('post_requests', {
+  workspacePath: text('workspace_path').notNull(),
+  requestKey: text('request_key').notNull(),
+  eventId: text('event_id').notNull(),
+});
+
 export const sessionEventState = sqliteTable('session_event_state', {
   id: text('id').primaryKey(),
   sessionId: text('session_id').notNull(),

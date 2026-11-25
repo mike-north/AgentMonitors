@@ -1234,11 +1234,14 @@ the separate, genuinely-pending remainder, which the deferred marker signposts c
 
 **Bounded recap delivery (_current_).** A `post-compact` recap draws from unread monitor
 events and direct posts eligible under [002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current).
-The hook commit MUST consume only the post offers represented in its rendered context.
+Eligible posts take priority under both the event-count and character limits. The hook renders
+those posts before monitor events, so an oversized unread monitor event cannot crowd out a due
+post. The hook commit MUST consume only the post offers represented in its rendered context.
 A partially shown post counts as presented. A wholly omitted post retains its current offer,
 including a final needs-attention offer. For example, when an 8,000-character informational
 post fills a recap and a short post is omitted, the next recap can show the short post.
-The compiled hook regression in `post.integration.test.ts` exercises this sequence.
+The compiled hook regressions in `post.integration.test.ts` exercise this sequence and verify
+that repeated recaps reach needs-attention despite unread monitor events at both limits.
 
 Both truncation branches use the recap marker: "not everything fit in this recap; omitted
 content stays unread and posts follow their delivery schedule". The marker includes the

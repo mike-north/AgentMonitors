@@ -2567,6 +2567,12 @@ delivery claim and reservation protocol. A post has no snapshot or object cursor
 only in the recipient's session-scoped event list and use the reserved event identity
 `message/post`.
 
+When the optional request `key` is supplied, the runtime commits the key and event ID in the
+same transaction as the event and projection. Keys are unique within the recipient's workspace.
+A repeat with the same key in that workspace returns the original ID without creating or
+changing a post, even after a restart or when the original session is dormant. Different
+workspaces can use the same key independently.
+
 | State             | Meaning                                                                                                    |
 | ----------------- | ---------------------------------------------------------------------------------------------------------- |
 | `pending`         | The initial delivery has yet to be claimed.                                                                |
@@ -2575,8 +2581,9 @@ only in the recipient's session-scoped event list and use the reserved event ide
 | `needs-attention` | The acknowledgement deadline passed after the initial delivery and all configured resurfaces were claimed. |
 | `acked`           | The recipient explicitly acknowledged the post.                                                            |
 
-For a post requiring acknowledgement, each committed claim starts a new deadline using the
-post's persisted interval. The next offer uses the same ID and body. A released or expired
+For a post requiring acknowledgement, committing the initial offer or a scheduled resurface
+starts a new deadline using the persisted interval. Committing the final needs-attention offer
+clears the deadline. Each offer uses the same ID and body. A released or expired
 reservation leaves the offer eligible without spending the resurfacing budget. At the deadline
 after the last allowed resurface, the event becomes `needs-attention` and is eligible for one
 final delivery labeled accordingly. It remains visible as `needs-attention` until acknowledged.
@@ -2593,7 +2600,9 @@ The timing policy and claim progress are stored with the projection and survive 
 Interval and budget defaults and bounds are in [005 §18](./005-cli-reference.md#18-post--send-a-message).
 
 Verified: `apps/cli/src/commands/post.integration.test.ts` exercises posting, claiming, listing
-and acknowledgement over the local socket with a controlled clock and a reopened database.
+and acknowledgement over the local socket with a controlled clock and a reopened database. It also
+checks ID recovery after a committed reply times out. `libs/core/src/inbox/db.migration.test.ts`
+covers legacy projections and keyed replay across database connections.
 
 ## 8. Hook State
 
@@ -2810,13 +2819,22 @@ and reservation scenarios for `low` at `turn-idle` and `normal` at `turn-interru
 
 At `post-compact`, if unread monitor events or eligible posts remain, the runtime **MUST** emit a recap payload that:
 
-- includes a summary of up to the 10 most recent recap candidates (`MAX_RECAP_EVENTS = 10`, using `.slice(-10)` so the 10 newest are included)
+- includes a summary of up to 10 recap candidates (`MAX_RECAP_EVENTS = 10`)
 - appends two commands: one for full session history and one for unread details
 - updates `lastRecapAt` on the session record
 
-The `DeliveryClaim` in this case has `mode: 'recap'`. The `events` array contains up to 10 `DeliveryEventSummary` entries, each including `body` (the raw monitor instructions — see §9.1 for the `DeliveryEventSummary` shape). Claiming any delivery **MUST** mark the underlying session-event rows as claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains null) (BP2). Bounded hook recaps consume only the post offers represented in the rendered context (006 §5.5).
+The `DeliveryClaim` in this case has `mode: 'recap'`. Eligible posts fill the first slots in
+oldest-first order. The newest unread monitor events fill remaining slots after per-recipient
+collapse. Each `DeliveryEventSummary` includes `body`, which contains the monitor instructions or
+post text (see §9.1). Claiming a delivery **MUST** mark its underlying session-event rows as
+claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains
+null) (BP2). Bounded hook recaps consume only the post offers represented in the rendered context
+(006 §5.5).
 
-Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` post-compact branch; `MAX_RECAP_EVENTS = 10`; `store.markClaimed()` does not set `acknowledgedAt` (see `libs/core/src/runtime/store.ts`: only sets `firstNotifiedAt`, `lastClaimAt`, `lastClaimLifecycle`). Each mapped event includes `body: event.body`.
+Verified: `libs/core/src/runtime/service.ts` selects the `post-compact` claim.
+`store.markClaimed()` records claim metadata and advances the post schedule (§7.2) while
+leaving acknowledgement state intact. The compiled recap regressions in
+`apps/cli/src/commands/post.integration.test.ts` exercise both limits.
 
 ## 10. Daemon and IPC
 
@@ -3463,25 +3481,40 @@ Real owned-socket tests verify dates rather than inferring correctness from core
 
 Poll ingestion atomically admits the complete emitted span and source/notify state before Interpret. Retained rows drain before newer input (§2.7). Final crash acceptance remains separate work.
 
+### `post_requests`
+
+Durable recovery records for keyed posts (§7.2). The primary key is
+`(workspace_path, request_key)`.
+
+| Column           | Type          | Notes                                                          |
+| ---------------- | ------------- | -------------------------------------------------------------- |
+| `workspace_path` | TEXT NOT NULL | Recipient workspace, or the empty string for unscoped sessions |
+| `request_key`    | TEXT NOT NULL | Request key supplied by the caller                             |
+| `event_id`       | TEXT NOT NULL | ID returned for the original post                              |
+
 ### `session_event_state`
 
 Per-session delivery tracking for each projected event. Drives the unread/claimed/acknowledged state machine (§7).
 
-| Column                 | Type             | Notes                                                                       |
-| ---------------------- | ---------------- | --------------------------------------------------------------------------- |
-| `id`                   | TEXT PK          | ULID                                                                        |
-| `session_id`           | TEXT NOT NULL    | FK to `agent_sessions.id`                                                   |
-| `event_id`             | TEXT NOT NULL    | FK to `monitor_events.id`                                                   |
-| `first_notified_at`    | INTEGER nullable | Set when event is first claimed; `NULL` = pending                           |
-| `acknowledged_at`      | INTEGER nullable | Set by explicit ack; `NULL` = unread                                        |
-| `last_claim_at`        | INTEGER nullable | Time of most recent claim                                                   |
-| `last_claim_lifecycle` | TEXT nullable    | Lifecycle at most recent claim                                              |
-| `diff_text`            | TEXT nullable    | Per-recipient delta (G10); `NULL` ⇒ fall back to `monitor_events.diff_text` |
-| `interpret_decision`   | TEXT nullable    | Per-recipient Interpret verdict (G14); `NULL` for non-`prose`               |
-| `interpret_reason`     | TEXT nullable    | Interpret suppression/failure detail (G14)                                  |
-| `interpret_digest`     | TEXT nullable    | Delivered cheap digest when verdict is `deliver` (G14)                      |
-| `created_at`           | INTEGER NOT NULL |                                                                             |
-| `updated_at`           | INTEGER NOT NULL |                                                                             |
+| Column                   | Type             | Notes                                                                               |
+| ------------------------ | ---------------- | ----------------------------------------------------------------------------------- |
+| `id`                     | TEXT PK          | ULID                                                                                |
+| `session_id`             | TEXT NOT NULL    | FK to `agent_sessions.id`                                                           |
+| `event_id`               | TEXT NOT NULL    | FK to `monitor_events.id`                                                           |
+| `first_notified_at`      | INTEGER nullable | Set when event is first claimed; `NULL` = pending                                   |
+| `acknowledged_at`        | INTEGER nullable | Set by explicit ack; `NULL` = unread                                                |
+| `last_claim_at`          | INTEGER nullable | Time of most recent claim                                                           |
+| `last_claim_lifecycle`   | TEXT nullable    | Lifecycle at most recent claim                                                      |
+| `diff_text`              | TEXT nullable    | Per-recipient delta (G10); `NULL` ⇒ fall back to `monitor_events.diff_text`         |
+| `interpret_decision`     | TEXT nullable    | Per-recipient Interpret verdict (G14); `NULL` for non-`prose`                       |
+| `interpret_reason`       | TEXT nullable    | Interpret suppression/failure detail (G14)                                          |
+| `interpret_digest`       | TEXT nullable    | Delivered cheap digest when verdict is `deliver` (G14)                              |
+| `message_retry_ms`       | INTEGER nullable | Resurface interval in milliseconds, 0 for a one-off post, NULL for monitor events   |
+| `message_max_resurfaces` | INTEGER NOT NULL | Maximum scheduled resurfaces, defaults to 0                                         |
+| `message_claims`         | INTEGER NOT NULL | Committed post offers, including the initial and final offers, defaults to 0        |
+| `message_due_at_ms`      | INTEGER nullable | Next offer deadline in Unix milliseconds, cleared when the final offer is committed |
+| `created_at`             | INTEGER NOT NULL |                                                                                     |
+| `updated_at`             | INTEGER NOT NULL |                                                                                     |
 
 ### `session_object_cursor`
 

@@ -59,6 +59,7 @@ const daemonMethodSchema = z.enum([
   'events.list',
   'events.ack',
   'messages.post',
+  'messages.postKeyed',
   'events.retractObject',
   'events.suppressObject',
   'verifyArtifacts.register',
@@ -796,9 +797,13 @@ function handleRequest(
       );
     }
     case 'messages.post':
-      return Promise.resolve(
-        runtime.postMessage(postMessageInputSchema.parse(request.params)),
-      );
+    case 'messages.postKeyed': {
+      const input = postMessageInputSchema.parse(request.params);
+      if (request.method === 'messages.postKeyed' && input.key === undefined) {
+        throw new Error('A post request key is required.');
+      }
+      return Promise.resolve(runtime.postMessage(input));
+    }
     case 'events.ack':
       {
         const params = eventsAckParamsSchema.parse(request.params);

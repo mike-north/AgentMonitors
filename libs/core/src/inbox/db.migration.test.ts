@@ -1287,3 +1287,118 @@ describe('ordering migration keeps definition_fingerprint (#451 + #534)', () => 
     ).toContain('idx_monitor_events_object_sequence');
   });
 });
+
+it('preserves pre-post projections and recovers keyed posts after reopening', () => {
+  const dbPath = tempDbPath();
+  const legacy = new Database(dbPath);
+  migrationClients.add(legacy);
+  legacy.exec(legacyEventsDDL);
+  legacy.exec(`
+    CREATE TABLE session_event_state (
+      id TEXT PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      first_notified_at INTEGER,
+      acknowledged_at INTEGER,
+      last_claim_at INTEGER,
+      last_claim_lifecycle TEXT,
+      interpret_decision TEXT,
+      interpret_reason TEXT,
+      interpret_digest TEXT,
+      net_suppressed_at INTEGER,
+      diff_text TEXT,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
+  for (const [id, firstNotifiedAt, acknowledgedAt] of [
+    ['pending', null, null],
+    ['claimed', 2, null],
+    ['acknowledged', 2, 3],
+  ] as const) {
+    legacy
+      .prepare(
+        `
+      INSERT INTO monitor_events (id, monitor_id, source_name, urgency, title, created_at)
+      VALUES (?, 'release', 'schedule', 'normal', 'Release', 1)
+    `,
+      )
+      .run(id);
+    legacy
+      .prepare(
+        `
+      INSERT INTO session_event_state (
+        id, session_id, event_id, first_notified_at, acknowledged_at, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, 1, 3)
+    `,
+      )
+      .run(
+        `projection-${id}`,
+        retainedSessionId,
+        id,
+        firstNotifiedAt,
+        acknowledgedAt,
+      );
+  }
+  legacy.close();
+
+  const store = new RuntimeStore(createDb(dbPath));
+  expect(
+    store.pendingEventsForSession(retainedSessionId).map(({ id }) => id),
+  ).toEqual(['pending']);
+  expect(
+    store.unreadEventsForSession(retainedSessionId).map(({ id }) => id),
+  ).toEqual(['pending', 'claimed']);
+  expect(
+    store
+      .listEvents({ sessionId: retainedSessionId })
+      .map((event) => [event.id, event.deliveryState, event.messageState]),
+  ).toEqual([
+    ['acknowledged', 'acknowledged', undefined],
+    ['claimed', 'claimed', undefined],
+    ['pending', 'unread', undefined],
+  ]);
+
+  const open = (workspacePath: string, hostSessionId: string) =>
+    store.openSession({
+      adapter: 'test',
+      hostSessionId,
+      agentIdentity: hostSessionId,
+      hookStatePath: path.join(workspacePath, `${hostSessionId}.json`),
+      workspacePath,
+    }).id;
+  const workspace = path.dirname(dbPath);
+  const recipient = open(workspace, 'recipient');
+  const sibling = open(workspace, 'sibling');
+  const otherWorkspace = open(path.join(workspace, 'other'), 'other');
+  const first = store.insertMessageOnce(
+    recipient,
+    'Original',
+    100,
+    1,
+    'request',
+  );
+  expect(first.created).toBe(true);
+  store.closeSession(recipient);
+
+  const reopened = new RuntimeStore(createDb(dbPath));
+  expect(
+    reopened.insertMessageOnce(recipient, 'Replay', 100, 1, 'request'),
+  ).toEqual({ eventId: first.eventId, created: false });
+  expect(
+    reopened.insertMessageOnce(sibling, 'Replay', 100, 1, 'request'),
+  ).toEqual({ eventId: first.eventId, created: false });
+  expect(
+    reopened.insertMessageOnce(
+      otherWorkspace,
+      'Independent',
+      100,
+      1,
+      'request',
+    ),
+  ).toMatchObject({ created: true });
+  expect(reopened.pendingEventsForSession(recipient)).toMatchObject([
+    { id: first.eventId, body: 'Original' },
+  ]);
+  expect(reopened.pendingEventsForSession(sibling)).toEqual([]);
+});

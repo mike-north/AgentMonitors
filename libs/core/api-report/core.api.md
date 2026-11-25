@@ -1442,6 +1442,7 @@ export interface PendingRollupState {
 export interface PostMessageInput {
     // (undocumented)
     body: string;
+    key?: string | undefined;
     // (undocumented)
     maxResurfaces?: number | undefined;
     // (undocumented)
@@ -1456,6 +1457,7 @@ export interface PostMessageInput {
 export const postMessageInputSchema: z.ZodObject<{
     sessionId: z.ZodString;
     body: z.ZodString;
+    key: z.ZodOptional<z.ZodString>;
     requireAck: z.ZodOptional<z.ZodBoolean>;
     resurfaceAfterMs: z.ZodOptional<z.ZodNumber>;
     maxResurfaces: z.ZodOptional<z.ZodNumber>;
@@ -1625,6 +1627,10 @@ export class RuntimeStore {
         restrictToSessionId?: string;
     }): MonitorEventRecord;
     insertMessage(sessionId: string, body: string, retryMs: number, maxResurfaces: number): MonitorEventRecord;
+    insertMessageOnce(sessionId: string, body: string, retryMs: number, maxResurfaces: number, key: string): {
+        eventId: string;
+        created: boolean;
+    };
     interpretDigestsForSession(sessionId: string, eventIds: string[]): Map<string, string>;
     isVerifyArtifactCleanupEffective(input: {
         workspacePath: string;

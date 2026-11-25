@@ -59,12 +59,16 @@ import {
   monitorState,
   objectEventSuppressions,
   observationHistory,
+  postRequests,
   sessionEventState,
   sessionObjectCursor,
   verifyArtifacts,
 } from '../inbox/schema.js';
 import { EPHEMERAL_MONITOR_ID_PREFIX } from './types.js';
-import { registerRuntimeTransaction } from './runtime-transaction.js';
+import {
+  registerRuntimeTransaction,
+  runRuntimeTransaction,
+} from './runtime-transaction.js';
 import type {
   AgentSessionRecord,
   EnqueueMaterializationRetryInput,
@@ -1682,6 +1686,42 @@ export class RuntimeStore {
       undefined,
       { message: { sessionId, retryMs, maxResurfaces } },
     );
+  }
+
+  /** Commit a keyed post and its recovery record in one writer transaction. */
+  insertMessageOnce(
+    sessionId: string,
+    body: string,
+    retryMs: number,
+    maxResurfaces: number,
+    key: string,
+  ): { eventId: string; created: boolean } {
+    const db = asInternalDb(this.db);
+    return runRuntimeTransaction(this, () => {
+      const workspacePath = this.getSessionById(sessionId).workspacePath ?? '';
+      const existing = db
+        .select({ eventId: postRequests.eventId })
+        .from(postRequests)
+        .where(
+          and(
+            eq(postRequests.workspacePath, workspacePath),
+            eq(postRequests.requestKey, key),
+          ),
+        )
+        .get();
+      if (existing) return { eventId: existing.eventId, created: false };
+
+      const { id: eventId } = this.insertMessage(
+        sessionId,
+        body,
+        retryMs,
+        maxResurfaces,
+      );
+      db.insert(postRequests)
+        .values({ workspacePath, requestKey: key, eventId })
+        .run();
+      return { eventId, created: true };
+    });
   }
 
   /**
