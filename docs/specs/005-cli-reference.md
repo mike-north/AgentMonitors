@@ -2315,7 +2315,9 @@ value, not from a real suppression. See 006 §12.7.
 
 `version-skew`, `channel-registration-unverified`, and `channel-session-unmatched` are the three
 **advisory, non-blocking** codes: all are reported when present, but none counts toward a transport's `healthy` field, its `fail` status,
-or the overall `deliverable` verdict. `version-skew` was blocking through issue #373; it was made
+or the overall `deliverable` verdict. `channel-lead-uncovered` is advisory only when fresh,
+correctly bound hook heartbeats cover every session missing a channel heartbeat; without that
+evidence, it remains blocking. `version-skew` was blocking through issue #373; it was made
 informational because the hook transport's heartbeat legitimately carries the pre-upgrade CLI version
 for up to its full 24h TTL after every release (it only refreshes on the next prompt) — treating it as
 blocking made `doctor` exit non-zero for up to a day after every single upgrade, the exact cry-wolf
@@ -2325,8 +2327,7 @@ action needed" wording.
 **Current: channel advisories preserve the delivery verdict.** A channel record whose session is no
 longer active remains visible until its heartbeat expires. `channel-session-unmatched` changes neither
 `healthy` nor the transport check status. It does not establish a listening route for another session.
-`channel-lead-uncovered` is also advisory when each session without a channel heartbeat has a fresh,
-correctly bound hook heartbeat; without that hook evidence, it remains blocking. Both codes remain in
+Both channel codes remain in
 `transports[].problems[]` and the text Delivery transports block, without additional JSON fields.
 
 When `deliverable` is true, every delivery-transport check and `delivery-verdict` is non-failing.
