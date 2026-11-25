@@ -74,6 +74,7 @@ function readEntries(root) {
       } catch (error) {
         throw new Error(
           `${name}: ${error instanceof Error ? error.message : String(error)}`,
+          { cause: error },
         );
       }
       return { date, text, links };
