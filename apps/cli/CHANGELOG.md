@@ -1,5 +1,50 @@
 # @agentmonitors/cli
 
+## 0.14.0
+
+### Minor Changes
+
+- a35a733: Add direct session messages with optional required acknowledgement. Unacknowledged messages can
+  resurface on a configurable schedule and remain visible as needs-attention when the budget is spent.
+
+### Patch Changes
+
+- 2983eb9: Record a tick whose retry drain completes retained work as `triggered` in monitor history. The tick's single history row now counts the drained events in `emitted`, so `agentmonitors monitor history` shows that a retried event was eventually emitted instead of `no-change`. When the source matched no files or rebaselined on that tick, the row keeps that outcome as `sourceOutcome`, and `agentmonitors monitor explain` still reports it.
+- 71d6428: Record durable counts for accepted notify work discarded when an ephemeral monitor is cancelled or its session retires. Show terminal dispositions in doctor and monitor explain after restart.
+
+  Serialize notify admission with declaration and owner retirement so outstanding observations cannot recreate held work. Keep existing holds visible in diagnostics even beside an older disposition.
+
+- 88162f9: Return unacknowledged claims to pending after a restart-safe claim TTL, defaulting to 30 minutes. Configure the shipped runtime with claim-ttl-ms in the workspace coordination file, or use RuntimeStore's claimTtlMs constructor option. Preserve first-surfaced history, recipient cursors and independent delivery reservations.
+
+  Keep lifecycle coordination independent of unapplied claim policy, and resolve offline history policy from its storage workspace without changing audit query scope.
+
+  Preserve the complete claim policy field line, including whitespace, across coordination rewrites.
+
+- a35a733: Prioritize due posts in bounded recaps and recover committed post IDs after interrupted replies with workspace-scoped request keys.
+
+  Keep post retries on the original workspace and daemon endpoint, including when the recipient moves.
+
+- dadec7d: Keep doctor delivery checks consistent with available delivery routes. Report leftover channel session heartbeats and hook-covered channel gaps as advisories while preserving diagnostics and failures when delivery is unavailable.
+- a35a733: Keep direct posts eligible when a bounded recap omits them. Return the committed event ID and warn separately when hook-state refresh fails.
+- a35a733: Reject conflicting post keys, prevent duplicate presentation of a post offer after a restart, and preserve the claim timing of monitor events omitted from a recap. Keep truncated posts available in unread history and stop resurfacing them after successful output.
+- Updated dependencies [2983eb9]
+- Updated dependencies [a35a733]
+- Updated dependencies [258a26d]
+- Updated dependencies [f235e53]
+- Updated dependencies [4835da7]
+- Updated dependencies [71d6428]
+- Updated dependencies [88162f9]
+- Updated dependencies [2d023f5]
+- Updated dependencies [a35a733]
+- Updated dependencies [a35a733]
+- Updated dependencies [a35a733]
+  - @agentmonitors/core@0.17.0
+  - @agentmonitors/source-api-poll@0.6.3
+  - @agentmonitors/source-command-poll@0.7.1
+  - @agentmonitors/source-file-fingerprint@0.5.3
+  - @agentmonitors/source-incoming-changes@0.4.3
+  - @agentmonitors/source-schedule@0.3.3
+
 ## 0.13.1
 
 ### Patch Changes
