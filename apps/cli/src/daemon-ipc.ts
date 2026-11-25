@@ -59,7 +59,7 @@ const daemonMethodSchema = z.enum([
   'events.list',
   'events.ack',
   'messages.post',
-  'messages.postKeyed',
+  'messages.postScoped',
   'events.retractObject',
   'events.suppressObject',
   'verifyArtifacts.register',
@@ -797,10 +797,13 @@ function handleRequest(
       );
     }
     case 'messages.post':
-    case 'messages.postKeyed': {
+    case 'messages.postScoped': {
       const input = postMessageInputSchema.parse(request.params);
-      if (request.method === 'messages.postKeyed' && input.key === undefined) {
-        throw new Error('A post request key is required.');
+      if (
+        request.method === 'messages.postScoped' &&
+        (input.key === undefined || input.workspacePath === undefined)
+      ) {
+        throw new Error('A post request key and workspace are required.');
       }
       return Promise.resolve(runtime.postMessage(input));
     }
@@ -1282,8 +1285,21 @@ export async function callDaemon<T = unknown>(
   params: JsonRecord = {},
   options: { socketPath?: string; timeoutMs?: number } = {},
 ): Promise<T> {
-  const socketPath = resolveSocketPath(options.socketPath);
-  const timeoutMs = options.timeoutMs ?? 2_000;
+  return await callDaemonAtSocket<T>(
+    resolveSocketPath(options.socketPath),
+    method,
+    params,
+    options.timeoutMs,
+  );
+}
+
+/** Send a request to an already resolved endpoint. */
+export async function callDaemonAtSocket<T = unknown>(
+  socketPath: string,
+  method: DaemonMethod,
+  params: JsonRecord,
+  timeoutMs = 2_000,
+): Promise<T> {
   const request: DaemonRequest = {
     id: `${String(Date.now())}-${Math.random().toString(16).slice(2)}`,
     method,

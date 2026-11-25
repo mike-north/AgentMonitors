@@ -2571,7 +2571,10 @@ When the optional request `key` is supplied, the runtime commits the key and eve
 same transaction as the event and projection. Keys are unique within the recipient's workspace.
 A repeat with the same key in that workspace returns the original ID without creating or
 changing a post, even after a restart or when the original session is dormant. Different
-workspaces can use the same key independently.
+workspaces can use the same key independently. A keyed request may pin its workspace explicitly.
+The runtime looks for the original ID in that workspace before checking the recipient's current
+registration. A new post requires the recipient to be registered in the selected workspace when
+the write transaction runs.
 
 | State             | Meaning                                                                                                    |
 | ----------------- | ---------------------------------------------------------------------------------------------------------- |

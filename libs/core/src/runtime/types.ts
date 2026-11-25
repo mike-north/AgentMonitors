@@ -143,6 +143,8 @@ export interface PostMessageInput {
   body: string;
   /** A workspace-scoped key for recovering the original event ID on retry. */
   key?: string | undefined;
+  /** Pin a keyed post to this registered workspace. An empty string selects the global scope. */
+  workspacePath?: string | undefined;
   requireAck?: boolean | undefined;
   resurfaceAfterMs?: number | undefined;
   maxResurfaces?: number | undefined;

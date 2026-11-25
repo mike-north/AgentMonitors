@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Post retries retain their workspace and endpoint (002 §7.2, 005 §18)
+
+A post retry uses the original recipient workspace and daemon endpoint. The workspace's recovery
+record remains usable after the recipient changes workspace. A new write requires a matching
+registration, and an unconfirmed command prints its recovery parameters.
+
 ## 2026-11-25 — Post recap priority and request recovery (002 §7.2, §9 and §15, 005 §18, 006 §5.5)
 
 Eligible posts take priority in bounded recaps. The projection deadline clears when the final

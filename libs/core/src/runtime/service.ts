@@ -3200,6 +3200,7 @@ export class AgentMonitorRuntime {
             retryMs,
             maxResurfaces,
             message.key,
+            message.workspacePath,
           );
     if (!created) return { eventId };
     try {

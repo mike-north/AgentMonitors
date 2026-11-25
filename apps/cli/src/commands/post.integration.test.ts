@@ -506,6 +506,74 @@ it('recovers the committed ID when the daemon reply misses the IPC timeout', asy
   });
 }, 15_000);
 
+it('recovers the original post when the recipient changes workspace before the retry', async () => {
+  await withPostSession(
+    async ({ root, runtime, sessionId, hookStatePath, post }) => {
+      const commit = runtime.postMessage.bind(runtime);
+      let committedId: string | undefined;
+      const requests = vi
+        .spyOn(runtime, 'postMessage')
+        .mockImplementationOnce((input) => {
+          const result = commit(input);
+          committedId = result.eventId;
+          runtime.openSession({
+            adapter: 'claude-code',
+            hostSessionId: 'recipient',
+            agentIdentity: 'recipient',
+            hookStatePath,
+            workspacePath: path.join(root, 'moved'),
+          });
+          return {
+            ...result,
+            then() {
+              // The post is durable even though the reply never arrives.
+            },
+          };
+        });
+
+      expect((await post('Only one durable post')).stdout.trim()).toBe(
+        committedId,
+      );
+      expect(runtime.listSessions()).toContainEqual(
+        expect.objectContaining({
+          id: sessionId,
+          workspacePath: path.join(root, 'moved'),
+        }),
+      );
+      const key = requests.mock.calls[0]?.[0].key;
+      if (!key) throw new Error('Missing request key.');
+      expect(requests.mock.calls.map(([input]) => input)).toEqual([
+        expect.objectContaining({ key, workspacePath: root }),
+        expect.objectContaining({ key, workspacePath: root }),
+      ]);
+      expect(runtime.listEvents({ sessionId }).map(({ id }) => id)).toEqual([
+        committedId,
+      ]);
+
+      const replay = await post(
+        'Only one durable post',
+        '--key',
+        key,
+        '--workspace',
+        root,
+      );
+      expect(replay.stdout.trim()).toBe(committedId);
+      await expect(
+        post('Invalid workspace', '--key', 'unused-key', '--workspace', root),
+      ).rejects.toThrow(
+        'The recipient is no longer registered in the selected workspace.',
+      );
+      const independent = await post(
+        'A post in the new workspace',
+        '--key',
+        key,
+      );
+      expect(independent.stdout.trim()).not.toBe(committedId);
+      expect(runtime.listEvents({ sessionId })).toHaveLength(2);
+    },
+  );
+}, 15_000);
+
 it('prints the key when neither post attempt receives a reply', async () => {
   await withPostSession(async ({ runtime, sessionId, post }) => {
     const commit = runtime.postMessage.bind(runtime);

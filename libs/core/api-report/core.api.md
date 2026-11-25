@@ -1451,6 +1451,7 @@ export interface PostMessageInput {
     resurfaceAfterMs?: number | undefined;
     // (undocumented)
     sessionId: string;
+    workspacePath?: string | undefined;
 }
 
 // @public (undocumented)
@@ -1458,6 +1459,7 @@ export const postMessageInputSchema: z.ZodObject<{
     sessionId: z.ZodString;
     body: z.ZodString;
     key: z.ZodOptional<z.ZodString>;
+    workspacePath: z.ZodOptional<z.ZodString>;
     requireAck: z.ZodOptional<z.ZodBoolean>;
     resurfaceAfterMs: z.ZodOptional<z.ZodNumber>;
     maxResurfaces: z.ZodOptional<z.ZodNumber>;
@@ -1627,7 +1629,7 @@ export class RuntimeStore {
         restrictToSessionId?: string;
     }): MonitorEventRecord;
     insertMessage(sessionId: string, body: string, retryMs: number, maxResurfaces: number): MonitorEventRecord;
-    insertMessageOnce(sessionId: string, body: string, retryMs: number, maxResurfaces: number, key: string): {
+    insertMessageOnce(sessionId: string, body: string, retryMs: number, maxResurfaces: number, key: string, expectedWorkspacePath?: string): {
         eventId: string;
         created: boolean;
     };

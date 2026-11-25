@@ -14,11 +14,18 @@ export const postMessageInputSchema = z
         message: 'Message body must contain text.',
       }),
     key: z.string().min(1).optional(),
+    workspacePath: z.string().optional(),
     requireAck: z.boolean().optional(),
     resurfaceAfterMs: z.number().int().min(1).max(2_147_483_647).optional(),
     maxResurfaces: z.number().int().min(0).max(100).optional(),
   })
   .superRefine((input, ctx) => {
+    if (input.workspacePath !== undefined && input.key === undefined) {
+      ctx.addIssue({
+        code: 'custom',
+        message: 'Pinning a post workspace requires a request key.',
+      });
+    }
     if (
       !input.requireAck &&
       (input.resurfaceAfterMs !== undefined ||

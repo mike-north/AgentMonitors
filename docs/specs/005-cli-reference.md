@@ -2976,7 +2976,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 **Status:** Current. Routes through the local daemon socket.
 
 ```text
-agentmonitors post --session <id> [--socket <path>] [--key <string>] [--require-ack]
+agentmonitors post --session <id> [--socket <path>] [--key <string>] [--workspace <path>] [--require-ack]
                    [--resurface-after-ms <ms>] [--max-resurfaces <count>] <body>
 ```
 
@@ -2990,16 +2990,18 @@ no repost. Command errors are reported on stderr with a nonzero exit code.
 - `--key <string>` accepts a nonempty request key and defaults to a fresh key for each invocation.
   Reuse a key within the same workspace to recover the original ID. For example, repeating
   `agentmonitors post --session <id> --key release-check 'Check the release'` returns the same ID.
+- `--workspace <path>` pins the request key to an exact registered workspace path. Use
+  `--workspace ''` for the global scope. The default is the recipient's workspace at lookup time.
 - `--require-ack` enables scheduled resurfacing.
 - `--resurface-after-ms` accepts integers from 1 through 2,147,483,647 and defaults to 300,000.
 - `--max-resurfaces` accepts integers from 0 through 100 and defaults to 2.
 
 If the connection fails after sending the request, including a reply timeout, the command
-retries once with the same key. If it still cannot confirm the result, it exits nonzero and
-prints the key on stderr. Retry the same command with the printed `--key` to recover the ID.
-The CLI uses `messages.postKeyed`, which requires a daemon that supports keyed posts.
-The compiled CLI integration tests delay a reply past the IPC timeout and verify that only one
-post is committed.
+retries once with the same key, workspace, and daemon endpoint. If it still cannot confirm the
+result, it exits nonzero and prints the key, workspace, and socket on stderr. Retry the command
+with those values to recover the ID. The CLI uses `messages.postScoped`, which requires a daemon
+that supports workspace-pinned posts. The compiled CLI integration tests withhold a reply past
+the IPC timeout and verify that moving the recipient to another workspace cannot duplicate the post.
 
 Both timing options require `--require-ack`. Use `events list --session <id>` to inspect a post's
 state and `events ack --session <id> --event-ids <event-id>` to acknowledge it. Use the same

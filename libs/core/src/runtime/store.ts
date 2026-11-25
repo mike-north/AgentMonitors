@@ -1695,10 +1695,14 @@ export class RuntimeStore {
     retryMs: number,
     maxResurfaces: number,
     key: string,
+    expectedWorkspacePath?: string,
   ): { eventId: string; created: boolean } {
     const db = asInternalDb(this.db);
     return runRuntimeTransaction(this, () => {
-      const workspacePath = this.getSessionById(sessionId).workspacePath ?? '';
+      const workspacePath =
+        expectedWorkspacePath ??
+        this.getSessionById(sessionId).workspacePath ??
+        '';
       const existing = db
         .select({ eventId: postRequests.eventId })
         .from(postRequests)
@@ -1711,6 +1715,17 @@ export class RuntimeStore {
         .get();
       if (existing) return { eventId: existing.eventId, created: false };
 
+      // A replay can recover the original result after the recipient moves.
+      // A new write requires the recipient to still belong to the pinned scope.
+      if (
+        expectedWorkspacePath !== undefined &&
+        (this.getSessionById(sessionId).workspacePath ?? '') !==
+          expectedWorkspacePath
+      ) {
+        throw new Error(
+          'The recipient is no longer registered in the selected workspace.',
+        );
+      }
       const { id: eventId } = this.insertMessage(
         sessionId,
         body,
