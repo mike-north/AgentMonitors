@@ -39,12 +39,13 @@ import {
 import { resolveDataRoot } from '../workspace-paths.js';
 import { getCliVersion } from '../cli-version.js';
 import {
-  readTransportHeartbeats,
+  readTransportHeartbeatsResult,
   type TransportName,
 } from '../transport-heartbeat.js';
 import {
   computeTransportHealth,
   disqualifiesFromListening,
+  isAdvisoryProblem,
   isSharedProblem,
   type DeliveryTransportHealth,
   type TransportStatus,
@@ -731,6 +732,9 @@ function transportChecks(
   const anyConfigured = health.transports.some(
     (transport) => transport.configured,
   );
+  const newerSchema = health.pipelineProblems.find(
+    (problem) => problem.code === 'heartbeat-newer-schema',
+  );
 
   for (const transport of health.transports) {
     const name = `transport:${transport.name}`;
@@ -738,13 +742,16 @@ function transportChecks(
       checks.push({
         name,
         status: hasLeadSession ? 'idle' : 'skip',
-        detail: hasLeadSession
-          ? `No ${transport.name} transport has reported in for this workspace. Either it has not run yet (the hook transport records itself on the first prompt of a session; the channel is optional), or it is running under a different HOME/data root and is invisible from here.`
-          : `No ${transport.name} transport has reported in (expected when no agent session is currently open).`,
+        detail: newerSchema
+          ? `[${newerSchema.code}] ${newerSchema.detail}`
+          : hasLeadSession
+            ? `No ${transport.name} transport has reported in for this workspace. Either it has not run yet (the hook transport records itself on the first prompt of a session; the channel is optional), or it is running under a different HOME/data root and is invisible from here.`
+            : `No ${transport.name} transport has reported in (expected when no agent session is currently open).`,
         // Idle is not the same as "nothing to do" — the reader who hits this
         // first (every fresh setup) still needs a concrete next step, not a
         // bare status glyph (005 §15).
-        remediation: notConfiguredRemediation(transport.name),
+        remediation:
+          newerSchema?.remediation ?? notConfiguredRemediation(transport.name),
       });
       continue;
     }
@@ -795,7 +802,11 @@ function transportChecks(
   // otherwise the worst case, suppression on a workspace with no heartbeat yet,
   // would exit 0 while nothing can ever arrive.
   const idleVerdict =
-    !hasLeadSession || (!anyConfigured && health.pipelineProblems.length === 0);
+    !hasLeadSession ||
+    (!anyConfigured &&
+      health.pipelineProblems.every((problem) =>
+        isAdvisoryProblem(problem.code),
+      ));
   checks.push({
     name: 'delivery-verdict',
     status: idleVerdict ? 'idle' : health.deliverable ? 'pass' : 'fail',
@@ -1215,6 +1226,7 @@ export const doctorCommand = new Command('doctor')
         const { diagnoses, unavailableSessionIds } = daemonRunning
           ? await gatherDeliveryDiagnoses(activeLeadSessions, socketPath)
           : { diagnoses: [], unavailableSessionIds: [] };
+        const heartbeatScan = readTransportHeartbeatsResult();
         const health = computeTransportHealth({
           workspacePath: workspace,
           socketPath,
@@ -1227,7 +1239,8 @@ export const doctorCommand = new Command('doctor')
           // here let the diagnostic erase its own evidence — a second run
           // found no record and exited 0 with nothing actually recovered —
           // and contradicted 005 §15's "diagnoses only, never mutates".
-          heartbeats: readTransportHeartbeats(),
+          heartbeats: heartbeatScan.records,
+          newerSchemaPresent: heartbeatScan.newerSchemaPresent,
           diagnoses,
           diagnosisUnavailableSessionIds: unavailableSessionIds,
           cliVersion: getCliVersion(),

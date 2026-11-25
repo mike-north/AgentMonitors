@@ -75,6 +75,8 @@ export type TransportProblemCode =
   | 'heartbeat-stale'
   /** A long-lived transport is running an older CLI than this one. */
   | 'version-skew'
+  /** A registry entry uses an incompatible newer format; binding is unknown. */
+  | 'heartbeat-newer-schema'
   /** The channel is up, but host-side channel registration is unprovable here. */
   | 'channel-registration-unverified'
   /**
@@ -122,14 +124,15 @@ export type TransportProblemCode =
   | 'hook-lead-uncovered';
 
 /**
- * Problems that belong to the delivery pipeline as a whole rather than to one
- * transport. They are attached to EVERY configured transport — a down daemon or
+ * Findings that belong to the registry or delivery pipeline as a whole rather
+ * than to one transport. They are attached to EVERY configured transport — a down daemon or
  * a muted reminder blocks the hook and channel paths alike, and reporting
  * either against a single transport would imply the other one still works — but
  * a renderer must report them ONCE, at the verdict, instead of repeating them
  * per row. {@link isSharedProblem} is that filter.
  */
 const SHARED_PROBLEM_CODES: readonly TransportProblemCode[] = [
+  'heartbeat-newer-schema',
   'daemon-unreachable',
   'reminders-suppressed',
   'delivery-diagnosis-unavailable',
@@ -149,6 +152,7 @@ const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
   'channel-registration-unverified',
   'version-skew',
   'channel-session-unmatched',
+  'heartbeat-newer-schema',
 ];
 
 /**
@@ -175,10 +179,14 @@ export function disqualifiesFromListening(
   );
 }
 
-/** Channel coverage is optional only where a valid hook route covers the gap. */
-function isAdvisoryProblem(
+/**
+ * Informational findings never change health or exit status. Channel coverage
+ * is optional only where a valid hook route covers the gap.
+ * @internal
+ */
+export function isAdvisoryProblem(
   code: TransportProblemCode,
-  channelGapsCoveredByHooks: boolean,
+  channelGapsCoveredByHooks = false,
 ): boolean {
   return (
     ADVISORY_PROBLEM_CODES.includes(code) ||
@@ -278,6 +286,8 @@ export interface TransportHealthInput {
   leadHostSessionIds: readonly string[];
   /** Every heartbeat in the machine-wide registry. */
   heartbeats: readonly TransportHeartbeat[];
+  /** A newer format exists somewhere in the registry; its binding is unknown. */
+  newerSchemaPresent?: boolean;
   /** Per-lead-session delivery diagnoses, when the daemon was reachable. */
   diagnoses: readonly HookDeliveryDiagnosis[];
   /**
@@ -947,6 +957,14 @@ export function computeTransportHealth(
   input: TransportHealthInput,
 ): DeliveryTransportHealth {
   const sharedProblems: TransportProblem[] = [];
+  if (input.newerSchemaPresent) {
+    sharedProblems.push({
+      code: 'heartbeat-newer-schema',
+      detail:
+        'A transport using a newer record format is present in the registry; this CLI cannot read it or determine its workspace binding.',
+      remediation: 'Upgrade this CLI to interpret the newer heartbeat format.',
+    });
+  }
   if (!input.daemonRunning) sharedProblems.push(daemonProblem(input));
   sharedProblems.push(...suppressionProblems(input));
   sharedProblems.push(...diagnosisUnavailableProblems(input));
@@ -1107,9 +1125,12 @@ function buildVerdict(
     // that explicitly stops a reader from chasing a "fix the transport"
     // remediation for a problem that has nothing to do with the transport.
     const anyConfigured = transports.some((transport) => transport.configured);
-    const base = anyConfigured
-      ? 'delivery to active sessions in this workspace → via none: there is no live session for this workspace — a transport has reported in previously, but no lead session is currently open for it to deliver to.'
-      : 'delivery to active sessions in this workspace → via none (no lead session is registered for this workspace; no transport has reported in).';
+    const base =
+      input.newerSchemaPresent && !anyConfigured
+        ? 'delivery to active sessions in this workspace → via none (no lead session is registered; newer-format transport evidence cannot be interpreted).'
+        : anyConfigured
+          ? 'delivery to active sessions in this workspace → via none: there is no live session for this workspace — a transport has reported in previously, but no lead session is currently open for it to deliver to.'
+          : 'delivery to active sessions in this workspace → via none (no lead session is registered for this workspace; no transport has reported in).';
     return `${base}${mutedClause}`;
   }
   if (reach === 'none') {

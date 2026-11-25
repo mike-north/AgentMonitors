@@ -9,6 +9,27 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Heartbeat cleanup checks file identity (006 §12.9) — Refs #463
+
+The comparison always includes device and retains reported timestamp precision with bigint stats.
+The documented identity contract is exact with non-zero inode observations and best-effort without
+them. Missing, synthesized or coarse timestamps can match a replacement published between the
+first read and final check. Cleanup creates no files, and the next heartbeat write recreates a
+removed record. This clarifies existing behavior without changing code or tests.
+
+Cleanup reads lease or retention evidence through a descriptor and compares its file identity with
+the path immediately before unlinking. Changed stat observations defer cleanup; no cleanup
+files are created. The final check and unlink are not atomic, so a publication in that window can
+remain absent until the next heartbeat write. Real-filesystem tests cover replacement detection,
+zero-inode fallback, unlink failure and next-write recovery. §12.9 names the verifying code and tests.
+
+## 2026-11-25 — Heartbeat format retention and diagnostics (006 §12.9) — Refs #463
+
+Heartbeat interpretation uses one shape-and-version predicate. Write-path cleanup removes
+uninterpretable records only after 48 hours measured from file mtime; compatible records retain
+their own lease policy. Newer integer schema markers produce an informational health advisory
+instead of an empty-registry diagnosis. Doctor remains read-only and its exit status is unchanged.
+
 ## 2026-11-25 — Serialize ephemeral admission with retirement (002 §6.4 and §10.7) — Refs #667
 
 Notify admission and held-work flushes check the declaration and owner liveness under their

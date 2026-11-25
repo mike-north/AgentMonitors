@@ -1,5 +1,13 @@
 import { createHash } from 'node:crypto';
-import { readFileSync, readdirSync, rmSync } from 'node:fs';
+import {
+  closeSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { writePrivateFileAtomic } from '@agentmonitors/core';
@@ -63,7 +71,15 @@ import { resolveDataRoot, workspaceHash } from './workspace-paths.js';
  * @see ../../../docs/specs/006-agent-integration.md §12 (transport health)
  */
 
-/** Record schema version — bumped only on an incompatible field change. */
+/**
+ * Bump on incompatible field changes. Readers accept only the current shape
+ * and version through {@link canReadHeartbeatRecord}; older and malformed
+ * records are skipped, while newer versions also produce a health advisory.
+ * No read migrates or deletes files. Write-path cleanup retains all unreadable
+ * records until their mtime age exceeds {@link UNREADABLE_HEARTBEAT_REAP_AGE_MS}.
+ * Cleanup checks the opened file's identity against the path before unlinking;
+ * this check does not synchronize concurrent writers (see {@link reapHeartbeatFileIfExpired}).
+ */
 export const TRANSPORT_HEARTBEAT_SCHEMA_VERSION = 1;
 
 /** The two delivery transports that report liveness (006 §3, §4). */
@@ -136,6 +152,16 @@ export const CHANNEL_HEARTBEAT_TTL_MS = 30_000;
  * seen the hook transport recently enough that we can say it is wired up".
  */
 export const HOOK_HEARTBEAT_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Retain unreadable evidence for two hook leases before write-path cleanup.
+ * Uninterpretable payloads cannot supply a trusted timestamp or lease; their
+ * filesystem mtime is the retention clock, including after a schema bump.
+ * Cleanup reads mtime from the opened file and checks path identity before
+ * unlinking; it creates no additional registry files.
+ * @internal
+ */
+export const UNREADABLE_HEARTBEAT_REAP_AGE_MS = 2 * HOOK_HEARTBEAT_TTL_MS;
 
 /** The machine-wide transport registry directory. */
 export function transportRegistryDir(): string {
@@ -243,7 +269,7 @@ export interface WriteHeartbeatInput {
 function readExistingLastDeliveryAt(target: string): string | undefined {
   try {
     const parsed: unknown = JSON.parse(readFileSync(target, 'utf-8'));
-    return isTransportHeartbeat(parsed) ? parsed.lastDeliveryAt : undefined;
+    return canReadHeartbeatRecord(parsed) ? parsed.lastDeliveryAt : undefined;
   } catch {
     return undefined;
   }
@@ -423,18 +449,34 @@ export function isTransportHeartbeat(
   );
 }
 
+/**
+ * The sole interpretation gate for persisted heartbeat payloads.
+ * Shape validity alone never establishes compatibility with this CLI.
+ * @internal
+ */
+export function canReadHeartbeatRecord(
+  value: unknown,
+): value is TransportHeartbeat {
+  return (
+    isTransportHeartbeat(value) &&
+    value.schemaVersion === TRANSPORT_HEARTBEAT_SCHEMA_VERSION
+  );
+}
+
 /** Result of a registry scan that distinguishes "empty" from "unreadable". */
 export interface ReadTransportHeartbeatsResult {
   records: TransportHeartbeat[];
+  /** Registry-wide evidence only: unreadable payloads cannot establish binding. */
+  newerSchemaPresent: boolean;
   /**
    * Whether the registry DIRECTORY itself failed to read (e.g. a transient
    * `EMFILE`/`EACCES`) — as opposed to the directory reading fine but
    * containing zero, malformed, or future-schema files, none of which are a
    * read failure. A caller that must not mistake "I couldn't prove there's no
    * live transport" for "there is no live transport" (the daemon's reap check)
-   * needs this distinction; a caller that is content treating either case as
-   * "no transports" (`doctor`, `transport-health`) can ignore it and keep
-   * using {@link readTransportHeartbeats}.
+   * needs this distinction. Callers that treat either case as "no transports"
+   * can use {@link readTransportHeartbeats}. Newer-format evidence is reported
+   * separately by `newerSchemaPresent`, without trusting its payload shape.
    */
   readFailed: boolean;
 }
@@ -475,27 +517,45 @@ export function readTransportHeartbeatsResult(): ReadTransportHeartbeatsResult {
     // proven empty, which callers that fail closed (the reaper) must be able
     // to tell apart from "confirmed nothing here".
     const code = (error as NodeJS.ErrnoException).code;
-    return { records: [], readFailed: code !== 'ENOENT' };
+    return {
+      records: [],
+      newerSchemaPresent: false,
+      readFailed: code !== 'ENOENT',
+    };
   }
   const records: TransportHeartbeat[] = [];
+  let newerSchemaPresent = false;
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     try {
       const parsed: unknown = JSON.parse(
         readFileSync(path.join(transportRegistryDir(), name), 'utf-8'),
       );
-      if (
-        isTransportHeartbeat(parsed) &&
-        parsed.schemaVersion === TRANSPORT_HEARTBEAT_SCHEMA_VERSION
-      ) {
+      if (canReadHeartbeatRecord(parsed)) {
         records.push(parsed);
+      } else if (
+        typeof parsed === 'object' &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        'schemaVersion' in parsed
+      ) {
+        // Only the format marker is understood; no transport, lease or binding
+        // from an incompatible payload is trusted as current-schema evidence.
+        const version = parsed.schemaVersion;
+        if (
+          typeof version === 'number' &&
+          Number.isInteger(version) &&
+          version > TRANSPORT_HEARTBEAT_SCHEMA_VERSION
+        ) {
+          newerSchemaPresent = true;
+        }
       }
     } catch {
       // Per-file parse failure stays skipped — not a registry-level failure.
       continue;
     }
   }
-  return { records, readFailed: false };
+  return { records, newerSchemaPresent, readFailed: false };
 }
 
 /**
@@ -503,16 +563,17 @@ export function readTransportHeartbeatsResult(): ReadTransportHeartbeatsResult {
  *
  * A thin, contract-unchanged wrapper over
  * {@link readTransportHeartbeatsResult} for callers that are fine treating a
- * registry-level read failure the same as "no transports" (`doctor`,
- * `transport-health`). The reaper needs the finer-grained result and calls
- * {@link readTransportHeartbeatsResult} directly instead.
+ * registry-level read failure the same as "no transports". Diagnostic callers
+ * use the richer result to preserve newer-format evidence. Cleanup reads files
+ * separately so it can also age unreadable payloads by their filesystem mtime.
  */
 export function readTransportHeartbeats(): TransportHeartbeat[] {
   return readTransportHeartbeatsResult().records;
 }
 
 /**
- * Reap records whose lease expired as of `now`. **Write path only.**
+ * Reap expired leases and unreadable files past the mtime retention age.
+ * **Write path only.** Temporary files are excluded by the read-path pattern.
  *
  * Deliberately NOT folded into {@link readTransportHeartbeats} (issue #425
  * review). Reaping during a read made the diagnostic destroy its own evidence:
@@ -542,17 +603,64 @@ export function reapExpiredHeartbeats(now: Date): void {
     if (!name.endsWith('.json')) continue;
     const filePath = path.join(transportRegistryDir(), name);
     try {
-      const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf-8'));
-      if (
-        isTransportHeartbeat(parsed) &&
-        parsed.schemaVersion === TRANSPORT_HEARTBEAT_SCHEMA_VERSION &&
-        isHeartbeatStale(parsed, now)
-      ) {
-        rmSync(filePath, { force: true });
-      }
+      reapHeartbeatFileIfExpired(filePath, now);
     } catch {
       continue;
     }
+  }
+}
+
+/**
+ * Read and age one opened file, then compare its path's stat observations before
+ * unlinking. The descriptor pins the judged inode. When both observations have
+ * non-zero inode numbers, device/inode comparison identifies that file exactly.
+ * Device, size and mtime always participate; if either inode is zero, ctime and
+ * birthtime are compared too, with zero birthtime agreeing only with zero.
+ *
+ * Without inode identity this is best-effort: absent, synthesized or coarse
+ * timestamps can match across different files. A heartbeat published between
+ * cleanup's first read and its final path check can therefore be removed.
+ * Bigint stats retain reported precision; they cannot supply missing identity.
+ * Even with exact inode identity, publication after lstat but before rmSync
+ * remains a race. In every case cleanup creates no files or alternate names,
+ * and the next heartbeat write recreates a removed record. A failed unlink
+ * leaves the original path available to subsequent passes.
+ */
+function reapHeartbeatFileIfExpired(filePath: string, now: Date): void {
+  const fd = openSync(filePath, 'r');
+  try {
+    const identity = fstatSync(fd, { bigint: true });
+    const content = readFileSync(fd, 'utf-8');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      // Invalid JSON and unreadable payloads share the mtime retention rule.
+      parsed = undefined;
+    }
+    const expired = canReadHeartbeatRecord(parsed)
+      ? isHeartbeatStale(parsed, now)
+      : BigInt(now.getTime()) * 1_000_000n - identity.mtimeNs >
+        BigInt(UNREADABLE_HEARTBEAT_REAP_AGE_MS) * 1_000_000n;
+    if (!expired) {
+      return;
+    }
+
+    const current = lstatSync(filePath, { bigint: true });
+    if (
+      identity.dev !== current.dev ||
+      identity.size !== current.size ||
+      identity.mtimeNs !== current.mtimeNs ||
+      (identity.ino !== 0n && current.ino !== 0n
+        ? identity.ino !== current.ino
+        : identity.ctimeNs !== current.ctimeNs ||
+          identity.birthtimeNs !== current.birthtimeNs)
+    ) {
+      return;
+    }
+    rmSync(filePath, { force: true });
+  } finally {
+    closeSync(fd);
   }
 }
 

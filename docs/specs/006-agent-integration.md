@@ -1978,3 +1978,51 @@ is attached, even after the session it serves has gone dormant. The reaping cont
   `apps/cli/src/transport-heartbeat.ts`), used both here and by `transport-health`'s binding checks,
   so "does this heartbeat belong to this daemon/workspace" cannot silently diverge between the two
   call sites.
+
+### 12.9 Schema versions and unreadable records (_current_)
+
+> Verified: `apps/cli/src/transport-heartbeat.ts` (`canReadHeartbeatRecord`,
+> `reapHeartbeatFileIfExpired`, `UNREADABLE_HEARTBEAT_REAP_AGE_MS`);
+> `apps/cli/src/transport-heartbeat.test.ts` ("identity-checked heartbeat cleanup",
+> "unreadable heartbeat retention"); `apps/cli/src/transport-health.test.ts`;
+> `apps/cli/src/commands/transport-health.integration.test.ts` ("keeps unreadable files and reports
+> newer formats without changing exit status", "keeps newer-schema diagnostics advisory with an
+> active lead session").
+
+`TRANSPORT_HEARTBEAT_SCHEMA_VERSION` changes only for incompatible field changes. On a bump,
+`canReadHeartbeatRecord` remains the single shape-and-version interpretation predicate used by
+registry reads and cleanup. Older versions, newer versions and malformed shapes are not interpreted;
+invalid JSON is likewise unreadable. Readers perform no migration or deletion.
+
+Both paths scan registry filenames ending in `.json`; atomic-write `.tmp` files are excluded.
+On the write path, readable records expire according to their own `updatedAt` and `ttlMs` lease.
+Unreadable files expire only when their filesystem mtime age is strictly greater than
+`UNREADABLE_HEARTBEAT_REAP_AGE_MS` (48 hours, twice `HOOK_HEARTBEAT_TTL_MS`). Their payload's
+timestamps and lease fields cannot establish retention. Files exactly at the boundary are retained.
+Cleanup reads each candidate through an open descriptor and obtains its device, inode, size and
+mtime from `fstat`. Both descriptor and final path observations use bigint stats, retaining the
+precision the filesystem reports. Device, size and mtime must always agree. If both inode numbers
+are non-zero, they must agree too: device/inode identifies the opened file exactly while its
+descriptor remains open. If either inode is zero, ctime and birthtime must agree instead, in
+addition to device, size and mtime. Two zero birthtimes agree, while zero versus a reported creation
+time does not. An expired file is unlinked only after a matching final `lstat`; a mismatch defers
+cleanup to a later pass.
+
+On filesystems without inode identity, this comparison is **best-effort**. Ctime and birthtime can
+be unavailable, synthesized or too coarsely resolved to separate files. Equal stat observations
+therefore do not prove that the path still holds the file cleanup read. A heartbeat published
+between cleanup's first read and its final path check can be removed on these filesystems.
+Nanosecond representation does not create identity information the filesystem omitted.
+
+The final path check and unlink are also separate operations on every filesystem, so a replacement
+published after that check can be removed even when inode identity is exact. In every case cleanup
+creates no files and does not rename records, and the next heartbeat write recreates a removed
+record. These removal windows are part of the cleanup contract; writers and cleanup are not
+synchronized. Unlink errors leave the original record in place for a subsequent cleanup attempt.
+
+A parsed JSON object with an integer schema version greater than this CLI's version produces
+`[heartbeat-newer-schema]`: a transport using a newer record format is present, but this CLI cannot
+read it or determine its workspace binding. This advisory replaces empty-registry / not-configured
+wording without establishing a listening route or changing doctor exit status. Older and malformed
+records retain the existing diagnostic behavior. Doctor never reaps either fresh or old files;
+only subsequent transport writes reconcile expired evidence.

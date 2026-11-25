@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -7,15 +8,18 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   CHANNEL_HEARTBEAT_TTL_MS,
   HOOK_HEARTBEAT_TTL_MS,
   TRANSPORT_HEARTBEAT_SCHEMA_VERSION,
+  UNREADABLE_HEARTBEAT_REAP_AGE_MS,
+  canReadHeartbeatRecord,
   heartbeatMatchesBinding,
   isHeartbeatStale,
   isTransportHeartbeat,
@@ -32,11 +36,99 @@ import {
  * Transport heartbeat persistence (issue #425).
  *
  * These run against a REAL filesystem under an isolated `XDG_DATA_HOME` rather
- * than a mocked `fs`: the whole point of the record is that a separate process
+ * than an in-memory `fs`: the whole point of the record is that a separate process
  * (`doctor`) can read what another process (`channel serve` / `hook deliver`)
  * wrote, so a mock that never exercises the shared path, the atomic rename, or
  * the JSON round-trip would prove nothing about the property under test.
  */
+
+/** Race and fault hooks around real filesystem operations and stat observations. */
+const interleaving = vi.hoisted(
+  (): {
+    afterIdentity?: () => void;
+    afterLstat?: () => void;
+    beforeRemove?: () => void;
+    zeroInode?: boolean;
+    /** Isolate each generation field without relying on filesystem timestamp resolution. */
+    changedPathField?: 'dev' | 'ctimeNs' | 'birthtimeNs';
+    /** One-shot syscall failures must preserve the candidate for a later pass. */
+    failure?: 'open' | 'fstat' | 'read' | 'lstat';
+    failed?: string;
+    /** Every successfully opened candidate must be closed, including on errors. */
+    descriptors: Set<number>;
+  } => ({ descriptors: new Set() }),
+);
+
+vi.mock('node:fs', async (importOriginal) => {
+  const fs = await importOriginal<typeof import('node:fs')>();
+  const fail = (stage: 'open' | 'fstat' | 'read' | 'lstat'): void => {
+    if (interleaving.failure === stage) {
+      delete interleaving.failure;
+      interleaving.failed = stage;
+      throw Object.assign(new Error(`injected ${stage} failure`), {
+        code: 'EIO',
+      });
+    }
+  };
+  return {
+    ...fs,
+    openSync: (...args: Parameters<typeof fs.openSync>) => {
+      fail('open');
+      const fd = fs.openSync(...args);
+      interleaving.descriptors.add(fd);
+      return fd;
+    },
+    closeSync: (fd: number) => {
+      fs.closeSync(fd);
+      interleaving.descriptors.delete(fd);
+    },
+    readFileSync: (...args: Parameters<typeof fs.readFileSync>) => {
+      if (typeof args[0] === 'number') fail('read');
+      return fs.readFileSync(...args);
+    },
+    fstatSync: (...args: Parameters<typeof fs.fstatSync>) => {
+      fail('fstat');
+      const result = fs.fstatSync(...args);
+      const identity = interleaving.zeroInode
+        ? { ...result, ino: typeof result.ino === 'bigint' ? 0n : 0 }
+        : result;
+      const callback = interleaving.afterIdentity;
+      delete interleaving.afterIdentity;
+      callback?.();
+      return identity;
+    },
+    lstatSync: (...args: Parameters<typeof fs.lstatSync>) => {
+      fail('lstat');
+      const result = fs.lstatSync(...args);
+      const identity = interleaving.zeroInode
+        ? { ...result, ino: typeof result.ino === 'bigint' ? 0n : 0 }
+        : result;
+      const field = interleaving.changedPathField;
+      const observed =
+        field === 'dev'
+          ? {
+              ...identity,
+              dev:
+                typeof identity.dev === 'bigint'
+                  ? identity.dev + 1n
+                  : identity.dev + 1,
+            }
+          : field !== undefined && 'ctimeNs' in identity
+            ? { ...identity, [field]: identity[field] + 1n }
+            : identity;
+      const callback = interleaving.afterLstat;
+      delete interleaving.afterLstat;
+      callback?.();
+      return observed;
+    },
+    rmSync: (...args: Parameters<typeof fs.rmSync>) => {
+      const callback = interleaving.beforeRemove;
+      delete interleaving.beforeRemove;
+      callback?.();
+      return fs.rmSync(...args);
+    },
+  };
+});
 
 let dataHome: string;
 let previousDataHome: string | undefined;
@@ -48,6 +140,14 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  expect(interleaving.descriptors.size).toBe(0);
+  delete interleaving.failure;
+  delete interleaving.failed;
+  delete interleaving.afterIdentity;
+  delete interleaving.afterLstat;
+  delete interleaving.beforeRemove;
+  delete interleaving.zeroInode;
+  delete interleaving.changedPathField;
   if (previousDataHome === undefined) {
     delete process.env['XDG_DATA_HOME'];
   } else {
@@ -58,6 +158,403 @@ afterEach(() => {
 
 const WORKSPACE = '/repos/agentmonitors';
 const SOCKET = '/tmp/agentmonitors-test.sock';
+
+describe('candidate failure isolation', () => {
+  it.each(['open', 'fstat', 'read', 'lstat'] as const)(
+    'retains both candidate kinds after %s failure without leaking a descriptor or making artifacts',
+    (stage) => {
+      const now = new Date('2026-11-25T12:00:00Z');
+      const old = new Date(
+        now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+      );
+      const input = {
+        transport: 'channel' as const,
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      };
+      for (const kind of ['unreadable', 'stale-valid']) {
+        const record = writeTransportHeartbeat({ ...input, now: old });
+        expect(record).toBeDefined();
+        const [name] = readdirSync(transportRegistryDir());
+        if (!name) throw new Error('missing heartbeat');
+        const file = path.join(transportRegistryDir(), name);
+        if (kind === 'unreadable') {
+          writeFileSync(file, '{"schemaVersion":0}');
+          utimesSync(file, old, old);
+        }
+        const content = readFileSync(file, 'utf8');
+        interleaving.failure = stage;
+
+        expect(() => reapExpiredHeartbeats(now)).not.toThrow();
+
+        expect(interleaving.failed).toBe(stage);
+        expect(interleaving.descriptors.size).toBe(0);
+        expect(readdirSync(transportRegistryDir())).toEqual([name]);
+        expect(readFileSync(file, 'utf8')).toBe(content);
+        reapExpiredHeartbeats(now);
+        expect(readdirSync(transportRegistryDir())).toEqual([]);
+      }
+    },
+  );
+
+  it('leaves a symlink, its target, and a directory unchanged while cleaning regular candidates', () => {
+    const now = new Date('2026-11-25T12:00:00Z');
+    mkdirSync(transportRegistryDir(), { recursive: true });
+    const target = path.join(dataHome, 'outside-registry');
+    writeFileSync(target, '{"schemaVersion":0}');
+    utimesSync(target, new Date(0), new Date(0));
+    const link = path.join(transportRegistryDir(), 'link.json');
+    symlinkSync(target, link);
+    mkdirSync(path.join(transportRegistryDir(), 'directory.json'));
+    const ordinary = path.join(transportRegistryDir(), 'ordinary.json');
+    writeFileSync(ordinary, '{"schemaVersion":0}');
+    utimesSync(ordinary, new Date(0), new Date(0));
+
+    expect(() => reapExpiredHeartbeats(now)).not.toThrow();
+
+    expect(readFileSync(target, 'utf8')).toBe('{"schemaVersion":0}');
+    expect(existsSync(link)).toBe(true);
+    expect(readdirSync(transportRegistryDir()).sort()).toEqual([
+      'directory.json',
+      'link.json',
+    ]);
+    expect(interleaving.descriptors.size).toBe(0);
+  });
+
+  it.each([1, 12345, UNREADABLE_HEARTBEAT_REAP_AGE_MS * 2])(
+    'uses the readable record own ttlMs=%s with a strict age boundary',
+    (ttlMs) => {
+      const now = new Date('2026-11-25T12:00:00Z');
+      expect(
+        writeTransportHeartbeat({
+          transport: 'channel',
+          workspacePath: WORKSPACE,
+          socketPath: SOCKET,
+          ttlMs,
+          now,
+        }),
+      ).toBeDefined();
+      const [name] = readdirSync(transportRegistryDir());
+      if (!name) throw new Error('missing heartbeat');
+
+      reapExpiredHeartbeats(new Date(now.getTime() + ttlMs));
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+      reapExpiredHeartbeats(new Date(now.getTime() + ttlMs + 1));
+      expect(readdirSync(transportRegistryDir())).toEqual([]);
+    },
+  );
+});
+
+describe('identity-checked heartbeat cleanup', () => {
+  it.each([
+    { field: 'dev', zeroInode: false },
+    { field: 'dev', zeroInode: true },
+    { field: 'ctimeNs', zeroInode: true },
+    { field: 'birthtimeNs', zeroInode: true },
+  ] as const)(
+    'defers cleanup on a changed $field (zero inode: $zeroInode)',
+    ({ field, zeroInode }) => {
+      const now = new Date('2026-11-25T12:00:00Z');
+      mkdirSync(transportRegistryDir(), { recursive: true });
+      const file = path.join(transportRegistryDir(), 'expired.json');
+      writeFileSync(file, '{"schemaVersion":0}');
+      utimesSync(file, new Date(0), new Date(0));
+      interleaving.zeroInode = zeroInode;
+      interleaving.changedPathField = field;
+
+      reapExpiredHeartbeats(now);
+
+      expect(readdirSync(transportRegistryDir())).toEqual(['expired.json']);
+      delete interleaving.changedPathField;
+      reapExpiredHeartbeats(now);
+      expect(readdirSync(transportRegistryDir())).toEqual([]);
+    },
+  );
+
+  it('retains an equal-size equal-mtime replacement published before lstat when inode numbers are unavailable', () => {
+    const now = new Date('2026-11-25T12:00:00Z');
+    const old = new Date(now.getTime() - CHANNEL_HEARTBEAT_TTL_MS - 1000);
+    const input = {
+      transport: 'channel' as const,
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+    };
+    expect(writeTransportHeartbeat({ ...input, now: old })).toBeDefined();
+    const [name] = readdirSync(transportRegistryDir());
+    if (!name) throw new Error('missing heartbeat');
+    const file = path.join(transportRegistryDir(), name);
+    utimesSync(file, new Date(0), new Date(0));
+    const identity = statSync(file);
+    interleaving.zeroInode = true;
+    const refresh = vi.fn(() => {
+      const fresh = writeTransportHeartbeat({ ...input, now });
+      // Equal observable metadata must not turn a different generation into
+      // the stale candidate that was read through the original descriptor.
+      utimesSync(file, new Date(0), new Date(0));
+      return fresh;
+    });
+    interleaving.afterIdentity = refresh;
+
+    reapExpiredHeartbeats(now);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refresh.mock.results[0]?.type).toBe('return');
+    expect(canReadHeartbeatRecord(refresh.mock.results[0]?.value)).toBe(true);
+    expect(existsSync(file)).toBe(true);
+    expect(statSync(file).size).toBe(identity.size);
+    expect(statSync(file).mtimeMs).toBe(identity.mtimeMs);
+    expect(statSync(file).ino).not.toBe(identity.ino);
+    expect(readTransportHeartbeats()[0]?.updatedAt).toBe(now.toISOString());
+  });
+
+  it.each(['unreadable', 'stale-valid'] as const)(
+    'retains a fresh replacement of a %s candidate',
+    (kind) => {
+      const now = new Date();
+      const old = new Date(
+        now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+      );
+      const input = {
+        transport: 'channel' as const,
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      };
+      writeTransportHeartbeat({ ...input, now: old });
+      const [name] = readdirSync(transportRegistryDir());
+      if (name === undefined) throw new Error('missing heartbeat');
+      const file = path.join(transportRegistryDir(), name);
+      if (kind === 'unreadable') {
+        writeFileSync(file, '{"schemaVersion":0}');
+        utimesSync(file, old, old);
+      }
+
+      const refresh = vi.fn(() => writeTransportHeartbeat({ ...input, now }));
+      // Publishing after fstat must not change the descriptor's identity or
+      // payload, but the final path check must notice the different file.
+      interleaving.afterIdentity = refresh;
+
+      reapExpiredHeartbeats(now);
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(canReadHeartbeatRecord(refresh.mock.results[0]?.value)).toBe(true);
+      expect(existsSync(file)).toBe(true);
+      expect(readTransportHeartbeats()[0]?.updatedAt).toBe(now.toISOString());
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+    },
+  );
+
+  it.each([
+    { kind: 'unreadable', zeroInode: false },
+    { kind: 'stale-valid', zeroInode: false },
+    { kind: 'unreadable', zeroInode: true },
+    { kind: 'stale-valid', zeroInode: true },
+  ])(
+    'leaves only the original $kind file after an unlink failure and reaps it on a later pass (zero inode: $zeroInode)',
+    ({ kind, zeroInode }) => {
+      const now = new Date();
+      const old = new Date(
+        now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+      );
+      writeTransportHeartbeat({
+        transport: 'channel',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now: old,
+      });
+      const [name] = readdirSync(transportRegistryDir());
+      if (name === undefined) throw new Error('missing heartbeat');
+      const file = path.join(transportRegistryDir(), name);
+      if (kind === 'unreadable') {
+        writeFileSync(file, '{"schemaVersion":0}');
+        utimesSync(file, old, old);
+      }
+      interleaving.zeroInode = zeroInode;
+      const failUnlink = vi.fn(() => {
+        throw new Error('injected unlink failure');
+      });
+      interleaving.beforeRemove = failUnlink;
+
+      expect(() => reapExpiredHeartbeats(now)).not.toThrow();
+
+      expect(failUnlink).toHaveBeenCalledTimes(1);
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+      reapExpiredHeartbeats(now);
+      expect(readdirSync(transportRegistryDir())).toEqual([]);
+    },
+  );
+
+  it.each(['inode', 'size', 'mtime'] as const)(
+    'detects a changed %s independently of the other identity fields',
+    (changed) => {
+      const now = new Date();
+      const input = {
+        transport: 'channel' as const,
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+      };
+      writeTransportHeartbeat({
+        ...input,
+        now: new Date(now.getTime() - CHANNEL_HEARTBEAT_TTL_MS - 1000),
+      });
+      const [name] = readdirSync(transportRegistryDir());
+      if (name === undefined) throw new Error('missing heartbeat');
+      const file = path.join(transportRegistryDir(), name);
+      utimesSync(file, new Date(0), new Date(0));
+      const originalIdentity = statSync(file);
+      // Meaningful inode numbers distinguish equal-size/equal-mtime writes;
+      // filesystems without them must still check both remaining fields.
+      interleaving.zeroInode = changed !== 'inode';
+      const refresh = vi.fn(() => {
+        writeTransportHeartbeat({ ...input, now });
+        if (changed === 'size') {
+          writeFileSync(file, `${readFileSync(file, 'utf8')} `);
+        }
+        if (changed !== 'mtime') {
+          utimesSync(file, new Date(0), new Date(0));
+        }
+      });
+      interleaving.afterIdentity = refresh;
+
+      reapExpiredHeartbeats(now);
+
+      expect(refresh).toHaveBeenCalledTimes(1);
+      expect(readdirSync(transportRegistryDir())).toEqual([name]);
+      expect(readTransportHeartbeats()[0]?.updatedAt).toBe(now.toISOString());
+      if (changed === 'size') {
+        expect(statSync(file).size).toBe(originalIdentity.size + 1);
+        expect(statSync(file).mtimeMs).toBe(0);
+      } else {
+        expect(statSync(file).size).toBe(originalIdentity.size);
+        if (changed === 'inode') {
+          expect(statSync(file).mtimeMs).toBe(0);
+          expect(statSync(file).ino).not.toBe(originalIdentity.ino);
+        } else {
+          expect(statSync(file).mtimeMs).toBeGreaterThan(0);
+        }
+      }
+    },
+  );
+
+  it('recreates a heartbeat on its next write after replacement in the final unlink window', () => {
+    const now = new Date();
+    const old = new Date(
+      now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - 1000,
+    );
+    const input = {
+      transport: 'channel' as const,
+      workspacePath: WORKSPACE,
+      socketPath: SOCKET,
+    };
+    writeTransportHeartbeat({ ...input, now: old });
+    const [name] = readdirSync(transportRegistryDir());
+    if (name === undefined) throw new Error('missing heartbeat');
+    const file = path.join(transportRegistryDir(), name);
+    writeFileSync(file, '{"schemaVersion":0}');
+    utimesSync(file, old, old);
+    const refresh = vi.fn(() => writeTransportHeartbeat({ ...input, now }));
+    // lstat and unlink are distinct operations. This intentionally exercises
+    // the remaining window rather than claiming the check makes them atomic.
+    interleaving.afterLstat = refresh;
+
+    reapExpiredHeartbeats(now);
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(canReadHeartbeatRecord(refresh.mock.results[0]?.value)).toBe(true);
+    expect(readdirSync(transportRegistryDir())).toEqual([]);
+    const nextWrite = new Date(now.getTime() + CHANNEL_HEARTBEAT_TTL_MS / 3);
+    expect(writeTransportHeartbeat({ ...input, now: nextWrite })).toBeDefined();
+    expect(readTransportHeartbeats()[0]?.updatedAt).toBe(
+      nextWrite.toISOString(),
+    );
+    expect(readdirSync(transportRegistryDir())).toEqual([name]);
+  });
+});
+
+describe('unreadable heartbeat retention', () => {
+  it('allows at least two hook leases before discarding unreadable evidence', () => {
+    expect(UNREADABLE_HEARTBEAT_REAP_AGE_MS).toBeGreaterThanOrEqual(
+      2 * HOOK_HEARTBEAT_TTL_MS,
+    );
+  });
+
+  it.each([0, 99, 'bad-shape', 'non-json'])(
+    'reaps %s only beyond the mtime boundary',
+    (kind) => {
+      const now = new Date('2026-11-25T12:00:00Z');
+      const valid = writeTransportHeartbeat({
+        transport: 'hook',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now,
+      });
+      expect(canReadHeartbeatRecord(valid)).toBe(true);
+      const content =
+        typeof kind === 'number'
+          ? JSON.stringify({
+              ...valid,
+              schemaVersion: kind,
+              updatedAt: '2099-01-01T00:00:00Z',
+              ttlMs: 1,
+            })
+          : kind === 'bad-shape'
+            ? '{}'
+            : 'not json';
+      expect(
+        canReadHeartbeatRecord(
+          typeof kind === 'number' ? { ...valid, schemaVersion: kind } : {},
+        ),
+      ).toBe(false);
+      for (const delta of [-1000, 0, 1000]) {
+        const file = path.join(
+          transportRegistryDir(),
+          `channel-unreadable-${delta}.json`,
+        );
+        writeFileSync(file, content);
+        const mtime = new Date(
+          now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - delta,
+        );
+        utimesSync(file, mtime, mtime);
+      }
+      const temp = path.join(
+        transportRegistryDir(),
+        'channel-unreadable.json.123.tmp',
+      );
+      writeFileSync(temp, content);
+      utimesSync(temp, new Date(0), new Date(0));
+      reapExpiredHeartbeats(now);
+      for (const delta of [-1000, 0, 1000]) {
+        expect(
+          existsSync(
+            path.join(
+              transportRegistryDir(),
+              `channel-unreadable-${delta}.json`,
+            ),
+          ),
+        ).toBe(delta <= 0);
+      }
+      expect(existsSync(temp)).toBe(true);
+      expect(readTransportHeartbeats()).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { schemaVersion: 99, expected: true },
+    { schemaVersion: 0, expected: false },
+    { schemaVersion: 1.5, expected: false },
+    { schemaVersion: '99', expected: false },
+    { schemaVersion: null, expected: false },
+  ])(
+    'reports only integer newer schema metadata: %s',
+    ({ schemaVersion, expected }) => {
+      mkdirSync(transportRegistryDir(), { recursive: true });
+      writeFileSync(
+        path.join(transportRegistryDir(), 'channel-format.json'),
+        JSON.stringify({ schemaVersion }),
+      );
+      expect(readTransportHeartbeatsResult().newerSchemaPresent).toBe(expected);
+    },
+  );
+});
 
 describe('writeTransportHeartbeat', () => {
   it('records every field the health surface compares against', () => {
@@ -790,6 +1287,7 @@ describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
   it('reports readFailed: false and an empty list when the registry directory has never been created', () => {
     expect(readTransportHeartbeatsResult()).toEqual({
       records: [],
+      newerSchemaPresent: false,
       readFailed: false,
     });
   });
@@ -798,6 +1296,7 @@ describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
     mkdirSync(transportRegistryDir(), { recursive: true });
     expect(readTransportHeartbeatsResult()).toEqual({
       records: [],
+      newerSchemaPresent: false,
       readFailed: false,
     });
   });
@@ -814,6 +1313,7 @@ describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
 
     expect(readTransportHeartbeatsResult()).toEqual({
       records: [],
+      newerSchemaPresent: false,
       readFailed: true,
     });
   });

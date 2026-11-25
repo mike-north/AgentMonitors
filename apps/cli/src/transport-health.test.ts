@@ -36,6 +36,37 @@ const SOCKET = '/data/agentmonitors/workspaces/abc123/agentmonitors.sock';
 const CLI_VERSION = '1.4.0';
 const HOST_SESSION = 'host-session-1';
 
+describe('newer heartbeat schema', () => {
+  it('reports an advisory without asserting an empty registry or changing delivery', () => {
+    const baseline = computeTransportHealth(
+      input({ heartbeats: [], leadHostSessionIds: [] }),
+    );
+    const health = computeTransportHealth(
+      input({
+        heartbeats: [],
+        leadHostSessionIds: [],
+        newerSchemaPresent: true,
+      }),
+    );
+    expect(health.pipelineProblems).toContainEqual(
+      expect.objectContaining({
+        code: 'heartbeat-newer-schema',
+        detail: expect.stringContaining('newer record format'),
+      }),
+    );
+    expect(
+      health.pipelineProblems.find(
+        (problem) => problem.code === 'heartbeat-newer-schema',
+      )?.detail,
+    ).toContain('this CLI cannot read');
+    expect(health.verdict).not.toContain('no transport has reported in');
+    expect(health.deliverable).toBe(baseline.deliverable);
+    expect(health.deliveryWillReachThisSession).toBe(
+      baseline.deliveryWillReachThisSession,
+    );
+  });
+});
+
 function heartbeat(
   transport: TransportName,
   overrides: Partial<TransportHeartbeat> = {},
