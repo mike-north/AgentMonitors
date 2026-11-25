@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Reject malformed numeric CLI options (005 §6, §9.2, §16) — Refs #656
+
+Daemon polling/reaping, verification timeout, explain row limits and history row limits now
+use strict bounded decimal-integer parsing before state resolution or daemon work. Timer
+values stop at 2147483647; row limits stop at 1000. Existing omitted defaults and reaping's
+explicit zero are preserved. Rejections use a single format-aware error line; daemon run
+accepts an error-format selector for numeric admission. Subprocess coverage checks each
+range, diagnostic, output stream, absence of side effects and accepted boundaries.
+
 ## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468
 
 Coordination rewrites now retain the complete `claim-ttl-ms` field line, including indentation,

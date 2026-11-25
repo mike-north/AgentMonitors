@@ -605,6 +605,22 @@ Exits 1 on: file not found, parse error, unknown source, observation exception,
 `no-files-matched`, or absent/null initial state from a stateful source. Exits 0 on successful
 dry-run, including genuine quiet/no-change runs where the source matched its scope.
 
+### Bounded numeric options
+
+`daemon run --poll-ms` / `--reap-after-ms`, `verify --timeout-ms`,
+`monitor explain --history-limit` / `--event-limit`, and `monitor history --limit`
+accept only plain decimal digits within their inclusive option-table ranges. Fractions,
+signs, exponent notation, partly numeric strings and out-of-range values are rejected.
+Omission keeps each documented default, including the monitor-derived verification budget.
+The row-count cap of `1000` applies at the CLI boundary; IPC limits are unchanged.
+
+Invalid input exits with code `1` before monitor discovery, local-state resolution, daemon
+connection/startup, or file writes. The only output in text/toon format is one stderr line:
+`Error: <flag> must be a whole number from <min> to <max> (got "<value>").`
+JSON format instead writes one stdout line, `{"error":"<same message without Error: prefix>"}`,
+with empty stderr. The raw value is JSON-escaped so the diagnostic always occupies one line.
+`verify` retains its existing `text` and `json` formats.
+
 ### `monitor history` — Observation audit trail
 
 **Status:** Fully implemented (socket with a no-daemon in-process DB fallback).
@@ -649,7 +665,7 @@ agentmonitors monitor history [monitorId] [--socket <path>] [--workspace <path>]
 | `[monitorId]`        | —                   | Filter to a single monitor id                                                                                                   |
 | `--socket <path>`    | resolved default    | Unix domain socket path for the daemon                                                                                          |
 | `--workspace <path>` | current working dir | Opt-in row filter to one workspace's history (issue #345/#307) — also selects which workspace's daemon/db to reach (issue #374) |
-| `--limit <n>`        | `50`                | Maximum rows (newest first)                                                                                                     |
+| `--limit <n>`        | `50`                | Maximum rows (newest first), a whole number from `1` to `1000` inclusive                                                        |
 | `--format`           | auto (see §1)       | `toon`, `text` (one row per line), or `json`                                                                                    |
 
 **`--dir` is intentionally NOT accepted here (issue #420 P5).** `init`, `validate`, and `monitor
@@ -697,8 +713,8 @@ agentmonitors monitor explain <monitorId> [--dir <path>] [--workspace <path>] [-
 | `--dir <path>`        | `.claude/monitors`  | Directory containing monitor definitions                                                          |
 | `--workspace <path>`  | current working dir | Workspace path used for session projection, and (issue #374) which workspace's daemon/db to reach |
 | `--socket <path>`     | resolved default    | Unix domain socket path for the daemon                                                            |
-| `--history-limit <n>` | `10`                | Observation history rows included in structured output                                            |
-| `--event-limit <n>`   | `10`                | Materialized event rows included in structured output                                             |
+| `--history-limit <n>` | `10`                | Observation history rows included in structured output; whole number from `1` to `1000` inclusive |
+| `--event-limit <n>`   | `10`                | Materialized event rows included in structured output; whole number from `1` to `1000` inclusive  |
 | `--format`            | auto (see §1)       | `toon`, `text` (stage summary), or `json` (full report)                                           |
 
 Text output prints one line per stage with a status glyph, followed by a verdict:
@@ -1312,11 +1328,15 @@ agentmonitors daemon run [monitorsDir] [options]
 | ---------------------- | --------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[monitorsDir]`        | positional (optional) | `.claude/monitors`                | Directory containing `MONITOR.md` files                                                                                                                                                                                          |
 | `--workspace <path>`   | string                | `process.cwd()`                   | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path)                                                                                                                      |
-| `--poll-ms <ms>`       | number (string)       | `30000`                           | Polling interval in milliseconds                                                                                                                                                                                                 |
+| `--format <format>`    | string                | `text`                            | Numeric-option errors: `text` or `toon` on stderr, `json` on stdout                                                                                                                                                              |
+| `--poll-ms <ms>`       | number (string)       | `30000`                           | Polling interval in milliseconds; whole number from `1` to `2147483647` inclusive                                                                                                                                                |
 | `--socket <path>`      | string                | resolved default                  | Unix domain socket path for the daemon                                                                                                                                                                                           |
-| `--reap-after-ms <ms>` | number (string)       | `300000`                          | Stop after this many ms with no active sessions; `0` disables idle reaping                                                                                                                                                       |
+| `--reap-after-ms <ms>` | number (string)       | `300000`                          | Whole number from `0` to `2147483647` inclusive, in ms with no active sessions; `0` disables idle reaping                                                                                                                        |
 | `--detach`             | boolean               | `false`                           | Run the daemon in the background and return (issue #389 P1); see **Background mode** below                                                                                                                                       |
 | `--log <path>`         | string                | `<workspace data dir>/daemon.log` | With `--detach`, append the backgrounded daemon's stdout+stderr here (created if missing). **Requires `--detach`** — given without it, the command errors rather than silently discarding the flag (issue #389 review finding 3) |
+
+`--format <text|toon|json>` (default `text`) selects numeric-option error output; it does not
+change continuous-loop or startup output.
 
 Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals. `--poll-ms` is the loop-wake cadence; per-monitor observation is still gated by each monitor's schedule or `watch.interval`.
 
@@ -2708,7 +2728,7 @@ agentmonitors verify [monitor] [--dir <path>] [--workspace <path>]
 | `--manual`               | off (auto-trigger)             | Skip the auto-trigger; prompt the operator to make the change and watch for it (for sources `verify` can't fabricate a change for). **Blocks and does not read stdin** — see "Trigger modes". Mutually exclusive with `--trigger-cmd`.                                                                                                            |
 | `--trigger-cmd <shell>`  | off (auto-trigger)             | **Decoupled trigger.** After baseline, `verify` runs this shell command itself (via the OS default shell — `/bin/sh -c` on POSIX — `cwd` = the workspace) to cause the watched change, then observes/materializes/delivers. One self-contained, non-interactive run for a source `verify` can't auto-trigger. Mutually exclusive with `--manual`. |
 | `--use-workspace-daemon` | off (isolated)                 | Run against the workspace's real daemon/db (booting a detached one if needed) and **leave it running**, so a follow-up `doctor` reflects the delivery. Requires an enabled workspace.                                                                                                                                                             |
-| `--timeout-ms <ms>`      | derived (see Budget)           | Override the **post-trigger** detection budget, in milliseconds (matches the `--poll-ms` / `--reap-after-ms` unit-suffixed convention).                                                                                                                                                                                                           |
+| `--timeout-ms <ms>`      | derived (see Budget)           | Override the **post-trigger** detection budget, a whole number from `1` to `2147483647` inclusive in milliseconds (matches the `--poll-ms` / `--reap-after-ms` unit-suffixed convention).                                                                                                                                                         |
 | `--format <format>`      | `text`                         | Output format: `text`, `json`.                                                                                                                                                                                                                                                                                                                    |
 
 ### Trigger modes

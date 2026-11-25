@@ -24,6 +24,7 @@ import {
   type Urgency,
 } from '@agentmonitors/core';
 import { reportError } from '../output.js';
+import { MAX_TIMER_DELAY_MS, parseIntegerOption } from '../integer-option.js';
 import { registerCoreSources } from '../sources.js';
 import { cliEntry } from '../detached-spawn.js';
 import { spawnDetachedDaemon } from '../detached-spawn.js';
@@ -1544,6 +1545,20 @@ export const verifyCommand = new Command('verify')
       },
     ) => {
       const json = options.format === 'json';
+      // Validate an explicit cap before monitor discovery or daemon setup. An
+      // omitted cap still uses the monitor-derived detection budget.
+      let overrideMs: number | undefined;
+      if (options.timeoutMs !== undefined) {
+        const timeout = parseIntegerOption('--timeout-ms', options.timeoutMs, {
+          min: 1,
+          max: MAX_TIMER_DELAY_MS,
+        });
+        if (!timeout.ok) {
+          reportError(timeout.message, json);
+          return;
+        }
+        overrideMs = timeout.value;
+      }
       const workspace = path.resolve(options.workspace);
       const monitorsDir = options.dir
         ? path.resolve(options.dir)
@@ -1578,17 +1593,8 @@ export const verifyCommand = new Command('verify')
         }
 
         const budget = computeVerifyBudget(monitor);
-        const overrideMs = options.timeoutMs
-          ? Number(options.timeoutMs)
-          : undefined;
-        const validOverrideMs =
-          overrideMs !== undefined &&
-          Number.isFinite(overrideMs) &&
-          overrideMs > 0
-            ? overrideMs
-            : undefined;
-        const timeoutOverridden = validOverrideMs !== undefined;
-        const detectCapMs = validOverrideMs ?? budget.detectMs;
+        const timeoutOverridden = overrideMs !== undefined;
+        const detectCapMs = overrideMs ?? budget.detectMs;
 
         daemon = options.useWorkspaceDaemon
           ? await useWorkspaceDaemon(monitorsDir, workspace)

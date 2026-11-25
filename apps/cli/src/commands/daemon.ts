@@ -18,6 +18,7 @@ import {
 } from '@agentmonitors/core';
 import { createRuntime } from '../runtime.js';
 import { reportError } from '../output.js';
+import { MAX_TIMER_DELAY_MS, parseIntegerOption } from '../integer-option.js';
 import {
   callDaemon,
   createDaemonServer,
@@ -695,6 +696,11 @@ daemonCommand
     process.cwd(),
   )
   .option('--poll-ms <ms>', 'Polling interval in milliseconds', '30000')
+  .addOption(
+    new Option('--format <format>', 'Numeric-option error format')
+      .choices(['text', 'toon', 'json'])
+      .default('text'),
+  )
   .option('--socket <path>', 'Unix domain socket path for the daemon')
   .option(
     '--reap-after-ms <ms>',
@@ -730,25 +736,35 @@ Foreground vs background:
       options: {
         workspace: string;
         pollMs: string;
+        format: string;
         socket?: string;
         reapAfterMs: string;
         detach?: boolean;
         log?: string;
       },
     ) => {
-      const pollMs = Number(options.pollMs);
-      if (!Number.isFinite(pollMs) || pollMs <= 0) {
-        reportError('--poll-ms must be a positive number.', false);
+      // Admit both timer values before resolving state or contacting a daemon.
+      // Zero is meaningful only for idle reaping; timer overflow must never
+      // turn the observation cadence into Node's 1 ms fallback.
+      const json = options.format === 'json';
+      const poll = parseIntegerOption('--poll-ms', options.pollMs, {
+        min: 1,
+        max: MAX_TIMER_DELAY_MS,
+      });
+      if (!poll.ok) {
+        reportError(poll.message, json);
         return;
       }
-      const reapAfterMs = Number(options.reapAfterMs);
-      if (!Number.isFinite(reapAfterMs) || reapAfterMs < 0) {
-        reportError(
-          '--reap-after-ms must be a non-negative number (0 disables).',
-          false,
-        );
+      const reap = parseIntegerOption('--reap-after-ms', options.reapAfterMs, {
+        min: 0,
+        max: MAX_TIMER_DELAY_MS,
+      });
+      if (!reap.ok) {
+        reportError(reap.message, json);
         return;
       }
+      const pollMs = poll.value;
+      const reapAfterMs = reap.value;
       // Resolve to an absolute, normalized path the SAME way `doctor` and
       // `session open` do (issue #335), so an unresolved relative value
       // cannot silently diverge from what those commands compute.
