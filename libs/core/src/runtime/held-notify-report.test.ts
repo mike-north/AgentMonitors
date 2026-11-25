@@ -657,38 +657,135 @@ it('diagnoses global ephemeral holds as eligible and releases them on a real tic
   }
 });
 
-it('diagnoses retired ephemeral holds as stranded without offering nonexistent definition repair', async () => {
-  const { db, store, runtime, session, monitor, workspace, dir } =
-    await ephemeralHold(false);
+it('disposes every workspace route of a global declaration without leaking receipts across scopes', async () => {
+  const f = await ephemeralHold(true);
   try {
-    runtime.cancelEphemeralMonitor(session.id, monitor.id);
-    const before = store.getMonitorState(monitor.id, workspace);
-    expect(store.listActiveEphemeralMonitors(workspace)).toEqual([]);
+    const foreign = `${f.workspace}-other`;
+    const foreignDir = path.join(foreign, 'monitors');
+    mkdirSync(foreignDir, { recursive: true });
+    const registry = new SourceRegistry();
+    registry.register({
+      name: 'test-held',
+      scopeSchema: { type: 'object' },
+      async observe() {
+        return { observations: [{ title: 'Foreign accepted change' }] };
+      },
+    });
+    const runtime = new AgentMonitorRuntime(f.store, registry);
+    await runtime.tick(foreignDir, foreign);
+    expect(
+      f.store.getMonitorState(f.monitor.id, foreign).notifyState.pendingDebounce
+        ?.observations,
+    ).toHaveLength(1);
+    runtime.cancelEphemeralMonitor(f.session.id, f.monitor.id);
+    const firstReceipt = f.store.getMonitorState(
+      f.monitor.id,
+      f.workspace,
+    ).notifyState;
+    runtime.cancelEphemeralMonitor(f.session.id, f.monitor.id);
+    expect(
+      f.store.getMonitorState(f.monitor.id, f.workspace).notifyState,
+    ).toEqual(firstReceipt);
+    for (const [workspacePath, monitorsDir] of [
+      [f.workspace, f.dir],
+      [foreign, foreignDir],
+    ]) {
+      const report = await runtime.doctorReport({ workspacePath, monitorsDir });
+      expect(report.heldNotifyWork).toEqual([]);
+      expect(report.heldNotifyDispositions).toEqual([
+        expect.objectContaining({
+          monitorId: f.monitor.id,
+          disposition: 'discarded-on-cancel',
+          observations: 1,
+        }),
+      ]);
+    }
+    expect(
+      (
+        await runtime.doctorReport({
+          workspacePath: `${foreign}-unrelated`,
+          monitorsDir: foreignDir,
+        })
+      ).heldNotifyDispositions,
+    ).toEqual([]);
+  } finally {
+    f.db.$client.close();
+  }
+});
+
+it('lists a cancelled hold disposition after database reopen without stranded work', async () => {
+  const databasePath = path.join(process.env.HOME ?? '', 'cancelled.sqlite');
+  const { db, store, runtime, session, monitor, workspace, dir } =
+    await ephemeralHold(false, databasePath);
+  runtime.cancelEphemeralMonitor(session.id, monitor.id);
+  const disposition = {
+    monitorId: monitor.id,
+    disposition: 'discarded-on-cancel',
+    observations: 1,
+    recordedAt: expect.any(String),
+  };
+  expect(
+    store.getMonitorState(monitor.id, workspace).notifyState,
+  ).toMatchObject({ disposition });
+  db.$client.close();
+  const reopenedDb = createDb(databasePath);
+  const reopenedStore = new RuntimeStore(reopenedDb);
+  const reopened = new AgentMonitorRuntime(reopenedStore, new SourceRegistry());
+  try {
     const input = {
       monitorsDir: dir,
       workspacePath: workspace,
       monitorId: monitor.id,
     };
-    const doctor = await runtime.doctorReport(input);
-    const explain = await runtime.explainMonitor(input);
-    const hold = doctor.heldNotifyWork?.[0];
-    expect(hold).toMatchObject({ observations: 1, blockedByDefinition: false });
-    expect(hold?.reason).toContain('declaration is retired');
-    expect(hold?.reason).toContain('no future tick will release this work');
-    expect(hold?.reason).toContain('no definition file to edit');
-    expect(hold?.reason).not.toContain('Fix the definition');
-    expect(hold?.reason).not.toContain(
-      'will be flushed on the next daemon tick',
+    const doctor = await reopened.doctorReport(input);
+    const explain = await reopened.explainMonitor(input);
+    expect(doctor.heldNotifyWork).toEqual([]);
+    expect(doctor.heldNotifyDispositions).toEqual([disposition]);
+    expect(explain.stages.find((stage) => stage.id === 'notify')).toMatchObject(
+      {
+        status: 'ok',
+        details: disposition,
+      },
     );
-    expect(explain.stages.find((stage) => stage.id === 'notify')?.reason).toBe(
-      hold?.reason,
-    );
-    expect((await runtime.tick(dir, workspace)).emittedEventIds).toEqual([]);
-    expect(store.getMonitorState(monitor.id, workspace)).toEqual(before);
+    expect(JSON.stringify(explain)).not.toContain('declaration-retired');
+    expect((await reopened.tick(dir, workspace)).emittedEventIds).toEqual([]);
   } finally {
-    db.$client.close();
+    reopenedDb.$client.close();
   }
 });
+
+for (const strategy of ['debounce', 'rollup'] as const) {
+  it(`reports a real ${strategy} hold even when a retirement receipt also exists`, async () => {
+    const fixture = await ephemeralHold(false);
+    const { db, runtime, store, session, monitor, workspace } = fixture;
+    try {
+      const accepted = store.getMonitorState(monitor.id, workspace);
+      const envelopes = accepted.notifyState.pendingDebounce?.observations;
+      expect(envelopes).toHaveLength(1);
+      runtime.cancelEphemeralMonitor(session.id, monitor.id);
+      const terminal = store.getMonitorState(monitor.id, workspace);
+      // Model persisted inconsistent state from an older writer. A terminal
+      // receipt describes past discards and cannot certify today's hold is gone.
+      store.setMonitorState(monitor.id, workspace, {
+        ...terminal,
+        notifyState: {
+          ...terminal.notifyState,
+          ...(strategy === 'debounce'
+            ? { pendingDebounce: accepted.notifyState.pendingDebounce }
+            : { pendingRollup: { observations: envelopes ?? [] } }),
+        },
+      });
+      await expectEphemeralBarrier(
+        fixture,
+        runtime,
+        'declaration-retired',
+        'declaration is retired',
+      );
+    } finally {
+      db.$client.close();
+    }
+  });
+}
 
 /** Both read-only surfaces must name the same barrier without rewriting accepted work. */
 async function expectEphemeralBarrier(
@@ -743,9 +840,14 @@ it('diagnoses an already stale owner before the next tick reaps its declaration'
     const held = store.getMonitorState(monitor.id, workspace).notifyState;
     expect((await runtime.tick(dir, workspace)).emittedEventIds).toEqual([]);
     expect(store.getEphemeralMonitorById(monitor.id).status).toBe('reaped');
-    expect(store.getMonitorState(monitor.id, workspace).notifyState).toEqual(
-      held,
-    );
+    expect(
+      store.getMonitorState(monitor.id, workspace).notifyState,
+    ).toMatchObject({
+      disposition: {
+        disposition: 'discarded-on-retirement',
+        observations: held.pendingDebounce?.observations.length,
+      },
+    });
   } finally {
     db.$client.close();
     vi.useRealTimers();
@@ -790,13 +892,12 @@ it('restores a missing ephemeral source registration without editing a definitio
   }
 });
 
-it('diagnoses a durably inactive owner after an interrupted close and database reopen', async () => {
+it('preserves an active owner and its accepted hold after an interrupted close and database reopen', async () => {
   const databasePath = path.join(process.env.HOME ?? '', 'interrupted.sqlite');
   const fixture = await ephemeralHold(false, databasePath);
   const { runtime, store, session, monitor, workspace, dir, registry } =
     fixture;
-  // A crash can commit owner dormancy before declaration retirement. Reopening
-  // must diagnose that durable lifecycle state rather than a file error.
+  // Owner dormancy and declaration retirement share the held-work commit.
   const reap = vi
     .spyOn(store, 'reapEphemeralMonitorsForSession')
     .mockImplementation(() => {
@@ -811,27 +912,22 @@ it('diagnoses a durably inactive owner after an interrupted close and database r
   const reopenedStore = new RuntimeStore(db);
   const reopened = new AgentMonitorRuntime(reopenedStore, registry);
   try {
-    expect(reopenedStore.getSessionById(session.id).status).toBe('dormant');
+    expect(reopenedStore.getSessionById(session.id).status).toBe('active');
     expect(reopenedStore.getEphemeralMonitorById(monitor.id).status).toBe(
       'active',
     );
     await expectEphemeralBarrier(
       { ...fixture, db, store: reopenedStore },
       reopened,
-      'owner-inactive',
-      'owner is inactive',
+      'none',
+      'next daemon tick',
     );
-    const held = reopenedStore.getMonitorState(
-      monitor.id,
-      workspace,
-    ).notifyState;
-    expect((await reopened.tick(dir, workspace)).emittedEventIds).toEqual([]);
+    expect((await reopened.tick(dir, workspace)).emittedEventIds).toHaveLength(
+      1,
+    );
     expect(reopenedStore.getEphemeralMonitorById(monitor.id).status).toBe(
       'active',
     );
-    expect(
-      reopenedStore.getMonitorState(monitor.id, workspace).notifyState,
-    ).toEqual(held);
   } finally {
     db.$client.close();
   }

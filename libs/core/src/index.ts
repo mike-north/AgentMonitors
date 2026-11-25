@@ -254,6 +254,7 @@ export type {
   DoctorMonitorRollup,
   HeldNotifyBarrier,
   HeldNotifyWork,
+  HeldNotifyDisposition,
   DoctorParseError,
   DoctorReportInput,
   ErroredObservation,
