@@ -13,17 +13,6 @@ import { defineConfig } from 'vitest/config';
  * after the parallel suite finishes (see .github/workflows/ci.yml and the
  * root test:serial script). `verify.integration` is here too: each `verify`
  * case boots and supervises its own isolated daemon.
- *
- * `cli.docker.test.ts` is here for a related reason (PR #453 CI hang, issue
- * #425): it drives a Docker container through a SYNCHRONOUS `execFileSync`
- * that blocks its worker thread outright — vitest cannot preempt synchronous
- * code, so `testTimeout` alone cannot bound it. Running it in the parallel
- * pool alongside this PR's new real-daemon integration tests starved both of
- * CPU on CI's constrained runners badly enough to exceed the 30-minute job
- * timeout; the file self-skips without a reachable Docker daemon, so this was
- * entirely invisible locally. It is bounded instead by its own `execFileSync`
- * `timeout` option (Node kills the child directly) plus the generous
- * `testTimeout` below, which only needs to exceed that bound.
  */
 export default defineConfig({
   test: {
@@ -38,7 +27,6 @@ export default defineConfig({
       'src/commands/daemon-ingress-kill-fault.integration.test.ts',
       'src/commands/daemon-retry-kill-fault.integration.test.ts',
       'src/commands/verify.integration.test.ts',
-      'src/commands/cli.docker.test.ts',
       'src/channel-shutdown.integration.test.ts',
       'src/commands/transport-health.integration.test.ts',
       'src/commands/held-notify.integration.test.ts',

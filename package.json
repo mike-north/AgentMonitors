@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "verify": "pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run",
+    "verify": "pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:docker-smoke && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run",
     "affected": "NX_TUI=false nx affected -t build check --exclude=agentmonitors-workspace,@agentmonitors/website --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t test --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main} --parallel=2 && NX_TUI=false nx affected -t check:api-report --exclude=agentmonitors-workspace --base=${NX_BASE:-origin/main} --parallel=1",
     "build": "NX_TUI=false nx run-many --target=build --exclude=agentmonitors-workspace,@agentmonitors/website",
     "check": "pnpm check:packages && pnpm check:workspace && pnpm check:aipm",
@@ -24,7 +24,8 @@
     "publish:packages": "node scripts/publish-release-packages.mjs",
     "publish:packages:dry-run": "node scripts/publish-release-packages.mjs --dry-run",
     "release": "pnpm build && pnpm publish:packages",
-    "test": "echo 'Partial test run: omits test:serial, test:scripts, test:standalone-consumer, test:e2e-fresh-install-hooks and other validation; preset jq reductions report skips without local jq (required in CI); run pnpm verify for the pre-push gate.' && NX_TUI=false nx run-many --target=test --exclude=agentmonitors-workspace",
+    "test": "echo 'Partial test run: omits test:serial, test:docker-smoke, test:scripts, test:standalone-consumer, test:e2e-fresh-install-hooks and other validation; preset jq reductions report skips without local jq (required in CI); run pnpm verify for the pre-push gate.' && NX_TUI=false nx run-many --target=test --exclude=agentmonitors-workspace",
+    "test:docker-smoke": "NX_TUI=false nx run @agentmonitors/cli:test:docker-smoke",
     "test:scripts": "vitest run --config scripts/vitest.config.ts",
     "test:serial": "NX_TUI=false nx run @agentmonitors/cli:test:serial",
     "test:standalone-consumer": "node scripts/test-standalone-consumer.mjs",

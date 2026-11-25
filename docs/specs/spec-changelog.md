@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Uncached Docker install smoke (004 §2.10 and §2.14)
+
+CI and `pnpm verify` run the live Docker install smoke as `test:docker-smoke` immediately after
+`test:serial`. The smoke checks Docker reachability on every invocation and never replays a cached
+result. The serial daemon suite remains cached with the standard test environment fingerprint.
+
 ## 2026-11-25 — Skipped truncated posts keep scheduled offers (002 §7.2, 006 §4.5)
 
 A truncated post keeps its remaining resurfacing schedule if the hook write or channel push fails.

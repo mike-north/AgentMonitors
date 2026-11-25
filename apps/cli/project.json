@@ -6,12 +6,6 @@
       "{workspaceRoot}/agent-plugins/agentmonitors/**/*",
       "{workspaceRoot}/scripts/owned-test-group.mjs",
       "{workspaceRoot}/scripts/owned-worker-terminated.mjs"
-    ],
-    "dockerSmokeInputs": [
-      "{workspaceRoot}/package.json",
-      "{workspaceRoot}/pnpm-lock.yaml",
-      "{workspaceRoot}/pnpm-workspace.yaml",
-      "{workspaceRoot}/apps/*/package.json"
     ]
   },
   "targets": {
@@ -31,10 +25,12 @@
         "default",
         "^production",
         "testIsolation",
-        "dockerEnvironment",
-        "repoFixtureInputs",
-        "dockerSmokeInputs"
+        "testEnvironment",
+        "repoFixtureInputs"
       ]
+    },
+    "test:docker-smoke": {
+      "cache": false
     }
   }
 }

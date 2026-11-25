@@ -43,6 +43,7 @@ When you change behavior, update the matching numbered doc and add a
 ## Commands
 
 ```bash
+pnpm test:docker-smoke # live Docker install smoke (uncached; skips without Docker)
 pnpm verify     # pre-push gate: CI portable checks/suites and publish dry-run
 pnpm build      # build publishable packages (Nx; build deps first)
 pnpm test       # fast package suites only; prints omitted suites (not the pre-push gate)
@@ -53,7 +54,7 @@ pnpm affected   # build/check, test, check:api-report for projects changed since
 ```
 
 While iterating, use the focused command for the package you edit, then `pnpm affected`; both reuse
-Nx's local cache. `pnpm affected` omits `test:serial`, `test:scripts`, lint/format and packaging checks: also run
+Nx's local cache. `pnpm affected` omits `test:serial`, `test:docker-smoke`, `test:scripts`, lint/format and packaging checks: also run
 `pnpm test:serial` for daemon, process, IPC, preset or command-lifetime changes, and `pnpm test:scripts`
 for `scripts/` changes.
 Escalate to `pnpm verify` for shared configuration changes (`tsconfig.base.json`, `api-extractor.*.json`,
@@ -63,15 +64,15 @@ Escalate to `pnpm verify` for shared configuration changes (`tsconfig.base.json`
 
 Use `pnpm verify` before pushing from macOS/Linux (POSIX shell). After `pnpm install --frozen-lockfile` with Node 24 and
 the pinned pnpm, it sequentially runs build, check, API-report validation, fast tests,
-serial daemon tests, script tests, standalone-consumer tests, fresh-install hook E2E,
+serial daemon tests, Docker install smoke, script tests, standalone-consumer tests, fresh-install hook E2E,
 and publish dry-run. Packaging tests need registry network access; the dry-run does not
 publish. Nx dependency ordering and caching still apply; use
 `NX_SKIP_NX_CACHE=true pnpm verify` when fresh execution evidence is required.
 
 CI-only coverage: GitHub checkout/toolchain setup and change filters; Windows native
 installation on a Windows runner; the separately filtered website build/link job.
-Docker smoke is included in `test:serial` but self-skips without a reachable Docker daemon,
-so a local pass without Docker does not verify that CI coverage. `apps/website` remains
+The uncached `pnpm test:docker-smoke` runs the live install smoke and self-skips without a reachable
+Docker daemon. Report the skip as unverified Docker coverage. `apps/website` remains
 excluded from root build/check/format/lint; its CI link check does not validate copy-paste
 commands or semantic documentation correctness. Website changes need separate verification.
 The independent live advisory audit runs separately via `pnpm check:dependency-audit`;

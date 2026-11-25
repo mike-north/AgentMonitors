@@ -152,6 +152,7 @@ function assertLocalGate(
     'check:api-report',
     'test',
     'test:serial',
+    'test:docker-smoke',
     'test:scripts',
     'test:standalone-consumer',
     'test:e2e-fresh-install-hooks',
@@ -160,6 +161,9 @@ function assertLocalGate(
       candidate.jobs.test.steps.some((step) => step.run === `pnpm ${name}`),
     ).toBe(true);
   }
+  expect(commands[commands.indexOf('pnpm test:serial') + 1]).toBe(
+    'pnpm test:docker-smoke',
+  );
   expect(commands).toContain('pnpm build');
   expect(commands).toContain('pnpm publish:packages:dry-run');
   // Build first, then CI's test sequence, then the publish guard. CI repeats
@@ -178,7 +182,7 @@ function assertLocalGate(
 const completeScripts = {
   ...pkg.scripts,
   verify:
-    'pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run',
+    'pnpm build && pnpm check && pnpm check:api-report && pnpm test && pnpm test:serial && pnpm test:docker-smoke && pnpm test:scripts && pnpm test:standalone-consumer && pnpm test:e2e-fresh-install-hooks && pnpm publish:packages:dry-run',
 };
 
 describe('local verification gate (issue #458)', () => {
@@ -255,6 +259,7 @@ describe('local verification gate (issue #458)', () => {
 
   it.each([
     'test:serial',
+    'test:docker-smoke',
     'test:standalone-consumer',
     'check:api-report',
     'test:scripts',
@@ -344,6 +349,7 @@ describe('local verification gate (issue #458)', () => {
     expect(notice).toMatch(/^echo '[^']+'$/);
     for (const name of [
       'test:serial',
+      'test:docker-smoke',
       'test:scripts',
       'test:standalone-consumer',
       'test:e2e-fresh-install-hooks',

@@ -61,6 +61,7 @@ export function defaultVitestConfigPaths(packageDirs = PACKAGE_DIRS) {
  */
 export const ADDITIONAL_VITEST_CONFIG_PATHS = [
   'apps/cli/vitest.serial.config.ts',
+  'apps/cli/vitest.docker-smoke.config.ts',
   'scripts/vitest.config.ts',
 ];
 

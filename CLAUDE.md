@@ -32,6 +32,7 @@ and add a [`spec-changelog.md`](docs/specs/spec-changelog.md) entry
 pnpm + Nx monorepo (version pinned via package.json#packageManager). Package targets run through Nx with caching and dependency ordering; root scripts also run workspace and packaging checks directly.
 
 ```bash
+pnpm test:docker-smoke # live Docker install smoke (uncached; skips without Docker)
 pnpm verify         # pre-push gate: CI portable checks/suites and publish dry-run
 pnpm build          # build all publishable packages (excludes workspace root + website)
 pnpm test           # fast package suites only; prints omitted suites (not the pre-push gate)
@@ -47,7 +48,7 @@ pnpm clean          # remove dist/ + api-extractor temp/ dirs and reset the nx c
 
 Use `pnpm verify` before pushing from macOS/Linux (POSIX shell), after `pnpm install --frozen-lockfile` with Node 24 and
 the pinned pnpm. It sequentially runs build, check, API-report validation, fast tests,
-serial daemon tests, script tests, standalone-consumer tests, fresh-install hook E2E,
+serial daemon tests, Docker install smoke, script tests, standalone-consumer tests, fresh-install hook E2E,
 and publish dry-run. The packaging tests require registry network access; the dry-run
 does not publish. Nx caching still applies; `NX_SKIP_NX_CACHE=true pnpm verify` requests
 fresh execution evidence. Sequential execution keeps daemon suites isolated and prevents
@@ -55,8 +56,8 @@ concurrent packaging/API-report builds from writing the same outputs.
 
 CI-only coverage consists of GitHub checkout/toolchain setup and change filters, Windows
 native installation, and the separately filtered website build/link job. Docker smoke is
-part of `test:serial` but self-skips without a reachable Docker daemon: report that skip
-instead of claiming Docker coverage. `apps/website` stays excluded from root
+run by the uncached `pnpm test:docker-smoke` and self-skips without a reachable Docker daemon.
+Report the skip as unverified Docker coverage. `apps/website` stays excluded from root
 build/check/format/lint. Its existing CI link check does not prove copy-paste commands or
 semantic documentation correctness; verify website changes separately. The human decision
 on adding website coverage to the root gate remains open; see
@@ -88,7 +89,7 @@ pnpm affected                             # affected: build/check, test, then ch
 Nx caches these targets locally (`.nx/cache`), so an unchanged rerun replays in about a second. The cache
 contract (which root configs, cross-project files and host facilities each target hashes) is in
 [`004`](docs/specs/004-validation-testing.md) §2.14 and guarded by `scripts/nx-cache-contract.test.ts`.
-`pnpm affected` does not run `test:serial`, `test:scripts`, lint/format or packaging checks. Run
+`pnpm affected` does not run `test:serial`, `test:docker-smoke`, `test:scripts`, lint/format or packaging checks. Run
 `pnpm test:serial` too when you touch daemon, process, IPC, preset or command-lifetime code (see the
 include list in `apps/cli/vitest.serial.config.ts`), and `pnpm test:scripts` when you touch `scripts/`.
 The Nx daemon is disabled (`nx.json`) so host-facility fingerprints are re-checked on every run. Escalate to `pnpm verify` when you change shared compiler, test, lint, dependency, generator or
