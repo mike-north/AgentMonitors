@@ -478,7 +478,8 @@ the `hook deliver --debug` diagnosis (§5.2.1) and the per-session hook-state fi
 advertise a row the reservation makes momentarily unclaimable — staying consistent with what a claim
 would decide. Reserving and releasing refresh the hook-state projection so it tracks the lease as it
 is taken and dropped. (Leased rows remain **unread** — a lease is not an acknowledgement — so recap
-and `events list --unread` still show them.)
+and `events list --unread` still show monitor events. A direct post held by a live lease
+stays visible in unread details and is ineligible for a second recap offer while leased.)
 
 The reservation registry is **in-memory and daemon-local**: both transports drive the one daemon
 runtime (§6.1), and losing a lease (daemon restart, or a crashed/hung reserve that never commits or
@@ -724,8 +725,7 @@ unread event for the session, across every urgency band. A capped high-urgency d
 defers some events beyond what fits under the 4000-char cap (§5.1) — they stay pending and re-deliver
 at the next context event ([§5.5](#55-unread-recoverability-truncation-and-partial-delivery)) — and a
 `post-compact` recap's own `events` array is only its rendered slice (up to 10, [002
-§9.4](./002-runtime-delivery.md#94-recap)) of a FULL unread set the recap decision actually claims at
-commit time. A compliant agent that ran the blanket instruction after handling only what it was shown
+§9.4](./002-runtime-delivery.md#94-recap)) of the recap candidates. A compliant agent that ran the blanket instruction after handling only what it was shown
 would silently acknowledge — and thereby permanently drop from ordinary redelivery — events it never
 saw: exactly the event-loss-during-batching class this project's review priorities rank first,
 reintroduced by instruction text. The instruction therefore **MUST** interpolate `--event-ids`
@@ -847,8 +847,9 @@ the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
    window this ordering fix closes (issue #442, PR #442 round-10 review). A write failure — synchronous
    OR the awaited async rejection — releases the reservation instead of committing (nothing durably
    claimed; the rows return to pending). Non-`turn-interruptible` lifecycles, and a reminder claim
-   (`events: []`), carry no per-event sizing risk and are reserved+committed unsized (recap
-   re-validation of `moreDeferred` never applies — see step 8); a reminder claim's `moreDeferred` is
+   (`events: []`), reserve without a size limit. A bounded recap commit receives the IDs represented
+   in the rendered context so that omitted posts keep their offers (§5.5).
+   A reminder claim's `moreDeferred` is
    also always reported `false` regardless of what the settled-high sizing preview computed before the
    preview↔reserve race fell back to it (mirroring the channel transport's identical fix, issue #442,
    PR #442 round-10 review) — `renderHookDelivery` never reads `moreDeferred` for an eventless claim,
@@ -858,8 +859,7 @@ the renderer cases in `apps/cli/src/hook-deliver-render.test.ts`.
    commit, or the daemon restarted) → exit 0. In the lease-expired case the output — if any — was
    ALREADY written by this point, so this
    is a safe, intentional duplicate rather than a loss.
-8. Render (as part of step 7, using the reservation's own claim, BEFORE commit) via
-   `renderHookDelivery(claim, hookEventName)`. If null (no event bodies and no reminder message),
+8. Render the reservation's claim and record which event blocks it presents before committing. If null (no event bodies and no reminder message),
    nothing is written and the reservation still commits unsized (there is nothing to lose by
    committing an empty render). Marker selection inside `renderHookDelivery` is **lifecycle-aware**
    (issue #442, PR #442 round-9 review): a `post-compact` recap renders a distinct, lifecycle-specific
@@ -1012,7 +1012,7 @@ lifecycle and emits nothing otherwise.
 | ------------------ | --------------------------- | -------------------- | ----------------------------------------------------------------------------------------- |
 | `UserPromptSubmit` | yes                         | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal as reminder (low surfaces at `turn-idle`) |
 | `PostToolUse`      | yes                         | `turn-interruptible` | Settled high-urgency events (≥15 s old); normal as reminder (low surfaces at `turn-idle`) |
-| `SessionStart`     | yes                         | `post-compact`       | All unread events as a recap with bodies                                                  |
+| `SessionStart`     | yes                         | `post-compact`       | Unread monitor events and eligible posts as a recap with bodies                           |
 | `PreToolUse`       | **no** (permissionDecision) | — (emit nothing)     | nothing — additionalContext would be ignored                                              |
 | `Stop`             | **no** (top-level decision) | — (emit nothing)     | nothing — additionalContext would be ignored                                              |
 
@@ -1106,8 +1106,8 @@ different high-urgency work also stays genuinely pending beyond it (`moreDeferre
 event's own tail vs. a separate, still-pending remainder) and neither implies the other, so omitting
 either one would silently drop a real signal.
 
-The non-high branches need no sizing: `normal`/`low` reminders inject no per-event bodies, and the
-`post-compact` recap re-shows all unread each time, so both self-heal.
+Normal and low reminders inject no per-event bodies. A bounded `post-compact` recap reports
+which event blocks it presented when committing so that omitted post offers stay eligible.
 
 **The channel transport (§4.2.1) applies the SAME reserve → validate-fit → commit pattern, against its
 own, much larger content ceiling.** It is not exempt from boundedness — a coalesced high-urgency push previewed,
@@ -1232,30 +1232,17 @@ the same `additionalContext` — the claimed-unread marker's outcome-agnostic "t
 unread" framing describes only THIS event's own omitted tail, and does not (and must not) speak for
 the separate, genuinely-pending remainder, which the deferred marker signposts correctly.
 
-**Marker selection is lifecycle-aware: a `post-compact` recap needs its own, THIRD framing, distinct
-from both markers above (issue #442, PR #442 round-9 review).** `decideDelivery`'s `post-compact`
-branch (`service.ts`) reads `unreadEventsForSession` — NOT `pendingEventsForSession` — and
-`applyDelivery` claims the FULL candidate set (every unread event, not just the rendered
-`recapSlice`) at commit time regardless of what actually renders. Because recap re-sources from
-UNREAD state, a row being claimed (`first_notified_at` set) never hides it from a FUTURE recap; only
-acknowledging does — and that self-heal guarantee holds regardless of whether THIS particular recap's
-own commit lands, since a future recap always re-sources from `unreadEventsForSession` again. That
-makes BOTH ordinary markers insufficient for a recap: `buildHookDeferredMarker`'s "more monitor
-updates are pending ... run `events list --unread` to see the rest" wrongly implies the omitted whole
-blocks are not (about to be) claimed along with the rest of the recap's candidate set;
-`buildHookClaimedUnreadMarker`'s outcome-agnostic "the full copy stays unread" is accurate but
-incomplete for a recap — it misses the stronger, POSITIVE guarantee a recap actually offers: the
-omitted/cut content WILL reappear, automatically, on the NEXT `post-compact` recap (and any after
-that) until acknowledged, which is the intentional self-heal behavior this section already documents.
-`renderHookDelivery` therefore checks `claim.lifecycle === 'post-compact'` and, when true, uses a
-single unified `buildHookRecapMarker` in place of BOTH ordinary markers (for the whole-blocks-omitted
-branch AND the single-event mid-truncation branch alike — for a recap both are the SAME fact: content
-that stays unread and will keep re-surfacing on future recaps), reading "not everything fit in this
-recap; the omitted content stays unread and will reappear on future recaps until acknowledged — run
-`agentmonitors events list --session <id> --socket <path> --unread` to see it now". Like the ordinary
-claimed-unread marker, this recap marker is also built from the reservation's own claim before commit
-— so it deliberately asserts only the self-healing future-recap behavior (true regardless of this
-particular commit's outcome), never that this content specifically "is claimed" right now.
+**Bounded recap delivery (_current_).** A `post-compact` recap draws from unread monitor
+events and direct posts eligible under [002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current).
+The hook commit MUST consume only the post offers represented in its rendered context.
+A partially shown post counts as presented. A wholly omitted post retains its current offer,
+including a final needs-attention offer. For example, when an 8,000-character informational
+post fills a recap and a short post is omitted, the next recap can show the short post.
+The compiled hook regression in `post.integration.test.ts` exercises this sequence.
+
+Both truncation branches use the recap marker: "not everything fit in this recap; omitted
+content stays unread and posts follow their delivery schedule". The marker includes the
+session-scoped `events list --unread` command for retrieving full content.
 
 No durable event is lost by truncation; the cap only bounds how much is injected into a single turn (or,
 for the channel, into a single push).
@@ -1331,7 +1318,8 @@ shell-guarded for the "installed plugin, missing CLI" case (a user who hasn't ye
   rendering, writing (awaited to completion), and only then committing the `post-compact`
   reservation via the SAME shared `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery`
   flow `hook deliver` uses (§5.2, issue #442, PR #442 round-16 review), printing the rendered
-  `additionalContext` when there are unread events. This closes the same at-most-once loss window
+  `additionalContext` when there are recap candidates. Only posts represented in that context
+  consume their current offer. Omitted posts remain eligible for later recaps or ordinary delivery. This closes the same at-most-once loss window
   §5.2 describes for `hook deliver`'s own commit ordering: committing the reservation BEFORE the
   recap was successfully written would durably claim the unread rows even if an asynchronous write
   failure (e.g. `EPIPE`) meant nothing ever reached the agent. The SessionStart hook runs the single

@@ -3174,7 +3174,10 @@ export class AgentMonitorRuntime {
   }
 
   /** Post to one active lead session and return the stable event id for acknowledgement. */
-  postMessage(input: PostMessageInput): { eventId: string } {
+  postMessage(input: PostMessageInput): {
+    eventId: string;
+    hookStateRefreshError?: string;
+  } {
     const message = postMessageInputSchema.parse(input);
     const event = this.store.insertMessage(
       message.sessionId,
@@ -3182,8 +3185,12 @@ export class AgentMonitorRuntime {
       message.requireAck ? (message.resurfaceAfterMs ?? 300_000) : 0,
       message.requireAck ? (message.maxResurfaces ?? 2) : 0,
     );
-    this.refreshHookState(message.sessionId);
-    return { eventId: event.id };
+    try {
+      this.refreshHookState(message.sessionId);
+      return { eventId: event.id };
+    } catch (error) {
+      return { eventId: event.id, hookStateRefreshError: errorMessage(error) };
+    }
   }
 
   /**
@@ -3415,12 +3422,25 @@ export class AgentMonitorRuntime {
    * rows claimed, "was surfaced" — BP2, not acknowledged), returning the claim.
    * Returns `null` if the reservation is unknown or already expired — the rows
    * were never permanently consumed, so a stale commit is a safe no-op (they may
-   * have already re-delivered via the hook path).
+   * have already re-delivered via the hook path). A bounded recap can pass
+   * the event IDs it presented to leave omitted post offers eligible.
    */
-  commitDelivery(reservationId: string): DeliveryClaim | null {
+  commitDelivery(
+    reservationId: string,
+    presentedEventIds?: readonly string[],
+  ): DeliveryClaim | null {
     const plan = this.reservations.take(reservationId);
     if (!plan) return null;
-    this.applyDelivery(plan);
+    if (plan.isRecap && presentedEventIds !== undefined) {
+      const presented = new Set(presentedEventIds);
+      const candidates = plan.candidates.filter(
+        (event) =>
+          event.monitorId !== POST_MONITOR_ID || presented.has(event.id),
+      );
+      this.applyDelivery({ ...plan, candidates });
+    } else {
+      this.applyDelivery(plan);
+    }
     return plan.claim;
   }
 
@@ -3717,10 +3737,8 @@ export class AgentMonitorRuntime {
       // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
       // set, then recap only the delivered (post-collapse) tail. Only groups
       // represented in that tail may be claimed or suppressed; the cap must
-      // leave unseen groups intact for a later delivery. Recap reads all UNREAD
-      // (not pending), so a leased row is still recapped — a lease is not
-      // acknowledgement, and recap re-shows unread
-      // until acked (006 §5.5).
+      // leave unseen groups intact for a later delivery. Recap re-shows unread
+      // monitor events, while posts follow the normal offer policy (006 §5.5).
       const deliveredUnread = computeNetCollapseView(unread).delivered;
       const recapSlice = deliveredUnread.slice(-MAX_RECAP_EVENTS);
       const recapKeys = new Set(recapSlice.map(netCollapseGroupKey));

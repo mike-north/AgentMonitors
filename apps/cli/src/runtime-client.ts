@@ -244,10 +244,11 @@ export async function reserveDeliveryClient(
 export async function commitDeliveryClient(
   reservationId: string,
   socketPath?: string,
+  presentedEventIds?: string[],
 ): Promise<DeliveryClaim | null> {
   return await callDaemon<DeliveryClaim | null>(
     'hook.commit',
-    { reservationId },
+    { reservationId, presentedEventIds },
     socketPath ? { socketPath } : {},
   );
 }

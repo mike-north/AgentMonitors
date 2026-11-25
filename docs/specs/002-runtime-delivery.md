@@ -2584,7 +2584,11 @@ With a zero budget the first deadline after initial delivery makes it `needs-att
 Posts without required acknowledgement are offered once. Recaps respect these eligibility rules.
 
 Acknowledgement through `acknowledgeSession` or either delivery transport uses the existing
-session event acknowledgement. It cancels future offers, including any attention offer that has yet to be reserved.
+session event acknowledgement. After acknowledgement, no new offer can be reserved. If a previously
+delivered post has an in-flight retry or final offer, explicit acknowledgement by ID may race with
+that delivery. The transport may finish presenting the reserved offer, and the post stays
+acknowledged. Bulk acknowledgement skips posts held by a live reservation, like other leased
+events ([006 §4.5.1](./006-agent-integration.md#451-transport-state-semantics-reserve--commit--release)).
 The timing policy and claim progress are stored with the projection and survive restart.
 Interval and budget defaults and bounds are in [005 §18](./005-cli-reference.md#18-post--send-a-message).
 
@@ -2804,13 +2808,13 @@ and reservation scenarios for `low` at `turn-idle` and `normal` at `turn-interru
 
 ### 9.4 Recap
 
-At `post-compact`, if unread events remain, the runtime **MUST** emit a recap payload that:
+At `post-compact`, if unread monitor events or eligible posts remain, the runtime **MUST** emit a recap payload that:
 
-- includes a summary of up to the 10 most recent unread events (`MAX_RECAP_EVENTS = 10`, using `.slice(-10)` so the 10 newest are included)
+- includes a summary of up to the 10 most recent recap candidates (`MAX_RECAP_EVENTS = 10`, using `.slice(-10)` so the 10 newest are included)
 - appends two commands: one for full session history and one for unread details
 - updates `lastRecapAt` on the session record
 
-The `DeliveryClaim` in this case has `mode: 'recap'`. The `events` array contains up to 10 `DeliveryEventSummary` entries, each including `body` (the raw monitor instructions — see §9.1 for the `DeliveryEventSummary` shape). Claiming any delivery **MUST** mark the underlying session-event rows as claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains null) (BP2).
+The `DeliveryClaim` in this case has `mode: 'recap'`. The `events` array contains up to 10 `DeliveryEventSummary` entries, each including `body` (the raw monitor instructions — see §9.1 for the `DeliveryEventSummary` shape). Claiming any delivery **MUST** mark the underlying session-event rows as claimed (`firstNotifiedAt` set). Claiming **MUST NOT** acknowledge them (`acknowledgedAt` remains null) (BP2). Bounded hook recaps consume only the post offers represented in the rendered context (006 §5.5).
 
 Verified: `libs/core/src/runtime/service.ts` — `claimDelivery()` post-compact branch; `MAX_RECAP_EVENTS = 10`; `store.markClaimed()` does not set `acknowledgedAt` (see `libs/core/src/runtime/store.ts`: only sets `firstNotifiedAt`, `lastClaimAt`, `lastClaimLifecycle`). Each mapped event includes `body: event.body`.
 

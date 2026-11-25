@@ -1,3 +1,4 @@
+import type { AgentMonitorRuntime } from '@agentmonitors/core';
 import { Command } from 'commander';
 import { callDaemon } from '../daemon-ipc.js';
 import { MAX_TIMER_DELAY_MS, parseIntegerOption } from '../integer-option.js';
@@ -55,7 +56,9 @@ export const postCommand = new Command('post')
               });
         if (maxResurfaces?.ok === false) throw new Error(maxResurfaces.message);
         const socketPath = resolveManualDaemonSocketPath(options.socket);
-        const result = await callDaemon<{ eventId: string }>(
+        const result = await callDaemon<
+          ReturnType<AgentMonitorRuntime['postMessage']>
+        >(
           'messages.post',
           {
             sessionId: options.session,
@@ -67,6 +70,11 @@ export const postCommand = new Command('post')
           socketPath ? { socketPath } : {},
         );
         console.log(result.eventId);
+        if (result.hookStateRefreshError !== undefined) {
+          console.error(
+            `Warning: post committed, but hook-state refresh failed: ${result.hookStateRefreshError}`,
+          );
+        }
       } catch (error) {
         reportError(manualDaemonErrorMessage(error), false);
       }

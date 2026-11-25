@@ -1555,7 +1555,15 @@ Code hook payload on stdin** (a JSON object — there is **no `CLAUDE_CODE_SESSI
 3. If no daemon is listening at the socket, spawns `daemon run` as a **detached background process** (`stdio: 'ignore'`, `.unref()`), passing the derived socket/db paths, the monitors dir, and `reap-after-ms` from the local state. Waits up to 8 seconds for the socket to appear.
 4. Persists the resolved socket/db paths back to `.claude/agentmonitors.local.md` (so sibling hooks can use them without re-deriving).
 5. Opens a session via the `session.open` IPC method (`claudeCodeAdapter.createSessionInput()` with `hostSessionId` and `workspacePath`).
-6. **Surfaces the post-compact recap in the same process.** `SessionStart` is a context event, and a Claude Code hook invocation provides only **one** stdin stream — so the recap cannot be a separately chained `hook deliver` (it would see an already-consumed stdin and no-op; see 006 §5.6). Reusing the payload it already read, `session start` reserves the `post-compact` delivery for the session, renders it, and — only if there are unread events — writes the rendered `SessionStart` hook JSON (`{ "continue": true, "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": "…" } }`) to stdout, **awaiting the write's actual completion** before committing the reservation (the same RESERVE → RENDER → WRITE → COMMIT ordering `hook deliver` uses, via the shared `reserveRenderAndCommitHookDelivery` / `writeAndCommitHookDelivery` helpers — see 006 §5.6). The `post-compact` reservation's candidate rows come from a session's **unread** events (not only never-yet-claimed ones), so they can include rows an earlier delivery already claimed. A write failure (including an asynchronous `EPIPE` arriving after a synchronous "wrote" signal) releases the reservation instead of committing: this applies no new claim and does not advance the recap cursor, but it does NOT reset any row's existing claimed state either — a row already claimed by an earlier delivery stays claimed (it will not redeliver via the ordinary pending-event hook/channel path), while a row that was never claimed remains pending. Either way, every row in the reservation remains **unread** and is eligible to appear again on a future recap.
+6. **Surfaces the post-compact recap in the same process.** `session start` reads the hook payload
+   once and uses it to reserve, render, and write the `SessionStart` hook JSON for that session when
+   there are recap candidates. It awaits the stdout write before committing, using the same flow
+   as `hook deliver` (006 §5.6). If the write fails, including an asynchronous `EPIPE`, it releases
+   the reservation and preserves each row's prior delivery state and the recap cursor.
+   A successful write consumes offers only for posts represented in the rendered context,
+   including a post shown with a truncated body. Posts omitted by the 4,000-character cap keep
+   their current offer, including a final needs-attention offer. Later recaps can show unread
+   monitor events and posts eligible under the retry policy in 002 §7.2.
 
 **Output:**
 
@@ -1931,7 +1939,7 @@ mode it is additionally named on stderr rather than silently disappearing.
 | -------------------- | --------------------------------- | ------------------------------------------------------------------------------- |
 | `turn-interruptible` | `UserPromptSubmit`, `PostToolUse` | settled high-urgency event bodies; normal-urgency changes as reminder text only |
 | `turn-idle`          | override only                     | low-urgency changes as reminder text only                                       |
-| `post-compact`       | `SessionStart`                    | all unread event bodies as a recap                                              |
+| `post-compact`       | `SessionStart`                    | unread monitor events and eligible posts as a recap                             |
 
 Note: for a derived `turn-interruptible` lifecycle, `normal` urgency produces `events: []` (reminder
 only — no body injection); `low` does likewise at `turn-idle`. "Reminder only" is **not** silence:
@@ -2973,7 +2981,11 @@ agentmonitors post --session <id> [--socket <path>] [--require-ack]
 ```
 
 Use `session list` to find the recipient's active lead session ID. The body must contain text
-and is limited to 16,384 UTF-16 code units. The command prints the event ID on success.
+and is limited to 16,384 UTF-16 code units. A committed post exits 0 and prints its event ID to
+stdout. If the subsequent hook-state refresh fails, the same success output and exit code apply,
+and stderr carries a warning. The core API and `messages.post` IPC success result include the
+event ID and an optional `hookStateRefreshError` string for that failure. A refresh warning requires
+no repost. Command errors are reported on stderr with a nonzero exit code.
 
 - `--require-ack` enables scheduled resurfacing.
 - `--resurface-after-ms` accepts integers from 1 through 2,147,483,647 and defaults to 300,000.

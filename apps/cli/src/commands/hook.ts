@@ -21,7 +21,7 @@ import { readLocalState } from '../local-state.js';
 import {
   MAX_ADDITIONAL_CONTEXT,
   packEventsUnderCap,
-  renderHookDelivery,
+  renderHookDeliveryWithCoverage,
   resolveHookClaimFit,
   type HookDeliveryOutput,
 } from '../hook-deliver-render.js';
@@ -253,8 +253,8 @@ async function settledWorkRemainsBeyondClaim(
  * there (issue #299). A reminder claim (`events: []`) is a single coalesced
  * `message`, not assembled from a variable number of per-event blocks, so
  * there is nothing for a substitution race to drop; `turn-idle`/`post-compact`
- * need no sizing either (the recap self-heals by re-showing all unread each
- * time, §5.5). Both are reserved with no `maxEvents` and accepted directly.
+ * are reserved with no `maxEvents`. A recap commit uses the rendered prefix
+ * to keep omitted post offers eligible (§5.5).
  *
  * Returns `null` when nothing is pending to reserve (mirrors `reserveDelivery`
  * returning `null`).
@@ -512,17 +512,25 @@ export async function reserveRenderAndCommitHookDelivery(
     socketPath,
   );
   if (!sized) return null;
-  const output = renderHookDelivery(sized.reservation.claim, hookEventName, {
+  const { claim, reservationId } = sized.reservation;
+  const rendered = renderHookDeliveryWithCoverage(claim, hookEventName, {
     moreDeferred: sized.moreDeferred,
     socketPath,
   });
+  const presentedCount = rendered?.presentedCount ?? 0;
+  const presentedEventIds =
+    claim.mode === 'recap' && presentedCount < claim.events.length
+      ? claim.events.slice(0, presentedCount).map((event) => event.eventId)
+      : undefined;
   return {
-    output,
+    output: rendered?.output ?? null,
     moreDeferred: sized.moreDeferred,
     previewCount: sized.previewCount,
     reservedClaim: sized.reservation.claim,
     commit: () =>
-      commitDeliveryClient(sized.reservation.reservationId, socketPath),
+      presentedEventIds
+        ? commitDeliveryClient(reservationId, socketPath, presentedEventIds)
+        : commitDeliveryClient(reservationId, socketPath),
     release: () =>
       releaseDeliveryClient(sized.reservation.reservationId, socketPath),
   };

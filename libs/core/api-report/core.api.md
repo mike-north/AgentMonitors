@@ -24,7 +24,7 @@ export class AgentMonitorRuntime {
     claimDelivery(sessionId: string, lifecycle: DeliveryLifecycle, maxEvents?: number): DeliveryClaim | null;
     // (undocumented)
     closeSession(sessionId: string, now?: Date): AgentSessionRecord;
-    commitDelivery(reservationId: string): DeliveryClaim | null;
+    commitDelivery(reservationId: string, presentedEventIds?: readonly string[]): DeliveryClaim | null;
     declareEphemeralMonitor(input: DeclareEphemeralMonitorInput): EphemeralMonitorRecord;
     diagnoseHookDelivery(sessionId: string, lifecycle: DeliveryLifecycle): HookDeliveryDiagnosis;
     doctorReport(input: DoctorReportInput): Promise<MonitorDoctorReport>;
@@ -42,6 +42,7 @@ export class AgentMonitorRuntime {
     openSession(input: OpenSessionInput): AgentSessionRecord;
     postMessage(input: PostMessageInput): {
         eventId: string;
+        hookStateRefreshError?: string;
     };
     previewCoalescedReminder(sessionId: string): string | undefined;
     previewSettledHighDelivery(sessionId: string): DeliveryEventSummary[];

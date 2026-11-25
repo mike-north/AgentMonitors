@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Bounded post recaps and durable post results (002 §7.2, 005 §10.4 and §18, 006 §5.5–5.6)
+
+Recap commits preserve omitted post offers, including the final needs-attention offer.
+A committed post returns its event ID even if hook-state refresh fails. Explicit acknowledgement
+prevents new offers and permits a transport to finish an offer already held by a live reservation.
+
 ## 2026-11-25 — Direct posts with required acknowledgement (002 §7.2, 005 §18)
 
 `post` targets one active lead session and uses existing delivery and acknowledgement.

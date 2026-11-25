@@ -187,6 +187,9 @@ const hookReserveParamsSchema = hookClaimParamsSchema;
 const hookReservationParamsSchema = z.object({
   reservationId: z.string(),
 });
+const hookCommitParamsSchema = hookReservationParamsSchema.extend({
+  presentedEventIds: z.array(z.string()).optional(),
+});
 const hookDiagnoseParamsSchema = z.object({
   sessionId: z.string(),
   lifecycle: deliveryLifecycleSchema,
@@ -861,8 +864,10 @@ function handleRequest(
       );
     }
     case 'hook.commit': {
-      const params = hookReservationParamsSchema.parse(request.params);
-      return Promise.resolve(runtime.commitDelivery(params.reservationId));
+      const params = hookCommitParamsSchema.parse(request.params);
+      return Promise.resolve(
+        runtime.commitDelivery(params.reservationId, params.presentedEventIds),
+      );
     }
     case 'hook.release': {
       const params = hookReservationParamsSchema.parse(request.params);
