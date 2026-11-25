@@ -2528,35 +2528,51 @@ being evaluated.
 For each projected event, the runtime tracks session-specific delivery state via `session_event_state`. These concepts are distinct (SP4):
 
 - **Unread:** `acknowledgedAt IS NULL` in `session_event_state`. The session has not acknowledged the event.
-- **Claimed (pending → notified):** `firstNotifiedAt IS NOT NULL`. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (events where `firstNotifiedAt IS NULL` and `acknowledgedAt IS NULL`). `firstNotifiedAt` records the **first** claim and is never overwritten: a repeat claim of the same row (a recap, or a row re-surfaced before acknowledgement) updates only `lastClaimAt` and `lastClaimLifecycle`. Every claim, first or repeat, advances the recipient's object cursor only forward (§1.1.2).
+- **Claimed (pending → notified) for monitor events:** `claim_started_at_ms IS NOT NULL` and the claim TTL has not elapsed. The event has been surfaced at least once at a delivery lifecycle. Implemented as `pendingEventsForSession()` (unacknowledged events with no claim-cycle start or a start at or before `now − claimTtlMs`). `firstNotifiedAt` records the **first** claim and is never overwritten: a repeat claim within a live cycle updates only `lastClaimAt` and `lastClaimLifecycle`; a claim after expiry also starts a new cycle. Every claim, first or repeat, advances the recipient's object cursor only forward (§1.1.2).
 - **Acknowledged:** `acknowledgedAt IS NOT NULL`. The session explicitly marked the event read.
 
 This distinction matters because a claimed event may still need user or agent attention later.
 
 Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines 435–452) and `pendingEventsForSession()` (lines 454–476); `libs/core/src/inbox/schema.ts` — `sessionEventState` columns (lines 86–96).
 
-### 7.1 Claim expiry (_target_)
+### 7.1 Claim expiry (_current_)
 
-> **Status: target** (Refs #468; origin #434).
+> **Status: current** (Refs #468; origin #434).
 
-Today a claimed monitor event is never surfaced again outside recap: claims select only pending monitor events, so an event the
-agent saw but never handled stays unread and silent until a recap. Claim expiry closes that gap. A
-claim that is not followed by an acknowledgement within the **claim TTL** expires: the event goes
-from claimed back to **pending** (unclaimed), so the next claim includes it again. The event stays
-unread throughout, because unread means "not acknowledged". This adds one edge to the model,
-claimed → pending. Expiry never acknowledges. An acknowledgement keeps its meaning, "handled", and
-delivery becomes at-least-once without relying on the agent to acknowledge.
+A monitor event claim not followed by acknowledgment within the claim TTL returns to **pending**, while
+remaining unread. Expiry never acknowledges. Delivery is at-least-once: each expired event follows
+its urgency's next delivery point (§9), and cycles repeat until acknowledged.
 
-- The claim TTL is one configurable duration. Its default is an implementation choice, documented
-  with the CLI ([005](./005-cli-reference.md)).
-- The TTL is measured from the event's durable claim time, `firstNotifiedAt` for the first claim
-  and the most recent re-claim time after an expiry, so it behaves the same across daemon
-  restarts. Each expiry starts a new claim cycle; expiry repeats until the event is acknowledged.
-- An expired event follows its own urgency's delivery rules again ([§9](#9-delivery-lifecycles)).
-- In-flight delivery leases (`reserved-in-flight`) are a separate mechanism, already
-  self-resolving, and are unaffected by claim expiry.
-- A long task may therefore see an event delivered twice. That is accepted: a duplicate costs less
-  than a missed event.
+- The single store-wide duration defaults to **30 minutes**. The shipped runtime reads
+  `claim-ttl-ms` from the target workspace's existing coordination file; all daemon and offline
+  runtime construction paths share that resolution. It is a positive safe integer in milliseconds,
+  validated and loaded when opening the store; a running daemon must be restarted after edits.
+  Coordination-only operations preserve the complete policy field line, including whitespace, without applying it, so lifecycle operations
+  against an existing runtime and disabled-workspace quick exits do not validate replacement policy.
+  Storage workspace selects policy independently of any optional observation-history query filter.
+  Absence uses the default. SDK callers may supply `RuntimeStore`'s `claimTtlMs` constructor option.
+  [005 §12.1](./005-cli-reference.md#121-hook-claim) defines units, validation and precedence.
+- `session_event_state.claim_started_at_ms` stores the start of the current claim cycle with
+  millisecond precision. A claim starts a new cycle only if there is no live cycle. A recap within
+  the TTL does not renew it. `first_notified_at` remains permanent first-surfaced history for
+  net-collapse decisions; `last_claim_at` and lifecycle still describe the latest claim or recap.
+- Eligibility and reported delivery state use the same boundary: one millisecond before expiry
+  the row is claimed; at `now − claim_started_at_ms >= claimTtlMs` it is pending. Reads compute
+  expiry without mutating rows, so previews and diagnostics remain read-only. No timer or running
+  daemon is required, including when the TTL passes during downtime.
+- The additive migration preserves existing rows and backfills cycle starts from
+  `first_notified_at * 1000` once. Reopening never overwrites a later cycle start.
+- Acknowledged rows never become pending. In-flight reservations (`reserved-in-flight`) remain a
+  separate mechanism: only a committed delivery starts a claim cycle. Monotonic recipient cursors
+  and the original per-recipient deltas survive expiry and re-claim.
+
+Verified: `libs/core/src/runtime/store.ts` — `pendingEventsForSession()`,
+`deliveryStateForRow()`, `markClaimed()`; `libs/core/src/inbox/db.ts` additive migration;
+`libs/core/src/runtime/claim-ttl.test.ts` (all urgency boundaries, downtime and restart, repeated
+cycles, acknowledgment, recap, lease independence and cursor ordering);
+`libs/core/src/inbox/db.released-shapes.test.ts` (released claim state and reopen preservation). Workspace configuration and daemon/offline agreement are verified by
+`apps/cli/src/claim-ttl.integration.test.ts`, `apps/cli/src/claim-ttl-coordination.integration.test.ts`
+and `apps/cli/src/local-state.test.ts`.
 
 ### 7.2 Direct posts and required acknowledgement (_current_)
 
@@ -2592,6 +2608,9 @@ after the last allowed resurface, the event becomes `needs-attention` and is eli
 final delivery labeled accordingly. It remains visible as `needs-attention` until acknowledged.
 With a zero budget the first deadline after initial delivery makes it `needs-attention`.
 Posts without required acknowledgement are offered once. Recaps respect these eligibility rules.
+Post eligibility and resurfacing are independent of the monitor claim TTL (§7.1). In a
+session-scoped listing, a post's `deliveryState` remains `claimed` from its first delivery
+until acknowledgement, and `messageState` reports its post-specific state.
 
 Acknowledgement through `acknowledgeSession` or either delivery transport uses the existing
 session event acknowledgement. After acknowledgement, no new offer can be reserved. If a previously
@@ -2615,9 +2634,9 @@ Verified: `libs/core/src/runtime/service.ts` — `writeJsonAtomic()` (lines 45�
 
 The hook state **MUST** include: `sessionId`, `updatedAt` (ISO 8601 string), unread counts for `low`, `normal`, `high`, and `total`, `hasPendingHigh`, `hasPendingNormal`, `hasPendingLow`, `latestHighTitles`.
 
-`hasPendingHigh` becomes `true` only when at least one unread high-urgency event is still unclaimed (`firstNotifiedAt IS NULL`) **and** its age is at or above the 15-second high-urgency settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000`). This threshold deliberately mirrors the delivery condition used by `claimDelivery` at `turn-interruptible`. Pending direct posts follow §7.2 and set this flag without the monitor settle window.
+`hasPendingHigh` becomes `true` only when at least one unread high-urgency event is pending (never claimed or its claim cycle has expired, §7.1) **and** its age is at or above the 15-second high-urgency settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000`). This threshold deliberately mirrors the delivery condition used by `claimDelivery` at `turn-interruptible`. Pending direct posts follow §7.2 and set this flag without the monitor settle window.
 
-`latestHighTitles` contains the titles of up to the 5 most recent unclaimed high-urgency events.
+`latestHighTitles` contains the titles of up to the 5 most recent eligible high-urgency events.
 
 Verified: `libs/core/src/runtime/service.ts` — `refreshHookState()` (lines 426–447): settle window check at line 430–432; `highUnread.slice(-5)` at line 441. `libs/core/src/runtime/types.ts` — `SessionHookState` (lines 121–129).
 
@@ -2765,6 +2784,9 @@ Two properties are **normative**:
 
 The same body is used for the low-urgency reminder (§9.3); urgency is carried in the claim's `urgency` field and in the transports' metadata, not in the prose.
 
+Pending includes claims whose TTL has elapsed (§7.1); before that boundary, an older claim
+remains quiet at ordinary delivery points.
+
 **Fresh work is independent of acknowledgment of older work (current).** Delivering a reminder
 claims only its pending batch (`firstNotifiedAt` is set), never acknowledges it. With no newly
 pending work, repeated claims return `null`; old work remains unread and queryable until explicitly
@@ -2775,7 +2797,7 @@ mixed-band recap. It deliberately replaces the former `pending === unread` band-
 A live same-band reservation still holds the next reminder, preventing simultaneous generic reminders
 from competing transports. That hold ends on commit, release or expiry; the committed older batch
 then remains unread but cannot block the next pending batch. The runtime MUST NOT auto-acknowledge,
-reset prior claims, or re-claim old rows to obtain forward progress.
+reset live claims, or re-claim old rows before their TTL to obtain forward progress.
 
 **Diagnostics.** `no-new-work` means no fresh pending work remains. `reserved-in-flight` means
 a same-band lease is the temporary blocker, even when older claimed rows coexist; it MUST NOT
@@ -2835,8 +2857,10 @@ null) (BP2). Bounded hook recaps consume only the post offers represented in the
 (006 §5.5).
 
 Verified: `libs/core/src/runtime/service.ts` selects the `post-compact` claim.
-`store.markClaimed()` records claim metadata and advances the post schedule (§7.2) while
-leaving acknowledgement state intact. The compiled recap regressions in
+`store.markClaimed()` records claim metadata, starts a monitor cycle when needed (§7.1), and
+advances the post schedule (§7.2) while leaving acknowledgement state intact. The mixed recap regression in
+`libs/core/src/runtime/claim-ttl.test.ts` covers independent post deadlines and monitor claim expiry
+with a monotonic cursor. The compiled recap regressions in
 `apps/cli/src/commands/post.integration.test.ts` exercise both limits.
 
 ## 10. Daemon and IPC
@@ -3504,8 +3528,9 @@ Per-session delivery tracking for each projected event. Drives the unread/claime
 | `id`                     | TEXT PK          | ULID                                                                                |
 | `session_id`             | TEXT NOT NULL    | FK to `agent_sessions.id`                                                           |
 | `event_id`               | TEXT NOT NULL    | FK to `monitor_events.id`                                                           |
-| `first_notified_at`      | INTEGER nullable | Set when event is first claimed; `NULL` = pending                                   |
+| `first_notified_at`      | INTEGER nullable | Permanent first-surfaced history; `NULL` = never claimed                            |
 | `acknowledged_at`        | INTEGER nullable | Set by explicit ack; `NULL` = unread                                                |
+| `claim_started_at_ms`    | INTEGER nullable | Durable monitor claim-cycle start in Unix milliseconds                              |
 | `last_claim_at`          | INTEGER nullable | Time of most recent claim                                                           |
 | `last_claim_lifecycle`   | TEXT nullable    | Lifecycle at most recent claim                                                      |
 | `diff_text`              | TEXT nullable    | Per-recipient delta (G10); `NULL` ⇒ fall back to `monitor_events.diff_text`         |

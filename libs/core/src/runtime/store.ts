@@ -324,19 +324,33 @@ export class MaterializationRetryCapacityError extends Error {
 }
 
 /** Initial claims and deadline-based reoffers share this eligibility check. */
-function isPendingProjection(nowMs: number) {
+function isPendingPost(nowMs: number) {
   return or(
     isNull(sessionEventState.firstNotifiedAt),
     lte(sessionEventState.messageDueAtMs, nowMs),
   );
 }
 
-function deliveryStateForRow(row: {
-  firstNotifiedAt: Date | null;
-  acknowledgedAt: Date | null;
-}): MonitorDeliveryState {
-  if (row.acknowledgedAt) return 'acknowledged';
-  if (row.firstNotifiedAt) return 'claimed';
+/** Report effective delivery state without consuming or renewing a claim cycle. */
+function deliveryStateForRow(
+  row: {
+    messageRetryMs: number | null;
+    firstNotifiedAt: Date | null;
+    claimStartedAt: Date | null;
+    acknowledgedAt: Date | null;
+  },
+  claimTtlMs: number,
+  nowMs: number,
+): MonitorDeliveryState {
+  if (row.acknowledgedAt) {
+    return 'acknowledged';
+  }
+  if (row.messageRetryMs !== null) {
+    return row.firstNotifiedAt ? 'claimed' : 'unread';
+  }
+  if (row.claimStartedAt && nowMs - row.claimStartedAt.getTime() < claimTtlMs) {
+    return 'claimed';
+  }
   return 'unread';
 }
 
@@ -495,10 +509,26 @@ function scopeMatches(
 
 export class RuntimeStore {
   /**
+   * Claim lifetime is evaluated against durable cycle starts on every read.
+   * Expiry changes eligibility, never acknowledgment or first-surfaced history.
+   */
+  private readonly claimTtlMs: number;
+
+  /**
    * Share this connection's writer boundary with internal runtime edit drains
    * and register the runtime-owned admission span runner.
    */
-  constructor(private readonly db: InboxDb) {
+  constructor(
+    private readonly db: InboxDb,
+    options: {
+      /** Lifetime of an unacknowledged claim cycle; defaults to 30 minutes. */
+      claimTtlMs?: number;
+    } = {},
+  ) {
+    this.claimTtlMs = options.claimTtlMs ?? 30 * 60_000;
+    if (!Number.isFinite(this.claimTtlMs) || this.claimTtlMs <= 0) {
+      throw new Error('claimTtlMs must be a positive finite duration');
+    }
     registerStoreWriter(this, db);
     // Runtime-owned spans compose store operations without adding executable
     // callbacks to the published store API. Cache visibility follows the outer
@@ -2139,8 +2169,12 @@ export class RuntimeStore {
               // it can report per-session delivery state (issue #338). `--unread`
               // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
               // claimed-but-unacknowledged events; this field lets a caller tell
-              // those apart from a genuinely never-surfaced event.
-              deliveryState: deliveryStateForRow(row.state),
+              // those apart from pending monitor work, including expired cycles.
+              deliveryState: deliveryStateForRow(
+                row.state,
+                this.claimTtlMs,
+                nowMs,
+              ),
             };
           })
       : asInternalDb(this.db)
@@ -2878,12 +2912,13 @@ export class RuntimeStore {
       .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
       .all();
 
+    const nowMs = Date.now();
     return rows.map(({ event, state, session }) => ({
       eventId: event.id,
       sessionId: session.id,
       sessionRole: session.role,
       sessionStatus: session.status,
-      deliveryState: deliveryStateForRow(state),
+      deliveryState: deliveryStateForRow(state, this.claimTtlMs, nowMs),
       workspacePath: session.workspacePath ?? null,
       createdAt: state.createdAt,
       ...(state.firstNotifiedAt
@@ -2979,7 +3014,19 @@ export class RuntimeStore {
         and(
           ...conditions,
           isNull(sessionEventState.acknowledgedAt),
-          isPendingProjection(nowMs),
+          or(
+            and(
+              isNotNull(sessionEventState.messageRetryMs),
+              isPendingPost(nowMs),
+            ),
+            and(
+              isNull(sessionEventState.messageRetryMs),
+              or(
+                isNull(sessionEventState.claimStartedAt),
+                sql`${sessionEventState.claimStartedAt} <= ${nowMs - this.claimTtlMs}`,
+              ),
+            ),
+          ),
           notInterpretSuppressed(),
           notNetSuppressed(),
         ),
@@ -3521,6 +3568,7 @@ export class RuntimeStore {
         `Event not found: ${ids.find((id) => !found.has(id)) ?? ''}`,
       );
     }
+    const nowMs = Date.now();
     return rows.map((row) => {
       const supplied = suppliedById.get(row.event.id);
       const projectionDiff = row.state?.diffText;
@@ -3538,7 +3586,13 @@ export class RuntimeStore {
           ? { diffText: projectionDiff }
           : {}),
         ...(row.state && supplied?.deliveryState !== undefined
-          ? { deliveryState: deliveryStateForRow(row.state) }
+          ? {
+              deliveryState: deliveryStateForRow(
+                row.state,
+                this.claimTtlMs,
+                nowMs,
+              ),
+            }
           : {}),
       };
     });
@@ -3675,7 +3729,7 @@ export class RuntimeStore {
    * A projection an earlier claim already surfaced (`first_notified_at` set) —
    * for example one a later `post-compact` recap folds into a newer endpoint —
    * was shown to the session, so it keeps no suppression marker and stays
-   * claimed and unread until acknowledged. This must run before
+   * unread until acknowledged, with expired cycles eligible again. This must run before
    * {@link markClaimed} stamps the current claim, which is what makes
    * `first_notified_at` here mean "claimed before this claim began".
    */
@@ -3724,9 +3778,8 @@ export class RuntimeStore {
     asInternalDb(this.db)
       .update(sessionEventState)
       .set({
-        // The first claim time is kept once set; a repeat claim (a recap, or a
-        // capped preview re-surfacing the row) updates only the last-claim
-        // metadata (002 §7).
+        // First-surfaced history never changes, including across expired
+        // cycles. Latest-claim metadata remains separate from cycle lifetime.
         firstNotifiedAt: sql`COALESCE(${sessionEventState.firstNotifiedAt}, ${Math.floor(now.getTime() / 1000)})`,
         // The last ordinary offer arms one final needs-attention offer.
         messageDueAtMs: sql`CASE
@@ -3738,6 +3791,12 @@ export class RuntimeStore {
         END`,
         messageClaims: sql`${sessionEventState.messageClaims} +
           CASE WHEN ${sessionEventState.messageRetryMs} IS NULL THEN 0 ELSE 1 END`,
+        // Recaps within a live cycle do not extend its lifetime. An expired
+        // cycle starts anew only when a delivery actually commits a claim.
+        claimStartedAt: sql`CASE WHEN ${sessionEventState.messageRetryMs} IS NULL
+          AND (${sessionEventState.claimStartedAt} IS NULL
+            OR ${sessionEventState.claimStartedAt} <= ${now.getTime() - this.claimTtlMs})
+          THEN ${now.getTime()} ELSE ${sessionEventState.claimStartedAt} END`,
         lastClaimAt: now,
         lastClaimLifecycle: lifecycle,
         updatedAt: now,
@@ -3750,7 +3809,7 @@ export class RuntimeStore {
             isNull(sessionEventState.messageRetryMs),
             and(
               isNull(sessionEventState.acknowledgedAt),
-              isPendingProjection(now.getTime()),
+              isPendingPost(now.getTime()),
             ),
           ),
         ),

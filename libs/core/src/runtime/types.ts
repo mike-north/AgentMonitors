@@ -197,15 +197,15 @@ export interface MonitorEventRecord {
   definitionFingerprint?: string | null;
   /**
    * The requesting session's delivery state for this event (002 §7):
-   * `unread` (not acknowledged), `claimed` (surfaced at least once at a
-   * delivery lifecycle, but not acknowledged), or `acknowledged`. Only present
+   * `unread` (pending: never claimed or its claim cycle expired), `claimed`
+   * (a live monitor claim cycle or a delivered post awaiting acknowledgement),
+   * or `acknowledged`. Only present
    * when the query was session-scoped (`EventQuery.sessionId` set) — a
    * global/unscoped `listEvents()` call has no single session's state to
    * report, so this is `undefined` in that case. The CLI's unread filter
    * matches an unacknowledged event and therefore includes
    * claimed-but-unacknowledged events (002 §7); this field lets a caller tell
-   * an unread-and-unclaimed event apart from one that was already surfaced
-   * once (issue #338).
+   * pending work apart from a live claim. Expiry never acknowledges (002 §7.1).
    */
   deliveryState?: MonitorDeliveryState;
 }

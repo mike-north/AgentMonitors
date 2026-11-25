@@ -1345,7 +1345,7 @@ it('preserves pre-post projections and recovers keyed posts after reopening', ()
   const store = new RuntimeStore(createDb(dbPath));
   expect(
     store.pendingEventsForSession(retainedSessionId).map(({ id }) => id),
-  ).toEqual(['pending']);
+  ).toEqual(['pending', 'claimed']);
   expect(
     store.unreadEventsForSession(retainedSessionId).map(({ id }) => id),
   ).toEqual(['pending', 'claimed']);
@@ -1355,7 +1355,7 @@ it('preserves pre-post projections and recovers keyed posts after reopening', ()
       .map((event) => [event.id, event.deliveryState, event.messageState]),
   ).toEqual([
     ['acknowledged', 'acknowledged', undefined],
-    ['claimed', 'claimed', undefined],
+    ['claimed', 'unread', undefined],
     ['pending', 'unread', undefined],
   ]);
 
