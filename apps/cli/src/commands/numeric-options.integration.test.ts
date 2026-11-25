@@ -29,7 +29,7 @@ const OPTIONS = [
     min: 1,
     max: 2147483647,
     default: '30000',
-    formats: ['text', 'toon', 'json'],
+    formats: ['text'],
   },
   {
     command: ['daemon', 'run'],
@@ -37,7 +37,7 @@ const OPTIONS = [
     min: 0,
     max: 2147483647,
     default: '300000',
-    formats: ['text', 'toon', 'json'],
+    formats: ['text'],
   },
   {
     command: ['verify'],
@@ -216,6 +216,10 @@ describe('bounded numeric CLI options', () => {
           expect(result.stdout.replace(/\s+/g, ' ')).toContain(
             `(default: "${option.default}")`,
           );
+          if (option.command[0] === 'daemon') {
+            // Numeric validation must preserve the daemon's existing CLI surface.
+            expect(result.stdout).not.toContain('--format');
+          }
         });
       }
     });

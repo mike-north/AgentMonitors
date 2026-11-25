@@ -619,9 +619,9 @@ The row-count cap of `1000` applies at the CLI boundary; IPC limits are unchange
 Invalid input exits with code `1` before monitor discovery, local-state resolution, daemon
 connection/startup, or file writes. The only output in text/toon format is one stderr line:
 `Error: <flag> must be a whole number from <min> to <max> (got "<value>").`
-JSON format instead writes one stdout line, `{"error":"<same message without Error: prefix>"}`,
+Commands supporting JSON format instead write one stdout line, `{"error":"<same message without Error: prefix>"}`,
 with empty stderr. The raw value is JSON-escaped so the diagnostic always occupies one line.
-`verify` retains its existing `text` and `json` formats.
+`daemon run` retains text-only stderr errors; `verify` retains its existing `text` and `json` formats.
 
 For example, `monitor history --limit 1junk` MUST reject the value rather than return one row,
 while `daemon run --reap-after-ms 0` MUST retain zero and disable idle reaping.
@@ -1335,15 +1335,11 @@ agentmonitors daemon run [monitorsDir] [options]
 | ---------------------- | --------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[monitorsDir]`        | positional (optional) | `.claude/monitors`                | Directory containing `MONITOR.md` files                                                                                                                                                                                          |
 | `--workspace <path>`   | string                | `process.cwd()`                   | Workspace path for session projection and per-workspace db/socket resolution (resolved to an absolute path)                                                                                                                      |
-| `--format <format>`    | string                | `text`                            | Numeric-option errors: `text` or `toon` on stderr, `json` on stdout                                                                                                                                                              |
 | `--poll-ms <ms>`       | number (string)       | `30000`                           | Polling interval in milliseconds; whole number from `1` to `2147483647` inclusive                                                                                                                                                |
 | `--socket <path>`      | string                | resolved default                  | Unix domain socket path for the daemon                                                                                                                                                                                           |
 | `--reap-after-ms <ms>` | number (string)       | `300000`                          | Whole number from `0` to `2147483647` inclusive, in ms with no active sessions; `0` disables idle reaping                                                                                                                        |
 | `--detach`             | boolean               | `false`                           | Run the daemon in the background and return (issue #389 P1); see **Background mode** below                                                                                                                                       |
 | `--log <path>`         | string                | `<workspace data dir>/daemon.log` | With `--detach`, append the backgrounded daemon's stdout+stderr here (created if missing). **Requires `--detach`** — given without it, the command errors rather than silently discarding the flag (issue #389 review finding 3) |
-
-`--format <text|toon|json>` (default `text`) selects numeric-option error output; it does not
-change continuous-loop or startup output.
 
 Starts the daemon loop: creates a Unix domain socket server, listens for IPC commands, then polls `runtime.tick()` at `--poll-ms` intervals. `--poll-ms` is the loop-wake cadence; per-monitor observation is still gated by each monitor's schedule or `watch.interval`.
 

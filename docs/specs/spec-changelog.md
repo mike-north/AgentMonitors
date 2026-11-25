@@ -14,8 +14,8 @@ Agent Monitors spec set in `docs/specs/`.
 Daemon polling/reaping, verification timeout, explain row limits and history row limits now
 use strict bounded decimal-integer parsing before state resolution or daemon work. Timer
 values stop at 2147483647; row limits stop at 1000. Existing omitted defaults and reaping's
-explicit zero are preserved. Rejections use a single format-aware error line; daemon run
-accepts an error-format selector for numeric admission. Subprocess coverage checks each
+explicit zero are preserved. Rejections use each command's existing error format, including
+text-only daemon run errors. Subprocess coverage checks each
 range, diagnostic, output stream, absence of side effects and accepted boundaries.
 
 ## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468
