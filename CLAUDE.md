@@ -24,7 +24,7 @@ monitors & observability · [`008`](docs/specs/008-reliability-process-hygiene.m
 process lifecycle/cleanup & power posture · [`000`](docs/specs/000-principles.md)
 the invariants the rest cite · [`roadmap`](docs/specs/roadmap.md) current→target gaps ·
 [`glossary`](docs/specs/glossary.md) terminology. When you change behavior, update the matching doc
-and add a [`spec-changelog.md`](docs/specs/spec-changelog.md) entry
+and add one new entry file under [`docs/specs/changelog/`](docs/specs/spec-changelog.md)
 (process: [`004`](docs/specs/004-validation-testing.md) §5–6).
 
 ## Commands

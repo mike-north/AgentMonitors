@@ -69,7 +69,7 @@ Do not smooth over these in explanatory docs. Each is tracked with a proof oblig
 ## 5. How To Update This Spec Set
 
 1. Update the relevant numbered doc first.
-2. Add a [spec-changelog.md](./spec-changelog.md) entry if the change resolves ambiguity or
+2. Add one new entry file under [changelog/](./changelog/) (see [instructions](./spec-changelog.md)) if the change resolves ambiguity or
    alters an earlier statement.
 3. Update or add tests that prove the changed rule ([004 §3](./004-validation-testing.md)).
 4. Only then adjust public website summaries if needed.

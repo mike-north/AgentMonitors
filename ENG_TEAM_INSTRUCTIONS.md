@@ -31,7 +31,7 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
 
 7. **Specs govern.** Consult the `docs/specs/` doc matching your task (map in `CLAUDE.md`).
    Behavior changes update the matching spec **in the same PR**, plus a
-   `docs/specs/spec-changelog.md` entry. If a spec section moves from _target_ to _current_,
+   new entry file under `docs/specs/changelog/`. If a spec section moves from _target_ to _current_,
    add `verified:` references and retire the roadmap item per `docs/specs/roadmap.md`.
 8. **Changesets:** required for any published-package behavior or public-type change
    (`@agentmonitors/*`); not for docs, specs, CI, or plugin-marketplace content. Never a
@@ -69,14 +69,11 @@ Conventions for the engineering fleet working this repo. The PM agent maintains 
     someone else pays.
 13. **Comment the PR link on the issue** when you open it; close the issue only when the
     change is merged and the acceptance criteria are demonstrably met.
-14. **Expect `docs/specs/spec-changelog.md` conflicts on every spec-touching rebase** — the file
-    is newest-first, so concurrent PRs always collide at the top. Resolution is mechanical: keep
-    ALL entries, yours newest-first. Never drop another PR's entry.
-15. **Push over SSH, and verify a CI run attached.** HTTPS pushes with the local OAuth token land
+14. **Push over SSH, and verify a CI run attached.** HTTPS pushes with the local OAuth token land
     on origin but only sometimes trigger Actions (observed repeatedly). SSH intermittently times
     out — retry it. If you had to fall back to HTTPS, check that a workflow run exists for your
     new head before walking away; a green-looking PR with no fresh run is stale evidence.
-16. **Reply to a review thread before (or when) resolving it** — a silently-resolved thread
+15. **Reply to a review thread before (or when) resolving it** — a silently-resolved thread
     leaves no record of what changed. The reply states the fix commit and the one-line what/why.
 
 ## Hard rules

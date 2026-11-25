@@ -36,8 +36,8 @@ Use this map to decide relevance:
 - [`roadmap.md`](docs/specs/roadmap.md) — known current→target gaps ·
   [`glossary.md`](docs/specs/glossary.md) — terminology
 
-When you change behavior, update the matching numbered doc and add a
-[`spec-changelog.md`](docs/specs/spec-changelog.md) entry (process in
+When you change behavior, update the matching numbered doc and add one new entry file under
+[`docs/specs/changelog/`](docs/specs/spec-changelog.md) (process in
 [`004`](docs/specs/004-validation-testing.md) §5–6).
 
 ## Commands
