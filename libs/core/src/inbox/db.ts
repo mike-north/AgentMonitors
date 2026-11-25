@@ -513,6 +513,31 @@ function buildSchema(db: InternalInboxDb, sqlite: BetterSQLiteClient): void {
   addColumnIfMissing(sqlite, 'session_event_state', 'interpret_reason', 'TEXT');
   addColumnIfMissing(sqlite, 'session_event_state', 'interpret_digest', 'TEXT');
 
+  addColumnIfMissing(
+    sqlite,
+    'session_event_state',
+    'message_retry_ms',
+    'INTEGER',
+  );
+  addColumnIfMissing(
+    sqlite,
+    'session_event_state',
+    'message_max_resurfaces',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  addColumnIfMissing(
+    sqlite,
+    'session_event_state',
+    'message_claims',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
+  addColumnIfMissing(
+    sqlite,
+    'session_event_state',
+    'message_due_at_ms',
+    'INTEGER',
+  );
+
   // Per-recipient baseline cursor + per-recipient delta (G10, 002 §1.1.2).
   db.run(sql`
     CREATE TABLE IF NOT EXISTS session_object_cursor (

@@ -122,6 +122,7 @@ import type {
   OrphanedMonitorWork,
   ObservationHistoryRecord,
   OpenSessionInput,
+  PostMessageInput,
   PollingDecision,
   ProcessObservationInput,
   UnretainedObservationLoss,
@@ -145,6 +146,7 @@ import {
   type DeliveryLifecycle,
   type SessionHookState,
 } from './types.js';
+import { POST_MONITOR_ID, postMessageInputSchema } from './message-policy.js';
 import { schedulingDefaults } from './scheduling-defaults.js';
 
 /**
@@ -693,6 +695,14 @@ function matchCronField(field: string, value: number): boolean {
   }
   const parsed = Number(field);
   return Number.isFinite(parsed) && parsed === value;
+}
+
+/** A direct post is eligible as soon as it is pending. */
+function isSettledHigh(event: MonitorEventRecord, nowMs: number): boolean {
+  return (
+    event.monitorId === POST_MONITOR_ID ||
+    nowMs - event.createdAt.getTime() >= DEFAULT_HIGH_URGENCY_SETTLE_MS
+  );
 }
 
 function summarizeEvents(events: { title: string; summary: string }[]): string {
@@ -3163,6 +3173,19 @@ export class AgentMonitorRuntime {
     };
   }
 
+  /** Post to one active lead session and return the stable event id for acknowledgement. */
+  postMessage(input: PostMessageInput): { eventId: string } {
+    const message = postMessageInputSchema.parse(input);
+    const event = this.store.insertMessage(
+      message.sessionId,
+      message.body,
+      message.requireAck ? (message.resurfaceAfterMs ?? 300_000) : 0,
+      message.requireAck ? (message.maxResurfaces ?? 2) : 0,
+    );
+    this.refreshHookState(message.sessionId);
+    return { eventId: event.id };
+  }
+
   /**
    * Acknowledge events for a session. Omitting `eventIds` acknowledges every
    * unread event for the session **except all rows** currently leased by an
@@ -3518,10 +3541,8 @@ export class AgentMonitorRuntime {
 
     if (lifecycle === 'turn-interruptible') {
       const highUnread = this.pendingForClaim(sessionId, 'high');
-      const settledHigh = highUnread.filter(
-        (event) =>
-          now.getTime() - event.createdAt.getTime() >=
-          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+      const settledHigh = highUnread.filter((event) =>
+        isSettledHigh(event, now.getTime()),
       );
 
       // Cross-monitor coalescing window (issue #441): computed up front so a
@@ -3679,8 +3700,20 @@ export class AgentMonitorRuntime {
       };
     }
 
-    const unread = this.store.unreadEventsForSession(sessionId);
-    if (lifecycle === 'post-compact' && unread.length > 0) {
+    if (lifecycle === 'post-compact') {
+      // Posts follow the same budget during recap and ordinary delivery.
+      const pendingPosts = this.pendingForClaim(sessionId, 'high').filter(
+        (event) => event.monitorId === POST_MONITOR_ID,
+      );
+      const postsById = new Map(pendingPosts.map((event) => [event.id, event]));
+      const unread = this.store
+        .unreadEventsForSession(sessionId)
+        .flatMap((event) => {
+          if (event.monitorId !== POST_MONITOR_ID) return [event];
+          const pending = postsById.get(event.id);
+          return pending ? [pending] : [];
+        });
+      if (unread.length === 0) return null;
       // Per-recipient `net` collapse (G10 PR-B, 002 §1.1.7) over the FULL unread
       // set, then recap only the delivered (post-collapse) tail. Only groups
       // represented in that tail may be claimed or suppressed; the cap must
@@ -3779,10 +3812,8 @@ export class AgentMonitorRuntime {
     // hook transport sizes and claims exactly what a real claim would decide —
     // never an event the channel is mid-surfacing.
     const highUnread = this.pendingForClaim(sessionId, 'high');
-    const settledHigh = highUnread.filter(
-      (event) =>
-        now.getTime() - event.createdAt.getTime() >=
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
+    const settledHigh = highUnread.filter((event) =>
+      isSettledHigh(event, now.getTime()),
     );
     if (settledHigh.length === 0) return [];
     // Same pure collapse DECISION the claim uses, so the previewed set is exactly
@@ -3825,10 +3856,8 @@ export class AgentMonitorRuntime {
   previewCoalescedReminder(sessionId: string): string | undefined {
     const now = new Date();
     const highUnread = this.pendingForClaim(sessionId, 'high');
-    const settledHigh = highUnread.filter(
-      (event) =>
-        now.getTime() - event.createdAt.getTime() >=
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
+    const settledHigh = highUnread.filter((event) =>
+      isSettledHigh(event, now.getTime()),
     );
     if (settledHigh.length === 0) return undefined;
 
@@ -3889,19 +3918,18 @@ export class AgentMonitorRuntime {
       // Lease-aware (issue #300): exclude rows reserved by an in-flight channel
       // push so this diagnosis matches what a real claim would surface.
       const pendingHigh = this.pendingForClaim(sessionId, 'high');
-      const settleHold = classifySettleWindowHold(
-        pendingHigh.map((event) => event.createdAt),
-        unreadCounts.high,
-        now,
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
-      );
-      if (settleHold) holds.push(settleHold);
-
-      const settledHighCount = pendingHigh.filter(
-        (event) =>
-          now.getTime() - event.createdAt.getTime() >=
-          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+      const settledHighCount = pendingHigh.filter((event) =>
+        isSettledHigh(event, now.getTime()),
       ).length;
+      if (settledHighCount === 0) {
+        const settleHold = classifySettleWindowHold(
+          pendingHigh.map((event) => event.createdAt),
+          unreadCounts.high,
+          now,
+          DEFAULT_HIGH_URGENCY_SETTLE_MS,
+        );
+        if (settleHold) holds.push(settleHold);
+      }
       const pendingNormal = this.pendingForClaim(sessionId, 'normal');
       const leasedNormal = this.leasedPendingCount(sessionId, 'normal');
       // Claimed-ids must be derived from the store's actually-claimed set
@@ -6535,11 +6563,8 @@ export class AgentMonitorRuntime {
     // `reserveDelivery`/`releaseDelivery` re-run this so the file tracks the
     // lease as it is taken and dropped.
     const highUnread = this.pendingForClaim(sessionId, 'high');
-    const pendingHigh = highUnread.some(
-      (event) =>
-        Date.now() - event.createdAt.getTime() >=
-        DEFAULT_HIGH_URGENCY_SETTLE_MS,
-    );
+    const nowMs = Date.now();
+    const pendingHigh = highUnread.some((event) => isSettledHigh(event, nowMs));
     const pendingNormal = this.pendingForClaim(sessionId, 'normal').length > 0;
     const pendingLow = this.pendingForClaim(sessionId, 'low').length > 0;
     const state = this.store.sessionHookState(sessionId, {

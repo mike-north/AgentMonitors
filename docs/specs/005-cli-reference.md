@@ -1679,6 +1679,8 @@ in the same way.
 delivery state for that event (002 §7). Present only because this query is always session-scoped
 (`--session` is required); a hypothetical unscoped `listEvents()` call in core has no single
 session's state to report and leaves the field `undefined`.
+Direct posts also carry `messageState` ([002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current)).
+The text format uses that value in the delivery-state column for a post.
 
 **Scope parsing:** the `--scope` value is split on `,`, then each segment is split on `=` to build a `Record<string, string>`. Segments that cannot be parsed as `key=value` are silently dropped.
 
@@ -2961,6 +2963,28 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 
 ---
 
+## §18 `post` — Send a message
+
+**Status:** Current. Routes through the local daemon socket.
+
+```text
+agentmonitors post --session <id> [--socket <path>] [--require-ack]
+                   [--resurface-after-ms <ms>] [--max-resurfaces <count>] <body>
+```
+
+Use `session list` to find the recipient's active lead session ID. The body must contain text
+and is limited to 16,384 UTF-16 code units. The command prints the event ID on success.
+
+- `--require-ack` enables scheduled resurfacing.
+- `--resurface-after-ms` accepts integers from 1 through 2,147,483,647 and defaults to 300,000.
+- `--max-resurfaces` accepts integers from 0 through 100 and defaults to 2.
+
+Both timing options require `--require-ack`. Use `events list --session <id>` to inspect a post's
+state and `events ack --session <id> --event-ids <event-id>` to acknowledge it. Use the same
+`--socket` option for each command when targeting an explicit daemon. See
+[002 §7.2](./002-runtime-delivery.md#72-direct-posts-and-required-acknowledgement-current) for the
+delivery and acknowledgement lifecycle.
+
 ## Appendix A — Command inventory
 
 | Command    | Subcommand | Transport                                                     | Status                                                            |
@@ -2994,6 +3018,7 @@ All commands set `process.exitCode = 1` rather than calling `process.exit(1)`. T
 | `session`  | `list`     | socket                                                        | Fully implemented                                                 |
 | `session`  | `start`    | in-process + socket (lazy boot)                               | Fully implemented                                                 |
 | `session`  | `end`      | socket                                                        | Fully implemented                                                 |
+| `post`     | —          | socket                                                        | Fully implemented                                                 |
 | `events`   | `list`     | socket                                                        | Fully implemented                                                 |
 | `events`   | `ack`      | socket                                                        | Fully implemented                                                 |
 | `hook`     | `claim`    | socket                                                        | Fully implemented                                                 |

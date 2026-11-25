@@ -17,6 +17,7 @@ import net from 'node:net';
 import {
   isErrnoException,
   isVerifyScratchObjectKey,
+  postMessageInputSchema,
   PRIVATE_DIR_MODE,
   PRIVATE_FILE_MODE,
   restrictExistingPathMode,
@@ -57,6 +58,7 @@ const daemonMethodSchema = z.enum([
   'session.list',
   'events.list',
   'events.ack',
+  'messages.post',
   'events.retractObject',
   'events.suppressObject',
   'verifyArtifacts.register',
@@ -790,6 +792,10 @@ function handleRequest(
         }),
       );
     }
+    case 'messages.post':
+      return Promise.resolve(
+        runtime.postMessage(postMessageInputSchema.parse(request.params)),
+      );
     case 'events.ack':
       {
         const params = eventsAckParamsSchema.parse(request.params);

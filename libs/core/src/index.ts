@@ -179,6 +179,7 @@ export {
   AgentMonitorRuntime,
   isVerifyScratchObjectKey,
 } from './runtime/service.js';
+export { postMessageInputSchema } from './runtime/message-policy.js';
 export {
   MaterializationRetryCapacityError,
   MaterializationRetryNotFoundError,
@@ -274,6 +275,8 @@ export type {
   EnqueueMaterializationRetryInput,
   MonitorDoctorReport,
   MonitorEventRecord,
+  MessageState,
+  PostMessageInput,
   MonitorExplainInput,
   MonitorExplainReport,
   MonitorExplainStage,

@@ -2539,7 +2539,7 @@ Verified: `libs/core/src/runtime/store.ts` — `unreadEventsForSession()` (lines
 
 > **Status: target** (Refs #468; origin #434).
 
-Today a claimed event is never surfaced again: claims select only pending events, so an event the
+Today a claimed monitor event is never surfaced again outside recap: claims select only pending monitor events, so an event the
 agent saw but never handled stays unread and silent until a recap. Claim expiry closes that gap. A
 claim that is not followed by an acknowledgement within the **claim TTL** expires: the event goes
 from claimed back to **pending** (unclaimed), so the next claim includes it again. The event stays
@@ -2558,6 +2558,39 @@ delivery becomes at-least-once without relying on the agent to acknowledge.
 - A long task may therefore see an event delivered twice. That is accepted: a duplicate costs less
   than a missed event.
 
+### 7.2 Direct posts and required acknowledgement (_current_)
+
+`AgentMonitorRuntime.postMessage` creates a durable event and its projection atomically for one
+existing, active lead session. It returns the event ID. The event is eligible immediately for
+concrete delivery at `turn-interruptible` or in a `post-compact` recap. Both paths use the normal
+delivery claim and reservation protocol. A post has no snapshot or object cursor. Posts appear
+only in the recipient's session-scoped event list and use the reserved event identity
+`message/post`.
+
+| State             | Meaning                                                                                                    |
+| ----------------- | ---------------------------------------------------------------------------------------------------------- |
+| `pending`         | The initial delivery has yet to be claimed.                                                                |
+| `delivered`       | The initial delivery was claimed.                                                                          |
+| `resurfaced`      | At least one scheduled reoffer was claimed.                                                                |
+| `needs-attention` | The acknowledgement deadline passed after the initial delivery and all configured resurfaces were claimed. |
+| `acked`           | The recipient explicitly acknowledged the post.                                                            |
+
+For a post requiring acknowledgement, each committed claim starts a new deadline using the
+post's persisted interval. The next offer uses the same ID and body. A released or expired
+reservation leaves the offer eligible without spending the resurfacing budget. At the deadline
+after the last allowed resurface, the event becomes `needs-attention` and is eligible for one
+final delivery labeled accordingly. It remains visible as `needs-attention` until acknowledged.
+With a zero budget the first deadline after initial delivery makes it `needs-attention`.
+Posts without required acknowledgement are offered once. Recaps respect these eligibility rules.
+
+Acknowledgement through `acknowledgeSession` or either delivery transport uses the existing
+session event acknowledgement. It cancels future offers, including any attention offer that has yet to be reserved.
+The timing policy and claim progress are stored with the projection and survive restart.
+Interval and budget defaults and bounds are in [005 §18](./005-cli-reference.md#18-post--send-a-message).
+
+Verified: `apps/cli/src/commands/post.integration.test.ts` exercises posting, claiming, listing
+and acknowledgement over the local socket with a controlled clock and a reopened database.
+
 ## 8. Hook State
 
 Each session has a hook-state JSON file on disk. The file is written atomically (write to `.tmp`, then `rename`) to prevent partial reads.
@@ -2566,7 +2599,7 @@ Verified: `libs/core/src/runtime/service.ts` — `writeJsonAtomic()` (lines 45�
 
 The hook state **MUST** include: `sessionId`, `updatedAt` (ISO 8601 string), unread counts for `low`, `normal`, `high`, and `total`, `hasPendingHigh`, `hasPendingNormal`, `hasPendingLow`, `latestHighTitles`.
 
-`hasPendingHigh` becomes `true` only when at least one unread high-urgency event is still unclaimed (`firstNotifiedAt IS NULL`) **and** its age is at or above the 15-second high-urgency settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000`). This threshold deliberately mirrors the delivery condition used by `claimDelivery` at `turn-interruptible`.
+`hasPendingHigh` becomes `true` only when at least one unread high-urgency event is still unclaimed (`firstNotifiedAt IS NULL`) **and** its age is at or above the 15-second high-urgency settle window (`DEFAULT_HIGH_URGENCY_SETTLE_MS = 15_000`). This threshold deliberately mirrors the delivery condition used by `claimDelivery` at `turn-interruptible`. Pending direct posts follow §7.2 and set this flag without the monitor settle window.
 
 `latestHighTitles` contains the titles of up to the 5 most recent unclaimed high-urgency events.
 

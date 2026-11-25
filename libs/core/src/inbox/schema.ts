@@ -188,6 +188,11 @@ export const sessionEventState = sqliteTable('session_event_state', {
   firstNotifiedAt: integer('first_notified_at', { mode: 'timestamp' }),
   acknowledgedAt: integer('acknowledged_at', { mode: 'timestamp' }),
   lastClaimAt: integer('last_claim_at', { mode: 'timestamp' }),
+  // NULL identifies monitor work. Zero identifies a post with no ack policy.
+  messageRetryMs: integer('message_retry_ms'),
+  messageMaxResurfaces: integer('message_max_resurfaces').notNull().default(0),
+  messageClaims: integer('message_claims').notNull().default(0),
+  messageDueAtMs: integer('message_due_at_ms'),
   lastClaimLifecycle: text('last_claim_lifecycle'),
   // The PER-RECIPIENT delta (G10, 002 §1.1.2): the diff of this event's shaped
   // artifact against THIS session's own baseline cursor at projection time.

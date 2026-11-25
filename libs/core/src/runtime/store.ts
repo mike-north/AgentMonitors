@@ -101,6 +101,10 @@ import {
   deserializeRetryEnvelope,
   serializeRetryEnvelope,
 } from './retry-envelope.js';
+import {
+  POST_MONITOR_ID,
+  messageStateForProjection,
+} from './message-policy.js';
 import { registerStoreWriter } from './store-writer.js';
 import { isVerifyScratchObjectKey } from './verify-scratch-key.js';
 
@@ -313,6 +317,14 @@ export class MaterializationRetryCapacityError extends Error {
     this.name = 'MaterializationRetryCapacityError';
     this.monitorId = monitorId;
   }
+}
+
+/** Initial claims and deadline-based reoffers share this eligibility check. */
+function isPendingProjection(nowMs: number) {
+  return or(
+    isNull(sessionEventState.firstNotifiedAt),
+    lte(sessionEventState.messageDueAtMs, nowMs),
+  );
 }
 
 function deliveryStateForRow(row: {
@@ -1640,6 +1652,38 @@ export class RuntimeStore {
     return this.writeEvent(input, baseline, options);
   }
 
+  /** Persist a post and its only projection in one transaction. */
+  insertMessage(
+    sessionId: string,
+    body: string,
+    retryMs: number,
+    maxResurfaces: number,
+  ): MonitorEventRecord {
+    const session = this.getSessionById(sessionId);
+    return this.writeEvent(
+      {
+        workspacePath: session.workspacePath ?? null,
+        monitorId: POST_MONITOR_ID,
+        sourceName: 'post',
+        urgency: 'high',
+        title: retryMs > 0 ? 'Message (acknowledgement required)' : 'Message',
+        body,
+        summary: body,
+        payload: {},
+        snapshotMetadata: {},
+        snapshotText: null,
+        diffText: null,
+        objectKey: null,
+        baselineStrategy: null,
+        queryScope: {},
+        tags: [],
+        createdAt: new Date(),
+      },
+      undefined,
+      { message: { sessionId, retryMs, maxResurfaces } },
+    );
+  }
+
   /**
    * {@link RuntimeStore.insertEvent}, optionally limited to recipients that
    * were registered before the event's observation was admitted. Retry
@@ -1650,7 +1694,10 @@ export class RuntimeStore {
   private writeEvent(
     input: Omit<MonitorEventRecord, 'id'>,
     baseline?: { previousContent: string | null },
-    options?: { restrictToSessionId?: string },
+    options?: {
+      restrictToSessionId?: string;
+      message?: { sessionId: string; retryMs: number; maxResurfaces: number };
+    },
     admittedAt?: RetryAdmission,
   ): MonitorEventRecord {
     const db = asInternalDb(this.db);
@@ -1705,15 +1752,22 @@ export class RuntimeStore {
         // leaking. The declaring session must also still be `active`: a session reaped
         // mid-tick (its close raced this observation) must not receive a projection
         // (007 §4.4). The event row itself is still retained for durability.
+        const message = options?.message;
+        const recipientId = message?.sessionId ?? options?.restrictToSessionId;
         const candidates = ephemeralStillActive
           ? this.sessionsForWorkspace(event.workspacePath).filter(
               (candidate) =>
                 candidate.role === 'lead' &&
-                (options?.restrictToSessionId === undefined ||
-                  (candidate.id === options.restrictToSessionId &&
+                (recipientId === undefined ||
+                  (candidate.id === recipientId &&
                     candidate.status === 'active')),
             )
           : [];
+        if (message && candidates.length !== 1) {
+          throw new Error(
+            'A message recipient must be an active lead session.',
+          );
+        }
         const projectionTargets =
           admittedAt === undefined
             ? candidates
@@ -1783,6 +1837,10 @@ export class RuntimeStore {
               sessionId: session.id,
               eventId: event.id,
               diffText: perRecipientDiff,
+              ...(message && {
+                messageRetryMs: message.retryMs,
+                messageMaxResurfaces: message.maxResurfaces,
+              }),
               createdAt: event.createdAt,
               updatedAt: event.createdAt,
             })
@@ -1992,6 +2050,7 @@ export class RuntimeStore {
       if (workspaceCondition) conditions.push(workspaceCondition);
     }
 
+    const nowMs = Date.now();
     let rows = query.sessionId
       ? asInternalDb(this.db)
           .select({
@@ -2016,15 +2075,19 @@ export class RuntimeStore {
           // equal-time history consistently across independent writers.
           .orderBy(desc(monitorEvents.createdAt), desc(monitorEvents.sequence))
           .all()
-          .map((row) => ({
-            ...rowToEvent(row.event),
-            // Only the session-scoped path joins session_event_state, so only
-            // it can report per-session delivery state (issue #338). `--unread`
-            // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
-            // claimed-but-unacknowledged events; this field lets a caller tell
-            // those apart from a genuinely never-surfaced event.
-            deliveryState: deliveryStateForRow(row.state),
-          }))
+          .map((row) => {
+            const messageState = messageStateForProjection(row.state, nowMs);
+            return {
+              ...rowToEvent(row.event),
+              ...(messageState === undefined ? {} : { messageState }),
+              // Only the session-scoped path joins session_event_state, so only
+              // it can report per-session delivery state (issue #338). `--unread`
+              // filters on `acknowledgedAt IS NULL` (002 §7), which INCLUDES
+              // claimed-but-unacknowledged events; this field lets a caller tell
+              // those apart from a genuinely never-surfaced event.
+              deliveryState: deliveryStateForRow(row.state),
+            };
+          })
       : asInternalDb(this.db)
           .select()
           .from(monitorEvents)
@@ -2043,6 +2106,7 @@ export class RuntimeStore {
                 monitorEvents.monitorId,
                 `${EPHEMERAL_MONITOR_ID_PREFIX}%`,
               ),
+              ne(monitorEvents.monitorId, POST_MONITOR_ID),
               ...conditions,
             ),
           )
@@ -2848,9 +2912,11 @@ export class RuntimeStore {
   ): MonitorEventRecord[] {
     const conditions = [eq(sessionEventState.sessionId, sessionId)];
     if (urgency) conditions.push(eq(monitorEvents.urgency, urgency));
+    const nowMs = Date.now();
     const rows = asInternalDb(this.db)
       .select({
         event: monitorEvents,
+        state: sessionEventState,
       })
       .from(sessionEventState)
       .innerJoin(monitorEvents, eq(sessionEventState.eventId, monitorEvents.id))
@@ -2858,14 +2924,23 @@ export class RuntimeStore {
         and(
           ...conditions,
           isNull(sessionEventState.acknowledgedAt),
-          isNull(sessionEventState.firstNotifiedAt),
+          isPendingProjection(nowMs),
           notInterpretSuppressed(),
           notNetSuppressed(),
         ),
       )
       .orderBy(asc(monitorEvents.createdAt), asc(monitorEvents.sequence))
       .all();
-    return rows.map((row) => rowToEvent(row.event));
+    return rows.map(({ event, state }) => {
+      const record = rowToEvent(event);
+      const messageState = messageStateForProjection(state, nowMs);
+      if (messageState === 'needs-attention') {
+        record.title = 'Message needs-attention (acknowledgement required)';
+      } else if (state.messageDueAtMs !== null) {
+        record.title = 'Message resurfaced (acknowledgement required)';
+      }
+      return record;
+    });
   }
 
   acknowledgeEvents(sessionId: string, eventIds: string[]): void {
@@ -3598,6 +3673,16 @@ export class RuntimeStore {
         // capped preview re-surfacing the row) updates only the last-claim
         // metadata (002 §7).
         firstNotifiedAt: sql`COALESCE(${sessionEventState.firstNotifiedAt}, ${Math.floor(now.getTime() / 1000)})`,
+        // The last ordinary offer arms one final needs-attention offer.
+        messageDueAtMs: sql`CASE
+          WHEN ${sessionEventState.messageRetryMs} > 0
+            AND ${sessionEventState.messageClaims} <= ${sessionEventState.messageMaxResurfaces}
+            AND ${sessionEventState.acknowledgedAt} IS NULL
+          THEN ${now.getTime()} + ${sessionEventState.messageRetryMs}
+          ELSE NULL
+        END`,
+        messageClaims: sql`${sessionEventState.messageClaims} +
+          CASE WHEN ${sessionEventState.messageRetryMs} IS NULL THEN 0 ELSE 1 END`,
         lastClaimAt: now,
         lastClaimLifecycle: lifecycle,
         updatedAt: now,
@@ -3606,6 +3691,13 @@ export class RuntimeStore {
         and(
           eq(sessionEventState.sessionId, sessionId),
           inArray(sessionEventState.eventId, eventIds),
+          or(
+            isNull(sessionEventState.messageRetryMs),
+            and(
+              isNull(sessionEventState.acknowledgedAt),
+              isPendingProjection(now.getTime()),
+            ),
+          ),
         ),
       )
       .run();

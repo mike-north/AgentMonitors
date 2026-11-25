@@ -9,6 +9,12 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Direct posts with required acknowledgement (002 §7.2, 005 §18)
+
+`post` targets one active lead session and uses existing delivery and acknowledgement.
+A required-acknowledgement post resurfaces at a configurable interval, then becomes
+`needs-attention` after its budget is spent and the final acknowledgement deadline passes.
+
 ## 2026-11-23 — Per-recipient cursors never move backward (002 §1.1.2, §7, §15) — Refs #298
 
 A claim advanced the recipient's object cursor to the newest event in that claim, even when an

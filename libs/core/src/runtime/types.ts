@@ -129,7 +129,26 @@ export interface DeclareEphemeralMonitorInput {
   displayName?: string;
 }
 
+/** State of a post in its recipient's event list. */
+export type MessageState =
+  | 'pending'
+  | 'delivered'
+  | 'resurfaced'
+  | 'needs-attention'
+  | 'acked';
+
+/** A post and its optional per-message acknowledgement policy. */
+export interface PostMessageInput {
+  sessionId: string;
+  body: string;
+  requireAck?: boolean | undefined;
+  resurfaceAfterMs?: number | undefined;
+  maxResurfaces?: number | undefined;
+}
+
 export interface MonitorEventRecord {
+  /** Present on posted messages in a session-scoped event list. */
+  messageState?: MessageState;
   id: string;
   workspacePath: string | null;
   monitorId: string;

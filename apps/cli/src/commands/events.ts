@@ -181,7 +181,7 @@ const eventsListCommand = eventsCommand
           // logic must not be fooled by two distinct strings that happen to
           // collapse to the same sanitized text).
           console.log(
-            `${event.id}  ${singleLineSafe(event.monitorId)}  ${event.urgency}  ${event.deliveryState ?? 'unread'}  ${singleLineSafe(event.title)}${detail}`,
+            `${event.id}  ${singleLineSafe(event.monitorId)}  ${event.urgency}  ${event.messageState ?? event.deliveryState ?? 'unread'}  ${singleLineSafe(event.title)}${detail}`,
           );
         }
       } catch (error) {
