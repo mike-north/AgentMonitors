@@ -54,7 +54,7 @@ interface RunResult {
   exitCode: number;
 }
 
-function runWithEnv(
+function runProcess(
   args: string[],
   env: Record<string, string>,
   cwd?: string,
@@ -79,6 +79,41 @@ function runWithEnv(
       exitCode: e.status ?? 1,
     };
   }
+}
+
+/** Every doctor scenario must keep successful delivery checks free of failures. */
+function runWithEnv(
+  args: string[],
+  env: Record<string, string>,
+  cwd?: string,
+): RunResult {
+  const result = runProcess(args, env, cwd);
+  if (args[0] === 'doctor' && args.includes('json')) {
+    const payload = JSON.parse(result.stdout) as {
+      leadSession: boolean;
+      deliverable: boolean;
+      checks: { name: string; status: string }[];
+    };
+    if (payload.leadSession && payload.deliverable) {
+      expect(
+        payload.checks.filter(
+          (check) =>
+            (check.name.startsWith('transport:') ||
+              check.name === 'delivery-verdict') &&
+            check.status === 'fail',
+        ),
+      ).toEqual([]);
+    }
+  } else if (
+    args[0] === 'doctor' &&
+    result.stdout.includes('✓ delivery-verdict')
+  ) {
+    // The text pass glyph represents the same active, deliverable verdict as
+    // JSON. Assert against this invocation rather than taking another sample.
+    expect(result.stdout).not.toContain('✗ transport:');
+    expect(result.stdout).not.toContain('✗ delivery-verdict');
+  }
+  return result;
 }
 
 function runWithStdin(
@@ -417,11 +452,95 @@ This monitor fires on a schedule.
       expect(result.stdout).not.toContain('[daemon-unreachable]');
       expect(result.stdout).not.toContain('[workspace-mismatch]');
       expect(result.stdout).not.toContain('NOT deliverable');
+
+      // Delivery success cannot conceal a failed workspace configuration check.
+      writeLocalState(fixture.dir, {
+        enabled: false,
+        socket: fixture.socketPath,
+      });
+      const disabled = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(disabled.exitCode).toBe(1);
+      expect(JSON.parse(disabled.stdout)).toMatchObject({
+        deliverable: true,
+        checks: expect.arrayContaining([
+          expect.objectContaining({ name: 'project-enabled', status: 'fail' }),
+        ]),
+      });
     } finally {
       daemon.stop();
       await daemon.waitForExit();
     }
   }, 30_000);
+
+  it.each([true, false])(
+    'reports an ended channel session without changing hook delivery (hook present: %s)',
+    async (hookPresent) => {
+      const fixture = transportFixture(`ended-${String(hookPresent)}`);
+      const daemon = await startDaemon(
+        fixture.monitorsRoot,
+        fixture.dir,
+        fixture.env,
+        fixture.socketPath,
+      );
+      try {
+        openLeadSession(fixture);
+        if (hookPresent) {
+          seedHeartbeat(fixture, 'hook');
+        }
+        seedHeartbeat(fixture, 'channel', { hostSessionId: 'ended-session' });
+        const result = runWithEnv(
+          ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+          fixture.env,
+          fixture.dir,
+        );
+        const payload = JSON.parse(result.stdout) as {
+          deliverable: boolean;
+          transports: {
+            name: string;
+            healthy: boolean;
+            problems: { code: string }[];
+          }[];
+          checks: { name: string; status: string }[];
+        };
+        expect(result.exitCode).toBe(hookPresent ? 0 : 1);
+        expect(payload.deliverable).toBe(hookPresent);
+        expect(payload.checks).toContainEqual(
+          expect.objectContaining({
+            name: 'delivery-verdict',
+            status: hookPresent ? 'pass' : 'fail',
+          }),
+        );
+        expect(payload.checks).toContainEqual(
+          expect.objectContaining({
+            name: 'transport:channel',
+            status: hookPresent ? 'pass' : 'fail',
+          }),
+        );
+        const channel = payload.transports.find(
+          (transport) => transport.name === 'channel',
+        );
+        expect(channel?.healthy).toBe(hookPresent);
+        expect(channel?.problems.map((problem) => problem.code)).toContain(
+          'channel-session-unmatched',
+        );
+        const text = runWithEnv(
+          ['doctor', '--workspace', fixture.dir],
+          fixture.env,
+          fixture.dir,
+        );
+        expect(text.stdout.split('Delivery transports:')[1]).toContain(
+          '[channel-session-unmatched]',
+        );
+      } finally {
+        daemon.stop();
+        await daemon.waitForExit();
+      }
+    },
+  );
 
   // --- Failure mode (b): bound to a different workspace ----------------------
   it('reports a channel bound to another workspace, naming both paths', async () => {
@@ -1004,6 +1123,42 @@ This monitor fires on a schedule.
       );
       expect(channel?.healthy).toBe(false);
       expect(payload.deliverable).toBe(false);
+      expect(result.exitCode).toBe(1);
+      expect(JSON.parse(result.stdout).checks).toContainEqual(
+        expect.objectContaining({ name: 'transport:channel', status: 'fail' }),
+      );
+
+      // Hook evidence for every active recipient makes the optional channel gap advisory.
+      seedHeartbeat(fixture, 'hook', { hostSessionId: coveredHost });
+      seedHeartbeat(fixture, 'hook', { hostSessionId: uncoveredHost });
+      const covered = runWithEnv(
+        ['doctor', '--workspace', fixture.dir, '--format', 'json'],
+        fixture.env,
+        fixture.dir,
+      );
+      const coveredPayload = JSON.parse(covered.stdout) as {
+        deliverable: boolean;
+        transports: { name: string; problems: { code: string }[] }[];
+        checks: { name: string; status: string }[];
+      };
+      expect(covered.exitCode).toBe(0);
+      expect(coveredPayload.deliverable).toBe(true);
+      expect(coveredPayload.checks).toContainEqual(
+        expect.objectContaining({ name: 'transport:channel', status: 'pass' }),
+      );
+      expect(
+        coveredPayload.transports
+          .find((transport) => transport.name === 'channel')
+          ?.problems.map((problem) => problem.code),
+      ).toContain('channel-lead-uncovered');
+      const text = runWithEnv(
+        ['doctor', '--workspace', fixture.dir],
+        fixture.env,
+        fixture.dir,
+      );
+      expect(text.stdout.split('Delivery transports:')[1]).toContain(
+        '[channel-lead-uncovered]',
+      );
     } finally {
       daemon.stop();
       await daemon.waitForExit();

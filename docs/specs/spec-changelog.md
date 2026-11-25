@@ -34,6 +34,24 @@ A required-acknowledgement post resurfaces at a configurable interval, then beco
 `needs-attention` after its budget is spent and the final acknowledgement deadline passes.
 Post deadlines and budgets are independent of the monitor claim TTL.
 
+## 2026-11-25 — Doctor delivery checks agree with available routes (005 §15) — Refs #462
+
+Unmatched channel sessions are advisory and cannot establish delivery to an active session.
+Channel coverage gaps are advisory when matching fresh hook evidence covers those sessions.
+Doctor preserves all problem details while keeping transport checks non-failing whenever delivery
+is available. Unrelated failing checks still cause exit 1. Transport unit tests and built-CLI
+scenarios verify health, text/JSON diagnostics, exit status, and the delivery-check invariant.
+The corresponding doctor gap is removed from roadmap G22.
+
+## 2026-11-25 — Prepare the rollup competitor once per file (004 §2.9) — Refs #664
+
+The rollup admission suite compiles its private competitor fixture and current core source once
+before its cases. Each competing process executes the resulting JavaScript against real SQLite.
+The subprocess bound stays at 15 seconds, nested within each competing case's explicit budget;
+compilation has a separate hook budget. This fixture-only preparation leaves package build
+ownership and shared output directories unchanged. Existing admission assertions and the
+four-concurrent-copy, 50-round load check validate the boundary.
+
 ## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468
 
 Coordination rewrites now retain the complete `claim-ttl-ms` field line, including indentation,

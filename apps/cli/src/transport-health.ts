@@ -148,6 +148,7 @@ export function isSharedProblem(code: TransportProblemCode): boolean {
 const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
   'channel-registration-unverified',
   'version-skew',
+  'channel-session-unmatched',
 ];
 
 /**
@@ -161,9 +162,28 @@ const ADVISORY_PROBLEM_CODES: readonly TransportProblemCode[] = [
  * behind it is down), because `healthy` and "is a listening method" answer
  * different questions — see the file's own docstring on why `reach` and
  * `deliverable` are kept separate.
+ * `channelGapsCoveredByHooks` requires valid hook evidence for every recipient
+ * without a channel record; callers without that evidence keep gaps blocking.
  */
-export function disqualifiesFromListening(code: TransportProblemCode): boolean {
-  return !isSharedProblem(code) && !ADVISORY_PROBLEM_CODES.includes(code);
+export function disqualifiesFromListening(
+  code: TransportProblemCode,
+  channelGapsCoveredByHooks = false,
+): boolean {
+  return (
+    !isSharedProblem(code) &&
+    !isAdvisoryProblem(code, channelGapsCoveredByHooks)
+  );
+}
+
+/** Channel coverage is optional only where a valid hook route covers the gap. */
+function isAdvisoryProblem(
+  code: TransportProblemCode,
+  channelGapsCoveredByHooks: boolean,
+): boolean {
+  return (
+    ADVISORY_PROBLEM_CODES.includes(code) ||
+    (code === 'channel-lead-uncovered' && channelGapsCoveredByHooks)
+  );
 }
 
 export interface TransportProblem {
@@ -664,7 +684,8 @@ function selectHeartbeats(
   );
   // No session match: still SHOW any same-workspace channel record — a reader
   // diagnosing silence needs to know a server is running — but mark it
-  // unmatched so it can never be counted as this session's listening method.
+  // unmatched, with uncovered active recipients blocking unless hooks cover them,
+  // so it can never by itself be counted as this session's listening method.
   // Hiding it entirely would lose a real fact; counting it would be the false
   // clean bill of health.
   const pool = sessionMatches.length > 0 ? sessionMatches : sameWorkspace;
@@ -781,6 +802,7 @@ function buildTransport(
   transport: TransportName,
   input: TransportHealthInput,
   sharedProblems: readonly TransportProblem[],
+  channelGapsCoveredByHooks = false,
 ): TransportStatus {
   const matches = selectHeartbeats(transport, input);
   // Choose the representative by FRESHNESS first, corrupt/future-out-of-
@@ -890,7 +912,7 @@ function buildTransport(
   problems.push(...sharedProblems);
 
   const blocking = problems.filter(
-    (problem) => !ADVISORY_PROBLEM_CODES.includes(problem.code),
+    (problem) => !isAdvisoryProblem(problem.code, channelGapsCoveredByHooks),
   );
 
   return {
@@ -930,7 +952,30 @@ export function computeTransportHealth(
   sharedProblems.push(...diagnosisUnavailableProblems(input));
 
   const hook = buildTransport('hook', input, sharedProblems);
-  const channel = buildTransport('channel', input, sharedProblems);
+  // A channel gap is advisory only with fresh, correctly bound hook evidence
+  // for that exact recipient. Other sessions' hook activity is insufficient.
+  const channelSessionIds = new Set(
+    selectHeartbeats('channel', input).map((record) => record.hostSessionId),
+  );
+  const hookSessionIds = new Set(
+    selectHeartbeats('hook', input)
+      .filter(
+        (record) =>
+          !heartbeatProblems(record, 'hook', input).some((problem) =>
+            disqualifiesFromListening(problem.code),
+          ),
+      )
+      .map((record) => record.hostSessionId),
+  );
+  const channelGapsCoveredByHooks = input.leadHostSessionIds
+    .filter((id) => !channelSessionIds.has(id))
+    .every((id) => hookSessionIds.has(id));
+  const channel = buildTransport(
+    'channel',
+    input,
+    sharedProblems,
+    channelGapsCoveredByHooks,
+  );
   const transports = [hook, channel];
 
   // A running heartbeat is not, on its own, an ACTIVE recipient (issue #425
@@ -971,8 +1016,11 @@ export function computeTransportHealth(
     ? transports.filter(
         (transport) =>
           transport.running &&
+          // An advisory leftover record establishes no active channel listener.
+          (transport.name !== 'channel' ||
+            input.leadHostSessionIds.some((id) => channelSessionIds.has(id))) &&
           !transport.problems.some((problem) =>
-            disqualifiesFromListening(problem.code),
+            disqualifiesFromListening(problem.code, channelGapsCoveredByHooks),
           ),
       )
     : [];
