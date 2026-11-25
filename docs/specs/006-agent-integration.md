@@ -1978,3 +1978,23 @@ is attached, even after the session it serves has gone dormant. The reaping cont
   `apps/cli/src/transport-heartbeat.ts`), used both here and by `transport-health`'s binding checks,
   so "does this heartbeat belong to this daemon/workspace" cannot silently diverge between the two
   call sites.
+
+### 12.9 Schema versions and unreadable records (_current_)
+
+`TRANSPORT_HEARTBEAT_SCHEMA_VERSION` changes only for incompatible field changes. On a bump,
+`canReadHeartbeatRecord` remains the single shape-and-version interpretation predicate used by
+registry reads and cleanup. Older versions, newer versions and malformed shapes are not interpreted;
+invalid JSON is likewise unreadable. Readers perform no migration or deletion.
+
+Both paths scan registry filenames ending in `.json`; atomic-write `.tmp` files are excluded.
+On the write path, readable records expire according to their own `updatedAt` and `ttlMs` lease.
+Unreadable files expire only when their filesystem mtime age is strictly greater than
+`UNREADABLE_HEARTBEAT_REAP_AGE_MS` (48 hours, twice `HOOK_HEARTBEAT_TTL_MS`). Their payload's
+timestamps and lease fields cannot establish retention. Files exactly at the boundary are retained.
+
+A parsed JSON object with an integer schema version greater than this CLI's version produces
+`[heartbeat-newer-schema]`: a transport using a newer record format is present, but this CLI cannot
+read it or determine its workspace binding. This advisory replaces empty-registry / not-configured
+wording without establishing a listening route or changing doctor exit status. Older and malformed
+records retain the existing diagnostic behavior. Doctor never reaps either fresh or old files;
+only subsequent transport writes reconcile expired evidence.

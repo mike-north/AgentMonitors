@@ -1,5 +1,6 @@
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -7,6 +8,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -16,6 +18,8 @@ import {
   CHANNEL_HEARTBEAT_TTL_MS,
   HOOK_HEARTBEAT_TTL_MS,
   TRANSPORT_HEARTBEAT_SCHEMA_VERSION,
+  UNREADABLE_HEARTBEAT_REAP_AGE_MS,
+  canReadHeartbeatRecord,
   heartbeatMatchesBinding,
   isHeartbeatStale,
   isTransportHeartbeat,
@@ -58,6 +62,92 @@ afterEach(() => {
 
 const WORKSPACE = '/repos/agentmonitors';
 const SOCKET = '/tmp/agentmonitors-test.sock';
+
+describe('unreadable heartbeat retention', () => {
+  it('allows at least two hook leases before discarding unreadable evidence', () => {
+    expect(UNREADABLE_HEARTBEAT_REAP_AGE_MS).toBeGreaterThanOrEqual(
+      2 * HOOK_HEARTBEAT_TTL_MS,
+    );
+  });
+
+  it.each([0, 99, 'bad-shape', 'non-json'])(
+    'reaps %s only beyond the mtime boundary',
+    (kind) => {
+      const now = new Date('2026-11-25T12:00:00Z');
+      const valid = writeTransportHeartbeat({
+        transport: 'hook',
+        workspacePath: WORKSPACE,
+        socketPath: SOCKET,
+        now,
+      });
+      expect(canReadHeartbeatRecord(valid)).toBe(true);
+      const content =
+        typeof kind === 'number'
+          ? JSON.stringify({
+              ...valid,
+              schemaVersion: kind,
+              updatedAt: '2099-01-01T00:00:00Z',
+              ttlMs: 1,
+            })
+          : kind === 'bad-shape'
+            ? '{}'
+            : 'not json';
+      expect(
+        canReadHeartbeatRecord(
+          typeof kind === 'number' ? { ...valid, schemaVersion: kind } : {},
+        ),
+      ).toBe(false);
+      for (const delta of [-1000, 0, 1000]) {
+        const file = path.join(
+          transportRegistryDir(),
+          `channel-unreadable-${delta}.json`,
+        );
+        writeFileSync(file, content);
+        const mtime = new Date(
+          now.getTime() - UNREADABLE_HEARTBEAT_REAP_AGE_MS - delta,
+        );
+        utimesSync(file, mtime, mtime);
+      }
+      const temp = path.join(
+        transportRegistryDir(),
+        'channel-unreadable.json.123.tmp',
+      );
+      writeFileSync(temp, content);
+      utimesSync(temp, new Date(0), new Date(0));
+      reapExpiredHeartbeats(now);
+      for (const delta of [-1000, 0, 1000]) {
+        expect(
+          existsSync(
+            path.join(
+              transportRegistryDir(),
+              `channel-unreadable-${delta}.json`,
+            ),
+          ),
+        ).toBe(delta <= 0);
+      }
+      expect(existsSync(temp)).toBe(true);
+      expect(readTransportHeartbeats()).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { schemaVersion: 99, expected: true },
+    { schemaVersion: 0, expected: false },
+    { schemaVersion: 1.5, expected: false },
+    { schemaVersion: '99', expected: false },
+    { schemaVersion: null, expected: false },
+  ])(
+    'reports only integer newer schema metadata: %s',
+    ({ schemaVersion, expected }) => {
+      mkdirSync(transportRegistryDir(), { recursive: true });
+      writeFileSync(
+        path.join(transportRegistryDir(), 'channel-format.json'),
+        JSON.stringify({ schemaVersion }),
+      );
+      expect(readTransportHeartbeatsResult().newerSchemaPresent).toBe(expected);
+    },
+  );
+});
 
 describe('writeTransportHeartbeat', () => {
   it('records every field the health surface compares against', () => {
@@ -790,6 +880,7 @@ describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
   it('reports readFailed: false and an empty list when the registry directory has never been created', () => {
     expect(readTransportHeartbeatsResult()).toEqual({
       records: [],
+      newerSchemaPresent: false,
       readFailed: false,
     });
   });
@@ -798,6 +889,7 @@ describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
     mkdirSync(transportRegistryDir(), { recursive: true });
     expect(readTransportHeartbeatsResult()).toEqual({
       records: [],
+      newerSchemaPresent: false,
       readFailed: false,
     });
   });
@@ -814,6 +906,7 @@ describe('readTransportHeartbeatsResult (PR #461 finding 1)', () => {
 
     expect(readTransportHeartbeatsResult()).toEqual({
       records: [],
+      newerSchemaPresent: false,
       readFailed: true,
     });
   });

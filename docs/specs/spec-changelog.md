@@ -9,6 +9,13 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Heartbeat format retention and diagnostics (006 §12.9) — Refs #463
+
+Heartbeat interpretation uses one shape-and-version predicate. Write-path cleanup removes
+uninterpretable records only after 48 hours measured from file mtime; compatible records retain
+their own lease policy. Newer integer schema markers produce an informational health advisory
+instead of an empty-registry diagnosis. Doctor remains read-only and its exit status is unchanged.
+
 ## 2026-11-25 — Doctor delivery checks agree with available routes (005 §15) — Refs #462
 
 Unmatched channel sessions are advisory and cannot establish delivery to an active session.
