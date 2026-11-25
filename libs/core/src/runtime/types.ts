@@ -626,6 +626,8 @@ export interface MonitorDoctorReport {
    * Optional for compatibility with reports returned by older daemons.
    */
   heldNotifyWork?: HeldNotifyWork[];
+  /** Terminal discards, including declarations no longer discovered as active. */
+  heldNotifyDispositions?: HeldNotifyDisposition[];
   generatedAt: Date;
   monitorsDir: string;
   /**
@@ -752,7 +754,25 @@ export interface PendingRollupState {
   observations: StoredObservationEnvelope[];
 }
 
+/**
+ * A terminal accounting of accepted notify observations removed at retirement.
+ * Stored with the scoped notify state, independently of declaration discovery.
+ * @public
+ */
+export interface HeldNotifyDisposition {
+  /** The declaration whose accepted work was discarded. */
+  monitorId: string;
+  /** Cancel is distinct from explicit session end or inactivity retirement. */
+  disposition: 'discarded-on-cancel' | 'discarded-on-retirement';
+  /** ISO timestamp of the retirement decision. */
+  recordedAt: string;
+  /** Accepted observations removed from debounce and rollup holds combined. */
+  observations: number;
+}
+
 export interface NotifyRuntimeState {
+  /** Terminal receipt replaces held envelopes in the retirement transaction. */
+  disposition?: HeldNotifyDisposition;
   suppressedUntil?: string;
   pendingDebounce?: PendingDebounceState;
   pendingRollup?: PendingRollupState;

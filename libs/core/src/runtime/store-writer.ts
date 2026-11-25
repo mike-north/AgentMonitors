@@ -68,6 +68,31 @@ export function heldMonitorIds(store: object, workspacePath: string): string[] {
   return rows.map((row) => row.monitor_id);
 }
 
+/** Enumerate every persisted route for a declaration, including global owners' workspaces. @internal */
+export function monitorStateRoutes(
+  store: object,
+  monitorId: string,
+): (string | null)[] {
+  // Only fixed schema columns are decoded; source and envelope data stay in the store.
+  const rows = storeWriter(store)
+    .prepare('SELECT workspace_path FROM monitor_state WHERE monitor_id = ?')
+    .all(monitorId) as { workspace_path: string | null }[];
+  return rows.map((row) => row.workspace_path);
+}
+
+/** Receipts remain discoverable after their declarations stop being active. @internal */
+export function dispositionMonitorIds(
+  store: object,
+  workspacePath: string,
+): string[] {
+  const rows = storeWriter(store)
+    .prepare(
+      "SELECT monitor_id FROM monitor_state WHERE workspace_path = ? AND json_type(notify_state, '$.disposition') = 'object' ORDER BY monitor_id",
+    )
+    .all(workspacePath) as { monitor_id: string }[];
+  return rows.map((row) => row.monitor_id);
+}
+
 /**
  * Learn private pacing identity on an existing scoped row without changing source
  * representation, observation clocks or accepted work. Caller owns the synchronous

@@ -573,6 +573,14 @@ export interface GroupMembershipTracking {
 export type HeldNotifyBarrier = 'none' | 'definition-rejected' | 'source-unavailable' | 'owner-inactive' | 'declaration-retired' | 'workspace-mismatch' | 'declaration-invalid' | 'retained-work' | 'capture-invalid';
 
 // @public
+export interface HeldNotifyDisposition {
+    disposition: 'discarded-on-cancel' | 'discarded-on-retirement';
+    monitorId: string;
+    observations: number;
+    recordedAt: string;
+}
+
+// @public
 export interface HeldNotifyWork {
     blockedByDefinition: boolean;
     dueAt?: string;
@@ -941,6 +949,7 @@ export interface MonitorDoctorReport {
     // (undocumented)
     generatedAt: Date;
     hasLeadSession: boolean;
+    heldNotifyDispositions?: HeldNotifyDisposition[];
     heldNotifyWork?: HeldNotifyWork[];
     invalidCount: number;
     leadSessions: AgentSessionRecord[];
@@ -1221,6 +1230,7 @@ export type NotifyConfig = z.infer<typeof notifySchema>;
 
 // @public (undocumented)
 export interface NotifyRuntimeState {
+    disposition?: HeldNotifyDisposition;
     // (undocumented)
     pendingDebounce?: PendingDebounceState;
     // (undocumented)

@@ -9,6 +9,15 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-25 — Account for held work at ephemeral retirement (002 §6.4, 005 §6 and doctor) — Refs #667
+
+Cancellation records `discarded-on-cancel`; explicit end and inactivity reap record
+`discarded-on-retirement`. Each scoped receipt replaces accepted holds atomically with
+retirement and retains the count and recording time across database reopen. Doctor lists
+receipts independently of active declarations; monitor explain reports them in notify.
+The legacy `declaration-retired` barrier remains for preexisting inconsistent state.
+Suspension/resume and retention of suspended sessions remain target under #636.
+
 ## 2026-11-25 — Prepare the rollup competitor once per file (004 §2.9) — Refs #664
 
 The rollup admission suite compiles its private competitor fixture and current core source once

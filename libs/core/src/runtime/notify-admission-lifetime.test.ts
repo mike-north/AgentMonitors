@@ -22,6 +22,151 @@ import type {
 import type { MonitorDefinition } from '../schema/types.js';
 import { AgentMonitorRuntime } from './service.js';
 import { RuntimeStore } from './store.js';
+import type { EphemeralMonitorRecord } from './types.js';
+
+/** Retirement consumes only accepted holds, atomically with declaration liveness. */
+for (const strategy of ['debounce', 'rollup'] as const) {
+  for (const retirement of ['cancel', 'close', 'dormant'] as const) {
+    for (const failWrite of [false, true]) {
+      it(`${retirement} ${strategy} ${failWrite ? 'rolls back a failed disposition' : 'records the accepted discard without later emission'}`, async () => {
+        vi.useFakeTimers({ toFake: ['Date'] });
+        const start = new Date('2026-03-20T08:00:00Z');
+        vi.setSystemTime(start);
+        const root = mkdtempSync(path.join(tmpdir(), 'retirement-'));
+        roots.push(root);
+        const dir = path.join(root, 'monitors');
+        mkdirSync(dir);
+        const databasePath = path.join(root, 'retirement.sqlite');
+        const db = createDb(databasePath);
+        clients.push(db.$client);
+        const store = new RuntimeStore(db);
+        const registry = new SourceRegistry();
+        registry.register({
+          name: 'retirement-source',
+          scopeSchema: { type: 'object' },
+          async observe() {
+            return { observations: [{ title: 'First' }, { title: 'Second' }] };
+          },
+        });
+        const runtime = new AgentMonitorRuntime(
+          store,
+          registry,
+          undefined,
+          undefined,
+          { sessionDormancyMs: 1_000 },
+        );
+        // Declarations currently expose urgency only. Exercise rollup through
+        // the same tick pipeline without expanding the declaration API.
+        const reconstruction = runtime as unknown as {
+          ephemeralRecordToMonitor(
+            record: EphemeralMonitorRecord,
+          ): MonitorDefinition;
+        };
+        const rebuild = reconstruction.ephemeralRecordToMonitor.bind(runtime);
+        vi.spyOn(reconstruction, 'ephemeralRecordToMonitor').mockImplementation(
+          (record) => {
+            const monitor = rebuild(record);
+            monitor.frontmatter.notify =
+              strategy === 'debounce'
+                ? { strategy: 'debounce', 'settle-for': '1h' }
+                : { strategy: 'rollup', window: '0 9 * * *', timezone: 'UTC' };
+            return monitor;
+          },
+        );
+        const session = runtime.openSession(
+          claudeCodeAdapter.createSessionInput({
+            hostSessionId: 'retirement',
+            workspacePath: root,
+          }),
+        );
+        const monitor = runtime.declareEphemeralMonitor({
+          sessionId: session.id,
+          source: 'retirement-source',
+          scope: {},
+          instruction: 'Inspect',
+        });
+        await runtime.tick(dir, root);
+        const before = store.getMonitorState(monitor.id, root);
+        expect(
+          (strategy === 'debounce'
+            ? before.notifyState.pendingDebounce
+            : before.notifyState.pendingRollup
+          )?.observations,
+        ).toHaveLength(2);
+        const write = vi.spyOn(store, 'setMonitorState');
+        if (failWrite)
+          write.mockImplementation(() => {
+            throw new Error('Disposition write failed');
+          });
+        const retire = async () => {
+          if (retirement === 'cancel')
+            runtime.cancelEphemeralMonitor(session.id, monitor.id);
+          else if (retirement === 'close') runtime.closeSession(session.id);
+          else {
+            vi.setSystemTime(new Date(start.getTime() + 2_000));
+            await runtime.tick(dir, root);
+          }
+        };
+        if (failWrite) {
+          await expect(retire()).rejects.toThrow('Disposition write failed');
+          expect(store.getEphemeralMonitorById(monitor.id).status).toBe(
+            'active',
+          );
+          expect(store.getSessionById(session.id).status).toBe('active');
+          expect(store.getMonitorState(monitor.id, root)).toEqual(before);
+          write.mockRestore();
+          await retire();
+        } else await retire();
+        write.mockRestore();
+        const state = store.getMonitorState(monitor.id, root);
+        expect(state.notifyState.pendingDebounce).toBeUndefined();
+        expect(state.notifyState.pendingRollup).toBeUndefined();
+        expect(state.notifyState.disposition).toEqual({
+          monitorId: monitor.id,
+          disposition:
+            retirement === 'cancel'
+              ? 'discarded-on-cancel'
+              : 'discarded-on-retirement',
+          observations: 2,
+          recordedAt: new Date().toISOString(),
+        });
+        vi.setSystemTime(new Date('2026-03-20T10:00:00Z'));
+        expect((await runtime.tick(dir, root)).emittedEventIds).toEqual([]);
+        expect(
+          store.listEvents({ monitorId: monitor.id, workspacePath: root }),
+        ).toEqual([]);
+        expect(
+          (
+            await runtime.doctorReport({
+              monitorsDir: dir,
+              workspacePath: root,
+            })
+          ).heldNotifyWork,
+        ).toEqual([]);
+        db.$client.close();
+        const reopenedDb = createDb(databasePath);
+        clients.push(reopenedDb.$client);
+        const reopenedStore = new RuntimeStore(reopenedDb);
+        const reopened = new AgentMonitorRuntime(reopenedStore, registry);
+        const input = {
+          monitorsDir: dir,
+          workspacePath: root,
+          monitorId: monitor.id,
+        };
+        expect(
+          (await reopened.doctorReport(input)).heldNotifyDispositions,
+        ).toEqual([state.notifyState.disposition]);
+        expect((await reopened.doctorReport(input)).heldNotifyWork).toEqual([]);
+        expect(
+          (await reopened.explainMonitor(input)).stages.find(
+            (stage) => stage.id === 'notify',
+          )?.details,
+        ).toEqual(state.notifyState.disposition);
+        expect((await reopened.tick(dir, root)).emittedEventIds).toEqual([]);
+      });
+    }
+  }
+}
 
 /** Explicit barriers control observations and admission continuations without timing races. */
 function deferred<T>() {

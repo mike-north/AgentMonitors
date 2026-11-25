@@ -886,6 +886,11 @@ function renderText(
   for (const hold of report.heldNotifyWork ?? []) {
     lines.push(`Held notify work ${hold.monitorId}: ${hold.reason}`);
   }
+  for (const receipt of report.heldNotifyDispositions ?? []) {
+    lines.push(
+      `Notify disposition ${receipt.monitorId}: ${receipt.disposition}; discarded ${String(receipt.observations)} accepted observation(s) at ${receipt.recordedAt}.`,
+    );
+  }
   // Outboxes have one location in the core report. Render records separately
   // from definition health so invalid/absent definitions cannot hide them.
   for (const group of [
@@ -984,6 +989,7 @@ function toJson(
       remediation: check.remediation ?? null,
     })),
     heldNotifyWork: report.heldNotifyWork ?? [],
+    heldNotifyDispositions: report.heldNotifyDispositions ?? [],
     orphanedMonitorWork: report.orphanedMonitorWork ?? [],
     ephemeralMonitorWork: report.ephemeralMonitorWork ?? [],
     parseErrors: report.parseErrors,
