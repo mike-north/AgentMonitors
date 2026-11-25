@@ -9,6 +9,40 @@ Agent Monitors spec set in `docs/specs/`.
 - Prefer short entries tied to the numbered doc affected.
 - If implementation behavior and desired behavior differ, say so explicitly.
 
+## 2026-11-24 — Preserve claim policy field bytes (002 §7.1, 005 §12.1) — Refs #468
+
+Coordination rewrites now retain the complete `claim-ttl-ms` field line, including indentation,
+separator whitespace and trailing spaces/tabs. Trimming and interpretation occur only when runtime
+composition applies policy. Other coordination fields retain their normalization. Local-state and
+built-CLI lifecycle regressions assert exact field-line preservation.
+
+## 2026-11-24 — Claim policy belongs to runtime construction (002 §7.1, 005 §12.1) — Refs #468
+
+Coordination reads and rewrites retain raw `claim-ttl-ms` text without applying it. Runtime/store
+construction remains strict, with no invalid-value fallback. An invalid replacement on disk no longer
+blocks lifecycle operations against a live daemon or disabled-workspace quick exits. Offline history
+uses its storage workspace's policy independently of its optional query filter; omitted `--workspace`
+keeps the global audit tail in cwd's selected database even with a different `CLAUDE_PROJECT_DIR`.
+Built-CLI and local-state tests verify these boundaries.
+
+## 2026-11-24 — Workspace claim TTL configuration (002 §7.1, 005 §12.1) — Refs #468
+
+The shipped runtime now resolves `claim-ttl-ms` from existing workspace coordination frontmatter.
+Daemon run/once and offline readers use the same target-workspace policy. The setting is a positive
+safe integer in milliseconds, default 1,800,000; malformed values fail explicitly. Session rewrites
+preserve it. Restart a daemon after edits. Daemon IPC and offline-reader tests verify the non-default
+lifetime, and the built CLI rejects invalid values. The additive public constructor option is a
+minor core change; CLI behavior remains a patch.
+
+## 2026-11-24 — Claim expiry is current (002 §7.1, 005 §12.1) — Refs #468
+
+Unacknowledged claims return to pending at a configurable TTL (default 30 minutes), without
+acknowledgment. Durable millisecond claim-cycle starts survive restarts, while permanent
+first-surfaced history and monotonic cursors remain intact. Recaps do not renew a live cycle.
+In-flight leases remain separate. Released databases gain an additive, one-time backfill.
+Boundary, urgency, restart/downtime, acknowledgment, repeated-cycle, lease and cursor tests verify
+002 §7.1; 005 documents the in-process `RuntimeStore` setting and CLI default.
+
 ## 2026-11-23 — Per-recipient cursors never move backward (002 §1.1.2, §7, §15) — Refs #298
 
 A claim advanced the recipient's object cursor to the newest event in that claim, even when an

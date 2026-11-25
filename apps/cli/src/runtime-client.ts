@@ -483,7 +483,12 @@ export function rearmRetryInProcess(
   dbPath: string,
 ): MaterializationRetryRepairResult {
   return normalizeRepairResult(
-    createRuntime(dbPath).rearmMaterializationRetry(input),
+    createRuntime(
+      dbPath,
+      undefined,
+      undefined,
+      input.workspacePath,
+    ).rearmMaterializationRetry(input),
   );
 }
 
@@ -493,7 +498,12 @@ export function skipRetryInProcess(
   dbPath: string,
 ): MaterializationRetryRepairResult {
   return normalizeRepairResult(
-    createRuntime(dbPath).skipMaterializationRetry(input),
+    createRuntime(
+      dbPath,
+      undefined,
+      undefined,
+      input.workspacePath,
+    ).skipMaterializationRetry(input),
   );
 }
 
@@ -512,7 +522,7 @@ export async function daemonTickClient(
   workspacePath?: string,
   dbPath?: string,
 ): Promise<RuntimeTickResult> {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(dbPath, undefined, undefined, workspacePath);
   return await runtime.tick(monitorsDir, workspacePath);
 }
 
@@ -539,7 +549,12 @@ export async function explainMonitorInProcess(
   input: MonitorExplainInput,
   dbPath: string,
 ): Promise<MonitorExplainReport> {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(
+    dbPath,
+    undefined,
+    undefined,
+    input.workspacePath,
+  );
   return await runtime.explainMonitor(input);
 }
 
@@ -547,6 +562,10 @@ export async function explainMonitorInProcess(
  * Read observation history *in-process* from the persisted SQLite store,
  * bypassing the daemon socket. Fallback for {@link listObservationHistoryClient}
  * when the daemon is unreachable. Issue #150.
+ *
+ * `storageWorkspace` selects the database's claim policy independently of
+ * `query.workspacePath`, which is only an optional audit filter. An unscoped
+ * query must remain unscoped while using the workspace that selected storage.
  *
  * `dbPath` is the workspace-resolved database path ({@link
  * resolveWorkspaceDbPath} in `workspace-db-path.ts`) — the SAME db `doctor`
@@ -559,8 +578,9 @@ export async function explainMonitorInProcess(
 export function listObservationHistoryInProcess(
   query: ObservationHistoryQuery,
   dbPath: string,
+  storageWorkspace: string,
 ): ObservationHistoryRecord[] {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(dbPath, undefined, undefined, storageWorkspace);
   return runtime.listObservationHistory(query);
 }
 
@@ -582,7 +602,12 @@ export async function doctorReportInProcess(
   input: DoctorReportInput,
   dbPath: string,
 ): Promise<MonitorDoctorReport> {
-  const runtime = createRuntime(dbPath);
+  const runtime = createRuntime(
+    dbPath,
+    undefined,
+    undefined,
+    input.workspacePath,
+  );
   return await runtime.doctorReport(input);
 }
 

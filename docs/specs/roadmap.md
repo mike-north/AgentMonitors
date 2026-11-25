@@ -334,7 +334,8 @@ Interpret → Deliver → [React]`:
     reaped for good, even while the agent is alive and waiting for a delivery
     ([002 §6.2](./002-runtime-delivery.md)).
   - Held notify work of a cancelled or reaped ephemeral monitor stays held forever.
-  - A claim that is never acknowledged stays claimed forever.
+  - An unacknowledged claim returns to pending after its configurable TTL (default 30 minutes),
+    remaining unread until acknowledged ([002 §7.1](./002-runtime-delivery.md)).
   - `doctor` can report a deliverable verdict and still exit 1 on a leftover channel record.
   - A channel push to a session with no channel listener is committed as claimed, so the hook path
     skips it, and the agent sees it only in a later recap.
@@ -342,7 +343,6 @@ Interpret → Deliver → [React]`:
   - Session liveness by host process, with suspension and resume
     ([002 §6.3](./002-runtime-delivery.md), [007 §4.4](./007-agent-facing-interaction.md)).
   - An explicit disposition for held work ([002 §6.4](./002-runtime-delivery.md)).
-  - Claim expiry ([002 §7.1](./002-runtime-delivery.md)).
   - `channel-session-unmatched` is advisory, and the exit code agrees with the verdict
     ([005](./005-cli-reference.md), doctor section).
   - A channel commit requires host confirmation from the session transcript, with no model-facing

@@ -399,7 +399,12 @@ async function runOwnedLoop(
   // Source cancellation is independent of the tick await: shutdown must end
   // in-flight command groups before the observation can hold the loop open.
   const shutdown = new AbortController();
-  const runtime = createRuntime(dbPath, journal, shutdown.signal);
+  const runtime = createRuntime(
+    dbPath,
+    journal,
+    shutdown.signal,
+    workspacePath,
+  );
   let stopping = false;
   let wakeLoop: (() => void) | undefined;
   const server = createDaemonServer({
@@ -981,6 +986,9 @@ daemonCommand
             resolveWorkspaceDbPath(
               process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd(),
             ),
+            undefined,
+            undefined,
+            process.env['CLAUDE_PROJECT_DIR'] ?? process.cwd(),
           ).status();
       const payload = {
         running,

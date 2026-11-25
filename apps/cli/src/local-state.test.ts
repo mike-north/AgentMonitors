@@ -1,5 +1,11 @@
 import { describe, it, expect } from 'vitest';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdtempSync,
+  mkdirSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { readLocalState, writeLocalState } from './local-state.js';
@@ -157,3 +163,87 @@ describe('local-state', () => {
     }
   });
 });
+
+/** Claim lifetime is workspace coordination policy, preserved across session rewrites. */
+describe('workspace claim TTL', () => {
+  it('round-trips an explicit claim-ttl-ms', () => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'claim-setting-'));
+    try {
+      mkdirSync(path.join(ws, '.claude'));
+      writeFileSync(
+        path.join(ws, '.claude', 'agentmonitors.local.md'),
+        '---\nenabled: true\nclaim-ttl-ms: 60000\n---\n',
+      );
+      const state = readLocalState(ws);
+      expect(state.claimTtlMs).toBe('claim-ttl-ms: 60000');
+      writeLocalState(ws, { ...state, socket: '/example.sock' });
+      expect(readLocalState(ws).claimTtlMs).toBe('claim-ttl-ms: 60000');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    '0',
+    '-1',
+    '1.5',
+    'Infinity',
+    'true',
+    'nope',
+    '',
+    '"60000"',
+    '9007199254740992',
+  ])(
+    'preserves unapplied raw claim policy %j across coordination rewrites',
+    (value) => {
+      const ws = mkdtempSync(path.join(tmpdir(), 'claim-setting-'));
+      try {
+        mkdirSync(path.join(ws, '.claude'));
+        writeFileSync(
+          path.join(ws, '.claude', 'agentmonitors.local.md'),
+          `---\nenabled: true\nclaim-ttl-ms: ${value}\n---\n`,
+        );
+        const state = readLocalState(ws);
+        expect(state.claimTtlMs).toBe(`claim-ttl-ms: ${value}`);
+        writeLocalState(ws, { ...state, socket: '/rewritten.sock' });
+        expect(readLocalState(ws).claimTtlMs).toBe(`claim-ttl-ms: ${value}`);
+        expect(
+          readFileSync(
+            path.join(ws, '.claude', 'agentmonitors.local.md'),
+            'utf8',
+          ),
+        ).toContain(`claim-ttl-ms: ${value}\n`);
+      } finally {
+        rmSync(ws, { recursive: true, force: true });
+      }
+    },
+  );
+});
+
+/** Policy field fidelity includes its separator, indentation and trailing whitespace. */
+it.each(['claim-ttl-ms: 0 \t', '\tclaim-ttl-ms \t:\t60000  \t'])(
+  'preserves the complete policy field bytes %j while normalizing other fields',
+  (policyLine) => {
+    const ws = mkdtempSync(path.join(tmpdir(), 'claim-bytes-'));
+    const file = path.join(ws, '.claude', 'agentmonitors.local.md');
+    try {
+      mkdirSync(path.dirname(file));
+      writeFileSync(
+        file,
+        `---\nenabled: true \t\nsocket: /example.sock \t\n${policyLine}\n---\n`,
+      );
+      const state = readLocalState(ws);
+      expect(state.enabled).toBe(true);
+      expect(state.socket).toBe('/example.sock');
+      writeLocalState(ws, state);
+      const lines = readFileSync(file, 'utf8').split('\n');
+      expect(lines.find((line) => line.includes('claim-ttl-ms'))).toBe(
+        policyLine,
+      );
+      expect(lines).toContain('enabled: true');
+      expect(lines).toContain('socket: /example.sock');
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  },
+);

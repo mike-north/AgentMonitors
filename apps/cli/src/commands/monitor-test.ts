@@ -837,6 +837,7 @@ const monitorHistoryCommand = monitorTestCommand
         const records = listObservationHistoryInProcess(
           query,
           resolveWorkspaceDbPath(socketWorkspace, state),
+          socketWorkspace,
         );
         if (records.length === 0) {
           // Daemon down AND nothing persisted → actionable remediation, not a
