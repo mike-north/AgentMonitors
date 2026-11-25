@@ -1,5 +1,22 @@
 # @agentmonitors/source-schedule
 
+## 0.3.3
+
+### Patch Changes
+
+- Updated dependencies [2983eb9]
+- Updated dependencies [a35a733]
+- Updated dependencies [258a26d]
+- Updated dependencies [f235e53]
+- Updated dependencies [4835da7]
+- Updated dependencies [71d6428]
+- Updated dependencies [88162f9]
+- Updated dependencies [2d023f5]
+- Updated dependencies [a35a733]
+- Updated dependencies [a35a733]
+- Updated dependencies [a35a733]
+  - @agentmonitors/core@0.17.0
+
 ## 0.3.2
 
 ### Patch Changes

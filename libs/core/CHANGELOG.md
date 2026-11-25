@@ -1,5 +1,43 @@
 # @agentmonitors/core
 
+## 0.17.0
+
+### Minor Changes
+
+- a35a733: Add direct session messages with optional required acknowledgement. Unacknowledged messages can
+  resurface on a configurable schedule and remain visible as needs-attention when the budget is spent.
+- 4835da7: Expose the versioned source-neutral external-event envelope and its JSON value types, strict
+  validator, semantic identity helpers, immutable limits, and structured validation errors.
+  The validator returns canonical JSON; general encoding remains internal. The v1 schema is
+  an additive interoperability contract; durable receipt and runtime ingestion APIs remain target behavior.
+- 71d6428: Record durable counts for accepted notify work discarded when an ephemeral monitor is cancelled or its session retires. Show terminal dispositions in doctor and monitor explain after restart.
+
+  Serialize notify admission with declaration and owner retirement so outstanding observations cannot recreate held work. Keep existing holds visible in diagnostics even beside an older disposition.
+
+- 88162f9: Return unacknowledged claims to pending after a restart-safe claim TTL, defaulting to 30 minutes. Configure the shipped runtime with claim-ttl-ms in the workspace coordination file, or use RuntimeStore's claimTtlMs constructor option. Preserve first-surfaced history, recipient cursors and independent delivery reservations.
+
+  Keep lifecycle coordination independent of unapplied claim policy, and resolve offline history policy from its storage workspace without changing audit query scope.
+
+  Preserve the complete claim policy field line, including whitespace, across coordination rewrites.
+
+### Patch Changes
+
+- 2983eb9: Record a tick whose retry drain completes retained work as `triggered` in monitor history. The tick's single history row now counts the drained events in `emitted`, so `agentmonitors monitor history` shows that a retried event was eventually emitted instead of `no-change`. When the source matched no files or rebaselined on that tick, the row keeps that outcome as `sourceOutcome`, and `agentmonitors monitor explain` still reports it.
+- 258a26d: `monitor explain` no longer reports a recorded loss or a retry-drain report as a failed source call. Right after a terminal retry is skipped, after a span whose only observations a hold refused, after a failed retry attempt, or while a monitor is paused behind a terminal retry, the Observation stage now says which stage owns the row, and the verdict falls on Materialization. Materialization's retained-work reasons end with the oldest retry's last error. A genuine source failure still fails the Observation stage.
+- f235e53: `monitor explain` reports rows suppressed by the net collapse under their own `netSuppressed`
+  delivery count instead of folding them into `claimed` or `acknowledged`, so the counts match what
+  a session was actually shown. The net collapse no longer marks rows an earlier claim already
+  surfaced as suppressed when a later recap folds them into a newer endpoint; those rows stay
+  unread until acknowledged. A recap that re-shows an already-claimed endpoint keeps its delta
+  instead of rendering it with no diff.
+- 2d023f5: A recipient's per-object cursor no longer moves backward when a claim surfaces only events older than one it was already shown, such as a normal event claimed after a newer high event or a recap of older unread rows. The next delta now always starts from the newest event the recipient has seen. A repeat claim keeps the projection's first claim time and updates only the last-claim fields. Existing databases gain two cursor columns on open, filled from each cursor's baseline event.
+- a35a733: Prioritize due posts in bounded recaps and recover committed post IDs after interrupted replies with workspace-scoped request keys.
+
+  Keep post retries on the original workspace and daemon endpoint, including when the recipient moves.
+
+- a35a733: Keep direct posts eligible when a bounded recap omits them. Return the committed event ID and warn separately when hook-state refresh fails.
+- a35a733: Reject conflicting post keys, prevent duplicate presentation of a post offer after a restart, and preserve the claim timing of monitor events omitted from a recap. Keep truncated posts available in unread history and stop resurfacing them after successful output.
+
 ## 0.16.0
 
 ### Minor Changes
