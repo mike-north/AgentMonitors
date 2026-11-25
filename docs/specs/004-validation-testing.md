@@ -455,6 +455,16 @@ The incoming-changes cold-target check executes `src/index.test.ts`, `src/unavai
 and `src/revision-expressions.test.ts` in `plugins/source-incoming-changes`; the last suite's
 compiled cases enforce that the Nx prerequisite produces a usable current artifact.
 
+**Current, normative:** `rollup-admission.test.ts` prepares its real-process competitor once
+in `beforeAll`, bundling the fixture and current core source into a file-owned temporary directory.
+This private fixture preparation is permitted; package builds and shared `dist` writes remain
+forbidden. Each competing admission launches plain Node against that bundle, retains the
+15,000 ms subprocess limit, and has a case budget equal to that limit plus a fixed 5,000 ms
+fixture/assertion margin. Preparation has its own explicit 15,000 ms hook budget. The not-due,
+due and watch competitors still commit through real SQLite before the parent's flush transaction;
+the existing assertions continue to require no duplicate events, projections or interpretation.
+Four concurrent file runs over 50 rounds exercise the harness under contention without retries.
+
 ### 2.10 Repository pre-push gate
 
 **Current, normative:** after installing the frozen lockfile with Node 24 and the pinned

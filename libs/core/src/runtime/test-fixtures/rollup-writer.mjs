@@ -1,35 +1,15 @@
 /**
- * Owned-process competitor for rollup admission tests. Resolve only core source
- * .js references to their .ts originals; production modules are never rewritten.
- * Node's type transform runs the exact source without depending on shared dist.
+ * Real-process rollup competitor, bundled with current core source before use.
+ * The parent supplies a fixed clock and a shared SQLite path so this process
+ * can commit the winning window before the parent's admission transaction.
  */
-import { registerHooks } from 'node:module';
-import { existsSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath, pathToFileURL, URL } from 'node:url';
-
-const sourceRoot = path.resolve(import.meta.dirname, '../..');
-const sourcePrefix = pathToFileURL(`${sourceRoot}${path.sep}`).href;
-registerHooks({
-  resolve(specifier, context, nextResolve) {
-    if (
-      context.parentURL?.startsWith(sourcePrefix) &&
-      specifier.startsWith('.') &&
-      specifier.endsWith('.js')
-    ) {
-      const candidate = new URL(
-        `${specifier.slice(0, -3)}.ts`,
-        context.parentURL,
-      );
-      if (
-        candidate.href.startsWith(sourcePrefix) &&
-        existsSync(fileURLToPath(candidate))
-      )
-        return { url: candidate.href, shortCircuit: true };
-    }
-    return nextResolve(specifier, context);
-  },
-});
+import {
+  createDb,
+  RuntimeStore,
+  AgentMonitorRuntime,
+  SourceRegistry,
+  claudeCodeAdapter,
+} from '../../index.js';
 
 const [mode, dbPath, monitorsDir, workspacePath, epoch] = process.argv.slice(2);
 const timestamp = Number(epoch);
@@ -42,13 +22,6 @@ globalThis.Date = new Proxy(NativeDate, {
     return key === 'now' ? () => timestamp : Reflect.get(target, key, receiver);
   },
 });
-const {
-  createDb,
-  RuntimeStore,
-  AgentMonitorRuntime,
-  SourceRegistry,
-  claudeCodeAdapter,
-} = await import(pathToFileURL(path.join(sourceRoot, 'index.ts')).href);
 const db = createDb(dbPath);
 const store = new RuntimeStore(db);
 const registry = new SourceRegistry();
