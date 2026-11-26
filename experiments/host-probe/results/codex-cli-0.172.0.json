@@ -133,7 +133,12 @@
     }
   },
   "hookRun": {
-    "invocation": "hc run --bg --name probe-tui-682 --cwd <tmp-workspace> env CODEX_HOME=<tmp-home> codex -m gpt-6.1-terra --dangerously-bypass-hook-trust",
+    "invocation": [
+      "codex",
+      "-m",
+      "gpt-6.1-terra",
+      "--dangerously-bypass-hook-trust"
+    ],
     "workspace": "<tmp-workspace>",
     "codexHome": "<tmp-home>",
     "compaction": "/compact",
@@ -152,7 +157,78 @@
       "CODEX_MANAGED_BY_NPM",
       "CODEX_MANAGED_PACKAGE_ROOT"
     ],
-    "sightings": "codex-cli-0.172.0-sightings.jsonl"
+    "sightings": "codex-cli-0.172.0-sightings.jsonl",
+    "echoReceipts": [
+      {
+        "turnId": "sha256:ef485cf12af2e761",
+        "markers": [
+          {
+            "marker": "PROBE_SESSIONSTART_CONTEXT_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_SESSIONSTART_PLAIN_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_USERPROMPTSUBMIT_CONTEXT_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_USERPROMPTSUBMIT_PLAIN_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_PRETOOLUSE_CONTEXT_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_POSTTOOLUSE_CONTEXT_487FE9A3EE14",
+            "present": true
+          }
+        ]
+      },
+      {
+        "turnId": "sha256:9da7241c717ac80f",
+        "markers": [
+          {
+            "marker": "PROBE_SESSIONSTART_CONTEXT_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_SESSIONSTART_PLAIN_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_USERPROMPTSUBMIT_CONTEXT_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_USERPROMPTSUBMIT_PLAIN_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_PRETOOLUSE_CONTEXT_487FE9A3EE14",
+            "present": true
+          },
+          {
+            "marker": "PROBE_POSTTOOLUSE_CONTEXT_487FE9A3EE14",
+            "present": true
+          }
+        ]
+      }
+    ],
+    "rejectionEvidence": {
+      "run": "codex-cli-682-partial-sightings.jsonl",
+      "emittedContext": "hook-specific-additional-context-json",
+      "emittedPlain": "plain-text",
+      "displayedErrors": [
+        "hook returned invalid stop hook JSON output",
+        "hook returned invalid PreCompact hook JSON output",
+        "hook returned invalid PostCompact hook JSON output"
+      ],
+      "attribution": "The display did not identify which handler caused each rejection; SessionEnd rejection was not observable after exit."
+    }
   },
   "identity": {
     "hookSessionId": "sha256:251dba499576663b",
@@ -166,13 +242,6 @@
       "observed": false,
       "hookSessionId": "sha256:2a5a2cf2c6b7c6eb",
       "invocation": [
-        "hc",
-        "run",
-        "--bg",
-        "--name",
-        "probe-tui-682",
-        "--cwd",
-        "<throwaway-workspace-under-home>",
         "codex",
         "-m",
         "gpt-6.1-terra",
@@ -205,7 +274,7 @@
     "desktop": {
       "observed": "not established",
       "reason": "A loaded vscode source does not identify the desktop surface.",
-      "requiredAction": "Open a new desktop chat in a unique empty /tmp workspace, send a short prompt, and leave the chat open; then recheck the default socket loaded list and compare thread/read cwd to that workspace."
+      "requiredAction": "Open a new desktop chat in a unique empty <tmp-workspace>, send a short prompt, and leave it open; then recheck the default socket loaded list and compare thread/read cwd to that workspace."
     }
   },
   "environment": {
@@ -219,119 +288,427 @@
     ],
     "callerCodexHomeSet": false,
     "callerNoDaemon": "The invoking Codex process had --no-daemon; command-line flags are not inherited. The probe invocation did not contain --no-daemon.",
-    "hcChildNote": "The original TUI child environment was not captured; the later isolated hook observed the key names listed in hookRun."
+    "childEnvironmentNote": "The original TUI child environment was not captured; the later isolated hook observed the key names listed in hookRun."
   },
   "delivery": {
-    "threadId": "sha256:f13cf8d276d92a5e",
-    "turnStart": {
+    "wake": {
+      "threadId": "sha256:b586ce5559f1360a",
+      "threadStart": {
+        "request": {
+          "id": 2,
+          "method": "thread/start",
+          "params": {
+            "cwd": "<tmp-workspace>",
+            "model": "gpt-6.1-terra"
+          }
+        },
+        "response": {
+          "id": 2,
+          "result": {
+            "thread": {
+              "id": "sha256:b586ce5559f1360a"
+            }
+          }
+        }
+      },
       "request": {
+        "id": 3,
         "method": "turn/start",
         "params": {
-          "threadId": "sha256:f13cf8d276d92a5e",
+          "threadId": "sha256:b586ce5559f1360a",
+          "model": "gpt-6.1-terra",
           "input": [
             {
-              "type": "text",
-              "text": "Wait briefly, then say done."
+              "type": "text"
             }
-          ],
-          "model": "gpt-6.1-terra"
+          ]
         }
       },
       "response": {
-        "turn": {
-          "id": "sha256:003327c82d570041",
-          "rootTurnId": "sha256:003327c82d570041",
-          "items": [],
-          "itemsView": "notLoaded",
-          "status": "inProgress",
-          "error": null,
-          "startedAt": null,
-          "completedAt": null,
-          "durationMs": null
+        "id": 3,
+        "result": {
+          "turn": {
+            "id": "sha256:e9070a358a39d549",
+            "status": "inProgress"
+          }
         }
       },
       "completed": "completed",
       "usage": {
         "total": {
-          "totalTokens": 97547,
-          "inputTokens": 97487,
-          "cachedInputTokens": 64640,
+          "totalTokens": 32468,
+          "inputTokens": 32462,
+          "cachedInputTokens": 30848,
           "cacheWriteInputTokens": 0,
-          "outputTokens": 60,
-          "reasoningOutputTokens": 9
+          "outputTokens": 6,
+          "reasoningOutputTokens": 0
         },
         "last": {
-          "totalTokens": 32563,
-          "inputTokens": 32546,
-          "cachedInputTokens": 32384,
+          "totalTokens": 32468,
+          "inputTokens": 32462,
+          "cachedInputTokens": 30848,
           "cacheWriteInputTokens": 0,
-          "outputTokens": 17,
+          "outputTokens": 6,
           "reasoningOutputTokens": 0
         },
         "modelContextWindow": 475000
-      }
+      },
+      "usageScope": "unsteered turn"
     },
-    "steer": {
+    "combined": {
+      "threadId": "sha256:347c5ade81ceecad",
+      "threadStart": {
+        "request": {
+          "id": 4,
+          "method": "thread/start",
+          "params": {
+            "cwd": "<tmp-workspace>",
+            "model": "gpt-6.1-terra"
+          }
+        },
+        "response": {
+          "id": 4,
+          "result": {
+            "thread": {
+              "id": "sha256:347c5ade81ceecad"
+            }
+          }
+        }
+      },
+      "turnStart": {
+        "request": {
+          "id": 5,
+          "method": "turn/start",
+          "params": {
+            "threadId": "sha256:347c5ade81ceecad",
+            "model": "gpt-6.1-terra",
+            "input": [
+              {
+                "type": "text"
+              }
+            ]
+          }
+        },
+        "response": {
+          "id": 5,
+          "result": {
+            "turn": {
+              "id": "sha256:8e5ccb2185468e77",
+              "status": "inProgress"
+            }
+          }
+        }
+      },
+      "steer": {
+        "request": {
+          "id": 6,
+          "method": "turn/steer",
+          "params": {
+            "threadId": "sha256:347c5ade81ceecad",
+            "expectedTurnId": "sha256:8e5ccb2185468e77",
+            "input": [
+              {
+                "type": "text"
+              }
+            ]
+          }
+        },
+        "response": {
+          "id": 6,
+          "result": {
+            "turnId": "sha256:8e5ccb2185468e77"
+          }
+        },
+        "marker": {
+          "marker": "STEER_794C00DD1108EA6E",
+          "present": true,
+          "turnId": "sha256:8e5ccb2185468e77"
+        }
+      },
+      "completed": "completed",
+      "usage": {
+        "total": {
+          "totalTokens": 97532,
+          "inputTokens": 97480,
+          "cachedInputTokens": 64640,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 52,
+          "reasoningOutputTokens": 12
+        },
+        "last": {
+          "totalTokens": 32556,
+          "inputTokens": 32538,
+          "cachedInputTokens": 32384,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 18,
+          "reasoningOutputTokens": 0
+        },
+        "modelContextWindow": 475000
+      },
+      "usageScope": "turn with steering"
+    },
+    "inject": {
       "request": {
-        "method": "turn/steer",
+        "id": 7,
+        "method": "thread/inject_items",
         "params": {
-          "threadId": "sha256:f13cf8d276d92a5e",
-          "expectedTurnId": "sha256:003327c82d570041",
-          "input": [
+          "threadId": "sha256:347c5ade81ceecad",
+          "items": [
             {
-              "type": "text",
-              "text": "Say STEER_5B21FD279FB624AD in your next answer."
+              "type": "message",
+              "role": "user"
             }
           ]
         }
       },
       "response": {
-        "turnId": "sha256:003327c82d570041"
+        "id": 7,
+        "result": {}
       },
-      "output": [
-        "Done. STEER_5B21FD279FB624AD"
-      ],
-      "reflected": true
-    },
-    "inject": {
-      "request": {
-        "method": "thread/inject_items",
-        "params": {
-          "threadId": "sha256:f13cf8d276d92a5e",
-          "items": [
-            {
-              "type": "message",
-              "role": "user",
-              "content": [
-                {
-                  "type": "input_text",
-                  "text": "Remember INJECT_C5DB0B4246BB1681 for the next answer."
-                }
-              ]
-            }
-          ]
-        }
-      },
-      "response": {},
-      "startedTurnDuringObservation": false,
+      "startedDuringObservation": false,
       "observationMs": 1500,
-      "nextStartResponse": {
-        "turn": {
-          "id": "sha256:1972880f154d8a71",
-          "rootTurnId": "sha256:1972880f154d8a71",
-          "items": [],
-          "itemsView": "notLoaded",
-          "status": "inProgress",
-          "error": null,
-          "startedAt": null,
-          "completedAt": null,
-          "durationMs": null
+      "nextTurn": {
+        "request": {
+          "id": 8,
+          "method": "turn/start",
+          "params": {
+            "threadId": "sha256:347c5ade81ceecad",
+            "model": "gpt-6.1-terra",
+            "input": [
+              {
+                "type": "text"
+              }
+            ]
+          }
+        },
+        "response": {
+          "id": 8,
+          "result": {
+            "turn": {
+              "id": "sha256:c29c54dae99847ff",
+              "status": "inProgress"
+            }
+          }
         }
       },
-      "output": [
-        "INJECT_C5DB0B4246BB1681"
-      ],
-      "reflected": true
-    }
+      "marker": {
+        "marker": "INJECT_4885A5CCA9271338",
+        "present": true,
+        "turnId": "sha256:c29c54dae99847ff"
+      }
+    },
+    "lifecycle": [
+      {
+        "method": "thread/status/changed",
+        "threadId": "sha256:b586ce5559f1360a",
+        "status": "active"
+      },
+      {
+        "method": "turn/started",
+        "threadId": "sha256:b586ce5559f1360a",
+        "turnId": "sha256:e9070a358a39d549",
+        "status": "inProgress"
+      },
+      {
+        "method": "thread/tokenUsage/updated",
+        "threadId": "sha256:b586ce5559f1360a",
+        "turnId": "sha256:e9070a358a39d549",
+        "usage": {
+          "total": {
+            "totalTokens": 32468,
+            "inputTokens": 32462,
+            "cachedInputTokens": 30848,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 6,
+            "reasoningOutputTokens": 0
+          },
+          "last": {
+            "totalTokens": 32468,
+            "inputTokens": 32462,
+            "cachedInputTokens": 30848,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 6,
+            "reasoningOutputTokens": 0
+          },
+          "modelContextWindow": 475000
+        }
+      },
+      {
+        "method": "thread/status/changed",
+        "threadId": "sha256:b586ce5559f1360a",
+        "status": "idle"
+      },
+      {
+        "method": "turn/completed",
+        "threadId": "sha256:b586ce5559f1360a",
+        "turnId": "sha256:e9070a358a39d549",
+        "status": "completed"
+      },
+      {
+        "method": "thread/status/changed",
+        "threadId": "sha256:347c5ade81ceecad",
+        "status": "active"
+      },
+      {
+        "method": "turn/started",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:8e5ccb2185468e77",
+        "status": "inProgress"
+      },
+      {
+        "method": "thread/tokenUsage/updated",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:8e5ccb2185468e77",
+        "usage": {
+          "total": {
+            "totalTokens": 32461,
+            "inputTokens": 32460,
+            "cachedInputTokens": 0,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 1,
+            "reasoningOutputTokens": 0
+          },
+          "last": {
+            "totalTokens": 32461,
+            "inputTokens": 32460,
+            "cachedInputTokens": 0,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 1,
+            "reasoningOutputTokens": 0
+          },
+          "modelContextWindow": 475000
+        }
+      },
+      {
+        "method": "thread/tokenUsage/updated",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:8e5ccb2185468e77",
+        "usage": {
+          "total": {
+            "totalTokens": 64976,
+            "inputTokens": 64942,
+            "cachedInputTokens": 32256,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 34,
+            "reasoningOutputTokens": 12
+          },
+          "last": {
+            "totalTokens": 32515,
+            "inputTokens": 32482,
+            "cachedInputTokens": 32256,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 33,
+            "reasoningOutputTokens": 12
+          },
+          "modelContextWindow": 475000
+        }
+      },
+      {
+        "method": "thread/tokenUsage/updated",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:8e5ccb2185468e77",
+        "usage": {
+          "total": {
+            "totalTokens": 97532,
+            "inputTokens": 97480,
+            "cachedInputTokens": 64640,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 52,
+            "reasoningOutputTokens": 12
+          },
+          "last": {
+            "totalTokens": 32556,
+            "inputTokens": 32538,
+            "cachedInputTokens": 32384,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 18,
+            "reasoningOutputTokens": 0
+          },
+          "modelContextWindow": 475000
+        }
+      },
+      {
+        "method": "thread/status/changed",
+        "threadId": "sha256:347c5ade81ceecad",
+        "status": "idle"
+      },
+      {
+        "method": "turn/completed",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:8e5ccb2185468e77",
+        "status": "completed"
+      },
+      {
+        "method": "thread/status/changed",
+        "threadId": "sha256:347c5ade81ceecad",
+        "status": "active"
+      },
+      {
+        "method": "turn/started",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:c29c54dae99847ff",
+        "status": "inProgress"
+      },
+      {
+        "method": "thread/tokenUsage/updated",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:c29c54dae99847ff",
+        "usage": {
+          "total": {
+            "totalTokens": 130135,
+            "inputTokens": 130068,
+            "cachedInputTokens": 97024,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 67,
+            "reasoningOutputTokens": 12
+          },
+          "last": {
+            "totalTokens": 32603,
+            "inputTokens": 32588,
+            "cachedInputTokens": 32384,
+            "cacheWriteInputTokens": 0,
+            "outputTokens": 15,
+            "reasoningOutputTokens": 0
+          },
+          "modelContextWindow": 475000
+        }
+      },
+      {
+        "method": "thread/status/changed",
+        "threadId": "sha256:347c5ade81ceecad",
+        "status": "idle"
+      },
+      {
+        "method": "turn/completed",
+        "threadId": "sha256:347c5ade81ceecad",
+        "turnId": "sha256:c29c54dae99847ff",
+        "status": "completed"
+      }
+    ],
+    "receiptScope": "Allowlisted projections of request and response envelopes and notifications; generated markers and observed presence only for model text."
+  },
+  "previousSteeredTurn": {
+    "threadId": "sha256:f13cf8d276d92a5e",
+    "turnId": "sha256:003327c82d570041",
+    "usage": {
+      "total": {
+        "totalTokens": 97547,
+        "inputTokens": 97487,
+        "cachedInputTokens": 64640,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 60,
+        "reasoningOutputTokens": 9
+      },
+      "last": {
+        "totalTokens": 32563,
+        "inputTokens": 32546,
+        "cachedInputTokens": 32384,
+        "cacheWriteInputTokens": 0,
+        "outputTokens": 17,
+        "reasoningOutputTokens": 0
+      },
+      "modelContextWindow": 475000
+    },
+    "usageScope": "turn with steering; not standalone wake usage"
   }
 }

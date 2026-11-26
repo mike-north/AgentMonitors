@@ -9,14 +9,9 @@ export function redactId(id) {
   return `sha256:${createHash('sha256').update(id).digest('hex').slice(0, 16)}`;
 }
 
-/** Strip paths and hash protocol identities before persisting a receipt. */
-export function redactReceipt(value, key = '') {
-  if (Array.isArray(value)) return value.map(item => redactReceipt(item));
-  if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k,v]) => [k, redactReceipt(v,k)]));
-  if (typeof value !== 'string') return value;
-  if (/^(id|.*[iI]d)$/.test(key)) return redactId(value);
-  if (value.startsWith('/')) return '<tmp-workspace>';
-  return value;
+/** Retain only a known marker and its observed presence, never model-generated prose. */
+export function markerReceipt(marker, turnId, messages) {
+  return { marker, present: messages.some(message => typeof message === 'string' && message.includes(marker)), turnId: redactId(turnId) };
 }
 
 /** A fresh directory prevents accidental use of existing project settings or files. */
@@ -50,7 +45,9 @@ export function createBoundClient(rpc) {
 /** Record field presence and comparable identities without preserving private payloads. */
 export function hookSighting(payload, mode, env = {}) {
   const hash = value => typeof value === 'string' && value ? redactId(value) : null;
-  return { event: payload.hook_event_name ?? null, mode, keys: Object.keys(payload).sort(), sessionId: hash(payload.session_id), turnId: hash(payload.turn_id), codexEnvKeys: Object.keys(env).filter(key => key.startsWith('CODEX_')).sort() };
+  const common = ['Stop', 'PreCompact', 'PostCompact', 'SessionEnd'].includes(payload.hook_event_name);
+  const outputType = common ? (mode === 'context' ? 'common-json-system-message' : 'common-json-continue') : (mode === 'context' ? 'hook-specific-additional-context-json' : 'plain-text');
+  return { event: payload.hook_event_name ?? null, mode, outputType, keys: Object.keys(payload).sort(), sessionId: hash(payload.session_id), turnId: hash(payload.turn_id), codexEnvKeys: Object.keys(env).filter(key => key.startsWith('CODEX_')).sort() };
 }
 
 /** Supply distinct markers where the hook protocol accepts context; use valid common output elsewhere. */
